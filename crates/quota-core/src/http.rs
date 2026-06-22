@@ -45,6 +45,24 @@ pub struct Header {
     pub value: String,
 }
 
+/// A 2xx response exposing its headers alongside the body, for the few providers
+/// whose window signal lives in RESPONSE HEADERS (e.g. `x-ratelimit-reset-*`)
+/// rather than the JSON body. Most providers use [`JsonRequest::send`] (body only).
+pub struct HttpResponse {
+    headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Case-insensitive lookup of a response header value.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 impl Header {
     pub fn new(name: &'static str, value: impl Into<String>) -> Self {
         Self {
@@ -135,6 +153,14 @@ impl JsonRequest {
     /// - other non-2xx → [`FetchError::Upstream`] (with a short body excerpt)
     /// - transport/timeout → [`FetchError::Upstream`]
     pub async fn send(self, client: &reqwest::Client) -> Result<Vec<u8>, FetchError> {
+        Ok(self.send_full(client).await?.body)
+    }
+
+    /// Like [`send`](Self::send) but also returns the response headers, for
+    /// providers whose window lives in a header (e.g. `x-ratelimit-reset-*`).
+    /// Same uniform error mapping (401/403 → Unauthorized, other non-2xx →
+    /// Upstream, transport/timeout → Upstream).
+    pub async fn send_full(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
             Method::Post(body) => client.post(&self.url).body(body.clone()),
@@ -149,6 +175,11 @@ impl JsonRequest {
             .await
             .map_err(|e| FetchError::Upstream(e.to_string()))?;
         let status = response.status();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
         let body = response
             .bytes()
             .await
@@ -161,6 +192,9 @@ impl JsonRequest {
             let excerpt: String = String::from_utf8_lossy(&body).chars().take(200).collect();
             return Err(FetchError::Upstream(format!("HTTP {status}: {excerpt}")));
         }
-        Ok(body.to_vec())
+        Ok(HttpResponse {
+            headers,
+            body: body.to_vec(),
+        })
     }
 }
