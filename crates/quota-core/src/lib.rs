@@ -5,9 +5,11 @@
 //! assembles the silent-degrade `/usage` array Alfonso consumes. The subc module
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
+pub mod anthropic;
 pub mod cache;
 pub mod codex;
 pub mod model;
+pub mod opencode_auth;
 pub mod provider;
 
 use std::{
@@ -38,7 +40,10 @@ impl Registry {
     /// The default registry: every provider we support, 60s TTL.
     pub fn with_defaults() -> Self {
         Self::new(
-            vec![Box::new(codex::CodexProvider::new())],
+            vec![
+                Box::new(codex::CodexProvider::new()),
+                Box::new(anthropic::AnthropicProvider::new()),
+            ],
             cache::DEFAULT_TTL,
         )
     }

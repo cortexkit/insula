@@ -408,3 +408,35 @@ async fn skeleton_returns_real_codex_window() {
         primary["usedPercent"], primary["resetsAt"], primary["windowMinutes"]
     );
 }
+
+/// 2nd-archetype proof: a REAL anthropic/claude window from opencode's auth
+/// store, through the full wire. Validates that the provider abstraction holds
+/// across a DISTINCT archetype (already-percent utilization, already-ISO8601
+/// reset, named windows) — not just a second copy of the codex shape.
+/// Ignored by default; run with `cargo test -p quota-module -- --ignored`.
+#[tokio::test]
+#[ignore = "requires a real anthropic OAuth session in opencode auth.json"]
+async fn skeleton_returns_real_anthropic_window() {
+    let (_daemon, _module, result) = drive_usage_get().await;
+    let claude = result
+        .iter()
+        .find(|e| e["provider"] == "claude")
+        .expect("response should include a claude entry");
+    assert!(
+        claude.get("error").is_none(),
+        "expected a HEALTHY claude entry from the real session, got: {claude}"
+    );
+    let primary = &claude["usage"]["primary"];
+    assert!(
+        primary["usedPercent"].is_number(),
+        "primary.usedPercent must be a real number: {claude}"
+    );
+    assert!(
+        primary["resetsAt"].is_string(),
+        "primary.resetsAt must be an ISO timestamp: {claude}"
+    );
+    eprintln!(
+        "[skeleton] REAL claude window: usedPercent={} resetsAt={} windowMinutes={}",
+        primary["usedPercent"], primary["resetsAt"], primary["windowMinutes"]
+    );
+}
