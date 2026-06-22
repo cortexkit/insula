@@ -16,6 +16,7 @@ pub mod env;
 pub mod gemini;
 pub mod grok;
 pub mod http;
+pub mod jetbrains;
 pub mod kilo;
 pub mod kimi;
 pub mod llmproxy;
@@ -65,6 +66,7 @@ impl Registry {
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(gemini::GeminiProvider::new()),
                 Box::new(grok::GrokProvider::new()),
+                Box::new(jetbrains::JetBrainsProvider::new()),
                 Box::new(kimi::KimiProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(manus::ManusProvider::new()),
