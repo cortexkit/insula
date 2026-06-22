@@ -11,6 +11,7 @@ pub mod codex;
 pub mod elevenlabs;
 pub mod env;
 pub mod http;
+pub mod kilo;
 pub mod llmproxy;
 pub mod model;
 pub mod opencode_auth;
@@ -49,6 +50,7 @@ impl Registry {
                 Box::new(codex::CodexProvider::new()),
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
+                Box::new(kilo::KiloProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
             ],
