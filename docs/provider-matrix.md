@@ -143,7 +143,7 @@ Token from a provider CLI's own on-disk file, or shell out to its CLI.
 
 | provider | cb_id | category | reset evidence |
 |---|---|---|---|
-| copilot | copilot | **IMPLICIT-RESET → PROMOTE** | real top-level `quota_reset_date` field + refilling monthly `percent_remaining`; CodexBar parses the date (CopilotUsageModels.swift:217,223,257) and only drops it in its *simplified* per-quota window (CopilotUsageFetcher.swift:141). Faithful: `percent_remaining`→usedPercent, `quota_reset_date`→resetsAt, windowMinutes=43200 (monthly). |
+| copilot | copilot | **IMPLICIT-RESET → PROMOTE** | real top-level `quota_reset_date` field + refilling monthly `percent_remaining`; CodexBar parses the date (`Sources/CodexBarCore/CopilotUsageModels.swift:217,223,257`) and only drops it in its *simplified* per-quota window (`Sources/CodexBarCore/Providers/Copilot/CopilotUsageFetcher.swift:141`). Faithful: `percent_remaining`→usedPercent, `quota_reset_date`→resetsAt, windowMinutes=43200 (monthly). |
 | deepseek | deepseek | TRULY-RESETLESS | USD balance, no period (DeepSeekUsageSnapshot resetsAt nil). Balance axis. |
 | moonshot | moonshot | TRULY-RESETLESS | account balance, no period. Balance axis. |
 | venice | venice | TRULY-RESETLESS | USD/DIEM balance; DIEM epoch-allocation is not a reset. Balance axis. |

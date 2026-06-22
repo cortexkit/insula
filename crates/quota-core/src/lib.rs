@@ -9,6 +9,7 @@ pub mod alibaba;
 pub mod anthropic;
 pub mod cache;
 pub mod codex;
+pub mod copilot;
 pub mod elevenlabs;
 pub mod env;
 pub mod http;
@@ -52,6 +53,7 @@ impl Registry {
             vec![
                 Box::new(codex::CodexProvider::new()),
                 Box::new(anthropic::AnthropicProvider::new()),
+                Box::new(copilot::CopilotProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
