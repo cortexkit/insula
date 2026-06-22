@@ -5,17 +5,21 @@
 //! assembles the silent-degrade `/usage` array Alfonso consumes. The subc module
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
+pub mod alibaba;
 pub mod anthropic;
 pub mod cache;
 pub mod codex;
 pub mod elevenlabs;
 pub mod env;
 pub mod http;
+pub mod kilo;
 pub mod llmproxy;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
+pub mod synthetic;
 pub mod warp;
+pub mod zai;
 
 use std::{
     sync::Mutex,
@@ -51,6 +55,10 @@ impl Registry {
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
+                Box::new(synthetic::SyntheticProvider::new()),
+                Box::new(zai::ZaiProvider::new()),
+                Box::new(kilo::KiloProvider::new()),
+                Box::new(alibaba::AlibabaProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
