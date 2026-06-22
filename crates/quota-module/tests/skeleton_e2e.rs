@@ -1,53 +1,49 @@
 #![forbid(unsafe_code)]
 
-//! Walking-skeleton exit gate: prove ONE provider end-to-end over the REAL subc
-//! wire.
+//! Walking-skeleton exit gate: prove the provider path end-to-end over the REAL
+//! subc wire, against an IN-PROCESS subc daemon.
 //!
 //! Topology (a consumer → subc → this module → a real provider fetch → back):
 //!   - stand up an in-process subc daemon (loopback TCP + HMAC auth, the real
 //!     `serve_listener` + `Router` + `ControlHandler`);
 //!   - spawn the REAL `quota-module` binary as a subc client; it HELLO-registers
 //!     a ManagementSurface and connects back;
-//!   - drive a consumer the way `subc-probe` does: authenticate, `catalog.list`,
-//!     `route.open` the management surface, then a `usage.get` REQUEST on the
-//!     route channel;
+//!   - drive the consumer via the shared [`common`] driver: authenticate,
+//!     `catalog.list`, `route.open` the management surface, then a `usage.get`
+//!     REQUEST on the route channel;
 //!   - assert the RESPONSE carries a `ProviderUsage[]` for `codex`.
+//!
+//! The consumer-side wire driver is shared with `real_daemon_e2e` via
+//! `tests/common`; this file owns only the IN-PROCESS daemon setup. The
+//! real-binary supervision proof (a standalone `subc-core` spawning the module from
+//! `subc.jsonc`) lives in `real_daemon_e2e.rs`.
 //!
 //! `skeleton_returns_real_codex_window` is the load-bearing proof and is
 //! `#[ignore]` so it only runs when a real codex session is present
 //! (`cargo test -- --ignored`); it asserts a HEALTHY window from the real
 //! provider, never a stub. `skeleton_round_trips_usage_get_over_the_wire` runs in
-//! CI and proves the full wire path regardless of whether a session exists
-//! (degraded entry is an acceptable silent-degrade outcome there).
+//! CI and proves the full wire path regardless of whether a session exists.
 
-use std::{
-    net::Ipv4Addr,
-    path::{Path, PathBuf},
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+mod common;
+
+use std::{net::Ipv4Addr, path::Path, path::PathBuf, process, time::Duration};
 
 use serde_json::Value;
-use subc_core::{
-    read_frame, serve_listener, write_frame, ControlHandler, Frame, Registry, Router, ServerAuth,
-};
-use subc_protocol::{
-    session::ConfigTier, BindIdentity, Flags, FrameType, Priority, RouteTarget,
-};
+use subc_core::{serve_listener, ControlHandler, Registry, Router, ServerAuth};
+use subc_protocol::FrameType;
 use subc_transport::{
-    authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
-    ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     process::{Child, Command},
-    time::{sleep, timeout, Instant},
+    time::{sleep, Instant},
 };
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+use common::{
+    catalog_list, connect_consumer, raw_route_frame, route_open, unique_temp_dir, usage_get,
+    MODULE_ID, SETUP_TIMEOUT,
+};
 
 // ---- in-process daemon -----------------------------------------------------
 
@@ -118,7 +114,7 @@ fn spawn_quota_module(subc_connection_file: &Path) -> ModuleProcess {
     command
         .arg("--subc")
         .arg(subc_connection_file)
-        .env("SUBC_MODULE_ID", "ai-provider-quota")
+        .env("SUBC_MODULE_ID", MODULE_ID)
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
     let child = command.spawn().expect("spawn quota-module");
@@ -139,123 +135,15 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
     }
 }
 
-// ---- consumer driver (mirrors subc-probe) ----------------------------------
-
-async fn connect_consumer(connection_file_path: &Path) -> TcpStream {
-    let conn = connection_file::read(connection_file_path).unwrap();
-    let endpoint = conn.endpoints.first().unwrap();
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .await
-        .unwrap();
-    authenticate_client(&mut stream, &conn, Duration::from_secs(2))
-        .await
-        .unwrap();
-    stream
-}
-
-async fn control_rpc(stream: &mut TcpStream, corr: u64, body: Value) -> Frame {
-    let frame = Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Passive, false),
-        0,
-        corr,
-        serde_json::to_vec(&body).unwrap(),
-    )
-    .unwrap();
-    write_frame(stream, &frame).await.unwrap();
-    read_until_channel0(stream, corr).await
-}
-
-async fn read_until_channel0(stream: &mut TcpStream, corr: u64) -> Frame {
-    loop {
-        let frame = read_frame_timeout(stream).await;
-        if frame.header.channel == 0
-            && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
-            && frame.header.corr == corr
-        {
-            return frame;
-        }
-    }
-}
-
-async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
-    timeout(READ_TIMEOUT, async {
-        read_frame(stream)
-            .await
-            .unwrap()
-            .expect("connection should stay open")
-    })
-    .await
-    .expect("timed out waiting for a frame")
-}
-
-async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> u16 {
-    let request = json_route_open(project_root);
-    let frame = control_rpc(stream, corr, request).await;
-    assert_eq!(
-        frame.header.ty,
-        FrameType::Response,
-        "route.open should succeed: {}",
-        String::from_utf8_lossy(&frame.body)
-    );
-    let value: Value = serde_json::from_slice(&frame.body).unwrap();
-    value["route_channel"].as_u64().unwrap() as u16
-}
-
-fn json_route_open(project_root: &Path) -> Value {
-    let target = RouteTarget::ManagementSurface {
-        module_id: "ai-provider-quota".to_string(),
-    };
-    let identity = BindIdentity {
-        project_root: project_root.to_path_buf(),
-        harness: "quota-e2e".to_string(),
-        session: "session-1".to_string(),
-    };
-    let config: Vec<ConfigTier> = Vec::new();
-    serde_json::json!({
-        "op": "route.open",
-        "target": target,
-        "identity": identity,
-        "config": config,
-    })
-}
-
-async fn usage_get(stream: &mut TcpStream, route_channel: u16, corr: u64) -> Value {
-    let body = serde_json::json!({ "method": "usage.get", "params": {} });
-    let frame = Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
-        route_channel,
-        corr,
-        serde_json::to_vec(&body).unwrap(),
-    )
-    .unwrap();
-    write_frame(stream, &frame).await.unwrap();
-
-    loop {
-        let frame = read_frame_timeout(stream).await;
-        match frame.header.ty {
-            FrameType::Response if frame.header.corr == corr => {
-                return serde_json::from_slice(&frame.body).unwrap();
-            }
-            FrameType::Error if frame.header.corr == corr => {
-                panic!(
-                    "usage.get returned error: {}",
-                    String::from_utf8_lossy(&frame.body)
-                );
-            }
-            _ => continue,
-        }
-    }
-}
+// ---- per-test orchestration (in-process daemon + real module + consumer) ----
 
 /// Stand up daemon + real module, confirm it is in the catalog, and open a route
 /// to its management surface. Returns the live pieces plus an authenticated
 /// consumer already bound to `route_channel`.
-async fn open_quota_route() -> (TestDaemon, ModuleProcess, TcpStream, u16) {
+async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
     let daemon = start_daemon().await;
     let module = spawn_quota_module(&daemon.connection_file_path);
-    wait_for_registration(&daemon.registry, "ai-provider-quota", SETUP_TIMEOUT).await;
+    wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = unique_temp_dir("quota-e2e-project");
     std::fs::create_dir_all(&project_root).unwrap();
@@ -263,15 +151,11 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, TcpStream, u16) {
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
 
     // catalog.list — confirm the module is discoverable as a management surface.
-    let catalog = control_rpc(&mut consumer, 1, serde_json::json!({ "op": "catalog.list" })).await;
-    assert_eq!(catalog.header.ty, FrameType::Response);
-    let catalog_value: Value = serde_json::from_slice(&catalog.body).unwrap();
-    let found = catalog_value["modules"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|m| m["module_id"] == "ai-provider-quota");
-    assert!(found, "quota module should be in the catalog: {catalog_value}");
+    let modules = catalog_list(&mut consumer, 1).await;
+    assert!(
+        modules.iter().any(|m| m["module_id"] == MODULE_ID),
+        "quota module should be in the catalog: {modules:?}"
+    );
 
     let route_channel = route_open(&mut consumer, &project_root, 2).await;
     let _ = std::fs::remove_dir_all(&project_root);
@@ -284,33 +168,6 @@ async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
     let response = usage_get(&mut consumer, route_channel, 3).await;
     let result = response["result"].as_array().cloned().unwrap_or_default();
     (daemon, module, result)
-}
-
-/// Send a raw data-plane request body on the route channel and return the
-/// terminal frame for `corr` (Response or Error), without interpreting it.
-async fn raw_route_request(stream: &mut TcpStream, route_channel: u16, corr: u64, body: Value) -> Frame {
-    let frame = Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
-        route_channel,
-        corr,
-        serde_json::to_vec(&body).unwrap(),
-    )
-    .unwrap();
-    write_frame(stream, &frame).await.unwrap();
-    loop {
-        let frame = read_frame_timeout(stream).await;
-        if frame.header.corr == corr
-            && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
-        {
-            return frame;
-        }
-    }
-}
-
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -346,7 +203,7 @@ async fn unknown_method_returns_error_frame_with_canonical_error_body() {
     let (_daemon, _module, mut consumer, route_channel) = open_quota_route().await;
 
     // An unknown method on a well-formed body.
-    let frame = raw_route_request(
+    let frame = raw_route_frame(
         &mut consumer,
         route_channel,
         7,
@@ -368,7 +225,7 @@ async fn unknown_method_returns_error_frame_with_canonical_error_body() {
     );
 
     // A malformed body (not decodable as a usage request) is also an Error frame.
-    let frame = raw_route_request(
+    let frame = raw_route_frame(
         &mut consumer,
         route_channel,
         8,
