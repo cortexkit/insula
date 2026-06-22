@@ -1,0 +1,18 @@
+# Rust
+/target
+**/target
+Cargo.lock
+
+# Node
+node_modules
+package-lock.json
+bun.lockb
+
+# Agent tooling
+.alfonso
+_bmad-output
+.bmad
+
+# OS / editor
+.DS_Store
+*.swp
