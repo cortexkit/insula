@@ -143,10 +143,17 @@ origin) → DEFER (same antigravity wall, report-don't-force):**
 | opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
 | amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |
 
-**3C — HEADLESS but BALANCE-leaning (credits + refresh date, not a clean window):**
-| provider | cb_id | note |
-|---|---|---|
-| manus | manus | `MANUS_SESSION_TOKEN` env → Bearer (headless-sourceable), but the signal is credits (totalCredits/freeCredits/…) + `nextRefreshTime` — a refilling balance, not a utilization%. Like the REPORT set: it has a real refresh date, so it COULD map an implicit-reset window, but the primary signal is balance. Build only if Alfonso consumes a credits-with-refill signal; else it's a future Balance-axis case. |
+**3C — manus → BUILD (copilot test PASSED against source).** `MANUS_SESSION_TOKEN`
+env → Bearer (headless-sourceable). Applied the refilling-vs-prepaid test to
+CodexBar `ManusUsageFetcher.swift:164-206 toUsageSnapshot`: the refresh window is
+`usedPercent = (maxRefreshCredits − refreshCredits)/maxRefreshCredits` with
+`resetsAt: nextRefreshTime` — a genuine REFILLING ALLOTMENT (per-period cap
+`maxRefreshCredits`, current refill `refreshCredits`) with a REAL provider reset.
+That is a faithful implicit-reset window (the copilot case), NOT crof's fabricated
+reset. So manus maps secondary←refresh-allotment legitimately. Caveat: the
+`proMonthlyCredits` primary has `resetsAt: nil` (no reset) so it can't be a
+RateWindow — emit only the refresh window; `totalCredits` is a prepaid balance →
+the future Balance seam, not forced into a window.
 
 CHARTER CORRECTION (important): the "prefer opencode-store bearer over cookie-scrape
 for ollama/opencode/opencodego" rule rested on a false premise. The opencode store
@@ -164,9 +171,17 @@ a headless bearer — all three DEFER.
 
 ### Group 5 — auth-file-token / CLI-probe  (mixed)
 Token from a provider CLI's own on-disk file, or shell out to its CLI.
+GROK LIVE-PROVEN: the opencode store `xai` entry is an OAUTH token (type/refresh/
+access/expires — like claude, NOT an inference api-key like ollama-cloud). Probed
+grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig live with it (POST,
+grpc-web+proto, empty 5-byte frame, Bearer) → HTTP 200 grpc-status:0 with real
+protobuf Timestamp fields (billing-period start ≈2026-05-31 / end ≈2026-06-30). So
+grok IS live-anchorable via the opencode xai OAuth token — the store shortcut holds
+here (unlike ollama). The response is protobuf (grpc-web), so grok needs minimal
+protobuf decoding of the billing Timestamps, not JSON.
 | provider | cb_id | session source | endpoint | window |
 |---|---|---|---|---|
-| grok | grok | `~/.grok/auth.json` or cookie | POST grok.com (protobuf) OR `grok agent` JSON-RPC | monthly (billingPeriodEnd) — HAS WINDOW |
+| grok | grok | opencode `xai` OAuth (LIVE-PROVEN) / `~/.grok/auth.json` | POST grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (grpc-web+proto) | monthly (billingPeriodEnd) — HAS WINDOW, LIVE-ANCHORABLE |
 | jetbrains | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — HAS WINDOW |
 | kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL |
 | codebuff | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage | weekly (subscription) — PARTIAL |
