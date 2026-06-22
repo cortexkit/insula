@@ -16,6 +16,7 @@ pub mod model;
 pub mod opencode_auth;
 pub mod provider;
 pub mod warp;
+pub mod zai;
 
 use std::{
     sync::Mutex,
@@ -51,6 +52,7 @@ impl Registry {
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
+                Box::new(zai::ZaiProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
