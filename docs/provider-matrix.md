@@ -105,29 +105,56 @@ fabricates resetsAt locally; kilo straddles Group 5 (env OR auth-file). alibaba
 has an api-key path (Group 2) and a console-cookie path (Group 3) — port the
 api-key path; its console mode needs a `sec_token` scraped from HTML.
 
-### Group 3 — web-session / browser-cookie, HAS WINDOW
-Session from browser cookies (macOS-only import) or a login flow → web backend.
-These are the HARDEST: cookie import is macOS-only and fragile, some scrape HTML
-or speak protobuf. Lower priority unless the provider matters to Alfonso.
+### Group 3 — web-session, HAS WINDOW — re-partitioned by HEADLESS SOURCEABILITY
+
+Audited each provider's credential ORIGIN (3 explore workers vs CodexBar +
+OmniRoute, + a live ollama probe) because for G3 the gating question is the
+antigravity one: can a headless server even OBTAIN the credential, or does it only
+exist after an interactive desktop/browser login? Three buckets:
+
+**3A — HEADLESS-SOURCEABLE (api-key-env / native token) → BUILD (these are really
+api-key providers mis-filed as cookie):**
 | provider | cb_id | session source | endpoint | window |
 |---|---|---|---|---|
-| ollama | ollama | browser cookie OR opencode `ollama-cloud` | GET ollama.com/settings (HTML) | session + weekly |
-| opencode | opencode | browser cookie `auth`/`__Host-auth` | POST/GET opencode.ai/_server | rolling + weekly |
-| opencodego | opencodego | browser cookie (same) | GET opencode.ai/workspace/{id}/go (HTML) | rolling + weekly + monthly |
-| cursor | cursor | browser cookie (cursor.com) | GET cursor.com/api/usage-summary | billing cycle |
-| factory | factory | cookie OR bearer (WorkOS oauth) | GET api.factory.ai/api/billing/limits | 5h + weekly + monthly |
-| minimax | minimax | cookie OR `MINIMAX_API_KEY` | GET {host}/v1/api/openplatform/coding_plan/remains | interval + weekly |
-| mimo | mimo | cookie (api-platform_serviceToken + userId) | GET {api}/tokenPlan/usage | month |
-| manus | manus | cookie OR `MANUS_SESSION_TOKEN` | POST api.manus.im/.../GetAvailableCredits | monthly + daily refresh |
-| kimi | kimi | cookie OR `KIMI_AUTH_TOKEN` | POST kimi.com/apiv2/.../GetUsages | weekly + 5h rate limit |
-| stepfun | stepfun | login flow (user/pass) → Oasis-Token | POST platform.stepfun.com/.../QueryStepPlanRateLimit | 5h + weekly |
-| windsurf | windsurf | browser local-storage / SQLite `state.vscdb` | POST windsurf.com/_backend/.../GetPlanStatus (protobuf) | daily + weekly |
-| doubao | doubao | `ARK_API_KEY`/`DOUBAO_API_KEY` | POST ark...volces.com/.../chat/completions (probe) | from response rate-limit headers |
-| amp | amp | browser cookie (ampcode.com) | GET ampcode.com/settings (HTML scrape) | freeTierUsage quota + windowHours |
-Notes: opencode/opencodego — for OUR ecosystem these likely become opencode-store
-bearer reads (Group 1-style), NOT cookie scrapes; flag for design. windsurf is
-protobuf-over-Connect. stepfun's login flow is the heaviest (device register +
-password sign-in).
+| minimax | minimax | `MINIMAX_CODING_API_KEY`/`MINIMAX_API_KEY` bearer | GET {host}/v1/api/openplatform/coding_plan/remains | remains_time/end_time (epoch) |
+| doubao | doubao | `ARK_API_KEY`/`VOLCENGINE_API_KEY`/`DOUBAO_API_KEY` bearer | POST ark...volces.com (probe) | `x-ratelimit-reset-requests` header (ISO/duration/sec) |
+| kimi | kimi | `KIMI_AUTH_TOKEN` env (else cookie) | POST kimi.com/apiv2/.../GetUsages | weekly + 5h (`resetTime`) |
+| stepfun | stepfun | `STEPFUN_TOKEN` env (else user/pass login flow) | POST platform.stepfun.com/.../QueryStepPlanRateLimit | 5h + weekly (Unix-sec) |
+| windsurf | windsurf | native SQLite `state.vscdb` (the Windsurf EDITOR writes it) | local read of `windsurf.settings.cachedPlanInfo` | daily + weekly (`*ResetAtUnix`) |
+Notes: minimax/doubao/kimi belong with Group 2 (api-key-env bearer) — minimax has
+real epoch windows, doubao reuses synthetic's duration-string parser, kimi-official
+has a real resetTime (NOT KimiK2, which is the deferred credits-only one). stepfun
+is headless via env token; its user/pass login flow (device-register + sign-in) is
+heavier and a fallback, not the primary. windsurf is headless-WITH-CAVEAT: a real
+native file like gemini's, but needs the Windsurf desktop editor installed (absent
+on a pure server → degrade) AND a SQLite read dep; the web path is protobuf-over-
+Connect behind browser local-storage (desktop-only) — so port the SQLite read, not
+the protobuf web fetch.
+
+**3B — DESKTOP-ONLY (browser-cookie scrape / short-lived JWT, NO native headless
+origin) → DEFER (same antigravity wall, report-don't-force):**
+| provider | cb_id | why deferred |
+|---|---|---|
+| cursor | cursor | browser cookie (cursor.com), short-lived JWT, NO CLI file. Real window `billingCycleEnd`. |
+| factory | factory | WorkOS/next-auth browser session (cookie + local-storage scrape), NO CLI file. Real window `windowEnd`/`secondsRemaining`. |
+| mimo | mimo | browser cookie (`api-platform_serviceToken`+`userId`), desktop-only. Real window `currentPeriodEnd`. |
+| ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. LIVE-PROVEN dead-end: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
+| opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |
+| opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
+| amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |
+
+**3C — HEADLESS but BALANCE-leaning (credits + refresh date, not a clean window):**
+| provider | cb_id | note |
+|---|---|---|
+| manus | manus | `MANUS_SESSION_TOKEN` env → Bearer (headless-sourceable), but the signal is credits (totalCredits/freeCredits/…) + `nextRefreshTime` — a refilling balance, not a utilization%. Like the REPORT set: it has a real refresh date, so it COULD map an implicit-reset window, but the primary signal is balance. Build only if Alfonso consumes a credits-with-refill signal; else it's a future Balance-axis case. |
+
+CHARTER CORRECTION (important): the "prefer opencode-store bearer over cookie-scrape
+for ollama/opencode/opencodego" rule rested on a false premise. The opencode store
+does NOT carry an opencode-own or ollama-usage credential — it holds bearer tokens
+for the inference providers the user logged into (anthropic/openai/ollama-cloud-
+inference/etc.). ollama's usage endpoint rejects the inference key (proven live);
+opencode/opencodego usage is browser-cookie-only. So none of the three collapse to
+a headless bearer — all three DEFER.
 
 ### Group 4 — cloud-vendor signed  (NO WINDOW)
 | provider | cb_id | session source | endpoint | window |
