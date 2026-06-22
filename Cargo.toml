@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/quota-core", "crates/quota-module"]
+
+# ai-provider-quota — a subc-supervised module serving per-provider usage/quota
+# windows, replacing the external CodexBar dependency. See docs/charter.md.
+#
+# The subc wire contract crates are PATH dependencies on the sibling subconscious
+# monorepo (same arrangement AFT uses): subc-protocol/subc-transport are the
+# module-facing wire, subc-core is a dev-only dep for the in-process daemon used
+# in the end-to-end skeleton test. The TS @cortexkit/subc-client (Alfonso's
+# consumer transport) is owned by subc, NOT built here.
+[workspace.dependencies]
+subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+subc-transport = { path = "../subconscious/crates/subc-transport" }
+subc-core = { path = "../subconscious/crates/subc-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }

@@ -1,0 +1,16 @@
+[package]
+name = "quota-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Provider usage fetchers + RateWindow normalization + TTL cache for the ai-provider-quota subc module. Pure logic, wire-agnostic."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
