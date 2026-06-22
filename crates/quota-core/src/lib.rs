@@ -5,6 +5,7 @@
 //! assembles the silent-degrade `/usage` array Alfonso consumes. The subc module
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
+pub mod alibaba;
 pub mod anthropic;
 pub mod cache;
 pub mod codex;
@@ -51,6 +52,7 @@ impl Registry {
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
+                Box::new(alibaba::AlibabaProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
