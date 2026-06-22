@@ -26,8 +26,16 @@ do not fit the RateWindow model and Alfonso's pace projection cannot use them.
 - **PARTIAL (~5)** — a window on one sub-signal (e.g. codebuff's weekly
   subscription limit) but credits on the primary.
 
-**Open question Q-matrix-1 (for the driver):** do we port all 46 for parity
-(NO-WINDOW providers emit a degraded/credits-only entry), or scope the fan-out to
+> **RULINGS (Ufuk + ALF, locked):** v1 = the window-bearing set only; the
+> "all 46" lock is revised. The former NO-WINDOW set is re-categorized in Group 6
+> below into IMPLICIT-RESET (faithful reset → promotable into v1, e.g. **copilot**),
+> TRULY-RESETLESS (prepaid balance → the reserved `Balance` seam, deferred), and
+> REPORT (ambiguous → held for confirmation). A balance signal is NEVER expressed
+> as a fabricated window. crof + Group 4 (cloud-cost) stay deferred.
+
+**Q-matrix-1 — RESOLVED:** v1 is window-bearing only; NO-WINDOW deferred as an
+additive fan-out. (Kept below for history.) The original question was: port all 46
+(NO-WINDOW emit a degraded/credits entry), or scope the fan-out to
 the ~24 window-bearing providers that Alfonso's pace model can actually use? My
 lean: port the ~24 window-bearing first (real value), defer NO-WINDOW until we
 decide whether Alfonso should model a credits/balance signal at all. This is a
@@ -119,24 +127,40 @@ Token from a provider CLI's own on-disk file, or shell out to its CLI.
 | kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL |
 | codebuff | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage | weekly (subscription) — PARTIAL |
 
-### Group 6 — api-key-env, NO WINDOW (credits/balance/count)
-Don't fit RateWindow. Lowest priority; emit degraded or a future credits signal.
-| provider | cb_id | signal |
-|---|---|---|
-| openrouter | openrouter | credits (totalUsage/totalCredits) |
-| deepseek | deepseek | USD balance |
-| moonshot | moonshot | balance |
-| venice | venice | USD/DIEM balance |
-| kimik2 | kimik2 | credits |
-| deepgram | deepgram | usage count |
-| copilot | copilot | premium-interaction % remaining (no reset) |
-| groq | groq | prometheus rate (no window) |
-| azureopenai | azureopenai | validation probe only |
-| abacus | abacus | compute points (cookie) |
-| augment | augment | credits (cookie/CLI) |
-| commandcode | commandcode | credits (cookie) |
-| mistral | mistral | cost (cookie, admin.mistral.ai) |
-| perplexity | perplexity | credits (cookie) |
+### Group 6 — the former "NO WINDOW" set, re-categorized (ALF ruling)
+
+"No window" conflated two different things. Each provider below is now tagged:
+- **IMPLICIT-RESET** — quota-like with a FAITHFUL reset the provider itself
+  reports/uses → folds into the existing RateWindow, no new axis → PROMOTABLE to
+  v1. A reset counts only if it is real (a field in the response or a genuine
+  cycle the provider uses), never a fabricated convenience period.
+- **TRULY-RESETLESS** — prepaid balance / cumulative cost / rate gauge with no
+  real period → needs the future Balance axis (the reserved seam) → stays deferred.
+- **REPORT** — carries a billing/renewal date, but whether the signal is a
+  *refilling quota* (implicit-reset) or a *prepaid balance with a charge date*
+  (resetless) cannot be determined from the response shape alone. Held for driver
+  confirmation rather than promoted on a guess (the "report, don't force" rule).
+
+| provider | cb_id | category | reset evidence |
+|---|---|---|---|
+| copilot | copilot | **IMPLICIT-RESET → PROMOTE** | real top-level `quota_reset_date` field + refilling monthly `percent_remaining`; CodexBar parses the date (CopilotUsageModels.swift:217,223,257) and only drops it in its *simplified* per-quota window (CopilotUsageFetcher.swift:141). Faithful: `percent_remaining`→usedPercent, `quota_reset_date`→resetsAt, windowMinutes=43200 (monthly). |
+| deepseek | deepseek | TRULY-RESETLESS | USD balance, no period (DeepSeekUsageSnapshot resetsAt nil). Balance axis. |
+| moonshot | moonshot | TRULY-RESETLESS | account balance, no period. Balance axis. |
+| venice | venice | TRULY-RESETLESS | USD/DIEM balance; DIEM epoch-allocation is not a reset. Balance axis. |
+| kimik2 | kimik2 | TRULY-RESETLESS | prepaid credits, no period. Balance axis. |
+| deepgram | deepgram | TRULY-RESETLESS | usage-breakdown count, no period. Balance/count axis. |
+| mistral | mistral | TRULY-RESETLESS | cumulative monthly COST aggregate (admin billing), not a quota. Balance axis. |
+| groq | groq | TRULY-RESETLESS | Prometheus rate gauge; usedPercent is statically 0 (GroqUsageSnapshot:65) — a throughput metric, not a quota window. Exclude. |
+| azureopenai | azureopenai | TRULY-RESETLESS | validation probe only (no usage payload at all). Exclude. |
+| abacus | abacus | **REPORT** | `nextBillingDate`→resetsAt exists, but compute-points are likely prepaid (depleting), not a refilling allotment. Refill-vs-prepaid unverified. (cookie auth.) |
+| augment | augment | **REPORT** | `billingPeriodEnd`→resetsAt exists; credits = consumed/available. Refill-vs-prepaid unverified. (cookie/CLI auth.) |
+| commandcode | commandcode | **REPORT** | `billingPeriodEnd` present; monthlyCredits signal. Refill-vs-prepaid unverified. (cookie auth.) |
+| perplexity | perplexity | **REPORT** | "recurring" credit grants carry `renewalDateTs`→resetsAt; "recurring" implies refill (→ implicit-reset), but waterfall-attributed across recurring/purchased/promotional. (cookie auth.) |
+| openrouter | openrouter | EXCLUDED (Ufuk) | not categorized. |
+
+**Promotion proposal to driver:** copilot → v1 (verified faithful). The 4 REPORT
+providers need a refill-semantics check before promotion; all 4 are also cookie-auth
+(a G3 concern), so they're naturally sequenced with the G3 cookie/web work, not now.
 
 ---
 
