@@ -19,6 +19,7 @@ pub mod llmproxy;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
+pub mod stepfun;
 pub mod synthetic;
 pub mod warp;
 pub mod zai;
@@ -59,6 +60,7 @@ impl Registry {
                 Box::new(gemini::GeminiProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
+                Box::new(stepfun::StepFunProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),
                 Box::new(zai::ZaiProvider::new()),
                 Box::new(kilo::KiloProvider::new()),
