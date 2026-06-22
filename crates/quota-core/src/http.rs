@@ -115,6 +115,19 @@ impl JsonRequest {
         }
     }
 
+    /// A POST with NO default `Accept`/`Content-Type` headers, for non-JSON wire
+    /// protocols (e.g. grok's gRPC-web, where the caller sets
+    /// `application/grpc-web+proto` itself and a JSON `Accept` changes the server's
+    /// response framing). The caller supplies all content headers via `.header(..)`.
+    pub fn post(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: Method::Post(body),
+            url: url.into(),
+            headers: vec![],
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
     /// A POST with an `application/x-www-form-urlencoded` body (e.g. an OAuth2
     /// token refresh). `pairs` are percent-encoded into `k=v&k=v` form.
     pub fn post_form(url: impl Into<String>, pairs: &[(&str, &str)]) -> Self {
