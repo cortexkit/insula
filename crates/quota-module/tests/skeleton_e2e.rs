@@ -249,8 +249,10 @@ async fn usage_get(stream: &mut TcpStream, route_channel: u16, corr: u64) -> Val
     }
 }
 
-/// Drive the full path and return the `result` array.
-async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
+/// Stand up daemon + real module, confirm it is in the catalog, and open a route
+/// to its management surface. Returns the live pieces plus an authenticated
+/// consumer already bound to `route_channel`.
+async fn open_quota_route() -> (TestDaemon, ModuleProcess, TcpStream, u16) {
     let daemon = start_daemon().await;
     let module = spawn_quota_module(&daemon.connection_file_path);
     wait_for_registration(&daemon.registry, "ai-provider-quota", SETUP_TIMEOUT).await;
@@ -272,11 +274,38 @@ async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
     assert!(found, "quota module should be in the catalog: {catalog_value}");
 
     let route_channel = route_open(&mut consumer, &project_root, 2).await;
-    let response = usage_get(&mut consumer, route_channel, 3).await;
-
     let _ = std::fs::remove_dir_all(&project_root);
+    (daemon, module, consumer, route_channel)
+}
+
+/// Drive the full path and return the `result` array.
+async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
+    let (daemon, module, mut consumer, route_channel) = open_quota_route().await;
+    let response = usage_get(&mut consumer, route_channel, 3).await;
     let result = response["result"].as_array().cloned().unwrap_or_default();
     (daemon, module, result)
+}
+
+/// Send a raw data-plane request body on the route channel and return the
+/// terminal frame for `corr` (Response or Error), without interpreting it.
+async fn raw_route_request(stream: &mut TcpStream, route_channel: u16, corr: u64, body: Value) -> Frame {
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        route_channel,
+        corr,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    write_frame(stream, &frame).await.unwrap();
+    loop {
+        let frame = read_frame_timeout(stream).await;
+        if frame.header.corr == corr
+            && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+        {
+            return frame;
+        }
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -303,6 +332,52 @@ async fn skeleton_round_trips_usage_get_over_the_wire() {
         healthy ^ degraded,
         "codex entry must be exactly one of healthy|degraded: {codex}"
     );
+}
+
+/// Locks the module-data-plane ERROR contract (the precedent for every future
+/// module): a bad request on the route channel comes back as a `FrameType::Error`
+/// frame whose body is subc's canonical `ErrorBody { code, message }` — NOT an
+/// error embedded in a success `result` wrapper. This lets a client share ONE
+/// error codec across channel-0 control and the data plane. Per-provider
+/// degradation stays embedded in `result[]` (covered by the round-trip test);
+/// wholesale Error frames are reserved for bad-request/unknown-method.
+#[tokio::test]
+async fn unknown_method_returns_error_frame_with_canonical_error_body() {
+    let (_daemon, _module, mut consumer, route_channel) = open_quota_route().await;
+
+    // An unknown method on a well-formed body.
+    let frame = raw_route_request(
+        &mut consumer,
+        route_channel,
+        7,
+        serde_json::json!({ "method": "cost.get", "params": {} }),
+    )
+    .await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Error,
+        "unknown method must be a wholesale Error frame, not a result wrapper"
+    );
+    let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body)
+        .expect("Error frame body must be subc's canonical ErrorBody {code,message}");
+    assert_eq!(error.code, "unknown_method");
+    assert!(
+        error.message.contains("cost.get"),
+        "message should name the rejected method: {}",
+        error.message
+    );
+
+    // A malformed body (not decodable as a usage request) is also an Error frame.
+    let frame = raw_route_request(
+        &mut consumer,
+        route_channel,
+        8,
+        serde_json::json!({ "not_a_method": true }),
+    )
+    .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let error: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(error.code, "invalid_request");
 }
 
 /// The load-bearing proof: a REAL codex window from the real on-disk session.
