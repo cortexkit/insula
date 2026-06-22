@@ -58,6 +58,39 @@ pub struct Usage {
     pub extra_rate_windows: Option<Vec<ExtraWindow>>,
 }
 
+/// What a [`Balance`] amount is denominated in.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum BalanceKind {
+    /// Opaque provider credits/points.
+    Credits,
+    /// A real currency (then `unit` is a currency code like "USD").
+    Currency,
+}
+
+/// A prepaid balance signal — remaining credits or currency with NO reset window.
+///
+/// RESERVED SEAM — currently never populated by any provider. Some providers
+/// report only a remaining balance with no reset/period (prepaid USD, pure
+/// credits); the one thing we must never do is express that as a [`RateWindow`]
+/// with a fabricated `resetsAt`, which would poison the consumer's pace
+/// projection. This type is the future home for that signal so the balance axis
+/// can be added later as a non-breaking change. No provider wires to it today and
+/// no consumer reads it yet; it exists only to reserve the shape.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Balance {
+    /// Amount remaining, in `unit`.
+    pub remaining: f64,
+    /// Total/limit when the provider reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// Denomination of `remaining`/`total` — a currency code for `Currency`, or a
+    /// credit/point label for `Credits`.
+    pub unit: String,
+    pub kind: BalanceKind,
+}
+
 /// One provider/account's usage entry. The `/usage` response is an array of
 /// these. A fetch failure becomes an entry carrying `error` (silent-degrade),
 /// never a failure of the whole array.
@@ -73,6 +106,11 @@ pub struct ProviderUsage {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// RESERVED SEAM — a prepaid balance signal alongside (or instead of) the
+    /// windows in `usage`. Currently never populated; see [`Balance`]. Omitted
+    /// from the wire while absent, so today's consumer output is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<Balance>,
     /// Present only on a degraded entry. The consumer skips any entry with a
     /// truthy `error`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +125,7 @@ impl ProviderUsage {
             account,
             source: Some(source.to_string()),
             usage: Some(usage),
+            balance: None,
             error: None,
         }
     }
@@ -99,7 +138,50 @@ impl ProviderUsage {
             account: None,
             source: None,
             usage: None,
+            balance: None,
             error: Some(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balance_seam_is_absent_from_the_wire_today() {
+        // The reserved balance seam must not appear in any current provider's
+        // serialized entry — today's consumer output is byte-identical to before.
+        let entry = ProviderUsage::healthy(
+            "codex",
+            None,
+            "oauth",
+            Usage {
+                primary: Some(RateWindow {
+                    used_percent: 41.0,
+                    resets_at: "2026-06-22T13:44:39Z".to_string(),
+                    window_minutes: Some(300),
+                }),
+                ..Usage::default()
+            },
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("balance"), "balance must be omitted: {json}");
+    }
+
+    #[test]
+    fn balance_seam_round_trips_when_present() {
+        // When the future axis is populated it serializes camelCase and survives a
+        // round-trip — proving adding the balance axis later is non-breaking.
+        let balance = Balance {
+            remaining: 12.5,
+            total: Some(20.0),
+            unit: "USD".to_string(),
+            kind: BalanceKind::Currency,
+        };
+        let json = serde_json::to_string(&balance).unwrap();
+        assert!(json.contains("\"kind\":\"currency\""), "{json}");
+        let decoded: Balance = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, balance);
     }
 }
