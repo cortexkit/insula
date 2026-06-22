@@ -15,6 +15,7 @@ pub mod llmproxy;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
+pub mod synthetic;
 pub mod warp;
 
 use std::{
@@ -50,6 +51,7 @@ impl Registry {
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
+                Box::new(synthetic::SyntheticProvider::new()),
                 Box::new(warp::WarpProvider::new()),
             ],
             cache::DEFAULT_TTL,
