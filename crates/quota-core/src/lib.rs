@@ -16,6 +16,7 @@ pub mod gemini;
 pub mod http;
 pub mod kilo;
 pub mod llmproxy;
+pub mod minimax;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
@@ -62,6 +63,7 @@ impl Registry {
                 Box::new(synthetic::SyntheticProvider::new()),
                 Box::new(zai::ZaiProvider::new()),
                 Box::new(kilo::KiloProvider::new()),
+                Box::new(minimax::MinimaxProvider::new()),
                 Box::new(alibaba::AlibabaProvider::new()),
             ],
             cache::DEFAULT_TTL,
