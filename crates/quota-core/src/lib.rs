@@ -16,6 +16,7 @@ pub mod gemini;
 pub mod http;
 pub mod kilo;
 pub mod llmproxy;
+pub mod manus;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
@@ -63,6 +64,7 @@ impl Registry {
                 Box::new(zai::ZaiProvider::new()),
                 Box::new(kilo::KiloProvider::new()),
                 Box::new(alibaba::AlibabaProvider::new()),
+                Box::new(manus::ManusProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
