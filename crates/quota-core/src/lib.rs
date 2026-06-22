@@ -12,6 +12,7 @@ pub mod codex;
 pub mod copilot;
 pub mod elevenlabs;
 pub mod env;
+pub mod gemini;
 pub mod http;
 pub mod kilo;
 pub mod llmproxy;
@@ -55,6 +56,7 @@ impl Registry {
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(copilot::CopilotProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
+                Box::new(gemini::GeminiProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(warp::WarpProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),

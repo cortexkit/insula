@@ -18,6 +18,27 @@ use crate::provider::FetchError;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Percent-encode form pairs into an `application/x-www-form-urlencoded` body.
+fn encode_form(pairs: &[(&str, &str)]) -> String {
+    fn enc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// A header to attach to the request.
 pub struct Header {
     pub name: &'static str,
@@ -70,6 +91,21 @@ impl JsonRequest {
             headers: vec![
                 Header::new("Accept", "application/json"),
                 Header::new("Content-Type", "application/json"),
+            ],
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// A POST with an `application/x-www-form-urlencoded` body (e.g. an OAuth2
+    /// token refresh). `pairs` are percent-encoded into `k=v&k=v` form.
+    pub fn post_form(url: impl Into<String>, pairs: &[(&str, &str)]) -> Self {
+        let body = encode_form(pairs).into_bytes();
+        Self {
+            method: Method::Post(body),
+            url: url.into(),
+            headers: vec![
+                Header::new("Accept", "application/json"),
+                Header::new("Content-Type", "application/x-www-form-urlencoded"),
             ],
             timeout: DEFAULT_TIMEOUT,
         }
