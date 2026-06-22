@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::{
+    http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
@@ -120,35 +121,13 @@ impl UsageProvider for AnthropicProvider {
             OpencodeAuth::Api { key } => key,
         };
 
-        let response = self
-            .http
-            .get(USAGE_URL)
+        let body = JsonRequest::get(USAGE_URL)
             .timeout(REQUEST_TIMEOUT)
-            .header("Authorization", format!("Bearer {access}"))
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .header("anthropic-beta", BETA_HEADER)
-            .header("User-Agent", CLAUDE_CODE_UA)
-            .send()
-            .await
-            .map_err(|e| FetchError::Upstream(e.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| FetchError::Upstream(format!("reading body: {e}")))?;
-
-        if status == 401 || status == 403 {
-            return Err(FetchError::Unauthorized(format!(
-                "anthropic usage returned HTTP {status}"
-            )));
-        }
-        if !status.is_success() {
-            return Err(FetchError::Upstream(format!(
-                "anthropic usage returned HTTP {status}"
-            )));
-        }
+            .bearer(&access)
+            .header(Header::new("anthropic-beta", BETA_HEADER))
+            .header(Header::new("User-Agent", CLAUDE_CODE_UA))
+            .send(&self.http)
+            .await?;
 
         let usage = normalize_usage(&body)?;
         Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))

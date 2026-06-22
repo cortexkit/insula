@@ -74,8 +74,11 @@ Simplest HTTP archetype: API key from env (or opencode store) → GET → decode
 | warp | warp | `WARP_API_KEY`/`WARP_TOKEN` | POST app.warp.dev/graphql/v2 | request limit (nextRefreshTime) |
 | zai | zai | `Z_AI_API_KEY` | GET {base}/api/monitor/usage/quota/limit | token limits (nextResetTime + unit→minutes) |
 | kilo | kilo | `KILO_API_KEY` or `~/.local/share/kilo/auth.json` | GET app.kilo.ai/api/trpc/... | credits + pass reset |
+| alibaba | alibaba | `ALIBABA_CODING_PLAN_API_KEY` (or cookie) | POST {host}/data/api.json | 5h + weekly + monthly |
 Notes: warp needs `x-warp-client-id` + UA spoof; zai is multi-region; crof
-fabricates resetsAt locally; kilo straddles Group 5 (env OR auth-file).
+fabricates resetsAt locally; kilo straddles Group 5 (env OR auth-file). alibaba
+has an api-key path (Group 2) and a console-cookie path (Group 3) — port the
+api-key path; its console mode needs a `sec_token` scraped from HTML.
 
 ### Group 3 — web-session / browser-cookie, HAS WINDOW
 Session from browser cookies (macOS-only import) or a login flow → web backend.
@@ -95,6 +98,7 @@ or speak protobuf. Lower priority unless the provider matters to Alfonso.
 | stepfun | stepfun | login flow (user/pass) → Oasis-Token | POST platform.stepfun.com/.../QueryStepPlanRateLimit | 5h + weekly |
 | windsurf | windsurf | browser local-storage / SQLite `state.vscdb` | POST windsurf.com/_backend/.../GetPlanStatus (protobuf) | daily + weekly |
 | doubao | doubao | `ARK_API_KEY`/`DOUBAO_API_KEY` | POST ark...volces.com/.../chat/completions (probe) | from response rate-limit headers |
+| amp | amp | browser cookie (ampcode.com) | GET ampcode.com/settings (HTML scrape) | freeTierUsage quota + windowHours |
 Notes: opencode/opencodego — for OUR ecosystem these likely become opencode-store
 bearer reads (Group 1-style), NOT cookie scrapes; flag for design. windsurf is
 protobuf-over-Connect. stepfun's login flow is the heaviest (device register +
@@ -133,7 +137,6 @@ Don't fit RateWindow. Lowest priority; emit degraded or a future credits signal.
 | commandcode | commandcode | credits (cookie) |
 | mistral | mistral | cost (cookie, admin.mistral.ai) |
 | perplexity | perplexity | credits (cookie) |
-| alibaba | alibaba | HAS WINDOW actually (5h/weekly/monthly) — move to Group 2/3; api-key OR cookie |
 
 ---
 

@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::{
+    http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
@@ -113,7 +114,7 @@ struct WindowSnapshot {
 fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
     let used_percent = snapshot.used_percent?;
     let reset_at = snapshot.reset_at?;
-    let resets_at = epoch_to_iso8601(reset_at)?;
+    let resets_at = crate::env::epoch_to_iso8601(reset_at)?;
     let window_minutes = snapshot
         .limit_window_seconds
         .filter(|s| *s > 0)
@@ -123,16 +124,6 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         resets_at,
         window_minutes,
     })
-}
-
-/// Convert epoch seconds to an RFC 3339 / ISO 8601 UTC string (`...Z`), matching
-/// what `Date.parse` on the consumer expects.
-fn epoch_to_iso8601(epoch_secs: i64) -> Option<String> {
-    use chrono::{TimeZone, Utc};
-    match Utc.timestamp_opt(epoch_secs, 0) {
-        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        _ => None,
-    }
 }
 
 /// Normalize a full `/wham/usage` JSON body to [`Usage`]. Pure — no I/O — so it
@@ -245,39 +236,15 @@ impl UsageProvider for CodexProvider {
         let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
         let url = resolve_usage_url(config_toml.as_deref());
 
-        let mut request = self
-            .http
-            .get(&url)
+        let mut request = JsonRequest::get(url)
             .timeout(REQUEST_TIMEOUT)
-            .header("Authorization", format!("Bearer {}", creds.bearer))
-            .header("User-Agent", "ai-provider-quota")
-            .header("Accept", "application/json");
+            .bearer(&creds.bearer)
+            .header(Header::new("User-Agent", "ai-provider-quota"));
         if let Some(account_id) = &creds.account_id {
-            request = request.header("ChatGPT-Account-Id", account_id);
+            request = request.header(Header::new("ChatGPT-Account-Id", account_id.clone()));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| FetchError::Upstream(e.to_string()))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| FetchError::Upstream(format!("reading body: {e}")))?;
-
-        if status == 401 || status == 403 {
-            return Err(FetchError::Unauthorized(format!(
-                "codex usage returned HTTP {status}"
-            )));
-        }
-        if !status.is_success() {
-            return Err(FetchError::Upstream(format!(
-                "codex usage returned HTTP {status}: {}",
-                String::from_utf8_lossy(&body).chars().take(200).collect::<String>()
-            )));
-        }
-
+        let body = request.send(&self.http).await?;
         let usage = normalize_usage(&body)?;
         let source = if creds.is_oauth { "oauth" } else { "api" };
         Ok(ProviderUsage::healthy(

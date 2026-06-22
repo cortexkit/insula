@@ -1,0 +1,130 @@
+//! Shared HTTP helper for usage fetchers.
+//!
+//! Almost every window-bearing provider is "attach a credential header → GET (or
+//! POST) one URL → decode JSON", with identical error mapping: 401/403 →
+//! `Unauthorized`, any other non-2xx → `Upstream`, transport failure → `Upstream`.
+//! Centralizing that here keeps each provider fetcher to its real work — auth
+//! source + endpoint + window normalization — and keeps the error→FetchError
+//! mapping uniform so silent-degrade behaves identically across providers.
+//!
+//! It deliberately returns the raw response BYTES rather than a decoded type: the
+//! per-provider normalizer owns decoding (its own response shape), and keeping the
+//! bytes makes those normalizers unit-testable against recorded real payloads
+//! without going through this module.
+
+use std::time::Duration;
+
+use crate::provider::FetchError;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A header to attach to the request.
+pub struct Header {
+    pub name: &'static str,
+    pub value: String,
+}
+
+impl Header {
+    pub fn new(name: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            name,
+            value: value.into(),
+        }
+    }
+
+    /// `Authorization: Bearer <token>`.
+    pub fn bearer(token: &str) -> Self {
+        Self::new("Authorization", format!("Bearer {token}"))
+    }
+}
+
+/// A small request spec the helper executes and maps to [`FetchError`].
+pub struct JsonRequest {
+    method: Method,
+    url: String,
+    headers: Vec<Header>,
+    timeout: Duration,
+}
+
+enum Method {
+    Get,
+    Post(Vec<u8>),
+}
+
+impl JsonRequest {
+    /// A GET that accepts JSON.
+    pub fn get(url: impl Into<String>) -> Self {
+        Self {
+            method: Method::Get,
+            url: url.into(),
+            headers: vec![Header::new("Accept", "application/json")],
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// A POST with a JSON body.
+    pub fn post_json(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: Method::Post(body),
+            url: url.into(),
+            headers: vec![
+                Header::new("Accept", "application/json"),
+                Header::new("Content-Type", "application/json"),
+            ],
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// Attach `Authorization: Bearer <token>`.
+    pub fn bearer(self, token: &str) -> Self {
+        self.header(Header::bearer(token))
+    }
+
+    /// Attach an arbitrary header.
+    pub fn header(mut self, header: Header) -> Self {
+        self.headers.push(header);
+        self
+    }
+
+    /// Override the default 30s timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Execute the request and return the response body bytes on 2xx.
+    ///
+    /// Error mapping (uniform silent-degrade contract):
+    /// - 401/403 → [`FetchError::Unauthorized`]
+    /// - other non-2xx → [`FetchError::Upstream`] (with a short body excerpt)
+    /// - transport/timeout → [`FetchError::Upstream`]
+    pub async fn send(self, client: &reqwest::Client) -> Result<Vec<u8>, FetchError> {
+        let mut builder = match &self.method {
+            Method::Get => client.get(&self.url),
+            Method::Post(body) => client.post(&self.url).body(body.clone()),
+        }
+        .timeout(self.timeout);
+        for header in &self.headers {
+            builder = builder.header(header.name, &header.value);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| FetchError::Upstream(e.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| FetchError::Upstream(format!("reading body: {e}")))?;
+
+        if status == 401 || status == 403 {
+            return Err(FetchError::Unauthorized(format!("HTTP {status}")));
+        }
+        if !status.is_success() {
+            let excerpt: String = String::from_utf8_lossy(&body).chars().take(200).collect();
+            return Err(FetchError::Upstream(format!("HTTP {status}: {excerpt}")));
+        }
+        Ok(body.to_vec())
+    }
+}
