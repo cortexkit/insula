@@ -212,9 +212,9 @@ protobuf decoding of the billing Timestamps, not JSON.
 | provider | cb_id | session source | endpoint | window |
 |---|---|---|---|---|
 | **grok** ✅ | grok | opencode `xai` OAuth (LIVE-VERIFIED) | POST grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (grpc-web+proto) | monthly (billingPeriodEnd) — DONE, commit ed302a5 |
-| jetbrains | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — HAS WINDOW |
-| kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL |
-| codebuff | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage | weekly (subscription) — PARTIAL |
+| **jetbrains** ✅ | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — DONE, commit cb31db2 (hybrid-verified) |
+| kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL (not in v1) |
+| **codebuff** ✅ | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage + GET /api/user/subscription | weekly (subscription) — DONE, commit 7a3f4c9 |
 
 ### Group 6 — the former "NO WINDOW" set, re-categorized (ALF ruling)
 
