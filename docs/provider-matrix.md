@@ -112,6 +112,36 @@ OmniRoute, + a live ollama probe) because for G3 the gating question is the
 antigravity one: can a headless server even OBTAIN the credential, or does it only
 exist after an interactive desktop/browser login? Three buckets:
 
+**WINDSURF — DEFERRED (Ufuk's "no stale-window-as-live" bar).** It is
+headless-SOURCEABLE (reads the editor's own native SQLite `state.vscdb` →
+`windsurf.settings.cachedPlanInfo`, with real `dailyResetAtUnix`/`weeklyResetAtUnix`),
+but it is fundamentally a DIFFERENT KIND of signal: an editor CACHE, not a live
+fetch. The deciding problem is "consumed AS-LIVE" — any window we emit is used by
+Alfonso's router identically to a live-fetched one (source is observability-only;
+the router does not discount on it), yet windsurf's value can be hours-to-days stale
+and we CANNOT measure how stale:
+- No per-key write-timestamp exists in the cache; `state.vscdb` mtime is the
+  shared-DB last-write of ANY VSCode key, reliable only as "file ancient ⇒ drop",
+  never as freshness proof.
+- A designed staleness guard (KEEP for a future revisit — it's correct and reusable):
+  (a) drop a window whose STORED `*ResetAtUnix` is already in the past (period rolled
+  over since cache write — exact, no mtime needed); (b) bound cache-age to the window
+  length (daily ≤24h, weekly ≤7d) via mtime. This is the tightest bound the data
+  supports — but ≤24h on a daily window still means reporting this-morning's 0% as
+  current after the user burned 90%, indistinguishable-to-the-consumer from a live
+  ±60s value. Every other v1 provider is live (within the 60s TTL); windsurf would be
+  the lone silently-stale-as-live outlier = the misleading-metric case the user
+  rules out, for one provider.
+UNBLOCK CONDITIONS (revisit precisely when any lands): (1) windsurf exposes a real
+headless USAGE FETCH endpoint (live value) → builds like any live provider; (2) the
+cache grows a per-key write-timestamp → staleness becomes measurable; (3) we add a
+staleness/confidence field to `ProviderUsage` that the router discounts on (ALF's-
+call model+consumer change, same shape as the balance seam) → the reset-guarded
+design above becomes shippable as-is. Note for a future build: SET
+windowMinutes=daily 1440/weekly 10080 (derivable-and-correct from the field names,
+and the consumer needs the burn-rate denominator) — confirmed not a faithfulness
+violation.
+
 **3A — HEADLESS-SOURCEABLE (api-key-env / native token) → BUILD (these are really
 api-key providers mis-filed as cookie):**
 | provider | cb_id | session source | endpoint | window |
@@ -120,7 +150,7 @@ api-key providers mis-filed as cookie):**
 | doubao | doubao | `ARK_API_KEY`/`VOLCENGINE_API_KEY`/`DOUBAO_API_KEY` bearer | POST ark...volces.com (probe) | `x-ratelimit-reset-requests` header (ISO/duration/sec) |
 | kimi | kimi | `KIMI_AUTH_TOKEN` env (else cookie) | POST kimi.com/apiv2/.../GetUsages | weekly + 5h (`resetTime`) |
 | stepfun | stepfun | `STEPFUN_TOKEN` env (else user/pass login flow) | POST platform.stepfun.com/.../QueryStepPlanRateLimit | 5h + weekly (Unix-sec) |
-| windsurf | windsurf | native SQLite `state.vscdb` (the Windsurf EDITOR writes it) | local read of `windsurf.settings.cachedPlanInfo` | daily + weekly (`*ResetAtUnix`) |
+| ~~windsurf~~ DEFERRED | windsurf | native SQLite `state.vscdb` (editor cache) | local read of `windsurf.settings.cachedPlanInfo` | daily + weekly (`*ResetAtUnix`) — see defer below |
 Notes: minimax/doubao/kimi belong with Group 2 (api-key-env bearer) — minimax has
 real epoch windows, doubao reuses synthetic's duration-string parser, kimi-official
 has a real resetTime (NOT KimiK2, which is the deferred credits-only one). stepfun
@@ -181,7 +211,7 @@ here (unlike ollama). The response is protobuf (grpc-web), so grok needs minimal
 protobuf decoding of the billing Timestamps, not JSON.
 | provider | cb_id | session source | endpoint | window |
 |---|---|---|---|---|
-| grok | grok | opencode `xai` OAuth (LIVE-PROVEN) / `~/.grok/auth.json` | POST grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (grpc-web+proto) | monthly (billingPeriodEnd) — HAS WINDOW, LIVE-ANCHORABLE |
+| **grok** ✅ | grok | opencode `xai` OAuth (LIVE-VERIFIED) | POST grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (grpc-web+proto) | monthly (billingPeriodEnd) — DONE, commit ed302a5 |
 | jetbrains | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — HAS WINDOW |
 | kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL |
 | codebuff | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage | weekly (subscription) — PARTIAL |
