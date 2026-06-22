@@ -5,15 +5,81 @@ windows — the headless engine that replaces the external **CodexBar** dependen
 
 Alfonso's model router needs to know how much quota each provider has left and when
 each window resets, so it can route around exhaustion (the "provider is in a quota
-cooldown" decisions). Today Alfonso polls a running `codexbar serve --port 8087`
-binary for this. This module replicates that capability natively and serves it
-**through subc** — so Alfonso connects to subc (not an external binary) for its
-quota signal.
+cooldown" decisions). This module fetches each provider's usage by reusing the
+user's OWN existing session (OAuth token, API key, local CLI file), normalizes it to
+a uniform `ProviderUsage[]` shape, and serves it **through subc** — so Alfonso
+connects to subc (not an external binary) for its quota signal.
 
-See `docs/charter.md` for the full mission, the reverse-engineered contracts, the
-locked decisions, the multi-repo split, and the Phase 0 charter.
+See `docs/charter.md` for the mission and reverse-engineered contracts, and
+`docs/provider-matrix.md` for the full per-provider archetype/verification matrix.
 
-## Status
+## What it serves
 
-Greenfield. Owning agent makes the first commit (this scaffold is uncommitted so the
-module's history is yours from line one).
+A subc `ManagementSurface` exposing one query operation, `usage.get`, which returns
+`{ "result": ProviderUsage[] }`. Each entry is one provider/account's windows
+(`primary`/`secondary`/`tertiary` `RateWindow`s with `usedPercent` + `resetsAt`), or
+a silent-degraded entry carrying `error` when that provider has no usable session —
+a single provider's failure never fails the whole array.
+
+## Providers (v1: window-bearing)
+
+19 providers are registered, each fetching a real rate/usage window:
+
+`codex`, `claude`, `copilot`, `gemini`, `grok`, `jetbrains`, `doubao`, `elevenlabs`,
+`kimi`, `llmproxy`, `manus`, `minimax`, `stepfun`, `warp`, `synthetic`, `zai`,
+`kilo`, `alibaba`, `codebuff`.
+
+Verification (see each module's `VERIFICATION:` doc block):
+- **Live-verified** (real window proven through the wire): codex, claude, gemini, grok.
+- **Hybrid**: jetbrains (file-read/parse/degrade proven on real disk; active-window
+  mapping fixture-verified).
+- **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
+  upgraded to live when a key is supplied): the rest.
+
+Providers that produce no real reset window (prepaid balances, fabricated resets,
+desktop-only browser-cookie sources) are deferred with rationale in
+`docs/provider-matrix.md`.
+
+## Build
+
+```sh
+cargo build --release            # builds quota-core + the quota-module binary
+cargo test -p quota-core         # provider normalizers (unit)
+cargo test -p quota-module       # in-process wire e2e (skeleton_e2e)
+```
+
+Live and real-daemon proofs are `#[ignore]` (need real sessions / a built
+`subc-core`):
+
+```sh
+# real provider windows through the wire (needs the provider's real session):
+cargo test -p quota-core --test gemini_live    -- --ignored --nocapture
+cargo test -p quota-core --test grok_live      -- --ignored --nocapture
+cargo test -p quota-module --test skeleton_e2e -- --ignored --nocapture
+
+# real-daemon supervision: a standalone subc-core spawns the module from subc.jsonc
+# and routes usage.get (builds subc-core in ../subconscious):
+cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture
+```
+
+## Install as a supervised subc module
+
+The subc daemon (`subc-core`) spawns and supervises modules listed in its config at
+`$XDG_CONFIG_HOME/cortexkit/subc.jsonc` (`~/.config/cortexkit/subc.jsonc`). Add an
+entry pointing `program` at the built binary — see `examples/subc.jsonc`:
+
+```jsonc
+{
+  "version": 1,
+  "modules": {
+    "ai-provider-quota": {
+      "program": "/abs/path/to/target/release/quota-module"
+    }
+  }
+}
+```
+
+`args`/`env`/`enabled` are optional. The daemon appends `--subc <connection-file>`
+and injects `SUBC_MODULE_ID` itself — do **not** put those in `args`/`env`. On its
+next start the daemon spawns the module, which HELLO-registers its ManagementSurface;
+a consumer then reaches it via `catalog.list` → `route.open` → `usage.get`.
