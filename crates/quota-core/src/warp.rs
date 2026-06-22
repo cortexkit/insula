@@ -11,11 +11,15 @@
 //! used and no reset. No fixed window length is reported (`windowMinutes` omitted).
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
-//! `WARP_API_KEY` available. Endpoint, the client-UA/x-warp-client-id headers, the
-//! GraphQL query, and the `data.user.user.requestLimitInfo.{isUnlimited,
-//! requestLimit, requestsUsedSinceLastRefresh, nextRefreshTime}` response shape are
-//! ported from CodexBar (`Providers/Warp/WarpUsageFetcher.swift:132-205, 259-290`
-//! and `WarpUsageFetcher.swift:42-60`). Rides the live-proven `http.rs`.
+//! `WARP_API_KEY` available. Endpoint, the client-UA/x-warp-client-id/x-warp-os-*
+//! headers, the populated osContext, the GraphQL query, and the
+//! `data.user.user.requestLimitInfo.{isUnlimited, requestLimit,
+//! requestsUsedSinceLastRefresh, nextRefreshTime}` response shape are ported from
+//! CodexBar (`Providers/Warp/WarpUsageFetcher.swift:132-205, 259-290` and
+//! `WarpUsageFetcher.swift:42-60`). Because this is fixture-only, the request
+//! construction reproduces CodexBar's FULL client fingerprint faithfully (we can't
+//! live-verify which parts the edge limiter requires, so we drop nothing). Rides
+//! the live-proven `http.rs`.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -33,6 +37,15 @@ const API_KEY_ENV: &[&str] = &["WARP_API_KEY", "WARP_TOKEN"];
 const API_URL: &str = "https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo";
 const CLIENT_ID: &str = "warp-app";
 const USER_AGENT: &str = "Warp/1.0";
+// Warp's edge limiter 429s a request unless it carries the official client's
+// fingerprint: the client id, UA, AND the os-context headers + body fields below.
+// We reproduce CodexBar's known-good fingerprint verbatim (it is what passes the
+// limiter). The os-category/name match CodexBar's macOS client; the version value
+// is not checked for an exact match (presence/shape is), so a static value is
+// fine — but the fields must be present.
+const OS_CATEGORY: &str = "macOS";
+const OS_NAME: &str = "macOS";
+const OS_VERSION: &str = "1.0.0";
 
 const GRAPHQL_QUERY: &str = "query GetRequestLimitInfo($requestContext: RequestContext!) { \
 user(requestContext: $requestContext) { __typename ... on UserOutput { user { \
@@ -133,16 +146,25 @@ impl UsageProvider for WarpProvider {
         let api_key = env::first_env(API_KEY_ENV)
             .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
+        // Reproduce CodexBar's request construction faithfully: a populated
+        // osContext in the variables AND the matching x-warp-os-* headers, both
+        // part of the client fingerprint the edge limiter checks.
         let body = json!({
             "query": GRAPHQL_QUERY,
             "operationName": "GetRequestLimitInfo",
-            "variables": { "requestContext": { "clientContext": {}, "osContext": {} } },
+            "variables": { "requestContext": {
+                "clientContext": {},
+                "osContext": { "category": OS_CATEGORY, "name": OS_NAME, "version": OS_VERSION },
+            } },
         });
         let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
 
         let response = JsonRequest::post_json(API_URL, body)
             .bearer(&api_key)
             .header(Header::new("x-warp-client-id", CLIENT_ID))
+            .header(Header::new("x-warp-os-category", OS_CATEGORY))
+            .header(Header::new("x-warp-os-name", OS_NAME))
+            .header(Header::new("x-warp-os-version", OS_VERSION))
             .header(Header::new("User-Agent", USER_AGENT))
             .send(&self.http)
             .await?;
