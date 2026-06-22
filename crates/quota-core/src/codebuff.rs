@@ -34,7 +34,7 @@ use serde_json::json;
 
 use crate::{
     env,
-    http::{Header, JsonRequest},
+    http::JsonRequest,
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };

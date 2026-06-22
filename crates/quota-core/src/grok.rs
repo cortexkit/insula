@@ -184,7 +184,7 @@ fn grpc_web_frames(data: &[u8]) -> (Vec<Vec<u8>>, String) {
 
 /// `grpc-status` from a trailer block; `Some(0)` is success, non-zero an RPC error.
 fn grpc_status(trailer: &str) -> Option<i64> {
-    for line in trailer.split(|c| c == '\r' || c == '\n') {
+    for line in trailer.split(['\r', '\n']) {
         let line = line.trim();
         if let Some(rest) = line.to_ascii_lowercase().strip_prefix("grpc-status:") {
             return rest.trim().parse().ok();
