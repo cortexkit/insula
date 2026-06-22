@@ -11,9 +11,11 @@ pub mod codex;
 pub mod elevenlabs;
 pub mod env;
 pub mod http;
+pub mod llmproxy;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
+pub mod warp;
 
 use std::{
     sync::Mutex,
@@ -47,6 +49,8 @@ impl Registry {
                 Box::new(codex::CodexProvider::new()),
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
+                Box::new(llmproxy::LlmProxyProvider::new()),
+                Box::new(warp::WarpProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )

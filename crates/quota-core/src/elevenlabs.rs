@@ -10,6 +10,14 @@
 //! account-wide usage window resetting at `next_character_count_reset_unix`
 //! (epoch seconds). ElevenLabs does not report a fixed window length, so
 //! `windowMinutes` is omitted and the consumer paces on utilization alone.
+//!
+//! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
+//! `ELEVENLABS_API_KEY` was available to fetch a real window. The endpoint, the
+//! `xi-api-key` header, and the `character_count/character_limit/
+//! next_character_count_reset_unix` response shape are ported from CodexBar's
+//! working parser (`Providers/ElevenLabs/ElevenLabsUsageFetcher.swift:24-33,
+//! 192-238`); the test payload mirrors that shape. The shared HTTP transport it
+//! rides (`http.rs`) is itself live-proven via codex + anthropic.
 
 use async_trait::async_trait;
 use serde::Deserialize;
