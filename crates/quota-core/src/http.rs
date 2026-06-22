@@ -45,10 +45,11 @@ pub struct Header {
     pub value: String,
 }
 
-/// A 2xx response exposing its headers alongside the body, for the few providers
-/// whose window signal lives in RESPONSE HEADERS (e.g. `x-ratelimit-reset-*`)
+/// A response exposing its status + headers alongside the body, for the few
+/// providers whose window signal lives in RESPONSE HEADERS (e.g. `x-ratelimit-reset-*`)
 /// rather than the JSON body. Most providers use [`JsonRequest::send`] (body only).
 pub struct HttpResponse {
+    pub status: u16,
     headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -156,11 +157,27 @@ impl JsonRequest {
         Ok(self.send_full(client).await?.body)
     }
 
-    /// Like [`send`](Self::send) but also returns the response headers, for
-    /// providers whose window lives in a header (e.g. `x-ratelimit-reset-*`).
-    /// Same uniform error mapping (401/403 → Unauthorized, other non-2xx →
-    /// Upstream, transport/timeout → Upstream).
+    /// Like [`send`](Self::send) but also returns the response status + headers
+    /// (2xx only), for providers whose window lives in a header (e.g.
+    /// `x-ratelimit-reset-*`). Same uniform error mapping as [`send`](Self::send).
     pub async fn send_full(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
+        let raw = self.send_raw(client).await?;
+        if raw.status == 401 || raw.status == 403 {
+            return Err(FetchError::Unauthorized(format!("HTTP {}", raw.status)));
+        }
+        if !(200..300).contains(&raw.status) {
+            let excerpt: String = String::from_utf8_lossy(&raw.body).chars().take(200).collect();
+            return Err(FetchError::Upstream(format!("HTTP {}: {excerpt}", raw.status)));
+        }
+        Ok(raw)
+    }
+
+    /// Execute the request and return the raw status + headers + body with NO
+    /// status-based error mapping (only transport/timeout → `Upstream`). For the
+    /// rare provider whose status semantics are bespoke — e.g. doubao must read
+    /// rate-limit headers off BOTH 200 AND 429 — so it owns the status policy while
+    /// still riding this shared transport instead of hand-rolling `reqwest`.
+    pub async fn send_raw(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
             Method::Post(body) => client.post(&self.url).body(body.clone()),
@@ -174,7 +191,7 @@ impl JsonRequest {
             .send()
             .await
             .map_err(|e| FetchError::Upstream(e.to_string()))?;
-        let status = response.status();
+        let status = response.status().as_u16();
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
@@ -185,14 +202,8 @@ impl JsonRequest {
             .await
             .map_err(|e| FetchError::Upstream(format!("reading body: {e}")))?;
 
-        if status == 401 || status == 403 {
-            return Err(FetchError::Unauthorized(format!("HTTP {status}")));
-        }
-        if !status.is_success() {
-            let excerpt: String = String::from_utf8_lossy(&body).chars().take(200).collect();
-            return Err(FetchError::Upstream(format!("HTTP {status}: {excerpt}")));
-        }
         Ok(HttpResponse {
+            status,
             headers,
             body: body.to_vec(),
         })

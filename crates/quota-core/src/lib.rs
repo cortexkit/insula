@@ -10,15 +10,20 @@ pub mod anthropic;
 pub mod cache;
 pub mod codex;
 pub mod copilot;
+pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
 pub mod gemini;
 pub mod http;
 pub mod kilo;
+pub mod kimi;
 pub mod llmproxy;
+pub mod manus;
+pub mod minimax;
 pub mod model;
 pub mod opencode_auth;
 pub mod provider;
+pub mod stepfun;
 pub mod synthetic;
 pub mod warp;
 pub mod zai;
@@ -55,9 +60,14 @@ impl Registry {
                 Box::new(codex::CodexProvider::new()),
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(copilot::CopilotProvider::new()),
+                Box::new(doubao::DoubaoProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(gemini::GeminiProvider::new()),
+                Box::new(kimi::KimiProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
+                Box::new(manus::ManusProvider::new()),
+                Box::new(minimax::MinimaxProvider::new()),
+                Box::new(stepfun::StepFunProvider::new()),
                 Box::new(warp::WarpProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),
                 Box::new(zai::ZaiProvider::new()),
