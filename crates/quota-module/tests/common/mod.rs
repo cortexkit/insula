@@ -17,7 +17,7 @@ use std::{
 
 use serde_json::Value;
 use subc_core::{read_frame, write_frame, Frame};
-use subc_protocol::{session::ConfigTier, BindIdentity, Flags, FrameType, Priority, RouteTarget};
+use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
     net::TcpStream,
@@ -123,12 +123,10 @@ fn json_route_open(project_root: &Path) -> Value {
         harness: "quota-e2e".to_string(),
         session: "session-1".to_string(),
     };
-    let config: Vec<ConfigTier> = Vec::new();
     serde_json::json!({
         "op": "route.open",
         "target": target,
         "identity": identity,
-        "config": config,
     })
 }
 

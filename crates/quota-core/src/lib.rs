@@ -7,6 +7,7 @@
 
 pub mod alibaba;
 pub mod anthropic;
+pub mod browser_cookies;
 pub mod cache;
 pub mod codebuff;
 pub mod codex;
@@ -24,6 +25,7 @@ pub mod llmproxy;
 pub mod manus;
 pub mod minimax;
 pub mod model;
+pub mod ollama;
 pub mod opencode_auth;
 pub mod provider;
 pub mod stepfun;
@@ -73,6 +75,7 @@ impl Registry {
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(manus::ManusProvider::new()),
                 Box::new(minimax::MinimaxProvider::new()),
+                Box::new(ollama::OllamaProvider::new()),
                 Box::new(stepfun::StepFunProvider::new()),
                 Box::new(warp::WarpProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),

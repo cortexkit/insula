@@ -11,6 +11,7 @@ bun.lockb
 # Agent tooling
 .alfonso
 .opencode
+.cortexkit
 _bmad-output
 .bmad
 
