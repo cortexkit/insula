@@ -12,6 +12,7 @@ pub mod cache;
 pub mod codebuff;
 pub mod codex;
 pub mod copilot;
+pub mod cursor;
 pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
@@ -66,6 +67,7 @@ impl Registry {
                 Box::new(anthropic::AnthropicProvider::new()),
                 Box::new(codebuff::CodebuffProvider::new()),
                 Box::new(copilot::CopilotProvider::new()),
+                Box::new(cursor::CursorProvider::new()),
                 Box::new(doubao::DoubaoProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
                 Box::new(gemini::GeminiProvider::new()),
