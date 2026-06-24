@@ -6,6 +6,7 @@
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
 pub mod alibaba;
+pub mod amp;
 pub mod anthropic;
 pub mod browser_cookies;
 pub mod cache;
@@ -82,6 +83,7 @@ impl Registry {
                 Box::new(zai::ZaiProvider::new()),
                 Box::new(kilo::KiloProvider::new()),
                 Box::new(alibaba::AlibabaProvider::new()),
+                Box::new(amp::AmpProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
