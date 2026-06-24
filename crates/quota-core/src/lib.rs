@@ -15,6 +15,7 @@ pub mod copilot;
 pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
+pub mod factory;
 pub mod gemini;
 pub mod grok;
 pub mod http;
@@ -68,6 +69,7 @@ impl Registry {
                 Box::new(copilot::CopilotProvider::new()),
                 Box::new(doubao::DoubaoProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
+                Box::new(factory::FactoryProvider::new()),
                 Box::new(gemini::GeminiProvider::new()),
                 Box::new(grok::GrokProvider::new()),
                 Box::new(jetbrains::JetBrainsProvider::new()),
