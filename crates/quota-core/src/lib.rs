@@ -26,7 +26,9 @@ pub mod manus;
 pub mod minimax;
 pub mod model;
 pub mod ollama;
+pub mod opencode;
 pub mod opencode_auth;
+pub mod opencodego;
 pub mod provider;
 pub mod stepfun;
 pub mod synthetic;
@@ -76,6 +78,8 @@ impl Registry {
                 Box::new(manus::ManusProvider::new()),
                 Box::new(minimax::MinimaxProvider::new()),
                 Box::new(ollama::OllamaProvider::new()),
+                Box::new(opencode::OpenCodeProvider::new()),
+                Box::new(opencodego::OpenCodeGoProvider::new()),
                 Box::new(stepfun::StepFunProvider::new()),
                 Box::new(warp::WarpProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),
