@@ -6,15 +6,19 @@
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
 pub mod alibaba;
+pub mod amp;
 pub mod anthropic;
+pub mod antigravity;
 pub mod browser_cookies;
 pub mod cache;
 pub mod codebuff;
 pub mod codex;
 pub mod copilot;
+pub mod cursor;
 pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
+pub mod factory;
 pub mod gemini;
 pub mod grok;
 pub mod http;
@@ -23,10 +27,13 @@ pub mod kilo;
 pub mod kimi;
 pub mod llmproxy;
 pub mod manus;
+pub mod mimo;
 pub mod minimax;
 pub mod model;
 pub mod ollama;
+pub mod opencode;
 pub mod opencode_auth;
+pub mod opencodego;
 pub mod provider;
 pub mod stepfun;
 pub mod synthetic;
@@ -64,24 +71,31 @@ impl Registry {
             vec![
                 Box::new(codex::CodexProvider::new()),
                 Box::new(anthropic::AnthropicProvider::new()),
+                Box::new(antigravity::AntigravityProvider::new()),
                 Box::new(codebuff::CodebuffProvider::new()),
                 Box::new(copilot::CopilotProvider::new()),
+                Box::new(cursor::CursorProvider::new()),
                 Box::new(doubao::DoubaoProvider::new()),
                 Box::new(elevenlabs::ElevenLabsProvider::new()),
+                Box::new(factory::FactoryProvider::new()),
                 Box::new(gemini::GeminiProvider::new()),
                 Box::new(grok::GrokProvider::new()),
                 Box::new(jetbrains::JetBrainsProvider::new()),
                 Box::new(kimi::KimiProvider::new()),
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(manus::ManusProvider::new()),
+                Box::new(mimo::MimoProvider::new()),
                 Box::new(minimax::MinimaxProvider::new()),
                 Box::new(ollama::OllamaProvider::new()),
+                Box::new(opencode::OpenCodeProvider::new()),
+                Box::new(opencodego::OpenCodeGoProvider::new()),
                 Box::new(stepfun::StepFunProvider::new()),
                 Box::new(warp::WarpProvider::new()),
                 Box::new(synthetic::SyntheticProvider::new()),
                 Box::new(zai::ZaiProvider::new()),
                 Box::new(kilo::KiloProvider::new()),
                 Box::new(alibaba::AlibabaProvider::new()),
+                Box::new(amp::AmpProvider::new()),
             ],
             cache::DEFAULT_TTL,
         )
