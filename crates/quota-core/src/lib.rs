@@ -24,6 +24,7 @@ pub mod kimi;
 pub mod llmproxy;
 pub mod manus;
 pub mod minimax;
+pub mod mimo;
 pub mod model;
 pub mod ollama;
 pub mod opencode_auth;
@@ -75,6 +76,7 @@ impl Registry {
                 Box::new(llmproxy::LlmProxyProvider::new()),
                 Box::new(manus::ManusProvider::new()),
                 Box::new(minimax::MinimaxProvider::new()),
+                Box::new(mimo::MimoProvider::new()),
                 Box::new(ollama::OllamaProvider::new()),
                 Box::new(stepfun::StepFunProvider::new()),
                 Box::new(warp::WarpProvider::new()),
