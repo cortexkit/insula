@@ -70,7 +70,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 .and_then(env::epoch_to_iso8601);
             resets_at.map(|resets_at| RateWindow {
                 used_percent,
-                resets_at,
+                resets_at: Some(resets_at),
                 window_minutes: None,
             })
         }
@@ -143,7 +143,7 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         assert_eq!(primary.window_minutes, None);
         assert!(usage.secondary.is_none());
     }

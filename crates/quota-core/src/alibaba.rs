@@ -213,7 +213,7 @@ fn window_from_used_total_reset(
     let resets_at = any_date(reset_keys, quota)?;
     Some(RateWindow {
         used_percent: (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
 }
@@ -469,11 +469,11 @@ mod tests {
         let usage = normalize_usage(payload.to_string().as_bytes()).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 20.0);
-        assert_eq!(secondary.resets_at, "2026-07-01T00:00:00Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 20.0);

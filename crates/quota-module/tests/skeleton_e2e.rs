@@ -288,12 +288,22 @@ async fn skeleton_returns_real_anthropic_window() {
         primary["usedPercent"].is_number(),
         "primary.usedPercent must be a real number: {claude}"
     );
+    // CodexBar-faithful: the five-hour primary may be an idle 0%-used window with
+    // no reset (Anthropic reports resets_at: null when nothing is pending), in
+    // which case resetsAt is omitted — never fabricated. So accept present-string
+    // OR absent here, and prove a REAL ISO reset flows through on the active
+    // weekly window (secondary) so the live-window proof stays meaningful.
     assert!(
-        primary["resetsAt"].is_string(),
-        "primary.resetsAt must be an ISO timestamp: {claude}"
+        primary["resetsAt"].is_string() || primary["resetsAt"].is_null(),
+        "primary.resetsAt must be an ISO timestamp or omitted (idle window): {claude}"
+    );
+    let secondary = &claude["usage"]["secondary"];
+    assert!(
+        secondary["usedPercent"].is_number() && secondary["resetsAt"].is_string(),
+        "the active weekly window must carry a real percent + ISO reset: {claude}"
     );
     eprintln!(
-        "[skeleton] REAL claude window: usedPercent={} resetsAt={} windowMinutes={}",
-        primary["usedPercent"], primary["resetsAt"], primary["windowMinutes"]
+        "[skeleton] REAL claude windows: primary usedPercent={} resetsAt={} | secondary usedPercent={} resetsAt={}",
+        primary["usedPercent"], primary["resetsAt"], secondary["usedPercent"], secondary["resetsAt"]
     );
 }

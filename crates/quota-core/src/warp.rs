@@ -104,7 +104,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         let resets_at = info.next_refresh_time?;
         Some(RateWindow {
             used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
-            resets_at,
+            resets_at: Some(resets_at),
             window_minutes: None,
         })
     });
@@ -194,7 +194,7 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
-        assert_eq!(primary.resets_at, "2026-07-01T00:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
         assert_eq!(primary.window_minutes, None);
     }
 

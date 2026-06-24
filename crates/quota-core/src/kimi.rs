@@ -210,7 +210,7 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
     let resets_at = parse_reset_time(detail.reset_time.as_deref())?;
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes,
     })
 }
@@ -344,12 +344,12 @@ mod tests {
         let usage = normalize_usage(&fixture_body()).unwrap();
         let primary = usage.primary.as_ref().unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-07-01T12:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T12:00:00Z"));
         assert_eq!(primary.window_minutes, None);
 
         let secondary = usage.secondary.as_ref().unwrap();
         assert_eq!(secondary.used_percent, 20.0);
-        assert_eq!(secondary.resets_at, "2026-06-22T18:00:00Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T18:00:00Z"));
         assert_eq!(secondary.window_minutes, Some(300));
     }
 

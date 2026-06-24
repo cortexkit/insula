@@ -109,12 +109,12 @@ struct WindowSnapshot {
 
 /// Normalize one upstream window snapshot to a [`RateWindow`].
 ///
-/// Returns `None` when the window lacks the load-bearing fields (`used_percent`
-/// + `reset_at`), so the consumer never sees a half-formed window.
+/// Requires only `used_percent`; `reset_at` is carried through when present and
+/// omitted otherwise (an idle window can report a percent with no pending reset,
+/// which CodexBar shows rather than dropping). The reset is never fabricated.
 fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
     let used_percent = snapshot.used_percent?;
-    let reset_at = snapshot.reset_at?;
-    let resets_at = crate::env::epoch_to_iso8601(reset_at)?;
+    let resets_at = snapshot.reset_at.and_then(crate::env::epoch_to_iso8601);
     let window_minutes = snapshot
         .limit_window_seconds
         .filter(|s| *s > 0)
@@ -305,15 +305,28 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 41.0);
         assert_eq!(primary.window_minutes, Some(300)); // 18000s / 60 = 300m (5h)
-        assert_eq!(primary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.window_minutes, Some(10080)); // weekly
         assert!(usage.tertiary.is_none());
     }
 
     #[test]
-    fn window_without_required_fields_is_dropped() {
+    fn window_with_percent_but_no_reset_is_kept_resetless() {
+        // CodexBar-faithful: a window reporting a percent with no reset (e.g. an
+        // idle window) is emitted with resetsAt omitted, not dropped. The reset is
+        // never fabricated.
         let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 50 } } }"#;
+        let usage = normalize_usage(body).unwrap();
+        let primary = usage.primary.expect("window kept with percent, reset-less");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn window_without_used_percent_is_dropped() {
+        // The percent is the load-bearing field; without it there is no window.
+        let body = br#"{ "rate_limit": { "primary_window": { "reset_at": 1782135879 } } }"#;
         let usage = normalize_usage(body).unwrap();
         assert!(usage.primary.is_none());
     }

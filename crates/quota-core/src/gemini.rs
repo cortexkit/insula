@@ -192,7 +192,7 @@ pub fn normalize_quota(body: &[u8]) -> Result<Usage, FetchError> {
         let resets_at = reset?;
         Some(RateWindow {
             used_percent: (100.0 - fraction * 100.0).clamp(0.0, 100.0),
-            resets_at,
+            resets_at: Some(resets_at),
             window_minutes: Some(WINDOW_MINUTES_24H),
         })
     };
@@ -411,7 +411,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 40.0);
         assert_eq!(primary.window_minutes, Some(1440));
-        assert_eq!(primary.resets_at, "2026-06-23T00:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-23T00:00:00Z"));
         // flash (0.75) → 25% used; flash-lite (1.0) → 0% used.
         assert_eq!(usage.secondary.unwrap().used_percent, 25.0);
         assert_eq!(usage.tertiary.unwrap().used_percent, 0.0);

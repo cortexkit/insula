@@ -183,7 +183,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs)?;
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
     })
 }
@@ -205,7 +205,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     )?;
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: window_minutes(
             opt_int(&m.weekly_start_time),
             opt_int(&m.weekly_end_time),
@@ -400,7 +400,7 @@ mod tests {
         let expected_end_secs = end / 1000;
         assert_eq!(
             primary.resets_at,
-            env::epoch_to_iso8601(expected_end_secs).unwrap()
+            env::epoch_to_iso8601(expected_end_secs)
         );
         assert!(usage.secondary.is_none());
     }
@@ -466,7 +466,7 @@ mod tests {
         assert!((secondary.used_percent - 10.4).abs() < 0.01);
         assert_eq!(
             secondary.resets_at,
-            env::epoch_to_iso8601(week_end / 1000).unwrap()
+            env::epoch_to_iso8601(week_end / 1000)
         );
     }
 }

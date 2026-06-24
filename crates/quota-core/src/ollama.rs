@@ -167,7 +167,7 @@ fn window_for(html: &str, labels: &[&str], window_minutes: i64) -> Option<RateWi
             {
                 return Some(RateWindow {
                     used_percent,
-                    resets_at,
+                    resets_at: Some(resets_at),
                     window_minutes: Some(window_minutes),
                 });
             }
@@ -305,11 +305,11 @@ mod tests {
         let usage = normalize_usage(SETTINGS_FIXTURE).unwrap();
         let session = usage.primary.unwrap();
         assert_eq!(session.used_percent, 0.0);
-        assert_eq!(session.resets_at, "2026-06-24T03:00:00Z");
+        assert_eq!(session.resets_at.as_deref(), Some("2026-06-24T03:00:00Z"));
         assert_eq!(session.window_minutes, Some(300));
         let weekly = usage.secondary.unwrap();
         assert_eq!(weekly.used_percent, 30.8);
-        assert_eq!(weekly.resets_at, "2026-06-29T00:00:00Z");
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-06-29T00:00:00Z"));
         assert_eq!(weekly.window_minutes, Some(10080));
     }
 

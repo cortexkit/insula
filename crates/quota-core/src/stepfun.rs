@@ -112,7 +112,7 @@ fn rate_window_from_left_and_reset(
     let resets_at = env::epoch_to_iso8601(reset)?;
     Some(RateWindow {
         used_percent: used_percent_from_left_rate(left),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
 }
@@ -213,11 +213,11 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 0.0);
-        assert_eq!(secondary.resets_at, "2026-06-29T13:44:39Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-29T13:44:39Z"));
         assert_eq!(secondary.window_minutes, Some(10080));
     }
 

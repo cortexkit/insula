@@ -177,7 +177,7 @@ fn rate_window_from(
     let resets_at = reset_at_for_window(window, now)?;
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
 }
@@ -352,11 +352,11 @@ mod tests {
         let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 12.5);
-        assert_eq!(primary.resets_at, "2026-06-24T08:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T08:00:00Z"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 40.0);
-        assert_eq!(secondary.resets_at, "2026-07-25T17:20:00Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-25T17:20:00Z"));
         assert_eq!(secondary.window_minutes, Some(10080));
         assert!(usage.tertiary.is_none(), "monthly has no reset → dropped");
     }
@@ -383,7 +383,7 @@ mod tests {
         let usage = normalize_billing_limits(&value, now).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 10.0);
-        assert_eq!(primary.resets_at, "2026-06-24T04:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
         assert_eq!(primary.window_minutes, Some(300));
     }
 

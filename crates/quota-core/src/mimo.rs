@@ -115,7 +115,7 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
     let primary = match (used_percent, resets_at) {
         (Some(pct), Some(reset)) => Some(RateWindow {
             used_percent: pct,
-            resets_at: reset,
+            resets_at: Some(reset),
             window_minutes: Some(43200),
         }),
         _ => None,
@@ -293,7 +293,7 @@ mod tests {
         let usage = normalize(DETAIL_HEALTHY, USAGE_HEALTHY).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 45.0);
-        assert_eq!(primary.resets_at, "2026-07-24T12:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 
@@ -317,7 +317,7 @@ mod tests {
         let usage = normalize(DETAIL_HEALTHY, USAGE_COUNTS_ONLY).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-07-24T12:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 }

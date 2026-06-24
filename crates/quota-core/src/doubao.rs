@@ -78,7 +78,7 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
 
     let primary = Some(RateWindow {
         used_percent,
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: None,
     });
 
@@ -275,7 +275,7 @@ mod tests {
         let usage = normalize_usage(&headers).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
-        assert_eq!(primary.resets_at, "2026-06-22T18:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T18:00:00Z"));
         assert_eq!(primary.window_minutes, None);
     }
 

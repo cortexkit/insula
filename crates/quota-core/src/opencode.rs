@@ -405,7 +405,7 @@ fn window_from_map(
     let resets_at = env::epoch_to_iso8601(reset_epoch)?;
     Some(RateWindow {
         used_percent,
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
 }
@@ -573,7 +573,7 @@ fn window_from_parts(
     let resets_at = env::epoch_to_iso8601(reset_epoch)?;
     Some(RateWindow {
         used_percent: p.clamp(0.0, 100.0),
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
 }
@@ -682,10 +682,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 42.5);
         assert_eq!(primary.window_minutes, Some(300));
-        assert_eq!(
-            primary.resets_at,
-            env::epoch_to_iso8601(now + 7200).unwrap()
-        );
+        assert_eq!(primary.resets_at, env::epoch_to_iso8601(now + 7200));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 10.0);
         assert_eq!(secondary.window_minutes, Some(10080));

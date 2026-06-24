@@ -139,7 +139,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
 
             resets_at.map(|resets_at| RateWindow {
                 used_percent,
-                resets_at,
+                resets_at: Some(resets_at),
                 window_minutes: Some((window_hours * 60.0).round() as i64),
             })
         }
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(primary.used_percent, 25.0);
         // resets_at = now + (25 / 10 * 3600) = now + 9000s = 2 hours 30 mins
         // 12:00:00 + 2h 30m = 14:30:00
-        assert_eq!(primary.resets_at, "2026-06-24T14:30:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T14:30:00Z"));
         assert_eq!(primary.window_minutes, Some(300));
     }
 
@@ -339,7 +339,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
         // resets_at = now + (10 / 5 * 3600) = now + 7200s = 2 hours
-        assert_eq!(primary.resets_at, "2026-06-24T14:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T14:00:00Z"));
         assert_eq!(primary.window_minutes, Some(120));
     }
 

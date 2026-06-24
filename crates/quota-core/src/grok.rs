@@ -268,7 +268,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     Ok(Usage {
         primary: Some(RateWindow {
             used_percent,
-            resets_at,
+            resets_at: Some(resets_at),
             window_minutes,
         }),
         secondary: None,
@@ -381,7 +381,7 @@ mod tests {
         // fixed32 at path [1,1] = 76.57, rounded to 2dp (no f32→f64 widening noise).
         assert_eq!(primary.used_percent, 76.57);
         // varint at [1,5,1] = 1782864000 = 2026-07-01T00:00:00Z.
-        assert_eq!(primary.resets_at, "2026-07-01T00:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
         // period start [1,4,1] = 2026-06-01 → 30-day window = 43200 min.
         assert_eq!(primary.window_minutes, Some(43200));
     }

@@ -97,7 +97,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let primary = match (min_remaining, min_reset) {
         (Some(remaining), Some(resets_at)) => Some(RateWindow {
             used_percent: (100.0 - remaining).clamp(0.0, 100.0),
-            resets_at,
+            resets_at: Some(resets_at),
             window_minutes: None,
         }),
         _ => None,
@@ -172,7 +172,7 @@ mod tests {
         // Independent aggregation: min remaining = 30% → used 70%; min reset =
         // 17:00 (openai's group), which need not be the most-depleted group's.
         assert_eq!(primary.used_percent, 70.0);
-        assert_eq!(primary.resets_at, "2026-06-22T17:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
         assert_eq!(primary.window_minutes, None);
     }
 

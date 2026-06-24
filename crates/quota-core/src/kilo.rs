@@ -307,7 +307,7 @@ fn pass_window(pass: &PassFields) -> Option<RateWindow> {
     };
     Some(RateWindow {
         used_percent,
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes: None,
     })
 }
@@ -565,7 +565,7 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.expect("pass window with reset");
         assert_eq!(primary.used_percent, 0.0);
-        assert_eq!(primary.resets_at, "2026-03-28T04:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-03-28T04:00:00Z"));
         assert_eq!(primary.window_minutes, None);
     }
 
@@ -624,7 +624,7 @@ mod tests {
         let primary = normalize_usage(body).unwrap().primary.unwrap();
         let expected_used = (3.5 / 28.5) * 100.0;
         assert!((primary.used_percent - expected_used).abs() < 0.01);
-        assert_eq!(primary.resets_at, "2026-03-28T04:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-03-28T04:00:00Z"));
     }
 
     #[test]

@@ -53,11 +53,15 @@ struct OAuthUsageResponse {
 
 fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWindow> {
     let window = window?;
+    // CodexBar's makeWindow (ClaudeUsageFetcher.swift:945-956) builds a window
+    // from `utilization` alone and leaves resetsAt nil when absent — an idle
+    // session window reports `utilization: 0.0, resets_at: null` (nothing pending
+    // to reset), and CodexBar shows it. So require only the percent; carry the
+    // reset through when present, omit it otherwise. Never fabricate a reset.
     let used_percent = window.utilization?;
-    let resets_at = window.resets_at.clone()?;
     Some(RateWindow {
         used_percent,
-        resets_at,
+        resets_at: window.resets_at.clone(),
         window_minutes: Some(window_minutes),
     })
 }
@@ -153,7 +157,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 16.0); // already a percent, NOT /100
         assert_eq!(primary.window_minutes, Some(300));
-        assert_eq!(primary.resets_at, "2026-06-22T17:00:00.175593+00:00");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T17:00:00.175593+00:00"));
         assert_eq!(usage.secondary.unwrap().used_percent, 48.0);
         // opus is null, so tertiary falls back to sonnet.
         assert_eq!(usage.tertiary.unwrap().used_percent, 4.0);
@@ -164,6 +168,25 @@ mod tests {
         let body = br#"{ "five_hour": { "resets_at": "2026-06-22T17:00:00Z" } }"#;
         let usage = normalize_usage(body).unwrap();
         assert!(usage.primary.is_none());
+    }
+
+    #[test]
+    fn idle_zero_percent_window_with_null_reset_is_kept() {
+        // The exact live shape Anthropic returns for an idle session: five_hour
+        // utilization 0.0 with resets_at: null (nothing pending to reset). CodexBar
+        // shows this 0% window; we keep it reset-less rather than dropping it, so
+        // the headline session window does not vanish when simply empty.
+        let body = br#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 91.0, "resets_at": "2026-06-24T14:00:00Z" }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        let primary = usage.primary.expect("idle 0% window kept");
+        assert_eq!(primary.used_percent, 0.0);
+        assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_minutes, Some(300));
+        // The active weekly window is unaffected.
+        assert_eq!(usage.secondary.unwrap().used_percent, 91.0);
     }
 
     #[test]

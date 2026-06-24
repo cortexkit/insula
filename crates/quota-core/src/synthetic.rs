@@ -302,7 +302,7 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
 
     Some(RateWindow {
         used_percent: clamped,
-        resets_at,
+        resets_at: Some(resets_at),
         window_minutes,
     })
 }
@@ -526,17 +526,17 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
-        assert_eq!(primary.resets_at, "2026-06-22T15:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T15:00:00Z"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 45.0);
-        assert_eq!(secondary.resets_at, "2026-06-22T16:00:00Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T16:00:00Z"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 20.0); // remaining 80 -> used 20
-        assert_eq!(tertiary.resets_at, "2026-06-22T17:00:00Z");
+        assert_eq!(tertiary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
         assert_eq!(tertiary.window_minutes, Some(60));
     }
 
@@ -559,12 +559,12 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 10.0);
-        assert_eq!(primary.resets_at, "2026-06-22T15:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T15:00:00Z"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 30.0);
-        assert_eq!(secondary.resets_at, "2026-06-22T16:00:00Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T16:00:00Z"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         assert!(usage.tertiary.is_none());

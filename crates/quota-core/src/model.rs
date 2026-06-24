@@ -12,8 +12,16 @@
 //!   `extraRateWindows`).
 //! - A healthy entry MUST NOT carry `error` (the consumer skips any entry whose
 //!   `error` is truthy), so it is omitted when absent.
-//! - A window is only emitted when it has both `usedPercent` and `resetsAt`;
-//!   the consumer drops any window missing either.
+//! - A window is emitted when it has a `usedPercent`; `resetsAt` is OPTIONAL and
+//!   omitted when the provider reports no reset, matching CodexBar's
+//!   `makeWindow` (`ClaudeUsageFetcher.swift:945-956`), which builds a window
+//!   from `utilization` alone and leaves `resetsAt` nil. A provider that
+//!   genuinely reports no reset (e.g. an idle 0%-used session window) thus shows
+//!   the real percent reset-less instead of vanishing. This is distinct from
+//!   FABRICATING a reset (crof-class), which we still never do. NOTE: the pace
+//!   consumer (`codexbar-window-extractors.ts`) still requires `resetsAt` to feed
+//!   a window into pacing, so a reset-less window appears in the dump (parity
+//!   with CodexBar's surface) but contributes no burn-rate projection.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +31,11 @@ use serde::{Deserialize, Serialize};
 pub struct RateWindow {
     /// 0..100 percent of the window's quota consumed.
     pub used_percent: f64,
-    /// ISO 8601 / RFC 3339 timestamp when the window resets.
-    pub resets_at: String,
+    /// ISO 8601 / RFC 3339 timestamp when the window resets. Omitted when the
+    /// provider reports no reset (e.g. an idle session window with nothing
+    /// pending) — never fabricated. Mirrors CodexBar's optional `resetsAt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
     /// Window length in minutes. Omitted when the provider does not report one;
     /// the consumer then paces on utilization alone rather than a burn rate.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +170,7 @@ mod tests {
             Usage {
                 primary: Some(RateWindow {
                     used_percent: 41.0,
-                    resets_at: "2026-06-22T13:44:39Z".to_string(),
+                    resets_at: Some("2026-06-22T13:44:39Z".to_string()),
                     window_minutes: Some(300),
                 }),
                 ..Usage::default()

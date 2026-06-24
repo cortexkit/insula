@@ -163,14 +163,14 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
     let primary = token_limit.clone().or(time_limit.clone()).map(|limit| RateWindow {
         used_percent: limit.used_percent,
-        resets_at: limit.resets_at,
+        resets_at: Some(limit.resets_at),
         window_minutes: limit.window_minutes,
     });
 
     let secondary = if token_limit.is_some() && time_limit.is_some() {
         time_limit.map(|limit| RateWindow {
             used_percent: limit.used_percent,
-            resets_at: limit.resets_at,
+            resets_at: Some(limit.resets_at),
             window_minutes: limit.window_minutes,
         })
     } else {
@@ -179,7 +179,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
     let tertiary = session_token_limit.map(|limit| RateWindow {
         used_percent: limit.used_percent,
-        resets_at: limit.resets_at,
+        resets_at: Some(limit.resets_at),
         window_minutes: limit.window_minutes,
     });
 
@@ -292,12 +292,12 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
         assert_eq!(primary.window_minutes, Some(300)); // 5 hours = 300 minutes
-        assert_eq!(primary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 10.0);
         assert_eq!(secondary.window_minutes, None); // TIME_LIMIT has no window_minutes
-        assert_eq!(secondary.resets_at, "2026-06-22T13:44:39Z");
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
 
         assert!(usage.tertiary.is_none());
     }

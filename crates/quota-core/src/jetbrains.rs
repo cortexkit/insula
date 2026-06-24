@@ -153,7 +153,7 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
     Ok(Usage {
         primary: Some(RateWindow {
             used_percent: used,
-            resets_at,
+            resets_at: Some(resets_at),
             window_minutes: None,
         }),
         secondary: None,
@@ -220,7 +220,7 @@ mod tests {
         let usage = normalize_usage(ACTIVE_XML.as_bytes()).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0); // 250/1000
-        assert_eq!(primary.resets_at, "2026-07-01T00:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
 
     #[test]

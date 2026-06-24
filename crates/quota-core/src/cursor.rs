@@ -100,7 +100,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             Ok(Usage {
                 primary: Some(RateWindow {
                     used_percent: pct,
-                    resets_at: reset,
+                    resets_at: Some(reset),
                     window_minutes: Some(43200),
                 }),
                 secondary: None,
@@ -186,7 +186,7 @@ mod tests {
         let usage = normalize_usage(json.as_bytes()).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 45.5);
-        assert_eq!(primary.resets_at, "2026-07-24T03:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T03:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 
@@ -204,7 +204,7 @@ mod tests {
         let usage = normalize_usage(json.as_bytes()).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
-        assert_eq!(primary.resets_at, "2026-07-24T03:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T03:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 

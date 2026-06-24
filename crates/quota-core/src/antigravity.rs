@@ -346,7 +346,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         pool: pool_of(&group.display_name),
         window: RateWindow {
             used_percent,
-            resets_at: reset,
+            resets_at: Some(reset),
             window_minutes: window_minutes_of(bucket),
         },
         title,
@@ -560,7 +560,7 @@ mod tests {
         // most-used (weekly), mirroring CodexBar.
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 47.0);
-        assert_eq!(primary.resets_at, "2026-06-30T00:00:00Z");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
         assert_eq!(primary.window_minutes, Some(10080));
         // Claude/GPT pool has only the 5-hour bucket: used = (1 - 0.95) * 100 = 5.
         let secondary = usage.secondary.unwrap();
