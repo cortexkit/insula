@@ -20,13 +20,12 @@ use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
-        Bindings, ConfigBinding, ConfigSource, IdentityBinding, ManagementOperation,
-        ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
+        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{ModuleControlRequest, ModuleControlResponse},
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    SUBC_MODULE_ID_ENV, PROTOCOL_VERSION,
+    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{
@@ -75,7 +74,9 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let loop_result = module_loop(&mut read_half, tx.clone(), &config, registry).await;
     drop(tx);
 
-    let writer_result = writer.await.map_err(|e| ModuleError::Message(e.to_string()));
+    let writer_result = writer
+        .await
+        .map_err(|e| ModuleError::Message(e.to_string()));
     match (loop_result, writer_result) {
         (Err(loop_err), _) => Err(loop_err),
         (Ok(()), Ok(Ok(()))) => Ok(()),
@@ -152,11 +153,19 @@ where
     Ok(())
 }
 
-async fn send_hello(writer: &mpsc::Sender<Frame>, config: &ModuleConfig) -> Result<(), ModuleError> {
+async fn send_hello(
+    writer: &mpsc::Sender<Frame>,
+    config: &ModuleConfig,
+) -> Result<(), ModuleError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
+        // Echo the one-time launch nonce subc injects via SUBC_LAUNCH_NONCE for a
+        // reserved module; absent (None) for a normally-supervised module like this one.
+        launch_nonce: std::env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty()),
     })
     .map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
@@ -175,7 +184,8 @@ where
     match frame.header.ty {
         FrameType::HelloAck => serde_json::from_slice(&frame.body).map_err(ModuleError::Json),
         FrameType::Error => {
-            let body = serde_json::from_slice::<ErrorBody>(&frame.body).map_err(ModuleError::Json)?;
+            let body =
+                serde_json::from_slice::<ErrorBody>(&frame.body).map_err(ModuleError::Json)?;
             Err(ModuleError::Message(format!(
                 "subc rejected HELLO: {} — {}",
                 body.code, body.message
@@ -298,7 +308,10 @@ async fn handle_usage_request(
             channel,
             corr,
             "unknown_method",
-            &format!("unknown method '{}', expected '{USAGE_GET_OP}'", request.method),
+            &format!(
+                "unknown method '{}', expected '{USAGE_GET_OP}'",
+                request.method
+            ),
         )
         .await;
     }
@@ -382,11 +395,6 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 scope: StorageScope::Project,
                 owns_schema: false,
             },
-            config: ConfigBinding {
-                source: ConfigSource::SubcMediated,
-                tiers: Vec::new(),
-                expansion: std::collections::BTreeMap::new(),
-            },
             vault_grants: Vec::new(),
             identity: IdentityBinding {
                 requires: Vec::new(),
@@ -414,7 +422,9 @@ fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, M
         // Ignore unknown args (e.g. --connection-file) for forward-compat with
         // supervised launch conventions.
     }
-    Err(ModuleError::Message("--subc <connection-file> is required".into()))
+    Err(ModuleError::Message(
+        "--subc <connection-file> is required".into(),
+    ))
 }
 
 #[derive(Debug)]
