@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux-only. Unlike llm-runner there is no cfg(windows) code to exercise: the only
+  # platform-specific paths are the macOS cookie/antigravity probes, which carry
+  # cfg(not(target_os = "macos")) stubs — so the Linux leg compiles and covers the
+  # non-macOS path. macOS stays the development platform (local cargo test + clippy);
+  # the live + real-daemon tests are #[ignore] (need real creds, the macOS desktop
+  # state, or the sibling subc-core daemon) and are intentionally not CI-run.
+  #
+  # Runners are Blacksmith, not GitHub-hosted: these repos are owned by a free-plan
+  # organization where GitHub bills private-repo Actions minutes and blocks jobs once
+  # the (zero) spending limit is hit. Blacksmith third-party runners do not consume
+  # GitHub's included minutes. Revert `runner` to GitHub-hosted `ubuntu-latest` if the
+  # repo becomes public (public-repo Actions minutes are free).
+  test:
+    name: Test (ubuntu)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: ai-provider-quota
+    steps:
+      - name: Checkout ai-provider-quota
+        uses: actions/checkout@v5
+        with:
+          path: ai-provider-quota
+
+      # quota-module path-deps the private cortexkit/subconscious sibling
+      # (subc-protocol/subc-transport, plus subc-core as a dev-dep). The default
+      # GITHUB_TOKEN is scoped to this repo only, so mint a short-lived token from the
+      # org-installed cortexkit-ci GitHub App (Contents: read) to check it out. quota
+      # path-deps ONLY subconscious (not commons), so this is a single-sibling checkout.
+      - name: Mint cross-repo read token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
+      # The path-dep layout is ../subconscious relative to the workspace, so check the
+      # sibling out next to ai-provider-quota.
+      - name: Checkout subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Runs the 153 quota-core unit tests + the in-process skeleton_e2e CI test
+      # (skeleton_round_trips_usage_get_over_the_wire). The live real-window proofs and
+      # real_daemon_e2e are #[ignore] and excluded here by design.
+      - name: Test
+        run: cargo test --workspace --all-targets
