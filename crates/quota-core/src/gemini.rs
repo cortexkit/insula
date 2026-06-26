@@ -69,8 +69,8 @@ const PROJECTS_URL: &str = "https://cloudresourcemanager.googleapis.com/v1/proje
 const CRED_MASK: &[u8] = b"quota-public-creds-v1";
 const CLIENT_ID_MASKED: &[u8] = &[
     71, 77, 94, 70, 84, 24, 72, 69, 91, 95, 80, 86, 0, 12, 29, 93, 2, 7, 31, 25, 65, 3, 17, 29, 26,
-    17, 20, 21, 70, 3, 29, 15, 85, 76, 21, 65, 13, 9, 23, 68, 20, 0, 66, 64, 5, 90, 0, 93, 0, 6, 76,
-    11, 6, 12, 74, 15, 23, 16, 23, 22, 95, 21, 94, 31, 1, 10, 26, 21, 3, 19, 26, 15,
+    17, 20, 21, 70, 3, 29, 15, 85, 76, 21, 65, 13, 9, 23, 68, 20, 0, 66, 64, 5, 90, 0, 93, 0, 6,
+    76, 11, 6, 12, 74, 15, 23, 16, 23, 22, 95, 21, 94, 31, 1, 10, 26, 21, 3, 19, 26, 15,
 ];
 const CLIENT_SECRET_MASKED: &[u8] = &[
     54, 58, 44, 39, 49, 117, 93, 65, 23, 36, 14, 46, 125, 14, 95, 84, 11, 68, 126, 29, 28, 22, 16,
@@ -272,7 +272,9 @@ impl GeminiProvider {
         let refresh_token = creds
             .refresh_token
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| FetchError::NoSession("gemini creds have no refresh_token".to_string()))?;
+            .ok_or_else(|| {
+                FetchError::NoSession("gemini creds have no refresh_token".to_string())
+            })?;
 
         let cid = client_id();
         let secret = client_secret();
@@ -293,7 +295,9 @@ impl GeminiProvider {
         let token = refreshed
             .access_token
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| FetchError::Unauthorized("gemini refresh returned no access_token".to_string()))?;
+            .ok_or_else(|| {
+                FetchError::Unauthorized("gemini refresh returned no access_token".to_string())
+            })?;
         let lifetime = Duration::from_secs(refreshed.expires_in.unwrap_or(3600));
         let expires_at = now + lifetime.saturating_sub(EXPIRY_SKEW);
         self.store_token(token.clone(), expires_at);
@@ -419,7 +423,8 @@ mod tests {
 
     #[test]
     fn bucket_without_reset_drops_that_window() {
-        let body = br#"{ "buckets": [ { "modelId": "gemini-2.5-pro", "remainingFraction": 0.5 } ] }"#;
+        let body =
+            br#"{ "buckets": [ { "modelId": "gemini-2.5-pro", "remainingFraction": 0.5 } ] }"#;
         // No resetTime → no well-formed window.
         assert!(normalize_quota(body).unwrap().primary.is_none());
     }

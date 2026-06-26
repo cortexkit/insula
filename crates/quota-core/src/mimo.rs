@@ -71,29 +71,41 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         .map_err(|e| FetchError::Decode(format!("failed to parse detail JSON: {e}")))?;
 
     if detail_envelope.code == 401 || detail_envelope.code == 403 {
-        return Err(FetchError::Unauthorized(format!("mimo API returned code {}", detail_envelope.code)));
+        return Err(FetchError::Unauthorized(format!(
+            "mimo API returned code {}",
+            detail_envelope.code
+        )));
     }
     if detail_envelope.code != 0 {
-        return Err(FetchError::Decode(format!("mimo API returned non-zero code {}", detail_envelope.code)));
+        return Err(FetchError::Decode(format!(
+            "mimo API returned non-zero code {}",
+            detail_envelope.code
+        )));
     }
 
-    let detail_data = detail_envelope.data.ok_or_else(|| {
-        FetchError::Decode("mimo detail response missing data field".to_string())
-    })?;
+    let detail_data = detail_envelope
+        .data
+        .ok_or_else(|| FetchError::Decode("mimo detail response missing data field".to_string()))?;
 
     let usage_envelope: MimoEnvelope<MimoUsage> = serde_json::from_str(usage_json)
         .map_err(|e| FetchError::Decode(format!("failed to parse usage JSON: {e}")))?;
 
     if usage_envelope.code == 401 || usage_envelope.code == 403 {
-        return Err(FetchError::Unauthorized(format!("mimo API returned code {}", usage_envelope.code)));
+        return Err(FetchError::Unauthorized(format!(
+            "mimo API returned code {}",
+            usage_envelope.code
+        )));
     }
     if usage_envelope.code != 0 {
-        return Err(FetchError::Decode(format!("mimo API returned non-zero code {}", usage_envelope.code)));
+        return Err(FetchError::Decode(format!(
+            "mimo API returned non-zero code {}",
+            usage_envelope.code
+        )));
     }
 
-    let usage_data = usage_envelope.data.ok_or_else(|| {
-        FetchError::Decode("mimo usage response missing data field".to_string())
-    })?;
+    let usage_data = usage_envelope
+        .data
+        .ok_or_else(|| FetchError::Decode("mimo usage response missing data field".to_string()))?;
 
     let mut used_percent = None;
     if let Some(month_usage) = usage_data.month_usage {
@@ -110,7 +122,9 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         }
     }
 
-    let resets_at = detail_data.current_period_end.and_then(|s| parse_reset_time(&s));
+    let resets_at = detail_data
+        .current_period_end
+        .and_then(|s| parse_reset_time(&s));
 
     let primary = match (used_percent, resets_at) {
         (Some(pct), Some(reset)) => Some(RateWindow {
@@ -122,7 +136,9 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
     };
 
     if primary.is_none() {
-        return Err(FetchError::Decode("mimo: no valid usage window (missing percent or reset time)".to_string()));
+        return Err(FetchError::Decode(
+            "mimo: no valid usage window (missing percent or reset time)".to_string(),
+        ));
     }
 
     Ok(Usage {
@@ -164,20 +180,17 @@ impl UsageProvider for MimoProvider {
         let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
             browser_cookies::CookieError::NoStore
             | browser_cookies::CookieError::NoCookie
-            | browser_cookies::CookieError::Unsupported => {
-                FetchError::NoSession(e.to_string())
-            }
+            | browser_cookies::CookieError::Unsupported => FetchError::NoSession(e.to_string()),
             browser_cookies::CookieError::NoKeychainKey(_)
-            | browser_cookies::CookieError::Extract(_) => {
-                FetchError::Upstream(e.to_string())
-            }
+            | browser_cookies::CookieError::Extract(_) => FetchError::Upstream(e.to_string()),
         })?;
 
         let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
         let has_user_id = jar.has_cookie_named(|n| n == "userId");
         if !has_token || !has_user_id {
             return Err(FetchError::NoSession(
-                "missing required mimo session cookies (api-platform_serviceToken and userId)".to_string(),
+                "missing required mimo session cookies (api-platform_serviceToken and userId)"
+                    .to_string(),
             ));
         }
 
@@ -189,19 +202,34 @@ impl UsageProvider for MimoProvider {
             .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
             .header(Header::new("x-timeZone", "UTC+01:00"))
             .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
-            .header(Header::new("Referer", "https://platform.xiaomimimo.com/#/console/balance"))
+            .header(Header::new(
+                "Referer",
+                "https://platform.xiaomimimo.com/#/console/balance",
+            ))
             .header(Header::new("User-Agent", BROWSER_USER_AGENT));
 
         let detail_res = detail_req.send_raw(&self.http).await?;
         if (300..400).contains(&detail_res.status) || detail_res.status == 401 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", detail_res.status)));
+            return Err(FetchError::Unauthorized(format!(
+                "HTTP {}",
+                detail_res.status
+            )));
         }
         if detail_res.status == 403 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", detail_res.status)));
+            return Err(FetchError::Unauthorized(format!(
+                "HTTP {}",
+                detail_res.status
+            )));
         }
         if !(200..300).contains(&detail_res.status) {
-            let excerpt: String = String::from_utf8_lossy(&detail_res.body).chars().take(200).collect();
-            return Err(FetchError::Upstream(format!("HTTP {}: {excerpt}", detail_res.status)));
+            let excerpt: String = String::from_utf8_lossy(&detail_res.body)
+                .chars()
+                .take(200)
+                .collect();
+            return Err(FetchError::Upstream(format!(
+                "HTTP {}: {excerpt}",
+                detail_res.status
+            )));
         }
 
         // Fetch usage
@@ -212,19 +240,34 @@ impl UsageProvider for MimoProvider {
             .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
             .header(Header::new("x-timeZone", "UTC+01:00"))
             .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
-            .header(Header::new("Referer", "https://platform.xiaomimimo.com/#/console/balance"))
+            .header(Header::new(
+                "Referer",
+                "https://platform.xiaomimimo.com/#/console/balance",
+            ))
             .header(Header::new("User-Agent", BROWSER_USER_AGENT));
 
         let usage_res = usage_req.send_raw(&self.http).await?;
         if (300..400).contains(&usage_res.status) || usage_res.status == 401 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", usage_res.status)));
+            return Err(FetchError::Unauthorized(format!(
+                "HTTP {}",
+                usage_res.status
+            )));
         }
         if usage_res.status == 403 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", usage_res.status)));
+            return Err(FetchError::Unauthorized(format!(
+                "HTTP {}",
+                usage_res.status
+            )));
         }
         if !(200..300).contains(&usage_res.status) {
-            let excerpt: String = String::from_utf8_lossy(&usage_res.body).chars().take(200).collect();
-            return Err(FetchError::Upstream(format!("HTTP {}: {excerpt}", usage_res.status)));
+            let excerpt: String = String::from_utf8_lossy(&usage_res.body)
+                .chars()
+                .take(200)
+                .collect();
+            return Err(FetchError::Upstream(format!(
+                "HTTP {}: {excerpt}",
+                usage_res.status
+            )));
         }
 
         let detail_json = String::from_utf8_lossy(&detail_res.body);

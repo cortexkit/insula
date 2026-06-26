@@ -18,3 +18,7 @@ _bmad-output
 # OS / editor
 .DS_Store
 *.swp
+
+# Cross-repo doc-gen artifacts (regenerated, not source)
+/ARCHITECTURE.md
+/STRUCTURE.md

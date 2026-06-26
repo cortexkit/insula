@@ -162,9 +162,15 @@ fn trpc_error(entry: &Value) -> Option<FetchError> {
     let combined = [
         string_at_path(error_obj, &["json", "data", "code"]),
         string_at_path(error_obj, &["data", "code"]),
-        error_obj.get("code").and_then(|v| v.as_str()).map(str::to_string),
+        error_obj
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         string_at_path(error_obj, &["json", "message"]),
-        error_obj.get("message").and_then(|v| v.as_str()).map(str::to_string),
+        error_obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     ]
     .into_iter()
     .flatten()
@@ -294,11 +300,9 @@ fn fallback_pass_fields(payload: &Value) -> PassFields {
 
 fn pass_window(pass: &PassFields) -> Option<RateWindow> {
     let total = pass.total?;
-    let used = pass.used.unwrap_or_else(|| {
-        pass.remaining
-            .map(|r| (total - r).max(0.0))
-            .unwrap_or(0.0)
-    });
+    let used = pass
+        .used
+        .unwrap_or_else(|| pass.remaining.map(|r| (total - r).max(0.0)).unwrap_or(0.0));
     let resets_at = pass.resets_at.clone()?;
     let used_percent = if total > 0.0 {
         (used / total * 100.0).clamp(0.0, 100.0)
@@ -448,8 +452,7 @@ fn epoch_to_rfc3339(value: f64) -> Option<String> {
 }
 
 fn kilo_auth_file_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".local/share/kilo/auth.json"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/kilo/auth.json"))
 }
 
 fn read_auth_file_token() -> Option<String> {
@@ -524,9 +527,9 @@ mod tests {
     #[test]
     fn batch_url_matches_codexbar_shape() {
         let url = batch_url("https://app.kilo.ai/api/trpc").unwrap();
-        assert!(url.contains(
-            "user.getCreditBlocks,kiloPass.getState,user.getAutoTopUpPaymentMethod"
-        ));
+        assert!(
+            url.contains("user.getCreditBlocks,kiloPass.getState,user.getAutoTopUpPaymentMethod")
+        );
         assert!(url.contains("batch=1"));
         assert!(url.contains("input="));
         assert!(url.contains("%22json%22"));

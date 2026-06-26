@@ -46,7 +46,9 @@ impl std::fmt::Display for CookieError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoStore => write!(f, "no Chrome cookie store found"),
-            Self::NoKeychainKey(m) => write!(f, "Chrome Safe Storage keychain key unavailable: {m}"),
+            Self::NoKeychainKey(m) => {
+                write!(f, "Chrome Safe Storage keychain key unavailable: {m}")
+            }
             Self::NoCookie => write!(f, "no matching cookie for domain"),
             Self::Extract(m) => write!(f, "cookie extraction failed: {m}"),
             Self::Unsupported => write!(f, "browser-cookie extraction is macOS+Chrome only"),
@@ -198,11 +200,9 @@ fn read_encrypted_cookies(
     std::fs::copy(store, &tmp).map_err(|e| CookieError::Extract(format!("copy store: {e}")))?;
 
     let result = (|| {
-        let conn = rusqlite::Connection::open_with_flags(
-            &tmp,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
+        let conn =
+            rusqlite::Connection::open_with_flags(&tmp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
         let mut stmt = conn
             .prepare("SELECT host_key, name, encrypted_value FROM cookies WHERE host_key LIKE ?1")
             .map_err(|e| CookieError::Extract(format!("prepare: {e}")))?;
@@ -282,8 +282,8 @@ mod tests {
         }
         plaintext.extend_from_slice(value.as_bytes());
         let iv = [b' '; 16];
-        let ct = Aes128CbcEnc::new(key.into(), &iv.into())
-            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        let ct =
+            Aes128CbcEnc::new(key.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
         let mut out = b"v10".to_vec();
         out.extend_from_slice(&ct);
         out

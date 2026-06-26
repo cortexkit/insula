@@ -149,8 +149,7 @@ fn parse_reset(block: &str) -> Option<String> {
 /// Heuristic: the settings page was replaced by a sign-in page (dead cookie).
 fn looks_signed_out(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    let has_heading =
-        lower.contains("sign in to ollama") || lower.contains("log in to ollama");
+    let has_heading = lower.contains("sign in to ollama") || lower.contains("log in to ollama");
     let has_auth_route = lower.contains("/api/auth/signin") || lower.contains("/auth/signin");
     let has_form = lower.contains("<form");
     let has_password = lower.contains("type=\"password\"") || lower.contains("name=\"password\"");
@@ -178,7 +177,11 @@ fn window_for(html: &str, labels: &[&str], window_minutes: i64) -> Option<RateWi
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
-    let session = window_for(html, &["Session usage", "Hourly usage"], SESSION_WINDOW_MINUTES);
+    let session = window_for(
+        html,
+        &["Session usage", "Hourly usage"],
+        SESSION_WINDOW_MINUTES,
+    );
     let weekly = window_for(html, &["Weekly usage"], WEEKLY_WINDOW_MINUTES);
 
     if session.is_none() && weekly.is_none() {
@@ -347,7 +350,10 @@ mod tests {
     fn parses_decimal_and_spaced_percents() {
         assert_eq!(percent_before_marker("30.8% used", "used"), Some(30.8));
         assert_eq!(percent_before_marker(" 0% used ", "used"), Some(0.0));
-        assert_eq!(percent_before_marker("foo 100 % used bar", "used"), Some(100.0));
+        assert_eq!(
+            percent_before_marker("foo 100 % used bar", "used"),
+            Some(100.0)
+        );
         assert_eq!(percent_before_marker("no percent here", "used"), None);
     }
 }

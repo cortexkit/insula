@@ -115,7 +115,11 @@ fn parse_flexible_factory_date(value: &Value) -> Option<String> {
         return None;
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     None
 }
@@ -183,10 +187,7 @@ fn rate_window_from(
 }
 
 fn pool_from_limits(limits: &FactoryBillingLimits) -> Option<&FactoryBillingPool> {
-    limits
-        .standard
-        .as_ref()
-        .or(limits.core.as_ref())
+    limits.standard.as_ref().or(limits.core.as_ref())
 }
 
 /// Normalize billing limits JSON to [`Usage`] (pure — unit-testable).
@@ -230,7 +231,10 @@ pub fn normalize_billing_limits(value: &Value, now: DateTime<Utc>) -> Result<Usa
 }
 
 /// Decode raw billing limits bytes then normalize.
-pub fn normalize_billing_limits_bytes(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
+pub fn normalize_billing_limits_bytes(
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> Result<Usage, FetchError> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("factory billing limits not JSON: {e}")))?;
     normalize_billing_limits(&value, now)
@@ -311,7 +315,10 @@ impl UsageProvider for FactoryProvider {
             .send_raw(&self.http)
             .await?;
 
-        let excerpt: String = String::from_utf8_lossy(&response.body).chars().take(200).collect();
+        let excerpt: String = String::from_utf8_lossy(&response.body)
+            .chars()
+            .take(200)
+            .collect();
         map_billing_http_status(response.status, &excerpt)?;
 
         let usage = normalize_billing_limits_bytes(&response.body, Utc::now())?;
@@ -363,10 +370,9 @@ mod tests {
 
     #[test]
     fn drops_window_with_percent_but_no_reset() {
-        let value: Value = serde_json::from_str(
-            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0}}}}"#,
-        )
-        .unwrap();
+        let value: Value =
+            serde_json::from_str(r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0}}}}"#)
+                .unwrap();
         assert!(matches!(
             normalize_billing_limits(&value, fixed_now()),
             Err(FetchError::Decode(_))

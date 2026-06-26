@@ -161,11 +161,14 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         token_limit = Some(token_limits.remove(0));
     }
 
-    let primary = token_limit.clone().or(time_limit.clone()).map(|limit| RateWindow {
-        used_percent: limit.used_percent,
-        resets_at: Some(limit.resets_at),
-        window_minutes: limit.window_minutes,
-    });
+    let primary = token_limit
+        .clone()
+        .or(time_limit.clone())
+        .map(|limit| RateWindow {
+            used_percent: limit.used_percent,
+            resets_at: Some(limit.resets_at),
+            window_minutes: limit.window_minutes,
+        });
 
     let secondary = if token_limit.is_some() && time_limit.is_some() {
         time_limit.map(|limit| RateWindow {

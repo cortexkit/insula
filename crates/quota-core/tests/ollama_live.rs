@@ -13,7 +13,11 @@ async fn ollama_live_returns_real_window_or_degrades() {
             eprintln!("[ollama-live] {}", serde_json::to_string(&entry).unwrap());
             assert!(entry.error.is_none(), "healthy entry expected: {entry:?}");
             assert!(
-                entry.usage.as_ref().map(|u| u.primary.is_some() || u.secondary.is_some()).unwrap_or(false),
+                entry
+                    .usage
+                    .as_ref()
+                    .map(|u| u.primary.is_some() || u.secondary.is_some())
+                    .unwrap_or(false),
                 "expected at least one window"
             );
         }
@@ -21,7 +25,10 @@ async fn ollama_live_returns_real_window_or_degrades() {
             eprintln!("[ollama-live] degraded: {e}");
             assert!(matches!(
                 e,
-                FetchError::NoSession(_) | FetchError::Unauthorized(_) | FetchError::Upstream(_) | FetchError::Decode(_)
+                FetchError::NoSession(_)
+                    | FetchError::Unauthorized(_)
+                    | FetchError::Upstream(_)
+                    | FetchError::Decode(_)
             ));
         }
     }

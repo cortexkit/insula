@@ -42,7 +42,8 @@ const INTL_GATEWAY: &str = "https://modelstudio.console.alibabacloud.com";
 const CN_GATEWAY: &str = "https://bailian.console.aliyun.com";
 const INTL_DASHBOARD: &str =
     "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=coding-plan#/efm/coding_plan";
-const CN_DASHBOARD: &str = "https://bailian.console.aliyun.com/cn-beijing/?tab=model#/efm/coding_plan";
+const CN_DASHBOARD: &str =
+    "https://bailian.console.aliyun.com/cn-beijing/?tab=model#/efm/coding_plan";
 
 struct RegionConfig {
     gateway: &'static str,
@@ -112,7 +113,11 @@ fn parse_date_iso(raw: &Value) -> Option<String> {
         return None;
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
@@ -161,10 +166,9 @@ fn find_first_dictionary<'a>(
 }
 
 fn find_quota_info(value: &Value) -> Option<&serde_json::Map<String, Value>> {
-    if let Some(direct) = find_first_dictionary(
-        &["codingPlanQuotaInfo", "coding_plan_quota_info"],
-        value,
-    ) {
+    if let Some(direct) =
+        find_first_dictionary(&["codingPlanQuotaInfo", "coding_plan_quota_info"], value)
+    {
         return Some(direct);
     }
     find_dictionary_matching_quota_keys(value)
@@ -234,9 +238,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         ));
     }
 
-    let quota = find_quota_info(&expanded).ok_or_else(|| {
-        FetchError::Decode("alibaba missing coding plan quota data".to_string())
-    })?;
+    let quota = find_quota_info(&expanded)
+        .ok_or_else(|| FetchError::Decode("alibaba missing coding plan quota data".to_string()))?;
 
     let primary = window_from_used_total_reset(
         &["per5HourUsedQuota", "perFiveHourUsedQuota"],
@@ -349,8 +352,7 @@ fn should_retry_alternate_region(err: &FetchError) -> bool {
         FetchError::Unauthorized(_) => true,
         FetchError::Upstream(msg) => msg.contains("HTTP 404") || msg.contains("HTTP 403"),
         FetchError::Decode(msg) => {
-            msg.contains("missing coding plan quota data")
-                || msg.contains("no quota windows found")
+            msg.contains("missing coding plan quota data") || msg.contains("no quota windows found")
         }
         FetchError::NoSession(_) => false,
     }
@@ -400,9 +402,8 @@ impl UsageProvider for AlibabaProvider {
     }
 
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV).ok_or_else(|| {
-            FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set"))
-        })?;
+        let api_key = env::first_env(API_KEY_ENV)
+            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
         match fetch_once(&self.http, &api_key, &INTL_REGION).await {
             Ok(body) => {
@@ -425,14 +426,8 @@ mod tests {
 
     fn sample_quota() -> serde_json::Map<String, Value> {
         serde_json::Map::from_iter([
-            (
-                "per5HourUsedQuota".to_string(),
-                Value::Number(25.into()),
-            ),
-            (
-                "per5HourTotalQuota".to_string(),
-                Value::Number(100.into()),
-            ),
+            ("per5HourUsedQuota".to_string(), Value::Number(25.into())),
+            ("per5HourTotalQuota".to_string(), Value::Number(100.into())),
             (
                 "per5HourQuotaNextRefreshTime".to_string(),
                 Value::Number(1_782_135_879.into()),

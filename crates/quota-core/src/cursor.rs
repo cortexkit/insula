@@ -61,13 +61,25 @@ struct PlanUsage {
 fn parse_billing_cycle_end(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-        return Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ") {
-        return Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     None
 }
@@ -77,7 +89,10 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let summary: CursorUsageSummary = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("cursor usage summary not decodable: {e}")))?;
 
-    let resets_at = summary.billing_cycle_end.as_deref().and_then(parse_billing_cycle_end);
+    let resets_at = summary
+        .billing_cycle_end
+        .as_deref()
+        .and_then(parse_billing_cycle_end);
 
     let mut used_percent = None;
     if let Some(ind) = &summary.individual_usage {
@@ -96,24 +111,22 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     }
 
     match (used_percent, resets_at) {
-        (Some(pct), Some(reset)) => {
-            Ok(Usage {
-                primary: Some(RateWindow {
-                    used_percent: pct,
-                    resets_at: Some(reset),
-                    window_minutes: Some(43200),
-                }),
-                secondary: None,
-                tertiary: None,
-                extra_rate_windows: None,
-            })
-        }
-        (Some(_), None) => {
-            Err(FetchError::Decode("cursor: percent present but billingCycleEnd is missing or invalid".to_string()))
-        }
-        _ => {
-            Err(FetchError::Decode("cursor: no valid usage window found".to_string()))
-        }
+        (Some(pct), Some(reset)) => Ok(Usage {
+            primary: Some(RateWindow {
+                used_percent: pct,
+                resets_at: Some(reset),
+                window_minutes: Some(43200),
+            }),
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: None,
+        }),
+        (Some(_), None) => Err(FetchError::Decode(
+            "cursor: percent present but billingCycleEnd is missing or invalid".to_string(),
+        )),
+        _ => Err(FetchError::Decode(
+            "cursor: no valid usage window found".to_string(),
+        )),
     }
 }
 

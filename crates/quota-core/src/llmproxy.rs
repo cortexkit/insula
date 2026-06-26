@@ -144,7 +144,10 @@ impl UsageProvider for LlmProxyProvider {
         let url = quota_stats_url(&base)
             .ok_or_else(|| FetchError::NoSession("LLM_PROXY_BASE_URL is empty".to_string()))?;
 
-        let body = JsonRequest::get(url).bearer(&api_key).send(&self.http).await?;
+        let body = JsonRequest::get(url)
+            .bearer(&api_key)
+            .send(&self.http)
+            .await?;
         let usage = normalize_usage(&body)?;
         Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
     }
@@ -184,7 +187,8 @@ mod tests {
 
     #[test]
     fn group_without_reset_is_dropped() {
-        let body = br#"{ "providers": { "x": { "quota_groups": [ { "remaining_percent": 10.0 } ] } } }"#;
+        let body =
+            br#"{ "providers": { "x": { "quota_groups": [ { "remaining_percent": 10.0 } ] } } }"#;
         // Worst group has no reset_time → no well-formed window.
         assert!(normalize_usage(body).unwrap().primary.is_none());
     }

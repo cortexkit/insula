@@ -125,7 +125,11 @@ fn window_minutes(start_raw: Option<i64>, end_raw: Option<i64>) -> Option<i64> {
     let start = start_raw.and_then(epoch_to_secs)?;
     let end = end_raw.and_then(epoch_to_secs)?;
     let minutes = (end - start) / 60;
-    if minutes > 0 { Some(minutes) } else { None }
+    if minutes > 0 {
+        Some(minutes)
+    } else {
+        None
+    }
 }
 
 fn resets_at_iso(end_raw: Option<i64>, remains_raw: Option<i64>, now_secs: i64) -> Option<String> {
@@ -148,9 +152,7 @@ fn resets_at_iso(end_raw: Option<i64>, remains_raw: Option<i64>, now_secs: i64) 
 
 fn is_text_quota_model(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
-    lower.starts_with("minimax-m")
-        || lower.starts_with("m2.")
-        || lower.starts_with("coding-plan")
+    lower.starts_with("minimax-m") || lower.starts_with("m2.") || lower.starts_with("coding-plan")
 }
 
 fn interval_total(m: &ModelRemains) -> i64 {
@@ -206,10 +208,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
         resets_at: Some(resets_at),
-        window_minutes: window_minutes(
-            opt_int(&m.weekly_start_time),
-            opt_int(&m.weekly_end_time),
-        ),
+        window_minutes: window_minutes(opt_int(&m.weekly_start_time), opt_int(&m.weekly_end_time)),
     })
 }
 
@@ -217,11 +216,7 @@ fn check_base_resp(base: &Option<BaseResp>) -> Result<(), FetchError> {
     let Some(base) = base else {
         return Ok(());
     };
-    let status = base
-        .status_code
-        .as_ref()
-        .and_then(decode_int)
-        .unwrap_or(0);
+    let status = base.status_code.as_ref().and_then(decode_int).unwrap_or(0);
     if status == 0 {
         return Ok(());
     }
@@ -230,7 +225,11 @@ fn check_base_resp(base: &Option<BaseResp>) -> Result<(), FetchError> {
         .clone()
         .unwrap_or_else(|| format!("status_code {status}"));
     let lower = message.to_lowercase();
-    if status == 1004 || lower.contains("cookie") || lower.contains("log in") || lower.contains("login") {
+    if status == 1004
+        || lower.contains("cookie")
+        || lower.contains("log in")
+        || lower.contains("login")
+    {
         return Err(FetchError::Unauthorized(message));
     }
     Err(FetchError::Upstream(message))
@@ -398,10 +397,7 @@ mod tests {
         assert_eq!(primary.used_percent, 75.0);
         assert_eq!(primary.window_minutes, Some(300));
         let expected_end_secs = end / 1000;
-        assert_eq!(
-            primary.resets_at,
-            env::epoch_to_iso8601(expected_end_secs)
-        );
+        assert_eq!(primary.resets_at, env::epoch_to_iso8601(expected_end_secs));
         assert!(usage.secondary.is_none());
     }
 
@@ -464,9 +460,6 @@ mod tests {
         assert!(usage.primary.is_some());
         let secondary = usage.secondary.unwrap();
         assert!((secondary.used_percent - 10.4).abs() < 0.01);
-        assert_eq!(
-            secondary.resets_at,
-            env::epoch_to_iso8601(week_end / 1000)
-        );
+        assert_eq!(secondary.resets_at, env::epoch_to_iso8601(week_end / 1000));
     }
 }

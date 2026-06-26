@@ -134,12 +134,13 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
 
     // type Unknown/Error (or absent current/maximum) = no active AI quota — a normal
     // not-configured state, surfaced as NoSession (folds into silent-degrade).
-    let used = used_percent(quota.current.as_deref(), quota.maximum.as_deref()).ok_or_else(|| {
-        FetchError::NoSession(format!(
-            "jetbrains: no active quota (type {:?})",
-            quota.kind.as_deref().unwrap_or("?")
-        ))
-    })?;
+    let used =
+        used_percent(quota.current.as_deref(), quota.maximum.as_deref()).ok_or_else(|| {
+            FetchError::NoSession(format!(
+                "jetbrains: no active quota (type {:?})",
+                quota.kind.as_deref().unwrap_or("?")
+            ))
+        })?;
 
     let resets_at = extract_option_value(xml, "nextRefill")
         .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok())
@@ -147,8 +148,9 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
         .filter(|s| !s.trim().is_empty());
 
     // A quota with no real refill date is not a well-formed window.
-    let resets_at = resets_at
-        .ok_or_else(|| FetchError::Decode("jetbrains: quota present but no refill date".to_string()))?;
+    let resets_at = resets_at.ok_or_else(|| {
+        FetchError::Decode("jetbrains: quota present but no refill date".to_string())
+    })?;
 
     Ok(Usage {
         primary: Some(RateWindow {

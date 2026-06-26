@@ -135,7 +135,10 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .rate_limit
         .ok_or_else(|| FetchError::Decode("usage response missing rate_limit".to_string()))?;
     Ok(Usage {
-        primary: rate_limit.primary_window.as_ref().and_then(normalize_window),
+        primary: rate_limit
+            .primary_window
+            .as_ref()
+            .and_then(normalize_window),
         secondary: rate_limit
             .secondary_window
             .as_ref()
@@ -228,9 +231,8 @@ impl UsageProvider for CodexProvider {
             FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
         })?;
         let auth_path = home.join("auth.json");
-        let data = std::fs::read(&auth_path).map_err(|e| {
-            FetchError::NoSession(format!("reading {}: {e}", auth_path.display()))
-        })?;
+        let data = std::fs::read(&auth_path)
+            .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", auth_path.display())))?;
         let creds = parse_credentials(&data)?;
 
         let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
@@ -338,7 +340,9 @@ mod tests {
             "https://chatgpt.com/backend-api/wham/usage"
         );
         assert_eq!(
-            resolve_usage_url(Some("chatgpt_base_url = \"https://proxy.local/backend-api\"\n")),
+            resolve_usage_url(Some(
+                "chatgpt_base_url = \"https://proxy.local/backend-api\"\n"
+            )),
             "https://proxy.local/backend-api/wham/usage"
         );
     }

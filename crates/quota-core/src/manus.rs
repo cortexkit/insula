@@ -136,7 +136,11 @@ fn flexible_date_iso(value: &Value) -> Option<String> {
         return None;
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     None
 }
@@ -190,9 +194,8 @@ fn decode_credits(body: &[u8]) -> Result<ManusCreditsResponse, FetchError> {
         }
     }
 
-    parse_credits_value(&root).ok_or_else(|| {
-        FetchError::Decode("manus: response missing expected credits fields".into())
-    })
+    parse_credits_value(&root)
+        .ok_or_else(|| FetchError::Decode("manus: response missing expected credits fields".into()))
 }
 
 /// Map refresh allotment to [`Usage`]. Pure — unit-testable.
@@ -219,7 +222,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         Some(RateWindow {
             used_percent,
             resets_at: Some(resets_at),
-            window_minutes: window_minutes_from_refresh_interval(response.refresh_interval.as_deref()),
+            window_minutes: window_minutes_from_refresh_interval(
+                response.refresh_interval.as_deref(),
+            ),
         })
     } else {
         return Err(FetchError::Decode("manus: no refilling window".into()));
@@ -240,7 +245,8 @@ fn window_minutes_from_refresh_interval(interval: Option<&str>) -> Option<i64> {
     if text.is_empty() {
         return None;
     }
-    let normalized: String = text.to_lowercase()
+    let normalized: String = text
+        .to_lowercase()
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
@@ -300,8 +306,9 @@ impl UsageProvider for ManusProvider {
     }
 
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let token = resolve_session_token()
-            .ok_or_else(|| FetchError::NoSession(format!("none of {SESSION_TOKEN_ENV:?} is set")))?;
+        let token = resolve_session_token().ok_or_else(|| {
+            FetchError::NoSession(format!("none of {SESSION_TOKEN_ENV:?} is set"))
+        })?;
 
         let body = JsonRequest::post_json(CREDITS_URL, b"{}".to_vec())
             .bearer(&token)

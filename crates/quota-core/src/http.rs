@@ -179,8 +179,14 @@ impl JsonRequest {
             return Err(FetchError::Unauthorized(format!("HTTP {}", raw.status)));
         }
         if !(200..300).contains(&raw.status) {
-            let excerpt: String = String::from_utf8_lossy(&raw.body).chars().take(200).collect();
-            return Err(FetchError::Upstream(format!("HTTP {}: {excerpt}", raw.status)));
+            let excerpt: String = String::from_utf8_lossy(&raw.body)
+                .chars()
+                .take(200)
+                .collect();
+            return Err(FetchError::Upstream(format!(
+                "HTTP {}: {excerpt}",
+                raw.status
+            )));
         }
         Ok(raw)
     }

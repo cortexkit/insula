@@ -273,9 +273,8 @@ impl UsageProvider for KimiProvider {
     }
 
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let auth_token = resolve_auth_token().ok_or_else(|| {
-            FetchError::NoSession(format!("none of {AUTH_TOKEN_ENV:?} is set"))
-        })?;
+        let auth_token = resolve_auth_token()
+            .ok_or_else(|| FetchError::NoSession(format!("none of {AUTH_TOKEN_ENV:?} is set")))?;
 
         let body = serde_json::to_vec(&json!({ "scope": ["FEATURE_CODING"] }))
             .map_err(|e| FetchError::Decode(e.to_string()))?;

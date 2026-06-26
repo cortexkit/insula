@@ -66,7 +66,11 @@ fn build_subc_core() -> PathBuf {
         .expect("run cargo build for subc-core");
     assert!(status.success(), "building subc-core failed");
     let bin = root.join("target/debug/subc-core");
-    assert!(bin.exists(), "subc-core binary missing at {}", bin.display());
+    assert!(
+        bin.exists(),
+        "subc-core binary missing at {}",
+        bin.display()
+    );
     bin
 }
 

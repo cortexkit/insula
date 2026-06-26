@@ -145,7 +145,9 @@ fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
 fn weekly_window(subscription: &serde_json::Value) -> Option<RateWindow> {
     let rate = subscription.get("rateLimit")?;
     let limit = field_f64(rate, &["weeklyLimit", "limit"]).filter(|l| *l > 0.0)?;
-    let used = field_f64(rate, &["weeklyUsed", "used"]).unwrap_or(0.0).max(0.0);
+    let used = field_f64(rate, &["weeklyUsed", "used"])
+        .unwrap_or(0.0)
+        .max(0.0);
     let resets_at = field_str(rate, "weeklyResetsAt")?;
     Some(RateWindow {
         used_percent: ((used / limit) * 100.0).clamp(0.0, 100.0),
@@ -241,7 +243,8 @@ mod tests {
 
     #[test]
     fn credits_and_weekly_windows() {
-        let usage = br#"{ "usage": 250, "quota": 1000, "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
+        let usage =
+            br#"{ "usage": 250, "quota": 1000, "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
         let subscription = br#"{ "rateLimit": { "weeklyUsed": 30, "weeklyLimit": 100, "weeklyResetsAt": "2026-06-29T00:00:00Z" } }"#;
         let result = normalize_usage(usage, Some(subscription)).unwrap();
         let primary = result.primary.unwrap();
@@ -255,7 +258,8 @@ mod tests {
     #[test]
     fn credits_derived_from_used_plus_remaining() {
         // No explicit quota; total = used + remaining. String numbers too.
-        let usage = br#"{ "used": "20", "remaining": "80", "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
+        let usage =
+            br#"{ "used": "20", "remaining": "80", "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
         let result = normalize_usage(usage, None).unwrap();
         assert_eq!(result.primary.unwrap().used_percent, 20.0);
     }

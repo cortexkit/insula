@@ -245,7 +245,11 @@ pub async fn fetch_workspace_id(
     })
 }
 
-async fn server_get(client: &reqwest::Client, url: &str, headers: Vec<Header>) -> Result<String, FetchError> {
+async fn server_get(
+    client: &reqwest::Client,
+    url: &str,
+    headers: Vec<Header>,
+) -> Result<String, FetchError> {
     let req = apply_headers(JsonRequest::get(url).timeout(REQUEST_TIMEOUT), headers);
     let bytes = req.send(client).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -414,7 +418,8 @@ fn first_window_dict<'a>(
     dict: &'a serde_json::Map<String, Value>,
     keys: &[&str],
 ) -> Option<&'a serde_json::Map<String, Value>> {
-    keys.iter().find_map(|k| dict.get(*k).and_then(|v| v.as_object()))
+    keys.iter()
+        .find_map(|k| dict.get(*k).and_then(|v| v.as_object()))
 }
 
 fn parse_usage_dict(
@@ -541,7 +546,9 @@ fn parse_windows_regex(text: &str, now_secs: i64, include_monthly: bool) -> Opti
     let tertiary = if include_monthly {
         window_block(text, "monthlyUsage").and_then(|block| {
             let p = field_after_key(block, "usagePercent")?;
-            let r = RESET_IN_KEYS.iter().find_map(|k| field_after_key_i64(block, k))?;
+            let r = RESET_IN_KEYS
+                .iter()
+                .find_map(|k| field_after_key_i64(block, k))?;
             window_from_parts(p, r, now_secs, MONTHLY_WINDOW_MINUTES)
         })
     } else {
@@ -578,7 +585,11 @@ fn window_from_parts(
     })
 }
 
-pub fn parse_windows(text: &str, now_secs: i64, include_monthly: bool) -> Result<Usage, FetchError> {
+pub fn parse_windows(
+    text: &str,
+    now_secs: i64,
+    include_monthly: bool,
+) -> Result<Usage, FetchError> {
     if looks_signed_out(text) {
         return Err(FetchError::Unauthorized(
             "opencode: signed-out response body".to_string(),
@@ -619,7 +630,9 @@ fn map_cookie_err(e: CookieError) -> FetchError {
         CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
             FetchError::NoSession(e.to_string())
         }
-        CookieError::NoKeychainKey(_) | CookieError::Extract(_) => FetchError::Upstream(e.to_string()),
+        CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+            FetchError::Upstream(e.to_string())
+        }
     }
 }
 

@@ -83,10 +83,20 @@ const RESET_KEYS: &[&str] = &[
     "endAt",
     "end_at",
 ];
-const WINDOW_MINUTES_KEYS: &[&str] = &["windowMinutes", "window_minutes", "periodMinutes", "period_minutes"];
+const WINDOW_MINUTES_KEYS: &[&str] = &[
+    "windowMinutes",
+    "window_minutes",
+    "periodMinutes",
+    "period_minutes",
+];
 const WINDOW_HOURS_KEYS: &[&str] = &["windowHours", "window_hours", "periodHours", "period_hours"];
 const WINDOW_DAYS_KEYS: &[&str] = &["windowDays", "window_days", "periodDays", "period_days"];
-const WINDOW_SECONDS_KEYS: &[&str] = &["windowSeconds", "window_seconds", "periodSeconds", "period_seconds"];
+const WINDOW_SECONDS_KEYS: &[&str] = &[
+    "windowSeconds",
+    "window_seconds",
+    "periodSeconds",
+    "period_seconds",
+];
 const WINDOW_STRING_KEYS: &[&str] = &[
     "window",
     "windowLabel",
@@ -172,7 +182,11 @@ fn parse_date_value(val: &serde_json::Value) -> Option<String> {
             return epoch_to_iso8601_f64(n);
         }
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-            return Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            return Some(
+                dt.with_timezone(&chrono::Utc)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string(),
+            );
         }
     }
     None
@@ -316,20 +330,32 @@ fn named_quota(val: &serde_json::Value, _label: &str) -> Option<RateWindow> {
     }
 }
 
-fn prioritized_quota_slots(root: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<Option<RateWindow>>> {
+fn prioritized_quota_slots(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<Option<RateWindow>>> {
     let data_dict = root.get("data").and_then(|v| v.as_object());
 
-    let rolling = root.get("rollingFiveHourLimit")
+    let rolling = root
+        .get("rollingFiveHourLimit")
         .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
         .and_then(|v| named_quota(v, "Rolling five-hour limit"));
 
-    let weekly = root.get("weeklyTokenLimit")
+    let weekly = root
+        .get("weeklyTokenLimit")
         .or_else(|| data_dict.and_then(|d| d.get("weeklyTokenLimit")))
         .and_then(|v| named_quota(v, "Weekly token limit"));
 
-    let search_hourly = root.get("search").and_then(|v| v.as_object())
+    let search_hourly = root
+        .get("search")
+        .and_then(|v| v.as_object())
         .and_then(|s| s.get("hourly"))
-        .or_else(|| data_dict.and_then(|d| d.get("search").and_then(|v| v.as_object()).and_then(|s| s.get("hourly"))))
+        .or_else(|| {
+            data_dict.and_then(|d| {
+                d.get("search")
+                    .and_then(|v| v.as_object())
+                    .and_then(|s| s.get("hourly"))
+            })
+        })
         .and_then(|v| named_quota(v, "Search hourly"));
 
     if rolling.is_some() || weekly.is_some() || search_hourly.is_some() {
@@ -339,7 +365,9 @@ fn prioritized_quota_slots(root: &serde_json::Map<String, serde_json::Value>) ->
     }
 }
 
-fn fallback_quota_objects(root: &serde_json::Map<String, serde_json::Value>) -> Vec<serde_json::Map<String, serde_json::Value>> {
+fn fallback_quota_objects(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
     let data_dict = root.get("data").and_then(|v| v.as_object());
 
     let keys = &[
@@ -375,7 +403,9 @@ fn fallback_quota_objects(root: &serde_json::Map<String, serde_json::Value>) -> 
     Vec::new()
 }
 
-fn extract_quota_objects(val: &serde_json::Value) -> Vec<serde_json::Map<String, serde_json::Value>> {
+fn extract_quota_objects(
+    val: &serde_json::Value,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
     let mut results = Vec::new();
     match val {
         serde_json::Value::Array(arr) => {
@@ -420,7 +450,11 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             map.insert("quotas".to_string(), serde_json::Value::Array(arr));
             map
         }
-        _ => return Err(FetchError::Decode("synthetic response is neither object nor array".to_string())),
+        _ => {
+            return Err(FetchError::Decode(
+                "synthetic response is neither object nor array".to_string(),
+            ))
+        }
     };
 
     if let Some(slots) = prioritized_quota_slots(&root) {
@@ -480,9 +514,8 @@ impl UsageProvider for SyntheticProvider {
     }
 
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV).ok_or_else(|| {
-            FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set"))
-        })?;
+        let api_key = env::first_env(API_KEY_ENV)
+            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
         let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
 
         let body = JsonRequest::get(base)

@@ -45,7 +45,11 @@ struct SubscriptionResponse {
 /// Build the subscription URL, honoring a `/v1`-suffixed base (don't double it).
 fn subscription_url(base: &str) -> String {
     let trimmed = base.trim().trim_end_matches('/');
-    let base = if trimmed.is_empty() { DEFAULT_BASE } else { trimmed };
+    let base = if trimmed.is_empty() {
+        DEFAULT_BASE
+    } else {
+        trimmed
+    };
     if base.ends_with("/v1") {
         format!("{base}/user/subscription")
     } else {
@@ -111,9 +115,8 @@ impl UsageProvider for ElevenLabsProvider {
     }
 
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV).ok_or_else(|| {
-            FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set"))
-        })?;
+        let api_key = env::first_env(API_KEY_ENV)
+            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
         let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
         let url = subscription_url(&base);
 

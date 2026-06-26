@@ -79,8 +79,7 @@ struct LocalServer {
 /// which we cannot auth so skip).
 fn classify_command(command: &str) -> Option<String> {
     let lower = command.to_ascii_lowercase();
-    let is_language_server =
-        lower.contains("language_server") || lower.contains("language-server");
+    let is_language_server = lower.contains("language_server") || lower.contains("language-server");
     let is_antigravity = lower.contains("antigravity");
     let is_cli = lower.contains("antigravity-cli")
         || lower.contains("antigravity_cli")
@@ -456,7 +455,9 @@ impl AntigravityProvider {
             // Containment guard: this client disables cert validation, so it must
             // only ever talk to loopback. Refuse anything else.
             if !is_loopback_url(&url) {
-                return Err(FetchError::Upstream("refusing non-loopback URL".to_string()));
+                return Err(FetchError::Upstream(
+                    "refusing non-loopback URL".to_string(),
+                ));
             }
 
             let mut req = JsonRequest::post_json(url, b"{\"forceRefresh\":true}".to_vec())
@@ -506,9 +507,8 @@ impl UsageProvider for AntigravityProvider {
             ));
         }
 
-        let mut last_err = FetchError::NoSession(
-            "no Antigravity loopback port served quota".to_string(),
-        );
+        let mut last_err =
+            FetchError::NoSession("no Antigravity loopback port served quota".to_string());
         for server in &servers {
             let ports = discover_ports(server.pid);
             for port in ports {

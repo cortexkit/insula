@@ -134,10 +134,11 @@ impl Registry {
             out.push(entry);
         }
 
-        self.cache
-            .lock()
-            .expect("usage cache mutex poisoned")
-            .put(provider_filter, out.clone(), now);
+        self.cache.lock().expect("usage cache mutex poisoned").put(
+            provider_filter,
+            out.clone(),
+            now,
+        );
         out
     }
 }

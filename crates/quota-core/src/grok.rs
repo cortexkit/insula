@@ -122,7 +122,8 @@ fn scan_message(bytes: &[u8], path: &[u64], scan: &mut Scan) {
                 if i + 4 > bytes.len() {
                     break;
                 }
-                let value = f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                let value =
+                    f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
                 scan.order += 1;
                 scan.fixed32.push(Fixed32Field {
                     path: field_path,
@@ -203,7 +204,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         }
     }
     if frames.is_empty() {
-        return Err(FetchError::Decode("grok: no gRPC-web data frame".to_string()));
+        return Err(FetchError::Decode(
+            "grok: no gRPC-web data frame".to_string(),
+        ));
     }
 
     let mut scan = Scan::default();
@@ -219,12 +222,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .filter(|f| {
             f.path.last() == Some(&1) && f.value.is_finite() && (0.0..=100.0).contains(&f.value)
         })
-        .min_by(|a, b| {
-            a.path
-                .len()
-                .cmp(&b.path.len())
-                .then(a.order.cmp(&b.order))
-        })
+        .min_by(|a, b| a.path.len().cmp(&b.path.len()).then(a.order.cmp(&b.order)))
         // The wire value is a 32-bit float; widening to f64 exposes its imprecision
         // (e.g. 76.57 → 76.58000183…). Round to 2 dp so the consumer gets a clean
         // percent rather than float noise.
@@ -307,7 +305,9 @@ impl UsageProvider for GrokProvider {
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
         let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
             .map_err(FetchError::NoSession)?
-            .ok_or_else(|| FetchError::NoSession("no xai entry in opencode auth.json".to_string()))?;
+            .ok_or_else(|| {
+                FetchError::NoSession("no xai entry in opencode auth.json".to_string())
+            })?;
         let access = match auth {
             OpencodeAuth::Oauth { access, .. } => access,
             OpencodeAuth::Api { key } => key,
@@ -400,9 +400,6 @@ mod tests {
 
     #[test]
     fn empty_body_is_decode_error() {
-        assert!(matches!(
-            normalize_usage(&[]),
-            Err(FetchError::Decode(_))
-        ));
+        assert!(matches!(normalize_usage(&[]), Err(FetchError::Decode(_))));
     }
 }

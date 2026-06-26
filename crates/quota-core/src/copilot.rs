@@ -88,7 +88,11 @@ impl QuotaSnapshot {
 /// Build one quota snapshot from the `monthly_quotas`/`limited_user_quotas`
 /// fallback (`monthly` = entitlement, `limited` = remaining). Faithful to
 /// CodexBar's makeQuotaSnapshot: both required, entitlement must be > 0.
-fn snapshot_from_counts(monthly: Option<f64>, limited: Option<f64>, quota_id: &str) -> Option<QuotaSnapshot> {
+fn snapshot_from_counts(
+    monthly: Option<f64>,
+    limited: Option<f64>,
+    quota_id: &str,
+) -> Option<QuotaSnapshot> {
     let entitlement = monthly?.max(0.0);
     let remaining = limited?.max(0.0);
     if entitlement <= 0.0 {
@@ -109,7 +113,10 @@ fn snapshot_from_counts(monthly: Option<f64>, limited: Option<f64>, quota_id: &s
 fn normalize_reset(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-        return dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        return dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
         if let Some(dt) = date.and_hms_opt(0, 0, 0) {

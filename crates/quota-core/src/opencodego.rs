@@ -34,12 +34,10 @@ async fn fetch_go_page_html(
         .timeout(REQUEST_TIMEOUT)
         .header(Header::new("Cookie", cookie.to_string()))
         .header(Header::new("User-Agent", USER_AGENT.to_string()))
-        .header(
-            Header::new(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
-            ),
-        )
+        .header(Header::new(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
+        ))
         .send(client)
         .await?;
     let text = String::from_utf8_lossy(&bytes).into_owned();

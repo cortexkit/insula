@@ -61,8 +61,11 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
         .filter(|s| !s.is_empty())
         .ok_or_else(|| FetchError::Decode("no rate-limit headers".to_string()))?;
 
-    let resets_at = parse_reset_time(reset_raw)
-        .ok_or_else(|| FetchError::Decode(format!("unparseable x-ratelimit-reset-requests: {reset_raw}")))?;
+    let resets_at = parse_reset_time(reset_raw).ok_or_else(|| {
+        FetchError::Decode(format!(
+            "unparseable x-ratelimit-reset-requests: {reset_raw}"
+        ))
+    })?;
 
     let (remaining, limit) = (
         headers.remaining_requests.unwrap_or(0),
@@ -101,13 +104,25 @@ fn parse_reset_time(value: &str) -> Option<String> {
     }
 
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Some(dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return Some(dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
     if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ") {
-        return Some(dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        return Some(
+            dt.with_timezone(&Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
+        );
     }
 
     let mut seconds: f64 = 0.0;
@@ -176,7 +191,10 @@ async fn probe_model(
         .await?;
 
     if response.status == 401 {
-        return Err(FetchError::Unauthorized(format!("HTTP {}", response.status)));
+        return Err(FetchError::Unauthorized(format!(
+            "HTTP {}",
+            response.status
+        )));
     }
     if response.status != 200 && response.status != 429 {
         let excerpt: String = String::from_utf8_lossy(&response.body)
@@ -255,9 +273,8 @@ impl UsageProvider for DoubaoProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            FetchError::Upstream("all probe models failed".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| FetchError::Upstream("all probe models failed".to_string())))
     }
 }
 

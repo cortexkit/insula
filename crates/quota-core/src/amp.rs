@@ -102,7 +102,8 @@ fn looks_signed_out(html: &str) -> bool {
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchError> {
-    let block_pos = html.find("freeTierUsage")
+    let block_pos = html
+        .find("freeTierUsage")
         .or_else(|| html.find("getFreeTierUsage"));
 
     let block = match block_pos {
@@ -225,7 +226,10 @@ impl UsageProvider for AmpProvider {
             .await?;
 
         if response.status == 401 || response.status == 403 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", response.status)));
+            return Err(FetchError::Unauthorized(format!(
+                "HTTP {}",
+                response.status
+            )));
         }
 
         if (300..400).contains(&response.status) {

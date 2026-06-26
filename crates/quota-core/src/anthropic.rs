@@ -157,7 +157,10 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 16.0); // already a percent, NOT /100
         assert_eq!(primary.window_minutes, Some(300));
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T17:00:00.175593+00:00"));
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-06-22T17:00:00.175593+00:00")
+        );
         assert_eq!(usage.secondary.unwrap().used_percent, 48.0);
         // opus is null, so tertiary falls back to sonnet.
         assert_eq!(usage.tertiary.unwrap().used_percent, 4.0);
