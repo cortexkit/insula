@@ -77,6 +77,7 @@ struct LocalServer {
 /// Whether a command line is an Antigravity language server or `agy` CLI, and the
 /// CSRF token to use (empty string = CLI, needs none; None = app/IDE with no token,
 /// which we cannot auth so skip).
+#[cfg(any(target_os = "macos", test))]
 fn classify_command(command: &str) -> Option<String> {
     let lower = command.to_ascii_lowercase();
     let is_language_server = lower.contains("language_server") || lower.contains("language-server");
@@ -98,6 +99,7 @@ fn classify_command(command: &str) -> Option<String> {
 }
 
 /// Extract the value of `--csrf_token` (`--csrf_token=VALUE` or `--csrf_token VALUE`).
+#[cfg(any(target_os = "macos", test))]
 fn extract_csrf_token(command: &str) -> Option<String> {
     let flag = "--csrf_token";
     let at = command.find(flag)? + flag.len();
@@ -114,6 +116,7 @@ fn extract_csrf_token(command: &str) -> Option<String> {
 }
 
 /// Parse `ps -ax -o pid=,command=` output into candidate Antigravity servers.
+#[cfg(any(target_os = "macos", test))]
 fn parse_process_list(output: &str) -> Vec<LocalServer> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -133,6 +136,7 @@ fn parse_process_list(output: &str) -> Vec<LocalServer> {
 
 /// Parse loopback listening ports from `lsof -nP -iTCP -sTCP:LISTEN` output. Each
 /// listening line ends with `:<port> (LISTEN)`.
+#[cfg(any(target_os = "macos", test))]
 fn parse_listening_ports(output: &str) -> Vec<u16> {
     let mut ports = Vec::new();
     for line in output.lines() {
@@ -650,5 +654,21 @@ mod tests {
             agy 123 user 9u IPv4 0x0 0t0 TCP 127.0.0.1:443 (ESTABLISHED)\n";
         let ports = parse_listening_ports(lsof);
         assert_eq!(ports, vec![51234, 51235]);
+    }
+
+    #[test]
+    fn parses_process_list_keeps_only_antigravity_servers() {
+        let ps = "  123 /Applications/Antigravity.app/Contents/MacOS/agy\n\
+            456 /Applications/Antigravity.app/language_server --csrf_token=tok antigravity\n\
+            789 /usr/bin/node unrelated.js\n\
+            notapid garbage line\n";
+        let servers = parse_process_list(ps);
+        assert_eq!(servers.len(), 2);
+        // CLI process: no token.
+        assert_eq!(servers[0].pid, 123);
+        assert_eq!(servers[0].csrf_token, "");
+        // App language server: token extracted.
+        assert_eq!(servers[1].pid, 456);
+        assert_eq!(servers[1].csrf_token, "tok");
     }
 }

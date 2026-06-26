@@ -234,6 +234,7 @@ fn decrypt_value(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String>
 
 /// The `v10` decryption, factored out so tests can exercise it with a synthetic
 /// blob encrypted under a known key (no real keychain needed).
+#[cfg(any(target_os = "macos", test))]
 fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
     use sha2::{Digest, Sha256};
