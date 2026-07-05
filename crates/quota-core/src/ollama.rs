@@ -230,6 +230,10 @@ impl UsageProvider for OllamaProvider {
         PROVIDER_NAME
     }
 
+    fn is_cookie_based(&self) -> bool {
+        true
+    }
+
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
         let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
             // No store / no cookie / unsupported platform → simply not logged in here.

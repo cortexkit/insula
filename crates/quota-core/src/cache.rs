@@ -44,6 +44,17 @@ impl UsageCache {
         }
     }
 
+    /// Return the most recent FULL sweep (unfiltered) and its age, ignoring TTL.
+    ///
+    /// Health summarization uses this: it wants the last serving pass regardless
+    /// of freshness, because staleness is itself a reported signal (the age is
+    /// returned) rather than a reason to hide the sweep. `None` when no full
+    /// sweep has been cached yet.
+    pub fn latest_full_sweep(&self, now: Instant) -> Option<(Vec<ProviderUsage>, Duration)> {
+        let entry = self.entries.get(&Self::key(None))?;
+        Some((entry.value.clone(), now.duration_since(entry.stored_at)))
+    }
+
     /// Store an array under the given filter.
     pub fn put(&mut self, provider_filter: Option<&str>, value: Vec<ProviderUsage>, now: Instant) {
         self.entries.insert(

@@ -21,6 +21,7 @@ pub mod env;
 pub mod factory;
 pub mod gemini;
 pub mod grok;
+pub mod health;
 pub mod http;
 pub mod jetbrains;
 pub mod kilo;
@@ -46,6 +47,7 @@ use std::{
 };
 
 use cache::UsageCache;
+use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::UsageProvider;
 
@@ -140,5 +142,181 @@ impl Registry {
             now,
         );
         out
+    }
+
+    /// A cheap domain-health snapshot (subc L3): summarize the last cached full
+    /// sweep without fetching. Reports how many providers — and how many of the
+    /// browser-cookie cohort — were degraded in that sweep, plus the sweep's
+    /// age. The serving cache lock being poisoned (a panicked serving task) is
+    /// reported as `cache_poisoned`, the one condition the module maps to
+    /// `failing`; every other state is `ok` with degraded detail, because a
+    /// provider degrading (no local creds) is this prober's normal resting state
+    /// on any given box, not a module fault.
+    pub fn health(&self) -> HealthSnapshot {
+        let cookie_names: std::collections::HashSet<&str> = self
+            .providers
+            .iter()
+            .filter(|p| p.is_cookie_based())
+            .map(|p| p.name())
+            .collect();
+        let providers_total = self.providers.len();
+        let cookie_cohort_total = cookie_names.len();
+
+        // Poison-tolerant: a poisoned serving mutex is the real data-path fault
+        // we must surface (fail-closed), not panic on in the health path.
+        let guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
+        };
+        let sweep = guard.latest_full_sweep(Instant::now());
+        drop(guard);
+
+        let Some((entries, age)) = sweep else {
+            // No sweep cached yet: healthy, just not-yet-exercised.
+            return HealthSnapshot {
+                providers_total,
+                providers_ok: providers_total,
+                degraded: Vec::new(),
+                cookie_cohort_total,
+                cookie_cohort_degraded: Vec::new(),
+                last_sweep_age: None,
+                cache_poisoned: false,
+            };
+        };
+
+        let mut degraded = Vec::new();
+        let mut cookie_cohort_degraded = Vec::new();
+        for entry in &entries {
+            if entry.error.is_some() {
+                if cookie_names.contains(entry.provider.as_str()) {
+                    cookie_cohort_degraded.push(entry.provider.clone());
+                }
+                degraded.push(entry.provider.clone());
+            }
+        }
+        let providers_ok = providers_total.saturating_sub(degraded.len());
+
+        HealthSnapshot {
+            providers_total,
+            providers_ok,
+            degraded,
+            cookie_cohort_total,
+            cookie_cohort_degraded,
+            last_sweep_age: Some(age),
+            cache_poisoned: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::model::Usage;
+    use crate::provider::FetchError;
+
+    /// A stub provider with a controllable outcome, so health() can be tested
+    /// against a real sweep rather than a mocked snapshot.
+    struct StubProvider {
+        name: &'static str,
+        cookie: bool,
+        ok: bool,
+    }
+
+    #[async_trait]
+    impl UsageProvider for StubProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn is_cookie_based(&self) -> bool {
+            self.cookie
+        }
+        async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
+            if self.ok {
+                Ok(ProviderUsage::healthy(
+                    self.name,
+                    None,
+                    "test",
+                    Usage::default(),
+                ))
+            } else {
+                Err(FetchError::NoSession("stub degraded".into()))
+            }
+        }
+    }
+
+    fn registry(specs: &[(&'static str, bool, bool)]) -> Registry {
+        let providers: Vec<Box<dyn UsageProvider>> = specs
+            .iter()
+            .map(|&(name, cookie, ok)| {
+                Box::new(StubProvider { name, cookie, ok }) as Box<dyn UsageProvider>
+            })
+            .collect();
+        Registry::new(providers, cache::DEFAULT_TTL)
+    }
+
+    #[tokio::test]
+    async fn health_reflects_the_last_sweeps_degraded_providers() {
+        let reg = registry(&[
+            ("codex", false, true),       // healthy api/oauth provider
+            ("cursor", true, false),      // degraded cookie provider (stale login)
+            ("amp", true, true),          // healthy cookie provider
+            ("elevenlabs", false, false), // degraded api provider (no key)
+        ]);
+
+        // Before any sweep: healthy-but-unexercised, no degraded list.
+        let pre = reg.health();
+        assert_eq!(pre.providers_total, 4);
+        assert_eq!(pre.cookie_cohort_total, 2);
+        assert_eq!(pre.providers_ok, 4);
+        assert!(pre.degraded.is_empty());
+        assert_eq!(pre.last_sweep_age, None);
+        assert!(!pre.cache_poisoned);
+
+        // Exercise the serving path so a real sweep is cached.
+        let _ = reg.get_usage(None).await;
+
+        // Non-vacuity: health() must now reflect the ACTUAL sweep outcome. This
+        // assertion fails if health() returns a blind "ok".
+        let post = reg.health();
+        assert_eq!(post.providers_total, 4);
+        assert_eq!(post.providers_ok, 2);
+        assert_eq!(post.degraded.len(), 2);
+        assert!(post.degraded.contains(&"cursor".to_string()));
+        assert!(post.degraded.contains(&"elevenlabs".to_string()));
+        // Only the cookie provider that degraded counts toward cohort staleness.
+        assert_eq!(post.cookie_cohort_total, 2);
+        assert_eq!(post.cookie_cohort_degraded, vec!["cursor".to_string()]);
+        assert!(post.last_sweep_age.is_some());
+        assert!(!post.cache_poisoned);
+        assert!(!post.is_failing());
+    }
+
+    #[tokio::test]
+    async fn health_all_healthy_reports_none_degraded() {
+        let reg = registry(&[("codex", false, true), ("amp", true, true)]);
+        let _ = reg.get_usage(None).await;
+        let h = reg.health();
+        assert_eq!(h.providers_ok, 2);
+        assert!(h.degraded.is_empty());
+        assert!(h.cookie_cohort_degraded.is_empty());
+        assert!(!h.is_failing());
+    }
+
+    #[test]
+    fn poisoned_cache_reports_failing() {
+        let reg = registry(&[("codex", false, true), ("cursor", true, true)]);
+        // Poison the serving mutex the way a panicked serving task would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.cache.lock().unwrap();
+            panic!("poison the usage cache mutex");
+        }));
+        let h = reg.health();
+        assert!(h.cache_poisoned);
+        assert!(h.is_failing());
+        // Totals still computed from the provider set even under poison.
+        assert_eq!(h.providers_total, 2);
+        assert_eq!(h.cookie_cohort_total, 1);
     }
 }

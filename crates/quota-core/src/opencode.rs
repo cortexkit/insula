@@ -660,6 +660,10 @@ impl UsageProvider for OpenCodeProvider {
         PROVIDER_NAME
     }
 
+    fn is_cookie_based(&self) -> bool {
+        true
+    }
+
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
         let cookie = load_cookie_header()?;
         let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;

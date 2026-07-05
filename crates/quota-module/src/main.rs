@@ -23,7 +23,9 @@ use subc_protocol::{
         Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
-    session::{ModuleControlRequest, ModuleControlResponse},
+    session::{
+        HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
@@ -160,7 +162,10 @@ async fn send_hello(
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest: manifest(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: None,
+        // Advertise health.check so the daemon actively probes us (capability-
+        // gated: unadvertised = health "unknown", never probed). We answer L2
+        // through the same frame path and report L3 domain health from the sweep.
+        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
         // Echo the one-time launch nonce subc injects via SUBC_LAUNCH_NONCE for a
         // reserved module; absent (None) for a normally-supervised module like this one.
         launch_nonce: std::env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
@@ -220,7 +225,7 @@ async fn handle_frame(
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => Ok(true), // route goodbye: nothing to tear down (no per-route state).
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer).await?;
+            handle_control_request(frame, writer, registry).await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -240,26 +245,72 @@ async fn handle_frame(
 async fn handle_control_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
+    registry: &Arc<Registry>,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
-    match request {
+    let response_body = match request {
         ModuleControlRequest::RouteBind { .. } => {
             // Machine-global surface: accept every bind. We key on no identity,
             // so there is nothing to validate or store — just ack.
-            let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
-                .map_err(ModuleError::Json)?;
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                control_flags(),
-                0,
-                frame.header.corr,
-                body,
-            )
-            .map_err(|e| ModuleError::Message(e.to_string()))?;
-            send(writer, response).await
+            ModuleControlResponse::RouteBindAck {}
         }
+        ModuleControlRequest::HealthCheck {} => {
+            // L3 domain health from the last usage sweep — cheap, no fetch. Only
+            // a poisoned serving cache (a panicked serving task) is `failing`;
+            // otherwise `ok`, because a provider degrading on a box without its
+            // creds is this prober's normal state, carried as detail not status.
+            health_report(&registry.health())
+        }
+    };
+    let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        control_flags(),
+        0,
+        frame.header.corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, response).await
+}
+
+/// Map the core health snapshot onto the subc health-report wire shape. Status
+/// is `failing` only when the serving cache is poisoned (real data-path fault);
+/// every other state is `ok` with the degraded providers and cookie-cohort
+/// staleness carried as opaque `detail`/`metrics` for `supervisor.health`.
+fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControlResponse {
+    let status = if snapshot.is_failing() {
+        HealthStatus::Failing
+    } else {
+        HealthStatus::Ok
+    };
+    let detail = if snapshot.cache_poisoned {
+        Some("usage cache mutex poisoned: a serving task panicked".to_string())
+    } else if !snapshot.degraded.is_empty() {
+        Some(format!(
+            "{}/{} providers degraded ({} of {} cookie-cohort)",
+            snapshot.degraded.len(),
+            snapshot.providers_total,
+            snapshot.cookie_cohort_degraded.len(),
+            snapshot.cookie_cohort_total,
+        ))
+    } else {
+        None
+    };
+    let metrics = json!({
+        "providersTotal": snapshot.providers_total,
+        "providersOk": snapshot.providers_ok,
+        "degraded": snapshot.degraded,
+        "cookieCohortTotal": snapshot.cookie_cohort_total,
+        "cookieCohortDegraded": snapshot.cookie_cohort_degraded,
+        "lastSweepAgeSecs": snapshot.last_sweep_age.map(|d| d.as_secs()),
+    });
+    ModuleControlResponse::HealthCheck {
+        status,
+        detail,
+        metrics: Some(metrics),
     }
 }
 
@@ -443,3 +494,93 @@ impl fmt::Display for ModuleError {
 }
 
 impl Error for ModuleError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the REAL channel-0 control handler with a `health.check` Request and
+    /// assert it answers with a well-formed `HealthCheck` Response carrying the
+    /// domain metrics. Exercises the actual arm + registry + mapper, not a mock.
+    #[tokio::test]
+    async fn health_check_control_request_returns_domain_report() {
+        let registry = Arc::new(Registry::with_defaults());
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+
+        let request = ModuleControlRequest::HealthCheck {};
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            control_flags(),
+            0,
+            42,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+
+        handle_control_request(frame, &tx, &registry).await.unwrap();
+
+        let response = rx.try_recv().expect("a response frame was sent");
+        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.channel, 0);
+        assert_eq!(response.header.corr, 42);
+
+        let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
+        let ModuleControlResponse::HealthCheck {
+            status, metrics, ..
+        } = body
+        else {
+            panic!("expected a HealthCheck response");
+        };
+        // No sweep has run in this fresh registry, so it is healthy-unexercised.
+        assert_eq!(status, HealthStatus::Ok);
+        let metrics = metrics.expect("health report carries metrics");
+        let obj = metrics.as_object().expect("metrics is a JSON object");
+        for key in [
+            "providersTotal",
+            "providersOk",
+            "degraded",
+            "cookieCohortTotal",
+            "cookieCohortDegraded",
+            "lastSweepAgeSecs",
+        ] {
+            assert!(obj.contains_key(key), "metrics include {key}");
+        }
+        // The default registry has the full provider set and a non-empty cookie
+        // cohort — a real count, not a placeholder.
+        assert!(obj["providersTotal"].as_u64().unwrap() >= 27);
+        assert!(obj["cookieCohortTotal"].as_u64().unwrap() >= 7);
+    }
+
+    /// The `route.bind` arm still acks unchanged after threading the registry in.
+    #[tokio::test]
+    async fn route_bind_control_request_still_acks() {
+        let registry = Arc::new(Registry::with_defaults());
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+
+        let bind = serde_json::json!({
+            "op": "route.bind",
+            "route_channel": 7,
+            "target": { "kind": "management_surface", "module_id": MODULE_ID_FOR_TEST },
+            "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
+        });
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            control_flags(),
+            0,
+            7,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap();
+
+        handle_control_request(frame, &tx, &registry).await.unwrap();
+
+        let response = rx.try_recv().expect("a response frame was sent");
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(matches!(body, ModuleControlResponse::RouteBindAck {}));
+    }
+
+    const MODULE_ID_FOR_TEST: &str = "ai-provider-quota";
+}

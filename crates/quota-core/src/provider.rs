@@ -22,6 +22,15 @@ pub trait UsageProvider: Send + Sync {
 
     /// Fetch and normalize this provider's usage from its real session.
     async fn fetch(&self) -> Result<ProviderUsage, FetchError>;
+
+    /// Whether this provider authenticates via a scraped local browser cookie
+    /// (the desktop-coupled cohort). Default `false`; the cookie providers
+    /// override to `true`. Health summarization uses this to count how much of
+    /// the cookie cohort is degraded — a stale-browser-login signal distinct
+    /// from an ordinary missing-credential degrade.
+    fn is_cookie_based(&self) -> bool {
+        false
+    }
 }
 
 /// Why a provider could not produce usage. Always foldable into a degraded
