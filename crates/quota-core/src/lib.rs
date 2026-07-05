@@ -47,7 +47,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{stream, StreamExt};
+use std::panic::AssertUnwindSafe;
+
+use futures_util::{stream, FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use health::HealthSnapshot;
@@ -55,6 +57,23 @@ use model::ProviderUsage;
 use provider::UsageProvider;
 use refresh::{next_slot_on_failure, next_slot_on_success, SlotStatus, STALL_HORIZON};
 use store::SlotStore;
+
+/// The outcome of one provider fetch attempt within a refresher sweep. The
+/// success payload is boxed so the enum stays small (the healthy `ProviderUsage`
+/// dwarfs the other variants).
+enum FetchOutcome {
+    /// Fetch resolved successfully.
+    Ok(Box<ProviderUsage>),
+    /// Fetch returned a normal error (classified transient/non-transient).
+    Err(provider::FetchError),
+    /// The whole fetch exceeded [`refresh::FETCH_DEADLINE`] — transient.
+    TimedOut,
+    /// The fetch future panicked — contained here as that provider's own
+    /// non-transient failure, never a crash of the refresher loop.
+    Panicked,
+    /// Shutdown was requested before/while fetching — skip, leave the slot.
+    Cancelled,
+}
 
 /// The provider registry: holds the fetchers and the refresher-owned slot store,
 /// and serves the `usage.get` query from the store WITHOUT ever fetching inline
@@ -115,7 +134,7 @@ impl Registry {
 
     /// Serve `usage.get`: return the usage array from the slot store, optionally
     /// filtered to one provider. CACHE-ONLY — this NEVER fetches, so it never
-    /// blocks on the network (the Q4 non-blocking guarantee); the background
+    /// blocks on the network (the non-blocking read guarantee); the background
     /// refresher owns all fetching. Providers not yet resolved are simply absent
     /// from the array (the honest cold state). Entries are assembled in registry
     /// order for a stable response, not `HashMap` order.
@@ -179,44 +198,65 @@ impl Registry {
         }
 
         // Fetch the due providers concurrently (cap-bounded), each under a hard
-        // whole-fetch deadline. Nothing here holds the store lock.
-        let results = stream::iter(due.into_iter().map(|idx| {
+        // whole-fetch deadline, publishing EACH result the moment it completes
+        // (a fast provider is not held behind a slow one). Nothing holds the
+        // store lock across a fetch: for each result we clone `prev` under the
+        // lock, drop it, compute the next slot OUTSIDE the lock, then re-lock
+        // only to insert.
+        let mut stream = stream::iter(due.into_iter().map(|idx| {
             let provider = &self.providers[idx];
             async move {
                 let name = provider.name().to_string();
                 let attempt_start = Instant::now();
+                // Contain a panicking provider: its unwind becomes a
+                // non-transient failure of THAT provider, so the refresher loop
+                // keeps running (a crash here would freeze all served data, since
+                // this loop is the only thing that fetches).
+                let fetch = AssertUnwindSafe(provider.fetch()).catch_unwind();
                 let outcome = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => None,
-                    r = tokio::time::timeout(refresh::FETCH_DEADLINE, provider.fetch()) => Some(r),
+                    _ = cancel.cancelled() => FetchOutcome::Cancelled,
+                    r = tokio::time::timeout(refresh::FETCH_DEADLINE, fetch) => match r {
+                        Ok(Ok(Ok(usage))) => FetchOutcome::Ok(Box::new(usage)),
+                        Ok(Ok(Err(err))) => FetchOutcome::Err(err),
+                        Ok(Err(_panic)) => FetchOutcome::Panicked,
+                        Err(_elapsed) => FetchOutcome::TimedOut,
+                    },
                 };
-                (name, attempt_start, outcome)
+                let completed_at = Instant::now();
+                (name, attempt_start, completed_at, outcome)
             }
         }))
-        .buffer_unordered(refresh::CONCURRENCY_CAP)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(refresh::CONCURRENCY_CAP);
 
-        // Write results back as whole-slot replacements.
-        let completed = Instant::now();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (name, attempt_start, outcome) in results {
-            let prev = match store.get(&name) {
-                Some(slot) => slot.clone(),
-                None => continue, // provider vanished (cannot happen today)
+        while let Some((name, attempt_start, completed_at, outcome)) = stream.next().await {
+            // Cancelled: leave the slot as-is for the next run — nothing to write.
+            if matches!(outcome, FetchOutcome::Cancelled) {
+                continue;
+            }
+            // Clone prev under the lock, then release BEFORE computing next.
+            let prev = {
+                let store = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match store.get(&name) {
+                    Some(slot) => slot.clone(),
+                    None => continue, // provider vanished (cannot happen today)
+                }
             };
             let next = match outcome {
-                // Cancelled before/underway: leave the slot as-is for next run.
-                None => continue,
-                Some(Ok(Ok(usage))) => next_slot_on_success(usage, attempt_start, completed),
-                Some(Ok(Err(err))) => {
-                    next_slot_on_failure(&prev, &name, &err, attempt_start, completed)
+                FetchOutcome::Cancelled => unreachable!("handled above"),
+                FetchOutcome::Ok(usage) => {
+                    next_slot_on_success(*usage, attempt_start, completed_at)
                 }
-                // Timeout: a transient failure (bounded the whole fetch).
-                Some(Err(_elapsed)) => next_slot_on_failure(
+                FetchOutcome::Err(err) => {
+                    next_slot_on_failure(&prev, &name, &err, attempt_start, completed_at)
+                }
+                // A whole-fetch timeout is a transient failure (the session is
+                // presumed intact); a panic is that provider's own bug, mapped to
+                // a non-transient Decode so it re-probes slowly, never crashing us.
+                FetchOutcome::TimedOut => next_slot_on_failure(
                     &prev,
                     &name,
                     &provider::FetchError::Upstream(format!(
@@ -224,9 +264,20 @@ impl Registry {
                         refresh::FETCH_DEADLINE.as_secs()
                     )),
                     attempt_start,
-                    completed,
+                    completed_at,
+                ),
+                FetchOutcome::Panicked => next_slot_on_failure(
+                    &prev,
+                    &name,
+                    &provider::FetchError::Decode("provider fetch panicked".to_string()),
+                    attempt_start,
+                    completed_at,
                 ),
             };
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.insert(name, next);
         }
     }
@@ -287,8 +338,13 @@ impl Registry {
         let providers_total = self.providers.len();
         let cookie_cohort_total = cookie_names.len();
 
-        // Poison-tolerant: a poisoned store mutex is the real data-path fault we
-        // surface fail-closed, not panic on in the health path.
+        // Poison-tolerant + fail-closed: a poisoned store mutex is a real fault,
+        // so we report `poisoned` (→ Failing) WITHOUT reading the per-provider
+        // slots. This deliberately diverges from "recover the guard and compute
+        // metrics anyway": under a torn lock the per-provider counts are exactly
+        // what is untrustworthy, so bare Failing is the honest signal. (Poison is
+        // near-unreachable regardless — writes are whole-slot inserts and a
+        // panicking fetch runs outside the lock.)
         let store = match self.store.lock() {
             Ok(store) => store,
             Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
@@ -483,7 +539,7 @@ mod tests {
         assert!(out[2].error.is_none());
     }
 
-    /// The Q4 guarantee: a read NEVER blocks on an in-flight fetch.
+    /// The non-blocking read guarantee: a read NEVER blocks on an in-flight fetch.
     #[tokio::test]
     async fn read_never_blocks_on_an_inflight_fetch() {
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -585,6 +641,48 @@ mod tests {
         assert!(h.refresher_stalled);
         assert!(h.is_degraded());
         assert!(!h.is_failing());
+    }
+
+    /// A panicking provider must NOT crash the refresher — if it did, the
+    /// background loop that owns all fetching would die and the served data would
+    /// freeze forever. A panic must degrade only its own slot, leaving the other
+    /// providers in the same sweep to resolve normally.
+    #[tokio::test]
+    async fn panicking_provider_is_contained_and_others_still_resolve() {
+        struct PanicProvider;
+        #[async_trait]
+        impl UsageProvider for PanicProvider {
+            fn name(&self) -> &str {
+                "boom"
+            }
+            async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
+                panic!("provider blew up mid-fetch");
+            }
+        }
+        let reg = Registry::new(vec![
+            Box::new(PanicProvider),
+            Box::new(StubProvider {
+                name: "codex",
+                cookie: false,
+                ok: true,
+            }),
+        ]);
+
+        // The sweep must COMPLETE despite the panicking provider.
+        tick(&reg).await;
+
+        let out = reg.get_usage(None).await;
+        let boom = out.iter().find(|e| e.provider == "boom").unwrap();
+        assert!(
+            boom.error.is_some(),
+            "panicked provider degrades its own slot"
+        );
+        let codex = out.iter().find(|e| e.provider == "codex").unwrap();
+        assert!(codex.error.is_none(), "healthy provider still resolved");
+        // The panic is a non-transient failure → the slot is degraded, not stale.
+        let h = reg.health();
+        assert!(h.degraded.contains(&"boom".to_string()));
+        assert_eq!(h.fresh, 1); // codex
     }
 
     #[tokio::test]

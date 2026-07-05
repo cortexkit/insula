@@ -162,18 +162,20 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream
     (daemon, module, consumer, route_channel)
 }
 
-/// Drive the full path and return the `result` array. Serving is cache-only —
-/// the module returns whatever the background refresher has resolved so far — so
-/// poll until the first sweep warms the array (or a deadline), exactly as a real
-/// consumer would when reading async-refreshed data.
-async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
+/// Drive the full path and return the `result` array once `want_provider` has
+/// been resolved. Serving is cache-only and the refresher publishes each
+/// provider's result AS IT COMPLETES, so a non-empty array may still be missing
+/// a specific provider mid-sweep; poll until the asserted provider appears (or a
+/// deadline), exactly as a real consumer reading async-refreshed data would.
+async fn drive_usage_get_for(want_provider: &str) -> (TestDaemon, ModuleProcess, Vec<Value>) {
     let (daemon, module, mut consumer, route_channel) = open_quota_route().await;
     let deadline = Instant::now() + Duration::from_secs(40);
     let mut corr = 3;
     let result = loop {
         let response = usage_get(&mut consumer, route_channel, corr).await;
         let result = response["result"].as_array().cloned().unwrap_or_default();
-        if !result.is_empty() || Instant::now() >= deadline {
+        let has_target = result.iter().any(|e| e["provider"] == want_provider);
+        if has_target || Instant::now() >= deadline {
             break result;
         }
         corr += 1;
@@ -188,7 +190,7 @@ async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
 /// or without a real session (silent-degrade is acceptable here).
 #[tokio::test]
 async fn skeleton_round_trips_usage_get_over_the_wire() {
-    let (_daemon, _module, result) = drive_usage_get().await;
+    let (_daemon, _module, result) = drive_usage_get_for("codex").await;
     let codex = result
         .iter()
         .find(|e| e["provider"] == "codex")
@@ -254,7 +256,7 @@ async fn unknown_method_returns_error_frame_with_canonical_error_body() {
 #[tokio::test]
 #[ignore = "requires a real ~/.codex/auth.json session"]
 async fn skeleton_returns_real_codex_window() {
-    let (_daemon, _module, result) = drive_usage_get().await;
+    let (_daemon, _module, result) = drive_usage_get_for("codex").await;
     let codex = result
         .iter()
         .find(|e| e["provider"] == "codex")
@@ -286,7 +288,7 @@ async fn skeleton_returns_real_codex_window() {
 #[tokio::test]
 #[ignore = "requires a real anthropic OAuth session in opencode auth.json"]
 async fn skeleton_returns_real_anthropic_window() {
-    let (_daemon, _module, result) = drive_usage_get().await;
+    let (_daemon, _module, result) = drive_usage_get_for("claude").await;
     let claude = result
         .iter()
         .find(|e| e["provider"] == "claude")

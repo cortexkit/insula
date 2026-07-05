@@ -1,10 +1,17 @@
 # Background Refresher + Cache-Only Read (Q4 spike)
 
-Status: IMPLEMENTED on branch `spike/refresher` (design Oracle-reviewed
-bg_f9972eaf, all must-fixes folded; 167 unit tests + real-daemon e2e + live
-codex real-window proof green; clippy/fmt clean). NOT on master — graduation to
-prod is gated on a SECOND Oracle pass over the implementation + a live smoke.
-Scope:
+Status: IMPLEMENTED on branch `spike/refresher`, BOTH Oracle passes folded
+(bg_f9972eaf design + bg_44d017b4 implementation). 169 unit tests + real-daemon
+e2e + live codex/claude real-window proofs green; clippy/fmt clean. NOT on
+master — graduation to prod is gated only on a LIVE SMOKE now. 2nd-pass
+implementation fixes folded: (1) CRITICAL panic containment — a panicking
+provider is `catch_unwind`-contained into its own non-transient failure, never
+crashing the refresher (would silently drop Q4); (2) transient-after-degraded
+stays degraded (a prior degraded entry is not relabelled stale-transient); (3)
+per-provider completion timestamps + incremental writeback (each result
+published as it completes, computed OUTSIDE the lock) — a fast provider is no
+longer held behind a slow one, which also means `usage.get` can return a PARTIAL
+array mid-sweep (a real consumer polls for the provider it needs). Scope:
 single-account, per-provider. The account-aware retrofit
 (per-`(provider, account)`) is deliberately clean: every store key and refresh
 unit below is already per-provider and becomes per-`(provider, account)` by

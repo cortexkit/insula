@@ -155,9 +155,17 @@ pub fn next_slot_on_failure(
     let class = classify(err);
     let retry_count = prev.retry_count.saturating_add(1);
     let delay = backoff(class, retry_count);
-    let (entry, status) = match (class, &prev.entry) {
-        (FetchClass::Transient, Some(prev_entry)) => {
-            (Some(prev_entry.clone()), SlotStatus::StaleTransient)
+    // Keep serving the previous window on a transient blip ONLY when it is a
+    // genuinely HEALTHY window. A previous DEGRADED entry (from an earlier
+    // non-transient failure) must not be relabelled stale-transient — it would
+    // then be counted as "serving" and mask a real degradation.
+    let prev_is_healthy = prev
+        .entry
+        .as_ref()
+        .is_some_and(|e| e.error.is_none() && e.usage.is_some());
+    let (entry, status) = match class {
+        FetchClass::Transient if prev_is_healthy => {
+            (prev.entry.clone(), SlotStatus::StaleTransient)
         }
         _ => (
             Some(ProviderUsage::degraded(provider_name, err)),
@@ -294,6 +302,35 @@ mod tests {
             t0,
         );
         // No good entry to keep → a visible degraded entry, not empty.
+        assert_eq!(next.status, SlotStatus::Degraded);
+        assert!(next.entry.as_ref().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn transient_failure_after_a_degraded_entry_stays_degraded() {
+        // A prior DEGRADED entry must NOT be relabelled stale-transient on a
+        // later transient blip — that would count it as "serving" and hide the
+        // degradation from health.
+        let t0 = Instant::now();
+        let cold = ProviderSlot::due_now(t0);
+        let degraded = next_slot_on_failure(
+            &cold,
+            "codex",
+            &FetchError::Unauthorized("401".into()),
+            t0,
+            t0,
+        );
+        assert_eq!(degraded.status, SlotStatus::Degraded);
+
+        let t1 = t0 + Duration::from_secs(300);
+        let next = next_slot_on_failure(
+            &degraded,
+            "codex",
+            &FetchError::Upstream("503".into()),
+            t1,
+            t1,
+        );
+        // Still degraded, not stale-transient.
         assert_eq!(next.status, SlotStatus::Degraded);
         assert!(next.entry.as_ref().unwrap().error.is_some());
     }

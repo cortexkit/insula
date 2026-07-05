@@ -10,7 +10,8 @@
 //! Status ladder (only the module maps this onto the protocol report):
 //! - cache mutex poisoned → `failing` (a serving/refresher task panicked);
 //! - refresher heartbeat older than the stall horizon → `degraded` (the loop is
-//!   wedged/dead — this is the Q4 non-blocking guarantee made observable);
+//!   wedged/dead — this makes the non-blocking read guarantee observable, since
+//!   a stalled refresher is the one thing that silently erodes served freshness);
 //! - otherwise → `ok`, with per-provider staleness carried as detail, because a
 //!   provider legitimately lacking local creds is this prober's normal resting
 //!   state, not a module fault.
