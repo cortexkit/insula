@@ -35,6 +35,7 @@ use tokio::{
     net::TcpStream,
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MODULE_ID: &str = "ai-provider-quota";
 const USAGE_GET_OP: &str = "usage.get";
@@ -73,8 +74,23 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     let registry = Arc::new(Registry::with_defaults());
-    let loop_result = module_loop(&mut read_half, tx.clone(), &config, registry).await;
+
+    // The background refresher owns all provider fetching: the serving path
+    // (usage.get) only ever reads the slot store, so route reads never block on
+    // the network. Cancelled when the frame loop ends so the task never leaks.
+    let refresher_cancel = CancellationToken::new();
+    let refresher = {
+        let registry = Arc::clone(&registry);
+        let cancel = refresher_cancel.clone();
+        tokio::spawn(async move { registry.refresh_loop(cancel).await })
+    };
+
+    let loop_result = module_loop(&mut read_half, tx.clone(), &config, Arc::clone(&registry)).await;
     drop(tx);
+
+    // Stop the refresher and reap it before returning.
+    refresher_cancel.cancel();
+    let _ = refresher.await;
 
     let writer_result = writer
         .await
@@ -277,35 +293,47 @@ async fn handle_control_request(
 }
 
 /// Map the core health snapshot onto the subc health-report wire shape. Status
-/// is `failing` only when the serving cache is poisoned (real data-path fault);
-/// every other state is `ok` with the degraded providers and cookie-cohort
-/// staleness carried as opaque `detail`/`metrics` for `supervisor.health`.
+/// ladder: `failing` when the slot store is poisoned (a serving/refresher task
+/// panicked); `degraded` when the refresher loop is stalled (wedged/dead — its
+/// last-known windows still serve, only freshness decays); otherwise `ok` with
+/// per-provider staleness carried as opaque `detail`/`metrics`, because a
+/// provider lacking local creds is this prober's normal resting state.
 fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControlResponse {
     let status = if snapshot.is_failing() {
         HealthStatus::Failing
+    } else if snapshot.is_degraded() {
+        HealthStatus::Degraded
     } else {
         HealthStatus::Ok
     };
     let detail = if snapshot.cache_poisoned {
-        Some("usage cache mutex poisoned: a serving task panicked".to_string())
+        Some("slot store mutex poisoned: a serving/refresher task panicked".to_string())
+    } else if snapshot.refresher_stalled {
+        Some(match snapshot.last_tick_age {
+            Some(age) => format!("refresher stalled: last tick {}s ago", age.as_secs()),
+            None => "refresher never ticked since startup".to_string(),
+        })
     } else if !snapshot.degraded.is_empty() {
         Some(format!(
-            "{}/{} providers degraded ({} of {} cookie-cohort)",
+            "{}/{} providers degraded ({} of {} cookie-cohort); {} serving",
             snapshot.degraded.len(),
             snapshot.providers_total,
             snapshot.cookie_cohort_degraded.len(),
             snapshot.cookie_cohort_total,
+            snapshot.serving(),
         ))
     } else {
         None
     };
     let metrics = json!({
         "providersTotal": snapshot.providers_total,
-        "providersOk": snapshot.providers_ok,
+        "fresh": snapshot.fresh,
+        "stale": snapshot.stale,
         "degraded": snapshot.degraded,
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieCohortDegraded": snapshot.cookie_cohort_degraded,
-        "lastSweepAgeSecs": snapshot.last_sweep_age.map(|d| d.as_secs()),
+        "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
+        "refresherStalled": snapshot.refresher_stalled,
     });
     ModuleControlResponse::HealthCheck {
         status,
@@ -532,17 +560,20 @@ mod tests {
         else {
             panic!("expected a HealthCheck response");
         };
-        // No sweep has run in this fresh registry, so it is healthy-unexercised.
+        // No refresher tick has run in this fresh registry and it was just
+        // created (within the stall horizon), so it is healthy/Ok, not stalled.
         assert_eq!(status, HealthStatus::Ok);
         let metrics = metrics.expect("health report carries metrics");
         let obj = metrics.as_object().expect("metrics is a JSON object");
         for key in [
             "providersTotal",
-            "providersOk",
+            "fresh",
+            "stale",
             "degraded",
             "cookieCohortTotal",
             "cookieCohortDegraded",
-            "lastSweepAgeSecs",
+            "lastTickAgeSecs",
+            "refresherStalled",
         ] {
             assert!(obj.contains_key(key), "metrics include {key}");
         }
@@ -550,6 +581,9 @@ mod tests {
         // cohort — a real count, not a placeholder.
         assert!(obj["providersTotal"].as_u64().unwrap() >= 27);
         assert!(obj["cookieCohortTotal"].as_u64().unwrap() >= 7);
+        // Fresh registry: never ticked, nothing fetched yet.
+        assert_eq!(obj["fresh"].as_u64().unwrap(), 0);
+        assert_eq!(obj["refresherStalled"], serde_json::json!(false));
     }
 
     /// The `route.bind` arm still acks unchanged after threading the registry in.

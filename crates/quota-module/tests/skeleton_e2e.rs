@@ -162,11 +162,23 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream
     (daemon, module, consumer, route_channel)
 }
 
-/// Drive the full path and return the `result` array.
+/// Drive the full path and return the `result` array. Serving is cache-only —
+/// the module returns whatever the background refresher has resolved so far — so
+/// poll until the first sweep warms the array (or a deadline), exactly as a real
+/// consumer would when reading async-refreshed data.
 async fn drive_usage_get() -> (TestDaemon, ModuleProcess, Vec<Value>) {
     let (daemon, module, mut consumer, route_channel) = open_quota_route().await;
-    let response = usage_get(&mut consumer, route_channel, 3).await;
-    let result = response["result"].as_array().cloned().unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut corr = 3;
+    let result = loop {
+        let response = usage_get(&mut consumer, route_channel, corr).await;
+        let result = response["result"].as_array().cloned().unwrap_or_default();
+        if !result.is_empty() || Instant::now() >= deadline {
+            break result;
+        }
+        corr += 1;
+        sleep(Duration::from_millis(200)).await;
+    };
     (daemon, module, result)
 }
 

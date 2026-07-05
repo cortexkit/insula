@@ -146,13 +146,26 @@ async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
-    let response = usage_get(&mut consumer, route_channel, 2).await;
-    let result = response["result"]
-        .as_array()
-        .expect("usage.get response must carry a result array");
-    // The array is always present; entries may be healthy or degraded depending on
-    // which provider sessions exist on this machine. The proof is the SUPERVISION +
-    // ROUTE path through a real daemon, so a non-panicking ProviderUsage[] suffices.
+    // Serving is cache-only: the module returns whatever its background
+    // refresher has resolved so far, so poll until the first sweep warms the
+    // array (or a deadline) — the real-consumer view of async-refreshed data.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut corr = 2;
+    let result = loop {
+        let response = usage_get(&mut consumer, route_channel, corr).await;
+        let result = response["result"]
+            .as_array()
+            .cloned()
+            .expect("usage.get response must carry a result array");
+        if !result.is_empty() || std::time::Instant::now() >= deadline {
+            break result;
+        }
+        corr += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    // Entries may be healthy or degraded depending on which provider sessions
+    // exist on this machine. The proof is the SUPERVISION + ROUTE path through a
+    // real daemon, so a non-panicking ProviderUsage[] suffices.
     eprintln!(
         "[real-daemon] usage.get returned {} provider entries",
         result.len()

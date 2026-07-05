@@ -16,6 +16,7 @@ subc-transport = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 subc-core = { workspace = true }
