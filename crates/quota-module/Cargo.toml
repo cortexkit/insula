@@ -6,7 +6,7 @@ publish = false
 description = "The ai-provider-quota subc module: registers a ManagementSurface, answers usage.get over the subc wire with ProviderUsage[]."
 
 [[bin]]
-name = "quota-module"
+name = "ck-quota"
 path = "src/main.rs"
 
 [dependencies]

@@ -78,7 +78,7 @@ fn build_subc_core() -> PathBuf {
 /// our freshly-built quota-module binary. Waits for the connection file.
 async fn start_real_daemon() -> RealDaemon {
     let subc_core = build_subc_core();
-    let quota_module = PathBuf::from(env!("CARGO_BIN_EXE_quota-module"));
+    let quota_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-quota"));
     assert!(quota_module.exists());
 
     let rig = unique_temp_dir("quota-real-daemon");

@@ -110,7 +110,7 @@ impl Drop for ModuleProcess {
 }
 
 fn spawn_quota_module(subc_connection_file: &Path) -> ModuleProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_quota-module"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-quota"));
     command
         .arg("--subc")
         .arg(subc_connection_file)

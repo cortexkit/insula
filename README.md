@@ -43,7 +43,7 @@ desktop-only browser-cookie sources) are deferred with rationale in
 ## Build
 
 ```sh
-cargo build --release            # builds quota-core + the quota-module binary
+cargo build --release            # builds quota-core + the ck-quota binary
 cargo test -p quota-core         # provider normalizers (unit)
 cargo test -p quota-module       # in-process wire e2e (skeleton_e2e)
 ```
@@ -73,7 +73,7 @@ entry pointing `program` at the built binary — see `examples/subc.jsonc`:
   "version": 1,
   "modules": {
     "ai-provider-quota": {
-      "program": "/abs/path/to/target/release/quota-module"
+      "program": "/abs/path/to/target/release/ck-quota"
     }
   }
 }
