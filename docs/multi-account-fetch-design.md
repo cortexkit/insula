@@ -1,13 +1,18 @@
 # Multi-account per-account fetch — design note
 
-Status: DRAFT, CKCRED enumeration contract folded in (2026-07-10). Greenlit by
-Ufuk (via ALF) to proceed at own pace; acute pain is gone (both OpenAI accounts
-replenished), so this is correctness/completeness, not urgent. The design-input
-gate is lifted; the remaining integration gate is that `GetResult.account_id` is
-still being built vault-side (CKCRED pings when the field lands) — so the
-handle-fetch machinery can be built and Oracle-reviewed against the known
-contract, but end-to-end labeled emission is only live-verifiable once the field
-ships.
+Status: DRAFT, CKCRED enumeration contract folded + adversarial Oracle pass
+folded (2026-07-10). Greenlit by Ufuk (via ALF) to proceed at own pace; acute
+pain is gone (both OpenAI accounts replenished), so this is
+correctness/completeness, not urgent. The design-input gate is lifted; the
+remaining integration gate is that `GetResult.account_id` is still being built
+vault-side (CKCRED pings when the field lands) — so the handle-fetch machinery
+can be built and unit-verified against the known contract, but end-to-end labeled
+emission is only live-verifiable once the field ships.
+
+The Oracle pass found the design NOT safe to implement as originally written (3
+CRITICAL + 3 HIGH); all are folded into the "Oracle-mandated corrections" section
+below and reflected in the sections above. The corrected design is what gets
+implemented.
 
 ## CKCRED enumeration contract (the load-bearing input, now known)
 
@@ -74,45 +79,59 @@ lose the backoff/stale history that belongs to that fetch unit.
 A provider is no longer a single fetch unit; it is a set of `(handle)` fetch
 units. Concretely:
 
-1. **Provider trait** gains handle-scoped fetch. Sketch:
+1. **Provider trait** gains handle-scoped fetch. Sketch (post-Oracle: `handles()`
+   returns `Result` per H5; `fetch_handle` returns an envelope per C2):
    ```
    trait UsageProvider {
        fn name(&self) -> &str;
-       // The credential handles this provider fetches under. Vault-sourced
-       // providers return the handles minted into the module's config home;
-       // machine-local providers return one implicit local handle.
-       fn handles(&self) -> Vec<CredentialHandle>;          // NEW (config read, NOT a vault/network call)
-       // Fetch ONE handle's usage; the returned ProviderUsage.account is set
-       // from GetResult.account_id resolved during this fetch.
-       async fn fetch_handle(&self, handle: &CredentialHandle) -> Result<ProviderUsage, FetchError>; // CHANGED from fetch(&self)
+       // The credential handles this provider fetches under. Result so a config
+       // read/parse FAILURE is distinct from an authoritative empty set (H5) —
+       // a failed enumeration must NOT be read as "remove all handles".
+       fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError>;  // NEW (config read, NOT a vault/network call)
+       // Fetch ONE handle. Returns the credential OBSERVATION (account_id +
+       // record_version, captured from the vault get) INDEPENDENTLY of whether
+       // the usage call succeeded (C2), so a label change is detected even when
+       // the usage fetch itself fails.
+       async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt;  // CHANGED from fetch(&self)
        fn is_cookie_based(&self) -> bool { false }
    }
+   struct FetchAttempt {
+       observed: Option<AccountObservation>,   // { account_id: Option<String>, record_version }
+       usage: Result<Usage, FetchError>,
+   }
    ```
-   `handles()` is a cheap config read (the known handle set), safe to call each
-   tick — there is NO `list-accounts` vault RPC (CKCRED contract). Machine-local
-   providers return a single implicit handle and behave exactly as today.
+   `handles()` is a cheap config read (the known handle set), enumerated for every
+   provider on every scheduler turn (H5) — there is NO `list-accounts` vault RPC
+   (CKCRED contract). Machine-local providers return one implicit handle and
+   behave exactly as today.
 
 2. **Slot key.** `SlotStore` keys on `SlotKey { provider: String, handle:
-   HandleId }`. `ProviderSlot` gains a cached `(account_id, record_version)` so
-   the label is only re-resolved when `record_version` bumps (refresh or
-   replace). `due_now` seeding, `insert`, `get`, backoff, and heartbeat are
-   otherwise unchanged.
+   HandleId }`, plus an **incarnation token** per active key (H4) so a stale
+   in-flight write for a removed-then-readded handle is fenced out. `ProviderSlot`
+   caches `(account_id, record_version)`; the label re-resolves when
+   `record_version` changes (any change, not just increase — monotonicity is not
+   warranted under restore/re-mint). An OBSERVED account change (different
+   account_id) clears the entry + freshness and RESTARTS backoff (C2) — a
+   different account is not the same account stale.
 
-3. **Refresh tick** enumerates handles per due provider (cheap config read), then
-   fetches each `(provider, handle)` as its own unit under the existing
-   concurrency cap + per-fetch deadline + panic containment. Each `get` returns
-   the token plus optional `GetResult.account_id` + `record_version`; the fetcher
-   labels `ProviderUsage.account` with `account_id` (falling back to the cached
-   label when the field is absent — see the field-not-yet-shipped gate). Each
-   result is a whole-slot insert at its `SlotKey`. Stale-serving and backoff
-   apply per (provider, handle), so one depleted/failing account never affects the
-   other's slot.
+3. **Scheduler turn** (replaces "refresh tick enumerates per due provider"):
+   each turn (a) enumerates ALL providers' handles outside the store lock,
+   retaining last-known-good on any `handles()` error (H5); (b) reconciles the
+   active-key set under the lock, assigning incarnations to new keys and reaping
+   removed ones (H4); (c) stamps the heartbeat (H6, independent of fetch-unit
+   count); (d) selects due units round-robin ACROSS providers (H6, no
+   provider-major starvation) up to the concurrency cap; (e) fetches each under
+   the existing per-fetch deadline + panic containment; (f) publishes each result
+   ONLY if its key is still active with the same incarnation (H4). Stale-serving
+   and backoff apply per (provider, handle).
 
-4. **get_usage** assembles entries in a stable order (registry provider order,
-   then a deterministic handle order) and emits one `ProviderUsage` per resolved
-   slot, each carrying its re-resolved `account` label. A provider with one
-   implicit handle whose `account_id` is absent emits exactly today's shape
-   (label None).
+4. **get_usage** groups by provider at read time and enforces the emission rule
+   (C1): if not all of a provider's active handles have a resolved `account_id`,
+   emit exactly ONE deterministic unlabeled entry (never two unlabeled); only when
+   all are resolved, emit one labeled entry per handle, deduplicated by
+   `(provider, account_id)`. Cheap values cloned under the lock, sorted OUTSIDE it
+   (registry index, then stable handle id). A single-implicit-handle provider with
+   account_id absent emits exactly today's shape (label None).
 
 5. **Credential source.** Two classes:
    - **Vault-sourced** (codex/claude/grok/... the OAuth + api-key set): one
@@ -133,58 +152,131 @@ units. Concretely:
 - The 28 machine-local / single-credential providers' behavior.
 - Freshness, Retry-After (still deferred, still must be clamped when added).
 
-## Open questions for the Oracle pass
+## Oracle-mandated corrections (adversarial pass, folded)
 
-1. **[RESOLVED — CKCRED]** Enumeration shape. No `list-accounts`; enumerate known
-   handles + `get` each; account_id is optional `GetResult.account_id` versioned
-   by `record_version`; handles survive replace. Folded into the core change
-   above. Remaining dependency is timing only: `GetResult.account_id` is still
-   being built vault-side (CKCRED pings on landing) — until then every vault get
-   returns account_id absent, so multi-account emission degrades to today's
-   single-implicit-handle behavior (safe, label None). The machinery is built and
-   Oracle-reviewed against the contract now; labeled emission is smoke-verified
-   once the field ships.
-2. **Label re-resolution on `record_version` bump.** The slot caches
-   `(account_id, record_version)`. On any bump (refresh OR replace) the label is
-   re-resolved from the fresh `get`. The Oracle should check: a `replace` that
-   swaps the account behind a handle must surface as a NEW account_id on the SAME
-   slot key (handle unchanged) — the slot's backoff/stale history correctly
-   carries across the swap (it is the same fetch unit), but the emitted label
-   flips. Confirm no window where the old account_id is served against the new
-   token.
-3. **Handle-set changes at runtime** (a handle added/removed from config): slots
-   for removed handles must be reaped (not served stale forever). A slot-GC pass
-   keyed on the current `handles()` set. This is the main net-new concurrency
-   surface. Note it is HANDLE churn, not account churn — narrower than the
-   original framing, because an account swap under a stable handle is just a
-   label re-resolve, not a slot add/remove.
-4. **Anonymous/implicit handle key.** Machine-local providers key on their single
-   implicit handle; `account_id` absent → label None, exactly today's shape.
-   Trivial, stated so the Oracle checks the degenerate case.
+The pass found 3 CRITICAL + 3 HIGH + 1 MEDIUM. All accepted; each reshapes the
+sketch above. These are binding on the implementation.
+
+**C1 — read-time emission gate (fixes multi-unlabeled-entry contract violation).**
+The sharpest risk, confirmed real: during the interim before `GetResult.account_id`
+ships (and any time two handles both resolve to an absent/None label), naive
+per-slot assembly emits TWO unlabeled entries for one provider — which the router
+drops loudly as a contract violation. Degraded entries also force `account=None`
+(`model.rs`), the same trap. FIX: `get_usage` groups by provider at read time and
+enforces the emission rule itself, not per-slot:
+- If a provider has >1 active handle but NOT all of them have a resolved
+  `account_id`, emit exactly ONE deterministic entry (the primary/legacy handle),
+  unlabeled — never two unlabeled.
+- Only when ALL active handles for a provider carry a resolved `account_id` do we
+  emit one labeled entry per handle, deduplicated by `(provider, account_id)`.
+- This makes the account_id-absent interim provably safe (collapses to today's
+  single entry) and is the invariant the router relies on.
+
+**C2 — fetch-attempt envelope (fixes non-atomic label update, esp. on failure).**
+`fetch_handle -> Result<ProviderUsage>` cannot carry the observed
+`(account_id, record_version)` when the usage call itself fails, so a
+replace-then-timeout would keep serving the OLD account's window under a handle
+that now serves a DIFFERENT account (transient-stale-serving of A against new B).
+FIX: the fetch returns an internal envelope `{ observed: Option<AccountObservation
+{ account_id, record_version }>, usage: Result<Usage, FetchError> }`. The
+credential observation is captured from the vault `get` INDEPENDENTLY of whether
+the usage fetch succeeds. On an observed account change (account_id differs from
+the slot's cached label), the transition CLEARS the old entry + freshness and
+RESTARTS backoff — a different account is not the same account stale, so it must
+never be served as either the old or (unverified) new window.
+
+**C3 — consistency guarantee weakened to bounded + fail-closed.** The original
+"no window where old account_id is served against the new token" is impossible
+under a polling fetch model: a replace can land after the vault `get` but before
+publication, or while the slot is backed off (up to the 5–15m transient backoff),
+so A stays visible until the next observation. FIX: the guarantee is BOUNDED
+snapshot consistency (convergence within one observation interval), and routing
+must fail CLOSED during convergence (treat a label-in-flux slot as unavailable,
+not as its stale identity). Zero-window consistency would require
+revision-coupled invalidation shared with the token-serving path — out of scope,
+explicitly not promised.
+
+**H4 — generation/incarnation fencing on GC + publication.** GC and the fetch
+writeback race: a fetch clones its prev slot, GC removes the handle, then the
+in-flight fetch re-inserts it (resurrection); remove+re-add is an ABA. FIX:
+reconcile the active handle set BEFORE due-selection under a single scheduler
+owner; stamp each slot with an incarnation/attempt token; publish a fetch result
+ONLY if the key is still active AND carries the same incarnation. A re-added
+handle gets a NEW incarnation, so a stale in-flight write for the old incarnation
+is dropped.
+
+**H5 — enumerate every provider every turn; `handles()` returns `Result`.**
+"Enumerate per due provider" starves discovery (a zero-handle or fully-backed-off
+provider is never due, so a newly added handle waits behind a 15m backoff), and a
+bare `Vec` can't tell an authoritative empty set from a transient config
+read/parse failure (which would look like "remove all handles" → mass GC). FIX:
+`handles() -> Result<Vec<CredentialHandle>>`, enumerated for EVERY provider on
+every scheduler turn (outside the store lock), canonicalized/deduplicated;
+reconcile only SUCCESSFUL snapshots and retain the last-known-good set on a read
+error (never GC on a failed enumeration).
+
+**H6 — round-robin admission + fetch-count-independent heartbeat.** Provider-major
+admission lets one provider's 100 slow handles delay the next provider ~7m under
+`buffer_unordered(8)` at the 35s deadline, and a sweep-start-only heartbeat goes
+stale (>300s) mid-sweep despite progress. FIX: admit due units round-robin ACROSS
+providers in bounded scheduler turns; stamp the heartbeat per scheduler turn
+(and reconcile handles) independently of the total fetch-unit count, so liveness
+and discovery cadence don't degrade as handles grow.
+
+**M7 — get_usage/sleep/health must stop assuming one slot per provider.** All
+three do singular name lookups today. FIX: keep an atomically reconciled
+active-key snapshot in the store; `get_usage` clones cheap values under the lock
+and sorts OUTSIDE it (registry index, then stable handle id); `sleep_until_next_due`
+takes the minimum across ALL active slots; `health` gets an explicitly defined
+provider-level aggregation (a provider is degraded only if ALL its handles are —
+one healthy account should not read as a provider-wide degrade). `handles()` is
+NEVER called under the cache mutex.
+
+Preserved base invariant (unchanged): enumeration, sorting, fetches, and
+next-slot computation stay OUTSIDE the store guard; only reconciliation,
+snapshotting, and fenced publication happen inside. The `std::sync::Mutex` +
+`!Send`-guard-across-await-is-a-compile-error protection from the refresher spike
+still holds.
 
 ## Verification plan
 
-- Unit: multi-handle slot store (two handles, one fails non-transiently → only
-  that slot degrades, the other keeps serving), slot-key uniqueness per handle,
-  implicit-handle key, slot GC on handle removal, label re-resolution on
-  `record_version` bump (account swap under a stable handle flips the label but
-  keeps the slot's backoff history).
-- Non-vacuous: a test that would FAIL if a depleted account's window pressured
-  the healthy account's slot (the exact routing bug this fixes); a test that
-  would FAIL if a `replace`-bumped `record_version` served the stale old
-  account_id against the new token.
+Each test must be non-vacuous (fail if the mechanism were wrong), and the Oracle
+findings each get an explicit adversarial test:
+- **C1 emission gate:** a provider with 2 handles both resolving account_id=None
+  emits exactly ONE unlabeled entry (would FAIL — emit two — without the gate);
+  once both resolve, emits two labeled entries deduped by (provider, account_id).
+- **C2 label atomicity on failure:** replace handle A→B, then B's usage call
+  times out; assert the slot does NOT serve A's old window (neither as A nor B) —
+  it clears + restarts backoff. Fails if the envelope/observation path is missing.
+- **C3 bounded consistency:** assert a label-in-flux slot reads as unavailable
+  (fail-closed), not as its stale identity, during convergence.
+- **H4 fencing:** a fetch in flight for handle H, H removed by GC, the fetch's
+  late write is DROPPED (no resurrection); remove+re-add gives a new incarnation
+  so the old write can't land on it (ABA).
+- **H5 enumeration:** a `handles()` error retains the last-known-good set (no mass
+  GC on a transient config read failure); a newly added handle is picked up on the
+  next turn without waiting behind another handle's backoff.
+- **H6 fairness + heartbeat:** one provider with many slow handles does not starve
+  another provider's due unit past a bounded turn; the heartbeat stays fresh
+  mid-sweep regardless of fetch-unit count.
+- **M7 health aggregation:** a provider with one healthy + one degraded handle
+  does NOT read as a provider-wide degrade.
+- **Base regressions:** the refresher's existing invariants (cache-only read
+  never blocks, panic containment, class-conditional stale-serving) still hold.
 - Integration: real-daemon supervision still green; get_usage emits two labeled
-  codex entries when two handles are present, one when one is; account_id-absent
+  codex entries when two handles resolve, one when one does; account_id-absent
   (field not yet shipped) degrades to today's single unlabeled entry.
 - Gates: fmt + forced clippy + full suite, per the standing rule.
 
 ## Sequencing
 
-Design note (this doc, CKCRED contract folded) → adversarial Oracle pass on the
-concurrency model (slot-key = (provider, handle) + label re-resolution on
-record_version + handle-set GC) → implement on a branch → unit + integration
-green with account_id absent (safe degrade) → CKCRED ships `GetResult.account_id`
-→ live smoke via driver drain-restart proving two labeled codex entries → merge.
-No rush; do not preempt current lane priorities. The only hard external
-dependency remaining is the `account_id` field shipping; everything up to live
-labeled smoke can proceed now.
+Design note (this doc — CKCRED contract + Oracle corrections folded) → implement
+on a branch with the C1–M7 fixes → unit + integration green with account_id
+absent (safe degrade, the router-contract-critical interim) → CKCRED ships
+`GetResult.account_id` → live smoke via driver drain-restart proving two labeled
+codex entries + a live `replace` flipping the label → merge. No rush; do not
+preempt current lane priorities. The only hard external dependency remaining is
+the `account_id` field shipping; everything up to live labeled smoke can proceed
+now. The build is Medium (1–2d) per the Oracle estimate — the C1 emission gate,
+C2 envelope, H4 fencing, and H6 round-robin scheduler are the substantive net-new
+pieces beyond the mechanical slot-key widening.
