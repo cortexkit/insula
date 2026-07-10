@@ -35,6 +35,7 @@ pub mod opencode;
 pub mod opencode_auth;
 pub mod opencodego;
 pub mod provider;
+mod qoder;
 pub mod refresh;
 pub mod stepfun;
 pub mod store;
@@ -117,6 +118,7 @@ impl Registry {
             Box::new(ollama::OllamaProvider::new()),
             Box::new(opencode::OpenCodeProvider::new()),
             Box::new(opencodego::OpenCodeGoProvider::new()),
+            Box::new(qoder::QoderProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(warp::WarpProvider::new()),
             Box::new(synthetic::SyntheticProvider::new()),
