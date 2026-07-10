@@ -1,18 +1,19 @@
 # Multi-account per-account fetch — design note
 
-Status: DRAFT, CKCRED enumeration contract folded + adversarial Oracle pass
-folded (2026-07-10). Greenlit by Ufuk (via ALF) to proceed at own pace; acute
-pain is gone (both OpenAI accounts replenished), so this is
-correctness/completeness, not urgent. The design-input gate is lifted; the
-remaining integration gate is that `GetResult.account_id` is still being built
-vault-side (CKCRED pings when the field lands) — so the handle-fetch machinery
-can be built and unit-verified against the known contract, but end-to-end labeled
-emission is only live-verifiable once the field ships.
+Status: MACHINERY LANDED on master (commit 177bcf8, 2026-07-10, CI-green). The
+per-(provider, handle) machinery, all 7 design-Oracle corrections, and all
+implementation-Oracle fixes are merged; every provider is migrated and codex emits
+a real single-account label. What remains is the VAULT-CONSUMER WIRING (a vault
+client + minted handles reading `GetResult.account_id` per handle) that lights up
+Ufuk's actual second account — a follow-on build, now unblocked (CKCRED shipped
+the field). The two-account live smoke waits on that wiring, not on any external
+gate.
 
-The Oracle pass found the design NOT safe to implement as originally written (3
-CRITICAL + 3 HIGH); all are folded into the "Oracle-mandated corrections" section
-below and reflected in the sections above. The corrected design is what gets
-implemented.
+History: CKCRED enumeration contract folded, then a design-Oracle pass (3 CRITICAL
++ 3 HIGH, folded into "Oracle-mandated corrections" below), then the build, then an
+implementation-Oracle pass that caught F1 (a CRITICAL stale-serve-old-account bug
+on timeout) + 5 latent traps, all fixed with non-vacuous regression tests before
+merge.
 
 ## CKCRED enumeration contract (the load-bearing input, now known)
 
