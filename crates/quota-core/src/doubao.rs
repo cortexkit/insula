@@ -1,45 +1,122 @@
-//! Doubao (Volcengine Ark) usage fetcher — credential from environment variables.
+//! Doubao usage fetcher — signed Coding Plan credentials with an Ark API-key fallback.
 //!
-//! A minimal `POST` chat-completions probe returns rate-limit windows in **response
-//! headers** (`x-ratelimit-remaining-requests`, `x-ratelimit-limit-requests`,
-//! `x-ratelimit-reset-requests`), not in the JSON body.
+//! Coding Plan sends an empty `POST` to Volcengine's `GetCodingPlanUsage` action and
+//! signs `content-type;host;x-content-sha256;x-date` with Volcengine's HMAC-SHA256
+//! scheme. If those credentials are absent or the request fails, the existing Ark
+//! chat-completions header probe remains available.
 //!
-//! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
-//! `ARK_API_KEY` / `VOLCENGINE_API_KEY` / `DOUBAO_API_KEY` available. Endpoint,
-//! probe body, Bearer auth, header parsing, and reset-time formats are ported from
-//! CodexBar (`DoubaoUsageFetcher.swift:89-182`, reset parser `216-247`;
-//! `DoubaoSettingsReader.swift:4-25` for env keys). HTTP accepts 200 and 429 like
-//! CodexBar (`141-146`); shared `http::JsonRequest::send_full` only maps 2xx, so the
-//! probe uses the same headers/timeout/body via `reqwest` directly.
+//! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no Doubao
+//! credentials were available. Coding Plan endpoint/request and response fields come
+//! from CodexBar (`DoubaoUsageFetcher.swift:153-155,210-267,517-546`); signing comes
+//! from `DoubaoVolcengineSigner.swift:30,41-102,104-152`; credential aliases and the
+//! default region come from `DoubaoSettingsReader.swift:9-28,52-64`; window mapping
+//! comes from `DoubaoUsageFetcher.swift:99-127`; signed-first fallback comes from
+//! `DoubaoProviderDescriptor.swift:73-100`.
 //!
-//! Window mapping: request-rate pool → `primary` only (`DoubaoUsageSnapshot.toUsageSnapshot`
-//! `29-63`); `window_minutes` omitted (CodexBar passes `nil`).
+//! The Ark fallback endpoint, body, Bearer auth, header parsing, and reset formats
+//! remain sourced from CodexBar (`DoubaoUsageFetcher.swift:89-182,216-247`). Ark's
+//! request-rate pool maps to `primary` with no known `window_minutes`.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::{
     env,
-    http::{HttpResponse, JsonRequest},
+    http::{Header, HttpResponse, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "doubao";
 const API_KEY_ENV: &[&str] = &["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"];
+const ACCESS_KEY_ID_ENV: &[&str] = &[
+    "VOLCENGINE_ACCESS_KEY_ID",
+    "VOLCENGINE_ACCESS_KEY",
+    "VOLC_ACCESSKEY",
+    "DOUBAO_ACCESS_KEY_ID",
+];
+const SECRET_ACCESS_KEY_ENV: &[&str] = &[
+    "VOLCENGINE_SECRET_ACCESS_KEY",
+    "VOLCENGINE_SECRET_KEY",
+    "VOLCENGINE_ACCESS_KEY_SECRET",
+    "VOLC_SECRETKEY",
+    "DOUBAO_SECRET_ACCESS_KEY",
+];
+const REGION_ENV: &[&str] = &[
+    "VOLCENGINE_REGION",
+    "VOLCENGINE_REGION_ID",
+    "VOLC_REGION",
+    "DOUBAO_REGION",
+];
+const DEFAULT_REGION: &str = "cn-beijing";
 const API_URL: &str = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions";
+const CODING_PLAN_API_URL: &str =
+    "https://open.volcengineapi.com/?Action=GetCodingPlanUsage&Version=2024-01-01";
+const CODING_PLAN_CONTENT_TYPE: &str = "application/x-www-form-urlencoded; charset=utf-8";
+const SIGNING_ALGORITHM: &str = "HMAC-SHA256";
+const SIGNING_SERVICE: &str = "ark";
+const SIGNING_TERMINATOR: &str = "request";
+const SIGNED_HEADERS: &str = "content-type;host;x-content-sha256;x-date";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Models to probe, ordered by likelihood (CodexBar `DoubaoUsageFetcher.swift:93-97`).
+type HmacSha256 = Hmac<Sha256>;
+
+/// Models to probe, ordered by likelihood (CodexBar `DoubaoUsageFetcher.swift:157-163`).
 const PROBE_MODELS: &[&str] = &[
     "doubao-seed-2.0-code",
     "doubao-1.5-pro-32k",
     "doubao-lite-32k",
 ];
 
-/// Header snapshot from a successful probe (200 or 429), for normalization tests.
+#[derive(Debug)]
+struct CodingPlanCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct SignedRequestHeaders {
+    content_type: String,
+    host: String,
+    x_date: String,
+    x_content_sha256: String,
+    authorization: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodingPlanUsageResponse {
+    #[serde(rename = "Result")]
+    result: CodingPlanResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodingPlanResult {
+    #[serde(rename = "Status")]
+    _status: Option<String>,
+    #[serde(rename = "UpdateTimestamp")]
+    _update_timestamp: Option<f64>,
+    #[serde(rename = "QuotaUsage")]
+    quota_usage: Vec<CodingPlanQuota>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodingPlanQuota {
+    #[serde(rename = "Level")]
+    level: String,
+    #[serde(rename = "Percent")]
+    percent: f64,
+    #[serde(rename = "ResetTimestamp")]
+    reset_timestamp: Option<f64>,
+}
+
+/// Header snapshot from a successful Ark probe (200 or 429), for normalization tests.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoubaoHeaderSnapshot {
     pub remaining_requests: Option<i64>,
@@ -47,12 +124,10 @@ pub struct DoubaoHeaderSnapshot {
     pub reset_requests: Option<String>,
 }
 
-/// Normalize rate-limit headers to [`Usage`]. Pure — unit-testable.
+/// Normalize Ark rate-limit headers to [`Usage`]. Pure — unit-testable.
 ///
-/// Requires `x-ratelimit-reset-requests` (CodexBar `151-153`); without it the
-/// response has no window. `used_percent` follows CodexBar `33-35` when
-/// `limit_requests > 0`; otherwise `0` when a reset is present (key valid, no limit
-/// header).
+/// Requires `x-ratelimit-reset-requests` (CodexBar `DoubaoUsageFetcher.swift:151-153`);
+/// without it the response has no window. `used_percent` follows CodexBar lines 41-58.
 pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchError> {
     let reset_raw = headers
         .reset_requests
@@ -93,10 +168,184 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
     })
 }
 
+/// Normalize a CodexBar-shaped Coding Plan response into session, weekly, and monthly
+/// windows (`DoubaoUsageFetcher.swift:99-127,250-267,517-546`).
+fn normalize_coding_plan_usage(body: &[u8]) -> Result<Usage, FetchError> {
+    let response: CodingPlanUsageResponse =
+        serde_json::from_slice(body).map_err(|error| FetchError::Decode(error.to_string()))?;
+    let quotas = &response.result.quota_usage;
+
+    Ok(Usage {
+        primary: coding_plan_window(quotas, &["session", "5-hour", "five_hour"], 300),
+        secondary: coding_plan_window(quotas, &["weekly", "week"], 10_080),
+        tertiary: coding_plan_window(quotas, &["monthly", "month"], 43_200),
+        extra_rate_windows: None,
+    })
+}
+
+fn coding_plan_window(
+    quotas: &[CodingPlanQuota],
+    levels: &[&str],
+    window_minutes: i64,
+) -> Option<RateWindow> {
+    let quota = quotas
+        .iter()
+        .find(|quota| levels.contains(&quota.level.to_ascii_lowercase().as_str()))?;
+    let resets_at = quota
+        .reset_timestamp
+        .filter(|timestamp| timestamp.is_finite() && *timestamp > 0.0)
+        .and_then(|timestamp| env::epoch_to_iso8601(timestamp as i64));
+
+    Some(RateWindow {
+        used_percent: quota.percent.clamp(0.0, 100.0),
+        resets_at,
+        window_minutes: Some(window_minutes),
+    })
+}
+
+fn coding_plan_credentials() -> Option<CodingPlanCredentials> {
+    Some(CodingPlanCredentials {
+        access_key_id: env::first_env(ACCESS_KEY_ID_ENV)?,
+        secret_access_key: env::first_env(SECRET_ACCESS_KEY_ENV)?,
+        region: env::first_env(REGION_ENV).unwrap_or_else(|| DEFAULT_REGION.to_string()),
+    })
+}
+
+/// Build Volcengine V4 headers using the canonical request, credential scope, and
+/// four-step signing-key derivation from `DoubaoVolcengineSigner.swift:30,41-102`.
+fn sign_coding_plan_request(
+    credentials: &CodingPlanCredentials,
+    date: DateTime<Utc>,
+    body: &[u8],
+) -> Result<SignedRequestHeaders, FetchError> {
+    let url = Url::parse(CODING_PLAN_API_URL)
+        .map_err(|error| FetchError::Decode(format!("invalid Coding Plan URL: {error}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| FetchError::Decode("Coding Plan URL has no host".to_string()))?;
+    let timestamp = date.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = date.format("%Y%m%d").to_string();
+    let payload_hash = sha256_hex(body);
+    let canonical_request = [
+        "POST".to_string(),
+        percent_encode(url.path(), false),
+        canonical_query_string(&url),
+        format!("content-type:{CODING_PLAN_CONTENT_TYPE}"),
+        format!("host:{host}"),
+        format!("x-content-sha256:{payload_hash}"),
+        format!("x-date:{timestamp}"),
+        String::new(),
+        SIGNED_HEADERS.to_string(),
+        payload_hash.clone(),
+    ]
+    .join("\n");
+    let credential_scope = format!(
+        "{date_stamp}/{}/{SIGNING_SERVICE}/{SIGNING_TERMINATOR}",
+        credentials.region
+    );
+    let string_to_sign = [
+        SIGNING_ALGORITHM.to_string(),
+        timestamp.clone(),
+        credential_scope.clone(),
+        sha256_hex(canonical_request.as_bytes()),
+    ]
+    .join("\n");
+
+    let date_key = hmac_sha256(
+        credentials.secret_access_key.as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let region_key = hmac_sha256(&date_key, credentials.region.as_bytes());
+    let service_key = hmac_sha256(&region_key, SIGNING_SERVICE.as_bytes());
+    let signing_key = hmac_sha256(&service_key, SIGNING_TERMINATOR.as_bytes());
+    let signature = hex_lower(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let authorization = format!(
+        "{SIGNING_ALGORITHM} Credential={}/{credential_scope}, SignedHeaders={SIGNED_HEADERS}, Signature={signature}",
+        credentials.access_key_id
+    );
+
+    Ok(SignedRequestHeaders {
+        content_type: CODING_PLAN_CONTENT_TYPE.to_string(),
+        host: host.to_string(),
+        x_date: timestamp,
+        x_content_sha256: payload_hash,
+        authorization,
+    })
+}
+
+fn canonical_query_string(url: &Url) -> String {
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (percent_encode(&key, true), percent_encode(&value, true)))
+        .collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn percent_encode(value: &str, encode_slash: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        let allowed = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (!encode_slash && byte == b'/');
+        if allowed {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex_lower(&Sha256::digest(data))
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    encoded
+}
+
+async fn fetch_coding_plan_usage(
+    client: &reqwest::Client,
+    credentials: &CodingPlanCredentials,
+) -> Result<Usage, FetchError> {
+    let body = Vec::new();
+    let signed = sign_coding_plan_request(credentials, Utc::now(), &body)?;
+    let response_body = JsonRequest::post(CODING_PLAN_API_URL, body)
+        .header(Header::new("Accept", "application/json"))
+        .header(Header::new("Content-Type", signed.content_type))
+        .header(Header::new("Host", signed.host))
+        .header(Header::new("X-Date", signed.x_date))
+        .header(Header::new("X-Content-Sha256", signed.x_content_sha256))
+        .header(Header::new("Authorization", signed.authorization))
+        .timeout(PROBE_TIMEOUT)
+        .send(client)
+        .await?;
+    normalize_coding_plan_usage(&response_body)
+}
+
 /// Parse `x-ratelimit-reset-requests` — ISO8601, `1d2h3m4s` components, or bare
 /// seconds until reset. Mirrors CodexBar `DoubaoUsageFetcher.parseResetTime`
-/// (`216-247`); duration-to-instant logic parallels `synthetic.rs` unit suffix
-/// handling (`211-249`) but uses compact `d/h/m/s` tokens per the Ark header format.
+/// (`216-247`).
 fn parse_reset_time(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -133,10 +382,7 @@ fn parse_reset_time(value: &str) -> Option<String> {
         while pos < bytes.len() && bytes[pos].is_ascii_digit() {
             pos += 1;
         }
-        if pos == start {
-            break;
-        }
-        if pos >= bytes.len() {
+        if pos == start || pos >= bytes.len() {
             break;
         }
         let num: f64 = trimmed[start..pos].parse().ok()?;
@@ -175,10 +421,8 @@ fn probe_body(model: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Probe one model and return the raw response. Rides the shared transport via
-/// `send_raw` (no status mapping) because doubao's status policy is bespoke: the
-/// rate-limit headers we need are present on BOTH 200 AND 429, so the caller — not
-/// the transport — decides what each status means.
+/// Probe one Ark model and return the raw response. The rate-limit headers can be
+/// present on both 200 and 429, so the caller owns status handling.
 async fn probe_model(
     client: &reqwest::Client,
     api_key: &str,
@@ -235,32 +479,12 @@ impl DoubaoProvider {
             http: reqwest::Client::new(),
         }
     }
-}
 
-impl Default for DoubaoProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl UsageProvider for DoubaoProvider {
-    fn name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-
+    async fn fetch_ark_usage(&self, api_key: &str) -> Result<Usage, FetchError> {
         let mut last_error: Option<FetchError> = None;
         for model in PROBE_MODELS {
-            match probe_model(&self.http, &api_key, model).await {
-                Ok(response) => {
-                    let snapshot = headers_to_snapshot(&response);
-                    let usage = normalize_usage(&snapshot)?;
-                    return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
-                }
+            match probe_model(&self.http, api_key, model).await {
+                Ok(response) => return normalize_usage(&headers_to_snapshot(&response)),
                 Err(err) => {
                     if let FetchError::Upstream(ref msg) = err {
                         if msg.starts_with("HTTP 404") || msg.starts_with("HTTP 403") {
@@ -278,9 +502,119 @@ impl UsageProvider for DoubaoProvider {
     }
 }
 
+impl Default for DoubaoProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl UsageProvider for DoubaoProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
+        let api_key = env::first_env(API_KEY_ENV);
+
+        // Coding Plan is more precise than Ark's request headers, but an Ark key can
+        // still recover usage when signed credentials fail (CodexBar descriptor 78-100).
+        if let Some(credentials) = coding_plan_credentials() {
+            match fetch_coding_plan_usage(&self.http, &credentials).await {
+                Ok(usage) => {
+                    return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
+                }
+                Err(coding_plan_error) => {
+                    if let Some(api_key) = api_key.as_deref() {
+                        let usage = self.fetch_ark_usage(api_key).await?;
+                        return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
+                    }
+                    return Err(coding_plan_error);
+                }
+            }
+        }
+
+        let api_key = api_key.ok_or_else(|| {
+            FetchError::NoSession(
+                "no complete Volcengine signing credentials or Doubao Ark API key found"
+                    .to_string(),
+            )
+        })?;
+        let usage = self.fetch_ark_usage(&api_key).await?;
+        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn coding_plan_payload_maps_all_three_windows() {
+        let payload = br#"{
+            "Result": {
+                "Status": "active",
+                "UpdateTimestamp": 1700000000,
+                "QuotaUsage": [
+                    {"Level": "session", "Percent": 37.5, "ResetTimestamp": 1700000000},
+                    {"Level": "weekly", "Percent": -4.0, "ResetTimestamp": 1800000000},
+                    {"Level": "monthly", "Percent": 123.0, "ResetTimestamp": 1900000000}
+                ]
+            }
+        }"#;
+
+        let usage = normalize_coding_plan_usage(payload).unwrap();
+        assert_eq!(
+            usage.primary,
+            Some(RateWindow {
+                used_percent: 37.5,
+                resets_at: Some("2023-11-14T22:13:20Z".to_string()),
+                window_minutes: Some(300),
+            })
+        );
+        assert_eq!(
+            usage.secondary,
+            Some(RateWindow {
+                used_percent: 0.0,
+                resets_at: Some("2027-01-15T08:00:00Z".to_string()),
+                window_minutes: Some(10_080),
+            })
+        );
+        assert_eq!(
+            usage.tertiary,
+            Some(RateWindow {
+                used_percent: 100.0,
+                resets_at: Some("2030-03-17T17:46:40Z".to_string()),
+                window_minutes: Some(43_200),
+            })
+        );
+        assert_eq!(usage.extra_rate_windows, None);
+    }
+
+    #[test]
+    fn signer_matches_fixed_volcengine_authorization() {
+        let credentials = CodingPlanCredentials {
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            region: "cn-beijing".to_string(),
+        };
+        let date = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let signed = sign_coding_plan_request(&credentials, date, b"").unwrap();
+
+        assert_eq!(
+            signed,
+            SignedRequestHeaders {
+                content_type: "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+                host: "open.volcengineapi.com".to_string(),
+                x_date: "20260102T030405Z".to_string(),
+                x_content_sha256:
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
+                authorization: "HMAC-SHA256 Credential=AKIDEXAMPLE/20260102/cn-beijing/ark/request, SignedHeaders=content-type;host;x-content-sha256;x-date, Signature=d15493b1dcd51a1f3a7f0c29ac8f37fe8412854a7c627b6f0aa3b62f569c2a86".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn normal_window_from_remaining_and_limit() {
