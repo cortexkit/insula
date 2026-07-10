@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -142,35 +143,45 @@ impl UsageProvider for WarpProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-        // Reproduce CodexBar's request construction faithfully: a populated
-        // osContext in the variables AND the matching x-warp-os-* headers, both
-        // part of the client fingerprint the edge limiter checks.
-        let body = json!({
-            "query": GRAPHQL_QUERY,
-            "operationName": "GetRequestLimitInfo",
-            "variables": { "requestContext": {
-                "clientContext": {},
-                "osContext": { "category": OS_CATEGORY, "name": OS_NAME, "version": OS_VERSION },
-            } },
-        });
-        let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
+            // Reproduce CodexBar's request construction faithfully: a populated
+            // osContext in the variables AND the matching x-warp-os-* headers, both
+            // part of the client fingerprint the edge limiter checks.
+            let body = json!({
+                "query": GRAPHQL_QUERY,
+                "operationName": "GetRequestLimitInfo",
+                "variables": { "requestContext": {
+                    "clientContext": {},
+                    "osContext": { "category": OS_CATEGORY, "name": OS_NAME, "version": OS_VERSION },
+                } },
+            });
+            let body =
+                serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
 
-        let response = JsonRequest::post_json(API_URL, body)
-            .bearer(&api_key)
-            .header(Header::new("x-warp-client-id", CLIENT_ID))
-            .header(Header::new("x-warp-os-category", OS_CATEGORY))
-            .header(Header::new("x-warp-os-name", OS_NAME))
-            .header(Header::new("x-warp-os-version", OS_VERSION))
-            .header(Header::new("User-Agent", USER_AGENT))
-            .send(&self.http)
-            .await?;
+            let response = JsonRequest::post_json(API_URL, body)
+                .bearer(&api_key)
+                .header(Header::new("x-warp-client-id", CLIENT_ID))
+                .header(Header::new("x-warp-os-category", OS_CATEGORY))
+                .header(Header::new("x-warp-os-name", OS_NAME))
+                .header(Header::new("x-warp-os-version", OS_VERSION))
+                .header(Header::new("User-Agent", USER_AGENT))
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&response)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&response)?;
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                "api",
+                usage,
+            ))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

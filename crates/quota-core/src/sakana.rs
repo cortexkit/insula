@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use reqwest::Url;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     model::{ProviderUsage, RateWindow, Usage},
@@ -335,29 +336,32 @@ impl UsageProvider for SakanaProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let cookie = load_cookie_header()?;
-        let http = self.http.as_ref().map_err(|message| {
-            FetchError::Upstream(format!("building Sakana HTTP client: {message}"))
-        })?;
-        let response = http
-            .get(BILLING_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header("Accept", "text/html,application/xhtml+xml")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Cookie", cookie)
-            .send()
-            .await
-            .map_err(|error| FetchError::Upstream(error.to_string()))?;
-        let status = response.status().as_u16();
-        let final_url = response.url().clone();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| FetchError::Upstream(format!("reading Sakana response: {error}")))?;
-        let usage = normalize_response(status, &final_url, &body)?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let cookie = load_cookie_header()?;
+            let http = self.http.as_ref().map_err(|message| {
+                FetchError::Upstream(format!("building Sakana HTTP client: {message}"))
+            })?;
+            let response = http
+                .get(BILLING_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header("Accept", "text/html,application/xhtml+xml")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Cookie", cookie)
+                .send()
+                .await
+                .map_err(|error| FetchError::Upstream(error.to_string()))?;
+            let status = response.status().as_u16();
+            let final_url = response.url().clone();
+            let body = response.bytes().await.map_err(|error| {
+                FetchError::Upstream(format!("reading Sakana response: {error}"))
+            })?;
+            let usage = normalize_response(status, &final_url, &body)?;
 
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

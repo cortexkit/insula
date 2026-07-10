@@ -23,6 +23,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -502,21 +503,25 @@ impl UsageProvider for KiloProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = resolve_api_key()?;
-        let url = batch_url(DEFAULT_TRPC_BASE)?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = resolve_api_key()?;
+            let url = batch_url(DEFAULT_TRPC_BASE)?;
 
-        let mut request = JsonRequest::get(url)
-            .bearer(&api_key)
-            .timeout(Duration::from_secs(15));
+            let mut request = JsonRequest::get(url)
+                .bearer(&api_key)
+                .timeout(Duration::from_secs(15));
 
-        if let Some(org_id) = env::first_env(ORG_ID_ENV) {
-            request = request.header(Header::new("X-KILOCODE-ORGANIZATIONID", org_id));
+            if let Some(org_id) = env::first_env(ORG_ID_ENV) {
+                request = request.header(Header::new("X-KILOCODE-ORGANIZATIONID", org_id));
+            }
+
+            let body = request.send(&self.http).await?;
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
         }
-
-        let body = request.send(&self.http).await?;
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

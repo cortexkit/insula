@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError},
     http::{Header, JsonRequest},
@@ -195,81 +196,85 @@ impl UsageProvider for AmpProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-            CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                FetchError::NoSession(e.to_string())
-            }
-            CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                FetchError::Upstream(e.to_string())
-            }
-        })?;
-
-        if !jar.has_cookie_named(is_session_cookie) {
-            return Err(FetchError::NoSession(
-                "no amp session cookie in browser".to_string(),
-            ));
-        }
-
-        let response = JsonRequest::get(SETTINGS_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", jar.header()))
-            .header(Header::new(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            ))
-            .header(Header::new(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ))
-            .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
-            .header(Header::new("Origin", "https://ampcode.com"))
-            .header(Header::new("Referer", SETTINGS_URL))
-            .send_raw(&self.http)
-            .await?;
-
-        if response.status == 401 || response.status == 403 {
-            return Err(FetchError::Unauthorized(format!(
-                "HTTP {}",
-                response.status
-            )));
-        }
-
-        if (300..400).contains(&response.status) {
-            if let Some(location) = response.header("Location") {
-                let loc_lower = location.to_ascii_lowercase();
-                if loc_lower.contains("auth.ampcode.com")
-                    || loc_lower.contains("login")
-                    || loc_lower.contains("signin")
-                    || loc_lower.contains("sign-in")
-                {
-                    return Err(FetchError::Unauthorized(format!(
-                        "redirected to login: {}",
-                        location
-                    )));
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
+                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                    FetchError::NoSession(e.to_string())
                 }
+                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                    FetchError::Upstream(e.to_string())
+                }
+            })?;
+
+            if !jar.has_cookie_named(is_session_cookie) {
+                return Err(FetchError::NoSession(
+                    "no amp session cookie in browser".to_string(),
+                ));
             }
-            return Err(FetchError::NoSession(format!(
-                "redirected to unknown location with status {}",
-                response.status
-            )));
-        }
 
-        if !(200..300).contains(&response.status) {
-            let excerpt: String = String::from_utf8_lossy(&response.body)
-                .chars()
-                .take(200)
-                .collect();
-            return Err(FetchError::Upstream(format!(
-                "HTTP {}: {excerpt}",
-                response.status
-            )));
-        }
+            let response = JsonRequest::get(SETTINGS_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Cookie", jar.header()))
+                .header(Header::new(
+                    "User-Agent",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+                ))
+                .header(Header::new(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ))
+                .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
+                .header(Header::new("Origin", "https://ampcode.com"))
+                .header(Header::new("Referer", SETTINGS_URL))
+                .send_raw(&self.http)
+                .await?;
 
-        let html = String::from_utf8_lossy(&response.body);
-        let usage = normalize_usage(&html, chrono::Utc::now())?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            if response.status == 401 || response.status == 403 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    response.status
+                )));
+            }
+
+            if (300..400).contains(&response.status) {
+                if let Some(location) = response.header("Location") {
+                    let loc_lower = location.to_ascii_lowercase();
+                    if loc_lower.contains("auth.ampcode.com")
+                        || loc_lower.contains("login")
+                        || loc_lower.contains("signin")
+                        || loc_lower.contains("sign-in")
+                    {
+                        return Err(FetchError::Unauthorized(format!(
+                            "redirected to login: {}",
+                            location
+                        )));
+                    }
+                }
+                return Err(FetchError::NoSession(format!(
+                    "redirected to unknown location with status {}",
+                    response.status
+                )));
+            }
+
+            if !(200..300).contains(&response.status) {
+                let excerpt: String = String::from_utf8_lossy(&response.body)
+                    .chars()
+                    .take(200)
+                    .collect();
+                return Err(FetchError::Upstream(format!(
+                    "HTTP {}: {excerpt}",
+                    response.status
+                )));
+            }
+
+            let html = String::from_utf8_lossy(&response.body);
+            let usage = normalize_usage(&html, chrono::Utc::now())?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

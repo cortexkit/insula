@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError, CookieJar},
     env,
@@ -682,13 +683,17 @@ impl UsageProvider for OpenCodeProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let cookie = load_cookie_header()?;
-        let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
-        let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
-        let now = Utc::now().timestamp();
-        let usage = parse_windows(&text, now, false)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let cookie = load_cookie_header()?;
+            let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
+            let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
+            let now = Utc::now().timestamp();
+            let usage = parse_windows(&text, now, false)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

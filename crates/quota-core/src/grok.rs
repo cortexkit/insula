@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -302,33 +303,37 @@ impl UsageProvider for GrokProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
-            .map_err(FetchError::NoSession)?
-            .ok_or_else(|| {
-                FetchError::NoSession("no xai entry in opencode auth.json".to_string())
-            })?;
-        let access = match auth {
-            OpencodeAuth::Oauth { access, .. } => access,
-            OpencodeAuth::Api { key } => key,
-        };
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
+                .map_err(FetchError::NoSession)?
+                .ok_or_else(|| {
+                    FetchError::NoSession("no xai entry in opencode auth.json".to_string())
+                })?;
+            let access = match auth {
+                OpencodeAuth::Oauth { access, .. } => access,
+                OpencodeAuth::Api { key } => key,
+            };
 
-        // An empty gRPC-web message: a single frame with flags=0 and length=0.
-        let frame: Vec<u8> = vec![0, 0, 0, 0, 0];
-        let body = JsonRequest::post(USAGE_URL, frame)
-            .timeout(REQUEST_TIMEOUT)
-            .bearer(&access)
-            .header(Header::new("Origin", "https://grok.com"))
-            .header(Header::new("Referer", "https://grok.com/?_s=usage"))
-            .header(Header::new("Accept", "*/*"))
-            .header(Header::new("Content-Type", CONTENT_TYPE))
-            .header(Header::new("x-grpc-web", "1"))
-            .header(Header::new("x-user-agent", "connect-es/2.1.1"))
-            .send(&self.http)
-            .await?;
+            // An empty gRPC-web message: a single frame with flags=0 and length=0.
+            let frame: Vec<u8> = vec![0, 0, 0, 0, 0];
+            let body = JsonRequest::post(USAGE_URL, frame)
+                .timeout(REQUEST_TIMEOUT)
+                .bearer(&access)
+                .header(Header::new("Origin", "https://grok.com"))
+                .header(Header::new("Referer", "https://grok.com/?_s=usage"))
+                .header(Header::new("Accept", "*/*"))
+                .header(Header::new("Content-Type", CONTENT_TYPE))
+                .header(Header::new("x-grpc-web", "1"))
+                .header(Header::new("x-user-agent", "connect-es/2.1.1"))
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

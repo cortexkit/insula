@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError, CookieJar},
     env,
@@ -284,49 +285,58 @@ impl UsageProvider for FactoryProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-            CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                FetchError::NoSession(e.to_string())
-            }
-            CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                FetchError::Upstream(e.to_string())
-            }
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
+                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                    FetchError::NoSession(e.to_string())
+                }
+                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                    FetchError::Upstream(e.to_string())
+                }
+            })?;
 
-        if !jar.has_cookie_named(is_session_cookie) {
-            return Err(FetchError::NoSession(
-                "no factory session cookie in browser".to_string(),
-            ));
+            if !jar.has_cookie_named(is_session_cookie) {
+                return Err(FetchError::NoSession(
+                    "no factory session cookie in browser".to_string(),
+                ));
+            }
+
+            let bearer = resolve_direct_bearer(&jar).ok_or_else(|| {
+                FetchError::NoSession(
+                    "factory: no direct bearer cookie (access-token/session); WorkOS exchange not implemented"
+                        .to_string(),
+                )
+            })?;
+
+            let response = JsonRequest::get(BILLING_LIMITS_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Accept", "application/json"))
+                .header(Header::new("Content-Type", "application/json"))
+                .header(Header::new("Origin", "https://app.factory.ai"))
+                .header(Header::new("Referer", "https://app.factory.ai/"))
+                .header(Header::new("x-factory-client", "web-app"))
+                .header(Header::new("Cookie", jar.header()))
+                .bearer(&bearer)
+                .send_raw(&self.http)
+                .await?;
+
+            let excerpt: String = String::from_utf8_lossy(&response.body)
+                .chars()
+                .take(200)
+                .collect();
+            map_billing_http_status(response.status, &excerpt)?;
+
+            let usage = normalize_billing_limits_bytes(&response.body, Utc::now())?;
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                "api",
+                usage,
+            ))
         }
-
-        let bearer = resolve_direct_bearer(&jar).ok_or_else(|| {
-            FetchError::NoSession(
-                "factory: no direct bearer cookie (access-token/session); WorkOS exchange not implemented"
-                    .to_string(),
-            )
-        })?;
-
-        let response = JsonRequest::get(BILLING_LIMITS_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Accept", "application/json"))
-            .header(Header::new("Content-Type", "application/json"))
-            .header(Header::new("Origin", "https://app.factory.ai"))
-            .header(Header::new("Referer", "https://app.factory.ai/"))
-            .header(Header::new("x-factory-client", "web-app"))
-            .header(Header::new("Cookie", jar.header()))
-            .bearer(&bearer)
-            .send_raw(&self.http)
-            .await?;
-
-        let excerpt: String = String::from_utf8_lossy(&response.body)
-            .chars()
-            .take(200)
-            .collect();
-        map_billing_http_status(response.status, &excerpt)?;
-
-        let usage = normalize_billing_limits_bytes(&response.body, Utc::now())?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

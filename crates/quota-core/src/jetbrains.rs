@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -185,14 +186,18 @@ impl UsageProvider for JetBrainsProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let path = discover_quota_file().ok_or_else(|| {
-            FetchError::NoSession("no JetBrains AIAssistantQuotaManager2.xml found".to_string())
-        })?;
-        let bytes = std::fs::read(&path)
-            .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", path.display())))?;
-        let usage = normalize_usage(&bytes)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let path = discover_quota_file().ok_or_else(|| {
+                FetchError::NoSession("no JetBrains AIAssistantQuotaManager2.xml found".to_string())
+            })?;
+            let bytes = std::fs::read(&path)
+                .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", path.display())))?;
+            let usage = normalize_usage(&bytes)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

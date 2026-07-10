@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use chrono::TimeZone;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -213,23 +214,27 @@ impl UsageProvider for CopilotProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let token = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let token = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-        // GitHub's `token <oauth>` scheme (not Bearer) + the editor headers the
-        // copilot_internal endpoint expects, reproduced from CodexBar.
-        let body = JsonRequest::get(USAGE_URL)
-            .header(Header::new("Authorization", format!("token {token}")))
-            .header(Header::new("Editor-Version", "vscode/1.96.2"))
-            .header(Header::new("Editor-Plugin-Version", "copilot-chat/0.26.7"))
-            .header(Header::new("User-Agent", "GitHubCopilotChat/0.26.7"))
-            .header(Header::new("X-Github-Api-Version", "2025-04-01"))
-            .send(&self.http)
-            .await?;
+            // GitHub's `token <oauth>` scheme (not Bearer) + the editor headers the
+            // copilot_internal endpoint expects, reproduced from CodexBar.
+            let body = JsonRequest::get(USAGE_URL)
+                .header(Header::new("Authorization", format!("token {token}")))
+                .header(Header::new("Editor-Version", "vscode/1.96.2"))
+                .header(Header::new("Editor-Plugin-Version", "copilot-chat/0.26.7"))
+                .header(Header::new("User-Agent", "GitHubCopilotChat/0.26.7"))
+                .header(Header::new("X-Github-Api-Version", "2025-04-01"))
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

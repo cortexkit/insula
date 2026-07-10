@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     http::{Header, JsonRequest},
     model::ProviderUsage,
@@ -83,13 +84,17 @@ impl UsageProvider for OpenCodeGoProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let cookie = load_cookie_header()?;
-        let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
-        let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
-        let now = chrono::Utc::now().timestamp();
-        let usage = parse_windows(&text, now, true)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let cookie = load_cookie_header()?;
+            let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
+            let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
+            let now = chrono::Utc::now().timestamp();
+            let usage = parse_windows(&text, now, true)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

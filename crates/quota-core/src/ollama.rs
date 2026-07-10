@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError},
     http::{Header, JsonRequest},
@@ -243,46 +244,49 @@ impl UsageProvider for OllamaProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-            // No store / no cookie / unsupported platform → simply not logged in here.
-            CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                FetchError::NoSession(e.to_string())
-            }
-            CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                FetchError::Upstream(e.to_string())
-            }
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
+                // No store / no cookie / unsupported platform → simply not logged in here.
+                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                    FetchError::NoSession(e.to_string())
+                }
+                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                    FetchError::Upstream(e.to_string())
+                }
+            })?;
 
-        // A jar without a recognized session cookie is not a usable login.
-        if !jar.has_cookie_named(is_session_cookie) {
-            return Err(FetchError::NoSession(
-                "no ollama session cookie in browser".to_string(),
-            ));
-        }
+            // A jar without a recognized session cookie is not a usable login.
+            if !jar.has_cookie_named(is_session_cookie) {
+                return Err(FetchError::NoSession(
+                    "no ollama session cookie in browser".to_string(),
+                ));
+            }
 
-        let html_bytes = JsonRequest::get(SETTINGS_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", jar.header()))
-            .header(Header::new(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+            let html_bytes = JsonRequest::get(SETTINGS_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Cookie", jar.header()))
+                .header(Header::new(
+                    "User-Agent",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            ))
-            .header(Header::new(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ))
-            .header(Header::new("Referer", SETTINGS_URL))
-            .send(&self.http)
-            .await?;
+                ))
+                .header(Header::new(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ))
+                .header(Header::new("Referer", SETTINGS_URL))
+                .send(&self.http)
+                .await?;
 
-        let html = String::from_utf8_lossy(&html_bytes);
-        let usage = normalize_usage(&html)?;
-        // source "api": ollama is a credentialed (non-oauth) fetch; kept within the
-        // existing source vocabulary until the consumer's source handling is
-        // verified opaque (the cookie cohort may later warrant a distinct label).
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let html = String::from_utf8_lossy(&html_bytes);
+            let usage = normalize_usage(&html)?;
+            // Use the existing "api" label because this fetch uses local credentials
+            // rather than OAuth. A cookie-specific label would require consumer support.
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

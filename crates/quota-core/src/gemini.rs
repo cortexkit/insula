@@ -45,6 +45,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::JsonRequest,
@@ -368,30 +369,34 @@ impl UsageProvider for GeminiProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let now = Instant::now();
-        let access_token = self.access_token(now).await?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let now = Instant::now();
+            let access_token = self.access_token(now).await?;
 
-        let mut project = self.discover_project(&access_token).await;
-        if project.is_none() {
-            project = self
-                .discover_project_via_resource_manager(&access_token)
-                .await;
+            let mut project = self.discover_project(&access_token).await;
+            if project.is_none() {
+                project = self
+                    .discover_project_via_resource_manager(&access_token)
+                    .await;
+            }
+
+            let quota_body = match &project {
+                Some(p) => json!({ "project": p }),
+                None => json!({}),
+            };
+            let quota_body =
+                serde_json::to_vec(&quota_body).map_err(|e| FetchError::Decode(e.to_string()))?;
+            let response = JsonRequest::post_json(QUOTA_URL, quota_body)
+                .bearer(&access_token)
+                .send(&self.http)
+                .await?;
+
+            let usage = normalize_quota(&response)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
         }
-
-        let quota_body = match &project {
-            Some(p) => json!({ "project": p }),
-            None => json!({}),
-        };
-        let quota_body =
-            serde_json::to_vec(&quota_body).map_err(|e| FetchError::Decode(e.to_string()))?;
-        let response = JsonRequest::post_json(QUOTA_URL, quota_body)
-            .bearer(&access_token)
-            .send(&self.http)
-            .await?;
-
-        let usage = normalize_quota(&response)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

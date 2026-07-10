@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -397,36 +398,41 @@ impl UsageProvider for KimiProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let auth_token = resolve_auth_token()
-            .ok_or_else(|| FetchError::NoSession(format!("none of {AUTH_TOKEN_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let auth_token = resolve_auth_token().ok_or_else(|| {
+                FetchError::NoSession(format!("none of {AUTH_TOKEN_ENV:?} is set"))
+            })?;
 
-        let body = serde_json::to_vec(&json!({ "scope": ["FEATURE_CODING"] }))
-            .map_err(|e| FetchError::Decode(e.to_string()))?;
+            let body = serde_json::to_vec(&json!({ "scope": ["FEATURE_CODING"] }))
+                .map_err(|e| FetchError::Decode(e.to_string()))?;
 
-        let session = decode_session_info(&auth_token);
-        let response = web_request(USAGE_URL, body, &auth_token, session.as_ref())
+            let session = decode_session_info(&auth_token);
+            let response = web_request(USAGE_URL, body, &auth_token, session.as_ref())
+                .send(&self.http)
+                .await?;
+            let mut usage = normalize_usage(&response)?;
+
+            // Subscription data is optional enrichment: a failed request or malformed
+            // response must not discard the already-normalized GetUsages windows.
+            if let Ok(response) = web_request(
+                SUBSCRIPTION_STATS_URL,
+                b"{}".to_vec(),
+                &auth_token,
+                session.as_ref(),
+            )
             .send(&self.http)
-            .await?;
-        let mut usage = normalize_usage(&response)?;
-
-        // Subscription data is optional enrichment: a failed request or malformed
-        // response must not discard the already-normalized GetUsages windows.
-        if let Ok(response) = web_request(
-            SUBSCRIPTION_STATS_URL,
-            b"{}".to_vec(),
-            &auth_token,
-            session.as_ref(),
-        )
-        .send(&self.http)
-        .await
-        {
-            if let Ok(extra_rate_windows) = normalize_subscription_stats(&response) {
-                usage.extra_rate_windows = extra_rate_windows;
+            .await
+            {
+                if let Ok(extra_rate_windows) = normalize_subscription_stats(&response) {
+                    usage.extra_rate_windows = extra_rate_windows;
+                }
             }
-        }
 
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

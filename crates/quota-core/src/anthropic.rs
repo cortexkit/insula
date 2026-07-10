@@ -18,6 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -114,27 +115,31 @@ impl UsageProvider for AnthropicProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
-            .map_err(FetchError::NoSession)?
-            .ok_or_else(|| {
-                FetchError::NoSession("no anthropic entry in opencode auth.json".to_string())
-            })?;
-        let access = match auth {
-            OpencodeAuth::Oauth { access, .. } => access,
-            OpencodeAuth::Api { key } => key,
-        };
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
+                .map_err(FetchError::NoSession)?
+                .ok_or_else(|| {
+                    FetchError::NoSession("no anthropic entry in opencode auth.json".to_string())
+                })?;
+            let access = match auth {
+                OpencodeAuth::Oauth { access, .. } => access,
+                OpencodeAuth::Api { key } => key,
+            };
 
-        let body = JsonRequest::get(USAGE_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .bearer(&access)
-            .header(Header::new("anthropic-beta", BETA_HEADER))
-            .header(Header::new("User-Agent", CLAUDE_CODE_UA))
-            .send(&self.http)
-            .await?;
+            let body = JsonRequest::get(USAGE_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .bearer(&access)
+                .header(Header::new("anthropic-beta", BETA_HEADER))
+                .header(Header::new("User-Agent", CLAUDE_CODE_UA))
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

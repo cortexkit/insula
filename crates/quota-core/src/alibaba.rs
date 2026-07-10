@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use serde_json::{json, Value};
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -401,22 +402,26 @@ impl UsageProvider for AlibabaProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-        match fetch_once(&self.http, &api_key, &INTL_REGION).await {
-            Ok(body) => {
-                let usage = normalize_usage(&body)?;
-                return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
+            match fetch_once(&self.http, &api_key, &INTL_REGION).await {
+                Ok(body) => {
+                    let usage = normalize_usage(&body)?;
+                    return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
+                }
+                Err(err) if should_retry_alternate_region(&err) => {}
+                Err(err) => return Err(err),
             }
-            Err(err) if should_retry_alternate_region(&err) => {}
-            Err(err) => return Err(err),
-        }
 
-        let body = fetch_once(&self.http, &api_key, &CN_REGION).await?;
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let body = fetch_once(&self.http, &api_key, &CN_REGION).await?;
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

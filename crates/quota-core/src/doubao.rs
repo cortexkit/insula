@@ -26,6 +26,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, HttpResponse, JsonRequest},
@@ -514,34 +515,38 @@ impl UsageProvider for DoubaoProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV);
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV);
 
-        // Coding Plan is more precise than Ark's request headers, but an Ark key can
-        // still recover usage when signed credentials fail (CodexBar descriptor 78-100).
-        if let Some(credentials) = coding_plan_credentials() {
-            match fetch_coding_plan_usage(&self.http, &credentials).await {
-                Ok(usage) => {
-                    return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
-                }
-                Err(coding_plan_error) => {
-                    if let Some(api_key) = api_key.as_deref() {
-                        let usage = self.fetch_ark_usage(api_key).await?;
+            // Prefer Coding Plan because it reports usage directly. If its signed
+            // request fails, an available Ark API key can still recover usage.
+            if let Some(credentials) = coding_plan_credentials() {
+                match fetch_coding_plan_usage(&self.http, &credentials).await {
+                    Ok(usage) => {
                         return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
                     }
-                    return Err(coding_plan_error);
+                    Err(coding_plan_error) => {
+                        if let Some(api_key) = api_key.as_deref() {
+                            let usage = self.fetch_ark_usage(api_key).await?;
+                            return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage));
+                        }
+                        return Err(coding_plan_error);
+                    }
                 }
             }
-        }
 
-        let api_key = api_key.ok_or_else(|| {
-            FetchError::NoSession(
-                "no complete Volcengine signing credentials or Doubao Ark API key found"
-                    .to_string(),
-            )
-        })?;
-        let usage = self.fetch_ark_usage(&api_key).await?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let api_key = api_key.ok_or_else(|| {
+                FetchError::NoSession(
+                    "no complete Volcengine signing credentials or Doubao Ark API key found"
+                        .to_string(),
+                )
+            })?;
+            let usage = self.fetch_ark_usage(&api_key).await?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

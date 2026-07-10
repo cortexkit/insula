@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::JsonRequest,
@@ -513,18 +514,22 @@ impl UsageProvider for SyntheticProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-        let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+            let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
 
-        let body = JsonRequest::get(base)
-            .bearer(&api_key)
-            .send(&self.http)
-            .await?;
+            let body = JsonRequest::get(base)
+                .bearer(&api_key)
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

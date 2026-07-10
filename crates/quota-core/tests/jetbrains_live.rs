@@ -2,13 +2,14 @@
 //! machine. The files here read type:"Unknown" (no active AI quota), so the
 //! provider must DEGRADE cleanly (NoSession), proving file-read + parse + degrade.
 use quota_core::jetbrains::JetBrainsProvider;
+use quota_core::provider::CredentialHandle;
 use quota_core::provider::{FetchError, UsageProvider};
 
 #[tokio::test]
 #[ignore = "requires JetBrains IDE config files on disk"]
 async fn jetbrains_live_reads_and_degrades_or_reports() {
     let p = JetBrainsProvider::new();
-    match p.fetch().await {
+    match p.fetch_handle(&CredentialHandle::implicit()).await.usage {
         Ok(entry) => eprintln!(
             "[jetbrains-live] active window: {}",
             serde_json::to_string(&entry).unwrap()

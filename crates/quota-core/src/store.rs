@@ -1,59 +1,102 @@
-//! The per-provider slot store: the single background refresher writes resolved
-//! [`ProviderSlot`]s here, and the serving read path only ever clones out of it.
+//! Refresher-owned active fetch units behind the registry mutex.
 //!
-//! This replaces the old single-slot TTL cache. Freshness is no longer a TTL on
-//! the read; the refresher owns it (see `refresh.rs`), and the read path serves
-//! whatever the last sweep produced. The store also holds the refresher's
-//! heartbeat (`last_tick_at`) and its birth time, which `health()` reads to tell
-//! a wedged refresher from a merely idle one.
+//! The store only performs in-memory reconciliation, snapshots, heartbeat
+//! updates, and incarnation-fenced whole-slot publication. Enumeration, sorting,
+//! transition computation, and all asynchronous work happen outside its lock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::refresh::ProviderSlot;
+use crate::provider::CredentialHandle;
+use crate::refresh::{Incarnation, ProviderSlot};
 
-/// The refresher-owned state behind the registry's mutex. Every op here is a
-/// cheap in-memory map/timestamp touch, so the lock is never held long and never
-/// across a `.await`.
+/// Active fetch-unit identity. The account label is not part of the key because
+/// a credential can change accounts without changing its handle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SlotKey {
+    pub provider: String,
+    pub handle: CredentialHandle,
+}
+
+impl SlotKey {
+    pub fn new(provider: impl Into<String>, handle: CredentialHandle) -> Self {
+        Self {
+            provider: provider.into(),
+            handle,
+        }
+    }
+}
+
+/// Refresher state protected by [`Registry`](crate::Registry)'s mutex.
 pub struct SlotStore {
-    slots: HashMap<String, ProviderSlot>,
-    /// When the store was created — lets `health()` detect a refresher that
-    /// never started (vs one that started and then stalled).
+    slots: HashMap<SlotKey, ProviderSlot>,
     created_at: Instant,
-    /// Heartbeat: stamped at the top of every refresher tick, unconditionally.
     last_tick_at: Option<Instant>,
+    next_incarnation: u128,
 }
 
 impl SlotStore {
-    /// Seed one due-now slot per provider, so the first refresher tick fetches
-    /// the whole set (cold start).
-    pub fn new<I, S>(provider_names: I, now: Instant) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let slots = provider_names
-            .into_iter()
-            .map(|n| (n.into(), ProviderSlot::due_now(now)))
-            .collect();
+    pub fn new(now: Instant) -> Self {
         Self {
-            slots,
+            slots: HashMap::new(),
             created_at: now,
             last_tick_at: None,
+            next_incarnation: 1,
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&ProviderSlot> {
-        self.slots.get(name)
+    /// Apply one authoritative, canonical handle snapshot for a provider.
+    /// Missing handles are reaped and new handles become immediately due.
+    pub fn reconcile(&mut self, provider: &str, handles: &[CredentialHandle], now: Instant) {
+        let active: HashSet<&CredentialHandle> = handles.iter().collect();
+        self.slots
+            .retain(|key, _| key.provider != provider || active.contains(&key.handle));
+
+        for handle in handles {
+            let key = SlotKey::new(provider, handle.clone());
+            if self.slots.contains_key(&key) {
+                continue;
+            }
+            let incarnation = Incarnation::from_counter(self.next_incarnation);
+            self.next_incarnation = self
+                .next_incarnation
+                .checked_add(1)
+                .expect("credential incarnation counter exhausted");
+            self.slots
+                .insert(key, ProviderSlot::due_now(now, incarnation));
+        }
     }
 
-    /// Whole-slot atomic replacement (the refresher computes the next slot
-    /// entirely outside the lock, then inserts it here).
-    pub fn insert(&mut self, name: String, slot: ProviderSlot) {
-        self.slots.insert(name, slot);
+    pub fn get(&self, key: &SlotKey) -> Option<&ProviderSlot> {
+        self.slots.get(key)
     }
 
-    /// Stamp the refresher heartbeat.
+    /// Clone active slots for computation after releasing the mutex.
+    pub fn snapshot(&self) -> Vec<(SlotKey, ProviderSlot)> {
+        self.slots
+            .iter()
+            .map(|(key, slot)| (key.clone(), slot.clone()))
+            .collect()
+    }
+
+    /// Publish only into the exact active lifetime that admitted the fetch.
+    /// Returns `false` when reconciliation removed or reincarnated the key.
+    pub fn publish_if_current(
+        &mut self,
+        key: &SlotKey,
+        incarnation: Incarnation,
+        next: ProviderSlot,
+    ) -> bool {
+        let Some(current) = self.slots.get(key) else {
+            return false;
+        };
+        if current.incarnation != incarnation {
+            return false;
+        }
+        self.slots.insert(key.clone(), next);
+        true
+    }
+
     pub fn mark_tick(&mut self, now: Instant) {
         self.last_tick_at = Some(now);
     }
@@ -64,5 +107,45 @@ impl SlotStore {
 
     pub fn created_at(&self) -> Instant {
         self.created_at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_and_readd_assigns_a_new_incarnation() {
+        let now = Instant::now();
+        let handle = CredentialHandle::new("H");
+        let key = SlotKey::new("mock", handle.clone());
+        let mut store = SlotStore::new(now);
+
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let first = store.get(&key).unwrap().incarnation;
+        store.reconcile("mock", &[], now);
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let second = store.get(&key).unwrap().incarnation;
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn stale_publication_cannot_resurrect_or_overwrite_a_readded_key() {
+        let now = Instant::now();
+        let handle = CredentialHandle::new("H");
+        let key = SlotKey::new("mock", handle.clone());
+        let mut store = SlotStore::new(now);
+
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let old = store.get(&key).unwrap().clone();
+        let old_incarnation = old.incarnation;
+        store.reconcile("mock", &[], now);
+        assert!(!store.publish_if_current(&key, old_incarnation, old.clone()));
+        assert!(store.get(&key).is_none());
+
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        assert!(!store.publish_if_current(&key, old_incarnation, old));
+        assert_ne!(store.get(&key).unwrap().incarnation, old_incarnation);
     }
 }

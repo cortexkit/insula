@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -305,23 +306,27 @@ impl UsageProvider for ManusProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let token = resolve_session_token().ok_or_else(|| {
-            FetchError::NoSession(format!("none of {SESSION_TOKEN_ENV:?} is set"))
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let token = resolve_session_token().ok_or_else(|| {
+                FetchError::NoSession(format!("none of {SESSION_TOKEN_ENV:?} is set"))
+            })?;
 
-        let body = JsonRequest::post_json(CREDITS_URL, b"{}".to_vec())
-            .bearer(&token)
-            .header(Header::new("Origin", "https://manus.im"))
-            .header(Header::new("Referer", "https://manus.im/"))
-            .header(Header::new("Connect-Protocol-Version", "1"))
-            .header(Header::new("User-Agent", USER_AGENT))
-            .timeout(REQUEST_TIMEOUT)
-            .send(&self.http)
-            .await?;
+            let body = JsonRequest::post_json(CREDITS_URL, b"{}".to_vec())
+                .bearer(&token)
+                .header(Header::new("Origin", "https://manus.im"))
+                .header(Header::new("Referer", "https://manus.im/"))
+                .header(Header::new("Connect-Protocol-Version", "1"))
+                .header(Header::new("User-Agent", USER_AGENT))
+                .timeout(REQUEST_TIMEOUT)
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

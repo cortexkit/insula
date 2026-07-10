@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError, CookieJar},
     env,
@@ -231,29 +232,33 @@ impl UsageProvider for QoderProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(map_cookie_error)?;
-        // Qoder's importer does not designate one session-cookie name, so send
-        // every cookie from its two exact international hosts.
-        let cookie = request_cookie_header(&jar).ok_or_else(|| {
-            FetchError::NoSession("no cookies for an exact Qoder browser host".to_string())
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(map_cookie_error)?;
+            // Qoder's importer does not designate one session-cookie name, so send
+            // every cookie from its two exact international hosts.
+            let cookie = request_cookie_header(&jar).ok_or_else(|| {
+                FetchError::NoSession("no cookies for an exact Qoder browser host".to_string())
+            })?;
 
-        let body = JsonRequest::get(USAGE_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", cookie))
-            .header(Header::new("Accept", "application/json, text/plain, */*"))
-            .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
-            .header(Header::new("User-Agent", USER_AGENT))
-            .header(Header::new("Origin", ORIGIN))
-            .header(Header::new("Referer", REFERER))
-            .header(Header::new("X-Requested-With", "XMLHttpRequest"))
-            .header(Header::new("Bx-V", "2.5.35"))
-            .send(&self.http)
-            .await?;
-        let usage = normalize_usage(&body)?;
+            let body = JsonRequest::get(USAGE_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Cookie", cookie))
+                .header(Header::new("Accept", "application/json, text/plain, */*"))
+                .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
+                .header(Header::new("User-Agent", USER_AGENT))
+                .header(Header::new("Origin", ORIGIN))
+                .header(Header::new("Referer", REFERER))
+                .header(Header::new("X-Requested-With", "XMLHttpRequest"))
+                .header(Header::new("Bx-V", "2.5.35"))
+                .send(&self.http)
+                .await?;
+            let usage = normalize_usage(&body)?;
 
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

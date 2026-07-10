@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::JsonRequest,
@@ -205,35 +206,39 @@ impl UsageProvider for CodebuffProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let token = resolve_token().ok_or_else(|| {
-            FetchError::NoSession(
-                "no CODEBUFF_API_KEY or ~/.config/manicode/credentials.json".to_string(),
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let token = resolve_token().ok_or_else(|| {
+                FetchError::NoSession(
+                    "no CODEBUFF_API_KEY or ~/.config/manicode/credentials.json".to_string(),
+                )
+            })?;
+
+            // Required: the usage (credits) endpoint.
+            let usage_body = JsonRequest::post_json(
+                format!("{BASE_URL}{USAGE_PATH}"),
+                serde_json::to_vec(&json!({ "fingerprintId": "quota-usage" }))
+                    .map_err(|e| FetchError::Decode(e.to_string()))?,
             )
-        })?;
-
-        // Required: the usage (credits) endpoint.
-        let usage_body = JsonRequest::post_json(
-            format!("{BASE_URL}{USAGE_PATH}"),
-            serde_json::to_vec(&json!({ "fingerprintId": "quota-usage" }))
-                .map_err(|e| FetchError::Decode(e.to_string()))?,
-        )
-        .timeout(REQUEST_TIMEOUT)
-        .bearer(&token)
-        .send(&self.http)
-        .await?;
-
-        // Best-effort: the subscription endpoint carries the weekly window. A
-        // failure here must not fail the whole fetch (CodexBar treats it optional).
-        let subscription_body = JsonRequest::get(format!("{BASE_URL}{SUBSCRIPTION_PATH}"))
             .timeout(REQUEST_TIMEOUT)
             .bearer(&token)
             .send(&self.http)
-            .await
-            .ok();
+            .await?;
 
-        let usage = normalize_usage(&usage_body, subscription_body.as_deref())?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            // Best-effort: the subscription endpoint carries the weekly window. A
+            // failure here must not fail the whole fetch (CodexBar treats it optional).
+            let subscription_body = JsonRequest::get(format!("{BASE_URL}{SUBSCRIPTION_PATH}"))
+                .timeout(REQUEST_TIMEOUT)
+                .bearer(&token)
+                .send(&self.http)
+                .await
+                .ok();
+
+            let usage = normalize_usage(&usage_body, subscription_body.as_deref())?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

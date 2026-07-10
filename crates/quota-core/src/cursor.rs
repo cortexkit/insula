@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError},
     http::{Header, JsonRequest},
@@ -159,30 +160,34 @@ impl UsageProvider for CursorProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-            CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                FetchError::NoSession(e.to_string())
-            }
-            CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                FetchError::Upstream(e.to_string())
-            }
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
+                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                    FetchError::NoSession(e.to_string())
+                }
+                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                    FetchError::Upstream(e.to_string())
+                }
+            })?;
 
-        if !jar.has_cookie_named(is_session_cookie) {
-            return Err(FetchError::NoSession(
-                "no cursor session cookie in browser".to_string(),
-            ));
+            if !jar.has_cookie_named(is_session_cookie) {
+                return Err(FetchError::NoSession(
+                    "no cursor session cookie in browser".to_string(),
+                ));
+            }
+
+            let body_bytes = JsonRequest::get(USAGE_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Cookie", jar.header()))
+                .send(&self.http)
+                .await?;
+
+            let usage = normalize_usage(&body_bytes)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
         }
-
-        let body_bytes = JsonRequest::get(USAGE_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", jar.header()))
-            .send(&self.http)
-            .await?;
-
-        let usage = normalize_usage(&body_bytes)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

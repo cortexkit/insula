@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -321,15 +322,20 @@ impl UsageProvider for ZaiProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-        let request = build_quota_request(&api_key, resolve_quota_url(), team_context_from_env())?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+            let request =
+                build_quota_request(&api_key, resolve_quota_url(), team_context_from_env())?;
 
-        let body = request.into_json_request().send(&self.http).await?;
+            let body = request.into_json_request().send(&self.http).await?;
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

@@ -23,9 +23,11 @@ use std::{path::PathBuf, time::Duration};
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::AccountObservation;
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -226,18 +228,28 @@ impl UsageProvider for CodexProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let home = codex_home().ok_or_else(|| {
-            FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
-        })?;
-        let auth_path = home.join("auth.json");
-        let data = std::fs::read(&auth_path)
-            .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", auth_path.display())))?;
-        let creds = parse_credentials(&data)?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let resolved = (|| {
+            let home = codex_home().ok_or_else(|| {
+                FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
+            })?;
+            let auth_path = home.join("auth.json");
+            let data = std::fs::read(&auth_path).map_err(|e| {
+                FetchError::NoSession(format!("reading {}: {e}", auth_path.display()))
+            })?;
+            let creds = parse_credentials(&data)?;
+            Ok::<_, FetchError>((home, creds))
+        })();
+
+        let (home, creds) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+        let observed = Some(AccountObservation::new(creds.account_id.clone(), None));
+        let source = if creds.is_oauth { "oauth" } else { "api" };
 
         let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
         let url = resolve_usage_url(config_toml.as_deref());
-
         let mut request = JsonRequest::get(url)
             .timeout(REQUEST_TIMEOUT)
             .bearer(&creds.bearer)
@@ -246,15 +258,14 @@ impl UsageProvider for CodexProvider {
             request = request.header(Header::new("ChatGPT-Account-Id", account_id.clone()));
         }
 
-        let body = request.send(&self.http).await?;
-        let usage = normalize_usage(&body)?;
-        let source = if creds.is_oauth { "oauth" } else { "api" };
-        Ok(ProviderUsage::healthy(
-            PROVIDER_NAME,
-            creds.account_id,
-            source,
-            usage,
-        ))
+        let usage = match request.send(&self.http).await {
+            Ok(body) => normalize_usage(&body),
+            Err(error) => Err(error),
+        };
+        match usage {
+            Ok(usage) => FetchAttempt::success(observed, source, usage),
+            Err(error) => FetchAttempt::failure(observed, Some(source.to_string()), error),
+        }
     }
 }
 

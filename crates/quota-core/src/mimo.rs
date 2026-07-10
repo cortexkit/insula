@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies,
     http::{Header, JsonRequest},
@@ -180,105 +181,109 @@ impl UsageProvider for MimoProvider {
         true
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-            browser_cookies::CookieError::NoStore
-            | browser_cookies::CookieError::NoCookie
-            | browser_cookies::CookieError::Unsupported => FetchError::NoSession(e.to_string()),
-            browser_cookies::CookieError::NoKeychainKey(_)
-            | browser_cookies::CookieError::Extract(_) => FetchError::Upstream(e.to_string()),
-        })?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
+                browser_cookies::CookieError::NoStore
+                | browser_cookies::CookieError::NoCookie
+                | browser_cookies::CookieError::Unsupported => FetchError::NoSession(e.to_string()),
+                browser_cookies::CookieError::NoKeychainKey(_)
+                | browser_cookies::CookieError::Extract(_) => FetchError::Upstream(e.to_string()),
+            })?;
 
-        let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
-        let has_user_id = jar.has_cookie_named(|n| n == "userId");
-        if !has_token || !has_user_id {
-            return Err(FetchError::NoSession(
-                "missing required mimo session cookies (api-platform_serviceToken and userId)"
-                    .to_string(),
-            ));
-        }
+            let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
+            let has_user_id = jar.has_cookie_named(|n| n == "userId");
+            if !has_token || !has_user_id {
+                return Err(FetchError::NoSession(
+                    "missing required mimo session cookies (api-platform_serviceToken and userId)"
+                        .to_string(),
+                ));
+            }
 
-        // Fetch detail
-        let detail_req = JsonRequest::get(DETAIL_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Accept", "application/json, text/plain, */*"))
-            .header(Header::new("Cookie", jar.header()))
-            .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
-            .header(Header::new("x-timeZone", "UTC+01:00"))
-            .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
-            .header(Header::new(
-                "Referer",
-                "https://platform.xiaomimimo.com/#/console/balance",
-            ))
-            .header(Header::new("User-Agent", BROWSER_USER_AGENT));
+            // The usage response omits account metadata needed by normalization,
+            // so validate and retain the detail response before fetching usage.
+            let detail_req = JsonRequest::get(DETAIL_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Accept", "application/json, text/plain, */*"))
+                .header(Header::new("Cookie", jar.header()))
+                .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
+                .header(Header::new("x-timeZone", "UTC+01:00"))
+                .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
+                .header(Header::new(
+                    "Referer",
+                    "https://platform.xiaomimimo.com/#/console/balance",
+                ))
+                .header(Header::new("User-Agent", BROWSER_USER_AGENT));
 
-        let detail_res = detail_req.send_raw(&self.http).await?;
-        if (300..400).contains(&detail_res.status) || detail_res.status == 401 {
-            return Err(FetchError::Unauthorized(format!(
-                "HTTP {}",
-                detail_res.status
-            )));
-        }
-        if detail_res.status == 403 {
-            return Err(FetchError::Unauthorized(format!(
-                "HTTP {}",
-                detail_res.status
-            )));
-        }
-        if !(200..300).contains(&detail_res.status) {
-            let excerpt: String = String::from_utf8_lossy(&detail_res.body)
-                .chars()
-                .take(200)
-                .collect();
-            return Err(FetchError::Upstream(format!(
-                "HTTP {}: {excerpt}",
-                detail_res.status
-            )));
-        }
+            let detail_res = detail_req.send_raw(&self.http).await?;
+            if (300..400).contains(&detail_res.status) || detail_res.status == 401 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    detail_res.status
+                )));
+            }
+            if detail_res.status == 403 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    detail_res.status
+                )));
+            }
+            if !(200..300).contains(&detail_res.status) {
+                let excerpt: String = String::from_utf8_lossy(&detail_res.body)
+                    .chars()
+                    .take(200)
+                    .collect();
+                return Err(FetchError::Upstream(format!(
+                    "HTTP {}: {excerpt}",
+                    detail_res.status
+                )));
+            }
 
-        // Fetch usage
-        let usage_req = JsonRequest::get(USAGE_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Accept", "application/json, text/plain, */*"))
-            .header(Header::new("Cookie", jar.header()))
-            .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
-            .header(Header::new("x-timeZone", "UTC+01:00"))
-            .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
-            .header(Header::new(
-                "Referer",
-                "https://platform.xiaomimimo.com/#/console/balance",
-            ))
-            .header(Header::new("User-Agent", BROWSER_USER_AGENT));
+            let usage_req = JsonRequest::get(USAGE_URL)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Accept", "application/json, text/plain, */*"))
+                .header(Header::new("Cookie", jar.header()))
+                .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
+                .header(Header::new("x-timeZone", "UTC+01:00"))
+                .header(Header::new("Origin", "https://platform.xiaomimimo.com"))
+                .header(Header::new(
+                    "Referer",
+                    "https://platform.xiaomimimo.com/#/console/balance",
+                ))
+                .header(Header::new("User-Agent", BROWSER_USER_AGENT));
 
-        let usage_res = usage_req.send_raw(&self.http).await?;
-        if (300..400).contains(&usage_res.status) || usage_res.status == 401 {
-            return Err(FetchError::Unauthorized(format!(
-                "HTTP {}",
-                usage_res.status
-            )));
-        }
-        if usage_res.status == 403 {
-            return Err(FetchError::Unauthorized(format!(
-                "HTTP {}",
-                usage_res.status
-            )));
-        }
-        if !(200..300).contains(&usage_res.status) {
-            let excerpt: String = String::from_utf8_lossy(&usage_res.body)
-                .chars()
-                .take(200)
-                .collect();
-            return Err(FetchError::Upstream(format!(
-                "HTTP {}: {excerpt}",
-                usage_res.status
-            )));
-        }
+            let usage_res = usage_req.send_raw(&self.http).await?;
+            if (300..400).contains(&usage_res.status) || usage_res.status == 401 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    usage_res.status
+                )));
+            }
+            if usage_res.status == 403 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    usage_res.status
+                )));
+            }
+            if !(200..300).contains(&usage_res.status) {
+                let excerpt: String = String::from_utf8_lossy(&usage_res.body)
+                    .chars()
+                    .take(200)
+                    .collect();
+                return Err(FetchError::Upstream(format!(
+                    "HTTP {}: {excerpt}",
+                    usage_res.status
+                )));
+            }
 
-        let detail_json = String::from_utf8_lossy(&detail_res.body);
-        let usage_json = String::from_utf8_lossy(&usage_res.body);
+            let detail_json = String::from_utf8_lossy(&detail_res.body);
+            let usage_json = String::from_utf8_lossy(&usage_res.body);
 
-        let usage = normalize(&detail_json, &usage_json)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize(&detail_json, &usage_json)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

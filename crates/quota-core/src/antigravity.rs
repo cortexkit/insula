@@ -50,6 +50,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -503,28 +504,32 @@ impl UsageProvider for AntigravityProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let servers = discover_servers();
-        if servers.is_empty() {
-            return Err(FetchError::NoSession(
-                "no Antigravity language server or agy CLI process running".to_string(),
-            ));
-        }
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let servers = discover_servers();
+            if servers.is_empty() {
+                return Err(FetchError::NoSession(
+                    "no Antigravity language server or agy CLI process running".to_string(),
+                ));
+            }
 
-        let mut last_err =
-            FetchError::NoSession("no Antigravity loopback port served quota".to_string());
-        for server in &servers {
-            let ports = discover_ports(server.pid);
-            for port in ports {
-                match self.probe(server, port).await {
-                    Ok(usage) => {
-                        return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage));
+            let mut last_err =
+                FetchError::NoSession("no Antigravity loopback port served quota".to_string());
+            for server in &servers {
+                let ports = discover_ports(server.pid);
+                for port in ports {
+                    match self.probe(server, port).await {
+                        Ok(usage) => {
+                            return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage));
+                        }
+                        Err(e) => last_err = e,
                     }
-                    Err(e) => last_err = e,
                 }
             }
+            Err(last_err)
         }
-        Err(last_err)
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

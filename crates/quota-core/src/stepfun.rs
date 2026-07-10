@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -174,26 +175,30 @@ impl UsageProvider for StepFunProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let token = env::first_env(TOKEN_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {TOKEN_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let token = env::first_env(TOKEN_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {TOKEN_ENV:?} is set")))?;
 
-        let cookie = format!("Oasis-Token={token}; Oasis-Webid={OASIS_WEB_ID}");
-        let body = b"{}".to_vec();
+            let cookie = format!("Oasis-Token={token}; Oasis-Webid={OASIS_WEB_ID}");
+            let body = b"{}".to_vec();
 
-        let response = JsonRequest::post_json(API_URL, body)
-            .header(Header::new("content-type", "application/json"))
-            .header(Header::new("oasis-appid", OASIS_APP_ID))
-            .header(Header::new("oasis-platform", "web"))
-            .header(Header::new("oasis-webid", OASIS_WEB_ID))
-            .header(Header::new("User-Agent", USER_AGENT))
-            .header(Header::new("Cookie", cookie))
-            .timeout(REQUEST_TIMEOUT)
-            .send(&self.http)
-            .await?;
+            let response = JsonRequest::post_json(API_URL, body)
+                .header(Header::new("content-type", "application/json"))
+                .header(Header::new("oasis-appid", OASIS_APP_ID))
+                .header(Header::new("oasis-platform", "web"))
+                .header(Header::new("oasis-webid", OASIS_WEB_ID))
+                .header(Header::new("User-Agent", USER_AGENT))
+                .header(Header::new("Cookie", cookie))
+                .timeout(REQUEST_TIMEOUT)
+                .send(&self.http)
+                .await?;
 
-        let usage = normalize_usage(&response)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&response)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 

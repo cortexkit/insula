@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -445,21 +446,25 @@ impl UsageProvider for MinimaxProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
-        let api_key = env::first_env(API_KEY_ENV)
-            .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let result: Result<ProviderUsage, FetchError> = async {
+            let api_key = env::first_env(API_KEY_ENV)
+                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-        let base = api_base_url();
-        let body = match fetch_remains_once(&self.http, &api_key, &base).await {
-            Ok(body) => body,
-            Err(FetchError::Unauthorized(_)) if base == GLOBAL_API_BASE => {
-                fetch_remains_once(&self.http, &api_key, CHINA_API_BASE).await?
-            }
-            Err(e) => return Err(e),
-        };
+            let base = api_base_url();
+            let body = match fetch_remains_once(&self.http, &api_key, &base).await {
+                Ok(body) => body,
+                Err(FetchError::Unauthorized(_)) if base == GLOBAL_API_BASE => {
+                    fetch_remains_once(&self.http, &api_key, CHINA_API_BASE).await?
+                }
+                Err(e) => return Err(e),
+            };
 
-        let usage = normalize_usage(&body)?;
-        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let usage = normalize_usage(&body)?;
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+        }
+        .await;
+        FetchAttempt::from_provider_usage(result)
     }
 }
 
