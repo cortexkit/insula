@@ -38,6 +38,16 @@ impl Incarnation {
     }
 }
 
+/// Orders overlapping attempts within one active incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttemptSequence(u128);
+
+impl AttemptSequence {
+    pub(crate) fn from_counter(value: u128) -> Self {
+        Self(value)
+    }
+}
+
 /// How a fetch failure is treated for backoff and stale-serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchClass {
@@ -61,6 +71,8 @@ pub enum SlotStatus {
 pub struct ProviderSlot {
     /// Lifetime fence assigned when the key entered the active set.
     pub incarnation: Incarnation,
+    /// Latest attempt admitted for this incarnation. Older completions are dropped.
+    pub attempt_sequence: AttemptSequence,
     /// Value eligible for serving. `None` is an honest unavailable state.
     pub entry: Option<ProviderUsage>,
     /// Most recent independently observed credential identity.
@@ -80,6 +92,7 @@ impl ProviderSlot {
     pub fn due_now(now: Instant, incarnation: Incarnation) -> Self {
         Self {
             incarnation,
+            attempt_sequence: AttemptSequence::from_counter(0),
             entry: None,
             observation: None,
             label_in_flux: false,
@@ -156,10 +169,67 @@ pub fn next_slot_after_attempt(
     attempt_start: Instant,
     completed: Instant,
 ) -> ProviderSlot {
-    let account_changed = match (&prev.observation, &attempt.observed) {
+    next_slot_after_attempt_inner(
+        prev,
+        provider_name,
+        attempt,
+        attempt_start,
+        completed,
+        false,
+    )
+}
+
+/// Fail closed when the scheduler terminates an attempt before the provider can
+/// return its credential observation. A previously labeled slot cannot safely
+/// stale-serve because the credential may have changed during the lost attempt.
+pub fn next_slot_after_unverified_failure(
+    prev: &ProviderSlot,
+    provider_name: &str,
+    error: FetchError,
+    attempt_start: Instant,
+    completed: Instant,
+) -> ProviderSlot {
+    next_slot_after_attempt_inner(
+        prev,
+        provider_name,
+        FetchAttempt::failure(None, None, error),
+        attempt_start,
+        completed,
+        true,
+    )
+}
+
+fn next_slot_after_attempt_inner(
+    prev: &ProviderSlot,
+    provider_name: &str,
+    attempt: FetchAttempt,
+    attempt_start: Instant,
+    completed: Instant,
+    identity_unverified: bool,
+) -> ProviderSlot {
+    // A successful usage response cannot validate a credential transition unless
+    // the provider explicitly reports the identity used for that response.
+    if prev.label_in_flux && attempt.observed.is_none() && attempt.usage.is_ok() {
+        return ProviderSlot {
+            incarnation: prev.incarnation,
+            attempt_sequence: prev.attempt_sequence,
+            entry: None,
+            observation: prev.observation.clone(),
+            label_in_flux: true,
+            last_success_at: None,
+            last_attempt_at: Some(attempt_start),
+            status: prev.status,
+            next_due_at: completed + BASE_INTERVAL,
+            retry_count: prev.retry_count,
+        };
+    }
+
+    let observed_account_changed = match (&prev.observation, &attempt.observed) {
         (Some(old), Some(new)) => old.account_id != new.account_id,
         _ => false,
     };
+    let identity_may_have_changed = identity_unverified && prev.observation.is_some();
+    let account_changed = observed_account_changed || identity_may_have_changed;
     let observation = attempt
         .observed
         .clone()
@@ -168,6 +238,7 @@ pub fn next_slot_after_attempt(
     match attempt.usage {
         Ok(usage) => ProviderSlot {
             incarnation: prev.incarnation,
+            attempt_sequence: prev.attempt_sequence,
             entry: Some(healthy_entry(
                 provider_name,
                 observation.as_ref(),
@@ -206,6 +277,7 @@ pub fn next_slot_after_attempt(
             let label_in_flux = account_changed || retry_base.label_in_flux;
             ProviderSlot {
                 incarnation: prev.incarnation,
+                attempt_sequence: prev.attempt_sequence,
                 entry: if label_in_flux { None } else { entry },
                 observation,
                 label_in_flux,

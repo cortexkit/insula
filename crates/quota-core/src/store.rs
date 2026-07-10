@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::provider::CredentialHandle;
-use crate::refresh::{Incarnation, ProviderSlot};
+use crate::refresh::{AttemptSequence, Incarnation, ProviderSlot};
 
 /// Active fetch-unit identity. The account label is not part of the key because
 /// a credential can change accounts without changing its handle.
@@ -33,6 +33,7 @@ pub struct SlotStore {
     created_at: Instant,
     last_tick_at: Option<Instant>,
     next_incarnation: u128,
+    next_attempt_sequence: u128,
 }
 
 impl SlotStore {
@@ -42,6 +43,7 @@ impl SlotStore {
             created_at: now,
             last_tick_at: None,
             next_incarnation: 1,
+            next_attempt_sequence: 1,
         }
     }
 
@@ -58,10 +60,9 @@ impl SlotStore {
                 continue;
             }
             let incarnation = Incarnation::from_counter(self.next_incarnation);
-            self.next_incarnation = self
-                .next_incarnation
-                .checked_add(1)
-                .expect("credential incarnation counter exhausted");
+            // Exhaustion is practically unreachable, but wrapping is safer than
+            // panicking while the scheduler owns the cache mutex.
+            self.next_incarnation = self.next_incarnation.wrapping_add(1);
             self.slots
                 .insert(key, ProviderSlot::due_now(now, incarnation));
         }
@@ -79,18 +80,35 @@ impl SlotStore {
             .collect()
     }
 
-    /// Publish only into the exact active lifetime that admitted the fetch.
-    /// Returns `false` when reconciliation removed or reincarnated the key.
+    /// Reserve an ordered attempt for an active incarnation. Concurrent attempts
+    /// may overlap, but only the newest reservation is allowed to publish.
+    pub fn admit(
+        &mut self,
+        key: &SlotKey,
+        incarnation: Incarnation,
+    ) -> Option<(ProviderSlot, AttemptSequence)> {
+        if self.slots.get(key)?.incarnation != incarnation {
+            return None;
+        }
+        let sequence = AttemptSequence::from_counter(self.next_attempt_sequence);
+        self.next_attempt_sequence = self.next_attempt_sequence.wrapping_add(1);
+        let current = self.slots.get_mut(key)?;
+        current.attempt_sequence = sequence;
+        Some((current.clone(), sequence))
+    }
+
+    /// Publish only into the exact active lifetime and latest admitted attempt.
     pub fn publish_if_current(
         &mut self,
         key: &SlotKey,
         incarnation: Incarnation,
+        attempt_sequence: AttemptSequence,
         next: ProviderSlot,
     ) -> bool {
         let Some(current) = self.slots.get(key) else {
             return false;
         };
-        if current.incarnation != incarnation {
+        if current.incarnation != incarnation || current.attempt_sequence != attempt_sequence {
             return false;
         }
         self.slots.insert(key.clone(), next);
@@ -138,14 +156,50 @@ mod tests {
         let mut store = SlotStore::new(now);
 
         store.reconcile("mock", std::slice::from_ref(&handle), now);
-        let old = store.get(&key).unwrap().clone();
-        let old_incarnation = old.incarnation;
+        let old_incarnation = store.get(&key).unwrap().incarnation;
+        let (old, old_sequence) = store.admit(&key, old_incarnation).unwrap();
         store.reconcile("mock", &[], now);
-        assert!(!store.publish_if_current(&key, old_incarnation, old.clone()));
+        assert!(!store.publish_if_current(&key, old_incarnation, old_sequence, old.clone()));
         assert!(store.get(&key).is_none());
 
         store.reconcile("mock", std::slice::from_ref(&handle), now);
-        assert!(!store.publish_if_current(&key, old_incarnation, old));
+        assert!(!store.publish_if_current(&key, old_incarnation, old_sequence, old));
         assert_ne!(store.get(&key).unwrap().incarnation, old_incarnation);
+    }
+
+    #[test]
+    fn older_attempt_cannot_publish_after_a_newer_admission() {
+        let now = Instant::now();
+        let handle = CredentialHandle::new("H");
+        let key = SlotKey::new("mock", handle.clone());
+        let mut store = SlotStore::new(now);
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let incarnation = store.get(&key).unwrap().incarnation;
+
+        let (old, old_sequence) = store.admit(&key, incarnation).unwrap();
+        let (new, new_sequence) = store.admit(&key, incarnation).unwrap();
+        assert!(!store.publish_if_current(&key, incarnation, old_sequence, old));
+        assert!(store.publish_if_current(&key, incarnation, new_sequence, new));
+    }
+
+    #[test]
+    fn incarnation_counter_wraps_without_panicking() {
+        let now = Instant::now();
+        let mut store = SlotStore::new(now);
+        store.next_incarnation = u128::MAX;
+
+        store.reconcile("mock", &[CredentialHandle::new("H1")], now);
+        let first = store
+            .get(&SlotKey::new("mock", CredentialHandle::new("H1")))
+            .unwrap()
+            .incarnation;
+        store.reconcile("mock", &[], now);
+        store.reconcile("mock", &[CredentialHandle::new("H2")], now);
+        let second = store
+            .get(&SlotKey::new("mock", CredentialHandle::new("H2")))
+            .unwrap()
+            .incarnation;
+
+        assert_ne!(first, second);
     }
 }

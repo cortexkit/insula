@@ -123,9 +123,10 @@ impl FetchAttempt {
     pub fn from_provider_usage(result: Result<ProviderUsage, FetchError>) -> Self {
         match result {
             Ok(entry) => {
-                let observed = entry
-                    .account
-                    .map(|account_id| AccountObservation::new(Some(account_id), None));
+                // `Some(AccountObservation { account_id: None, .. })` means the
+                // credential was resolved and explicitly exposes no account label.
+                // Outer `None` is reserved for an unavailable observation.
+                let observed = Some(AccountObservation::new(entry.account, None));
                 let source = entry.source;
                 let usage = entry.usage.ok_or_else(|| {
                     FetchError::Decode("provider returned a healthy entry without usage".into())

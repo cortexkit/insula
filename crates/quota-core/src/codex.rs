@@ -229,7 +229,7 @@ impl UsageProvider for CodexProvider {
     }
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
-        let resolved = (|| {
+        let resolved = tokio::task::spawn_blocking(|| {
             let home = codex_home().ok_or_else(|| {
                 FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
             })?;
@@ -238,17 +238,25 @@ impl UsageProvider for CodexProvider {
                 FetchError::NoSession(format!("reading {}: {e}", auth_path.display()))
             })?;
             let creds = parse_credentials(&data)?;
-            Ok::<_, FetchError>((home, creds))
-        })();
+            let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
+            Ok::<_, FetchError>((creds, config_toml))
+        })
+        .await;
 
-        let (home, creds) = match resolved {
-            Ok(resolved) => resolved,
-            Err(error) => return FetchAttempt::failure(None, None, error),
+        let (creds, config_toml) = match resolved {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => return FetchAttempt::failure(None, None, error),
+            Err(_) => {
+                return FetchAttempt::failure(
+                    None,
+                    None,
+                    FetchError::Decode("codex credential resolution task panicked".to_string()),
+                )
+            }
         };
         let observed = Some(AccountObservation::new(creds.account_id.clone(), None));
         let source = if creds.is_oauth { "oauth" } else { "api" };
 
-        let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
         let url = resolve_usage_url(config_toml.as_deref());
         let mut request = JsonRequest::get(url)
             .timeout(REQUEST_TIMEOUT)

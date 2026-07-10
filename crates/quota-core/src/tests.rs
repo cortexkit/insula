@@ -35,7 +35,8 @@ fn force_due(registry: &Registry, provider: &str) {
         }
         slot.next_due_at = Instant::now();
         let incarnation = slot.incarnation;
-        assert!(store.publish_if_current(&key, incarnation, slot));
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
     }
 }
 
@@ -289,7 +290,8 @@ async fn label_in_flux_is_unavailable_even_if_a_stale_entry_exists() {
         assert!(slot.entry.is_some());
         slot.label_in_flux = true;
         let incarnation = slot.incarnation;
-        assert!(store.publish_if_current(&key, incarnation, slot));
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
     }
 
     assert!(registry.get_usage(None).await.is_empty());
@@ -653,4 +655,335 @@ async fn cancelled_tick_leaves_slots_pending_without_hanging() {
         slot(&registry, "codex", "implicit-local").status,
         SlotStatus::Pending
     );
+}
+
+struct OuterTimeoutSwapProvider {
+    calls: AtomicUsize,
+    current_account: Arc<Mutex<&'static str>>,
+}
+
+#[async_trait]
+impl UsageProvider for OuterTimeoutSwapProvider {
+    fn name(&self) -> &str {
+        "outer-timeout"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            FetchAttempt::success(observed(Some("A")), "test", Usage::default())
+        } else {
+            *self.current_account.lock().unwrap() = "B";
+            std::future::pending::<()>().await;
+            unreachable!("the scheduler deadline must terminate this attempt")
+        }
+    }
+}
+
+#[tokio::test]
+async fn outer_timeout_after_credential_swap_fails_closed() {
+    let current_account = Arc::new(Mutex::new("A"));
+    let provider = OuterTimeoutSwapProvider {
+        calls: AtomicUsize::new(0),
+        current_account: Arc::clone(&current_account),
+    };
+    let registry = Registry::new(vec![Box::new(provider)]);
+    tick(&registry).await;
+    assert_eq!(
+        registry.get_usage(None).await[0].account.as_deref(),
+        Some("A")
+    );
+
+    force_due(&registry, "outer-timeout");
+    registry
+        .refresh_tick_with_deadline(&CancellationToken::new(), Duration::from_millis(20))
+        .await;
+
+    assert_eq!(*current_account.lock().unwrap(), "B");
+    assert!(registry.get_usage(None).await.is_empty());
+    let slot = slot(&registry, "outer-timeout", "implicit-local");
+    assert!(slot.label_in_flux);
+    assert!(slot.entry.is_none());
+    assert!(slot.last_success_at.is_none());
+    assert_eq!(slot.retry_count, 1);
+}
+
+struct PanickingNameProvider;
+
+#[async_trait]
+impl UsageProvider for PanickingNameProvider {
+    fn name(&self) -> &str {
+        panic!("provider name lookup panicked")
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(None, "test", Usage::default())
+    }
+}
+
+#[tokio::test]
+async fn panicking_provider_name_is_contained_at_registration() {
+    let registry = Registry::new(vec![Box::new(PanickingNameProvider)]);
+    assert_eq!(registry.provider_names(), vec!["invalid-provider-0"]);
+
+    tick(&registry).await;
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].provider, "invalid-provider-0");
+}
+
+struct DropBomb;
+
+impl Drop for DropBomb {
+    fn drop(&mut self) {
+        panic!("provider future panicked while being dropped")
+    }
+}
+
+struct DropPanicProvider {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl UsageProvider for DropPanicProvider {
+    fn name(&self) -> &str {
+        "drop-panic"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let _bomb = DropBomb;
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("cancellation must terminate this attempt")
+    }
+}
+
+#[tokio::test]
+async fn cancellation_contains_a_provider_future_drop_panic() {
+    let started = Arc::new(Notify::new());
+    let registry = Arc::new(Registry::new(vec![Box::new(DropPanicProvider {
+        started: Arc::clone(&started),
+    })]));
+    let cancel = CancellationToken::new();
+    let running = {
+        let registry = Arc::clone(&registry);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { registry.refresh_tick(&cancel).await })
+    };
+    started.notified().await;
+    cancel.cancel();
+
+    running
+        .await
+        .expect("provider teardown panic escaped the supervised task");
+    assert_eq!(
+        slot(&registry, "drop-panic", "implicit-local").status,
+        SlotStatus::Pending
+    );
+}
+
+struct CursorProvider {
+    name: String,
+    handles: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl UsageProvider for CursorProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok((0..self.handles)
+            .map(|index| handle(&format!("H{index}")))
+            .collect())
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        FetchAttempt::success(None, "test", Usage::default())
+    }
+}
+
+#[tokio::test]
+async fn persisted_round_robin_cursor_admits_provider_after_the_first_cap() {
+    let provider_count = refresh::CONCURRENCY_CAP + 1;
+    let calls: Vec<_> = (0..provider_count)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let providers: Vec<Box<dyn UsageProvider>> = (0..provider_count)
+        .map(|index| {
+            Box::new(CursorProvider {
+                name: format!("provider-{index:02}"),
+                handles: if index < refresh::CONCURRENCY_CAP {
+                    2
+                } else {
+                    1
+                },
+                calls: Arc::clone(&calls[index]),
+            }) as Box<dyn UsageProvider>
+        })
+        .collect();
+    let registry = Registry::new(providers);
+
+    tick(&registry).await;
+    assert_eq!(calls[provider_count - 1].load(Ordering::SeqCst), 0);
+    tick(&registry).await;
+
+    assert_eq!(calls[provider_count - 1].load(Ordering::SeqCst), 1);
+}
+
+struct OverlappingAttemptProvider {
+    calls: AtomicUsize,
+    old_started: Arc<Notify>,
+    old_gate: Arc<Notify>,
+}
+
+#[async_trait]
+impl UsageProvider for OverlappingAttemptProvider {
+    fn name(&self) -> &str {
+        "overlap"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.old_started.notify_one();
+            self.old_gate.notified().await;
+            FetchAttempt::success(observed(Some("A")), "test", Usage::default())
+        } else {
+            FetchAttempt::success(observed(Some("B")), "test", Usage::default())
+        }
+    }
+}
+
+#[tokio::test]
+async fn older_overlapping_attempt_cannot_overwrite_newer_result() {
+    let old_started = Arc::new(Notify::new());
+    let old_gate = Arc::new(Notify::new());
+    let registry = Arc::new(Registry::new(vec![Box::new(OverlappingAttemptProvider {
+        calls: AtomicUsize::new(0),
+        old_started: Arc::clone(&old_started),
+        old_gate: Arc::clone(&old_gate),
+    })]));
+
+    let old_tick = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.refresh_tick(&CancellationToken::new()).await })
+    };
+    old_started.notified().await;
+    let incarnation = slot(&registry, "overlap", "implicit-local").incarnation;
+
+    tick(&registry).await;
+    assert_eq!(
+        registry.get_usage(None).await[0].account.as_deref(),
+        Some("B")
+    );
+    assert_eq!(
+        slot(&registry, "overlap", "implicit-local").incarnation,
+        incarnation
+    );
+
+    old_gate.notify_one();
+    old_tick.await.unwrap();
+    assert_eq!(
+        registry.get_usage(None).await[0].account.as_deref(),
+        Some("B")
+    );
+}
+
+#[test]
+fn unobserved_success_cannot_close_label_flux() {
+    let now = Instant::now();
+    let cold = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+    let account_a = next_slot_after_attempt(
+        &cold,
+        "flux",
+        FetchAttempt::success(observed(Some("A")), "test", Usage::default()),
+        now,
+        now,
+    );
+    let account_b_failed = next_slot_after_attempt(
+        &account_a,
+        "flux",
+        FetchAttempt::failure(
+            observed(Some("B")),
+            Some("test".into()),
+            FetchError::Upstream("timeout".into()),
+        ),
+        now,
+        now,
+    );
+    assert!(account_b_failed.label_in_flux);
+
+    let unobserved_success = next_slot_after_attempt(
+        &account_b_failed,
+        "flux",
+        FetchAttempt::success(None, "test", Usage::default()),
+        now,
+        now,
+    );
+    assert!(unobserved_success.label_in_flux);
+    assert!(unobserved_success.entry.is_none());
+
+    let observed_success = next_slot_after_attempt(
+        &unobserved_success,
+        "flux",
+        FetchAttempt::success(observed(Some("B")), "test", Usage::default()),
+        now,
+        now,
+    );
+    assert!(!observed_success.label_in_flux);
+    assert_eq!(observed_success.account_id(), Some("B"));
+}
+
+struct DuplicateAccountProvider;
+
+#[async_trait]
+impl UsageProvider for DuplicateAccountProvider {
+    fn name(&self) -> &str {
+        "duplicate"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![handle("A-degraded"), handle("B-fresh")])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if handle.stable_id() == "A-degraded" {
+            FetchAttempt::failure(
+                observed(Some("shared-account")),
+                None,
+                FetchError::NoSession("logged out".into()),
+            )
+        } else {
+            FetchAttempt::success(observed(Some("shared-account")), "test", Usage::default())
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_account_prefers_fresh_handle_over_earlier_degraded_handle() {
+    let registry = Registry::new(vec![Box::new(DuplicateAccountProvider)]);
+    tick(&registry).await;
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].account.as_deref(), Some("shared-account"));
+    assert!(usage[0].error.is_none());
+    assert!(usage[0].usage.is_some());
+}
+
+#[test]
+fn adapter_distinguishes_absent_label_from_unavailable_observation() {
+    let attempt = FetchAttempt::from_provider_usage(Ok(ProviderUsage::healthy(
+        "unlabeled",
+        None,
+        "test",
+        Usage::default(),
+    )));
+    assert!(attempt.observed.is_some());
+    assert_eq!(attempt.observed.unwrap().account_id, None);
 }

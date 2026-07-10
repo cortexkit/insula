@@ -44,18 +44,21 @@ pub mod synthetic;
 pub mod warp;
 pub mod zai;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::{stream, FutureExt, StreamExt};
+use futures_util::{stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
-use refresh::{next_slot_after_attempt, ProviderSlot, SlotStatus, STALL_HORIZON};
+use refresh::{
+    next_slot_after_attempt, next_slot_after_unverified_failure, AttemptSequence, Incarnation,
+    ProviderSlot, SlotStatus, STALL_HORIZON,
+};
 use store::{SlotKey, SlotStore};
 
 enum FetchOutcome {
@@ -65,21 +68,35 @@ enum FetchOutcome {
     Cancelled,
 }
 
+struct RegisteredProvider {
+    name: String,
+    cookie_based: bool,
+    fetcher: Arc<dyn UsageProvider>,
+}
+
+struct DueCandidate {
+    provider_index: usize,
+    key: SlotKey,
+    incarnation: Incarnation,
+}
+
 struct DueUnit {
     provider_index: usize,
     key: SlotKey,
     prev: ProviderSlot,
+    attempt_sequence: AttemptSequence,
 }
 
 fn select_due_round_robin(
-    providers: &[Box<dyn UsageProvider>],
+    providers: &[RegisteredProvider],
     snapshot: Vec<(SlotKey, ProviderSlot)>,
     now: Instant,
-) -> Vec<DueUnit> {
+    last_admitted_provider: Option<usize>,
+) -> (Vec<DueCandidate>, Option<usize>) {
     let provider_index: HashMap<&str, usize> = providers
         .iter()
         .enumerate()
-        .map(|(index, provider)| (provider.name(), index))
+        .map(|(index, provider)| (provider.name.as_str(), index))
         .collect();
     let mut queues: Vec<VecDeque<(SlotKey, ProviderSlot)>> =
         (0..providers.len()).map(|_| VecDeque::new()).collect();
@@ -98,18 +115,25 @@ fn select_due_round_robin(
             .sort_by(|(left, _), (right, _)| left.handle.cmp(&right.handle));
     }
 
+    let provider_count = providers.len();
+    let first_provider = last_admitted_provider
+        .map(|index| (index + 1) % provider_count.max(1))
+        .unwrap_or(0);
     let mut admitted = Vec::with_capacity(refresh::CONCURRENCY_CAP);
-    while admitted.len() < refresh::CONCURRENCY_CAP {
+    let mut last_admitted = last_admitted_provider;
+    while admitted.len() < refresh::CONCURRENCY_CAP && provider_count > 0 {
         let mut progressed = false;
-        for (provider_index, queue) in queues.iter_mut().enumerate() {
-            let Some((key, prev)) = queue.pop_front() else {
+        for offset in 0..provider_count {
+            let provider_index = (first_provider + offset) % provider_count;
+            let Some((key, slot)) = queues[provider_index].pop_front() else {
                 continue;
             };
-            admitted.push(DueUnit {
+            admitted.push(DueCandidate {
                 provider_index,
                 key,
-                prev,
+                incarnation: slot.incarnation,
             });
+            last_admitted = Some(provider_index);
             progressed = true;
             if admitted.len() == refresh::CONCURRENCY_CAP {
                 break;
@@ -119,25 +143,52 @@ fn select_due_round_robin(
             break;
         }
     }
-    admitted
+    (admitted, last_admitted)
+}
+
+fn service_rank(status: SlotStatus) -> u8 {
+    match status {
+        SlotStatus::Fresh => 0,
+        SlotStatus::StaleTransient => 1,
+        SlotStatus::Degraded => 2,
+        SlotStatus::Pending => 3,
+    }
 }
 
 /// Provider registry with a cache-only read path and one background refresher.
 pub struct Registry {
-    providers: Vec<Box<dyn UsageProvider>>,
+    providers: Vec<RegisteredProvider>,
     store: Mutex<SlotStore>,
+    last_admitted_provider: Mutex<Option<usize>>,
 }
 
 impl Registry {
-    /// Build a registry. Handle enumeration is deferred to the first scheduler
-    /// turn so construction never performs provider-specific configuration reads.
+    /// Build a registry and cache provider metadata before the scheduler starts.
+    /// Hot paths never call provider-owned naming or classification methods.
     pub fn new(providers: Vec<Box<dyn UsageProvider>>) -> Self {
+        let providers = providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                let name =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| provider.name().to_owned()))
+                        .unwrap_or_else(|_| format!("invalid-provider-{index}"));
+                let cookie_based =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| provider.is_cookie_based()))
+                        .unwrap_or(false);
+                RegisteredProvider {
+                    name,
+                    cookie_based,
+                    fetcher: Arc::from(provider),
+                }
+            })
+            .collect();
         Self {
             providers,
             store: Mutex::new(SlotStore::new(Instant::now())),
+            last_admitted_provider: Mutex::new(None),
         }
     }
-
     /// The default registry: every provider we support.
     pub fn with_defaults() -> Self {
         Self::new(vec![
@@ -177,7 +228,7 @@ impl Registry {
     pub fn provider_names(&self) -> Vec<&str> {
         self.providers
             .iter()
-            .map(|provider| provider.name())
+            .map(|provider| provider.name.as_str())
             .collect()
     }
 
@@ -199,7 +250,7 @@ impl Registry {
             .providers
             .iter()
             .enumerate()
-            .map(|(index, provider)| (provider.name(), index))
+            .map(|(index, provider)| (provider.name.as_str(), index))
             .collect();
         snapshot.sort_by(|(left, _), (right, _)| {
             let left_index = provider_index
@@ -217,7 +268,7 @@ impl Registry {
 
         let mut out = Vec::new();
         for provider in &self.providers {
-            let name = provider.name();
+            let name = provider.name.as_str();
             if provider_filter.is_some_and(|filter| filter != name) {
                 continue;
             }
@@ -242,19 +293,27 @@ impl Registry {
                 continue;
             }
 
-            let mut emitted_accounts = HashSet::new();
-            for (_, slot) in slots {
-                if slot.label_in_flux {
+            let mut candidates: HashMap<String, (&SlotKey, &ProviderSlot)> = HashMap::new();
+            for (key, slot) in slots {
+                if slot.label_in_flux || slot.entry.is_none() {
                     continue;
                 }
                 let Some(account_id) = slot.account_id() else {
                     continue;
                 };
-                if !emitted_accounts.insert(account_id.to_string()) {
-                    continue;
+                let should_replace = match candidates.get(account_id) {
+                    Some((_, current)) => service_rank(slot.status) < service_rank(current.status),
+                    None => true,
+                };
+                if should_replace {
+                    candidates.insert(account_id.to_string(), (key, slot));
                 }
+            }
+            let mut selected: Vec<_> = candidates.into_iter().collect();
+            selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.cmp(&right.handle));
+            for (account_id, (_, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
-                    entry.account = Some(account_id.to_string());
+                    entry.account = Some(account_id);
                     out.push(entry);
                 }
             }
@@ -262,18 +321,23 @@ impl Registry {
         out
     }
 
-    /// Run one bounded scheduler turn.
-    ///
-    /// Every provider is enumerated before reconciliation. Failed enumeration
-    /// retains that provider's last-known-good active set. Due handles are
-    /// admitted round-robin across providers up to the concurrency cap.
+    /// Run one bounded scheduler turn using the production fetch deadline.
     pub async fn refresh_tick(&self, cancel: &CancellationToken) {
+        self.refresh_tick_with_deadline(cancel, refresh::FETCH_DEADLINE)
+            .await;
+    }
+
+    async fn refresh_tick_with_deadline(
+        &self,
+        cancel: &CancellationToken,
+        fetch_deadline: Duration,
+    ) {
         let turn_start = Instant::now();
         let enumerated: Vec<Option<Vec<CredentialHandle>>> = self
             .providers
             .iter()
             .map(|provider| {
-                match std::panic::catch_unwind(AssertUnwindSafe(|| provider.handles())) {
+                match std::panic::catch_unwind(AssertUnwindSafe(|| provider.fetcher.handles())) {
                     Ok(Ok(mut handles)) => {
                         handles.sort();
                         handles.dedup();
@@ -291,30 +355,67 @@ impl Registry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (provider, handles) in self.providers.iter().zip(enumerated.iter()) {
                 if let Some(handles) = handles {
-                    store.reconcile(provider.name(), handles, turn_start);
+                    store.reconcile(&provider.name, handles, turn_start);
                 }
             }
             store.mark_tick(turn_start);
             store.snapshot()
         };
-        let due = select_due_round_robin(&self.providers, snapshot, turn_start);
+        let candidates = {
+            let mut cursor = self
+                .last_admitted_provider
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (candidates, last_admitted) =
+                select_due_round_robin(&self.providers, snapshot, turn_start, *cursor);
+            *cursor = last_admitted;
+            candidates
+        };
+        let due: Vec<_> = {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    store.admit(&candidate.key, candidate.incarnation).map(
+                        |(prev, attempt_sequence)| DueUnit {
+                            provider_index: candidate.provider_index,
+                            key: candidate.key,
+                            prev,
+                            attempt_sequence,
+                        },
+                    )
+                })
+                .collect()
+        };
         if due.is_empty() {
             return;
         }
 
         let mut fetches = stream::iter(due.into_iter().map(|unit| {
-            let provider = &self.providers[unit.provider_index];
+            let provider = Arc::clone(&self.providers[unit.provider_index].fetcher);
             async move {
                 let attempt_start = Instant::now();
-                let fetch =
-                    AssertUnwindSafe(provider.fetch_handle(&unit.key.handle)).catch_unwind();
+                let handle = unit.key.handle.clone();
+                // Broader blocking-I/O isolation is deferred until providers use the future credential store.
+                let mut task = tokio::spawn(async move { provider.fetch_handle(&handle).await });
                 let outcome = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => FetchOutcome::Cancelled,
-                    result = tokio::time::timeout(refresh::FETCH_DEADLINE, fetch) => match result {
+                    _ = cancel.cancelled() => {
+                        task.abort();
+                        let _ = task.await;
+                        FetchOutcome::Cancelled
+                    },
+                    result = tokio::time::timeout(fetch_deadline, &mut task) => match result {
                         Ok(Ok(attempt)) => FetchOutcome::Attempt(Box::new(attempt)),
-                        Ok(Err(_)) => FetchOutcome::Panicked,
-                        Err(_) => FetchOutcome::TimedOut,
+                        Ok(Err(_join_error)) => FetchOutcome::Panicked,
+                        Err(_elapsed) => {
+                            task.abort();
+                            let _ = task.await;
+                            FetchOutcome::TimedOut
+                        }
                     },
                 };
                 (unit, attempt_start, Instant::now(), outcome)
@@ -323,35 +424,43 @@ impl Registry {
         .buffer_unordered(refresh::CONCURRENCY_CAP);
 
         while let Some((unit, attempt_start, completed_at, outcome)) = fetches.next().await {
-            let attempt = match outcome {
-                FetchOutcome::Attempt(attempt) => *attempt,
-                FetchOutcome::TimedOut => FetchAttempt::failure(
-                    None,
-                    None,
-                    provider::FetchError::Upstream(format!(
-                        "fetch exceeded {}s deadline",
-                        refresh::FETCH_DEADLINE.as_secs()
-                    )),
+            let next = match outcome {
+                FetchOutcome::Attempt(attempt) => next_slot_after_attempt(
+                    &unit.prev,
+                    &unit.key.provider,
+                    *attempt,
+                    attempt_start,
+                    completed_at,
                 ),
-                FetchOutcome::Panicked => FetchAttempt::failure(
-                    None,
-                    None,
+                FetchOutcome::TimedOut => next_slot_after_unverified_failure(
+                    &unit.prev,
+                    &unit.key.provider,
+                    provider::FetchError::Upstream(format!(
+                        "fetch exceeded {}ms deadline",
+                        fetch_deadline.as_millis()
+                    )),
+                    attempt_start,
+                    completed_at,
+                ),
+                FetchOutcome::Panicked => next_slot_after_unverified_failure(
+                    &unit.prev,
+                    &unit.key.provider,
                     provider::FetchError::Decode("provider fetch panicked".to_string()),
+                    attempt_start,
+                    completed_at,
                 ),
                 FetchOutcome::Cancelled => continue,
             };
-            let next = next_slot_after_attempt(
-                &unit.prev,
-                &unit.key.provider,
-                attempt,
-                attempt_start,
-                completed_at,
-            );
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            store.publish_if_current(&unit.key, unit.prev.incarnation, next);
+            store.publish_if_current(
+                &unit.key,
+                unit.prev.incarnation,
+                unit.attempt_sequence,
+                next,
+            );
         }
     }
 
@@ -397,14 +506,12 @@ impl Registry {
     /// A provider is degraded only when every active handle is degraded; one
     /// usable account keeps the provider in a serving bucket.
     pub fn health(&self) -> HealthSnapshot {
-        let cookie_names: HashSet<&str> = self
+        let providers_total = self.providers.len();
+        let cookie_cohort_total = self
             .providers
             .iter()
-            .filter(|provider| provider.is_cookie_based())
-            .map(|provider| provider.name())
-            .collect();
-        let providers_total = self.providers.len();
-        let cookie_cohort_total = cookie_names.len();
+            .filter(|provider| provider.cookie_based)
+            .count();
 
         let (snapshot, last_tick_at, created_at) = match self.store.lock() {
             Ok(store) => (store.snapshot(), store.last_tick_at(), store.created_at()),
@@ -417,7 +524,7 @@ impl Registry {
         let mut cookie_cohort_degraded = Vec::new();
 
         for provider in &self.providers {
-            let name = provider.name();
+            let name = provider.name.as_str();
             let slots: Vec<_> = snapshot
                 .iter()
                 .filter(|(key, _)| key.provider == name)
@@ -441,7 +548,7 @@ impl Registry {
                 stale += 1;
             } else if all_degraded {
                 degraded.push(name.to_string());
-                if cookie_names.contains(name) {
+                if provider.cookie_based {
                     cookie_cohort_degraded.push(name.to_string());
                 }
             }
