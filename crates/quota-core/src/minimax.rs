@@ -16,9 +16,9 @@
 //! MiniMax API key was available. Endpoint, auth headers, env key order, and
 //! `model_remains` field semantics are ported from CodexBar
 //! `MiniMaxUsageFetcher.swift:109-120` (request), `939-970` (remaining counts and
-//! percent fields), `1018-1030` (percent conversion), `1594-1616,1658-1665`
-//! (unlimited weekly quota); lane mapping/order comes from
-//! `MiniMaxUsageFetcher+ModelMapping.swift:4-12,43-50`,
+//! percent fields), `1018-1030` (percent conversion), `1594-1616,1648-1665`
+//! (unlimited weekly quota and unavailable placeholders); lane mapping/order comes
+//! from `MiniMaxUsageFetcher+ModelMapping.swift:4-12,43-50`,
 //! `MiniMaxUsageSnapshot.swift:18-65,116-135`, and the fixture/assertions in
 //! `MiniMaxTokenPlanChangeTests.swift:76-116,175-242`. See also
 //! `MiniMaxAPIRegion.swift:9,30-37,56-58` (URLs), `MiniMaxAPISettingsReader.swift:17-24`
@@ -256,11 +256,16 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
 
     if let Some(remaining_percent) = opt_float(&m.current_weekly_remaining_percent) {
         if opt_int(&m.current_weekly_status) == Some(3) && remaining_percent >= 100.0 {
-            return Some(RateWindow {
-                used_percent: 0.0,
-                resets_at: None,
-                window_minutes: Some(7 * 24 * 60),
-            });
+            if is_general_model(m) {
+                return Some(RateWindow {
+                    used_percent: 0.0,
+                    resets_at: None,
+                    window_minutes: Some(7 * 24 * 60),
+                });
+            }
+            if weekly_total(m) == 0 && opt_int(&m.current_weekly_usage_count).unwrap_or(0) == 0 {
+                return None;
+            }
         }
 
         return Some(RateWindow {
@@ -629,5 +634,51 @@ mod tests {
         assert_eq!(secondary.used_percent, 0.0);
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert_eq!(secondary.resets_at, None);
+    }
+
+    #[test]
+    fn token_plan_drops_non_general_weekly_placeholder() {
+        let now = 1_780_347_620;
+        let body = br#"{
+          "base_resp": { "status_code": 0 },
+          "model_remains": [
+            {
+              "model_name": "minimax-m2",
+              "current_interval_total_count": 0,
+              "current_interval_usage_count": 0,
+              "current_interval_status": 3,
+              "current_interval_remaining_percent": 100,
+              "current_weekly_total_count": 0,
+              "current_weekly_usage_count": 0,
+              "current_weekly_status": 3,
+              "current_weekly_remaining_percent": 100
+            },
+            {
+              "model_name": "general",
+              "current_interval_total_count": 0,
+              "current_interval_usage_count": 0,
+              "current_interval_status": 1,
+              "current_interval_remaining_percent": 99,
+              "start_time": 1780347600000,
+              "end_time": 1780365600000,
+              "current_weekly_total_count": 0,
+              "current_weekly_usage_count": 0,
+              "current_weekly_status": 3,
+              "current_weekly_remaining_percent": 100
+            }
+          ]
+        }"#;
+
+        let payload: CodingPlanPayload = serde_json::from_slice(body).unwrap();
+        let models = model_remains_list(&payload);
+        let placeholder = models
+            .iter()
+            .find(|model| model.model_name.as_deref() == Some("minimax-m2"))
+            .unwrap();
+        assert!(make_weekly_window(placeholder, now).is_none());
+
+        let usage = normalize_usage_at(body, now).unwrap();
+        assert!(usage.primary.is_some());
+        assert!(usage.secondary.is_some());
     }
 }
