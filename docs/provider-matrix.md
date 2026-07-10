@@ -10,6 +10,26 @@ Two providers are already built and proven live end-to-end:
 
 ---
 
+## Parity status
+
+**Current parity: CodexBar v0.41.0** (29 providers registered). CodexBar is a
+moving upstream; parity is re-checked whenever it publishes a newer GitHub
+release. On a new release, diff `git -C ~/Work/OSS/CodexBar diff
+v0.41.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+drift on providers we already serve (highest risk — no live creds to catch a
+silent degradation), new window-bearing providers to port, and balance/credits
+providers (deferred to the Balance axis).
+
+Providers added at v0.41.0: **sakana** (env `SAKANA_COOKIE` + billing HTML
+scrape) and **qoder** (browser-cookie, base+shared quota merge). Window updates:
+doubao (Volcengine-signed Coding Plan session/weekly/monthly), kimi (monthly +
+Code-7d subscription windows), zai (optional `msg` for CN + team scope), minimax
+(Token Plan percent lanes). Deferred to the Balance axis: **CrossModel**,
+**Wayfinder**, **ClawRouter** (dollar-budget/credits, no rate window). Qoder's CN
+endpoint (`qoder.com.cn`) is deferred — unverifiable without a CN session.
+
+---
+
 ## The load-bearing finding: only ~24 of 46 actually have a RATE WINDOW
 
 Alfonso consumes **RateWindows** — `{ utilization, resetsAt, windowMinutes }` —
