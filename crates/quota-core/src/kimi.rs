@@ -2,13 +2,15 @@
 //!
 //! POST `BillingService/GetUsages` with Bearer + `kimi-auth` cookie and the
 //! browser-style client fingerprint CodexBar sends. Weekly quota → `primary`,
-//! first 5h rate limit → `secondary` (CodexBar `KimiUsageSnapshot.toUsageSnapshot`).
+//! first 5h rate limit → `secondary`; a best-effort `GetSubscriptionStats` POST
+//! adds the monthly and Code 7-day windows to `extra_rate_windows`.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! `KIMI_AUTH_TOKEN` on this machine. Endpoint, headers, body, and response
-//! normalization ported from CodexBar (`Providers/Kimi/KimiUsageFetcher.swift:9-47,
-//! 67-75`, `KimiModels.swift:3-35`, `KimiUsageSnapshot.swift:34-81`,
-//! `KimiSettingsReader.swift:4-22`). Reset parsing also cross-checked with
+//! normalization ported from CodexBar (`Providers/Kimi/KimiUsageFetcher.swift:9-13,
+//! 78-172, 200-251`, `KimiModels.swift:3-40`,
+//! `KimiUsageSnapshot.swift:34-118`, `KimiSettingsReader.swift:4-22`).
+//! Reset parsing also cross-checked with
 //! OmniRoute `open-sse/services/usage.ts` `parseResetTime` (~1178-1199) and
 //! `getKimiUsage` limit `resetTime` fields (~2492-2517). Rides live-proven `http.rs`.
 
@@ -19,7 +21,7 @@ use serde_json::json;
 use crate::{
     env,
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -27,6 +29,8 @@ pub const PROVIDER_NAME: &str = "kimi";
 const AUTH_TOKEN_ENV: &[&str] = &["KIMI_AUTH_TOKEN", "kimi_auth_token"];
 const USAGE_URL: &str =
     "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages";
+const SUBSCRIPTION_STATS_URL: &str =
+    "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const RATE_LIMIT_WINDOW_MINUTES: i64 = 300;
@@ -55,6 +59,31 @@ struct KimiUsageDetail {
 #[derive(Debug, Deserialize)]
 struct KimiRateLimit {
     detail: KimiUsageDetail,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KimiSubscriptionStatsResponse {
+    subscription_balance: Option<KimiSubscriptionBalance>,
+    ratelimit_code7d: Option<KimiSubscriptionRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KimiSubscriptionBalance {
+    feature: Option<String>,
+    #[serde(rename = "type")]
+    balance_type: Option<String>,
+    amount_used_ratio: Option<f64>,
+    expire_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KimiSubscriptionRateLimit {
+    ratio: Option<f64>,
+    enabled: Option<bool>,
+    reset_time: Option<String>,
 }
 
 /// Trim env token and strip surrounding quotes (CodexBar `KimiSettingsReader.cleaned`).
@@ -243,8 +272,104 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     })
 }
 
+fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<ExtraWindow> {
+    let matches_feature = balance
+        .feature
+        .as_deref()
+        .is_none_or(|value| value == "FEATURE_OMNI");
+    let matches_type = balance
+        .balance_type
+        .as_deref()
+        .is_none_or(|value| value == "SUBSCRIPTION");
+    if !matches_feature || !matches_type {
+        return None;
+    }
+
+    let ratio = balance
+        .amount_used_ratio
+        .filter(|ratio| ratio.is_finite())?;
+    Some(ExtraWindow {
+        title: Some("Monthly".to_string()),
+        id: Some("kimi-monthly".to_string()),
+        window: Some(RateWindow {
+            used_percent: (ratio * 100.0).clamp(0.0, 100.0),
+            resets_at: parse_reset_time(balance.expire_time.as_deref()),
+            window_minutes: None,
+        }),
+    })
+}
+
+fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option<ExtraWindow> {
+    if limit.enabled == Some(false) {
+        return None;
+    }
+
+    let ratio = limit.ratio.filter(|ratio| ratio.is_finite())?;
+    Some(ExtraWindow {
+        title: Some("Code 7-day".to_string()),
+        id: Some("kimi-code-7d".to_string()),
+        window: Some(RateWindow {
+            used_percent: (ratio * 100.0).clamp(0.0, 100.0),
+            resets_at: parse_reset_time(limit.reset_time.as_deref()),
+            window_minutes: Some(7 * 24 * 60),
+        }),
+    })
+}
+
+/// Normalize GetSubscriptionStats JSON into optional named quota windows.
+fn normalize_subscription_stats(body: &[u8]) -> Result<Option<Vec<ExtraWindow>>, FetchError> {
+    let response: KimiSubscriptionStatsResponse = serde_json::from_slice(body)
+        .map_err(|e| FetchError::Decode(format!("kimi subscription stats not decodable: {e}")))?;
+    let windows: Vec<_> = [
+        response
+            .subscription_balance
+            .and_then(subscription_balance_to_window),
+        response
+            .ratelimit_code7d
+            .and_then(subscription_rate_limit_to_window),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    Ok((!windows.is_empty()).then_some(windows))
+}
+
 fn request_timezone() -> String {
     std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string())
+}
+
+/// Build either Kimi POST with the same JWT-derived headers CodexBar uses.
+fn web_request(
+    url: &'static str,
+    body: Vec<u8>,
+    auth_token: &str,
+    session: Option<&SessionInfo>,
+) -> JsonRequest {
+    let mut req = JsonRequest::post_json(url, body)
+        .bearer(auth_token)
+        .header(Header::new("Cookie", format!("kimi-auth={auth_token}")))
+        .header(Header::new("Origin", "https://www.kimi.com"))
+        .header(Header::new("Referer", "https://www.kimi.com/code/console"))
+        .header(Header::new("Accept", "*/*"))
+        .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
+        .header(Header::new("User-Agent", USER_AGENT))
+        .header(Header::new("connect-protocol-version", "1"))
+        .header(Header::new("x-language", "en-US"))
+        .header(Header::new("x-msh-platform", "web"))
+        .header(Header::new("r-timezone", request_timezone()));
+
+    if let Some(device_id) = session.and_then(|value| value.device_id.as_deref()) {
+        req = req.header(Header::new("x-msh-device-id", device_id));
+    }
+    if let Some(session_id) = session.and_then(|value| value.session_id.as_deref()) {
+        req = req.header(Header::new("x-msh-session-id", session_id));
+    }
+    if let Some(traffic_id) = session.and_then(|value| value.traffic_id.as_deref()) {
+        req = req.header(Header::new("x-traffic-id", traffic_id));
+    }
+
+    req
 }
 
 /// The Kimi official usage provider.
@@ -279,33 +404,28 @@ impl UsageProvider for KimiProvider {
         let body = serde_json::to_vec(&json!({ "scope": ["FEATURE_CODING"] }))
             .map_err(|e| FetchError::Decode(e.to_string()))?;
 
-        let mut req = JsonRequest::post_json(USAGE_URL, body)
-            .bearer(&auth_token)
-            .header(Header::new("Cookie", format!("kimi-auth={auth_token}")))
-            .header(Header::new("Origin", "https://www.kimi.com"))
-            .header(Header::new("Referer", "https://www.kimi.com/code/console"))
-            .header(Header::new("Accept", "*/*"))
-            .header(Header::new("Accept-Language", "en-US,en;q=0.9"))
-            .header(Header::new("User-Agent", USER_AGENT))
-            .header(Header::new("connect-protocol-version", "1"))
-            .header(Header::new("x-language", "en-US"))
-            .header(Header::new("x-msh-platform", "web"))
-            .header(Header::new("r-timezone", request_timezone()));
+        let session = decode_session_info(&auth_token);
+        let response = web_request(USAGE_URL, body, &auth_token, session.as_ref())
+            .send(&self.http)
+            .await?;
+        let mut usage = normalize_usage(&response)?;
 
-        if let Some(session) = decode_session_info(&auth_token) {
-            if let Some(device_id) = session.device_id {
-                req = req.header(Header::new("x-msh-device-id", device_id));
-            }
-            if let Some(session_id) = session.session_id {
-                req = req.header(Header::new("x-msh-session-id", session_id));
-            }
-            if let Some(traffic_id) = session.traffic_id {
-                req = req.header(Header::new("x-traffic-id", traffic_id));
+        // Subscription data is optional enrichment: a failed request or malformed
+        // response must not discard the already-normalized GetUsages windows.
+        if let Ok(response) = web_request(
+            SUBSCRIPTION_STATS_URL,
+            b"{}".to_vec(),
+            &auth_token,
+            session.as_ref(),
+        )
+        .send(&self.http)
+        .await
+        {
+            if let Ok(extra_rate_windows) = normalize_subscription_stats(&response) {
+                usage.extra_rate_windows = extra_rate_windows;
             }
         }
 
-        let response = req.send(&self.http).await?;
-        let usage = normalize_usage(&response)?;
         Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
     }
 }
@@ -338,6 +458,31 @@ mod tests {
         .unwrap()
     }
 
+    fn subscription_fixture(enabled: bool) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "ratelimitCode5h": {
+                "ratio": 0.4689,
+                "enabled": true,
+                "resetTime": "2026-07-02T11:56:36.876796734Z"
+            },
+            "ratelimitCode7d": {
+                "ratio": 0.0946,
+                "enabled": enabled,
+                "resetTime": "2026-07-09T06:56:36.876796734Z"
+            },
+            "subscriptionBalance": {
+                "id": "19eee1de-9092-8315-8000-0000e4e34d79",
+                "feature": "FEATURE_OMNI",
+                "type": "SUBSCRIPTION",
+                "unit": "UNIT_CREDIT",
+                "amountUsedRatio": 1.0,
+                "kimiCodeUsedRatio": 0.2854,
+                "expireTime": "2026-07-23T00:00:00Z"
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn normalizes_weekly_and_rate_limit_windows() {
         let usage = normalize_usage(&fixture_body()).unwrap();
@@ -350,6 +495,48 @@ mod tests {
         assert_eq!(secondary.used_percent, 20.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T18:00:00Z"));
         assert_eq!(secondary.window_minutes, Some(300));
+    }
+
+    #[test]
+    fn normalizes_subscription_stats_into_two_extra_windows() {
+        let windows = normalize_subscription_stats(&subscription_fixture(true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(windows.len(), 2);
+
+        let monthly = &windows[0];
+        assert_eq!(monthly.id.as_deref(), Some("kimi-monthly"));
+        assert_eq!(monthly.title.as_deref(), Some("Monthly"));
+        let monthly_window = monthly.window.as_ref().unwrap();
+        assert_eq!(monthly_window.used_percent, 100.0);
+        assert_eq!(
+            monthly_window.resets_at.as_deref(),
+            Some("2026-07-23T00:00:00Z")
+        );
+        assert_eq!(monthly_window.window_minutes, None);
+
+        let code_weekly = &windows[1];
+        assert_eq!(code_weekly.id.as_deref(), Some("kimi-code-7d"));
+        assert_eq!(code_weekly.title.as_deref(), Some("Code 7-day"));
+        let code_weekly_window = code_weekly.window.as_ref().unwrap();
+        assert_eq!(code_weekly_window.used_percent, 9.46);
+        assert_eq!(
+            code_weekly_window.resets_at.as_deref(),
+            Some("2026-07-09T06:56:36Z")
+        );
+        assert_eq!(code_weekly_window.window_minutes, Some(10_080));
+    }
+
+    #[test]
+    fn omits_disabled_subscription_code_window() {
+        let windows = normalize_subscription_stats(&subscription_fixture(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id.as_deref(), Some("kimi-monthly"));
+        assert!(windows
+            .iter()
+            .all(|window| window.id.as_deref() != Some("kimi-code-7d")));
     }
 
     #[test]
