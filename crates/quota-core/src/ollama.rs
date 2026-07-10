@@ -45,10 +45,12 @@ const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
 const MAX_BLOCK: usize = 4000;
 
 /// A recognized session-cookie name (any of these → treat the jar as a real login).
+/// `wos-session` is Ollama's WorkOS session cookie, adopted when it moved auth to
+/// WorkOS — a jar carrying only it is still a valid login.
 fn is_session_cookie(name: &str) -> bool {
     matches!(
         name,
-        "session" | "__Secure-session" | "ollama_session" | "__Host-ollama_session"
+        "session" | "__Secure-session" | "ollama_session" | "__Host-ollama_session" | "wos-session"
     ) || name.starts_with("__Secure-next-auth.session-token")
         || name.starts_with("next-auth.session-token")
 }
@@ -156,10 +158,13 @@ fn looks_signed_out(html: &str) -> bool {
     has_form && ((has_heading && has_password) || has_auth_route)
 }
 
-/// A window for a label, only when BOTH a percent AND a real reset are present —
-/// a percent without a reset is dropped (degrade-never-wrong: no fabricated reset).
-fn window_for(html: &str, labels: &[&str], window_minutes: i64) -> Option<RateWindow> {
-    for label in labels {
+/// A window for the first matching label, only when BOTH a percent AND a real reset
+/// are present — a percent without a reset is dropped (degrade-never-wrong: no
+/// fabricated reset). `window_minutes` is per-label: an "Hourly usage" block carries
+/// no fixed length (matching CodexBar, which stamps 5h only on "Session usage"),
+/// so a short hourly window is never mislabeled as the 5-hour session window.
+fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> {
+    for (label, window_minutes) in labels {
         if let Some(block) = block_after(html, label) {
             if let (Some(used_percent), Some(resets_at)) =
                 (parse_percent(block), parse_reset(block))
@@ -167,7 +172,7 @@ fn window_for(html: &str, labels: &[&str], window_minutes: i64) -> Option<RateWi
                 return Some(RateWindow {
                     used_percent,
                     resets_at: Some(resets_at),
-                    window_minutes: Some(window_minutes),
+                    window_minutes: *window_minutes,
                 });
             }
         }
@@ -177,12 +182,16 @@ fn window_for(html: &str, labels: &[&str], window_minutes: i64) -> Option<RateWi
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
+    // "Session usage" is the 5-hour window; "Hourly usage" is a distinct shorter
+    // window with no fixed length on the wire (CodexBar leaves it nil).
     let session = window_for(
         html,
-        &["Session usage", "Hourly usage"],
-        SESSION_WINDOW_MINUTES,
+        &[
+            ("Session usage", Some(SESSION_WINDOW_MINUTES)),
+            ("Hourly usage", None),
+        ],
     );
-    let weekly = window_for(html, &["Weekly usage"], WEEKLY_WINDOW_MINUTES);
+    let weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))]);
 
     if session.is_none() && weekly.is_none() {
         if looks_signed_out(html) {
@@ -348,6 +357,31 @@ mod tests {
         let usage = normalize_usage(html).unwrap();
         assert!(usage.primary.is_none(), "session has no reset → dropped");
         assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn hourly_usage_window_has_no_fixed_length() {
+        // An "Hourly usage" block (not "Session usage") is a distinct short window;
+        // it must NOT be stamped with the 5-hour session length.
+        let html = r#"
+          <span>Hourly usage</span><span>2.5% used</span>
+          <div data-time="2026-01-30T18:00:00Z">Resets in 3 hours</div>
+          <span>Weekly usage</span><span>4.2% used</span>
+          <div data-time="2026-02-02T00:00:00Z">Resets in 2 days</div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+        let session = usage.primary.unwrap();
+        assert_eq!(session.used_percent, 2.5);
+        assert_eq!(session.window_minutes, None, "hourly has no fixed length");
+        assert_eq!(usage.secondary.unwrap().window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn recognizes_workos_session_cookie() {
+        // Ollama moved auth to WorkOS; a jar carrying only `wos-session` is a login.
+        assert!(is_session_cookie("wos-session"));
+        assert!(is_session_cookie("__Secure-session"));
+        assert!(!is_session_cookie("marketing_id"));
     }
 
     #[test]

@@ -320,9 +320,13 @@ fn first_f64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64>
             if let Some(n) = v.as_f64() {
                 return Some(n);
             }
+            // A string body may parse to a non-finite float ("NaN"/"inf"); reject it
+            // so a garbage value never becomes a served percent.
             if let Some(s) = v.as_str() {
                 if let Ok(n) = s.trim().parse::<f64>() {
-                    return Some(n);
+                    if n.is_finite() {
+                        return Some(n);
+                    }
                 }
             }
         }
@@ -348,6 +352,12 @@ fn first_i64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i64>
 
 fn parse_date_value(val: &Value) -> Option<i64> {
     if let Some(n) = val.as_f64() {
+        // A non-finite or absurd magnitude (e.g. "1e308") is not a real timestamp;
+        // reject it explicitly rather than letting a saturating float→int cast
+        // produce a garbage epoch (the window is then dropped, never fabricated).
+        if !n.is_finite() || n >= i64::MAX as f64 {
+            return None;
+        }
         if n > 1_000_000_000_000.0 {
             return Some((n / 1000.0) as i64);
         }
@@ -393,6 +403,9 @@ fn percent_from_map(map: &serde_json::Map<String, Value>) -> Option<f64> {
             None
         }
     })?;
+    if !p.is_finite() {
+        return None;
+    }
     if (0.0..=1.0).contains(&p) {
         p *= 100.0;
     }
@@ -529,20 +542,25 @@ fn field_after_key_i64(block: &str, key: &str) -> Option<i64> {
 
 fn parse_windows_regex(text: &str, now_secs: i64, include_monthly: bool) -> Option<Usage> {
     let rolling_block = window_block(text, "rollingUsage")?;
-    let weekly_block = window_block(text, "weeklyUsage")?;
     let rolling_p = field_after_key(rolling_block, "usagePercent")
         .or_else(|| field_after_key(rolling_block, "usedPercent"))?;
     let rolling_r = RESET_IN_KEYS
         .iter()
         .find_map(|k| field_after_key_i64(rolling_block, k))?;
-    let weekly_p = field_after_key(weekly_block, "usagePercent")
-        .or_else(|| field_after_key(weekly_block, "usedPercent"))?;
-    let weekly_r = RESET_IN_KEYS
-        .iter()
-        .find_map(|k| field_after_key_i64(weekly_block, k))?;
+
+    // Weekly is optional: a response with only the rolling window must still serve
+    // the primary, rather than dropping everything when weekly is absent.
+    let weekly = window_block(text, "weeklyUsage").and_then(|weekly_block| {
+        let weekly_p = field_after_key(weekly_block, "usagePercent")
+            .or_else(|| field_after_key(weekly_block, "usedPercent"))?;
+        let weekly_r = RESET_IN_KEYS
+            .iter()
+            .find_map(|k| field_after_key_i64(weekly_block, k))?;
+        window_from_parts(weekly_p, weekly_r, now_secs, WEEKLY_WINDOW_MINUTES)
+    });
 
     let primary = window_from_parts(rolling_p, rolling_r, now_secs, ROLLING_WINDOW_MINUTES);
-    let secondary = window_from_parts(weekly_p, weekly_r, now_secs, WEEKLY_WINDOW_MINUTES);
+    let secondary = weekly;
     let tertiary = if include_monthly {
         window_block(text, "monthlyUsage").and_then(|block| {
             let p = field_after_key(block, "usagePercent")?;
@@ -731,6 +749,38 @@ mod tests {
         let usage = parse_windows(html, 1_700_000_000, false).unwrap();
         assert!(usage.primary.is_none());
         assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn nonfinite_percent_drops_that_window() {
+        // A "NaN" string percent must never become a served value; the rolling
+        // window is dropped while a well-formed weekly still emits.
+        let json = r#"{"rollingUsage":{"usagePercent":"NaN"},
+                       "weeklyUsage":{"usagePercent":10,"resetInSec":3600}}"#;
+        let usage = parse_windows(json, 1_700_000_000, false).unwrap();
+        assert!(usage.primary.is_none(), "NaN percent → no window");
+        assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn out_of_range_reset_drops_window_without_fabricating() {
+        // An absurd resetAt ("1e308") is not a real timestamp; the window is
+        // dropped rather than emitted with a fabricated or saturated reset.
+        let json = r#"{"rollingUsage":{"usagePercent":50,"resetAt":1e308},
+                       "weeklyUsage":{"usagePercent":10,"resetInSec":3600}}"#;
+        let usage = parse_windows(json, 1_700_000_000, false).unwrap();
+        assert!(usage.primary.is_none(), "garbage reset → no window");
+        assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn go_html_with_only_rolling_still_serves_primary() {
+        // A response missing the weekly block must still serve the rolling/primary
+        // window instead of dropping everything.
+        let html = r#" rollingUsage: { usagePercent: 5, resetInSec: 18000 } "#;
+        let usage = parse_windows(html, 1_700_000_000, false).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 5.0);
+        assert!(usage.secondary.is_none(), "no weekly block → no secondary");
     }
 
     #[test]

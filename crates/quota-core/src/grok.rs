@@ -337,7 +337,11 @@ mod tests {
     use super::*;
 
     /// A REAL captured gRPC-web response from GetGrokCreditsConfig (live wire bytes,
-    /// base64). Decodes to 76.57% used with a 2026-07-01 billing reset.
+    /// base64). Decodes to 76.57% used with a 2026-07-01 billing reset over a 30-day
+    /// period (43200 min). This is a historical capture: the live wire later moved to
+    /// a 7-day billing period, which the decoder handles automatically because the
+    /// window length is derived from the response's own period, not hardcoded — so
+    /// this fixture's 43200 proves the derivation, it is not a pinned assumption.
     const LIVE_FIXTURE_B64: &str = "AAAAADwKOg3XI5lCEgAaACIGCICX89AGKgYIgLGR0gY6BwgBFeE6k0JCEggBEgYIgJfz0AYaBgiAsZHSBmIAaAGAAAAAD2dycGMtc3RhdHVzOjANCg==";
 
     fn decode_b64(s: &str) -> Vec<u8> {
