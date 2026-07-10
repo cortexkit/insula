@@ -36,6 +36,7 @@ pub mod opencode_auth;
 pub mod opencodego;
 pub mod provider;
 pub mod refresh;
+mod sakana;
 pub mod stepfun;
 pub mod store;
 pub mod synthetic;
@@ -117,6 +118,7 @@ impl Registry {
             Box::new(ollama::OllamaProvider::new()),
             Box::new(opencode::OpenCodeProvider::new()),
             Box::new(opencodego::OpenCodeGoProvider::new()),
+            Box::new(sakana::SakanaProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(warp::WarpProvider::new()),
             Box::new(synthetic::SyntheticProvider::new()),
