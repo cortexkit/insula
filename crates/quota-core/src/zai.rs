@@ -1,10 +1,12 @@
 //! Zai usage fetcher — credential from an environment variable.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
-//! Z_AI_API_KEY available. Endpoint, headers, and response shape ported from
-//! CodexBar (Sources/CodexBarCore/Providers/Zai/ZaiUsageStats.swift:7-19,56-124,138-284,313-344,
-//! Sources/CodexBarCore/Providers/Zai/ZaiSettingsReader.swift:6-8,10-31, and
-//! Sources/CodexBarCore/Providers/Zai/ZaiAPIRegion.swift:3-35). Rides the live-proven http.rs.
+//! Z_AI_API_KEY available. Endpoint, headers, optional success message, team scope,
+//! and response shape ported from CodexBar
+//! (Sources/CodexBarCore/Providers/Zai/ZaiUsageStats.swift:7-19,21-45,56-124,138-315,318-460,
+//! Sources/CodexBarCore/Providers/Zai/ZaiSettingsReader.swift:6-10,12-31,
+//! Sources/CodexBarCore/Providers/Zai/ZaiAPIRegion.swift:3-35, and fixture
+//! Tests/CodexBarTests/ZaiProviderTests.swift:406-454,457-527). Rides the live-proven http.rs.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -18,12 +20,14 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "zai";
 const API_KEY_ENV: &[&str] = &["Z_AI_API_KEY"];
+const BIGMODEL_ORGANIZATION_ENV: &str = "Z_AI_BIGMODEL_ORGANIZATION";
+const BIGMODEL_PROJECT_ENV: &str = "Z_AI_BIGMODEL_PROJECT";
 const DEFAULT_BASE: &str = "https://api.z.ai";
 
 #[derive(Debug, Deserialize)]
 struct ZaiQuotaLimitResponse {
     code: i64,
-    msg: String,
+    msg: Option<String>,
     data: Option<ZaiQuotaLimitData>,
     success: bool,
 }
@@ -53,6 +57,34 @@ struct ValidLimit {
     used_percent: f64,
     window_minutes: Option<i64>,
     resets_at: String,
+}
+
+struct ZaiTeamContext {
+    organization: String,
+    project: String,
+}
+
+struct ZaiRequestSpec {
+    url: String,
+    headers: Vec<Header>,
+}
+
+impl ZaiRequestSpec {
+    fn into_json_request(self) -> JsonRequest {
+        self.headers
+            .into_iter()
+            .fold(JsonRequest::get(self.url), |request, header| {
+                request.header(header)
+            })
+    }
+
+    #[cfg(test)]
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+    }
 }
 
 fn get_used_percent(
@@ -103,9 +135,16 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .map_err(|e| FetchError::Decode(format!("zai quota limit not decodable: {e}")))?;
 
     if !response.success || response.code != 200 {
+        let message = response
+            .msg
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("zai quota API returned code {}", response.code));
         return Err(FetchError::Upstream(format!(
-            "zai API error: code={}, msg={}",
-            response.code, response.msg
+            "zai API error: code={}, msg={message}",
+            response.code
         )));
     }
 
@@ -215,6 +254,48 @@ fn resolve_quota_url() -> String {
     format!("{}/api/monitor/usage/quota/limit", DEFAULT_BASE)
 }
 
+fn team_context_from_env() -> Option<ZaiTeamContext> {
+    Some(ZaiTeamContext {
+        organization: env::first_env(&[BIGMODEL_ORGANIZATION_ENV])?,
+        project: env::first_env(&[BIGMODEL_PROJECT_ENV])?,
+    })
+}
+
+fn team_scope_url(raw_url: &str) -> Result<String, FetchError> {
+    let mut url = reqwest::Url::parse(raw_url)
+        .map_err(|error| FetchError::Upstream(format!("invalid zai quota URL: {error}")))?;
+    let existing_query: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(name, _)| name != "type")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    url.query_pairs_mut()
+        .extend_pairs(existing_query)
+        .append_pair("type", "2");
+    Ok(url.to_string())
+}
+
+fn build_quota_request(
+    api_key: &str,
+    url: String,
+    team_context: Option<ZaiTeamContext>,
+) -> Result<ZaiRequestSpec, FetchError> {
+    let mut headers = vec![Header::new("Authorization", format!("Bearer {api_key}"))];
+    let url = if let Some(team_context) = team_context {
+        headers.push(Header::new(
+            "Bigmodel-Organization",
+            team_context.organization,
+        ));
+        headers.push(Header::new("Bigmodel-Project", team_context.project));
+        team_scope_url(&url)?
+    } else {
+        url
+    };
+
+    Ok(ZaiRequestSpec { url, headers })
+}
+
 /// The Zai usage provider.
 pub struct ZaiProvider {
     http: reqwest::Client,
@@ -243,12 +324,9 @@ impl UsageProvider for ZaiProvider {
     async fn fetch(&self) -> Result<ProviderUsage, FetchError> {
         let api_key = env::first_env(API_KEY_ENV)
             .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-        let url = resolve_quota_url();
+        let request = build_quota_request(&api_key, resolve_quota_url(), team_context_from_env())?;
 
-        let body = JsonRequest::get(url)
-            .header(Header::new("authorization", format!("Bearer {api_key}")))
-            .send(&self.http)
-            .await?;
+        let body = request.into_json_request().send(&self.http).await?;
 
         let usage = normalize_usage(&body)?;
         Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
@@ -257,7 +335,40 @@ impl UsageProvider for ZaiProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::{ffi::OsString, sync::Mutex};
+
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn normalizes_quota_limit_payload() {
@@ -303,6 +414,93 @@ mod tests {
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
 
         assert!(usage.tertiary.is_none());
+    }
+
+    #[test]
+    fn normalizes_bigmodel_cn_payload_without_msg() {
+        let body = br#"{
+          "code": 200,
+          "data": {
+            "limits": [
+              {
+                "type": "TIME_LIMIT",
+                "unit": 5,
+                "number": 1,
+                "usage": 1000,
+                "currentValue": 147,
+                "remaining": 853,
+                "percentage": 14,
+                "nextResetTime": 1784706344993,
+                "usageDetails": [
+                  { "modelCode": "search-prime", "usage": 84 },
+                  { "modelCode": "web-reader", "usage": 41 },
+                  { "modelCode": "zread", "usage": 8 }
+                ]
+              },
+              {
+                "type": "TOKENS_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "percentage": 8,
+                "nextResetTime": 1783049703178
+              },
+              {
+                "type": "TOKENS_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "percentage": 7,
+                "nextResetTime": 1783496744998
+              }
+            ],
+            "level": "pro"
+          },
+          "success": true
+        }"#;
+
+        let usage = normalize_usage(body).unwrap();
+
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 7.0);
+        assert_eq!(primary.window_minutes, Some(10_080));
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-07-08T07:45:44Z"));
+
+        let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 14.7);
+        assert_eq!(secondary.window_minutes, None);
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-22T07:45:44Z"));
+
+        let tertiary = usage.tertiary.unwrap();
+        assert_eq!(tertiary.used_percent, 8.0);
+        assert_eq!(tertiary.window_minutes, Some(300));
+        assert_eq!(tertiary.resets_at.as_deref(), Some("2026-07-03T03:35:03Z"));
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn team_env_builds_scoped_request_with_bigmodel_headers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _organization = EnvGuard::set(BIGMODEL_ORGANIZATION_ENV, "org-test");
+        let _project = EnvGuard::remove(BIGMODEL_PROJECT_ENV);
+        let base_url = format!("{DEFAULT_BASE}/api/monitor/usage/quota/limit");
+
+        let personal =
+            build_quota_request("zai-test-token", base_url.clone(), team_context_from_env())
+                .unwrap();
+        assert_eq!(personal.url, base_url);
+        assert!(personal.header("Bigmodel-Organization").is_none());
+        assert!(personal.header("Bigmodel-Project").is_none());
+
+        std::env::set_var(BIGMODEL_PROJECT_ENV, "proj-test");
+        let team =
+            build_quota_request("zai-test-token", base_url, team_context_from_env()).unwrap();
+
+        assert_eq!(
+            team.url,
+            "https://api.z.ai/api/monitor/usage/quota/limit?type=2"
+        );
+        assert_eq!(team.header("Authorization"), Some("Bearer zai-test-token"));
+        assert_eq!(team.header("Bigmodel-Organization"), Some("org-test"));
+        assert_eq!(team.header("Bigmodel-Project"), Some("proj-test"));
     }
 
     #[test]
