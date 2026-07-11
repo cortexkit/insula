@@ -12,20 +12,32 @@ Two providers are already built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.41.0** (29 providers registered). CodexBar is a
-moving upstream; parity is re-checked whenever it publishes a newer GitHub
-release. On a new release, diff `git -C ~/Work/OSS/CodexBar diff
-v0.41.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+**Current parity: CodexBar v0.42.0** (29 providers registered; verified
+2026-07-11 with no code changes needed — zero window-shape drift on any served
+provider). CodexBar is a moving upstream; parity is re-checked whenever it
+publishes a newer GitHub release. On a new release, diff `git -C ~/Work/OSS/CodexBar
+diff v0.42.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
-providers (deferred to the Balance axis).
+providers (deferred to the Balance axis). When a diff touches a provider we serve,
+confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
+`/api/oauth/usage`, not CodexBar's CLI/web fetcher) and that the field actually
+changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
+
+v0.41.0 → v0.42.0 delta was all additive/non-window on served providers: Codex
+credits (balance axis), Gemini `paidTierName` label, Antigravity port-detection
+mechanics, Claude CLI/web-path refactor (not our OAuth endpoint). New providers
+were balance-only: **KimiK2** (prepaid credits, distinct from our coding-plan
+`kimi`) and **Wayfinder** (dollar savings meter) — both deferred to the Balance
+axis.
 
 Providers added at v0.41.0: **sakana** (env `SAKANA_COOKIE` + billing HTML
 scrape) and **qoder** (browser-cookie, base+shared quota merge). Window updates:
 doubao (Volcengine-signed Coding Plan session/weekly/monthly), kimi (monthly +
 Code-7d subscription windows), zai (optional `msg` for CN + team scope), minimax
 (Token Plan percent lanes). Deferred to the Balance axis: **CrossModel**,
-**Wayfinder**, **ClawRouter** (dollar-budget/credits, no rate window). Qoder's CN
+**Wayfinder**, **ClawRouter**, **KimiK2** (dollar-budget/prepaid credits, no rate
+window). Qoder's CN
 endpoint (`qoder.com.cn`) is deferred — unverifiable without a CN session.
 
 ---
