@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Real-daemon supervision proof: the STANDALONE `subc-core` binary reads a
+//! Real-daemon supervision proof: the STANDALONE `ck-subc` daemon binary reads a
 //! `subc.jsonc`, spawns + supervises `quota-module` as a child process it owns, and
 //! routes `usage.get` end-to-end.
 //!
 //! This is the "is it actually a subc module" gate that `skeleton_e2e` cannot give:
 //! skeleton_e2e runs the daemon IN-PROCESS and spawns the module itself. Here a real
-//! `subc-core` process — launched exactly as a user would run it — does the
+//! `ck-subc` process — launched exactly as a user would run it — does the
 //! spawning from config, injects `SUBC_MODULE_ID`, and supervises the child. We only
 //! drive the consumer; the daemon owns the module lifecycle.
 //!
 //! Requires both binaries built (the harness builds them): `quota-module` (this
-//! workspace) and `subc-core` (the sibling `../subconscious` workspace). The test is
+//! workspace) and `ck-subc` (the sibling `../subconscious` workspace). The test is
 //! `#[ignore]` by default because it shells out to `cargo build` in a sibling repo
 //! and binds real loopback ports — run it explicitly with
 //! `cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture`.
@@ -33,7 +33,7 @@ use common::{
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
 
-/// A real `subc-core` daemon process plus its isolated rig dir; killed on drop.
+/// A real `ck-subc` daemon process plus its isolated rig dir; killed on drop.
 struct RealDaemon {
     child: Child,
     rig: PathBuf,
@@ -56,25 +56,24 @@ fn subconscious_root() -> PathBuf {
         .expect("sibling ../subconscious repo must exist for the real-daemon test")
 }
 
-/// Build a binary in the subconscious workspace and return its path.
+/// Build the subc daemon in the subconscious workspace and return its path.
+/// The `subc-core` crate builds a binary named `ck-subc`; a stale `subc-core`
+/// binary can linger in target/debug after the rename, so the build and the
+/// path must both use the current artifact name to avoid running an old daemon.
 fn build_subc_core() -> PathBuf {
     let root = subconscious_root();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args(["build", "--bin", "subc-core"])
+        .args(["build", "--bin", "ck-subc"])
         .status()
-        .expect("run cargo build for subc-core");
-    assert!(status.success(), "building subc-core failed");
-    let bin = root.join("target/debug/subc-core");
-    assert!(
-        bin.exists(),
-        "subc-core binary missing at {}",
-        bin.display()
-    );
+        .expect("run cargo build for the ck-subc daemon");
+    assert!(status.success(), "building ck-subc failed");
+    let bin = root.join("target/debug/ck-subc");
+    assert!(bin.exists(), "ck-subc binary missing at {}", bin.display());
     bin
 }
 
-/// Launch a real subc-core daemon with an isolated rig whose subc.jsonc supervises
+/// Launch a real ck-subc daemon with an isolated rig whose subc.jsonc supervises
 /// our freshly-built quota-module binary. Waits for the connection file.
 async fn start_real_daemon() -> RealDaemon {
     let subc_core = build_subc_core();
@@ -110,7 +109,7 @@ async fn start_real_daemon() -> RealDaemon {
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn real subc-core daemon");
+        .expect("spawn real ck-subc daemon");
 
     let connection_file = runtime_dir.join("subc-connection.json");
     let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
@@ -129,12 +128,12 @@ async fn start_real_daemon() -> RealDaemon {
     }
 }
 
-/// The full supervision proof: a real subc-core binary spawns the module from
+/// The full supervision proof: a real ck-subc binary spawns the module from
 /// subc.jsonc, it registers, and usage.get routes end-to-end returning a
 /// ProviderUsage[] array (silent-degrade entries are fine — the point is the
 /// real spawn + route, not live windows).
 #[tokio::test]
-#[ignore = "builds subc-core in ../subconscious and binds loopback ports"]
+#[ignore = "builds ck-subc in ../subconscious and binds loopback ports"]
 async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
     let daemon = start_real_daemon().await;
     let mut consumer = connect_consumer(&daemon.connection_file).await;
@@ -181,7 +180,7 @@ async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
 /// The module-level error contract holds through a REAL daemon too: an unknown
 /// method on the route channel returns a canonical Error frame, not a Response.
 #[tokio::test]
-#[ignore = "builds subc-core in ../subconscious and binds loopback ports"]
+#[ignore = "builds ck-subc in ../subconscious and binds loopback ports"]
 async fn real_daemon_unknown_method_returns_error_frame() {
     let daemon = start_real_daemon().await;
     let mut consumer = connect_consumer(&daemon.connection_file).await;
