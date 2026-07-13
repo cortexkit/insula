@@ -143,7 +143,7 @@ async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
 
     let project_root = unique_temp_dir("quota-real-daemon-project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let route_channel = route_open(&mut consumer, &project_root, 1).await;
+    let route = route_open(&mut consumer, &project_root, 1).await;
 
     // Serving is cache-only: the module returns whatever its background
     // refresher has resolved so far, so poll until the first sweep warms the
@@ -151,7 +151,7 @@ async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
     let mut corr = 2;
     let result = loop {
-        let response = usage_get(&mut consumer, route_channel, corr).await;
+        let response = usage_get(&mut consumer, route, corr).await;
         let result = response["result"]
             .as_array()
             .cloned()
@@ -188,11 +188,11 @@ async fn real_daemon_unknown_method_returns_error_frame() {
 
     let project_root = unique_temp_dir("quota-real-daemon-err");
     std::fs::create_dir_all(&project_root).unwrap();
-    let route_channel = route_open(&mut consumer, &project_root, 1).await;
+    let route = route_open(&mut consumer, &project_root, 1).await;
 
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         2,
         serde_json::json!({ "method": "does.not.exist", "params": {} }),
     )

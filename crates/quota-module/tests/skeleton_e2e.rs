@@ -41,7 +41,7 @@ use tokio::{
 };
 
 use common::{
-    catalog_list, connect_consumer, raw_route_frame, route_open, unique_temp_dir, usage_get,
+    catalog_list, connect_consumer, raw_route_frame, route_open, unique_temp_dir, usage_get, Route,
     MODULE_ID, SETUP_TIMEOUT,
 };
 
@@ -139,8 +139,8 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
 
 /// Stand up daemon + real module, confirm it is in the catalog, and open a route
 /// to its management surface. Returns the live pieces plus an authenticated
-/// consumer already bound to `route_channel`.
-async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, u16) {
+/// consumer already bound to the route `(channel, epoch)`.
+async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Route) {
     let daemon = start_daemon().await;
     let module = spawn_quota_module(&daemon.connection_file_path);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
@@ -157,9 +157,9 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream
         "quota module should be in the catalog: {modules:?}"
     );
 
-    let route_channel = route_open(&mut consumer, &project_root, 2).await;
+    let route = route_open(&mut consumer, &project_root, 2).await;
     let _ = std::fs::remove_dir_all(&project_root);
-    (daemon, module, consumer, route_channel)
+    (daemon, module, consumer, route)
 }
 
 /// Drive the full path and return the `result` array once `want_provider` has
@@ -168,11 +168,11 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream
 /// a specific provider mid-sweep; poll until the asserted provider appears (or a
 /// deadline), exactly as a real consumer reading async-refreshed data would.
 async fn drive_usage_get_for(want_provider: &str) -> (TestDaemon, ModuleProcess, Vec<Value>) {
-    let (daemon, module, mut consumer, route_channel) = open_quota_route().await;
+    let (daemon, module, mut consumer, route) = open_quota_route().await;
     let deadline = Instant::now() + Duration::from_secs(40);
     let mut corr = 3;
     let result = loop {
-        let response = usage_get(&mut consumer, route_channel, corr).await;
+        let response = usage_get(&mut consumer, route, corr).await;
         let result = response["result"].as_array().cloned().unwrap_or_default();
         let has_target = result.iter().any(|e| e["provider"] == want_provider);
         if has_target || Instant::now() >= deadline {
@@ -214,12 +214,12 @@ async fn skeleton_round_trips_usage_get_over_the_wire() {
 /// wholesale Error frames are reserved for bad-request/unknown-method.
 #[tokio::test]
 async fn unknown_method_returns_error_frame_with_canonical_error_body() {
-    let (_daemon, _module, mut consumer, route_channel) = open_quota_route().await;
+    let (_daemon, _module, mut consumer, route) = open_quota_route().await;
 
     // An unknown method on a well-formed body.
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         7,
         serde_json::json!({ "method": "cost.get", "params": {} }),
     )
@@ -241,7 +241,7 @@ async fn unknown_method_returns_error_frame_with_canonical_error_body() {
     // A malformed body (not decodable as a usage request) is also an Error frame.
     let frame = raw_route_frame(
         &mut consumer,
-        route_channel,
+        route,
         8,
         serde_json::json!({ "not_a_method": true }),
     )

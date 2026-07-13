@@ -189,7 +189,8 @@ async fn send_hello(
             .filter(|value| !value.is_empty()),
     })
     .map_err(ModuleError::Json)?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, HELLO_CORR, body)
+    // Channel-0 control frame: epoch is always 0.
+    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
 }
@@ -230,6 +231,7 @@ async fn handle_frame(
                 frame.header.ver,
                 FrameType::Pong,
                 frame.header.flags,
+                0,
                 0,
                 frame.header.corr,
                 Vec::new(),
@@ -280,10 +282,12 @@ async fn handle_control_request(
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
+    // Channel-0 control reply: epoch is always 0.
     let response = Frame::build_with_version(
         frame.header.ver,
         FrameType::Response,
         control_flags(),
+        0,
         0,
         frame.header.corr,
         body,
@@ -362,6 +366,9 @@ async fn handle_usage_request(
     registry: &Arc<Registry>,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
+    // The route's binding epoch must be echoed on every reply, or the daemon
+    // drops the frame as belonging to a stale binding of this channel slot.
+    let epoch = frame.header.epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
 
@@ -372,6 +379,7 @@ async fn handle_usage_request(
                 writer,
                 ver,
                 channel,
+                epoch,
                 corr,
                 "invalid_request",
                 &format!("usage request body not decodable: {e}"),
@@ -385,6 +393,7 @@ async fn handle_usage_request(
             writer,
             ver,
             channel,
+            epoch,
             corr,
             "unknown_method",
             &format!(
@@ -402,6 +411,7 @@ async fn handle_usage_request(
         FrameType::Response,
         Flags::new(false, Priority::Interactive, false),
         channel,
+        epoch,
         corr,
         body,
     )
@@ -413,6 +423,7 @@ async fn send_route_error(
     writer: &mpsc::Sender<Frame>,
     ver: u8,
     channel: u16,
+    epoch: u32,
     corr: u64,
     code: &str,
     message: &str,
@@ -427,6 +438,7 @@ async fn send_route_error(
         FrameType::Error,
         Flags::new(false, Priority::Interactive, false),
         channel,
+        epoch,
         corr,
         body,
     )
@@ -541,6 +553,7 @@ mod tests {
             FrameType::Request,
             control_flags(),
             0,
+            0,
             42,
             serde_json::to_vec(&request).unwrap(),
         )
@@ -595,6 +608,7 @@ mod tests {
         let bind = serde_json::json!({
             "op": "route.bind",
             "route_channel": 7,
+            "epoch": 1,
             "target": { "kind": "management_surface", "module_id": MODULE_ID_FOR_TEST },
             "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
         });
@@ -602,6 +616,7 @@ mod tests {
             PROTOCOL_VERSION,
             FrameType::Request,
             control_flags(),
+            0,
             0,
             7,
             serde_json::to_vec(&bind).unwrap(),
