@@ -29,7 +29,7 @@ pub const CONSUME_TIMEOUT: Duration = Duration::from_secs(8);
 pub const PRE_POST_CUTOFF: Duration = Duration::from_secs(20);
 pub const PENDING_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const CREDIT_SAFETY_MARGIN_SECS: i64 = 60;
-pub const PENDING_ABANDON_AFTER_SECS: i64 = 24 * 60 * 60;
+pub const PENDING_OLD_AFTER_SECS: i64 = 24 * 60 * 60;
 pub const SPEND_BOUND_SECS: i64 = 30 * 60;
 pub const RESOLVED_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -130,10 +130,11 @@ pub struct UsageFacts {
     pub raw_percents: Vec<f64>,
     pub any_used_floor: bool,
     pub at_wall: bool,
+    pub wall_clear: bool,
 }
 
 impl UsageFacts {
-    pub fn from_usage(usage: &Usage, limit_reached: bool) -> Self {
+    pub fn from_usage(usage: &Usage, limit_reached: Option<bool>) -> Self {
         let mut raw_percents = Vec::new();
         for window in [&usage.primary, &usage.secondary, &usage.tertiary]
             .into_iter()
@@ -151,13 +152,15 @@ impl UsageFacts {
         }
         Self {
             any_used_floor: raw_percents.iter().any(|percent| *percent >= 1.0),
-            at_wall: limit_reached || raw_percents.iter().any(|percent| *percent >= 99.0),
+            at_wall: limit_reached == Some(true)
+                || raw_percents.iter().any(|percent| *percent >= 99.0),
+            wall_clear: limit_reached == Some(false),
             raw_percents,
         }
     }
 
     pub fn below_wall(&self) -> bool {
-        !self.at_wall
+        self.wall_clear && !self.at_wall
     }
 }
 
@@ -265,6 +268,10 @@ pub struct RedemptionRecord {
     pub account_id: String,
     pub redeem_request_id: String,
     pub created_at: String,
+    #[serde(default)]
+    pub last_attempt_at: Option<String>,
+    #[serde(default)]
+    pub attempt_count: u32,
     pub status: JournalStatus,
     pub outcome: Option<ConsumeOutcome>,
 }
@@ -290,7 +297,6 @@ impl std::error::Error for JournalError {}
 pub struct AccountJournalState {
     pub pending_id: Option<String>,
     pub spend_bound_allows: bool,
-    pub abandoned_this_tick: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +304,6 @@ pub enum Reservation {
     New(String),
     ExistingPending(String),
     SpendBound,
-    Abandoned,
     NoAction,
 }
 
@@ -326,53 +331,46 @@ impl RedemptionJournal {
         self.load()
     }
 
-    /// Prune old resolved records and abandon a stale pending id. Abandonment is
-    /// represented as resolved-without-outcome and never opens a new id in the
-    /// same call.
+    fn probe_atomic_write(&self) -> Result<(), JournalError> {
+        let records = self.load()?;
+        self.save(&records)
+    }
+
+    /// Prune old resolved records and report pending state. Pending ids are never
+    /// abandoned automatically: even an old record remains the only id for its
+    /// logical redemption until the server supplies a resolvable outcome.
     pub fn inspect_account(
         &self,
         account_id: &str,
         now: DateTime<Utc>,
     ) -> Result<AccountJournalState, JournalError> {
         let mut records = self.load()?;
-        let mut changed = prune_records(&mut records, now)? > 0;
-        let mut abandoned_this_tick = false;
-        for record in records.iter_mut().filter(|record| {
+        if prune_records(&mut records, now)? > 0 {
+            self.save(&records)?;
+        }
+        let pending = records.iter().find(|record| {
             record.account_id == account_id && record.status == JournalStatus::Pending
-        }) {
-            let created_at = parse_record_time(record)?;
-            if now.signed_duration_since(created_at).num_seconds() > PENDING_ABANDON_AFTER_SECS {
-                record.status = JournalStatus::Resolved;
-                record.outcome = None;
-                abandoned_this_tick = true;
-                changed = true;
+        });
+        if let Some(record) = pending {
+            let latest = parse_record_latest_time(record)?;
+            if now.signed_duration_since(latest).num_seconds() > PENDING_OLD_AFTER_SECS {
                 eprintln!(
-                    "[ck-quota] codex reset journal abandon account_id={} redeem_request_id={}",
-                    account_id, record.redeem_request_id
+                    "[ck-quota] codex reset journal pending-old account_id={} redeem_request_id={} attempt_count={}",
+                    account_id, record.redeem_request_id, record.attempt_count
                 );
             }
         }
-        if changed {
-            self.save(&records)?;
-        }
-        let pending_id = records
-            .iter()
-            .find(|record| {
-                record.account_id == account_id && record.status == JournalStatus::Pending
-            })
-            .map(|record| record.redeem_request_id.clone());
+        let pending_id = pending.map(|record| record.redeem_request_id.clone());
         let spend_bound_allows = !records.iter().any(|record| {
             record.account_id == account_id
                 && record.status == JournalStatus::Resolved
-                && parse_record_time(record).is_ok_and(|created_at| {
-                    let age = now.signed_duration_since(created_at).num_seconds();
-                    age < SPEND_BOUND_SECS
+                && parse_record_latest_time(record).is_ok_and(|latest| {
+                    now.signed_duration_since(latest).num_seconds() < SPEND_BOUND_SECS
                 })
         });
         Ok(AccountJournalState {
             pending_id,
             spend_bound_allows,
-            abandoned_this_tick,
         })
     }
 
@@ -384,9 +382,6 @@ impl RedemptionJournal {
         now: DateTime<Utc>,
     ) -> Result<Reservation, JournalError> {
         let state = self.inspect_account(account_id, now)?;
-        if state.abandoned_this_tick {
-            return Ok(Reservation::Abandoned);
-        }
         if let Some(id) = state.pending_id {
             return Ok(Reservation::ExistingPending(id));
         }
@@ -400,6 +395,8 @@ impl RedemptionJournal {
             account_id: account_id.to_string(),
             redeem_request_id: id.clone(),
             created_at: now.to_rfc3339(),
+            last_attempt_at: None,
+            attempt_count: 0,
             status: JournalStatus::Pending,
             outcome: None,
         });
@@ -408,6 +405,36 @@ impl RedemptionJournal {
             "[ck-quota] codex reset journal reserve account_id={account_id} redeem_request_id={id}"
         );
         Ok(Reservation::New(id))
+    }
+
+    /// Persist attempt metadata immediately before sending a consume POST.
+    pub fn record_attempt(
+        &self,
+        account_id: &str,
+        redeem_request_id: &str,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<(), JournalError> {
+        let mut records = self.load()?;
+        let record = records
+            .iter_mut()
+            .find(|record| {
+                record.account_id == account_id
+                    && record.redeem_request_id == redeem_request_id
+                    && record.status == JournalStatus::Pending
+            })
+            .ok_or_else(|| {
+                JournalError::new(format!(
+                    "pending redemption not found for account {account_id} id {redeem_request_id}"
+                ))
+            })?;
+        record.last_attempt_at = Some(attempted_at.to_rfc3339());
+        record.attempt_count = record.attempt_count.saturating_add(1);
+        let attempt_count = record.attempt_count;
+        self.save(&records)?;
+        eprintln!(
+            "[ck-quota] codex reset journal attempt account_id={account_id} redeem_request_id={redeem_request_id} attempt_count={attempt_count}"
+        );
+        Ok(())
     }
 
     pub fn resolve(
@@ -463,7 +490,7 @@ impl RedemptionJournal {
             JournalError::new(format!("decoding {}: {error}", self.path.display()))
         })?;
         for record in &records {
-            parse_record_time(record)?;
+            parse_record_latest_time(record)?;
         }
         Ok(records)
     }
@@ -498,6 +525,7 @@ impl RedemptionJournal {
                     self.path.display()
                 ))
             })?;
+            sync_parent_directory(parent)?;
             Ok(())
         })();
         if write_result.is_err() {
@@ -507,15 +535,42 @@ impl RedemptionJournal {
     }
 }
 
-fn parse_record_time(record: &RedemptionRecord) -> Result<DateTime<Utc>, JournalError> {
-    DateTime::parse_from_rfc3339(&record.created_at)
-        .map(|value| value.with_timezone(&Utc))
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), JournalError> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| JournalError::new(format!("syncing {}: {error}", parent.display())))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> Result<(), JournalError> {
+    // Windows does not support opening directories for fsync through std::fs.
+    Ok(())
+}
+
+fn parse_record_timestamp(
+    record: &RedemptionRecord,
+    field: &str,
+    value: &str,
+) -> Result<DateTime<Utc>, JournalError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
         .map_err(|error| {
             JournalError::new(format!(
-                "invalid created_at for redemption {}: {error}",
+                "invalid {field} for redemption {}: {error}",
                 record.redeem_request_id
             ))
         })
+}
+
+fn parse_record_latest_time(record: &RedemptionRecord) -> Result<DateTime<Utc>, JournalError> {
+    let created_at = parse_record_timestamp(record, "created_at", &record.created_at)?;
+    let last_attempt_at = record
+        .last_attempt_at
+        .as_deref()
+        .map(|value| parse_record_timestamp(record, "last_attempt_at", value))
+        .transpose()?;
+    Ok(last_attempt_at.map_or(created_at, |attempted_at| attempted_at.max(created_at)))
 }
 
 fn prune_records(
@@ -525,8 +580,8 @@ fn prune_records(
     let before = records.len();
     let mut keep = Vec::with_capacity(before);
     for record in records.drain(..) {
-        let created_at = parse_record_time(&record)?;
-        let age = now.signed_duration_since(created_at).num_seconds();
+        let latest = parse_record_latest_time(&record)?;
+        let age = now.signed_duration_since(latest).num_seconds();
         if record.status == JournalStatus::Resolved && age > RESOLVED_RETENTION_SECS {
             continue;
         }
@@ -727,16 +782,17 @@ pub struct ResetCoordinator {
 }
 
 impl ResetCoordinator {
-    pub fn new(journal: RedemptionJournal) -> Self {
-        Self {
+    pub fn new(journal: RedemptionJournal) -> Result<Self, JournalError> {
+        journal.probe_atomic_write()?;
+        Ok(Self {
             journal,
             journal_io: Mutex::new(()),
             accounts: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn from_env() -> Result<Self, JournalError> {
-        Ok(Self::new(RedemptionJournal::from_env()?))
+        Self::new(RedemptionJournal::from_env()?)
     }
 
     pub fn journal(&self) -> &RedemptionJournal {
@@ -812,7 +868,7 @@ impl ResetCoordinator {
                     .journal_io
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.journal.inspect_account(account_id, input.now)
+                self.journal.inspect_account(account_id, Utc::now())
             };
             let journal_state = match journal_state {
                 Ok(state) => state,
@@ -848,8 +904,7 @@ impl ResetCoordinator {
                 .is_none_or(|last_post_at| last_post_at.elapsed() >= PENDING_RETRY_INTERVAL);
             let may_retry_pending = journal_state.pending_id.is_some()
                 && before_post_cutoff
-                && pending_retry_interval_elapsed
-                && !journal_state.abandoned_this_tick;
+                && pending_retry_interval_elapsed;
             let should_reserve = trigger.fire;
 
             let reservation = if should_reserve || may_retry_pending {
@@ -857,11 +912,9 @@ impl ResetCoordinator {
                     .journal_io
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.journal.reserve(account_id, input.now)
+                self.journal.reserve(account_id, Utc::now())
             } else {
-                Ok(if journal_state.abandoned_this_tick {
-                    Reservation::Abandoned
-                } else if journal_state.pending_id.is_some() {
+                Ok(if journal_state.pending_id.is_some() {
                     Reservation::ExistingPending(journal_state.pending_id.clone().unwrap())
                 } else if !journal_state.spend_bound_allows {
                     Reservation::SpendBound
@@ -897,9 +950,7 @@ impl ResetCoordinator {
                 _ => None,
             };
             let no_post_result = request_id.is_none().then(|| {
-                let pending = reservation_is_pending
-                    || journal_state.pending_id.is_some()
-                    || journal_state.abandoned_this_tick;
+                let pending = reservation_is_pending || journal_state.pending_id.is_some();
                 ResetTickResult {
                     armed: true,
                     relax_eligible: reporting_eligible(true, &input.facts, false, pending, true),
@@ -910,7 +961,21 @@ impl ResetCoordinator {
                     trigger,
                 }
             });
-            if request_id.is_some() {
+            if let Some(request_id) = request_id.as_deref() {
+                let attempt_recorded = {
+                    let _journal_guard = self
+                        .journal_io
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.journal
+                        .record_attempt(account_id, request_id, Utc::now())
+                };
+                if let Err(error) = attempt_recorded {
+                    eprintln!(
+                        "[ck-quota] warning: codex reset attempt record failed for account_id={account_id}: {error}; tick disarmed"
+                    );
+                    return ResetTickResult::disarmed(&input);
+                }
                 account_state.in_flight = true;
                 account_state.last_post_at = Some(Instant::now());
             }

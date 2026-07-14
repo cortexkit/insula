@@ -25,12 +25,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::codex_resets::{
-    normalize_credits, response_now, CreditsSnapshot, ReqwestResetTransport, ResetCoordinator,
-    ResetRequest, ResetTickInput, ResetTransport, UsageFacts,
+    normalize_credits, response_now, CreditsHttpResponse, CreditsSnapshot, ReqwestResetTransport,
+    ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, UsageFacts,
 };
 use crate::config::CodexConfig;
 use crate::provider::AccountObservation;
@@ -85,7 +85,7 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
                 account_id: tokens
                     .account_id
                     .clone()
-                    .filter(|account_id| !account_id.trim().is_empty()),
+                    .filter(|account_id| !account_id.is_empty()),
                 is_oauth: true,
             });
         }
@@ -115,7 +115,7 @@ struct RateLimit {
     primary_window: Option<WindowSnapshot>,
     secondary_window: Option<WindowSnapshot>,
     #[serde(default)]
-    limit_reached: bool,
+    limit_reached: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +148,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexUsageSnapshot {
     pub usage: Usage,
-    pub limit_reached: bool,
+    pub limit_reached: Option<bool>,
 }
 
 /// Normalize a full `/wham/usage` JSON body without relaxing any percentages.
@@ -246,6 +246,31 @@ fn usage_request(url: String, credentials: &CodexCredentials, timeout: Duration)
         request = request.header(Header::new("ChatGPT-Account-Id", account_id.clone()));
     }
     request
+}
+
+pub(crate) fn normalize_credits_tick(
+    response: Result<CreditsHttpResponse, FetchError>,
+    local_now: DateTime<Utc>,
+) -> Result<(CreditsSnapshot, DateTime<Utc>), FetchError> {
+    response.and_then(|response| {
+        let now = response_now(response.date_header.as_deref(), local_now);
+        normalize_credits(&response.body).map(|credits| (credits, now))
+    })
+}
+
+pub(crate) fn unarmed_usage_attempt(
+    observed: Option<AccountObservation>,
+    source: &str,
+    snapshot: CodexUsageSnapshot,
+) -> FetchAttempt {
+    FetchAttempt::success(observed, source, snapshot.usage)
+}
+
+pub(crate) fn reset_trigger_expiry(
+    credits: &CreditsSnapshot,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    credits.earliest_usable_expiry(now)
 }
 
 fn reset_credentials_eligible(config: &CodexConfig, credentials: &CodexCredentials) -> bool {
@@ -372,7 +397,7 @@ impl UsageProvider for CodexProvider {
                 let facts = usage
                     .as_ref()
                     .ok()
-                    .map(|usage| UsageFacts::from_usage(usage, false));
+                    .map(|usage| UsageFacts::from_usage(usage, None));
                 log_reset_tick(facts.as_ref(), None, None, false, false);
             }
             return match usage {
@@ -393,10 +418,7 @@ impl UsageProvider for CodexProvider {
 
         let usage_snapshot = usage_http.and_then(|body| normalize_usage_snapshot(&body));
         let local_now = Utc::now();
-        let credits_snapshot = credits_http.and_then(|response| {
-            let now = response_now(response.date_header.as_deref(), local_now);
-            normalize_credits(&response.body).map(|credits| (credits, now))
-        });
+        let credits_snapshot = normalize_credits_tick(credits_http, local_now);
 
         let usage_snapshot = match usage_snapshot {
             Ok(snapshot) => snapshot,
@@ -415,22 +437,13 @@ impl UsageProvider for CodexProvider {
                     "[ck-quota] warning: codex credits GET failed account_id={account_id}: {error}; tick unarmed"
                 );
                 log_reset_tick(Some(&facts), None, None, false, false);
-                return FetchAttempt::success(observed, source, usage_snapshot.usage);
+                return unarmed_usage_attempt(observed, source, usage_snapshot);
             }
         };
-        if credits.earliest_usable_expiry(now).is_none() {
-            log_reset_tick(
-                Some(&facts),
-                Some(&credits),
-                credits.earliest_available_expiry(),
-                false,
-                false,
-            );
+        let Some(earliest_expiry) = reset_trigger_expiry(&credits, now) else {
+            log_reset_tick(Some(&facts), Some(&credits), None, false, false);
             return FetchAttempt::success(observed, source, usage_snapshot.usage);
-        }
-        let earliest_expiry = credits
-            .earliest_available_expiry()
-            .expect("a usable credit is also available");
+        };
 
         let coordinator = match &self.reset_coordinator {
             Ok(coordinator) => coordinator,
@@ -524,6 +537,22 @@ mod tests {
     }
 
     #[test]
+    fn f7_legacy_whitespace_account_id_is_preserved_but_cannot_arm_resets() {
+        let raw = br#"{
+            "auth_mode": "chatgpt",
+            "tokens": { "access_token": "oauth", "account_id": "   " }
+        }"#;
+        let credentials = parse_credentials(raw).unwrap();
+        assert_eq!(credentials.account_id.as_deref(), Some("   "));
+        assert!(!reset_credentials_eligible(
+            &CodexConfig {
+                auto_use_resets: 60
+            },
+            &credentials
+        ));
+    }
+
+    #[test]
     fn no_session_when_empty() {
         let raw = br#"{ "auth_mode": "chatgpt", "tokens": {} }"#;
         assert!(matches!(
@@ -563,7 +592,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(snapshot.limit_reached);
+        assert_eq!(snapshot.limit_reached, Some(true));
         assert_eq!(snapshot.usage.primary.unwrap().used_percent, 12.0);
     }
 

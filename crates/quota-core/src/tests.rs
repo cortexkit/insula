@@ -106,6 +106,55 @@ impl UsageProvider for BlockingProvider {
     }
 }
 
+struct RelaxThenBlockProvider {
+    calls: AtomicUsize,
+    started: Arc<Notify>,
+    gate: Arc<Notify>,
+}
+
+#[async_trait]
+impl UsageProvider for RelaxThenBlockProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return FetchAttempt::success(None, "test", full_usage(47.0)).with_relax_eligible(true);
+        }
+        self.started.notify_one();
+        self.gate.notified().await;
+        FetchAttempt::success(None, "test", full_usage(99.0))
+    }
+}
+
+#[tokio::test]
+async fn f4_in_flight_refresh_revokes_previous_relaxation() {
+    let started = Arc::new(Notify::new());
+    let gate = Arc::new(Notify::new());
+    let registry = Arc::new(Registry::new(vec![Box::new(RelaxThenBlockProvider {
+        calls: AtomicUsize::new(0),
+        started: Arc::clone(&started),
+        gate: Arc::clone(&gate),
+    })]));
+    tick(&registry).await;
+    assert_eq!(primary_percent(&registry.get_usage(None).await[0]), 0.0);
+
+    force_due(&registry, "codex");
+    let refresh = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.refresh_tick(&CancellationToken::new()).await })
+    };
+    started.notified().await;
+    assert_eq!(
+        primary_percent(&registry.get_usage(None).await[0]),
+        47.0,
+        "the raw stored value must be visible while a newer fetch is in flight"
+    );
+    gate.notify_one();
+    refresh.await.unwrap();
+}
+
 #[tokio::test]
 async fn health_reflects_provider_outcomes() {
     let registry = registry(&[
@@ -1041,6 +1090,7 @@ fn reset_facts(percent: f64, at_wall: bool) -> UsageFacts {
         raw_percents: vec![percent],
         any_used_floor: percent >= 1.0,
         at_wall,
+        wall_clear: !at_wall,
     }
 }
 
@@ -1140,6 +1190,8 @@ impl ResetTransport for MockResetTransport {
                 records.iter().any(|record| {
                     record.redeem_request_id == redeem_request_id
                         && record.status == crate::codex_resets::JournalStatus::Pending
+                        && record.last_attempt_at.is_some()
+                        && record.attempt_count == 1
                 }),
                 Ordering::SeqCst,
             );
@@ -1245,7 +1297,8 @@ async fn restarted_coordinator_reposts_the_same_pending_id_without_a_new_trigger
         Reservation::New(id) => id,
         other => panic!("expected reservation, got {other:?}"),
     };
-    let restarted = ResetCoordinator::new(RedemptionJournal::new(journal.path().to_path_buf()));
+    let restarted =
+        ResetCoordinator::new(RedemptionJournal::new(journal.path().to_path_buf())).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(
         ConsumeOutcome::AlreadyRedeemed,
     ));
@@ -1265,25 +1318,79 @@ async fn restarted_coordinator_reposts_the_same_pending_id_without_a_new_trigger
 }
 
 #[test]
-fn redemption_journal_abandons_old_pending_without_minting_that_tick() {
-    let temp = ResetTempDir::new("abandon");
+fn f2_old_pending_redemption_is_reused_forever() {
+    let temp = ResetTempDir::new("old-pending");
     let now = reset_now();
     let journal = temp.journal();
-    assert!(matches!(
-        journal
-            .reserve("acct", now - chrono::Duration::hours(25))
-            .unwrap(),
-        Reservation::New(_)
-    ));
+    let id = match journal
+        .reserve("acct", now - chrono::Duration::hours(25))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected a new pending id, got {other:?}"),
+    };
 
-    assert_eq!(journal.reserve("acct", now), Ok(Reservation::Abandoned));
+    assert_eq!(
+        journal.reserve("acct", now),
+        Ok(Reservation::ExistingPending(id.clone()))
+    );
     let records = journal.records().unwrap();
-    assert_eq!(records.len(), 1, "abandonment minted a replacement id");
+    assert_eq!(records.len(), 1, "old pending id was replaced");
+    assert_eq!(records[0].redeem_request_id, id);
     assert_eq!(
         records[0].status,
-        crate::codex_resets::JournalStatus::Resolved
+        crate::codex_resets::JournalStatus::Pending
     );
     assert_eq!(records[0].outcome, None);
+}
+
+#[test]
+fn f2_late_pending_attempt_starts_durable_spend_bound() {
+    let temp = ResetTempDir::new("late-pending-bound");
+    let now = reset_now();
+    let journal = temp.journal();
+    let id = match journal
+        .reserve("acct", now - chrono::Duration::hours(1))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected a new pending id, got {other:?}"),
+    };
+    journal.record_attempt("acct", &id, now).unwrap();
+    journal.resolve("acct", &id, ConsumeOutcome::Reset).unwrap();
+
+    let restarted = temp.journal();
+    let bounded = restarted
+        .inspect_account("acct", now + chrono::Duration::minutes(1))
+        .unwrap();
+    assert!(!bounded.spend_bound_allows);
+    let records = restarted.records().unwrap();
+    assert_eq!(records[0].last_attempt_at, Some(now.to_rfc3339()));
+    assert_eq!(records[0].attempt_count, 1);
+    assert_eq!(
+        restarted
+            .reserve("acct", now + chrono::Duration::minutes(1))
+            .unwrap(),
+        Reservation::SpendBound
+    );
+}
+
+#[test]
+fn f2_legacy_journal_records_default_attempt_metadata() {
+    let temp = ResetTempDir::new("legacy-attempt-fields");
+    let journal = temp.journal();
+    std::fs::write(
+        journal.path(),
+        format!(
+            r#"[{{"account_id":"acct","redeem_request_id":"legacy-id","created_at":"{}","status":"pending","outcome":null}}]"#,
+            reset_now().to_rfc3339()
+        ),
+    )
+    .unwrap();
+
+    let records = journal.records().unwrap();
+    assert_eq!(records[0].last_attempt_at, None);
+    assert_eq!(records[0].attempt_count, 0);
 }
 
 #[test]
@@ -1357,7 +1464,7 @@ fn spend_bound_survives_a_journal_restart() {
 async fn pre_post_cutoff_prevents_reservation_and_mutation() {
     let temp = ResetTempDir::new("pre-post-cutoff");
     let journal = temp.journal();
-    let coordinator = ResetCoordinator::new(journal.clone());
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
     let mut input = reset_tick_input(reset_now(), reset_facts(100.0, true));
     input.elapsed_since_attempt_start = crate::codex_resets::PRE_POST_CUTOFF;
@@ -1372,10 +1479,10 @@ async fn pre_post_cutoff_prevents_reservation_and_mutation() {
 }
 
 #[tokio::test]
-async fn redemption_is_reserved_before_the_consume_post() {
+async fn f2_redemption_and_attempt_metadata_are_durable_before_post() {
     let temp = ResetTempDir::new("reserve-before-post");
     let journal = temp.journal();
-    let coordinator = ResetCoordinator::new(journal.clone());
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
         .with_journal(&journal);
     let now = reset_now();
@@ -1402,7 +1509,7 @@ async fn wait_for_mock_post(transport: &MockResetTransport) {
 #[tokio::test]
 async fn overlapping_fetches_for_one_account_send_exactly_one_post() {
     let temp = ResetTempDir::new("overlap-one-account");
-    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()));
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
     let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Block(
         ConsumeOutcome::Reset,
     )));
@@ -1444,7 +1551,7 @@ async fn overlapping_fetches_for_one_account_send_exactly_one_post() {
 #[tokio::test]
 async fn unresolved_post_is_not_retried_again_in_the_same_tick() {
     let temp = ResetTempDir::new("same-tick-pending");
-    let coordinator = ResetCoordinator::new(temp.journal());
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Error);
     let now = reset_now();
 
@@ -1474,7 +1581,7 @@ async fn unresolved_post_is_not_retried_again_in_the_same_tick() {
 #[tokio::test]
 async fn two_handles_resolving_same_account_send_exactly_one_post() {
     let temp = ResetTempDir::new("two-handles-one-account");
-    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()));
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
     let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Block(
         ConsumeOutcome::AlreadyRedeemed,
     )));
@@ -1511,6 +1618,15 @@ async fn two_handles_resolving_same_account_send_exactly_one_post() {
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
 }
 
+fn primary_percent(entry: &ProviderUsage) -> f64 {
+    entry
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.primary.as_ref())
+        .expect("test usage has a primary window")
+        .used_percent
+}
+
 fn full_usage(percent: f64) -> Usage {
     let window = |used_percent: f64, label: &str, minutes| RateWindow {
         used_percent,
@@ -1544,6 +1660,41 @@ impl UsageProvider for RelaxingProvider {
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         FetchAttempt::success(None, "test", self.usage.clone()).with_relax_eligible(self.eligible)
     }
+}
+
+struct LabeledRelaxingProvider;
+
+#[async_trait]
+impl UsageProvider for LabeledRelaxingProvider {
+    fn name(&self) -> &str {
+        "codex-labeled"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(observed(Some("codex-account")), "test", full_usage(38.0))
+            .with_relax_eligible(true)
+    }
+}
+
+#[tokio::test]
+async fn f8_labeled_emission_applies_fresh_relaxation_transform() {
+    let registry = Registry::new(vec![Box::new(LabeledRelaxingProvider)]);
+    tick(&registry).await;
+
+    let served = registry.get_usage(Some("codex-labeled")).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].account.as_deref(), Some("codex-account"));
+    assert_eq!(primary_percent(&served[0]), 0.0);
+    assert_eq!(
+        slot(&registry, "codex-labeled", "implicit-local")
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.usage.as_ref())
+            .and_then(|usage| usage.primary.as_ref())
+            .unwrap()
+            .used_percent,
+        38.0
+    );
 }
 
 #[tokio::test]
@@ -1634,6 +1785,47 @@ impl UsageProvider for DegradingRelaxProvider {
     }
 }
 
+struct TransientlyFailingRelaxProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl UsageProvider for TransientlyFailingRelaxProvider {
+    fn name(&self) -> &str {
+        "codex-stale-transient"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            FetchAttempt::success(None, "test", full_usage(62.0)).with_relax_eligible(true)
+        } else {
+            FetchAttempt::failure(
+                None,
+                Some("test".to_string()),
+                FetchError::Upstream("temporary credits outage".to_string()),
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn f8_stale_transient_success_serves_raw_usage_after_failure() {
+    let registry = Registry::new(vec![Box::new(TransientlyFailingRelaxProvider {
+        calls: AtomicUsize::new(0),
+    })]);
+    tick(&registry).await;
+    assert_eq!(primary_percent(&registry.get_usage(None).await[0]), 0.0);
+
+    force_due(&registry, "codex-stale-transient");
+    tick(&registry).await;
+    let served = registry.get_usage(Some("codex-stale-transient")).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(primary_percent(&served[0]), 62.0);
+    let stale = slot(&registry, "codex-stale-transient", "implicit-local");
+    assert_eq!(stale.status, SlotStatus::StaleTransient);
+    assert!(!stale.relax_eligible);
+}
+
 #[tokio::test]
 async fn degraded_slots_and_other_providers_never_relax() {
     let registry = Registry::new(vec![
@@ -1673,7 +1865,7 @@ async fn degraded_slots_and_other_providers_never_relax() {
 #[tokio::test]
 async fn reporting_gate_keeps_wall_and_mutation_ticks_raw() {
     let temp = ResetTempDir::new("reporting-wall");
-    let coordinator = ResetCoordinator::new(temp.journal());
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
     let now = reset_now();
     let facts = reset_facts(100.0, true);
@@ -1694,7 +1886,7 @@ async fn reporting_gate_keeps_wall_and_mutation_ticks_raw() {
 #[tokio::test]
 async fn below_wall_expiry_mutation_tick_is_raw() {
     let temp = ResetTempDir::new("reporting-mutation");
-    let coordinator = ResetCoordinator::new(temp.journal());
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
     let result = coordinator
         .process_tick(
@@ -1716,7 +1908,7 @@ async fn below_wall_expiry_mutation_tick_is_raw() {
 #[tokio::test]
 async fn nothing_to_reset_storm_stays_raw_and_respects_spend_bound() {
     let temp = ResetTempDir::new("nothing-storm");
-    let coordinator = ResetCoordinator::new(temp.journal());
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport =
         MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::NothingToReset));
     let now = reset_now();
@@ -1747,7 +1939,7 @@ async fn nothing_to_reset_storm_stays_raw_and_respects_spend_bound() {
 #[tokio::test]
 async fn spend_bound_delays_mutation_but_not_below_wall_truth_relaxation() {
     let temp = ResetTempDir::new("bound-not-reporting");
-    let coordinator = ResetCoordinator::new(temp.journal());
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
     let now = reset_now();
     coordinator
@@ -1775,52 +1967,150 @@ async fn spend_bound_delays_mutation_but_not_below_wall_truth_relaxation() {
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn corrupt_journal_disarms_reporting_and_mutation() {
+#[test]
+fn corrupt_journal_prevents_reset_coordinator_construction() {
     let temp = ResetTempDir::new("corrupt-process");
     let journal = temp.journal();
     std::fs::write(journal.path(), b"{").unwrap();
-    let coordinator = ResetCoordinator::new(journal);
-    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
-    let result = coordinator
-        .process_tick(
-            "acct-reset",
-            reset_tick_input(reset_now(), reset_facts(20.0, false)),
-            &transport,
-            &reset_request("token"),
-        )
-        .await;
 
-    assert!(!result.armed);
-    assert!(!result.journal_ok);
-    assert!(!result.relax_eligible);
-    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    assert!(ResetCoordinator::new(journal).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn f5_read_only_journal_parent_disarms_before_reporting_can_relax() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = ResetTempDir::new("read-only-journal");
+    let parent = temp.journal().path().parent().unwrap().to_path_buf();
+    let original = std::fs::metadata(&parent).unwrap().permissions();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = ResetCoordinator::new(temp.journal());
+    std::fs::set_permissions(&parent, original).unwrap();
+
+    assert!(result.is_err());
+}
+
+struct CreditsFailurePathProvider {
+    transport: MockResetTransport,
+}
+
+#[async_trait]
+impl UsageProvider for CreditsFailurePathProvider {
+    fn name(&self) -> &str {
+        "codex-credits-failure"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let usage_snapshot = crate::codex::normalize_usage_snapshot(
+            br#"{"rate_limit":{"primary_window":{"used_percent":73.0},"limit_reached":false}}"#,
+        )
+        .unwrap();
+        let credits = self.transport.fetch_credits(&reset_request("token")).await;
+        match crate::codex::normalize_credits_tick(credits, Utc::now()) {
+            Ok(_) => panic!("the mock credits request unexpectedly armed the provider"),
+            Err(_) => crate::codex::unarmed_usage_attempt(
+                observed(Some("acct-reset")),
+                "oauth",
+                usage_snapshot,
+            ),
+        }
+    }
 }
 
 #[tokio::test]
-async fn credits_get_failure_keeps_raw_percentages() {
-    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
-        .credits_failure();
-    let credits = transport.fetch_credits(&reset_request("token")).await;
-    assert!(credits.is_err());
-
-    let registry = Registry::new(vec![Box::new(RelaxingProvider {
-        name: "codex",
-        eligible: credits.is_ok(),
-        usage: full_usage(73.0),
+async fn f8_credits_get_failure_follows_provider_path_and_keeps_raw_percentages() {
+    let registry = Registry::new(vec![Box::new(CreditsFailurePathProvider {
+        transport: MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+            .credits_failure(),
     })]);
     tick(&registry).await;
     let served = registry.get_usage(None).await;
-    assert_eq!(
-        served[0]
-            .usage
-            .as_ref()
-            .unwrap()
-            .primary
-            .as_ref()
-            .unwrap()
-            .used_percent,
-        73.0
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].account.as_deref(), Some("acct-reset"));
+    assert_eq!(primary_percent(&served[0]), 73.0);
+    assert!(!slot(&registry, "codex-credits-failure", "implicit-local").relax_eligible);
+}
+
+#[tokio::test]
+async fn f6_missing_limit_reached_never_relaxes_even_at_low_usage() {
+    let snapshot = crate::codex::normalize_usage_snapshot(
+        br#"{"rate_limit":{"primary_window":{"used_percent":10.0,"reset_at":1900000000,"limit_window_seconds":3600}}}"#,
+    )
+    .unwrap();
+    assert_eq!(snapshot.limit_reached, None);
+    let facts = UsageFacts::from_usage(&snapshot.usage, snapshot.limit_reached);
+    assert!(!facts.at_wall);
+    assert!(!facts.below_wall());
+
+    let temp = ResetTempDir::new("missing-wall-evidence");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let mut input = reset_tick_input(reset_now(), facts);
+    input.earliest_expiry = Some(input.now + chrono::Duration::days(20));
+    let result = coordinator
+        .process_tick("acct-reset", input, &transport, &reset_request("token"))
+        .await;
+    assert!(!result.relax_eligible);
+    assert!(!result.consume_attempted);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
+    let now = reset_now();
+    let credit = |id: &str, expiry: chrono::DateTime<Utc>| {
+        format!(
+            r#"{{"id":"{id}","reset_type":"codex_rate_limits","status":"available","expires_at":"{}"}}"#,
+            expiry.to_rfc3339()
+        )
+    };
+    let mixed = normalize_credits(
+        format!(
+            r#"{{"credits":[{},{}],"available_count":2}}"#,
+            credit("inside-margin", now + chrono::Duration::seconds(30)),
+            credit("healthy", now + chrono::Duration::days(20))
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mixed_expiry = crate::codex::reset_trigger_expiry(&mixed, now);
+    let mixed_trigger = evaluate_trigger(&TriggerInput {
+        armed: mixed_expiry.is_some(),
+        now,
+        earliest_expiry: mixed_expiry,
+        auto_use_resets_secs: 24 * 60 * 60,
+        any_used_floor: true,
+        at_wall: false,
+        pending: false,
+        spend_bound_allows: true,
+        before_post_cutoff: true,
+    });
+    assert!(!mixed_trigger.expiry_trigger);
+    assert!(!mixed_trigger.fire);
+
+    let near = normalize_credits(
+        format!(
+            r#"{{"credits":[{}],"available_count":1}}"#,
+            credit("healthy-near", now + chrono::Duration::hours(12))
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let near_expiry = crate::codex::reset_trigger_expiry(&near, now);
+    assert!(
+        evaluate_trigger(&TriggerInput {
+            armed: near_expiry.is_some(),
+            now,
+            earliest_expiry: near_expiry,
+            auto_use_resets_secs: 24 * 60 * 60,
+            any_used_floor: true,
+            at_wall: false,
+            pending: false,
+            spend_bound_allows: true,
+            before_post_cutoff: true,
+        })
+        .fire
     );
 }
 
@@ -1860,7 +2150,7 @@ async fn consume_response_codes_http_error_and_timeout_are_fail_closed() {
         ConsumeOutcome::AlreadyRedeemed,
     ] {
         let temp = ResetTempDir::new(outcome.as_code());
-        let coordinator = ResetCoordinator::new(temp.journal());
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
         let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(outcome));
         let result = coordinator
             .process_tick(
@@ -1876,7 +2166,7 @@ async fn consume_response_codes_http_error_and_timeout_are_fail_closed() {
     }
 
     let error_temp = ResetTempDir::new("http-error");
-    let error_coordinator = ResetCoordinator::new(error_temp.journal());
+    let error_coordinator = ResetCoordinator::new(error_temp.journal()).unwrap();
     let error_transport = MockResetTransport::new(MockConsumeBehavior::Error);
     let error_result = error_coordinator
         .process_tick(
@@ -1892,7 +2182,7 @@ async fn consume_response_codes_http_error_and_timeout_are_fail_closed() {
     assert!(!error_result.relax_eligible);
 
     let timeout_temp = ResetTempDir::new("timeout");
-    let timeout_coordinator = ResetCoordinator::new(timeout_temp.journal());
+    let timeout_coordinator = ResetCoordinator::new(timeout_temp.journal()).unwrap();
     let timeout_transport = MockResetTransport::new(MockConsumeBehavior::Hang);
     let timeout_result = timeout_coordinator
         .process_tick_with_timeout(

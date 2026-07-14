@@ -112,16 +112,43 @@ impl Drop for ModuleProcess {
     }
 }
 
-fn spawn_quota_module(subc_connection_file: &Path) -> ModuleProcess {
+fn quota_module_command(subc_connection_file: &Path, test_temp_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ck-quota"));
     command
         .arg("--subc")
         .arg(subc_connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
+        .env("XDG_CONFIG_HOME", test_temp_dir.join("quota-config"))
+        .env("CK_QUOTA_STATE_DIR", test_temp_dir.join("quota-state"))
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
-    let child = command.spawn().expect("spawn quota-module");
+    command
+}
+
+fn spawn_quota_module(subc_connection_file: &Path, test_temp_dir: &Path) -> ModuleProcess {
+    let child = quota_module_command(subc_connection_file, test_temp_dir)
+        .spawn()
+        .expect("spawn quota-module");
     ModuleProcess { child }
+}
+
+#[test]
+fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
+    let temp_dir = Path::new("/isolated-test-rig");
+    let command = quota_module_command(Path::new("/isolated/connection.json"), temp_dir);
+    let env: std::collections::HashMap<_, _> = command
+        .as_std()
+        .get_envs()
+        .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+        .collect();
+    assert_eq!(
+        env.get("XDG_CONFIG_HOME"),
+        Some(&"/isolated-test-rig/quota-config")
+    );
+    assert_eq!(
+        env.get("CK_QUOTA_STATE_DIR"),
+        Some(&"/isolated-test-rig/quota-state")
+    );
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
@@ -145,7 +172,7 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
 /// consumer already bound to the route `(channel, epoch)`.
 async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Route) {
     let daemon = start_daemon().await;
-    let module = spawn_quota_module(&daemon.connection_file_path);
+    let module = spawn_quota_module(&daemon.connection_file_path, &daemon.temp_dir);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = unique_temp_dir("quota-e2e-project");
