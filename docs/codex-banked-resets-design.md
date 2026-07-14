@@ -1,8 +1,10 @@
 # Codex banked resets: auto-consume + relaxed reporting
 
-Status: DRAFT — pending adversarial Oracle pass on the consume-safety path.
-Date: 2026-07-14. Ufuk-approved design shape (one knob, module-local, no ALF
-change); exhaustion backstop explicitly confirmed.
+Status: DESIGN v2 — adversarial Oracle pass folded (8 findings, 4 critical).
+Date: 2026-07-14. Ufuk-approved shape (one knob, module-local, no ALF change;
+exhaustion backstop confirmed). v1 of this note was ruled UNSAFE by the Oracle
+pass; every mechanism below that differs from v1 exists to close a named
+finding (F1..F8).
 
 ## Objective
 
@@ -10,11 +12,18 @@ OpenAI grants Codex accounts banked rate-limit reset credits ("Full reset",
 30-day expiry from grant). Unused credits vanish at `expires_at`. Two wants:
 
 1. Auto-consume a banked reset instead of letting it expire, and instead of
-   ever sitting hard-blocked at the rate limit wall while credits exist.
-2. While the feature is armed and credits are available, report codex windows
-   to the consumer as unused (`usedPercent: 0`) so ALF's pace model relaxes.
-   No ALF-side change: the relaxation is expressed entirely through the
-   existing wire shape.
+   letting the account sit hard-blocked at the rate-limit wall while credits
+   exist.
+2. While the feature is armed and credits are verifiably available, report
+   codex windows to the consumer as unused (`usedPercent: 0`) so ALF's pace
+   model relaxes. No ALF-side change; the relaxation is expressed entirely
+   through the existing wire shape.
+
+The v1 claim "the account can never sit at the wall" is NOT achievable with a
+polling refresher; the honest guarantee is BOUNDED: while armed with credits,
+a wall is detected within one refresh interval and a consume is attempted on
+that same tick, so the account is walled for at most ~2 refresh cycles per
+logical exhaustion event, not for days.
 
 ## Verified contract (live-probed 2026-07-14 + CodexBar v0.43.0 source)
 
@@ -27,23 +36,24 @@ resolution the codex provider already does).
    `rate_limit_reset_credits: { available_count }` (count only, no expiries).
    Live topology note: the 5h window is gone server-side; `primary_window` is
    now the weekly (604800s) and `secondary_window` is null. Our normalizer is
-   already dynamic; no change needed.
+   already dynamic; no change needed for that.
 2. `GET {base}/wham/rate-limit-reset-credits` — per-credit detail
    (CodexOAuthUsageFetcher.swift:347,420-470,562-608; live HTTP 200):
-   `{ credits: [ { id, reset_type: "codex_rate_limits", status: "available" |
-   (redeemed/expired states), granted_at, expires_at, redeem_started_at,
-   redeemed_at, title, description } ], available_count }`. ISO8601 dates.
-   CodexBar sends extra headers `OpenAI-Beta: codex-1`, `originator: Codex
-   Desktop`; live probe with them returns 200. We match CodexBar.
+   `{ credits: [ { id, reset_type: "codex_rate_limits", status, granted_at,
+   expires_at, redeem_started_at, redeemed_at, title, description } ],
+   available_count }`. ISO8601 dates. CodexBar sends `OpenAI-Beta: codex-1`
+   and `originator: Codex Desktop`; we match. Usable credit = status ==
+   "available".
 3. `POST {base}/wham/rate-limit-reset-credits/consume` with JSON body
-   `{ "redeem_request_id": "<uuid4>" }` (gist reference; live-verified by the
-   manual consume on 2026-07-12). Response `{ code, windows_reset }` where
+   `{ "redeem_request_id": "<uuid4>" }`. Response `{ code, windows_reset }`,
    `code ∈ { reset, nothing_to_reset, no_credit, already_redeemed }`.
-   `nothing_to_reset` / `no_credit` do NOT burn a credit. `redeem_request_id`
-   is a retry-idempotency key for one logical redemption.
+   `nothing_to_reset` / `no_credit` do NOT burn a credit. Retrying the SAME
+   `redeem_request_id` is idempotent (`already_redeemed`); requests with
+   DIFFERENT ids are independent redemptions — which is exactly why the
+   journal below reuses ids across crashes (F3).
 
-CodexBar itself only displays credits (no auto-consume anywhere in its
-source); the auto-consume behavior is ours.
+CodexBar only displays credits (no auto-consume in its source); auto-consume
+is our behavior.
 
 ## Config
 
@@ -53,7 +63,7 @@ New file, fleet convention: `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc`
 ```jsonc
 {
   "codex": {
-    // Seconds. 0 (or absent, or missing file) = feature OFF.
+    // Seconds. 0 (or absent, or missing/malformed file) = feature OFF.
     // When > 0: auto-consume a banked reset when the earliest available
     // credit is within this many seconds of its expires_at, or when the
     // account is at its rate limit (exhaustion backstop).
@@ -62,139 +72,199 @@ New file, fleet convention: `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc`
 }
 ```
 
-Plumbing: quota-module reads + parses the file at startup using the shared
-`subc-jsonc` crate (`jsonc_to_json`, same parser subc-core uses for
-subc.jsonc) and injects a plain `QuotaConfig` struct into
-`Registry::with_defaults(config)`. quota-core defines the struct but never
-touches subc crates (preserves the subc-free rule and standalone build).
-Config changes require a module restart (supervised restart is a standard
-fleet op); documented in the file template. Unknown fields ignored
-(forward-compatible). Malformed file = feature off + one stderr warning,
-never a crash (silent-degrade posture).
+Plumbing: quota-module reads + parses the file at startup with the shared
+`subc-jsonc` crate (`jsonc_to_json`, the same parser subc-core uses) and
+injects a plain `QuotaConfig` struct into `Registry::with_defaults(config)`;
+quota-core never touches subc crates. STARTUP-ONLY by design (F8): no
+hot-reload races; a supervised restart applies changes; the effective armed
+state is logged prominently at startup. Malformed file = off + one stderr
+warning. Unknown fields ignored. Value validation: negative or non-numeric =
+off; values are clamped to sane arithmetic (max 30 days).
+
+MULTI-HOST CAVEAT (documented, not solved): the redemption journal is
+per-host. Arming the same OpenAI account on two machines can double-spend
+(each host mints its own request ids). One armed host per account.
+
+## Arming requirements (F2, F5, F7)
+
+The feature ARMS for a given fetch only when ALL hold this tick:
+- `auto_use_resets > 0` (config),
+- the credential is OAuth with a non-empty `account_id` (an API-key fallback
+  has no account identity and cannot be mutation-keyed — never arms),
+- the credits GET succeeded THIS tick,
+- at least one credit has `status == "available"` and its `expires_at` is
+  beyond a safety margin (60s) from now — `now` taken from the credits
+  response `Date` header when present, else local clock (clock-skew hedge;
+  at the credits' 30-day scale only gross skew matters).
+
+Not armed ⇒ no consume and no relaxed reporting; raw truth flows exactly as
+today.
+
+## Redemption journal (F3) — crash-safe idempotency
+
+A tiny durable state file: `$XDG_STATE_HOME/cortexkit/ck-quota/redemptions.json`
+(default `~/.local/state/cortexkit/ck-quota/redemptions.json`), written
+atomically (temp + rename). One record per logical redemption:
+
+```json
+{ "account_id": "...", "redeem_request_id": "<uuid4>",
+  "created_at": "...", "status": "pending" | "resolved",
+  "outcome": "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed" | null }
+```
+
+Rules:
+- The record is written with `status: pending` BEFORE the POST is sent
+  (reserve-then-act). If the process dies between reserve and response, the
+  next attempt for that account REUSES the pending record's id — the server's
+  `already_redeemed` resolves it without a second spend. A NEW id is never
+  minted while a pending record exists for the account.
+- A pending record older than 24h with repeated resolution failures is marked
+  abandoned (logged); abandonment never mints a new id in the same tick.
+- Resolved records double as the durable spend-rate bound (F3/F4): a new
+  redemption for an account is not opened within 30 minutes of the previous
+  record's `created_at` (survives restart, unlike the v1 in-memory cooldown).
+  EXCEPTION: the 30-min bound applies to consume attempts, and deliberately
+  does NOT suppress truth-reporting (see reporting gate) — it can only delay
+  the next spend, never keep a lie alive.
+- Records for an account are pruned once resolved AND older than 7 days
+  (bounded file).
+- Journal I/O failures (unwritable dir, corrupt file) ⇒ the feature DISARMS
+  for that tick (fail-closed: no reserve ⇒ no POST; no arm ⇒ no zeroing) with
+  a stderr warning.
+
+In-process, a per-account mutex map (std Mutex, never held across await;
+entries pruned with the journal) makes reserve-check-act atomic against any
+overlapping fetch for the same account (F2 — the production scheduler is
+sequential per refresh_loop, but nothing structurally prevents overlap and
+`SlotStore::admit` explicitly tolerates it; the reserve is the mutation
+fence, publication fencing alone cannot un-send a POST).
 
 ## Trigger (pure function, unit-tested)
 
-Definitions, evaluated per handle on each refresher fetch with FRESH data
-from the same tick:
+Evaluated per handle per tick, with FRESH same-tick usage + credits:
 
-- `armed` = `auto_use_resets > 0` AND credits fetch succeeded this tick AND
-  at least one credit has `status == "available"`.
 - `expiry_trigger` = earliest available credit's `expires_at - now <=
   auto_use_resets` AND at least one served window has `used_percent >= 1.0`
-  (the floor stops pointless consumes into a fresh window, which the server
-  would refuse as `nothing_to_reset` while the credit marches to expiry
-  anyway — a credit cannot be harvested into an unused window).
+  (a credit cannot be harvested into an unused window — the server would
+  return `nothing_to_reset` and keep the credit while it marches to expiry).
 - `exhaustion_trigger` = `rate_limit.limit_reached == true` OR any served
-  window `used_percent >= 99.0` (belt for lag between the bool and the
-  percents).
-- Fire consume iff `armed && (expiry_trigger || exhaustion_trigger)` AND the
-  handle is not in consume cooldown.
+  window `used_percent >= 99.0`.
+- Fire iff `armed && (expiry_trigger || exhaustion_trigger)` AND no pending
+  journal record for the account AND the 30-min spend bound allows it AND the
+  pre-POST time cutoff allows it (below).
 
-At most ONE consume attempt per handle per tick. No in-tick retry: the next
-tick re-evaluates from fresh state.
+At most one consume attempt per account per tick, enforced by the journal +
+account mutex, not by scheduler assumptions.
 
-## Consume flow (inside the codex provider's fetch_handle)
+## Fetch sequencing per tick (F6)
 
-Sequencing per tick when the feature is configured on:
+1. Resolve credentials (spawn_blocking, as today).
+2. GET usage and GET credits IN PARALLEL (join), timeouts 12s / 8s.
+3. Evaluate trigger.
+4. If firing AND elapsed-since-attempt-start < 20s (pre-POST cutoff):
+   journal-reserve, POST consume (timeout 8s), journal-resolve with the
+   response code. No re-GET after the POST — the next tick (60s) is the
+   verifier. Worst case ≈ 12s + 8s + slack, comfortably inside the 35s
+   FETCH_DEADLINE; a deadline overrun after a landed POST can no longer
+   discard an unresolved redemption, because the journal record survives and
+   the next tick resolves it with the same id.
+5. Return the attempt with RAW usage (never transformed) + the relaxation
+   eligibility flag (below).
 
-1. GET usage (as today).
-2. GET credits.
-3. Evaluate trigger. If it does not fire → step 6.
-4. POST consume with a fresh uuid4 `redeem_request_id`. Stamp the handle's
-   consume-cooldown timestamp regardless of outcome.
-5. Re-GET usage (publish ground truth after a mutation, never guess).
-6. Reporting transform (below), return the FetchAttempt.
+## Reporting: relaxation as a READ-TIME transform (F1, F4, F5)
 
-Timeout budget: the refresher's outer FETCH_DEADLINE is 35s and an overrun
-fail-closes the slot (F1 machinery: identity_unverified). Per-request
-timeouts are tightened to fit worst case under the deadline: usage GET 12s,
-credits GET 5s, consume POST 8s, re-GET 5s = 30s worst case + slack. (The
-usage GET's current 30s timeout shrinks to 12s only when the feature is on;
-unarmed behavior is unchanged at 30s.)
+THE SLOT ALWAYS STORES RAW USAGE. v1's provider-side zeroing is the critical
+flaw the Oracle caught: a transformed 0% entry retained by StaleTransient
+stale-serving would be served indefinitely through outages with no truth left
+to fall back to.
 
-Consume outcome handling:
-- `reset` → success; log windows_reset; re-fetch shows the fresh window.
-- `already_redeemed` → treat as success (a previous attempt with this id won).
-- `nothing_to_reset` / `no_credit` → credit state was stale; no burn; log;
-  cooldown prevents hammering; next tick re-syncs.
-- HTTP error / timeout → log; cooldown; this tick reports TRUE numbers
-  (fail-closed); next tick re-evaluates. If the POST actually landed
-  server-side despite the timeout, the next tick's usage GET shows the fresh
-  window and the trigger is naturally false — the credit is spent and used,
-  not double-spent (a second attempt would use a NEW uuid, but the trigger
-  no longer fires; and if it raced, the server's own `nothing_to_reset`
-  refuses a pointless second reset without burning the credit).
+Mechanism:
+- `FetchAttempt` gains `relax_eligible: bool` (default false — no other
+  provider sets it). It rides into `ProviderSlot`.
+- `Registry::get_usage` zeroes every window's `used_percent` (primary /
+  secondary / tertiary / extra) of an entry ONLY when the slot's
+  `relax_eligible` is set AND the slot is fresh (`is_fresh(now)`, the
+  existing read-time freshness the health path already uses). `resets_at` and
+  `window_minutes` stay real.
+- A stale or degraded slot therefore serves RAW truth (or degrades) — a
+  relaxed 0% can never outlive the freshness horizon of the tick that
+  earned it.
 
-Consume cooldown: 30 minutes per handle, held as provider-internal state
-(`Mutex<HashMap<handle_id, Instant>>` inside CodexProvider — no slot-machinery
-change). Restart loses the cooldown, which is safe: post-restart the first
-tick re-fetches real usage + credits, and a just-consumed reset means a fresh
-window + one fewer credit, so the trigger does not re-fire.
+`relax_eligible` is set by the codex fetch iff ALL hold:
+- armed this tick (all arming requirements above), AND
+- fresh usage is BELOW the wall (`!limit_reached` and every window
+  `used_percent < 99.0`), AND
+- no consume was attempted this tick, AND no pending/unresolved journal
+  record exists for the account.
 
-## Reporting transform (the deliberate relaxation)
+Consequences (deliberate, the honest ones):
+- Mutation ticks report TRUE numbers; relaxation resumes only on the next
+  fresh below-wall observation (~60-120s). The consumer sees reality during
+  the one interval where reality is uncertain.
+- A walled account with a credit reports TRUE (100%) numbers while the
+  consume + verification cycle runs — never 0% at the wall. `nothing_to_reset`
+  loops (server disagreement), `no_credit` surprises, consume timeouts, and
+  the last-credit + instant-re-burn race all collapse into this same rule:
+  truth until a fresh below-wall pair proves otherwise (F4, F5).
+- The v1 "zero while walled, backstop will save us" is gone; the relaxation
+  now NEVER asserts more than the machinery has verified.
 
-When `armed` (fresh successful credits read, >= 1 available) — after any
-consume step — the returned `Usage` has every window's `used_percent` set to
-`0.0`, keeping the REAL `resets_at` and `window_minutes`. Rationale: with the
-exhaustion backstop armed, the account can never sit at the wall while a
-credit exists, so "effectively unused" is the honest pressure signal for the
-pace model. The raw observed percents are logged to stderr each tick
-(`codex[<handle>]: raw primary=49% → reported 0% (resets available: 3)`), so
-observability keeps the truth.
+Fail-closed enumeration (any ⇒ raw truth this read): feature off; not armed
+(incl. API-key credential, credits GET failed, zero available credits,
+expiring-now credits); walled or ≥99% this tick; consume attempted this tick;
+pending journal record; journal I/O failure; slot stale or degraded.
 
-Fail-closed enumeration (any of these ⇒ report TRUE percents this tick):
-- feature off (knob 0/absent/file missing or malformed)
-- credits GET failed this tick (no relaxing on stale credit knowledge)
-- zero available credits
-- usage GET itself failed (normal degraded path, unchanged)
-- consume attempted and errored (report the truth; retry next tick)
+## Observability
 
-The zeroing is provider-local: no model/wire change, no store or scheduler
-change, other providers untouched. Multi-account: credits, trigger, cooldown,
-and transform are all per-handle (each account has its own credits).
+stderr per tick when the feature is on: raw percents, credit count, earliest
+expiry, armed state, relax_eligible, and every journal transition
+(reserve/resolve/abandon) with outcome codes. The truth is always in the log
+even when the wire is relaxed.
 
 ## What we deliberately do NOT do
 
-- No spark / `additional_rate_limits` parsing in this feature (Ufuk ruling;
-  parity lane may add it separately).
-- No `X-OpenAI-Fedramp` header: CodexBar's credits fetcher does not send it;
-  we match CodexBar. (The gist sends it for fedramp accounts; ours are not.)
-- No consume when the trigger does not fire — never "top up" opportunistically.
-- No persistence of consume history beyond the in-memory cooldown.
-- No new wire field (resetCredits count stays module-internal for now).
+- No spark / `additional_rate_limits` parsing here (Ufuk ruling).
+- No `X-OpenAI-Fedramp` header (CodexBar's credits fetcher doesn't send it).
+- No opportunistic consume outside the two triggers.
+- No hot config reload; no cross-host coordination (documented caveat).
+- No new wire field; no model.rs change.
 
 ## Verification plan
 
-- Unit: trigger pure-function truth table (armed/expiry/exhaustion/floor/
-  cooldown), credits JSON normalizer against the live-captured shape,
-  consume-response code handling (all four codes), reporting transform
-  (zeroing + fail-closed cases), config parse (valid/absent/malformed/
-  unknown-fields).
-- Non-vacuous bar: each fail-closed case asserts TRUE percents are served;
-  the double-spend test asserts exactly one POST per tick and cooldown
-  suppression; a `nothing_to_reset` storm test asserts no repeated POSTs
-  within cooldown.
-- Live (gated #[ignore]): credits GET against the real endpoint (read-only).
-  NO live auto-consume test — spending a real credit in CI is not acceptable;
-  the consume path was manually live-verified 2026-07-12 (4→3, weekly 33→0%,
-  code=reset) and the response codes are locked in unit fixtures.
-- e2e: config file with knob on + a mock? No — the e2e rides real providers;
-  keep e2e as-is (feature off in harness), rely on unit coverage for the
-  transform. The skeleton e2e continues to prove the unchanged wire shape.
+Unit (all non-vacuous — each asserts the unsafe behavior is ABSENT):
+- Trigger truth table: armed/unarmed × expiry/exhaustion/floor × pending ×
+  spend-bound × cutoff.
+- Journal: reserve-before-POST ordering; crash-simulation (pending record
+  present at startup ⇒ same id reused, no new id); abandoned handling;
+  prune; corrupt-file ⇒ disarm; 30-min bound enforced across a simulated
+  restart.
+- Double-spend: overlapping fetches for one account (two tasks racing the
+  account mutex) ⇒ exactly one POST; two handles resolving the same
+  account_id ⇒ one POST.
+- Read-time transform: relax_eligible + fresh ⇒ zeroed; relax_eligible +
+  STALE slot ⇒ RAW (the F1 regression); degraded ⇒ raw/error; other
+  providers unaffected.
+- Reporting gate: walled ⇒ raw even with credits; mutation tick ⇒ raw;
+  nothing_to_reset storm ⇒ raw + no POST within spend bound (the F4
+  regression); credits-GET failure ⇒ raw.
+- Consume response handling: all four codes + HTTP error + timeout.
+- Config: valid/absent/malformed/negative/clamp/unknown-fields.
+- codex.rs credits normalizer against the live-captured JSON shape.
+Live (gated #[ignore]): credits GET read-only against the real endpoint.
+NO live auto-consume test — a real credit is not CI ammunition; the consume
+path was manually live-verified 2026-07-12 (4→3, weekly 33→0%, code=reset).
+e2e: unchanged (feature off in harness); the skeleton continues to prove the
+wire shape.
 
-## Open questions for the Oracle pass
+## Build shape
 
-1. Double-spend containment across ticks/restarts — is the
-   trigger-naturally-false argument airtight, or does a race exist where two
-   ticks both see stale "credit available + limit_reached" and fire twice?
-   (Cooldown covers a tick; does anything defeat the cooldown?)
-2. The 100%-report + exhaustion-backstop interaction: is there a reachable
-   state where we report 0% used but the backstop cannot fire (e.g. credits
-   endpoint down while usage fine) for long enough to strand the account at
-   the wall while ALF keeps routing? (Design says credits-GET failure ⇒ true
-   numbers; verify no gap.)
-3. Deadline interaction: consume POST at 8s + slow usage GETs — can the
-   4-request worst case overrun FETCH_DEADLINE and fail-close the slot in a
-   way that discards the consume outcome? Is the tightened budget sufficient?
-4. Multi-handle: two accounts both armed in one tick — any shared-state
-   hazard in the provider-internal cooldown map?
+- `crates/quota-core/src/config.rs` (QuotaConfig struct only, subc-free) +
+  quota-module startup read via subc-jsonc.
+- `crates/quota-core/src/codex_resets.rs`: credits normalizer, trigger pure
+  functions, journal (reserve/resolve/prune), consume client.
+- `codex.rs`: parallel GETs, trigger evaluation, relax_eligible.
+- `provider.rs` + `refresh.rs` + `lib.rs`: thread `relax_eligible`
+  (attempt → slot → read-time transform in get_usage).
+- Oracle impl-pass after build, before merge (same pipeline as the
+  multi-account machinery — its impl pass caught a critical both reviews
+  missed).
