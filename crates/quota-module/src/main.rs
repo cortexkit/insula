@@ -15,7 +15,7 @@
 
 use std::{error::Error, ffi::OsString, fmt, path::PathBuf, sync::Arc};
 
-use quota_core::Registry;
+use quota_core::{config::QuotaConfig, Registry};
 use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
@@ -41,11 +41,18 @@ const DEFAULT_MODULE_ID: &str = "ai-provider-quota";
 const USAGE_GET_OP: &str = "usage.get";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
+const QUOTA_CONFIG_RELATIVE_PATH: &str = "cortexkit/ck-quota.jsonc";
 
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
-    run(config).await
+    let quota_config = load_quota_config();
+    eprintln!(
+        "[ck-quota] codex banked resets armed={} auto_use_resets={}s (startup-only; arm one host per account)",
+        quota_config.codex.is_enabled(),
+        quota_config.codex.auto_use_resets
+    );
+    run(config, quota_config).await
 }
 
 struct ModuleConfig {
@@ -67,13 +74,55 @@ impl ModuleConfig {
     }
 }
 
-async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
+fn quota_config_path() -> Option<PathBuf> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(config_home).join(QUOTA_CONFIG_RELATIVE_PATH));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".config").join(QUOTA_CONFIG_RELATIVE_PATH))
+}
+
+fn parse_quota_config(contents: &str) -> Result<QuotaConfig, String> {
+    let json = subc_jsonc::jsonc_to_json(contents)?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn load_quota_config_file(path: &std::path::Path) -> QuotaConfig {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|error| format!("read failed: {error}"))
+        .and_then(|contents| parse_quota_config(&contents));
+    match parsed {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "[ck-quota] warning: {} unavailable or malformed ({error}); codex banked resets default OFF",
+                path.display()
+            );
+            QuotaConfig::default()
+        }
+    }
+}
+
+fn load_quota_config() -> QuotaConfig {
+    let Some(path) = quota_config_path() else {
+        eprintln!(
+            "[ck-quota] warning: cannot resolve the quota config path; codex banked resets default OFF"
+        );
+        return QuotaConfig::default();
+    };
+    load_quota_config_file(&path)
+}
+
+async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), ModuleError> {
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
-    let registry = Arc::new(Registry::with_defaults());
+    let registry = Arc::new(Registry::with_defaults(quota_config));
 
     // The background refresher owns all provider fetching: the serving path
     // (usage.get) only ever reads the slot store, so route reads never block on
@@ -538,13 +587,49 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_config_path(label: &str) -> PathBuf {
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ck-quota-config-{label}-{}-{id}.jsonc",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn quota_config_accepts_jsonc_and_unknown_fields() {
+        let config = parse_quota_config(
+            r#"{
+                // startup-only reset policy
+                "codex": { "auto_use_resets": 86400, },
+                "future_provider": true,
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.codex.auto_use_resets, 86_400);
+    }
+
+    #[test]
+    fn absent_or_malformed_quota_config_defaults_off() {
+        let absent = temp_config_path("absent");
+        let malformed = temp_config_path("malformed");
+        std::fs::write(&malformed, "{ not-jsonc").unwrap();
+
+        assert_eq!(load_quota_config_file(&absent), QuotaConfig::default());
+        assert_eq!(load_quota_config_file(&malformed), QuotaConfig::default());
+
+        let _ = std::fs::remove_file(malformed);
+    }
 
     /// Drive the REAL channel-0 control handler with a `health.check` Request and
     /// assert it answers with a well-formed `HealthCheck` Response carrying the
     /// domain metrics. Exercises the actual arm + registry + mapper, not a mock.
     #[tokio::test]
     async fn health_check_control_request_returns_domain_report() {
-        let registry = Arc::new(Registry::with_defaults());
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default()));
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
 
         let request = ModuleControlRequest::HealthCheck {};
@@ -602,7 +687,7 @@ mod tests {
     /// The `route.bind` arm still acks unchanged after threading the registry in.
     #[tokio::test]
     async fn route_bind_control_request_still_acks() {
-        let registry = Arc::new(Registry::with_defaults());
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default()));
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
 
         let bind = serde_json::json!({

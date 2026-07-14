@@ -94,6 +94,9 @@ impl SlotStore {
         self.next_attempt_sequence = self.next_attempt_sequence.wrapping_add(1);
         let current = self.slots.get_mut(key)?;
         current.attempt_sequence = sequence;
+        // Admission means the previous relaxation proof is no longer current:
+        // serve its raw usage while the next upstream observation is in flight.
+        current.relax_eligible = false;
         Some((current.clone(), sequence))
     }
 

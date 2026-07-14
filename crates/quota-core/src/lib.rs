@@ -12,6 +12,8 @@ pub mod antigravity;
 pub mod browser_cookies;
 pub mod codebuff;
 pub mod codex;
+pub mod codex_resets;
+pub mod config;
 pub mod copilot;
 pub mod cursor;
 pub mod doubao;
@@ -156,6 +158,30 @@ fn service_rank(status: SlotStatus) -> u8 {
     }
 }
 
+fn relax_usage_for_read(entry: &mut ProviderUsage) {
+    let Some(usage) = entry.usage.as_mut() else {
+        return;
+    };
+    for window in [
+        usage.primary.as_mut(),
+        usage.secondary.as_mut(),
+        usage.tertiary.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        window.used_percent = 0.0;
+    }
+    if let Some(extra) = usage.extra_rate_windows.as_mut() {
+        for window in extra
+            .iter_mut()
+            .filter_map(|extra_window| extra_window.window.as_mut())
+        {
+            window.used_percent = 0.0;
+        }
+    }
+}
+
 /// Provider registry with a cache-only read path and one background refresher.
 pub struct Registry {
     providers: Vec<RegisteredProvider>,
@@ -191,9 +217,9 @@ impl Registry {
         }
     }
     /// The default registry: every provider we support.
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults(config: config::QuotaConfig) -> Self {
         Self::new(vec![
-            Box::new(codex::CodexProvider::new()),
+            Box::new(codex::CodexProvider::new(config.codex)),
             Box::new(anthropic::AnthropicProvider::new()),
             Box::new(antigravity::AntigravityProvider::new()),
             Box::new(codebuff::CodebuffProvider::new()),
@@ -268,6 +294,7 @@ impl Registry {
                 .then_with(|| left.handle.cmp(&right.handle))
         });
 
+        let read_now = Instant::now();
         let mut out = Vec::new();
         for provider in &self.providers {
             let name = provider.name.as_str();
@@ -290,6 +317,9 @@ impl Registry {
                 }
                 if let Some(mut entry) = primary.entry.clone() {
                     entry.account = None;
+                    if primary.relax_eligible && primary.is_fresh(read_now) {
+                        relax_usage_for_read(&mut entry);
+                    }
                     out.push(entry);
                 }
                 continue;
@@ -316,6 +346,9 @@ impl Registry {
             for (account_id, (_, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
+                    if slot.relax_eligible && slot.is_fresh(read_now) {
+                        relax_usage_for_read(&mut entry);
+                    }
                     out.push(entry);
                 }
             }

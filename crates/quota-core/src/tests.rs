@@ -1,16 +1,22 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::model::Usage;
+use crate::codex_resets::{
+    evaluate_trigger, normalize_credits, reporting_eligible, response_now, ConsumeOutcome,
+    CreditsHttpResponse, RedemptionJournal, Reservation, ResetCoordinator, ResetRequest,
+    ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
+};
+use crate::model::{ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, FetchError, HandlesError};
-use crate::refresh::BASE_INTERVAL;
+use crate::refresh::{BASE_INTERVAL, FRESH_HORIZON};
 
 fn handle(id: &str) -> CredentialHandle {
     CredentialHandle::new(id)
@@ -98,6 +104,55 @@ impl UsageProvider for BlockingProvider {
         self.gate.notified().await;
         FetchAttempt::success(None, "test", Usage::default())
     }
+}
+
+struct RelaxThenBlockProvider {
+    calls: AtomicUsize,
+    started: Arc<Notify>,
+    gate: Arc<Notify>,
+}
+
+#[async_trait]
+impl UsageProvider for RelaxThenBlockProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return FetchAttempt::success(None, "test", full_usage(47.0)).with_relax_eligible(true);
+        }
+        self.started.notify_one();
+        self.gate.notified().await;
+        FetchAttempt::success(None, "test", full_usage(99.0))
+    }
+}
+
+#[tokio::test]
+async fn f4_in_flight_refresh_revokes_previous_relaxation() {
+    let started = Arc::new(Notify::new());
+    let gate = Arc::new(Notify::new());
+    let registry = Arc::new(Registry::new(vec![Box::new(RelaxThenBlockProvider {
+        calls: AtomicUsize::new(0),
+        started: Arc::clone(&started),
+        gate: Arc::clone(&gate),
+    })]));
+    tick(&registry).await;
+    assert_eq!(primary_percent(&registry.get_usage(None).await[0]), 0.0);
+
+    force_due(&registry, "codex");
+    let refresh = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.refresh_tick(&CancellationToken::new()).await })
+    };
+    started.notified().await;
+    assert_eq!(
+        primary_percent(&registry.get_usage(None).await[0]),
+        47.0,
+        "the raw stored value must be visible while a newer fetch is in flight"
+    );
+    gate.notify_one();
+    refresh.await.unwrap();
 }
 
 #[tokio::test]
@@ -986,4 +1041,1212 @@ fn adapter_distinguishes_absent_label_from_unavailable_observation() {
     )));
     assert!(attempt.observed.is_some());
     assert_eq!(attempt.observed.unwrap().account_id, None);
+}
+
+static RESET_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+struct ResetTempDir {
+    dir: std::path::PathBuf,
+}
+
+impl ResetTempDir {
+    fn new(label: &str) -> Self {
+        let id = RESET_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ck-quota-reset-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self { dir }
+    }
+
+    fn journal(&self) -> RedemptionJournal {
+        RedemptionJournal::new(self.dir.join("redemptions.json"))
+    }
+}
+
+impl Drop for ResetTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn reset_now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 14, 12, 0, 0)
+        .single()
+        .unwrap()
+}
+
+fn reset_request(bearer: &str) -> ResetRequest {
+    ResetRequest {
+        base_url: "https://example.invalid/backend-api".to_string(),
+        bearer: bearer.to_string(),
+        account_id: "acct-reset".to_string(),
+    }
+}
+
+fn reset_facts(percent: f64, at_wall: bool) -> UsageFacts {
+    UsageFacts {
+        raw_percents: vec![percent],
+        any_used_floor: percent >= 1.0,
+        at_wall,
+        wall_clear: !at_wall,
+    }
+}
+
+fn reset_tick_input(now: chrono::DateTime<Utc>, facts: UsageFacts) -> ResetTickInput {
+    ResetTickInput {
+        armed: true,
+        now,
+        earliest_expiry: Some(now + chrono::Duration::minutes(5)),
+        auto_use_resets_secs: 10 * 60,
+        facts,
+        elapsed_since_attempt_start: Duration::from_secs(1),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MockConsumeBehavior {
+    Outcome(ConsumeOutcome),
+    Error,
+    Hang,
+    Block(ConsumeOutcome),
+}
+
+struct MockResetTransport {
+    behavior: MockConsumeBehavior,
+    posts: AtomicUsize,
+    reservation_visible: AtomicBool,
+    journal_path: Option<std::path::PathBuf>,
+    credits_error: bool,
+    started: Semaphore,
+    release: Semaphore,
+}
+
+impl MockResetTransport {
+    fn new(behavior: MockConsumeBehavior) -> Self {
+        Self {
+            behavior,
+            posts: AtomicUsize::new(0),
+            reservation_visible: AtomicBool::new(false),
+            journal_path: None,
+            credits_error: false,
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+        }
+    }
+
+    fn with_journal(mut self, journal: &RedemptionJournal) -> Self {
+        self.journal_path = Some(journal.path().to_path_buf());
+        self
+    }
+
+    fn credits_failure(mut self) -> Self {
+        self.credits_error = true;
+        self
+    }
+
+    fn body(outcome: ConsumeOutcome) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "code": outcome.as_code(),
+            "windows_reset": ["primary"]
+        }))
+        .unwrap()
+    }
+}
+
+#[async_trait]
+impl ResetTransport for MockResetTransport {
+    async fn fetch_credits(
+        &self,
+        _request: &ResetRequest,
+    ) -> Result<CreditsHttpResponse, FetchError> {
+        if self.credits_error {
+            return Err(FetchError::Upstream("mock credits failure".into()));
+        }
+        Ok(CreditsHttpResponse {
+            body: br#"{
+                "credits": [{
+                    "id": "credit-1",
+                    "status": "available",
+                    "expires_at": "2026-07-15T12:00:00Z"
+                }],
+                "available_count": 1
+            }"#
+            .to_vec(),
+            date_header: Some("Tue, 14 Jul 2026 12:00:00 +0000".to_string()),
+        })
+    }
+
+    async fn consume(
+        &self,
+        _request: &ResetRequest,
+        redeem_request_id: &str,
+    ) -> Result<Vec<u8>, FetchError> {
+        if let Some(path) = &self.journal_path {
+            let records: Vec<crate::codex_resets::RedemptionRecord> =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            self.reservation_visible.store(
+                records.iter().any(|record| {
+                    record.redeem_request_id == redeem_request_id
+                        && record.status == crate::codex_resets::JournalStatus::Pending
+                        && record.last_attempt_at.is_some()
+                        && record.attempt_count == 1
+                }),
+                Ordering::SeqCst,
+            );
+        }
+        self.posts.fetch_add(1, Ordering::SeqCst);
+        self.started.add_permits(1);
+        match self.behavior {
+            MockConsumeBehavior::Outcome(outcome) => Ok(Self::body(outcome)),
+            MockConsumeBehavior::Error => Err(FetchError::Upstream("mock HTTP 503".into())),
+            MockConsumeBehavior::Hang => {
+                std::future::pending::<Result<Vec<u8>, FetchError>>().await
+            }
+            MockConsumeBehavior::Block(outcome) => {
+                let permit = self.release.acquire().await.unwrap();
+                permit.forget();
+                Ok(Self::body(outcome))
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_reset_trigger_truth_table_is_fully_fenced() {
+    let now = reset_now();
+    let base = TriggerInput {
+        armed: true,
+        now,
+        earliest_expiry: Some(now + chrono::Duration::minutes(5)),
+        auto_use_resets_secs: 10 * 60,
+        any_used_floor: true,
+        at_wall: false,
+        pending: false,
+        spend_bound_allows: true,
+        before_post_cutoff: true,
+    };
+    let mut cases = Vec::new();
+    cases.push(("expiry", base.clone(), true));
+
+    let mut unarmed = base.clone();
+    unarmed.armed = false;
+    cases.push(("unarmed", unarmed, false));
+
+    let mut outside_expiry = base.clone();
+    outside_expiry.earliest_expiry = Some(now + chrono::Duration::hours(1));
+    cases.push(("outside-expiry", outside_expiry, false));
+
+    let mut no_floor = base.clone();
+    no_floor.any_used_floor = false;
+    cases.push(("no-used-floor", no_floor, false));
+
+    let mut exhaustion = base.clone();
+    exhaustion.any_used_floor = false;
+    exhaustion.earliest_expiry = None;
+    exhaustion.at_wall = true;
+    cases.push(("exhaustion", exhaustion, true));
+
+    let mut pending = base.clone();
+    pending.pending = true;
+    cases.push(("pending", pending, false));
+
+    let mut spend_bound = base.clone();
+    spend_bound.spend_bound_allows = false;
+    cases.push(("spend-bound", spend_bound, false));
+
+    let mut cutoff = base;
+    cutoff.before_post_cutoff = false;
+    cases.push(("pre-post-cutoff", cutoff, false));
+
+    for (name, input, expected) in cases {
+        assert_eq!(evaluate_trigger(&input).fire, expected, "case {name}");
+    }
+}
+
+#[test]
+fn redemption_journal_reuses_pending_id_after_restart() {
+    let temp = ResetTempDir::new("restart");
+    let now = reset_now();
+    let journal = temp.journal();
+    let id = match journal.reserve("acct", now).unwrap() {
+        Reservation::New(id) => id,
+        other => panic!("expected a new reservation, got {other:?}"),
+    };
+
+    let parsed_id = uuid::Uuid::parse_str(&id).expect("journal id is a UUID");
+    assert_eq!(parsed_id.get_version_num(), 4);
+
+    let restarted = RedemptionJournal::new(journal.path().to_path_buf());
+    assert_eq!(
+        restarted.reserve("acct", now + chrono::Duration::minutes(1)),
+        Ok(Reservation::ExistingPending(id.clone()))
+    );
+    let records = restarted.records().unwrap();
+    assert_eq!(records.len(), 1, "restart must not mint a second id");
+    assert_eq!(records[0].redeem_request_id, id);
+}
+
+#[tokio::test]
+async fn restarted_coordinator_reposts_the_same_pending_id_without_a_new_trigger() {
+    let temp = ResetTempDir::new("restart-repost");
+    let now = reset_now();
+    let journal = temp.journal();
+    let pending_id = match journal.reserve("acct-reset", now).unwrap() {
+        Reservation::New(id) => id,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    let restarted =
+        ResetCoordinator::new(RedemptionJournal::new(journal.path().to_path_buf())).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::AlreadyRedeemed,
+    ));
+    let mut input = reset_tick_input(now + chrono::Duration::minutes(1), reset_facts(0.0, false));
+    input.earliest_expiry = Some(now + chrono::Duration::days(1));
+
+    let result = restarted
+        .process_tick("acct-reset", input, &transport, &reset_request("token"))
+        .await;
+
+    assert!(result.consume_attempted, "pending id was not retried");
+    assert_eq!(result.outcome, Some(ConsumeOutcome::AlreadyRedeemed));
+    let records = journal.records().unwrap();
+    assert_eq!(records.len(), 1, "retry minted a second logical redemption");
+    assert_eq!(records[0].redeem_request_id, pending_id);
+    assert_eq!(records[0].outcome, Some(ConsumeOutcome::AlreadyRedeemed));
+}
+
+#[test]
+fn f2_old_pending_redemption_is_reused_forever() {
+    let temp = ResetTempDir::new("old-pending");
+    let now = reset_now();
+    let journal = temp.journal();
+    let id = match journal
+        .reserve("acct", now - chrono::Duration::hours(25))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected a new pending id, got {other:?}"),
+    };
+
+    assert_eq!(
+        journal.reserve("acct", now),
+        Ok(Reservation::ExistingPending(id.clone()))
+    );
+    let records = journal.records().unwrap();
+    assert_eq!(records.len(), 1, "old pending id was replaced");
+    assert_eq!(records[0].redeem_request_id, id);
+    assert_eq!(
+        records[0].status,
+        crate::codex_resets::JournalStatus::Pending
+    );
+    assert_eq!(records[0].outcome, None);
+}
+
+#[test]
+fn f2_late_pending_attempt_starts_durable_spend_bound() {
+    let temp = ResetTempDir::new("late-pending-bound");
+    let now = reset_now();
+    let journal = temp.journal();
+    let id = match journal
+        .reserve("acct", now - chrono::Duration::hours(1))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected a new pending id, got {other:?}"),
+    };
+    journal.record_attempt("acct", &id, now).unwrap();
+    journal.resolve("acct", &id, ConsumeOutcome::Reset).unwrap();
+
+    let restarted = temp.journal();
+    let bounded = restarted
+        .inspect_account("acct", now + chrono::Duration::minutes(1))
+        .unwrap();
+    assert!(!bounded.spend_bound_allows);
+    let records = restarted.records().unwrap();
+    assert_eq!(records[0].last_attempt_at, Some(now.to_rfc3339()));
+    assert_eq!(records[0].attempt_count, 1);
+    assert_eq!(
+        restarted
+            .reserve("acct", now + chrono::Duration::minutes(1))
+            .unwrap(),
+        Reservation::SpendBound
+    );
+}
+
+#[test]
+fn f2_legacy_journal_records_default_attempt_metadata() {
+    let temp = ResetTempDir::new("legacy-attempt-fields");
+    let journal = temp.journal();
+    std::fs::write(
+        journal.path(),
+        format!(
+            r#"[{{"account_id":"acct","redeem_request_id":"legacy-id","created_at":"{}","status":"pending","outcome":null}}]"#,
+            reset_now().to_rfc3339()
+        ),
+    )
+    .unwrap();
+
+    let records = journal.records().unwrap();
+    assert_eq!(records[0].last_attempt_at, None);
+    assert_eq!(records[0].attempt_count, 0);
+}
+
+#[test]
+fn redemption_journal_prunes_old_resolved_records_only() {
+    let temp = ResetTempDir::new("prune");
+    let now = reset_now();
+    let journal = temp.journal();
+    let old_id = match journal
+        .reserve("old", now - chrono::Duration::days(8))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected old reservation, got {other:?}"),
+    };
+    journal
+        .resolve("old", &old_id, ConsumeOutcome::Reset)
+        .unwrap();
+    let recent_id = match journal
+        .reserve("recent", now - chrono::Duration::days(1))
+        .unwrap()
+    {
+        Reservation::New(id) => id,
+        other => panic!("expected recent reservation, got {other:?}"),
+    };
+    journal
+        .resolve("recent", &recent_id, ConsumeOutcome::NoCredit)
+        .unwrap();
+
+    assert_eq!(journal.prune(now).unwrap(), 1);
+    let records = journal.records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].account_id, "recent");
+}
+
+#[test]
+fn corrupt_redemption_journal_fails_closed() {
+    let temp = ResetTempDir::new("corrupt");
+    let journal = temp.journal();
+    std::fs::write(journal.path(), b"not json").unwrap();
+    assert!(journal.records().is_err());
+    assert!(journal.inspect_account("acct", reset_now()).is_err());
+}
+
+#[test]
+fn spend_bound_survives_a_journal_restart() {
+    let temp = ResetTempDir::new("spend-bound");
+    let now = reset_now();
+    let journal = temp.journal();
+    let id = match journal.reserve("acct", now).unwrap() {
+        Reservation::New(id) => id,
+        other => panic!("expected reservation, got {other:?}"),
+    };
+    journal
+        .resolve("acct", &id, ConsumeOutcome::NothingToReset)
+        .unwrap();
+
+    let restarted = RedemptionJournal::new(journal.path().to_path_buf());
+    assert_eq!(
+        restarted.reserve("acct", now + chrono::Duration::minutes(29)),
+        Ok(Reservation::SpendBound)
+    );
+    assert!(matches!(
+        restarted
+            .reserve("acct", now + chrono::Duration::minutes(31))
+            .unwrap(),
+        Reservation::New(_)
+    ));
+}
+
+#[tokio::test]
+async fn pre_post_cutoff_prevents_reservation_and_mutation() {
+    let temp = ResetTempDir::new("pre-post-cutoff");
+    let journal = temp.journal();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let mut input = reset_tick_input(reset_now(), reset_facts(100.0, true));
+    input.elapsed_since_attempt_start = crate::codex_resets::PRE_POST_CUTOFF;
+
+    let result = coordinator
+        .process_tick("acct-reset", input, &transport, &reset_request("token"))
+        .await;
+
+    assert!(!result.consume_attempted);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    assert!(journal.records().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn f2_redemption_and_attempt_metadata_are_durable_before_post() {
+    let temp = ResetTempDir::new("reserve-before-post");
+    let journal = temp.journal();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+        .with_journal(&journal);
+    let now = reset_now();
+
+    let result = coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            &transport,
+            &reset_request("handle-a"),
+        )
+        .await;
+
+    assert!(result.consume_attempted);
+    assert!(transport.reservation_visible.load(Ordering::SeqCst));
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+async fn wait_for_mock_post(transport: &MockResetTransport) {
+    let permit = transport.started.acquire().await.unwrap();
+    permit.forget();
+}
+
+#[tokio::test]
+async fn overlapping_fetches_for_one_account_send_exactly_one_post() {
+    let temp = ResetTempDir::new("overlap-one-account");
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Block(
+        ConsumeOutcome::Reset,
+    )));
+    let now = reset_now();
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            coordinator
+                .process_tick(
+                    "shared-account",
+                    reset_tick_input(now, reset_facts(100.0, true)),
+                    transport.as_ref(),
+                    &reset_request("same-handle"),
+                )
+                .await
+        })
+    };
+    wait_for_mock_post(&transport).await;
+    let second = coordinator
+        .process_tick(
+            "shared-account",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            transport.as_ref(),
+            &reset_request("same-handle"),
+        )
+        .await;
+
+    assert!(!second.consume_attempted);
+    assert!(second.pending);
+    assert!(!second.relax_eligible);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    transport.release.add_permits(1);
+    assert!(first.await.unwrap().consume_attempted);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unresolved_post_is_not_retried_again_in_the_same_tick() {
+    let temp = ResetTempDir::new("same-tick-pending");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Error);
+    let now = reset_now();
+
+    let first = coordinator
+        .process_tick(
+            "shared-account",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            &transport,
+            &reset_request("handle-a"),
+        )
+        .await;
+    let second = coordinator
+        .process_tick(
+            "shared-account",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            &transport,
+            &reset_request("handle-b"),
+        )
+        .await;
+
+    assert!(first.consume_attempted);
+    assert!(!second.consume_attempted);
+    assert!(second.pending);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn two_handles_resolving_same_account_send_exactly_one_post() {
+    let temp = ResetTempDir::new("two-handles-one-account");
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Block(
+        ConsumeOutcome::AlreadyRedeemed,
+    )));
+    let now = reset_now();
+
+    let handle_a = {
+        let coordinator = Arc::clone(&coordinator);
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            coordinator
+                .process_tick(
+                    "same-account-id",
+                    reset_tick_input(now, reset_facts(99.0, true)),
+                    transport.as_ref(),
+                    &reset_request("handle-a-token"),
+                )
+                .await
+        })
+    };
+    wait_for_mock_post(&transport).await;
+    let handle_b = coordinator
+        .process_tick(
+            "same-account-id",
+            reset_tick_input(now, reset_facts(99.0, true)),
+            transport.as_ref(),
+            &reset_request("handle-b-token"),
+        )
+        .await;
+
+    assert!(!handle_b.consume_attempted);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    transport.release.add_permits(1);
+    handle_a.await.unwrap();
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+fn primary_percent(entry: &ProviderUsage) -> f64 {
+    entry
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.primary.as_ref())
+        .expect("test usage has a primary window")
+        .used_percent
+}
+
+fn full_usage(percent: f64) -> Usage {
+    let window = |used_percent: f64, label: &str, minutes| RateWindow {
+        used_percent,
+        resets_at: Some(format!("2026-07-15T{label}:00Z")),
+        window_minutes: Some(minutes),
+    };
+    Usage {
+        primary: Some(window(percent, "01:00", 300)),
+        secondary: Some(window(percent + 1.0, "02:00", 10_080)),
+        tertiary: Some(window(percent + 2.0, "03:00", 43_200)),
+        extra_rate_windows: Some(vec![ExtraWindow {
+            title: Some("model pool".to_string()),
+            id: Some("model-1".to_string()),
+            window: Some(window(percent + 3.0, "04:00", 60)),
+        }]),
+    }
+}
+
+struct RelaxingProvider {
+    name: &'static str,
+    eligible: bool,
+    usage: Usage,
+}
+
+#[async_trait]
+impl UsageProvider for RelaxingProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(None, "test", self.usage.clone()).with_relax_eligible(self.eligible)
+    }
+}
+
+struct LabeledRelaxingProvider;
+
+#[async_trait]
+impl UsageProvider for LabeledRelaxingProvider {
+    fn name(&self) -> &str {
+        "codex-labeled"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(observed(Some("codex-account")), "test", full_usage(38.0))
+            .with_relax_eligible(true)
+    }
+}
+
+#[tokio::test]
+async fn f8_labeled_emission_applies_fresh_relaxation_transform() {
+    let registry = Registry::new(vec![Box::new(LabeledRelaxingProvider)]);
+    tick(&registry).await;
+
+    let served = registry.get_usage(Some("codex-labeled")).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].account.as_deref(), Some("codex-account"));
+    assert_eq!(primary_percent(&served[0]), 0.0);
+    assert_eq!(
+        slot(&registry, "codex-labeled", "implicit-local")
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.usage.as_ref())
+            .and_then(|usage| usage.primary.as_ref())
+            .unwrap()
+            .used_percent,
+        38.0
+    );
+}
+
+#[tokio::test]
+async fn relaxation_is_read_time_only_and_expires_at_the_freshness_horizon() {
+    let registry = Registry::new(vec![Box::new(RelaxingProvider {
+        name: "codex",
+        eligible: true,
+        usage: full_usage(41.0),
+    })]);
+    tick(&registry).await;
+
+    let stored = slot(&registry, "codex", "implicit-local");
+    let stored_usage = stored.entry.as_ref().unwrap().usage.as_ref().unwrap();
+    assert_eq!(stored_usage.primary.as_ref().unwrap().used_percent, 41.0);
+    assert_eq!(stored_usage.secondary.as_ref().unwrap().used_percent, 42.0);
+    assert_eq!(
+        stored_usage.extra_rate_windows.as_ref().unwrap()[0]
+            .window
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        44.0,
+        "the slot must retain raw truth"
+    );
+
+    let fresh = registry.get_usage(None).await;
+    let fresh_usage = fresh[0].usage.as_ref().unwrap();
+    assert_eq!(fresh_usage.primary.as_ref().unwrap().used_percent, 0.0);
+    assert_eq!(fresh_usage.secondary.as_ref().unwrap().used_percent, 0.0);
+    assert_eq!(fresh_usage.tertiary.as_ref().unwrap().used_percent, 0.0);
+    assert_eq!(
+        fresh_usage.extra_rate_windows.as_ref().unwrap()[0]
+            .window
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        0.0
+    );
+    assert_eq!(
+        fresh_usage.primary.as_ref().unwrap().resets_at,
+        stored_usage.primary.as_ref().unwrap().resets_at
+    );
+    assert_eq!(
+        fresh_usage.primary.as_ref().unwrap().window_minutes,
+        Some(300)
+    );
+
+    let key = SlotKey::new("codex", CredentialHandle::implicit());
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut stale = store.get(&key).unwrap().clone();
+        stale.last_success_at = Some(Instant::now() - FRESH_HORIZON - Duration::from_secs(1));
+        let incarnation = stale.incarnation;
+        let sequence = stale.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, sequence, stale));
+    }
+    let stale = registry.get_usage(None).await;
+    let stale_usage = stale[0].usage.as_ref().unwrap();
+    assert_eq!(stale_usage.primary.as_ref().unwrap().used_percent, 41.0);
+    assert_eq!(stale_usage.secondary.as_ref().unwrap().used_percent, 42.0);
+    assert_eq!(
+        stale_usage.extra_rate_windows.as_ref().unwrap()[0]
+            .window
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        44.0,
+        "a relaxed percentage survived beyond freshness"
+    );
+}
+
+struct DegradingRelaxProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl UsageProvider for DegradingRelaxProvider {
+    fn name(&self) -> &str {
+        "codex-degraded"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            FetchAttempt::success(None, "test", full_usage(55.0)).with_relax_eligible(true)
+        } else {
+            FetchAttempt::failure(None, None, FetchError::NoSession("signed out".to_string()))
+        }
+    }
+}
+
+struct TransientlyFailingRelaxProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl UsageProvider for TransientlyFailingRelaxProvider {
+    fn name(&self) -> &str {
+        "codex-stale-transient"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            FetchAttempt::success(None, "test", full_usage(62.0)).with_relax_eligible(true)
+        } else {
+            FetchAttempt::failure(
+                None,
+                Some("test".to_string()),
+                FetchError::Upstream("temporary credits outage".to_string()),
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn f8_stale_transient_success_serves_raw_usage_after_failure() {
+    let registry = Registry::new(vec![Box::new(TransientlyFailingRelaxProvider {
+        calls: AtomicUsize::new(0),
+    })]);
+    tick(&registry).await;
+    assert_eq!(primary_percent(&registry.get_usage(None).await[0]), 0.0);
+
+    force_due(&registry, "codex-stale-transient");
+    tick(&registry).await;
+    let served = registry.get_usage(Some("codex-stale-transient")).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(primary_percent(&served[0]), 62.0);
+    let stale = slot(&registry, "codex-stale-transient", "implicit-local");
+    assert_eq!(stale.status, SlotStatus::StaleTransient);
+    assert!(!stale.relax_eligible);
+}
+
+#[tokio::test]
+async fn degraded_slots_and_other_providers_never_relax() {
+    let registry = Registry::new(vec![
+        Box::new(DegradingRelaxProvider {
+            calls: AtomicUsize::new(0),
+        }),
+        Box::new(RelaxingProvider {
+            name: "other-provider",
+            eligible: false,
+            usage: full_usage(31.0),
+        }),
+    ]);
+    tick(&registry).await;
+    let initial = registry.get_usage(None).await;
+    assert_eq!(
+        initial[1]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        31.0,
+        "a provider that never opted in was transformed"
+    );
+
+    force_due(&registry, "codex-degraded");
+    tick(&registry).await;
+    let degraded = registry.get_usage(Some("codex-degraded")).await;
+    assert_eq!(degraded.len(), 1);
+    assert!(degraded[0].error.is_some());
+    assert!(degraded[0].usage.is_none());
+    assert!(!slot(&registry, "codex-degraded", "implicit-local").relax_eligible);
+}
+
+#[tokio::test]
+async fn reporting_gate_keeps_wall_and_mutation_ticks_raw() {
+    let temp = ResetTempDir::new("reporting-wall");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let now = reset_now();
+    let facts = reset_facts(100.0, true);
+    let result = coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(now, facts.clone()),
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+
+    assert!(result.consume_attempted);
+    assert!(!result.relax_eligible);
+    assert!(!reporting_eligible(true, &facts, true, false, true));
+}
+
+#[tokio::test]
+async fn below_wall_expiry_mutation_tick_is_raw() {
+    let temp = ResetTempDir::new("reporting-mutation");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let result = coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(reset_now(), reset_facts(20.0, false)),
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+
+    assert!(result.trigger.expiry_trigger);
+    assert!(result.consume_attempted);
+    assert!(
+        !result.relax_eligible,
+        "mutation tick reported relaxed data"
+    );
+}
+
+#[tokio::test]
+async fn nothing_to_reset_storm_stays_raw_and_respects_spend_bound() {
+    let temp = ResetTempDir::new("nothing-storm");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport =
+        MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::NothingToReset));
+    let now = reset_now();
+    let first = coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+    let second = coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(now + chrono::Duration::minutes(1), reset_facts(100.0, true)),
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+
+    assert_eq!(first.outcome, Some(ConsumeOutcome::NothingToReset));
+    assert!(!first.relax_eligible);
+    assert!(!second.consume_attempted);
+    assert!(!second.relax_eligible);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn spend_bound_delays_mutation_but_not_below_wall_truth_relaxation() {
+    let temp = ResetTempDir::new("bound-not-reporting");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let now = reset_now();
+    coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(now, reset_facts(100.0, true)),
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+
+    let mut below_wall =
+        reset_tick_input(now + chrono::Duration::minutes(1), reset_facts(20.0, false));
+    below_wall.earliest_expiry = Some(now + chrono::Duration::days(1));
+    let result = coordinator
+        .process_tick(
+            "acct-reset",
+            below_wall,
+            &transport,
+            &reset_request("token"),
+        )
+        .await;
+    assert!(!result.consume_attempted);
+    assert!(result.relax_eligible);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn corrupt_journal_prevents_reset_coordinator_construction() {
+    let temp = ResetTempDir::new("corrupt-process");
+    let journal = temp.journal();
+    std::fs::write(journal.path(), b"{").unwrap();
+
+    assert!(ResetCoordinator::new(journal).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn f5_read_only_journal_parent_disarms_before_reporting_can_relax() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = ResetTempDir::new("read-only-journal");
+    let parent = temp.journal().path().parent().unwrap().to_path_buf();
+    let original = std::fs::metadata(&parent).unwrap().permissions();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = ResetCoordinator::new(temp.journal());
+    std::fs::set_permissions(&parent, original).unwrap();
+
+    assert!(result.is_err());
+}
+
+struct CreditsFailurePathProvider {
+    transport: MockResetTransport,
+}
+
+#[async_trait]
+impl UsageProvider for CreditsFailurePathProvider {
+    fn name(&self) -> &str {
+        "codex-credits-failure"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let usage_snapshot = crate::codex::normalize_usage_snapshot(
+            br#"{"rate_limit":{"primary_window":{"used_percent":73.0},"limit_reached":false}}"#,
+        )
+        .unwrap();
+        let credits = self.transport.fetch_credits(&reset_request("token")).await;
+        match crate::codex::normalize_credits_tick(credits, Utc::now()) {
+            Ok(_) => panic!("the mock credits request unexpectedly armed the provider"),
+            Err(_) => crate::codex::unarmed_usage_attempt(
+                observed(Some("acct-reset")),
+                "oauth",
+                usage_snapshot,
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn f8_credits_get_failure_follows_provider_path_and_keeps_raw_percentages() {
+    let registry = Registry::new(vec![Box::new(CreditsFailurePathProvider {
+        transport: MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+            .credits_failure(),
+    })]);
+    tick(&registry).await;
+    let served = registry.get_usage(None).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].account.as_deref(), Some("acct-reset"));
+    assert_eq!(primary_percent(&served[0]), 73.0);
+    assert!(!slot(&registry, "codex-credits-failure", "implicit-local").relax_eligible);
+}
+
+#[tokio::test]
+async fn f6_missing_limit_reached_never_relaxes_even_at_low_usage() {
+    let snapshot = crate::codex::normalize_usage_snapshot(
+        br#"{"rate_limit":{"primary_window":{"used_percent":10.0,"reset_at":1900000000,"limit_window_seconds":3600}}}"#,
+    )
+    .unwrap();
+    assert_eq!(snapshot.limit_reached, None);
+    let facts = UsageFacts::from_usage(&snapshot.usage, snapshot.limit_reached);
+    assert!(!facts.at_wall);
+    assert!(!facts.below_wall());
+
+    let temp = ResetTempDir::new("missing-wall-evidence");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let mut input = reset_tick_input(reset_now(), facts);
+    input.earliest_expiry = Some(input.now + chrono::Duration::days(20));
+    let result = coordinator
+        .process_tick("acct-reset", input, &transport, &reset_request("token"))
+        .await;
+    assert!(!result.relax_eligible);
+    assert!(!result.consume_attempted);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
+    let now = reset_now();
+    let credit = |id: &str, expiry: chrono::DateTime<Utc>| {
+        format!(
+            r#"{{"id":"{id}","reset_type":"codex_rate_limits","status":"available","expires_at":"{}"}}"#,
+            expiry.to_rfc3339()
+        )
+    };
+    let mixed = normalize_credits(
+        format!(
+            r#"{{"credits":[{},{}],"available_count":2}}"#,
+            credit("inside-margin", now + chrono::Duration::seconds(30)),
+            credit("healthy", now + chrono::Duration::days(20))
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mixed_expiry = crate::codex::reset_trigger_expiry(&mixed, now);
+    let mixed_trigger = evaluate_trigger(&TriggerInput {
+        armed: mixed_expiry.is_some(),
+        now,
+        earliest_expiry: mixed_expiry,
+        auto_use_resets_secs: 24 * 60 * 60,
+        any_used_floor: true,
+        at_wall: false,
+        pending: false,
+        spend_bound_allows: true,
+        before_post_cutoff: true,
+    });
+    assert!(!mixed_trigger.expiry_trigger);
+    assert!(!mixed_trigger.fire);
+
+    let near = normalize_credits(
+        format!(
+            r#"{{"credits":[{}],"available_count":1}}"#,
+            credit("healthy-near", now + chrono::Duration::hours(12))
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let near_expiry = crate::codex::reset_trigger_expiry(&near, now);
+    assert!(
+        evaluate_trigger(&TriggerInput {
+            armed: near_expiry.is_some(),
+            now,
+            earliest_expiry: near_expiry,
+            auto_use_resets_secs: 24 * 60 * 60,
+            any_used_floor: true,
+            at_wall: false,
+            pending: false,
+            spend_bound_allows: true,
+            before_post_cutoff: true,
+        })
+        .fire
+    );
+}
+
+#[test]
+fn zero_or_expiring_now_credits_cannot_arm() {
+    let now = reset_now();
+    let zero = normalize_credits(br#"{"credits":[],"available_count":0}"#).unwrap();
+    assert_eq!(zero.earliest_usable_expiry(now), None);
+
+    let expiring = normalize_credits(
+        br#"{
+            "credits": [{
+                "id": "credit-soon",
+                "status": "available",
+                "expires_at": "2026-07-14T12:00:30Z"
+            }],
+            "available_count": 1
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(expiring.earliest_usable_expiry(now), None);
+    assert!(!reporting_eligible(
+        false,
+        &reset_facts(20.0, false),
+        false,
+        false,
+        true
+    ));
+}
+
+#[tokio::test]
+async fn consume_response_codes_http_error_and_timeout_are_fail_closed() {
+    for outcome in [
+        ConsumeOutcome::Reset,
+        ConsumeOutcome::NothingToReset,
+        ConsumeOutcome::NoCredit,
+        ConsumeOutcome::AlreadyRedeemed,
+    ] {
+        let temp = ResetTempDir::new(outcome.as_code());
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(outcome));
+        let result = coordinator
+            .process_tick(
+                "acct-reset",
+                reset_tick_input(reset_now(), reset_facts(100.0, true)),
+                &transport,
+                &reset_request("token"),
+            )
+            .await;
+        assert_eq!(result.outcome, Some(outcome));
+        assert!(!result.pending);
+        assert!(!result.relax_eligible);
+    }
+
+    let error_temp = ResetTempDir::new("http-error");
+    let error_coordinator = ResetCoordinator::new(error_temp.journal()).unwrap();
+    let error_transport = MockResetTransport::new(MockConsumeBehavior::Error);
+    let error_result = error_coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(reset_now(), reset_facts(100.0, true)),
+            &error_transport,
+            &reset_request("token"),
+        )
+        .await;
+    assert!(error_result.consume_attempted);
+    assert!(error_result.pending);
+    assert_eq!(error_result.outcome, None);
+    assert!(!error_result.relax_eligible);
+
+    let timeout_temp = ResetTempDir::new("timeout");
+    let timeout_coordinator = ResetCoordinator::new(timeout_temp.journal()).unwrap();
+    let timeout_transport = MockResetTransport::new(MockConsumeBehavior::Hang);
+    let timeout_result = timeout_coordinator
+        .process_tick_with_timeout(
+            "acct-reset",
+            reset_tick_input(reset_now(), reset_facts(100.0, true)),
+            &timeout_transport,
+            &reset_request("token"),
+            Duration::from_millis(10),
+        )
+        .await;
+    assert!(timeout_result.consume_attempted);
+    assert!(timeout_result.pending);
+    assert_eq!(timeout_result.outcome, None);
+    assert!(!timeout_result.relax_eligible);
+}
+
+#[test]
+fn credits_date_header_is_the_arming_clock_when_valid() {
+    let local = Utc.with_ymd_and_hms(2026, 7, 10, 1, 2, 3).single().unwrap();
+    let server = response_now(Some("Tue, 14 Jul 2026 12:00:00 GMT"), local);
+    assert_eq!(server, reset_now());
+    assert_eq!(response_now(Some("not-a-date"), local), local);
+}
+
+#[test]
+fn credits_normalizer_matches_live_captured_contract() {
+    let credits = normalize_credits(
+        br#"{
+            "credits": [
+                {
+                    "id": "rc_01",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-14T12:00:00Z",
+                    "expires_at": "2026-07-14T13:00:01Z",
+                    "redeem_started_at": null,
+                    "redeemed_at": null,
+                    "title": "Full reset",
+                    "description": "Reset Codex rate limits"
+                },
+                {
+                    "id": "rc_02",
+                    "reset_type": "codex_rate_limits",
+                    "status": "redeemed",
+                    "granted_at": "2026-06-01T12:00:00Z",
+                    "expires_at": "2026-07-01T12:00:00Z",
+                    "redeem_started_at": "2026-06-20T12:00:00Z",
+                    "redeemed_at": "2026-06-20T12:00:01Z",
+                    "title": "Full reset",
+                    "description": "Reset Codex rate limits"
+                }
+            ],
+            "available_count": 1
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(credits.reported_available_count, 1);
+    assert_eq!(credits.available.len(), 1);
+    assert_eq!(credits.available[0].id, "rc_01");
+    assert_eq!(
+        credits.available[0].expires_at,
+        Utc.with_ymd_and_hms(2026, 7, 14, 13, 0, 1)
+            .single()
+            .unwrap()
+    );
 }

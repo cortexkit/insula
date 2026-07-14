@@ -103,6 +103,7 @@ async fn start_real_daemon() -> RealDaemon {
 
     let child = Command::new(&subc_core)
         .env("XDG_CONFIG_HOME", rig.join("config"))
+        .env("CK_QUOTA_STATE_DIR", rig.join("quota-state"))
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("SUBC_PORT", "0") // ephemeral port
         .stdout(Stdio::null())
