@@ -69,6 +69,9 @@ async fn start_daemon() -> TestDaemon {
     let connection_file_path = temp_dir.join("subc-conn.json");
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
+        // Declare the wire-v2 envelope so the module's version validation
+        // exercises the same path as a real daemon's connection file.
+        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
         endpoints: vec![Endpoint {
             host: Ipv4Addr::LOCALHOST.to_string(),
             port,
