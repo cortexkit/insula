@@ -40,6 +40,7 @@ pub mod refresh;
 pub mod sakana;
 pub mod stepfun;
 pub mod store;
+pub mod sub2api;
 pub mod synthetic;
 pub mod warp;
 pub mod zai;
@@ -215,6 +216,7 @@ impl Registry {
             Box::new(qoder::QoderProvider::new()),
             Box::new(sakana::SakanaProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
+            Box::new(sub2api::Sub2ApiProvider::new()),
             Box::new(warp::WarpProvider::new()),
             Box::new(synthetic::SyntheticProvider::new()),
             Box::new(zai::ZaiProvider::new()),
