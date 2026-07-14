@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 rusqlite = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }

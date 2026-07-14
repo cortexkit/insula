@@ -9,12 +9,12 @@
 //! Run: `cargo run -p quota-core --example accuracy-dump`
 //! Filter to one provider: `cargo run -p quota-core --example accuracy-dump -- codex`
 
-use quota_core::Registry;
+use quota_core::{config::QuotaConfig, Registry};
 
 #[tokio::main]
 async fn main() {
     let filter = std::env::args().nth(1);
-    let registry = Registry::with_defaults();
+    let registry = Registry::with_defaults(QuotaConfig::default());
     let usage = registry.get_usage(filter.as_deref()).await;
     // Pretty JSON so a human can eyeball it and `jq` can slice it for the diff.
     println!(

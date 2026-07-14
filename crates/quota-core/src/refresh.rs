@@ -80,6 +80,8 @@ pub struct ProviderSlot {
     /// The credential changed but no successful usage belongs to the new label.
     /// Readers suppress the slot until a success closes the transition.
     pub label_in_flux: bool,
+    /// Whether fresh reads may zero the raw percentages stored in `entry`.
+    pub relax_eligible: bool,
     pub last_success_at: Option<Instant>,
     pub last_attempt_at: Option<Instant>,
     pub status: SlotStatus,
@@ -96,6 +98,7 @@ impl ProviderSlot {
             entry: None,
             observation: None,
             label_in_flux: false,
+            relax_eligible: false,
             last_success_at: None,
             last_attempt_at: None,
             status: SlotStatus::Pending,
@@ -216,6 +219,7 @@ fn next_slot_after_attempt_inner(
             entry: None,
             observation: prev.observation.clone(),
             label_in_flux: true,
+            relax_eligible: false,
             last_success_at: None,
             last_attempt_at: Some(attempt_start),
             status: prev.status,
@@ -247,6 +251,7 @@ fn next_slot_after_attempt_inner(
             )),
             observation,
             label_in_flux: false,
+            relax_eligible: attempt.relax_eligible,
             last_success_at: Some(completed),
             last_attempt_at: Some(attempt_start),
             status: SlotStatus::Fresh,
@@ -281,6 +286,7 @@ fn next_slot_after_attempt_inner(
                 entry: if label_in_flux { None } else { entry },
                 observation,
                 label_in_flux,
+                relax_eligible: false,
                 last_success_at: if account_changed {
                     None
                 } else {
@@ -312,6 +318,7 @@ mod tests {
             )),
             source: Some("test".to_string()),
             usage,
+            relax_eligible: false,
         }
     }
 

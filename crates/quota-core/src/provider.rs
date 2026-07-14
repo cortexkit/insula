@@ -89,6 +89,8 @@ pub struct FetchAttempt {
     pub observed: Option<AccountObservation>,
     pub source: Option<String>,
     pub usage: Result<Usage, FetchError>,
+    /// The slot may relax raw percentages only while this success remains fresh.
+    pub relax_eligible: bool,
 }
 
 impl FetchAttempt {
@@ -101,6 +103,7 @@ impl FetchAttempt {
             observed,
             source: Some(source.into()),
             usage: Ok(usage),
+            relax_eligible: false,
         }
     }
 
@@ -113,7 +116,15 @@ impl FetchAttempt {
             observed,
             source,
             usage: Err(error),
+            relax_eligible: false,
         }
+    }
+
+    /// Set read-time relaxation eligibility without changing other providers'
+    /// constructor call sites.
+    pub fn with_relax_eligible(mut self, relax_eligible: bool) -> Self {
+        self.relax_eligible = relax_eligible;
+        self
     }
 
     /// Adapt an existing single-credential provider body while preserving its
@@ -135,6 +146,7 @@ impl FetchAttempt {
                     observed,
                     source,
                     usage,
+                    relax_eligible: false,
                 }
             }
             Err(error) => Self::failure(None, None, error),
