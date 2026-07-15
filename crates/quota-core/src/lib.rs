@@ -226,12 +226,17 @@ impl Registry {
         config: config::QuotaConfig,
         credential_source: Option<Arc<dyn CredentialSource>>,
     ) -> Self {
+        let vault_handle_loader = Arc::new(vault_handles::VaultHandleLoader::from_env());
         let mut registry = Self::new(vec![
-            Box::new(codex::CodexProvider::new(
+            Box::new(codex::CodexProvider::new_with_handle_loader(
                 config.codex,
                 credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
             )),
-            Box::new(anthropic::AnthropicProvider::new()),
+            Box::new(anthropic::AnthropicProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(antigravity::AntigravityProvider::new()),
             Box::new(codebuff::CodebuffProvider::new()),
             Box::new(copilot::CopilotProvider::new()),
@@ -239,8 +244,14 @@ impl Registry {
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
             Box::new(factory::FactoryProvider::new()),
-            Box::new(gemini::GeminiProvider::new()),
-            Box::new(grok::GrokProvider::new()),
+            Box::new(gemini::GeminiProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(grok::GrokProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(jetbrains::JetBrainsProvider::new()),
             Box::new(kimi::KimiProvider::new()),
             Box::new(llmproxy::LlmProxyProvider::new()),
