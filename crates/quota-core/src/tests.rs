@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +20,7 @@ use crate::credential_source::{CredentialSource, VaultCapability, VaultCredentia
 use crate::model::{ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, FetchError, HandlesError};
 use crate::refresh::{BASE_INTERVAL, FRESH_HORIZON};
+use crate::vault_handles::VaultHandleLoader;
 
 fn handle(id: &str) -> CredentialHandle {
     CredentialHandle::new(id)
@@ -329,6 +332,30 @@ async fn unresolved_selection_prefers_fresh_local_over_cold_vault() {
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].source.as_deref(), Some("local-primary"));
     assert!(usage[0].error.is_none());
+}
+
+#[tokio::test]
+async fn i6_pending_local_does_not_hide_degraded_vault_entry() {
+    let registry = Registry::new(vec![Box::new(UnresolvedSelectionProvider)]);
+    tick(&registry).await;
+
+    let local_key = SlotKey::new("selection", CredentialHandle::implicit());
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut local = store.get(&local_key).unwrap().clone();
+        local.entry = None;
+        local.status = refresh::SlotStatus::Pending;
+        assert!(store.publish_if_current(
+            &local_key,
+            local.incarnation,
+            local.attempt_sequence,
+            local,
+        ));
+    }
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert!(usage[0].error.is_some(), "degraded vault entry was hidden");
 }
 
 struct SwapFailureProvider {
@@ -1170,6 +1197,7 @@ enum MockConsumeBehavior {
 struct MockResetTransport {
     behavior: MockConsumeBehavior,
     posts: AtomicUsize,
+    consume_accounts: Mutex<Vec<String>>,
     reservation_visible: AtomicBool,
     journal_path: Option<std::path::PathBuf>,
     credits_error: bool,
@@ -1182,6 +1210,7 @@ impl MockResetTransport {
         Self {
             behavior,
             posts: AtomicUsize::new(0),
+            consume_accounts: Mutex::new(Vec::new()),
             reservation_visible: AtomicBool::new(false),
             journal_path: None,
             credits_error: false,
@@ -1234,7 +1263,7 @@ impl ResetTransport for MockResetTransport {
 
     async fn consume(
         &self,
-        _request: &ResetRequest,
+        request: &ResetRequest,
         redeem_request_id: &str,
     ) -> Result<Vec<u8>, FetchError> {
         if let Some(path) = &self.journal_path {
@@ -1251,6 +1280,10 @@ impl ResetTransport for MockResetTransport {
             );
         }
         self.posts.fetch_add(1, Ordering::SeqCst);
+        self.consume_accounts
+            .lock()
+            .unwrap()
+            .push(request.account_id.clone());
         self.started.add_permits(1);
         match self.behavior {
             MockConsumeBehavior::Outcome(outcome) => Ok(Self::body(outcome)),
@@ -1347,6 +1380,143 @@ fn reset_request_debug_redacts_bearer_and_capability() {
     assert!(!debug.contains("reset-debug-secret"));
     assert!(!debug.contains("ckh_reporting_secret"));
     assert!(debug.contains("redacted"));
+}
+
+struct SameAccountVaultSource {
+    gets: AtomicUsize,
+}
+
+#[async_trait]
+impl CredentialSource for SameAccountVaultSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        assert_eq!(min_ttl_ms, 120_000);
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Ok(VaultCredential {
+            payload: b"real-provider-vault-token".to_vec(),
+            expires_at_ms: None,
+            record_version: 8,
+            account_id: Some("real-provider-account".to_string()),
+            project_id: None,
+        })
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+}
+
+fn write_owner_only_test_file(path: &std::path::Path, body: &[u8]) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).unwrap();
+    std::io::Write::write_all(&mut file, body).unwrap();
+}
+
+#[tokio::test]
+async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
+    let temp = ResetTempDir::new("real-provider-two-unit-one-post");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.lines().any(|line| {
+                line.eq_ignore_ascii_case("chatgpt-account-id: real-provider-account")
+            }));
+            assert!(request.lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer real-provider-local-token")
+                    || line.eq_ignore_ascii_case("authorization: Bearer real-provider-vault-token")
+            }));
+            let body = serde_json::json!({
+                "rate_limit": {
+                    "limit_reached": true,
+                    "primary_window": {
+                        "used_percent": 100.0,
+                        "reset_at": 1_900_000_000_i64,
+                        "limit_window_seconds": 604_800
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"real-provider-local-token","account_id":"real-provider-account"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    let handles_path = temp.dir.join("vault-handles.json");
+    write_owner_only_test_file(
+        &handles_path,
+        br#"{"handles":{"chatgpt:openai":"ckh_real_provider"}}"#,
+    );
+
+    let source = Arc::new(SameAccountVaultSource {
+        gets: AtomicUsize::new(0),
+    });
+    let credential_source: Arc<dyn CredentialSource> = source.clone();
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let provider = crate::codex::CodexProvider::new_for_test(
+        crate::config::CodexConfig {
+            auto_use_resets: 172_800,
+        },
+        Some(credential_source),
+        reset_transport,
+        coordinator,
+        VaultHandleLoader::new(Some(handles_path)),
+        codex_home,
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    http_server.await.unwrap();
+
+    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec!["real-provider-account".to_string()]
+    );
+    let usage = registry.get_usage(Some("codex")).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].account.as_deref(), Some("real-provider-account"));
 }
 
 struct TwoUnitResetProvider {

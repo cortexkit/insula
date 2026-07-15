@@ -728,10 +728,11 @@ impl ResetTransport for ReqwestResetTransport {
         for header in reset_headers(request) {
             http_request = http_request.header(header);
         }
-        let response = http_request.send_raw(&self.http).await?;
-        if !(200..300).contains(&response.status) {
-            return Err(FetchError::ProviderStatus(response.status));
-        }
+        let response = if request.auth_failure.is_some() {
+            http_request.send_codex_status_first(&self.http).await?
+        } else {
+            http_request.send_full(&self.http).await?
+        };
         Ok(CreditsHttpResponse {
             date_header: response.header("Date").map(ToString::to_string),
             body: response.body,
@@ -754,11 +755,14 @@ impl ResetTransport for ReqwestResetTransport {
         for header in reset_headers(request) {
             http_request = http_request.header(header);
         }
-        let response = http_request.send_raw(&self.http).await?;
-        if !(200..300).contains(&response.status) {
-            return Err(FetchError::ProviderStatus(response.status));
+        if request.auth_failure.is_some() {
+            http_request
+                .send_codex_status_first(&self.http)
+                .await
+                .map(|response| response.body)
+        } else {
+            http_request.send(&self.http).await
         }
-        Ok(response.body)
     }
 }
 

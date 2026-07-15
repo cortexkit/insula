@@ -259,6 +259,30 @@ fn transient_io(error: &std::io::Error) -> bool {
 }
 
 fn map_codex_handles(handles: HashMap<String, String>) -> (Vec<CredentialHandle>, Option<String>) {
+    let mut invalid_ids = handles
+        .iter()
+        .filter_map(|(credential_id, capability)| {
+            let invalid_id = credential_id.trim() != credential_id
+                || credential_id.chars().any(char::is_control);
+            let invalid_capability = capability.is_empty()
+                || capability.trim() != capability
+                || !capability.starts_with("ckh_");
+            (invalid_id || invalid_capability).then(|| credential_id.clone())
+        })
+        .collect::<Vec<_>>();
+    if !invalid_ids.is_empty() {
+        invalid_ids.sort();
+        let ids = invalid_ids
+            .iter()
+            .map(|id| id.escape_default().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        return (
+            Vec::new(),
+            Some(format!("rejected invalid vault handle entries [{ids}]")),
+        );
+    }
+
     let mut entries: Vec<_> = handles.into_iter().collect();
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -382,6 +406,20 @@ mod tests {
             .is_empty());
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn i7_surrounding_capability_whitespace_is_authoritative_empty() {
+        let path = write_file(
+            "semantic-invalid",
+            r#"{"handles":{"chatgpt:openai":"  ckh_x "}}"#,
+        );
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        assert!(loader.codex_handles().unwrap().is_empty());
+        let warning = loader.last_warning.lock().unwrap().clone().unwrap();
+        assert!(warning.contains("chatgpt:openai"));
+        assert!(!warning.contains("ckh_x"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

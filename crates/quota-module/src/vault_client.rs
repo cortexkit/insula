@@ -146,10 +146,15 @@ struct ClientState {
     next_connection_generation: AtomicU64,
     next_route_generation: AtomicU64,
     next_corr: AtomicU64,
+    request_timeout: Duration,
 }
 
 impl ClientState {
     fn new(connection_file_path: PathBuf) -> Self {
+        Self::with_timeout(connection_file_path, REQUEST_TIMEOUT)
+    }
+
+    fn with_timeout(connection_file_path: PathBuf, request_timeout: Duration) -> Self {
         Self {
             connection_file_path,
             connection: AsyncMutex::new(ConnectionState::Empty { retry_after: None }),
@@ -158,6 +163,7 @@ impl ClientState {
             next_connection_generation: AtomicU64::new(1),
             next_route_generation: AtomicU64::new(1),
             next_corr: AtomicU64::new(1),
+            request_timeout,
         }
     }
 
@@ -453,7 +459,7 @@ impl ClientState {
             body,
         )
         .map_err(|_| ClientFailure::Protocol)?;
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, self.request(connection, frame))
+        let response = tokio::time::timeout(self.request_timeout, self.request(connection, frame))
             .await
             .map_err(|_| ClientFailure::Transport)??;
         if response.header.ty == FrameType::Error {
@@ -547,7 +553,7 @@ impl ClientState {
     }
 
     async fn call(self: &Arc<Self>, body: Vec<u8>) -> Result<Frame, ClientFailure> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tokio::time::timeout(self.request_timeout, async {
             let mut last = ClientFailure::Transport;
             for attempt in 0..2 {
                 match self.call_once(body.clone()).await {
@@ -605,6 +611,16 @@ impl VaultClient {
             state: Arc::new(ClientState::new(connection_file_path.into())),
         }
     }
+
+    #[cfg(test)]
+    fn with_timeout(connection_file_path: impl Into<PathBuf>, request_timeout: Duration) -> Self {
+        Self {
+            state: Arc::new(ClientState::with_timeout(
+                connection_file_path.into(),
+                request_timeout,
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for VaultClient {
@@ -642,26 +658,20 @@ struct ReportParams<'a> {
 }
 
 #[derive(Deserialize)]
-struct GetResponse {
-    result: GetOutcome,
+struct VaultSuccessResult {
+    payload: Vec<u8>,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+    record_version: u64,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum GetOutcome {
-    Success {
-        payload: Vec<u8>,
-        #[serde(default)]
-        expires_at_ms: Option<i64>,
-        record_version: u64,
-        #[serde(default)]
-        account_id: Option<String>,
-        #[serde(default)]
-        project_id: Option<String>,
-    },
-    AppError {
-        error: VaultReadError,
-    },
+struct VaultErrorResult {
+    error: VaultReadError,
 }
 
 #[derive(Deserialize)]
@@ -681,8 +691,14 @@ fn class_to_error(class: &str) -> VaultGetError {
 
 fn classify_error_frame(body: &[u8]) -> ClientFailure {
     let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
-    if value.get("code").and_then(Value::as_str) == Some("unknown_channel") {
-        return ClientFailure::RouteGone;
+    match value.get("code").and_then(Value::as_str) {
+        Some("unknown_channel" | "unknown_module" | "module_reloading") => {
+            return ClientFailure::RouteGone;
+        }
+        Some("target_unavailable" | "module_timeout" | "backend_error") => {
+            return ClientFailure::Transport;
+        }
+        _ => {}
     }
     value
         .get("class")
@@ -694,27 +710,45 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
 }
 
 fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
-    let response: GetResponse =
-        serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
-    match response.result {
-        GetOutcome::Success {
-            payload,
-            expires_at_ms,
-            record_version,
-            account_id,
-            project_id,
-        } => Ok(VaultCredential {
-            payload,
-            expires_at_ms,
-            record_version,
-            account_id: account_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            project_id: project_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-        }),
-        GetOutcome::AppError { error } => Err(class_to_error(&error.class)),
+    let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or(VaultGetError::FailClosed)?;
+    let has_error = result.contains_key("error");
+    let has_success = [
+        "payload",
+        "expires_at_ms",
+        "record_version",
+        "account_id",
+        "project_id",
+    ]
+    .iter()
+    .any(|field| result.contains_key(*field));
+    match (has_success, has_error) {
+        (true, false) => {
+            let success: VaultSuccessResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Ok(VaultCredential {
+                payload: success.payload,
+                expires_at_ms: success.expires_at_ms,
+                record_version: success.record_version,
+                account_id: success
+                    .account_id
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                project_id: success
+                    .project_id
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            })
+        }
+        (false, true) => {
+            let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Err(class_to_error(&failure.error.class))
+        }
+        (true, true) | (false, false) => Err(VaultGetError::FailClosed),
     }
 }
 
@@ -786,6 +820,96 @@ impl CredentialSource for VaultClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    async fn loopback_listener(label: &str) -> (TcpListener, PathBuf, Vec<u8>, [u8; 16]) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let key = vec![0x5a; 32];
+        let daemon_id = [0x31; 16];
+        let path = std::env::temp_dir().join(format!(
+            "ck-quota-vault-client-{label}-{}-{}.json",
+            std::process::id(),
+            NEXT_LOOPBACK_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        connection_file::write_atomic(
+            &path,
+            &connection_file::ConnectionInfo {
+                schema: connection_file::SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![connection_file::Endpoint {
+                    host: std::net::Ipv4Addr::LOCALHOST.to_string(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: key.clone(),
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "vault-loopback-test".to_string(),
+            },
+        )
+        .unwrap();
+        (listener, path, key, daemon_id)
+    }
+
+    static NEXT_LOOPBACK_ID: AtomicU64 = AtomicU64::new(0);
+
+    async fn accept_authenticated(
+        listener: &TcpListener,
+        key: &[u8],
+        daemon_id: &[u8; 16],
+    ) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        subc_transport::authenticate_server(
+            &mut stream,
+            key,
+            daemon_id,
+            "vault-loopback-test",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        stream
+    }
+
+    async fn reply_route(stream: &mut TcpStream, channel: u16, epoch: u32) {
+        let request = read_frame(stream).await.unwrap().unwrap();
+        assert_eq!(request.header.ty, FrameType::Request);
+        assert_eq!(request.header.channel, 0);
+        let response = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            request.header.corr,
+            serde_json::to_vec(&serde_json::json!({
+                "route_channel": channel,
+                "route_epoch": epoch
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_frame(stream, &response).await.unwrap();
+    }
+
+    fn get_success(request: &Frame, payload: &[u8]) -> Frame {
+        Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&serde_json::json!({
+                "result": {
+                    "payload": payload,
+                    "record_version": 1,
+                    "account_id": "loopback-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn class_mapping_is_exhaustive_and_unknown_fails_closed() {
@@ -797,6 +921,143 @@ mod tests {
             VaultGetError::FailClosed
         );
         assert_eq!(class_to_error("future_class"), VaultGetError::FailClosed);
+    }
+
+    #[test]
+    fn i1_mixed_success_and_error_result_fails_closed() {
+        let body = serde_json::json!({
+            "result": {
+                "payload": b"must-not-be-served",
+                "record_version": 12,
+                "error": {"code": "needs_reauth", "class": "auth_required"}
+            }
+        });
+        assert_eq!(
+            decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            VaultGetError::FailClosed
+        );
+    }
+
+    #[test]
+    fn i3_module_reloading_is_transient_route_availability() {
+        for code in [
+            "unknown_module",
+            "target_unavailable",
+            "module_reloading",
+            "module_timeout",
+            "backend_error",
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "code": code,
+                "message": "module is temporarily unavailable"
+            }))
+            .unwrap();
+            assert_eq!(
+                classify_error_frame(&body).vault_error(),
+                VaultGetError::Transient,
+                "availability code {code} became fail-closed"
+            );
+        }
+        let unknown = serde_json::to_vec(&serde_json::json!({
+            "code": "future_authorization_error",
+            "message": "not an availability class"
+        }))
+        .unwrap();
+        assert_eq!(
+            classify_error_frame(&unknown).vault_error(),
+            VaultGetError::FailClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn i9_public_client_timeout_deregisters_and_discards_late_response() {
+        let (listener, path, key, daemon_id) = loopback_listener("timeout").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            reply_route(&mut stream, 7, 3).await;
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = write_frame(&mut stream, &get_success(&request, b"late-token")).await;
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_millis(30));
+
+        let result = client
+            .get(&VaultCapability::new("ckh_timeout"), 120_000)
+            .await;
+        assert_eq!(result.unwrap_err(), VaultGetError::Transient);
+        assert!(client.state.pending.lock().unwrap().is_empty());
+        server.await.unwrap();
+        assert!(client.state.pending.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn i9_public_client_connection_death_completes_waiters() {
+        let (listener, path, key, daemon_id) = loopback_listener("connection-death").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            reply_route(&mut stream, 7, 3).await;
+            let _ = read_frame(&mut stream).await;
+            drop(stream);
+            drop(listener);
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_millis(200));
+        let first_capability = VaultCapability::new("ckh_dead_one");
+        let second_capability = VaultCapability::new("ckh_dead_two");
+        let first = client.get(&first_capability, 120_000);
+        let second = client.get(&second_capability, 120_000);
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("connection-death waiters hung");
+        assert_eq!(first.unwrap_err(), VaultGetError::Transient);
+        assert_eq!(second.unwrap_err(), VaultGetError::Transient);
+        assert!(client.state.pending.lock().unwrap().is_empty());
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn i9_public_client_unknown_channel_reopens_route_on_same_connection() {
+        let (listener, path, key, daemon_id) = loopback_listener("route-reopen").await;
+        let accepts = Arc::new(AtomicU64::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            server_accepts.fetch_add(1, Ordering::Relaxed);
+            reply_route(&mut stream, 7, 3).await;
+            let first = read_frame(&mut stream).await.unwrap().unwrap();
+            let route_error = Frame::build(
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                first.header.channel,
+                first.header.epoch,
+                first.header.corr,
+                serde_json::to_vec(&subc_protocol::ErrorBody {
+                    code: "unknown_channel".to_string(),
+                    message: "route expired".to_string(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &route_error).await.unwrap();
+            reply_route(&mut stream, 8, 4).await;
+            let second = read_frame(&mut stream).await.unwrap().unwrap();
+            write_frame(&mut stream, &get_success(&second, b"recovered-token"))
+                .await
+                .unwrap();
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_millis(500));
+
+        let credential = client
+            .get(&VaultCapability::new("ckh_route"), 120_000)
+            .await
+            .unwrap();
+        assert_eq!(credential.payload, b"recovered-token");
+        server.await.unwrap();
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

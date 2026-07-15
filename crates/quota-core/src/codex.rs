@@ -157,14 +157,6 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
                     .and_then(|auth| auth.get("chatgpt_account_id"))
                     .and_then(serde_json::Value::as_str)
             })
-            .or_else(|| {
-                claims
-                    .get("organizations")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|organizations| organizations.first())
-                    .and_then(|organization| organization.get("id"))
-                    .and_then(serde_json::Value::as_str)
-            })
             .map(ToString::to_string),
     )
 }
@@ -400,12 +392,15 @@ fn usage_request(url: String, credentials: &CodexCredentials, timeout: Duration)
 async fn send_codex_request(
     request: JsonRequest,
     client: &reqwest::Client,
+    preserve_provider_status: bool,
 ) -> Result<Vec<u8>, FetchError> {
-    let response = request.send_raw(client).await?;
-    if (200..300).contains(&response.status) {
-        Ok(response.body)
+    if preserve_provider_status {
+        request
+            .send_codex_status_first(client)
+            .await
+            .map(|response| response.body)
     } else {
-        Err(FetchError::ProviderStatus(response.status))
+        request.send(client).await
     }
 }
 
@@ -472,6 +467,7 @@ pub struct CodexProvider {
     reset_coordinator: Result<Arc<ResetCoordinator>, String>,
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: VaultHandleLoader,
+    codex_home_override: Option<PathBuf>,
 }
 
 impl CodexProvider {
@@ -494,7 +490,32 @@ impl CodexProvider {
             reset_coordinator,
             credential_source,
             handle_loader: VaultHandleLoader::from_env(),
+            codex_home_override: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        reset_config: CodexConfig,
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        reset_transport: Arc<dyn ResetTransport>,
+        reset_coordinator: Arc<ResetCoordinator>,
+        handle_loader: VaultHandleLoader,
+        codex_home_override: PathBuf,
+    ) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            reset_config,
+            reset_transport,
+            reset_coordinator: Ok(reset_coordinator),
+            credential_source,
+            handle_loader,
+            codex_home_override: Some(codex_home_override),
+        }
+    }
+
+    fn resolved_codex_home(&self) -> Option<PathBuf> {
+        self.codex_home_override.clone().or_else(codex_home)
     }
 
     fn report_auth_failure(&self, context: &ServedCodexContext, error: &FetchError) {
@@ -527,6 +548,7 @@ impl CodexProvider {
         let observed = Some(context.observation());
         let source = context.source;
         let credentials = context.credentials();
+        let preserve_provider_status = context.capability.is_some();
         let usage_url = resolve_usage_url(config_toml.as_deref());
 
         let Some(account_id) = context
@@ -537,6 +559,7 @@ impl CodexProvider {
             let usage = send_codex_request(
                 usage_request(usage_url, &credentials, REQUEST_TIMEOUT),
                 &self.http,
+                preserve_provider_status,
             )
             .await
             .and_then(|body| normalize_usage(&body));
@@ -579,6 +602,7 @@ impl CodexProvider {
         let usage_future = send_codex_request(
             usage_request(usage_url, &credentials, ARMED_USAGE_TIMEOUT),
             &self.http,
+            preserve_provider_status,
         );
         let credits_future = self.reset_transport.fetch_credits(&reset_request);
         let (usage_http, credits_http) = tokio::join!(usage_future, credits_future);
@@ -681,6 +705,7 @@ impl UsageProvider for CodexProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let attempt_started = Instant::now();
+        let codex_home = self.resolved_codex_home();
         match handle.vault_capability() {
             Some(capability) => {
                 let Some(credential_source) = self.credential_source.as_ref() else {
@@ -702,8 +727,8 @@ impl UsageProvider for CodexProvider {
                         return FetchAttempt::failure(fallback_observation, None, error);
                     }
                 };
-                let config_toml = tokio::task::spawn_blocking(|| {
-                    codex_home()
+                let config_toml = tokio::task::spawn_blocking(move || {
+                    codex_home
                         .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
                 })
                 .await
@@ -712,8 +737,8 @@ impl UsageProvider for CodexProvider {
                     .await
             }
             None => {
-                let resolved = tokio::task::spawn_blocking(|| {
-                    let home = codex_home().ok_or_else(|| {
+                let resolved = tokio::task::spawn_blocking(move || {
+                    let home = codex_home.ok_or_else(|| {
                         FetchError::NoSession(
                             "cannot resolve CODEX_HOME or $HOME/.codex".to_string(),
                         )
@@ -759,6 +784,8 @@ impl UsageProvider for CodexProvider {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     struct ReportingSource {
         reports: Arc<Mutex<Vec<(u16, u64)>>>,
@@ -785,6 +812,101 @@ mod tests {
                 .unwrap()
                 .push((provider_status, record_version));
         }
+    }
+
+    async fn serve_one_raw_response(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(&response).await.unwrap();
+        });
+        format!("http://{address}/backend-api")
+    }
+
+    fn context_config(base_url: &str) -> Option<String> {
+        Some(format!("chatgpt_base_url = {base_url:?}\n"))
+    }
+
+    #[tokio::test]
+    async fn i2_local_401_keeps_legacy_error_while_vault_preserves_status() {
+        let response =
+            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let local_url = serve_one_raw_response(response.to_vec()).await;
+        let provider = CodexProvider::default();
+        let local = provider
+            .fetch_context(
+                ServedCodexContext::local(CodexCredentials {
+                    bearer: "local-secret".to_string(),
+                    account_id: None,
+                    is_oauth: true,
+                }),
+                context_config(&local_url),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(
+            local.usage,
+            Err(FetchError::Unauthorized(message)) if message.starts_with("HTTP 401")
+        ));
+
+        let vault_url = serve_one_raw_response(response.to_vec()).await;
+        let vault = provider
+            .fetch_context(
+                ServedCodexContext {
+                    bearer: "vault-secret".to_string(),
+                    canonical_account_id: None,
+                    record_version: Some(4),
+                    capability: Some(VaultCapability::new("ckh_test")),
+                    is_oauth: true,
+                    source: "vault",
+                },
+                context_config(&vault_url),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(vault.usage, Err(FetchError::ProviderStatus(401))));
+    }
+
+    #[tokio::test]
+    async fn i4_truncated_401_preserves_status_and_reports_auth_failure() {
+        let response =
+            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 100\r\nconnection: close\r\n\r\nshort";
+        let base_url = serve_one_raw_response(response.to_vec()).await;
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn CredentialSource> = Arc::new(ReportingSource {
+            reports: Arc::clone(&reports),
+        });
+        let provider = CodexProvider::new(CodexConfig::default(), Some(source));
+        let attempt = provider
+            .fetch_context(
+                ServedCodexContext {
+                    bearer: "vault-secret".to_string(),
+                    canonical_account_id: None,
+                    record_version: Some(44),
+                    capability: Some(VaultCapability::new("ckh_truncated")),
+                    is_oauth: true,
+                    source: "vault",
+                },
+                context_config(&base_url),
+                Instant::now(),
+            )
+            .await;
+        assert!(matches!(
+            attempt.usage,
+            Err(FetchError::ProviderStatus(401))
+        ));
+        for _ in 0..20 {
+            if !reports.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
     }
 
     #[test]
@@ -829,6 +951,14 @@ mod tests {
         assert_eq!(context.canonical_account_id.as_deref(), Some("jwt-account"));
         assert_eq!(context.observation().record_version, Some(17));
         assert!(!format!("{context:?}").contains("ckh_context_secret"));
+    }
+
+    #[test]
+    fn i5_organization_claim_is_not_an_account_identity() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"organizations":[{"id":"shared-org"}]}"#);
+        let token = format!("header.{payload}.signature");
+        assert_eq!(chatgpt_account_id(&token), None);
     }
 
     #[tokio::test]

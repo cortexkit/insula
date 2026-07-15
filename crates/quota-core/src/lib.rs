@@ -337,10 +337,11 @@ impl Registry {
                             let healthy = slot.entry.as_ref().is_some_and(|entry| {
                                 entry.error.is_none() && entry.usage.is_some()
                             });
-                            match (healthy, slot.is_fresh(read_now)) {
-                                (true, true) => 0u8,
-                                (true, false) => 1,
-                                (false, _) => 2,
+                            match (healthy, slot.is_fresh(read_now), slot.entry.is_some()) {
+                                (true, true, _) => 0u8,
+                                (true, false, _) => 1,
+                                (false, _, true) => 2,
+                                (false, _, false) => 3,
                             }
                         };
                         rank(left_slot)

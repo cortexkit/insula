@@ -307,11 +307,24 @@ async fn start_usage_http_stub() -> UsageHttpStub {
                     return;
                 };
                 let request = String::from_utf8_lossy(&request[..size]);
-                let account = request.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("chatgpt-account-id")
-                        .then(|| value.trim())
-                });
+                let header = |wanted: &str| {
+                    request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+                    })
+                };
+                let account = header("chatgpt-account-id");
+                let authorization = header("authorization");
+                assert!(
+                    matches!(
+                        (account, authorization),
+                        (
+                            Some("account-primary"),
+                            Some("Bearer local-token" | "Bearer vault-token-primary")
+                        ) | (Some("account-second"), Some("Bearer vault-token-second"))
+                    ),
+                    "bearer/account headers must come from one served context"
+                );
                 let used_percent = match account {
                     Some("account-second") => 62,
                     _ => 21,
@@ -500,7 +513,7 @@ async fn skeleton_round_trips_usage_get_over_the_wire() {
 }
 
 #[tokio::test]
-async fn vault_stub_serves_two_codex_accounts_then_fails_closed() {
+async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
     let daemon = start_daemon().await;
     let usage_stub = start_usage_http_stub().await;
     let mut vault_stub = start_vault_stub(&daemon.connection_file_path).await;
@@ -545,6 +558,14 @@ async fn vault_stub_serves_two_codex_accounts_then_fails_closed() {
             .collect::<Vec<_>>();
         codex_accounts.sort_unstable();
         if codex_accounts == ["account-primary", "account-second"] {
+            let used_percent = |account: &str| {
+                result
+                    .iter()
+                    .find(|entry| entry["provider"] == "codex" && entry["account"] == account)
+                    .and_then(|entry| entry["usage"]["primary"]["usedPercent"].as_f64())
+            };
+            assert_eq!(used_percent("account-primary"), Some(21.0));
+            assert_eq!(used_percent("account-second"), Some(62.0));
             break result;
         }
         assert!(
@@ -562,12 +583,8 @@ async fn vault_stub_serves_two_codex_accounts_then_fails_closed() {
         .expect("at least one non-codex provider should complete in the same sweep");
 
     vault_stub.stop();
-    write_owner_only(
-        &handles_path,
-        br#"{"handles":{"chatgpt:openai":"ckh_rotated_primary","chatgpt:openai:gmail":"ckh_rotated_second"}}"#,
-    );
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(80);
     loop {
         corr += 1;
         let response = usage_get(&mut consumer, route, corr).await;
@@ -577,9 +594,12 @@ async fn vault_stub_serves_two_codex_accounts_then_fails_closed() {
             .filter(|entry| entry["provider"] == "codex")
             .collect::<Vec<_>>();
         let failed_closed = codex.len() == 1
-            && codex[0]["account"].is_null()
+            && codex[0]["account"] == "account-primary"
             && codex[0]["error"].is_null()
-            && codex[0]["usage"].is_object();
+            && codex[0]["usage"]["primary"]["usedPercent"] == 21.0
+            && !result
+                .iter()
+                .any(|entry| entry["provider"] == "codex" && entry["account"] == "account-second");
         if failed_closed {
             assert!(
                 result
@@ -593,7 +613,7 @@ async fn vault_stub_serves_two_codex_accounts_then_fails_closed() {
             Instant::now() < deadline,
             "vault labels were stale-served after the stub died: {result:?}"
         );
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(250)).await;
     }
 }
 
