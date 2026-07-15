@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use crate::model::ProviderUsage;
-use crate::provider::{AccountObservation, FetchAttempt, FetchError};
+use crate::provider::{AccountObservation, CredentialResolution, FetchAttempt, FetchError};
 
 /// Nominal refresh cadence for a healthy fetch unit.
 pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
@@ -126,9 +126,11 @@ impl ProviderSlot {
 pub fn classify(err: &FetchError) -> FetchClass {
     match err {
         FetchError::Upstream(_) => FetchClass::Transient,
-        FetchError::NoSession(_) | FetchError::Unauthorized(_) | FetchError::Decode(_) => {
-            FetchClass::NonTransient
-        }
+        FetchError::ProviderStatus(401 | 403)
+        | FetchError::NoSession(_)
+        | FetchError::Unauthorized(_)
+        | FetchError::Decode(_) => FetchClass::NonTransient,
+        FetchError::ProviderStatus(_) => FetchClass::Transient,
     }
 }
 
@@ -172,13 +174,14 @@ pub fn next_slot_after_attempt(
     attempt_start: Instant,
     completed: Instant,
 ) -> ProviderSlot {
+    let identity_unverified = attempt.credential_resolution == CredentialResolution::Unverified;
     next_slot_after_attempt_inner(
         prev,
         provider_name,
         attempt,
         attempt_start,
         completed,
-        false,
+        identity_unverified,
     )
 }
 
@@ -304,6 +307,7 @@ fn next_slot_after_attempt_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential_source::VaultGetError;
     use crate::model::Usage;
 
     fn incarnation() -> Incarnation {
@@ -319,6 +323,7 @@ mod tests {
             source: Some("test".to_string()),
             usage,
             relax_eligible: false,
+            credential_resolution: CredentialResolution::Verified,
         }
     }
 
@@ -339,6 +344,14 @@ mod tests {
         assert_eq!(
             classify(&FetchError::Decode("bad json".into())),
             FetchClass::NonTransient
+        );
+        assert_eq!(
+            classify(&FetchError::ProviderStatus(401)),
+            FetchClass::NonTransient
+        );
+        assert_eq!(
+            classify(&FetchError::ProviderStatus(503)),
+            FetchClass::Transient
         );
     }
 
@@ -463,6 +476,31 @@ mod tests {
         assert_eq!(next.account_id(), Some("B"));
         assert_eq!(next.retry_count, 1);
         assert_eq!(next.next_due_at, t1 + BASE_INTERVAL);
+    }
+
+    #[test]
+    fn vault_get_transient_failure_fails_closed_instead_of_stale_serving() {
+        let t0 = Instant::now();
+        let cold = ProviderSlot::due_now(t0, incarnation());
+        let good = next_slot_after_attempt(
+            &cold,
+            "codex",
+            attempt(Some("old-account"), Ok(Usage::default())),
+            t0,
+            t0,
+        );
+        let next = next_slot_after_attempt(
+            &good,
+            "codex",
+            FetchAttempt::unverified_vault_failure(VaultGetError::Transient),
+            t0 + BASE_INTERVAL,
+            t0 + BASE_INTERVAL,
+        );
+
+        assert!(next.entry.is_none(), "old account window was stale-served");
+        assert!(next.label_in_flux);
+        assert!(next.last_success_at.is_none());
+        assert_eq!(next.retry_count, 1);
     }
 
     #[test]

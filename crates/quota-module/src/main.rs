@@ -13,9 +13,11 @@
 //! (`~/.codex/auth.json`, ...) regardless of the relayed bind identity, so it
 //! declares an empty identity scope and ignores `project_root`.
 
+mod vault_client;
+
 use std::{error::Error, ffi::OsString, fmt, path::PathBuf, sync::Arc};
 
-use quota_core::{config::QuotaConfig, Registry};
+use quota_core::{config::QuotaConfig, credential_source::CredentialSource, Registry};
 use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
@@ -36,6 +38,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
+use vault_client::VaultClient;
 
 const DEFAULT_MODULE_ID: &str = "ai-provider-quota";
 const USAGE_GET_OP: &str = "usage.get";
@@ -122,7 +125,12 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
-    let registry = Arc::new(Registry::with_defaults(quota_config));
+    let credential_source: Arc<dyn CredentialSource> =
+        Arc::new(VaultClient::new(config.connection_file_path.clone()));
+    let registry = Arc::new(Registry::with_defaults(
+        quota_config,
+        Some(credential_source),
+    ));
 
     // The background refresher owns all provider fetching: the serving path
     // (usage.get) only ever reads the slot store, so route reads never block on
@@ -629,7 +637,7 @@ mod tests {
     /// domain metrics. Exercises the actual arm + registry + mapper, not a mock.
     #[tokio::test]
     async fn health_check_control_request_returns_domain_report() {
-        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default()));
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default(), None));
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
 
         let request = ModuleControlRequest::HealthCheck {};
@@ -687,7 +695,7 @@ mod tests {
     /// The `route.bind` arm still acks unchanged after threading the registry in.
     #[tokio::test]
     async fn route_bind_control_request_still_acks() {
-        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default()));
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default(), None));
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
 
         let bind = serde_json::json!({

@@ -25,6 +25,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
@@ -33,8 +34,10 @@ use crate::codex_resets::{
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, UsageFacts,
 };
 use crate::config::CodexConfig;
+use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential};
 use crate::provider::AccountObservation;
 use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::vault_handles::VaultHandleLoader;
 use crate::{
     http::{Header, JsonRequest},
     model::{RateWindow, Usage},
@@ -48,7 +51,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ARMED_USAGE_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Resolved credentials for the usage call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CodexCredentials {
     pub bearer: String,
     pub account_id: Option<String>,
@@ -58,17 +61,163 @@ pub struct CodexCredentials {
 }
 
 /// The subset of `auth.json` we read.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AuthFile {
     #[serde(rename = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
     tokens: Option<AuthTokens>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AuthTokens {
     access_token: Option<String>,
     account_id: Option<String>,
+}
+
+impl std::fmt::Debug for CodexCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodexCredentials")
+            .field("bearer", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("is_oauth", &self.is_oauth)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuthFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthFile")
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tokens", &self.tokens)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuthTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthTokens")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
+/// One immutable credential result used by every read and mutation in a tick.
+struct ServedCodexContext {
+    bearer: String,
+    canonical_account_id: Option<String>,
+    record_version: Option<u64>,
+    capability: Option<VaultCapability>,
+    is_oauth: bool,
+    source: &'static str,
+}
+
+impl std::fmt::Debug for ServedCodexContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServedCodexContext")
+            .field("bearer", &"<redacted>")
+            .field("canonical_account_id", &self.canonical_account_id)
+            .field("record_version", &self.record_version)
+            .field("capability", &self.capability)
+            .field("is_oauth", &self.is_oauth)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+fn canonical_account_id(account_id: Option<String>) -> Option<String> {
+    account_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn chatgpt_account_id(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    canonical_account_id(
+        claims
+            .get("chatgpt_account_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                claims
+                    .get("https://api.openai.com/auth")
+                    .and_then(|auth| auth.get("chatgpt_account_id"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                claims
+                    .get("organizations")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|organizations| organizations.first())
+                    .and_then(|organization| organization.get("id"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(ToString::to_string),
+    )
+}
+
+impl ServedCodexContext {
+    fn local(credentials: CodexCredentials) -> Self {
+        Self {
+            canonical_account_id: credentials.account_id,
+            bearer: credentials.bearer,
+            record_version: None,
+            capability: None,
+            is_oauth: credentials.is_oauth,
+            source: if credentials.is_oauth { "oauth" } else { "api" },
+        }
+    }
+
+    fn vault(
+        capability: VaultCapability,
+        mut credential: VaultCredential,
+    ) -> Result<Self, FetchError> {
+        let bearer = match String::from_utf8(std::mem::take(&mut credential.payload)) {
+            Ok(bearer) => bearer,
+            Err(error) => {
+                let mut payload = error.into_bytes();
+                payload.fill(0);
+                return Err(FetchError::Decode(
+                    "vault credential payload is not valid UTF-8".to_string(),
+                ));
+            }
+        };
+        let canonical_account_id = canonical_account_id(credential.account_id.clone())
+            .or_else(|| chatgpt_account_id(&bearer));
+        Ok(Self {
+            bearer,
+            canonical_account_id,
+            record_version: Some(credential.record_version),
+            capability: Some(capability),
+            is_oauth: true,
+            source: "vault",
+        })
+    }
+
+    fn credentials(&self) -> CodexCredentials {
+        CodexCredentials {
+            bearer: self.bearer.clone(),
+            account_id: self.canonical_account_id.clone(),
+            is_oauth: self.is_oauth,
+        }
+    }
+
+    fn observation(&self) -> AccountObservation {
+        AccountObservation::new(self.canonical_account_id.clone(), self.record_version)
+    }
 }
 
 /// Parse credentials from raw `auth.json` bytes, preferring the OAuth token.
@@ -248,6 +397,18 @@ fn usage_request(url: String, credentials: &CodexCredentials, timeout: Duration)
     request
 }
 
+async fn send_codex_request(
+    request: JsonRequest,
+    client: &reqwest::Client,
+) -> Result<Vec<u8>, FetchError> {
+    let response = request.send_raw(client).await?;
+    if (200..300).contains(&response.status) {
+        Ok(response.body)
+    } else {
+        Err(FetchError::ProviderStatus(response.status))
+    }
+}
+
 pub(crate) fn normalize_credits_tick(
     response: Result<CreditsHttpResponse, FetchError>,
     local_now: DateTime<Utc>,
@@ -309,10 +470,15 @@ pub struct CodexProvider {
     reset_config: CodexConfig,
     reset_transport: Arc<dyn ResetTransport>,
     reset_coordinator: Result<Arc<ResetCoordinator>, String>,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: VaultHandleLoader,
 }
 
 impl CodexProvider {
-    pub fn new(reset_config: CodexConfig) -> Self {
+    pub fn new(
+        reset_config: CodexConfig,
+        credential_source: Option<Arc<dyn CredentialSource>>,
+    ) -> Self {
         let http = reqwest::Client::new();
         let reset_coordinator = if reset_config.is_enabled() {
             ResetCoordinator::from_env()
@@ -326,73 +492,57 @@ impl CodexProvider {
             http,
             reset_config,
             reset_coordinator,
+            credential_source,
+            handle_loader: VaultHandleLoader::from_env(),
         }
     }
-}
 
-impl Default for CodexProvider {
-    fn default() -> Self {
-        Self::new(CodexConfig::default())
-    }
-}
-
-#[async_trait]
-impl UsageProvider for CodexProvider {
-    fn name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
-        let attempt_started = Instant::now();
-        let resolved = tokio::task::spawn_blocking(|| {
-            let home = codex_home().ok_or_else(|| {
-                FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
-            })?;
-            let auth_path = home.join("auth.json");
-            let data = std::fs::read(&auth_path).map_err(|e| {
-                FetchError::NoSession(format!("reading {}: {e}", auth_path.display()))
-            })?;
-            let creds = parse_credentials(&data)?;
-            let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
-            Ok::<_, FetchError>((creds, config_toml))
-        })
-        .await;
-
-        let (creds, config_toml) = match resolved {
-            Ok(Ok(resolved)) => resolved,
-            Ok(Err(error)) => {
-                if self.reset_config.is_enabled() {
-                    log_reset_tick(None, None, None, false, false);
-                }
-                return FetchAttempt::failure(None, None, error);
-            }
-            Err(_) => {
-                if self.reset_config.is_enabled() {
-                    log_reset_tick(None, None, None, false, false);
-                }
-                return FetchAttempt::failure(
-                    None,
-                    None,
-                    FetchError::Decode("codex credential resolution task panicked".to_string()),
-                );
-            }
+    fn report_auth_failure(&self, context: &ServedCodexContext, error: &FetchError) {
+        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+            return;
         };
-        let observed = Some(AccountObservation::new(creds.account_id.clone(), None));
-        let source = if creds.is_oauth { "oauth" } else { "api" };
+        let (Some(source), Some(capability), Some(record_version)) = (
+            self.credential_source.as_ref(),
+            context.capability.as_ref(),
+            context.record_version,
+        ) else {
+            return;
+        };
+        let source = Arc::clone(source);
+        let capability = capability.clone();
+        let status = *status;
+        tokio::spawn(async move {
+            source
+                .report_auth_failure(&capability, status, record_version)
+                .await;
+        });
+    }
+
+    async fn fetch_context(
+        &self,
+        context: ServedCodexContext,
+        config_toml: Option<String>,
+        attempt_started: Instant,
+    ) -> FetchAttempt {
+        let observed = Some(context.observation());
+        let source = context.source;
+        let credentials = context.credentials();
         let usage_url = resolve_usage_url(config_toml.as_deref());
 
-        // Feature-off and non-account-scoped credentials retain the exact legacy
-        // single GET and 30-second timeout. Mutation cannot be keyed without an
-        // OAuth account id, so API-key fallback never fetches reset endpoints.
-        let Some(account_id) = creds
-            .account_id
+        let Some(account_id) = context
+            .canonical_account_id
             .as_deref()
-            .filter(|_| reset_credentials_eligible(&self.reset_config, &creds))
+            .filter(|_| reset_credentials_eligible(&self.reset_config, &credentials))
         else {
-            let usage = usage_request(usage_url, &creds, REQUEST_TIMEOUT)
-                .send(&self.http)
-                .await
-                .and_then(|body| normalize_usage(&body));
+            let usage = send_codex_request(
+                usage_request(usage_url, &credentials, REQUEST_TIMEOUT),
+                &self.http,
+            )
+            .await
+            .and_then(|body| normalize_usage(&body));
+            if let Err(error) = &usage {
+                self.report_auth_failure(&context, error);
+            }
             if self.reset_config.is_enabled() {
                 let facts = usage
                     .as_ref()
@@ -406,15 +556,35 @@ impl UsageProvider for CodexProvider {
             };
         };
 
-        let base_url = resolve_base_url(config_toml.as_deref());
-        let reset_request = ResetRequest {
-            base_url,
-            bearer: creds.bearer.clone(),
-            account_id: account_id.to_string(),
+        let auth_failure = match (
+            self.credential_source.as_ref(),
+            context.capability.as_ref(),
+            context.record_version,
+        ) {
+            (Some(credential_source), Some(capability), Some(record_version)) => {
+                Some(crate::codex_resets::AuthFailureContext {
+                    source: Arc::clone(credential_source),
+                    capability: capability.clone(),
+                    record_version,
+                })
+            }
+            _ => None,
         };
-        let usage_future = usage_request(usage_url, &creds, ARMED_USAGE_TIMEOUT).send(&self.http);
+        let reset_request = ResetRequest {
+            base_url: resolve_base_url(config_toml.as_deref()),
+            bearer: context.bearer.clone(),
+            account_id: account_id.to_string(),
+            auth_failure,
+        };
+        let usage_future = send_codex_request(
+            usage_request(usage_url, &credentials, ARMED_USAGE_TIMEOUT),
+            &self.http,
+        );
         let credits_future = self.reset_transport.fetch_credits(&reset_request);
         let (usage_http, credits_http) = tokio::join!(usage_future, credits_future);
+        if let Err(error) = &credits_http {
+            reset_request.report_auth_failure(error);
+        }
 
         let usage_snapshot = usage_http.and_then(|body| normalize_usage_snapshot(&body));
         let local_now = Utc::now();
@@ -423,6 +593,7 @@ impl UsageProvider for CodexProvider {
         let usage_snapshot = match usage_snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                self.report_auth_failure(&context, &error);
                 let credits = credits_snapshot.as_ref().ok().map(|(credits, _)| credits);
                 let earliest_expiry = credits.and_then(CreditsSnapshot::earliest_available_expiry);
                 log_reset_tick(None, credits, earliest_expiry, false, false);
@@ -488,9 +659,197 @@ impl UsageProvider for CodexProvider {
     }
 }
 
+impl Default for CodexProvider {
+    fn default() -> Self {
+        Self::new(CodexConfig::default(), None)
+    }
+}
+
+#[async_trait]
+impl UsageProvider for CodexProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        let mut handles = vec![CredentialHandle::implicit()];
+        if self.credential_source.is_some() {
+            handles.extend(self.handle_loader.codex_handles()?);
+        }
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let attempt_started = Instant::now();
+        match handle.vault_capability() {
+            Some(capability) => {
+                let Some(credential_source) = self.credential_source.as_ref() else {
+                    return FetchAttempt::unverified_vault_failure(
+                        crate::credential_source::VaultGetError::Permanent,
+                    );
+                };
+                let credential = match credential_source.get(capability, 120_000).await {
+                    Ok(credential) => credential,
+                    Err(error) => return FetchAttempt::unverified_vault_failure(error),
+                };
+                let fallback_observation = Some(AccountObservation::new(
+                    canonical_account_id(credential.account_id.clone()),
+                    Some(credential.record_version),
+                ));
+                let context = match ServedCodexContext::vault(capability.clone(), credential) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        return FetchAttempt::failure(fallback_observation, None, error);
+                    }
+                };
+                let config_toml = tokio::task::spawn_blocking(|| {
+                    codex_home()
+                        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
+                })
+                .await
+                .unwrap_or(None);
+                self.fetch_context(context, config_toml, attempt_started)
+                    .await
+            }
+            None => {
+                let resolved = tokio::task::spawn_blocking(|| {
+                    let home = codex_home().ok_or_else(|| {
+                        FetchError::NoSession(
+                            "cannot resolve CODEX_HOME or $HOME/.codex".to_string(),
+                        )
+                    })?;
+                    let auth_path = home.join("auth.json");
+                    let data = std::fs::read(&auth_path).map_err(|error| {
+                        FetchError::NoSession(format!("reading {}: {error}", auth_path.display()))
+                    })?;
+                    let credentials = parse_credentials(&data)?;
+                    let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
+                    Ok::<_, FetchError>((ServedCodexContext::local(credentials), config_toml))
+                })
+                .await;
+                let (context, config_toml) = match resolved {
+                    Ok(Ok(resolved)) => resolved,
+                    Ok(Err(error)) => {
+                        if self.reset_config.is_enabled() {
+                            log_reset_tick(None, None, None, false, false);
+                        }
+                        return FetchAttempt::failure(None, None, error);
+                    }
+                    Err(_) => {
+                        if self.reset_config.is_enabled() {
+                            log_reset_tick(None, None, None, false, false);
+                        }
+                        return FetchAttempt::failure(
+                            None,
+                            None,
+                            FetchError::Decode(
+                                "codex credential resolution task panicked".to_string(),
+                            ),
+                        );
+                    }
+                };
+                self.fetch_context(context, config_toml, attempt_started)
+                    .await
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct ReportingSource {
+        reports: Arc<Mutex<Vec<(u16, u64)>>>,
+    }
+
+    #[async_trait]
+    impl CredentialSource for ReportingSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, crate::credential_source::VaultGetError> {
+            unreachable!("reporting test does not fetch")
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            provider_status: u16,
+            record_version: u64,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((provider_status, record_version));
+        }
+    }
+
+    #[test]
+    fn secret_bearing_codex_debug_is_redacted() {
+        let secret = "codex-debug-secret";
+        let credentials = CodexCredentials {
+            bearer: secret.to_string(),
+            account_id: Some("acct".to_string()),
+            is_oauth: true,
+        };
+        let auth: AuthFile = serde_json::from_value(serde_json::json!({
+            "OPENAI_API_KEY": secret,
+            "tokens": { "access_token": secret, "account_id": "acct" }
+        }))
+        .unwrap();
+        for debug in [format!("{credentials:?}"), format!("{auth:?}")] {
+            assert!(!debug.contains(secret));
+            assert!(debug.contains("redacted"));
+        }
+    }
+
+    #[test]
+    fn vault_context_resolves_trimmed_account_once_with_jwt_fallback() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "chatgpt_account_id": "  jwt-account  "
+            }))
+            .unwrap(),
+        );
+        let token = format!("header.{payload}.signature");
+        let context = ServedCodexContext::vault(
+            VaultCapability::new("ckh_context_secret"),
+            VaultCredential {
+                payload: token.into_bytes(),
+                expires_at_ms: None,
+                record_version: 17,
+                account_id: None,
+                project_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(context.canonical_account_id.as_deref(), Some("jwt-account"));
+        assert_eq!(context.observation().record_version, Some(17));
+        assert!(!format!("{context:?}").contains("ckh_context_secret"));
+    }
+
+    #[tokio::test]
+    async fn usage_auth_failure_report_uses_served_record_version() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn CredentialSource> = Arc::new(ReportingSource {
+            reports: Arc::clone(&reports),
+        });
+        let provider = CodexProvider::new(CodexConfig::default(), Some(source));
+        let context = ServedCodexContext {
+            bearer: "secret".to_string(),
+            canonical_account_id: Some("acct".to_string()),
+            record_version: Some(23),
+            capability: Some(VaultCapability::new("ckh_report_secret")),
+            is_oauth: true,
+            source: "vault",
+        };
+        provider.report_auth_failure(&context, &FetchError::ProviderStatus(401));
+        tokio::task::yield_now().await;
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 23)]);
+    }
 
     #[test]
     fn prefers_oauth_token_over_api_key() {

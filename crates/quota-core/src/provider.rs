@@ -6,37 +6,90 @@
 
 use async_trait::async_trait;
 
+use crate::credential_source::{VaultCapability, VaultGetError};
 use crate::model::{ProviderUsage, Usage};
 
 /// Stable identity for one credential fetch unit.
 ///
-/// A handle is deliberately not an account identity: a credential can be
-/// replaced behind the same handle. The account label is observed separately on
-/// every fetch.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CredentialHandle(String);
+/// A vault handle includes the exact capability snapshot used by the fetch. The
+/// capability participates in equality and hashing, while all formatting exposes
+/// only the non-secret credential id.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum CredentialHandle {
+    ImplicitLocal,
+    Named(String),
+    Vault {
+        credential_id: String,
+        capability: VaultCapability,
+    },
+}
 
 impl CredentialHandle {
-    /// Build a provider-defined stable handle.
+    /// Build a provider-defined stable local handle.
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+        let id = id.into();
+        if id.is_empty() || id == "implicit-local" {
+            Self::ImplicitLocal
+        } else {
+            Self::Named(id)
+        }
     }
 
-    /// The single local credential source used by providers that do not yet
-    /// enumerate multiple credentials.
     pub fn implicit() -> Self {
-        Self("implicit-local".to_string())
+        Self::ImplicitLocal
     }
 
-    /// Stable provider-local identifier used for deterministic response order.
+    pub fn vault(credential_id: impl Into<String>, capability: VaultCapability) -> Self {
+        Self::Vault {
+            credential_id: credential_id.into(),
+            capability,
+        }
+    }
+
     pub fn stable_id(&self) -> &str {
-        &self.0
+        match self {
+            Self::ImplicitLocal => "implicit-local",
+            Self::Named(id) => id,
+            Self::Vault { credential_id, .. } => credential_id,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        !matches!(self, Self::Vault { .. })
+    }
+
+    pub fn vault_capability(&self) -> Option<&VaultCapability> {
+        match self {
+            Self::Vault { capability, .. } => Some(capability),
+            Self::ImplicitLocal | Self::Named(_) => None,
+        }
+    }
+
+    pub fn sort_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.stable_id().cmp(other.stable_id())
+    }
+}
+
+impl std::fmt::Debug for CredentialHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ImplicitLocal => formatter.write_str("CredentialHandle::ImplicitLocal"),
+            Self::Named(id) => formatter
+                .debug_tuple("CredentialHandle::Named")
+                .field(id)
+                .finish(),
+            Self::Vault { credential_id, .. } => formatter
+                .debug_struct("CredentialHandle::Vault")
+                .field("credential_id", credential_id)
+                .field("capability", &"<redacted>")
+                .finish(),
+        }
     }
 }
 
 impl std::fmt::Display for CredentialHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.stable_id())
     }
 }
 
@@ -80,6 +133,13 @@ impl AccountObservation {
     }
 }
 
+/// Whether this tick verified the identity behind the credential handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialResolution {
+    Verified,
+    Unverified,
+}
+
 /// One handle-scoped fetch result.
 ///
 /// The credential observation is independent of `usage`, so an account swap is
@@ -91,6 +151,7 @@ pub struct FetchAttempt {
     pub usage: Result<Usage, FetchError>,
     /// The slot may relax raw percentages only while this success remains fresh.
     pub relax_eligible: bool,
+    pub credential_resolution: CredentialResolution,
 }
 
 impl FetchAttempt {
@@ -104,6 +165,7 @@ impl FetchAttempt {
             source: Some(source.into()),
             usage: Ok(usage),
             relax_eligible: false,
+            credential_resolution: CredentialResolution::Verified,
         }
     }
 
@@ -117,6 +179,31 @@ impl FetchAttempt {
             source,
             usage: Err(error),
             relax_eligible: false,
+            credential_resolution: CredentialResolution::Verified,
+        }
+    }
+
+    pub fn unverified_vault_failure(error: VaultGetError) -> Self {
+        let fetch_error = match error {
+            VaultGetError::Transient => {
+                FetchError::Upstream("credential vault temporarily unavailable".to_string())
+            }
+            VaultGetError::AuthRequired => {
+                FetchError::NoSession("credential requires authentication".to_string())
+            }
+            VaultGetError::Permanent => {
+                FetchError::NoSession("vault credential is unavailable".to_string())
+            }
+            VaultGetError::FailClosed => {
+                FetchError::Decode("credential vault rejected the request".to_string())
+            }
+        };
+        Self {
+            observed: None,
+            source: None,
+            usage: Err(fetch_error),
+            relax_eligible: false,
+            credential_resolution: CredentialResolution::Unverified,
         }
     }
 
@@ -147,6 +234,7 @@ impl FetchAttempt {
                     source,
                     usage,
                     relax_eligible: false,
+                    credential_resolution: CredentialResolution::Verified,
                 }
             }
             Err(error) => Self::failure(None, None, error),
@@ -184,6 +272,8 @@ pub enum FetchError {
     NoSession(String),
     /// The session exists but is expired or rejected (401/403).
     Unauthorized(String),
+    /// Numeric provider HTTP status retained for auth-failure reporting.
+    ProviderStatus(u16),
     /// Transport or upstream error.
     Upstream(String),
     /// The response was not the shape we expected.
@@ -195,6 +285,7 @@ impl std::fmt::Display for FetchError {
         match self {
             Self::NoSession(m) => write!(f, "no session: {m}"),
             Self::Unauthorized(m) => write!(f, "unauthorized: {m}"),
+            Self::ProviderStatus(status) => write!(f, "provider returned HTTP {status}"),
             Self::Upstream(m) => write!(f, "upstream error: {m}"),
             Self::Decode(m) => write!(f, "decode error: {m}"),
         }

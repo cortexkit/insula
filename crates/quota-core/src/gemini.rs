@@ -96,12 +96,29 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 
 // ---- credentials file -------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OauthCreds {
     access_token: Option<String>,
     refresh_token: Option<String>,
     /// Expiry in epoch MILLISECONDS (gemini-cli's format).
     expiry_date: Option<i64>,
+}
+
+impl std::fmt::Debug for OauthCreds {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OauthCreds")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expiry_date", &self.expiry_date)
+            .finish()
+    }
 }
 
 fn creds_path() -> Option<PathBuf> {
@@ -403,6 +420,19 @@ impl UsageProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_credentials_debug_redacts_both_tokens() {
+        let credentials = OauthCreds {
+            access_token: Some("gemini-access-secret".to_string()),
+            refresh_token: Some("gemini-refresh-secret".to_string()),
+            expiry_date: Some(1234),
+        };
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("gemini-access-secret"));
+        assert!(!debug.contains("gemini-refresh-secret"));
+        assert!(debug.contains("redacted"));
+    }
 
     #[test]
     fn normalizes_per_model_buckets_by_tier() {

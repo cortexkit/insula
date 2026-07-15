@@ -15,6 +15,7 @@ pub mod codex;
 pub mod codex_resets;
 pub mod config;
 pub mod copilot;
+pub mod credential_source;
 pub mod cursor;
 pub mod doubao;
 pub mod elevenlabs;
@@ -44,6 +45,7 @@ pub mod stepfun;
 pub mod store;
 pub mod sub2api;
 pub mod synthetic;
+pub mod vault_handles;
 pub mod warp;
 pub mod zai;
 
@@ -55,6 +57,7 @@ use std::time::{Duration, Instant};
 use futures_util::{stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
+use credential_source::CredentialSource;
 use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
@@ -115,7 +118,7 @@ fn select_due_round_robin(
     for queue in &mut queues {
         queue
             .make_contiguous()
-            .sort_by(|(left, _), (right, _)| left.handle.cmp(&right.handle));
+            .sort_by(|(left, _), (right, _)| left.handle.sort_cmp(&right.handle));
     }
 
     let provider_count = providers.len();
@@ -187,6 +190,7 @@ pub struct Registry {
     providers: Vec<RegisteredProvider>,
     store: Mutex<SlotStore>,
     last_admitted_provider: Mutex<Option<usize>>,
+    credential_source: Option<Arc<dyn CredentialSource>>,
 }
 
 impl Registry {
@@ -214,12 +218,19 @@ impl Registry {
             providers,
             store: Mutex::new(SlotStore::new(Instant::now())),
             last_admitted_provider: Mutex::new(None),
+            credential_source: None,
         }
     }
     /// The default registry: every provider we support.
-    pub fn with_defaults(config: config::QuotaConfig) -> Self {
-        Self::new(vec![
-            Box::new(codex::CodexProvider::new(config.codex)),
+    pub fn with_defaults(
+        config: config::QuotaConfig,
+        credential_source: Option<Arc<dyn CredentialSource>>,
+    ) -> Self {
+        let mut registry = Self::new(vec![
+            Box::new(codex::CodexProvider::new(
+                config.codex,
+                credential_source.clone(),
+            )),
             Box::new(anthropic::AnthropicProvider::new()),
             Box::new(antigravity::AntigravityProvider::new()),
             Box::new(codebuff::CodebuffProvider::new()),
@@ -249,7 +260,13 @@ impl Registry {
             Box::new(kilo::KiloProvider::new()),
             Box::new(alibaba::AlibabaProvider::new()),
             Box::new(amp::AmpProvider::new()),
-        ])
+        ]);
+        registry.credential_source = credential_source;
+        registry
+    }
+
+    pub fn credential_source_wired(&self) -> bool {
+        self.credential_source.is_some()
     }
 
     /// Provider names registered, for discovery and observability.
@@ -262,10 +279,11 @@ impl Registry {
 
     /// Serve usage exclusively from active slot snapshots.
     ///
-    /// If any active handle lacks a resolved account label, only the stable first
-    /// handle is eligible and its entry is unlabeled. Once every handle resolves,
-    /// entries are labeled and duplicate accounts are collapsed. A label
-    /// transition without successful usage remains unavailable.
+    /// If any active handle lacks a resolved account label, one unlabeled
+    /// representative is selected by freshness and health, preferring local on a
+    /// tie. Once every handle resolves, entries are labeled and duplicate accounts
+    /// are collapsed. A label transition without successful usage remains
+    /// unavailable.
     pub async fn get_usage(&self, provider_filter: Option<&str>) -> Vec<ProviderUsage> {
         let mut snapshot = {
             let store = self
@@ -291,7 +309,7 @@ impl Registry {
                 .unwrap_or(usize::MAX);
             left_index
                 .cmp(&right_index)
-                .then_with(|| left.handle.cmp(&right.handle))
+                .then_with(|| left.handle.sort_cmp(&right.handle))
         });
 
         let read_now = Instant::now();
@@ -311,16 +329,41 @@ impl Registry {
 
             let all_resolved = slots.iter().all(|(_, slot)| slot.account_id().is_some());
             if !all_resolved {
-                let (_, primary) = slots[0];
-                if primary.label_in_flux {
-                    continue;
-                }
-                if let Some(mut entry) = primary.entry.clone() {
-                    entry.account = None;
-                    if primary.relax_eligible && primary.is_fresh(read_now) {
-                        relax_usage_for_read(&mut entry);
+                let primary = slots
+                    .iter()
+                    .filter(|(_, slot)| !slot.label_in_flux)
+                    .min_by(|(left_key, left_slot), (right_key, right_slot)| {
+                        let rank = |slot: &ProviderSlot| {
+                            let healthy = slot.entry.as_ref().is_some_and(|entry| {
+                                entry.error.is_none() && entry.usage.is_some()
+                            });
+                            match (healthy, slot.is_fresh(read_now)) {
+                                (true, true) => 0u8,
+                                (true, false) => 1,
+                                (false, _) => 2,
+                            }
+                        };
+                        rank(left_slot)
+                            .cmp(&rank(right_slot))
+                            .then_with(|| {
+                                right_key.handle.is_local().cmp(&left_key.handle.is_local())
+                            })
+                            .then_with(|| {
+                                left_key
+                                    .handle
+                                    .stable_id()
+                                    .cmp(right_key.handle.stable_id())
+                            })
+                    })
+                    .map(|(_, slot)| slot);
+                if let Some(primary) = primary {
+                    if let Some(mut entry) = primary.entry.clone() {
+                        entry.account = None;
+                        if primary.relax_eligible && primary.is_fresh(read_now) {
+                            relax_usage_for_read(&mut entry);
+                        }
+                        out.push(entry);
                     }
-                    out.push(entry);
                 }
                 continue;
             }
@@ -342,7 +385,7 @@ impl Registry {
                 }
             }
             let mut selected: Vec<_> = candidates.into_iter().collect();
-            selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.cmp(&right.handle));
+            selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.sort_cmp(&right.handle));
             for (account_id, (_, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
@@ -374,7 +417,7 @@ impl Registry {
             .map(|provider| {
                 match std::panic::catch_unwind(AssertUnwindSafe(|| provider.fetcher.handles())) {
                     Ok(Ok(mut handles)) => {
-                        handles.sort();
+                        handles.sort_by(CredentialHandle::sort_cmp);
                         handles.dedup();
                         Some(handles)
                     }
