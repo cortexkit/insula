@@ -985,8 +985,24 @@ mod tests {
             .get(&VaultCapability::new("ckh_timeout"), 120_000)
             .await;
         assert_eq!(result.unwrap_err(), VaultGetError::Transient);
-        assert!(client.state.pending.lock().unwrap().is_empty());
+        // The caller's own pending entry is removed by its drop guard at
+        // cancellation, but the detached single-flight route opener may still
+        // hold a channel-0 entry on a slow runner until its response lands, so
+        // deregistration is asserted as an eventually-empty map, not instant.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if client.state.pending.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending entries were not deregistered after the request timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         server.await.unwrap();
+        // The late credential.get response arrived after the timeout: it must
+        // have been discarded without reviving or leaking a pending entry.
         assert!(client.state.pending.lock().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
