@@ -1,205 +1,284 @@
 # Vault-consumer wiring: multi-account credentials from cortexkit-credentials
 
-Status: DESIGN v1 — pending adversarial Oracle pass. Date: 2026-07-16.
+Status: DESIGN v2 — adversarial Oracle pass folded (10 findings: 2 CRITICAL,
+6 HIGH, 1 MEDIUM, 1 LOW). Date: 2026-07-16. Scope ruling (Ufuk): codex
+two-account is the priority pair; anthropic + grok + gemini follow the same
+shape; antigravity OAuth fallback DEFERRED (Oracle-confirmed: its current
+implementation is a loopback probe with no OAuth request path to reuse).
+Banked resets knob stays GLOBAL — every armed-eligible codex account
+auto-consumes its own credits.
 
-VAULT STATE (live, CKCRED-confirmed 2026-07-16, receipt-verified): the handle
-file at `~/.config/cortexkit/ck-quota/vault-handles.json` EXISTS (0600) with
-five freshly minted ck-quota-dedicated handles: `chatgpt:openai` (account
-291f5165, v3), `chatgpt:openai:gmail` (account 7b66addd, v1 — the second
-OpenAI account, vault-native login), `oauth:anthropic` (v22), `oauth:xai`
-(v10), `antigravity:google` (v116 — the ONLY google credential; there is no
-separate gemini-cli entry, so the gemini vault lane resolves through the
-antigravity-method credential, whose get also serves `project_id`).
-`antigravity:google` serves `account_id: None` by design (claim table maps
-openai-family only today) — its entries stay unlabeled per the C1 gate, which
-is correct for a single-credential provider.
-Scope ruling (Ufuk): design for codex (openai) + anthropic + grok (xai) +
-gemini/antigravity-oauth in one coherent shape; codex two-account is the
-priority pair; masons build per-provider. Banked resets knob stays GLOBAL —
-every armed-eligible codex account auto-consumes its own credits.
+MERGE PHASING (Oracle-sized): merge 1 = vault client + core seam + machinery
+fixes + codex two-account (the priority pair, everything below unless marked
+later). Merge 2 = anthropic + grok (thin bearer-swap lanes). Merge 3 = gemini
+vault lane (split dispatch). Antigravity OAuth: out entirely for now.
 
-This is the deferred tail of docs/multi-account-fetch-design.md (read it
-first). The fetch machinery (slot per (provider, handle), FetchAttempt
-envelope, emission gate, incarnation fencing) is SHIPPED and Oracle-proven;
-this note adds ONLY the credential plumbing that lights up real vault handles.
+This is the deferred tail of docs/multi-account-fetch-design.md (read first).
+The fetch machinery (slot per (provider, handle), FetchAttempt envelope,
+emission gate C1, incarnation fencing, F1 unverified-failure path) is SHIPPED;
+this note adds the credential plumbing AND four machinery corrections the
+Oracle found necessary (V1, V2, V4, V6 below).
 
-## The upstream contract (verified live + CKCRED-confirmed 2026-07-16)
+## Live vault state (CKCRED-confirmed 2026-07-16, receipt-verified)
 
-Vault module: `cortexkit-credentials` (`ck-credentials`, live in prod,
-supervised by the same daemon as us). Read surface over a management route:
+`~/.config/cortexkit/ck-quota/vault-handles.json` EXISTS (0600) with five
+ck-quota-dedicated handles: `chatgpt:openai` (account 291f5165, v3),
+`chatgpt:openai:gmail` (account 7b66addd, v1 — the second OpenAI account,
+vault-native login), `oauth:anthropic` (v22), `oauth:xai` (v10),
+`antigravity:google` (v116 — the ONLY google credential; no separate
+gemini-cli entry; its get also serves `project_id`; account_id None by
+design, claim table maps openai-family only).
 
-- `credential.get { handle, min_ttl_ms? }` → `{ "result": ... }` two-level
-  decode (broca-proven): success `{ payload: [u8], expires_at_ms: i64|null,
-  record_version: u64, account_id?: string, project_id?: string }`; app error
-  `{ error: { code, class } }`. `needs_reauth` arrives as a RESPONSE, never an
-  Error frame. Optional fields are additive-only.
-- Error branching is on the fleet error CLASS tag (transient / permanent /
-  auth_required / context_overflow), never on code strings.
+## Upstream contract (verified live + CKCRED-confirmed)
+
+- `credential.get { handle, min_ttl_ms? }` → two-level decode (broca-proven):
+  Response `{ "result": ... }` where success = `{ payload: [u8],
+  expires_at_ms: i64|null, record_version: u64, account_id?, project_id? }`
+  and app error = `{ error: { code, class } }`. `needs_reauth` arrives as a
+  RESPONSE outcome, never an Error frame — decode the result envelope FIRST.
+- Error branching on the fleet error CLASS tag only (transient / permanent /
+  auth_required / context_overflow); code strings are diagnostics.
 - `credential.report_auth_failure { handle, provider_status, record_version }`
-  — version-CAS: a stale record_version makes the report a silent no-op, so
-  the consumer MUST report the version it was actually served.
-- `account_id` is parsed live from the served token (openai →
-  ChatGPT-Account-Id claim — the SAME claim codex.rs parses today). Handles
-  survive `login --replace`; a re-point to a different account ALWAYS bumps
-  `record_version`. RULE: bind (handle → account_id) on record_version and
-  re-resolve on any bump — never cache identity against the handle alone.
-  (This is exactly the ProviderSlot.observation re-resolution the shipped
-  machinery already does; the vault client just supplies the inputs.)
-- Handle delivery: CKCRED mints and writes our handle file directly (raw
-  handles never transit chat). Admin ops (mint/status) run against the LIVE
-  daemon since 2026-07-11 — no maintenance windows.
+  — version-CAS: stale version = silent no-op; always report the version you
+  were SERVED.
+- Handles survive `login --replace`; re-point to a different account ALWAYS
+  bumps `record_version`. Identity binds to record_version, never the handle.
+- Consumer transport: TCP connect + HMAC client auth + route.open — NO
+  consumer HELLO (matches broca and our own test driver; the v1 draft's
+  "HELLO as a consumer" was wrong and is dropped).
+- min_ttl_ms: request 120_000 — ample vs the 35s FETCH_DEADLINE, <20s
+  pre-POST cutoff, and 8s POST timeout (Oracle-verified), assuming the vault
+  honors the requested TTL. The served token is reused for the WHOLE attempt.
 
 ## Handle file
 
 `~/.config/cortexkit/ck-quota/vault-handles.json` (0600, dedicated
-secret-bearing file, broca's exact format and hygiene):
+secret-bearing file), env override `CK_QUOTA_VAULT_HANDLES_PATH` for tests.
+Format: `{ "handles": { "<credential_id>": "ckh_..." } }`.
 
-```json
-{ "handles": { "chatgpt:openai": "ckh_...", "chatgpt:openai:ufuk": "ckh_...",
-               "oauth:anthropic": "ckh_...", "oauth:xai": "ckh_..." } }
-```
+Loader rules (V7 — descriptor-based, race-free):
+- Open ONCE with O_NOFOLLOW (unix), then fstat the OPEN descriptor for
+  type/mode checks and read that same descriptor — no check-then-reopen
+  TOCTOU. Refuse symlinks, non-regular files, group/other-readable modes.
+- REJECT duplicate JSON keys (serde will collapse them silently — parse with
+  a duplicate-detecting map). Deduplicate identical raw capabilities listed
+  under different ids into ONE fetch unit, warning with ids only.
+- The deserialized shape carries bearer secrets: no derived Debug/Display
+  anywhere; log ids + presence only.
 
-- Keyed by credential id `<method>:<provider>[:<account>]`. The id is a
-  LABEL for operators; the account identity truth is GetResult.account_id.
-- Loader (ported from broca's vault_config.rs discipline): refuse symlinks,
-  refuse non-regular files, refuse group/other-readable modes (unix), never
-  Debug-derive the deserialized shape, log only ids + presence. Env override
-  `CK_QUOTA_VAULT_HANDLES_PATH` for tests.
-- Absent file = no vault handles = today's behavior exactly (implicit-local
-  handles only). Malformed/insecure file = SKIP vault handles for the tick +
-  stderr warning, serve implicit-local (degrade-never-wrong); the handles()
-  Result-error path (H5) already prevents mass-reaping on read errors.
+Enumeration outcomes (V8 — explicit, resolves the v1 contradiction):
+- File ABSENT, MALFORMED, SYMLINKED, or INSECURE-MODE → an AUTHORITATIVE
+  implicit-only snapshot: vault slots are reconciled AWAY (reaped) this tick,
+  implicit-local units continue. (A misconfigured secrets file must not
+  leave stale vault units fetching forever.) One stderr warning per change.
+- Genuine transient inspection/read failure (EIO etc.) → HandlesError (H5
+  path): last-known-good retained, old vault units continue this tick.
 
-## Credential id → provider mapping
+## Capability snapshot identity (V2 — CRITICAL fix)
 
-Static prefix table, applied at enumeration:
+`CredentialHandle::Vault` carries an owned, redacted CAPABILITY SNAPSHOT —
+the exact raw `ckh_` value read at enumeration — not just the credential id:
 
-| id prefix           | provider  | notes |
-|---------------------|-----------|-------|
-| `chatgpt:openai`    | codex     | any suffix = another account |
-| `oauth:anthropic`   | anthropic | |
-| `oauth:xai`         | grok      | |
-| `oauth:google` / `gemini:` | gemini | gemini-cli Code-Assist scope |
-| `antigravity:google`| antigravity (oauth fallback only) | local probe stays primary |
+- Slot EQUALITY/HASH includes the raw capability identity (a changed raw
+  value under the same file key is a REMOVE + ADD: the old unit gets a new
+  incarnation fence, in-flight publishes for the old capability are fenced
+  out). Sorting/logging/display use only `credential_id`.
+- Any identity cache is keyed by (raw capability identity, record_version) —
+  never (credential_id, record_version), which can alias two capabilities
+  (record_version is per-credential-record, not globally unique).
+- The fetch uses the snapshot it was enumerated with — never re-reads the
+  file mid-attempt.
 
-Unknown prefixes: ignored with a warning (forward-compatible with vault
-holdings for other consumers).
-
-## CredentialSource seam (the blessed interface, now concrete)
-
-quota-core stays subc-free. New trait in quota-core:
+## CredentialSource seam (quota-core, subc-free)
 
 ```rust
 pub trait CredentialSource: Send + Sync {
-    /// Resolve a vault credential by handle. Returns the opaque payload plus
-    /// the identity/version envelope. Implementations must be safe to call
-    /// concurrently and must NOT block the executor (async).
-    async fn get(&self, handle: &VaultHandleRef) -> Result<VaultCredential, VaultGetError>;
-    /// CAS-guarded auth-failure report; fire-and-forget semantics for the
-    /// caller (errors logged, never escalated into the fetch result).
-    async fn report_auth_failure(&self, handle: &VaultHandleRef, provider_status: u16, record_version: u64);
+    async fn get(&self, capability: &VaultCapability, min_ttl_ms: u64)
+        -> Result<VaultCredential, VaultGetError>;
+    /// CAS-guarded; fire-and-forget for the caller (errors logged only).
+    async fn report_auth_failure(&self, capability: &VaultCapability,
+        provider_status: u16, record_version: u64);
 }
 
 pub struct VaultCredential {
-    pub payload: Vec<u8>,          // token bytes, provider-interpreted
+    pub payload: Vec<u8>,            // token bytes; NEVER stored in FetchAttempt
     pub expires_at_ms: Option<i64>,
     pub record_version: u64,
-    pub account_id: Option<String>,
+    pub account_id: Option<String>,  // canonicalized: trimmed, empty→None
     pub project_id: Option<String>,
 }
 
+/// Fixed, secret-free variants (V7): NO upstream text rides these — the
+/// class tag decides behavior; sanitized diagnostics go to stderr only,
+/// never into FetchError strings that reach the usage wire.
 pub enum VaultGetError {
-    Transient(String),    // → FetchError::Network class (StaleTransient path)
-    AuthRequired,         // → FetchError::Unauthorized (degrade, non-transient)
-    Permanent(String),    // → FetchError::Unauthorized-class degrade
-    NotFound,             // revoked/unknown handle → non-transient degrade
+    Transient,        // fleet class: transient
+    AuthRequired,     // fleet class: auth_required (incl. needs_reauth)
+    Permanent,        // fleet class: permanent (incl. not_found/revoked)
+    FailClosed,       // context_overflow or UNKNOWN class → non-transient
 }
 ```
 
-- The registry holds `Option<Arc<dyn CredentialSource>>` (None = vault
-  wiring absent, all providers implicit-local — tests and the unwired
-  default). quota-module constructs the real client and passes it into
-  `Registry::with_defaults`.
-- Class mapping is the SAME transient/non-transient split the refresher
-  already classifies on; the vault's class tag routes directly.
+Registry holds `Option<Arc<dyn CredentialSource>>` (None = unwired, all
+implicit-local — tests and default).
 
-## The vault client (quota-module, the only subc-aware part)
+## Vault-get failure fencing (V1 — CRITICAL fix, machinery change)
 
-A second outbound consumer connection from the ck-quota process to the
-daemon, mirroring broca's vault.rs:
+A FAILED vault get means the fetch unit's identity is UNVERIFIED this tick —
+the handle may have been re-pointed since the last success. Every
+`VaultGetError` (including Transient) routes the attempt through the F1
+unverified-failure path (`next_slot_after_unverified_failure`): with a prior
+observation, fail closed (clear entry, label in flux, restart backoff);
+NEVER stale-serve the previous account's window on a vault-get failure.
 
-- Own TCP connect + HMAC auth + HELLO as a CONSUMER (not module identity),
-  `route.open(management, "cortexkit-credentials")`, then `credential.get`
-  request/response over the route channel with corr-id matching.
-- Wire v2: stamps the route's (channel, epoch) from route.open; reconnects
-  re-open the route (fresh epoch) — the stale-epoch drop is the signal.
-- Lifecycle: lazy connect on first use; on transport error or route-gone,
-  mark connection dead and reconnect on next call with backoff (the
-  refresher's own per-slot backoff already paces retries — the client's
-  internal backoff only guards connect storms within a tick).
-- Concurrency: the refresher fetches up to CONCURRENCY_CAP units in
-  parallel; the client multiplexes on one connection with corr-ids (broca
-  pattern) OR serializes behind an async Mutex as v1 simplification —
-  Oracle input requested. Either way no std lock across await.
-- Timeouts: credential.get bounded well inside FETCH_DEADLINE (proposed 10s)
-  so a wedged vault can never eat the whole fetch budget; a vault timeout is
-  Transient.
-- `min_ttl_ms`: request enough validity for the fetch that follows
-  (proposed 120_000) so the vault refreshes proactively rather than serving
-  a token that dies mid-fetch.
+Mechanism: `FetchAttempt` resolution gains the distinction
+`CredentialResolution::Verified | Unverified` (naming per implementation).
+Only a fetch whose SAME-TICK credential.get succeeded may take the normal
+transient stale-serving path for downstream (provider-endpoint) failures.
+Implicit-local units are Verified by construction (local file read is the
+identity source). This is a small, targeted refresh.rs/lib.rs change; the
+F1 machinery itself already exists.
+
+## Immutable mutation context (V3 — HIGH fix, codex)
+
+One successful `credential.get` per attempt constructs one immutable
+`ServedCodexContext { bearer, canonical_account_id, record_version,
+capability }`. The observation, usage GET, credits GET, journal account key,
+consume POST, and any report_auth_failure are built EXCLUSIVELY from this
+context. Never re-get mid-attempt; never mix the context with fallback
+account resolution (if account_id is absent from the vault result, fall back
+to parsing the token claim — but INTO the context, once, before any request).
+
+Mutation authorization policy (explicit): a successful credential.get IS the
+authorization point for that attempt's ≤20s consume window. A `login
+--replace` DURING that window does not cancel the POST (nothing in the
+contract can revoke an admitted spend); the blast radius is one reset
+against the account the token actually belongs to — the journal key and the
+bearer come from the same served result, so the journal cannot record a
+different account than the one the POST executes under (canonical_account_id
+is trimmed/validated once at context construction).
+
+## Emission-gate selection fix (V4 — HIGH fix, machinery change)
+
+`get_usage`'s UNRESOLVED branch (not all handles carry an account label)
+currently emits `slots[0]` deterministically — which can surface a cold
+degraded vault unit while a Fresh implicit-local unit holds healthy truth.
+Fix: in the unresolved branch, select the representative by read-time
+service rank — fresh-healthy (is_fresh(read_now)) > stale-healthy >
+degraded — tie-broken by explicit local-before-vault priority, then stable
+id. Regression: cold NotFound vault handle + Fresh local ⇒ the local entry
+is served.
+
+## The vault client (quota-module) — MULTIPLEXED (Oracle verdict)
+
+One shared connection, corr-id multiplexing (serialization loses: 8 admitted
+units × 10s vault timeout = 80s head-of-line, blowing the 35s deadline).
+
+- Writer queue + pending map keyed by (route_epoch, corr_id); responses
+  matched and dispatched to waiters; cancelled callers DEREGISTER their
+  pending entry (drop guard).
+- Single-flight state machines, SEPARATE for connection and route:
+  `unknown_channel` / route-gone invalidates the ROUTE only (re-open on the
+  live connection, fresh epoch); transport death invalidates the CONNECTION.
+  Generation counters on both; a late failure from an old generation never
+  evicts the replacement (compare-generation before invalidate).
+- Locks: internal state behind async-aware primitives, never a std guard
+  across await; connect storms bounded by single-flight + a short
+  failed-connect cooldown (a few seconds). No deeper client backoff — the
+  refresher's per-slot backoff already paces retries (Oracle: cut).
+- No client-side token caching, no JWT parsing fallback in the client
+  (Oracle: cut — the provider parses claims if it needs them).
+- credential.get timeout 10s (inside FETCH_DEADLINE with margin).
+
+## Class → slot behavior mapping (V6)
+
+| fleet class      | VaultGetError | slot path |
+|------------------|---------------|-----------|
+| transient        | Transient     | F1 unverified (V1) — fail closed w/ prior observation, else degraded-transient backoff |
+| auth_required    | AuthRequired  | non-transient degrade (NoSession-class), F1 fencing |
+| permanent        | Permanent     | non-transient degrade, F1 fencing |
+| context_overflow / unknown | FailClosed | non-transient degrade, F1 fencing |
+
+Provider-endpoint failures AFTER a verified get keep today's classification
+(transient stale-serve allowed — identity was verified this tick).
+Numeric HTTP status is preserved through the request layers (not stringly
+collapsed): every provider 401/403 — usage, credits, AND consume — fires
+`report_auth_failure(capability, status, served_record_version)`
+fire-and-forget alongside the normal degrade.
+
+## Secrets hygiene (V7)
+
+- Fixed secret-free error variants end-to-end: nothing derived from vault
+  payloads or upstream error text reaches `FetchError` strings (which are
+  wire-visible in degraded entries). Sanitized diagnostics → stderr only.
+- Manual (redacting) Debug for every secret-bearing type, including the
+  PRE-EXISTING derives the Oracle flagged: codex `CodexCredentials` /
+  `AuthFile` / `AuthTokens`, `ResetRequest`, gemini `OauthCreds`, plus the
+  new capability/credential types. Raw handles: no revealing Display.
+- Payload bytes never stored in FetchAttempt/slots — used within the fetch,
+  dropped.
 
 ## Provider integration
 
-`handles()` (per provider): implicit-local handle(s) as today PLUS one
-`CredentialHandle::Vault { credential_id }` per mapped entry in the handle
-file. The handle file is read per enumeration tick (cheap, already the
-handles() cadence) — adding/removing vault entries needs no restart
-(consistent with H5 last-known-good retention on read errors).
+`handles()`: implicit-local handle(s) as today PLUS one Vault capability
+snapshot per mapped entry. Prefix table: `chatgpt:openai*` → codex;
+`oauth:anthropic*` → anthropic; `oauth:xai*` → grok; `antigravity:google` /
+`oauth:google*` → gemini (merge 3). Unknown prefixes ignored with warning.
 
-`fetch_handle(Vault{..})`: resolve via CredentialSource, then run the SAME
-request path as the local-credential fetch with the served token:
-- codex: payload → access token; ChatGPT-Account-Id header from
-  GetResult.account_id (fallback: parse the claim from the token as today);
-  observation = account_id + record_version. Banked resets: the SAME
-  eligibility rules apply per account (OAuth + non-empty account_id);
-  journal + spend bound are already account-keyed; the consume POST uses the
-  vault-served token. On 401/403 from the provider: report_auth_failure with
-  the served record_version, then degrade as today.
-- anthropic / grok: payload → bearer token for the existing endpoints; no
-  account claim table upstream yet → account_id likely absent → the C1
-  emission gate keeps ONE unlabeled entry per provider until the vault
-  serves identities for them (correct, ALF-confirmed interim).
-- gemini / antigravity-oauth: payload is the full OAuth credential JSON
-  (vault owns refresh; we stop refreshing ourselves for vault handles —
-  strictly less bespoke OAuth in our repo, CKCRED's charter direction).
-
-Dedup: two handles serving the SAME account_id (e.g. implicit-local
-~/.codex/auth.json AND vault chatgpt:openai are both 291f5165 today) is
-ALREADY handled: the read-time gate dedups by account preferring
-Fresh > StaleTransient > Degraded, and the banked-resets journal fences
-consumes per account, so two fetch units cannot double-spend one account's
-credits. This exact topology becomes a live regression case.
+- codex (merge 1): vault lane builds ServedCodexContext; banked resets run
+  per account under the existing account-keyed journal + in-process fence
+  (Oracle V10 confirmed sufficient — first reserver wins, the other unit
+  sees in-flight/pending/spend-bound; a REGISTRY-level two-units-one-account
+  one-POST test is added). DOCUMENTED exception to the "walled ≤ ~2 refresh
+  cycles" guarantee: after a consume, a genuine second exhaustion within 30
+  minutes waits out the account-level spend bound (correct safety posture —
+  credits are account-global; never make the bound handle-scoped).
+- anthropic / grok (merge 2): vault payload → bearer for the existing
+  endpoints; account_id absent upstream today → C1 keeps one unlabeled entry
+  per provider (ALF-confirmed interim).
+- gemini (merge 3, V9): STRICT dispatch by handle source. Implicit-local
+  keeps today's file/cache/refresh path. The vault lane parses the served
+  credential JSON, uses ONLY the served access token, NEVER consults or
+  populates the local token cache, never refreshes locally (vault owns
+  refresh). Note: two valid tokens for one Google account share server-side
+  rate limits — correlated 429s are expected and classified transient.
+- antigravity OAuth fallback: DEFERRED (no existing OAuth request path; the
+  local probe remains the only antigravity lane).
 
 ## What this deliberately does NOT change
 
-- No slot-machinery changes (key, backoff, fencing, emission all shipped).
-- No wire/model changes; labels appear exactly as the emission gate already
-  specifies.
-- The local implicit handles stay (coexistence, dedup at read) — removing
-  local reads is a separate decommission decision, not this build.
-- Banked resets: no knob change; global arming per Ufuk ruling.
+- Slot machinery beyond the two targeted fixes (V1 fencing hook, V4
+  selection): key shape, backoff, incarnation fencing, heartbeat, relax
+  transform all unchanged.
+- No wire/model changes.
+- Implicit-local handles stay (coexistence, dedup at read; the dedup-two-
+  handles-one-account topology is live on this host today and becomes a
+  regression case). Decommissioning local reads is a later decision.
+- Banked resets: no knob change.
 
 ## Verification plan
 
-- Unit: handle-file loader (permissions/symlink/malformed/absent), id→
-  provider mapping, class→FetchError mapping, dedup-two-handles-one-account
-  (mock CredentialSource), record_version bump → label re-resolution,
-  report_auth_failure carries served version (mock captures it).
-- e2e (skeleton): a stub vault module served by the in-process daemon
-  (tests/common already drives the consumer wire) serving two openai
-  credentials with distinct account_ids → assert TWO labeled codex entries
-  on the wire; kill the stub → codex slots degrade transient, others
-  unaffected.
-- Live smoke (the deferred end-goal): both real accounts through the real
-  vault + real daemon → two labeled codex entries with correct per-account
-  percents; banked-resets log lines show per-account credit counts.
+Unit: loader (O_NOFOLLOW/fstat path, duplicate-key rejection, identical-
+capability dedup, absent/malformed/insecure → authoritative-empty vs
+transient-IO → H5 retained), capability-identity slot equality (same id +
+changed raw = new incarnation), V1 fencing (vault-get Transient with prior
+observation ⇒ entry cleared + flux, NOT stale-served — the F1-class
+regression), class mapping table incl. unknown-class fail-closed,
+ServedCodexContext single-source construction (mock asserts journal key ==
+context account == bearer's account), report_auth_failure carries served
+version on usage AND credits AND consume 401s, V4 selection (cold NotFound
+vault + Fresh local ⇒ local served), redacted Debug on secret types
+(compile-time trait test or format! assertion).
+Client: multiplex under 8 concurrent gets (mock daemon), route-gone
+recovery re-opens route on live connection, connection-death recovery,
+generation fencing (late old-generation failure doesn't evict), cancelled-
+caller deregistration, single-flight connect storm.
+Registry-level: two codex units (mock vault + mock local) one account ⇒
+exactly one consume POST through the REAL scheduler admission path.
+e2e (skeleton): stub vault module on the in-process daemon serving two
+openai credentials with distinct account_ids ⇒ TWO labeled codex entries on
+the wire; stub killed mid-run ⇒ codex fails closed (no stale old-account
+labels), others unaffected.
+Live smoke (the end-goal): both real accounts through the real vault ⇒ two
+labeled codex entries, per-account percents, per-account banked-resets log
+lines; then kill -9 ck-credentials and verify fail-closed labels.
