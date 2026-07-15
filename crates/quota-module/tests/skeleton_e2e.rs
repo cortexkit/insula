@@ -26,15 +26,27 @@
 
 mod common;
 
-use std::{net::Ipv4Addr, path::Path, path::PathBuf, process, time::Duration};
+use std::{
+    collections::HashMap, net::Ipv4Addr, path::Path, path::PathBuf, process, time::Duration,
+};
 
 use serde_json::Value;
-use subc_core::{serve_listener, ControlHandler, Registry, Router, ServerAuth};
-use subc_protocol::FrameType;
+use subc_core::{
+    read_frame, serve_listener, write_frame, ControlHandler, Registry, Router, ServerAuth,
+};
+use subc_protocol::{
+    manifest::{
+        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+    },
+    session::{ModuleControlRequest, ModuleControlResponse},
+    Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION,
+};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     process::{Child, Command},
     time::{sleep, Instant},
@@ -100,6 +112,263 @@ async fn start_daemon() -> TestDaemon {
     }
 }
 
+// ---- credential and HTTP stubs --------------------------------------------
+
+const VAULT_MODULE_ID: &str = "cortexkit-credentials";
+
+struct VaultStub {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl VaultStub {
+    fn stop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for VaultStub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn vault_manifest() -> ModuleManifest {
+    ModuleManifest {
+        module_id: VAULT_MODULE_ID.to_string(),
+        module_version: "test-stub".to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: vec![ProviderRole::ManagementSurface {
+            operations: vec![
+                ManagementOperation {
+                    name: "credential.get".to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+                ManagementOperation {
+                    name: "credential.report_auth_failure".to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+            ],
+            config_schema: serde_json::json!({"type":"object"}),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+        }],
+        consumes: Vec::new(),
+        scheduled_tasks: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: Vec::new(),
+            },
+        },
+    }
+}
+
+async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
+    let mut stream = connect_consumer(connection_file_path).await;
+    let hello = Frame::build(
+        FrameType::Hello,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&ModuleHelloBody {
+            manifest: vault_manifest(),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut stream, &hello).await.unwrap();
+    let ack = read_frame(&mut stream).await.unwrap().unwrap();
+    assert_eq!(ack.header.ty, FrameType::HelloAck);
+
+    let credentials: HashMap<&'static str, (&'static [u8], &'static str, u64)> = HashMap::from([
+        (
+            "ckh_openai_primary",
+            (b"vault-token-primary".as_slice(), "account-primary", 7),
+        ),
+        (
+            "ckh_openai_second",
+            (b"vault-token-second".as_slice(), "account-second", 11),
+        ),
+    ]);
+    let task = tokio::spawn(async move {
+        while let Ok(Some(frame)) = read_frame(&mut stream).await {
+            let response = match frame.header.ty {
+                FrameType::Ping => Frame::build_with_version(
+                    frame.header.ver,
+                    FrameType::Pong,
+                    frame.header.flags,
+                    0,
+                    0,
+                    frame.header.corr,
+                    Vec::new(),
+                )
+                .unwrap(),
+                FrameType::Request if frame.header.channel == 0 => {
+                    let request: ModuleControlRequest =
+                        serde_json::from_slice(&frame.body).unwrap();
+                    let body = match request {
+                        ModuleControlRequest::RouteBind { .. } => {
+                            serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap()
+                        }
+                        ModuleControlRequest::HealthCheck {} => unreachable!(),
+                    };
+                    Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Response,
+                        Flags::new(false, Priority::Passive, false),
+                        0,
+                        0,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap()
+                }
+                FrameType::Request => {
+                    let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                    let result = match request["method"].as_str() {
+                        Some("credential.get") => {
+                            assert_eq!(request["params"]["min_ttl_ms"], 120_000);
+                            let handle = request["params"]["handle"].as_str().unwrap_or_default();
+                            match credentials.get(handle) {
+                                Some((payload, account_id, record_version)) => serde_json::json!({
+                                    "result": {
+                                        "payload": payload,
+                                        "expires_at_ms": null,
+                                        "record_version": record_version,
+                                        "account_id": account_id,
+                                    }
+                                }),
+                                None => serde_json::json!({
+                                    "result": {"error": {"code": "not_found", "class": "permanent"}}
+                                }),
+                            }
+                        }
+                        Some("credential.report_auth_failure") => {
+                            serde_json::json!({"result": {}})
+                        }
+                        _ => serde_json::json!({
+                            "result": {"error": {"code": "unknown_method", "class": "permanent"}}
+                        }),
+                    };
+                    Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Response,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        serde_json::to_vec(&result).unwrap(),
+                    )
+                    .unwrap()
+                }
+                _ => continue,
+            };
+            if write_frame(&mut stream, &response).await.is_err() {
+                return;
+            }
+        }
+    });
+    VaultStub { task }
+}
+
+struct UsageHttpStub {
+    base_url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UsageHttpStub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_usage_http_stub() -> UsageHttpStub {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = vec![0; 16 * 1024];
+                let Ok(size) = stream.read(&mut request).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&request[..size]);
+                let header = |wanted: &str| {
+                    request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+                    })
+                };
+                let account = header("chatgpt-account-id");
+                let authorization = header("authorization");
+                assert!(
+                    matches!(
+                        (account, authorization),
+                        (
+                            Some("account-primary"),
+                            Some("Bearer local-token" | "Bearer vault-token-primary")
+                        ) | (Some("account-second"), Some("Bearer vault-token-second"))
+                    ),
+                    "bearer/account headers must come from one served context"
+                );
+                let used_percent = match account {
+                    Some("account-second") => 62,
+                    _ => 21,
+                };
+                let body = serde_json::json!({
+                    "rate_limit": {
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": used_percent,
+                            "reset_at": 1900000000,
+                            "limit_window_seconds": 604800
+                        }
+                    }
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    UsageHttpStub {
+        base_url: format!("http://{address}/backend-api"),
+        task,
+    }
+}
+
+fn write_owner_only(path: &Path, body: &[u8]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).unwrap();
+    std::io::Write::write_all(&mut file, body).unwrap();
+}
+
 // ---- the real module process ----------------------------------------------
 
 struct ModuleProcess {
@@ -120,6 +389,10 @@ fn quota_module_command(subc_connection_file: &Path, test_temp_dir: &Path) -> Co
         .env("SUBC_MODULE_ID", MODULE_ID)
         .env("XDG_CONFIG_HOME", test_temp_dir.join("quota-config"))
         .env("CK_QUOTA_STATE_DIR", test_temp_dir.join("quota-state"))
+        .env(
+            "CK_QUOTA_VAULT_HANDLES_PATH",
+            test_temp_dir.join("absent-vault-handles.json"),
+        )
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
     command
@@ -148,6 +421,10 @@ fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
     assert_eq!(
         env.get("CK_QUOTA_STATE_DIR"),
         Some(&"/isolated-test-rig/quota-state")
+    );
+    assert_eq!(
+        env.get("CK_QUOTA_VAULT_HANDLES_PATH"),
+        Some(&"/isolated-test-rig/absent-vault-handles.json")
     );
 }
 
@@ -233,6 +510,111 @@ async fn skeleton_round_trips_usage_get_over_the_wire() {
         healthy ^ degraded,
         "codex entry must be exactly one of healthy|degraded: {codex}"
     );
+}
+
+#[tokio::test]
+async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
+    let daemon = start_daemon().await;
+    let usage_stub = start_usage_http_stub().await;
+    let mut vault_stub = start_vault_stub(&daemon.connection_file_path).await;
+    wait_for_registration(&daemon.registry, VAULT_MODULE_ID, SETUP_TIMEOUT).await;
+
+    let codex_home = daemon.temp_dir.join("codex-home");
+    write_owner_only(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"local-token","account_id":"account-primary"}}"#,
+    );
+    write_owner_only(
+        &codex_home.join("config.toml"),
+        format!("chatgpt_base_url = {:?}\n", usage_stub.base_url).as_bytes(),
+    );
+    let handles_path = daemon.temp_dir.join("vault-handles.json");
+    write_owner_only(
+        &handles_path,
+        br#"{"handles":{"chatgpt:openai":"ckh_openai_primary","chatgpt:openai:gmail":"ckh_openai_second"}}"#,
+    );
+
+    let child = quota_module_command(&daemon.connection_file_path, &daemon.temp_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("CK_QUOTA_VAULT_HANDLES_PATH", &handles_path)
+        .spawn()
+        .expect("spawn vault-wired quota-module");
+    let _module = ModuleProcess { child };
+    wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
+
+    let project_root = daemon.temp_dir.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut consumer = connect_consumer(&daemon.connection_file_path).await;
+    let route = route_open(&mut consumer, &project_root, 10).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut corr = 11;
+    let initial = loop {
+        let response = usage_get(&mut consumer, route, corr).await;
+        let result = response["result"].as_array().cloned().unwrap_or_default();
+        let mut codex_accounts = result
+            .iter()
+            .filter(|entry| entry["provider"] == "codex")
+            .filter_map(|entry| entry["account"].as_str())
+            .collect::<Vec<_>>();
+        codex_accounts.sort_unstable();
+        if codex_accounts == ["account-primary", "account-second"] {
+            let used_percent = |account: &str| {
+                result
+                    .iter()
+                    .find(|entry| entry["provider"] == "codex" && entry["account"] == account)
+                    .and_then(|entry| entry["usage"]["primary"]["usedPercent"].as_f64())
+            };
+            assert_eq!(used_percent("account-primary"), Some(21.0));
+            assert_eq!(used_percent("account-second"), Some(62.0));
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "two vault-backed codex accounts did not arrive: {result:?}"
+        );
+        corr += 1;
+        sleep(Duration::from_millis(100)).await;
+    };
+    let unaffected_provider = initial
+        .iter()
+        .find(|entry| entry["provider"] != "codex")
+        .and_then(|entry| entry["provider"].as_str())
+        .map(ToString::to_string)
+        .expect("at least one non-codex provider should complete in the same sweep");
+
+    vault_stub.stop();
+
+    let deadline = Instant::now() + Duration::from_secs(80);
+    loop {
+        corr += 1;
+        let response = usage_get(&mut consumer, route, corr).await;
+        let result = response["result"].as_array().cloned().unwrap_or_default();
+        let codex = result
+            .iter()
+            .filter(|entry| entry["provider"] == "codex")
+            .collect::<Vec<_>>();
+        let failed_closed = codex.len() == 1
+            && codex[0]["account"] == "account-primary"
+            && codex[0]["error"].is_null()
+            && codex[0]["usage"]["primary"]["usedPercent"] == 21.0
+            && !result
+                .iter()
+                .any(|entry| entry["provider"] == "codex" && entry["account"] == "account-second");
+        if failed_closed {
+            assert!(
+                result
+                    .iter()
+                    .any(|entry| entry["provider"] == unaffected_provider),
+                "non-codex provider disappeared after the vault was killed: {result:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "vault labels were stale-served after the stub died: {result:?}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Locks the module-data-plane ERROR contract (the precedent for every future

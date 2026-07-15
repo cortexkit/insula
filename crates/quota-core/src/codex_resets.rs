@@ -18,6 +18,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::http::{Header, JsonRequest};
 use crate::model::Usage;
 use crate::provider::FetchError;
@@ -612,12 +613,62 @@ pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
         })
 }
 
+/// CAS identity used to report a provider rejection of a vault-served token.
+#[derive(Clone)]
+pub struct AuthFailureContext {
+    pub source: Arc<dyn CredentialSource>,
+    pub capability: VaultCapability,
+    pub record_version: u64,
+}
+
+impl std::fmt::Debug for AuthFailureContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthFailureContext")
+            .field("source", &"<credential-source>")
+            .field("capability", &"<redacted>")
+            .field("record_version", &self.record_version)
+            .finish()
+    }
+}
+
 /// Authentication and endpoint information shared by credits and consume calls.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResetRequest {
     pub base_url: String,
     pub bearer: String,
     pub account_id: String,
+    pub auth_failure: Option<AuthFailureContext>,
+}
+
+impl ResetRequest {
+    pub fn report_auth_failure(&self, error: &FetchError) {
+        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+            return;
+        };
+        let Some(context) = self.auth_failure.clone() else {
+            return;
+        };
+        let status = *status;
+        tokio::spawn(async move {
+            context
+                .source
+                .report_auth_failure(&context.capability, status, context.record_version)
+                .await;
+        });
+    }
+}
+
+impl std::fmt::Debug for ResetRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResetRequest")
+            .field("base_url", &self.base_url)
+            .field("bearer", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("auth_failure", &self.auth_failure)
+            .finish()
+    }
 }
 
 /// Credits response plus the server clock hedge carried in its `Date` header.
@@ -677,7 +728,11 @@ impl ResetTransport for ReqwestResetTransport {
         for header in reset_headers(request) {
             http_request = http_request.header(header);
         }
-        let response = http_request.send_full(&self.http).await?;
+        let response = if request.auth_failure.is_some() {
+            http_request.send_codex_status_first(&self.http).await?
+        } else {
+            http_request.send_full(&self.http).await?
+        };
         Ok(CreditsHttpResponse {
             date_header: response.header("Date").map(ToString::to_string),
             body: response.body,
@@ -700,7 +755,14 @@ impl ResetTransport for ReqwestResetTransport {
         for header in reset_headers(request) {
             http_request = http_request.header(header);
         }
-        http_request.send(&self.http).await
+        if request.auth_failure.is_some() {
+            http_request
+                .send_codex_status_first(&self.http)
+                .await
+                .map(|response| response.body)
+        } else {
+            http_request.send(&self.http).await
+        }
     }
 }
 
@@ -1003,6 +1065,7 @@ impl ResetCoordinator {
                 }
             },
             Ok(Err(error)) => {
+                request.report_auth_failure(&error);
                 eprintln!(
                     "[ck-quota] warning: codex reset POST failed account_id={account_id} redeem_request_id={request_id}: {error}"
                 );

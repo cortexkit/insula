@@ -191,6 +191,56 @@ impl JsonRequest {
         Ok(raw)
     }
 
+    /// Codex vault requests must retain the HTTP status even when a rejected
+    /// response body is truncated. Successful bodies remain mandatory; rejected
+    /// bodies are diagnostic-only and are consumed on a best-effort basis.
+    pub(crate) async fn send_codex_status_first(
+        self,
+        client: &reqwest::Client,
+    ) -> Result<HttpResponse, FetchError> {
+        let mut builder = match &self.method {
+            Method::Get => client.get(&self.url),
+            Method::Post(body) => client.post(&self.url).body(body.clone()),
+        }
+        .timeout(self.timeout);
+        for header in &self.headers {
+            builder = builder.header(header.name, &header.value);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| FetchError::Upstream(error.to_string()))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            if response.bytes().await.is_err() {
+                eprintln!(
+                    "[ck-quota] warning: codex rejected-response body was incomplete status={status}"
+                );
+            }
+            return Err(FetchError::ProviderStatus(status));
+        }
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body: body.to_vec(),
+        })
+    }
+
     /// Execute the request and return the raw status + headers + body with NO
     /// status-based error mapping (only transport/timeout → `Upstream`). For the
     /// rare provider whose status semantics are bespoke — e.g. doubao must read

@@ -23,3 +23,5 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
+base64 = "0.22"
+libc = "0.2"

@@ -152,6 +152,32 @@ mod tests {
     }
 
     #[test]
+    fn same_id_changed_capability_is_remove_add_with_new_incarnation() {
+        use crate::credential_source::VaultCapability;
+
+        let now = Instant::now();
+        let first_handle =
+            CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_first_secret"));
+        let second_handle =
+            CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_second_secret"));
+        assert_ne!(first_handle, second_handle);
+        assert!(!format!("{first_handle:?}").contains("ckh_first_secret"));
+
+        let first_key = SlotKey::new("codex", first_handle.clone());
+        let second_key = SlotKey::new("codex", second_handle.clone());
+        let mut store = SlotStore::new(now);
+        store.reconcile("codex", &[first_handle], now);
+        let first_incarnation = store.get(&first_key).unwrap().incarnation;
+
+        store.reconcile("codex", &[second_handle], now);
+        assert!(store.get(&first_key).is_none());
+        assert_ne!(
+            store.get(&second_key).unwrap().incarnation,
+            first_incarnation
+        );
+    }
+
+    #[test]
     fn stale_publication_cannot_resurrect_or_overwrite_a_readded_key() {
         let now = Instant::now();
         let handle = CredentialHandle::new("H");

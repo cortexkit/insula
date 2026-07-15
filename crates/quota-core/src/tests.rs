@@ -5,18 +5,22 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::codex_resets::{
-    evaluate_trigger, normalize_credits, reporting_eligible, response_now, ConsumeOutcome,
-    CreditsHttpResponse, RedemptionJournal, Reservation, ResetCoordinator, ResetRequest,
-    ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
+    evaluate_trigger, normalize_credits, reporting_eligible, response_now, AuthFailureContext,
+    ConsumeOutcome, CreditsHttpResponse, RedemptionJournal, Reservation, ResetCoordinator,
+    ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
+use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential, VaultGetError};
 use crate::model::{ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, FetchError, HandlesError};
 use crate::refresh::{BASE_INTERVAL, FRESH_HORIZON};
+use crate::vault_handles::VaultHandleLoader;
 
 fn handle(id: &str) -> CredentialHandle {
     CredentialHandle::new(id)
@@ -277,6 +281,81 @@ async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_dedupli
     let deduplicated = registry.get_usage(None).await;
     assert_eq!(deduplicated.len(), 1);
     assert_eq!(deduplicated[0].account.as_deref(), Some("A"));
+}
+
+struct UnresolvedSelectionProvider;
+
+#[async_trait]
+impl UsageProvider for UnresolvedSelectionProvider {
+    fn name(&self) -> &str {
+        "selection"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![
+            CredentialHandle::implicit(),
+            CredentialHandle::vault(
+                "chatgpt:openai",
+                crate::credential_source::VaultCapability::new("ckh_selection_secret"),
+            ),
+        ])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if handle.is_local() {
+            FetchAttempt::success(observed(None), "local-primary", Usage::default())
+        } else {
+            FetchAttempt::failure(
+                None,
+                None,
+                FetchError::NoSession("vault credential not found".to_string()),
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn unresolved_selection_prefers_fresh_local_over_cold_vault() {
+    assert!(
+        CredentialHandle::vault(
+            "chatgpt:openai",
+            crate::credential_source::VaultCapability::new("ckh_sort_proof"),
+        )
+        .sort_cmp(&CredentialHandle::implicit())
+            == std::cmp::Ordering::Less,
+        "the regression must put the degraded vault slot first in stable order"
+    );
+    let registry = Registry::new(vec![Box::new(UnresolvedSelectionProvider)]);
+    tick(&registry).await;
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].source.as_deref(), Some("local-primary"));
+    assert!(usage[0].error.is_none());
+}
+
+#[tokio::test]
+async fn i6_pending_local_does_not_hide_degraded_vault_entry() {
+    let registry = Registry::new(vec![Box::new(UnresolvedSelectionProvider)]);
+    tick(&registry).await;
+
+    let local_key = SlotKey::new("selection", CredentialHandle::implicit());
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut local = store.get(&local_key).unwrap().clone();
+        local.entry = None;
+        local.status = refresh::SlotStatus::Pending;
+        assert!(store.publish_if_current(
+            &local_key,
+            local.incarnation,
+            local.attempt_sequence,
+            local,
+        ));
+    }
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert!(usage[0].error.is_some(), "degraded vault entry was hidden");
 }
 
 struct SwapFailureProvider {
@@ -1082,6 +1161,7 @@ fn reset_request(bearer: &str) -> ResetRequest {
         base_url: "https://example.invalid/backend-api".to_string(),
         bearer: bearer.to_string(),
         account_id: "acct-reset".to_string(),
+        auth_failure: None,
     }
 }
 
@@ -1109,6 +1189,7 @@ fn reset_tick_input(now: chrono::DateTime<Utc>, facts: UsageFacts) -> ResetTickI
 enum MockConsumeBehavior {
     Outcome(ConsumeOutcome),
     Error,
+    Status(u16),
     Hang,
     Block(ConsumeOutcome),
 }
@@ -1116,6 +1197,7 @@ enum MockConsumeBehavior {
 struct MockResetTransport {
     behavior: MockConsumeBehavior,
     posts: AtomicUsize,
+    consume_accounts: Mutex<Vec<String>>,
     reservation_visible: AtomicBool,
     journal_path: Option<std::path::PathBuf>,
     credits_error: bool,
@@ -1128,6 +1210,7 @@ impl MockResetTransport {
         Self {
             behavior,
             posts: AtomicUsize::new(0),
+            consume_accounts: Mutex::new(Vec::new()),
             reservation_visible: AtomicBool::new(false),
             journal_path: None,
             credits_error: false,
@@ -1180,7 +1263,7 @@ impl ResetTransport for MockResetTransport {
 
     async fn consume(
         &self,
-        _request: &ResetRequest,
+        request: &ResetRequest,
         redeem_request_id: &str,
     ) -> Result<Vec<u8>, FetchError> {
         if let Some(path) = &self.journal_path {
@@ -1197,10 +1280,15 @@ impl ResetTransport for MockResetTransport {
             );
         }
         self.posts.fetch_add(1, Ordering::SeqCst);
+        self.consume_accounts
+            .lock()
+            .unwrap()
+            .push(request.account_id.clone());
         self.started.add_permits(1);
         match self.behavior {
             MockConsumeBehavior::Outcome(outcome) => Ok(Self::body(outcome)),
             MockConsumeBehavior::Error => Err(FetchError::Upstream("mock HTTP 503".into())),
+            MockConsumeBehavior::Status(status) => Err(FetchError::ProviderStatus(status)),
             MockConsumeBehavior::Hang => {
                 std::future::pending::<Result<Vec<u8>, FetchError>>().await
             }
@@ -1211,6 +1299,288 @@ impl ResetTransport for MockResetTransport {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct MockReportingCredentialSource {
+    reports: Mutex<Vec<(u16, u64)>>,
+}
+
+#[async_trait]
+impl CredentialSource for MockReportingCredentialSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::Permanent)
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        provider_status: u16,
+        record_version: u64,
+    ) {
+        self.reports
+            .lock()
+            .unwrap()
+            .push((provider_status, record_version));
+    }
+}
+
+fn reporting_reset_request(
+    source: Arc<MockReportingCredentialSource>,
+    secret: &str,
+) -> ResetRequest {
+    let source: Arc<dyn CredentialSource> = source;
+    ResetRequest {
+        base_url: "https://example.invalid/backend-api".to_string(),
+        bearer: secret.to_string(),
+        account_id: "acct-reset".to_string(),
+        auth_failure: Some(AuthFailureContext {
+            source,
+            capability: VaultCapability::new("ckh_reporting_secret"),
+            record_version: 31,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn credits_and_consume_auth_failures_report_served_version() {
+    let source = Arc::new(MockReportingCredentialSource::default());
+    let request = reporting_reset_request(Arc::clone(&source), "reset-bearer-secret");
+
+    request.report_auth_failure(&FetchError::ProviderStatus(401));
+    tokio::task::yield_now().await;
+
+    let temp = ResetTempDir::new("consume-auth-report");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Status(401));
+    coordinator
+        .process_tick(
+            "acct-reset",
+            reset_tick_input(reset_now(), reset_facts(100.0, true)),
+            &transport,
+            &request,
+        )
+        .await;
+    tokio::task::yield_now().await;
+
+    let mut reports = source.reports.lock().unwrap().clone();
+    reports.sort_unstable();
+    assert_eq!(reports, vec![(401, 31), (401, 31)]);
+}
+
+#[test]
+fn reset_request_debug_redacts_bearer_and_capability() {
+    let source = Arc::new(MockReportingCredentialSource::default());
+    let request = reporting_reset_request(source, "reset-debug-secret");
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("reset-debug-secret"));
+    assert!(!debug.contains("ckh_reporting_secret"));
+    assert!(debug.contains("redacted"));
+}
+
+struct SameAccountVaultSource {
+    gets: AtomicUsize,
+}
+
+#[async_trait]
+impl CredentialSource for SameAccountVaultSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        assert_eq!(min_ttl_ms, 120_000);
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Ok(VaultCredential {
+            payload: b"real-provider-vault-token".to_vec(),
+            expires_at_ms: None,
+            record_version: 8,
+            account_id: Some("real-provider-account".to_string()),
+            project_id: None,
+        })
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+}
+
+fn write_owner_only_test_file(path: &std::path::Path, body: &[u8]) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).unwrap();
+    std::io::Write::write_all(&mut file, body).unwrap();
+}
+
+#[tokio::test]
+async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
+    let temp = ResetTempDir::new("real-provider-two-unit-one-post");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.lines().any(|line| {
+                line.eq_ignore_ascii_case("chatgpt-account-id: real-provider-account")
+            }));
+            assert!(request.lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer real-provider-local-token")
+                    || line.eq_ignore_ascii_case("authorization: Bearer real-provider-vault-token")
+            }));
+            let body = serde_json::json!({
+                "rate_limit": {
+                    "limit_reached": true,
+                    "primary_window": {
+                        "used_percent": 100.0,
+                        "reset_at": 1_900_000_000_i64,
+                        "limit_window_seconds": 604_800
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"real-provider-local-token","account_id":"real-provider-account"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    let handles_path = temp.dir.join("vault-handles.json");
+    write_owner_only_test_file(
+        &handles_path,
+        br#"{"handles":{"chatgpt:openai":"ckh_real_provider"}}"#,
+    );
+
+    let source = Arc::new(SameAccountVaultSource {
+        gets: AtomicUsize::new(0),
+    });
+    let credential_source: Arc<dyn CredentialSource> = source.clone();
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let provider = crate::codex::CodexProvider::new_for_test(
+        crate::config::CodexConfig {
+            auto_use_resets: 172_800,
+        },
+        Some(credential_source),
+        reset_transport,
+        coordinator,
+        VaultHandleLoader::new(Some(handles_path)),
+        codex_home,
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    http_server.await.unwrap();
+
+    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec!["real-provider-account".to_string()]
+    );
+    let usage = registry.get_usage(Some("codex")).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].account.as_deref(), Some("real-provider-account"));
+}
+
+struct TwoUnitResetProvider {
+    coordinator: Arc<ResetCoordinator>,
+    transport: Arc<MockResetTransport>,
+}
+
+#[async_trait]
+impl UsageProvider for TwoUnitResetProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![
+            CredentialHandle::implicit(),
+            CredentialHandle::vault(
+                "chatgpt:openai:gmail",
+                crate::credential_source::VaultCapability::new("ckh_same_account"),
+            ),
+        ])
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let facts = reset_facts(100.0, true);
+        self.coordinator
+            .process_tick(
+                "same-codex-account",
+                reset_tick_input(reset_now(), facts),
+                self.transport.as_ref(),
+                &ResetRequest {
+                    base_url: "https://example.invalid/backend-api".to_string(),
+                    bearer: "same-account-token".to_string(),
+                    account_id: "same-codex-account".to_string(),
+                    auth_failure: None,
+                },
+            )
+            .await;
+        FetchAttempt::success(
+            observed(Some("same-codex-account")),
+            "test",
+            full_usage(100.0),
+        )
+    }
+}
+
+#[tokio::test]
+async fn registry_scheduler_two_codex_units_same_account_send_one_consume_post() {
+    let temp = ResetTempDir::new("registry-two-unit-one-post");
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let registry = Registry::new(vec![Box::new(TwoUnitResetProvider {
+        coordinator,
+        transport: Arc::clone(&transport),
+    })]);
+
+    tick(&registry).await;
+
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    let usage = registry.get_usage(Some("codex")).await;
+    assert_eq!(usage.len(), 1, "same-account slots must deduplicate");
+    assert_eq!(usage[0].account.as_deref(), Some("same-codex-account"));
 }
 
 #[test]

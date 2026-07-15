@@ -350,7 +350,8 @@ fn request_body(region: &RegionConfig) -> Vec<u8> {
 
 fn should_retry_alternate_region(err: &FetchError) -> bool {
     match err {
-        FetchError::Unauthorized(_) => true,
+        FetchError::Unauthorized(_) | FetchError::ProviderStatus(403 | 404) => true,
+        FetchError::ProviderStatus(_) => false,
         FetchError::Upstream(msg) => msg.contains("HTTP 404") || msg.contains("HTTP 403"),
         FetchError::Decode(msg) => {
             msg.contains("missing coding plan quota data") || msg.contains("no quota windows found")

@@ -14,7 +14,7 @@ use quota_core::{config::QuotaConfig, Registry};
 #[tokio::main]
 async fn main() {
     let filter = std::env::args().nth(1);
-    let registry = Registry::with_defaults(QuotaConfig::default());
+    let registry = Registry::with_defaults(QuotaConfig::default(), None);
     let usage = registry.get_usage(filter.as_deref()).await;
     // Pretty JSON so a human can eyeball it and `jq` can slice it for the diff.
     println!(
