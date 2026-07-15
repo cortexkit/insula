@@ -1,6 +1,18 @@
 # Vault-consumer wiring: multi-account credentials from cortexkit-credentials
 
 Status: DESIGN v1 — pending adversarial Oracle pass. Date: 2026-07-16.
+
+VAULT STATE (live, CKCRED-confirmed 2026-07-16, receipt-verified): the handle
+file at `~/.config/cortexkit/ck-quota/vault-handles.json` EXISTS (0600) with
+five freshly minted ck-quota-dedicated handles: `chatgpt:openai` (account
+291f5165, v3), `chatgpt:openai:gmail` (account 7b66addd, v1 — the second
+OpenAI account, vault-native login), `oauth:anthropic` (v22), `oauth:xai`
+(v10), `antigravity:google` (v116 — the ONLY google credential; there is no
+separate gemini-cli entry, so the gemini vault lane resolves through the
+antigravity-method credential, whose get also serves `project_id`).
+`antigravity:google` serves `account_id: None` by design (claim table maps
+openai-family only today) — its entries stay unlabeled per the C1 gate, which
+is correct for a single-credential provider.
 Scope ruling (Ufuk): design for codex (openai) + anthropic + grok (xai) +
 gemini/antigravity-oauth in one coherent shape; codex two-account is the
 priority pair; masons build per-provider. Banked resets knob stays GLOBAL —
