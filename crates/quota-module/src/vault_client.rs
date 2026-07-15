@@ -972,14 +972,21 @@ mod tests {
     #[tokio::test]
     async fn i9_public_client_timeout_deregisters_and_discards_late_response() {
         let (listener, path, key, daemon_id) = loopback_listener("timeout").await;
+        // The client timeout must fire strictly BETWEEN the request being sent
+        // and the response arriving, on any runner speed: the 1s budget is
+        // generous for loopback connect + auth + route.open (so the request is
+        // always sent), while the response is delayed well past the timeout.
+        // A tighter budget hangs slow runners: if the timeout expires before
+        // the request is even written, the server waits on a request that
+        // never comes and `server.await` never returns.
         let server = tokio::spawn(async move {
             let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
             reply_route(&mut stream, 7, 3).await;
             let request = read_frame(&mut stream).await.unwrap().unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
             let _ = write_frame(&mut stream, &get_success(&request, b"late-token")).await;
         });
-        let client = VaultClient::with_timeout(&path, Duration::from_millis(30));
+        let client = VaultClient::with_timeout(&path, Duration::from_secs(1));
 
         let result = client
             .get(&VaultCapability::new("ckh_timeout"), 120_000)
@@ -1000,7 +1007,12 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        server.await.unwrap();
+        // Bounded: a stub stuck waiting for a request that was never sent must
+        // fail the test, not wedge the whole test binary.
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("stub server did not finish: the get request never reached it")
+            .unwrap();
         // The late credential.get response arrived after the timeout: it must
         // have been discarded without reviving or leaking a pending entry.
         assert!(client.state.pending.lock().unwrap().is_empty());

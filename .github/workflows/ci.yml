@@ -29,6 +29,9 @@ jobs:
   test:
     name: Test (ubuntu)
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    # A wedged test must surface as a fast red run, not burn the runner for
+    # the 6-hour Actions default. Healthy runs finish well under 15 minutes.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ai-provider-quota
