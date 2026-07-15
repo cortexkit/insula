@@ -396,7 +396,7 @@ async fn send_codex_request(
 ) -> Result<Vec<u8>, FetchError> {
     if preserve_provider_status {
         request
-            .send_codex_status_first(client)
+            .send_provider_status_first(client, PROVIDER_NAME)
             .await
             .map(|response| response.body)
     } else {
@@ -466,7 +466,7 @@ pub struct CodexProvider {
     reset_transport: Arc<dyn ResetTransport>,
     reset_coordinator: Result<Arc<ResetCoordinator>, String>,
     credential_source: Option<Arc<dyn CredentialSource>>,
-    handle_loader: VaultHandleLoader,
+    handle_loader: Arc<VaultHandleLoader>,
     codex_home_override: Option<PathBuf>,
 }
 
@@ -474,6 +474,18 @@ impl CodexProvider {
     pub fn new(
         reset_config: CodexConfig,
         credential_source: Option<Arc<dyn CredentialSource>>,
+    ) -> Self {
+        Self::new_with_handle_loader(
+            reset_config,
+            credential_source,
+            Arc::new(VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        reset_config: CodexConfig,
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         let http = reqwest::Client::new();
         let reset_coordinator = if reset_config.is_enabled() {
@@ -489,7 +501,7 @@ impl CodexProvider {
             reset_config,
             reset_coordinator,
             credential_source,
-            handle_loader: VaultHandleLoader::from_env(),
+            handle_loader,
             codex_home_override: None,
         }
     }
@@ -509,7 +521,7 @@ impl CodexProvider {
             reset_transport,
             reset_coordinator: Ok(reset_coordinator),
             credential_source,
-            handle_loader,
+            handle_loader: Arc::new(handle_loader),
             codex_home_override: Some(codex_home_override),
         }
     }

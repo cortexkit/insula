@@ -102,10 +102,53 @@ impl<'de> Deserialize<'de> for HandleFile {
     }
 }
 
-/// Stateful warning suppression for the frequently-polled handles file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ProviderKind {
+    Codex,
+    Anthropic,
+    Grok,
+    Gemini,
+}
+
+#[derive(Clone, Default)]
+struct ProviderHandleSnapshot {
+    codex: Vec<CredentialHandle>,
+    anthropic: Vec<CredentialHandle>,
+    grok: Vec<CredentialHandle>,
+    gemini: Vec<CredentialHandle>,
+}
+
+impl ProviderHandleSnapshot {
+    fn for_provider(&self, provider: ProviderKind) -> &[CredentialHandle] {
+        match provider {
+            ProviderKind::Codex => &self.codex,
+            ProviderKind::Anthropic => &self.anthropic,
+            ProviderKind::Grok => &self.grok,
+            ProviderKind::Gemini => &self.gemini,
+        }
+    }
+
+    fn push(&mut self, provider: ProviderKind, handle: CredentialHandle) {
+        match provider {
+            ProviderKind::Codex => self.codex.push(handle),
+            ProviderKind::Anthropic => self.anthropic.push(handle),
+            ProviderKind::Grok => self.grok.push(handle),
+            ProviderKind::Gemini => self.gemini.push(handle),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoaderState {
+    last_warning: Option<String>,
+    cached: Option<Result<ProviderHandleSnapshot, HandlesError>>,
+    served_providers: HashSet<ProviderKind>,
+}
+
+/// Stateful warning suppression and one-parse-per-enumeration-cycle caching.
 pub struct VaultHandleLoader {
     path: Option<PathBuf>,
-    last_warning: Mutex<Option<String>>,
+    state: Mutex<LoaderState>,
 }
 
 impl VaultHandleLoader {
@@ -116,54 +159,84 @@ impl VaultHandleLoader {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
-            last_warning: Mutex::new(None),
+            state: Mutex::new(LoaderState::default()),
         }
     }
 
     /// Return the authoritative Codex vault handle snapshot for this scheduler turn.
     pub fn codex_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
-        let Some(path) = self.path.as_deref() else {
-            self.update_warning(None);
-            return Ok(Vec::new());
-        };
-        self.interpret(path, load_file(path))
+        self.provider_handles(ProviderKind::Codex)
+    }
+
+    /// Return the authoritative Anthropic vault handle snapshot for this scheduler turn.
+    pub fn anthropic_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Anthropic)
+    }
+
+    /// Return the authoritative Grok vault handle snapshot for this scheduler turn.
+    pub fn grok_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Grok)
+    }
+
+    /// Return the authoritative Gemini vault handle snapshot for this scheduler turn.
+    pub fn gemini_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Gemini)
+    }
+
+    fn provider_handles(
+        &self,
+        provider: ProviderKind,
+    ) -> Result<Vec<CredentialHandle>, HandlesError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.cached.is_none() || state.served_providers.contains(&provider) {
+            let (result, warning) = match self.path.as_deref() {
+                Some(path) => Self::interpret(path, load_file(path)),
+                None => (Ok(ProviderHandleSnapshot::default()), None),
+            };
+            Self::update_warning(&mut state, warning);
+            state.cached = Some(result);
+            state.served_providers.clear();
+        }
+        state.served_providers.insert(provider);
+        let snapshot = state
+            .cached
+            .as_ref()
+            .expect("vault handle snapshot initialized")
+            .clone()?;
+        Ok(snapshot.for_provider(provider).to_vec())
     }
 
     fn interpret(
-        &self,
         path: &Path,
         result: LoadResult,
-    ) -> Result<Vec<CredentialHandle>, HandlesError> {
+    ) -> (Result<ProviderHandleSnapshot, HandlesError>, Option<String>) {
         match result {
             LoadResult::Authoritative(handles) => {
-                let (handles, warning) = map_codex_handles(handles);
-                self.update_warning(warning);
-                Ok(handles)
+                let (handles, warning) = map_handles(handles);
+                (Ok(handles), warning)
             }
-            LoadResult::AuthoritativeEmpty(reason) => {
-                self.update_warning(Some(format!("{}: {reason}", path.display())));
-                Ok(Vec::new())
-            }
+            LoadResult::AuthoritativeEmpty(reason) => (
+                Ok(ProviderHandleSnapshot::default()),
+                Some(format!("{}: {reason}", path.display())),
+            ),
             LoadResult::Transient(reason) => {
                 let message = format!("{}: {reason}", path.display());
-                self.update_warning(Some(message.clone()));
-                Err(HandlesError::new(message))
+                (Err(HandlesError::new(message.clone())), Some(message))
             }
         }
     }
 
-    fn update_warning(&self, warning: Option<String>) {
-        let mut previous = self
-            .last_warning
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *previous == warning {
+    fn update_warning(state: &mut LoaderState, warning: Option<String>) {
+        if state.last_warning == warning {
             return;
         }
         if let Some(message) = warning.as_deref() {
             eprintln!("[ck-quota] warning: vault handles {message}");
         }
-        *previous = warning;
+        state.last_warning = warning;
     }
 }
 
@@ -258,7 +331,7 @@ fn transient_io(error: &std::io::Error) -> bool {
     false
 }
 
-fn map_codex_handles(handles: HashMap<String, String>) -> (Vec<CredentialHandle>, Option<String>) {
+fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Option<String>) {
     let mut invalid_ids = handles
         .iter()
         .filter_map(|(credential_id, capability)| {
@@ -278,39 +351,65 @@ fn map_codex_handles(handles: HashMap<String, String>) -> (Vec<CredentialHandle>
             .collect::<Vec<_>>()
             .join(",");
         return (
-            Vec::new(),
+            ProviderHandleSnapshot::default(),
             Some(format!("rejected invalid vault handle entries [{ids}]")),
         );
+    }
+
+    fn prefixed_id(id: &str, prefix: &str) -> bool {
+        id == prefix
+            || id
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(':'))
+    }
+
+    fn provider_for_id(id: &str) -> Option<ProviderKind> {
+        if prefixed_id(id, "chatgpt:openai") {
+            Some(ProviderKind::Codex)
+        } else if prefixed_id(id, "oauth:anthropic") {
+            Some(ProviderKind::Anthropic)
+        } else if prefixed_id(id, "oauth:xai") {
+            Some(ProviderKind::Grok)
+        } else if id == "antigravity:google" || prefixed_id(id, "oauth:google") {
+            Some(ProviderKind::Gemini)
+        } else {
+            None
+        }
     }
 
     let mut entries: Vec<_> = handles.into_iter().collect();
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut unsupported = Vec::new();
-    let mut by_capability: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_capability: HashMap<String, Vec<(String, ProviderKind)>> = HashMap::new();
     for (credential_id, capability) in entries {
-        if credential_id == "chatgpt:openai" || credential_id.starts_with("chatgpt:openai:") {
+        if let Some(provider) = provider_for_id(&credential_id) {
             by_capability
                 .entry(capability)
                 .or_default()
-                .push(credential_id);
+                .push((credential_id, provider));
         } else {
             unsupported.push(credential_id);
         }
     }
 
     let mut capabilities: Vec<_> = by_capability.into_iter().collect();
-    capabilities.sort_by(|(_, left_ids), (_, right_ids)| left_ids[0].cmp(&right_ids[0]));
+    capabilities.sort_by(|(_, left_ids), (_, right_ids)| left_ids[0].0.cmp(&right_ids[0].0));
     let mut duplicate_groups = Vec::new();
-    let mut mapped = Vec::with_capacity(capabilities.len());
+    let mut mapped = ProviderHandleSnapshot::default();
     for (capability, ids) in capabilities {
         if ids.len() > 1 {
-            duplicate_groups.push(ids.join(","));
+            duplicate_groups.push(
+                ids.iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
-        mapped.push(CredentialHandle::vault(
-            ids[0].clone(),
-            VaultCapability::new(capability),
-        ));
+        mapped.push(
+            ids[0].1,
+            CredentialHandle::vault(ids[0].0.clone(), VaultCapability::new(capability)),
+        );
     }
 
     let mut warnings = Vec::new();
@@ -322,7 +421,7 @@ fn map_codex_handles(handles: HashMap<String, String>) -> (Vec<CredentialHandle>
     }
     if !unsupported.is_empty() {
         warnings.push(format!(
-            "ignored ids outside merge-1 codex mapping [{}]",
+            "ignored ids outside supported vault mapping [{}]",
             unsupported.join(",")
         ));
     }
@@ -416,9 +515,51 @@ mod tests {
         );
         let loader = VaultHandleLoader::new(Some(path.clone()));
         assert!(loader.codex_handles().unwrap().is_empty());
-        let warning = loader.last_warning.lock().unwrap().clone().unwrap();
+        let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
         assert!(warning.contains("chatgpt:openai"));
         assert!(!warning.contains("ckh_x"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn all_supported_provider_ids_are_mapped_without_an_ignored_warning() {
+        let path = write_file(
+            "all-providers",
+            r#"{"handles":{"chatgpt:openai":"ckh_codex","oauth:anthropic":"ckh_anthropic","oauth:anthropic:work":"ckh_anthropic_work","oauth:xai":"ckh_grok","oauth:xai:work":"ckh_grok_work","antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","unknown:provider":"ckh_unknown"}}"#,
+        );
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+
+        assert_eq!(loader.codex_handles().unwrap().len(), 1);
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
+        assert_eq!(loader.grok_handles().unwrap().len(), 2);
+        assert_eq!(loader.gemini_handles().unwrap().len(), 2);
+        let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
+        assert!(warning.contains("unknown:provider"));
+        for mapped_id in ["oauth:anthropic", "oauth:xai", "antigravity:google"] {
+            assert!(!warning.contains(mapped_id));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_accessors_share_one_parse_until_a_provider_repeats() {
+        let path = write_file(
+            "one-parse",
+            r#"{"handles":{"chatgpt:openai":"ckh_codex","oauth:anthropic":"ckh_anthropic"}}"#,
+        );
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        assert_eq!(loader.codex_handles().unwrap().len(), 1);
+
+        std::fs::write(
+            &path,
+            r#"{"handles":{"chatgpt:openai":"ckh_codex","oauth:xai":"ckh_grok"}}"#,
+        )
+        .unwrap();
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+        assert!(loader.grok_handles().unwrap().is_empty());
+
+        assert_eq!(loader.codex_handles().unwrap().len(), 1);
+        assert_eq!(loader.grok_handles().unwrap().len(), 1);
         let _ = std::fs::remove_file(path);
     }
 
@@ -430,13 +571,11 @@ mod tests {
         assert!(!transient_io(&permanent));
 
         let path = PathBuf::from("/test/vault-handles.json");
-        let loader = VaultHandleLoader::new(Some(path.clone()));
-        assert!(loader
-            .interpret(&path, LoadResult::AuthoritativeEmpty("malformed"))
-            .unwrap()
-            .is_empty());
-        assert!(loader
-            .interpret(&path, LoadResult::Transient("read failed"))
-            .is_err());
+        let (empty, _) =
+            VaultHandleLoader::interpret(&path, LoadResult::AuthoritativeEmpty("malformed"));
+        assert!(empty.unwrap().codex.is_empty());
+        let (transient, _) =
+            VaultHandleLoader::interpret(&path, LoadResult::Transient("read failed"));
+        assert!(transient.is_err());
     }
 }

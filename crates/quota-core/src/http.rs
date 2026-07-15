@@ -191,12 +191,13 @@ impl JsonRequest {
         Ok(raw)
     }
 
-    /// Codex vault requests must retain the HTTP status even when a rejected
-    /// response body is truncated. Successful bodies remain mandatory; rejected
-    /// bodies are diagnostic-only and are consumed on a best-effort basis.
-    pub(crate) async fn send_codex_status_first(
+    /// Vault requests retain the HTTP status even when a rejected response body is
+    /// truncated. Successful bodies remain mandatory; rejected bodies are
+    /// diagnostic-only and are consumed on a best-effort basis.
+    pub(crate) async fn send_provider_status_first(
         self,
         client: &reqwest::Client,
+        provider: &'static str,
     ) -> Result<HttpResponse, FetchError> {
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
@@ -215,7 +216,7 @@ impl JsonRequest {
         if !(200..300).contains(&status) {
             if response.bytes().await.is_err() {
                 eprintln!(
-                    "[ck-quota] warning: codex rejected-response body was incomplete status={status}"
+                    "[ck-quota] warning: {provider} rejected-response body was incomplete status={status}"
                 );
             }
             return Err(FetchError::ProviderStatus(status));

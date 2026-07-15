@@ -3,8 +3,10 @@
 //! This is the deliberate 2nd spike: it shares codex's "OAuth bearer → one GET →
 //! decode JSON" skeleton but differs on every detail that could break the
 //! abstraction, which is exactly why it validates it:
-//!   - Session source: opencode's unified auth.json (`anthropic` OAuth entry),
-//!     NOT a provider-native file. CodexBar reads the macOS Keychain; we prefer
+//!   - Implicit-local session source: opencode's unified auth.json (`anthropic`
+//!     OAuth entry), NOT a provider-native file. Vault handles use the bare bearer
+//!     bytes served by the injected credential source. CodexBar reads the macOS
+//!     Keychain; we prefer
 //!     opencode's cross-platform store, which already holds the same token.
 //!   - Endpoint: `GET https://api.anthropic.com/api/oauth/usage` with the beta
 //!     header `anthropic-beta: oauth-2025-04-20` and a `claude-code/<ver>` UA.
@@ -13,15 +15,17 @@
 //!     ISO 8601 — unlike codex's int-percent + epoch. So normalization is a
 //!     near-passthrough here, mapping window names to known window lengths.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
+use crate::vault_handles::VaultHandleLoader;
 use crate::{
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{RateWindow, Usage},
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
 };
@@ -90,15 +94,119 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     })
 }
 
+fn canonical_account_id(account_id: Option<String>) -> Option<String> {
+    account_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn usage_request(url: &str, bearer: &str) -> JsonRequest {
+    JsonRequest::get(url)
+        .timeout(REQUEST_TIMEOUT)
+        .bearer(bearer)
+        .header(Header::new("anthropic-beta", BETA_HEADER))
+        .header(Header::new("User-Agent", CLAUDE_CODE_UA))
+}
+
 /// The anthropic usage provider.
 pub struct AnthropicProvider {
     http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    usage_url: String,
 }
 
 impl AnthropicProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
+            credential_source,
+            handle_loader,
+            usage_url: USAGE_URL.to_string(),
+        }
+    }
+
+    fn report_auth_failure(
+        &self,
+        capability: &VaultCapability,
+        record_version: u64,
+        error: &FetchError,
+    ) {
+        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+            return;
+        };
+        let Some(source) = self.credential_source.as_ref() else {
+            return;
+        };
+        let source = Arc::clone(source);
+        let capability = capability.clone();
+        let status = *status;
+        tokio::spawn(async move {
+            source
+                .report_auth_failure(&capability, status, record_version)
+                .await;
+        });
+    }
+
+    async fn fetch_local_bearer(&self, bearer: &str) -> FetchAttempt {
+        let result = usage_request(&self.usage_url, bearer)
+            .send(&self.http)
+            .await
+            .and_then(|body| normalize_usage(&body));
+        match result {
+            Ok(usage) => {
+                FetchAttempt::success(Some(AccountObservation::new(None, None)), "oauth", usage)
+            }
+            Err(error) => FetchAttempt::failure(None, None, error),
+        }
+    }
+
+    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match credential_source.get(capability, 120_000).await {
+            Ok(credential) => credential,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let record_version = credential.record_version;
+        let observed = Some(AccountObservation::new(
+            canonical_account_id(credential.account_id.clone()),
+            Some(record_version),
+        ));
+        let bearer = match String::from_utf8(std::mem::take(&mut credential.payload)) {
+            Ok(bearer) => bearer,
+            Err(error) => {
+                let mut payload = error.into_bytes();
+                payload.fill(0);
+                return FetchAttempt::failure(
+                    observed,
+                    None,
+                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
+                );
+            }
+        };
+
+        let result = usage_request(&self.usage_url, &bearer)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+            .map(|response| response.body)
+            .and_then(|body| normalize_usage(&body));
+        if let Err(error) = &result {
+            self.report_auth_failure(capability, record_version, error);
+        }
+        match result {
+            Ok(usage) => FetchAttempt::success(observed, "vault", usage),
+            Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
     }
 }
@@ -115,37 +223,331 @@ impl UsageProvider for AnthropicProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
-        let result: Result<ProviderUsage, FetchError> = async {
-            let auth = opencode_auth::read_provider(OPENCODE_PROVIDER)
-                .map_err(FetchError::NoSession)?
-                .ok_or_else(|| {
-                    FetchError::NoSession("no anthropic entry in opencode auth.json".to_string())
-                })?;
-            let access = match auth {
-                OpencodeAuth::Oauth { access, .. } => access,
-                OpencodeAuth::Api { key } => key,
-            };
-
-            let body = JsonRequest::get(USAGE_URL)
-                .timeout(REQUEST_TIMEOUT)
-                .bearer(&access)
-                .header(Header::new("anthropic-beta", BETA_HEADER))
-                .header(Header::new("User-Agent", CLAUDE_CODE_UA))
-                .send(&self.http)
-                .await?;
-
-            let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        let mut handles = vec![CredentialHandle::implicit()];
+        if self.credential_source.is_some() {
+            handles.extend(self.handle_loader.anthropic_handles()?);
         }
-        .await;
-        FetchAttempt::from_provider_usage(result)
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if let Some(capability) = handle.vault_capability() {
+            return self.fetch_vault(capability).await;
+        }
+
+        let access = match opencode_auth::read_provider(OPENCODE_PROVIDER)
+            .map_err(FetchError::NoSession)
+        {
+            Ok(Some(OpencodeAuth::Oauth { access, .. })) => access,
+            Ok(Some(OpencodeAuth::Api { key })) => key,
+            Ok(None) => {
+                return FetchAttempt::failure(
+                    None,
+                    None,
+                    FetchError::NoSession("no anthropic entry in opencode auth.json".to_string()),
+                );
+            }
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+        self.fetch_local_bearer(&access).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::credential_source::{VaultCredential, VaultGetError};
+    use crate::provider::CredentialResolution;
+    use crate::refresh::{next_slot_after_attempt, Incarnation, ProviderSlot};
+
+    type Reports = Arc<Mutex<Vec<(u16, u64)>>>;
+
+    struct MockCredentialSource {
+        get_result: Result<VaultCredential, VaultGetError>,
+        reports: Reports,
+    }
+
+    #[async_trait]
+    impl CredentialSource for MockCredentialSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            assert_eq!(min_ttl_ms, 120_000);
+            self.get_result.clone()
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            provider_status: u16,
+            record_version: u64,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((provider_status, record_version));
+        }
+    }
+
+    fn source(
+        get_result: Result<VaultCredential, VaultGetError>,
+    ) -> (Arc<dyn CredentialSource>, Reports) {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(MockCredentialSource {
+                get_result,
+                reports: Arc::clone(&reports),
+            }),
+            reports,
+        )
+    }
+
+    fn credential(payload: &[u8], record_version: u64) -> VaultCredential {
+        VaultCredential {
+            payload: payload.to_vec(),
+            expires_at_ms: None,
+            record_version,
+            account_id: Some("   ".to_string()),
+            project_id: None,
+        }
+    }
+
+    fn test_provider(source: Arc<dyn CredentialSource>, usage_url: String) -> AnthropicProvider {
+        let mut provider = AnthropicProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(None)),
+        );
+        provider.usage_url = usage_url;
+        provider
+    }
+
+    struct VaultOnlyProvider {
+        provider: AnthropicProvider,
+        handle: CredentialHandle,
+    }
+
+    #[async_trait]
+    impl UsageProvider for VaultOnlyProvider {
+        fn name(&self) -> &str {
+            PROVIDER_NAME
+        }
+
+        fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+            Ok(vec![self.handle.clone()])
+        }
+
+        async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+            self.provider.fetch_handle(handle).await
+        }
+    }
+
+    async fn serve_once(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            let reason = if status == 200 { "OK" } else { "Unauthorized" };
+            let headers = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            request
+        });
+        (format!("http://{address}/usage"), task)
+    }
+
+    fn write_handles(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ck-quota-anthropic-handles-{}.json",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn handles_include_mapped_vault_entries_when_source_is_wired() {
+        let path = write_handles(
+            r#"{"handles":{"oauth:anthropic":"ckh_anthropic","oauth:xai":"ckh_grok"}}"#,
+        );
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = AnthropicProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0], CredentialHandle::implicit());
+        assert_eq!(handles[1].stable_id(), "oauth:anthropic");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn vault_happy_path_uses_served_bearer_and_record_version() {
+        let body = br#"{"five_hour":{"utilization":12.0,"resets_at":null}}"#.to_vec();
+        let (url, request) = serve_once(200, body).await;
+        let (source, _) = source(Ok(credential(b"anthropic-vault-token", 27)));
+        let provider = test_provider(source, url);
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ))
+            .await;
+
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt.observed.unwrap(),
+            AccountObservation::new(None, Some(27))
+        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
+        assert!(request
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer anthropic-vault-token"));
+    }
+
+    #[tokio::test]
+    async fn vault_happy_path_serves_one_unlabeled_entry() {
+        let body = br#"{"five_hour":{"utilization":7.0,"resets_at":null}}"#.to_vec();
+        let (url, _) = serve_once(200, body).await;
+        let (source, _) = source(Ok(credential(b"anthropic-vault-token", 28)));
+        let handle =
+            CredentialHandle::vault("oauth:anthropic", VaultCapability::new("ckh_anthropic"));
+        let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
+            provider: test_provider(source, url),
+            handle,
+        })]);
+
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].account, None);
+        assert_eq!(
+            entries[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            7.0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_get_is_unverified_and_clears_prior_observation() {
+        let (source, _) = source(Err(VaultGetError::Transient));
+        let provider = test_provider(source, "http://unused.invalid".to_string());
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ))
+            .await;
+        assert_eq!(
+            attempt.credential_resolution,
+            CredentialResolution::Unverified
+        );
+
+        let now = std::time::Instant::now();
+        let cold = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        let prior = next_slot_after_attempt(
+            &cold,
+            PROVIDER_NAME,
+            FetchAttempt::success(
+                Some(AccountObservation::new(
+                    Some("prior-account".to_string()),
+                    Some(1),
+                )),
+                "vault",
+                Usage::default(),
+            ),
+            now,
+            now,
+        );
+        let next = next_slot_after_attempt(&prior, PROVIDER_NAME, attempt, now, now);
+        assert!(next.entry.is_none());
+        assert!(next.label_in_flux);
+        assert!(next.last_success_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn vault_401_reports_served_version_while_local_keeps_legacy_error() {
+        let (vault_url, _) = serve_once(401, Vec::new()).await;
+        let (source, reports) = source(Ok(credential(b"anthropic-vault-token", 44)));
+        let mut provider = test_provider(Arc::clone(&source), vault_url);
+        let vault = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ))
+            .await;
+        assert!(matches!(vault.usage, Err(FetchError::ProviderStatus(401))));
+        for _ in 0..20 {
+            if !reports.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
+
+        reports.lock().unwrap().clear();
+        let (local_url, _) = serve_once(401, Vec::new()).await;
+        provider.usage_url = local_url;
+        let local = provider.fetch_local_bearer("anthropic-local-token").await;
+        assert!(matches!(
+            local.usage,
+            Err(FetchError::Unauthorized(message)) if message == "HTTP 401"
+        ));
+        tokio::task::yield_now().await;
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_utf8_vault_payload_is_a_verified_decode_failure() {
+        let (source, _) = source(Ok(credential(&[0xff, 0xfe], 8)));
+        let provider = test_provider(source, "http://unused.invalid".to_string());
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ))
+            .await;
+        assert_eq!(
+            attempt.credential_resolution,
+            CredentialResolution::Verified
+        );
+        assert_eq!(attempt.observed.unwrap().record_version, Some(8));
+        assert!(matches!(attempt.usage, Err(FetchError::Decode(_))));
+    }
 
     #[test]
     fn normalizes_real_shaped_payload() {

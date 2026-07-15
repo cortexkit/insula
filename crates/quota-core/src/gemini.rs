@@ -8,6 +8,9 @@
 //! refresh_token, grant_type=refresh_token) and cache the new token in-memory until
 //! its expiry. We READ the creds file only and NEVER write the refreshed token
 //! back — that file is gemini-cli's, and we are a read-only quota observer.
+//! Vault handles take a separate strict path: the served payload is the bare Google
+//! access token, optional project metadata comes from the vault result, and the
+//! local file, refresh endpoint, and token cache are never touched.
 //!
 //! We deliberately do NOT replicate CodexBar's package archaeology to discover the
 //! OAuth client (locating the installed @google/gemini-cli bundle across npm/brew/
@@ -37,7 +40,7 @@
 
 use std::{
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -45,7 +48,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
+use crate::vault_handles::VaultHandleLoader;
 use crate::{
     env,
     http::JsonRequest,
@@ -140,6 +145,46 @@ fn client_id() -> String {
 
 fn client_secret() -> String {
     env::first_env(CLIENT_SECRET_ENV).unwrap_or_else(|| unmask(CLIENT_SECRET_MASKED))
+}
+
+fn canonical_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn project_from_load_response(response: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let project = value.get("cloudaicompanionProject")?;
+    let id = match project {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Object(_) => project
+            .get("id")
+            .or_else(|| project.get("projectId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }?;
+    canonical_optional(Some(id))
+}
+
+fn project_from_resource_response(response: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(response).ok()?;
+    let projects = value.get("projects")?.as_array()?;
+    for project in projects {
+        let Some(project_id) = project.get("projectId").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if project_id.starts_with("gen-lang-client")
+            || project
+                .get("labels")
+                .and_then(|labels| labels.get("generative-language"))
+                .is_some()
+        {
+            return Some(project_id.to_string());
+        }
+    }
+    None
 }
 
 // ---- quota response normalization (pure) ------------------------------------
@@ -242,13 +287,32 @@ struct CachedToken {
 pub struct GeminiProvider {
     http: reqwest::Client,
     token: Mutex<Option<CachedToken>>,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    token_url: String,
+    load_code_assist_url: String,
+    quota_url: String,
+    projects_url: String,
 }
 
 impl GeminiProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             token: Mutex::new(None),
+            credential_source,
+            handle_loader,
+            token_url: TOKEN_URL.to_string(),
+            load_code_assist_url: LOAD_CODE_ASSIST_URL.to_string(),
+            quota_url: QUOTA_URL.to_string(),
+            projects_url: PROJECTS_URL.to_string(),
         }
     }
 
@@ -297,7 +361,7 @@ impl GeminiProvider {
         let cid = client_id();
         let secret = client_secret();
         let body = JsonRequest::post_form(
-            TOKEN_URL,
+            &self.token_url,
             &[
                 ("client_id", &cid),
                 ("client_secret", &secret),
@@ -326,51 +390,142 @@ impl GeminiProvider {
     async fn discover_project(&self, access_token: &str) -> Option<String> {
         let body = json!({ "metadata": { "ideType": "GEMINI_CLI", "pluginType": "GEMINI" } });
         let body = serde_json::to_vec(&body).ok()?;
-        let response = JsonRequest::post_json(LOAD_CODE_ASSIST_URL, body)
+        let response = JsonRequest::post_json(&self.load_code_assist_url, body)
             .bearer(access_token)
             .send(&self.http)
             .await
             .ok()?;
-        let value: serde_json::Value = serde_json::from_slice(&response).ok()?;
-        let project = value.get("cloudaicompanionProject")?;
-        let id = match project {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(_) => project
-                .get("id")
-                .or_else(|| project.get("projectId"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            _ => None,
-        }?;
-        let trimmed = id.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
+        project_from_load_response(&response)
     }
 
     /// Fallback: discover a gen-lang-client / generative-language project.
     async fn discover_project_via_resource_manager(&self, access_token: &str) -> Option<String> {
-        let response = JsonRequest::get(PROJECTS_URL)
+        let response = JsonRequest::get(&self.projects_url)
             .bearer(access_token)
             .send(&self.http)
             .await
             .ok()?;
-        let value: serde_json::Value = serde_json::from_slice(&response).ok()?;
-        let projects = value.get("projects")?.as_array()?;
-        for project in projects {
-            let Some(project_id) = project.get("projectId").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if project_id.starts_with("gen-lang-client") {
-                return Some(project_id.to_string());
-            }
-            if project
-                .get("labels")
-                .and_then(|l| l.get("generative-language"))
-                .is_some()
-            {
-                return Some(project_id.to_string());
-            }
+        project_from_resource_response(&response)
+    }
+
+    fn report_auth_failure(
+        &self,
+        capability: &VaultCapability,
+        record_version: u64,
+        error: &FetchError,
+    ) {
+        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+            return;
+        };
+        let Some(source) = self.credential_source.as_ref() else {
+            return;
+        };
+        let source = Arc::clone(source);
+        let capability = capability.clone();
+        let status = *status;
+        tokio::spawn(async move {
+            source
+                .report_auth_failure(&capability, status, record_version)
+                .await;
+        });
+    }
+
+    async fn discover_project_for_vault(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<String>, FetchError> {
+        let body = json!({ "metadata": { "ideType": "GEMINI_CLI", "pluginType": "GEMINI" } });
+        let body =
+            serde_json::to_vec(&body).map_err(|error| FetchError::Decode(error.to_string()))?;
+        match JsonRequest::post_json(&self.load_code_assist_url, body)
+            .bearer(access_token)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+        {
+            Ok(response) => Ok(project_from_load_response(&response.body)),
+            Err(error @ FetchError::ProviderStatus(401 | 403 | 429)) => Err(error),
+            Err(_) => Ok(None),
         }
-        None
+    }
+
+    async fn discover_project_via_resource_manager_for_vault(
+        &self,
+        access_token: &str,
+    ) -> Result<Option<String>, FetchError> {
+        match JsonRequest::get(&self.projects_url)
+            .bearer(access_token)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+        {
+            Ok(response) => Ok(project_from_resource_response(&response.body)),
+            Err(error @ FetchError::ProviderStatus(401 | 403 | 429)) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        // The Google OAuth credential is refresh-only in the vault. A get may make
+        // one extra provider roundtrip before serving; the vault client's existing
+        // 10-second timeout accommodates that without provider handling.
+        let mut credential = match credential_source.get(capability, 120_000).await {
+            Ok(credential) => credential,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let record_version = credential.record_version;
+        let observed = Some(AccountObservation::new(
+            canonical_optional(credential.account_id.clone()),
+            Some(record_version),
+        ));
+        let mut project = canonical_optional(credential.project_id.clone());
+        // The vault payload is the bare access token; project metadata is carried
+        // separately on the credential result and is never parsed from the payload.
+        let access_token = match String::from_utf8(std::mem::take(&mut credential.payload)) {
+            Ok(access_token) => access_token,
+            Err(error) => {
+                let mut payload = error.into_bytes();
+                payload.fill(0);
+                return FetchAttempt::failure(
+                    observed,
+                    None,
+                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
+                );
+            }
+        };
+
+        let result: Result<Usage, FetchError> = async {
+            if project.is_none() {
+                project = self.discover_project_for_vault(&access_token).await?;
+            }
+            if project.is_none() {
+                project = self
+                    .discover_project_via_resource_manager_for_vault(&access_token)
+                    .await?;
+            }
+            let quota_body = match &project {
+                Some(project) => json!({ "project": project }),
+                None => json!({}),
+            };
+            let quota_body = serde_json::to_vec(&quota_body)
+                .map_err(|error| FetchError::Decode(error.to_string()))?;
+            let response = JsonRequest::post_json(&self.quota_url, quota_body)
+                .bearer(&access_token)
+                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .await?;
+            normalize_quota(&response.body)
+        }
+        .await;
+        if let Err(error) = &result {
+            self.report_auth_failure(capability, record_version, error);
+        }
+        match result {
+            Ok(usage) => FetchAttempt::success(observed, "vault", usage),
+            Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
+        }
     }
 }
 
@@ -386,7 +541,19 @@ impl UsageProvider for GeminiProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        let mut handles = vec![CredentialHandle::implicit()];
+        if self.credential_source.is_some() {
+            handles.extend(self.handle_loader.gemini_handles()?);
+        }
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if let Some(capability) = handle.vault_capability() {
+            return self.fetch_vault(capability).await;
+        }
+
         let result: Result<ProviderUsage, FetchError> = async {
             let now = Instant::now();
             let access_token = self.access_token(now).await?;
@@ -404,7 +571,7 @@ impl UsageProvider for GeminiProvider {
             };
             let quota_body =
                 serde_json::to_vec(&quota_body).map_err(|e| FetchError::Decode(e.to_string()))?;
-            let response = JsonRequest::post_json(QUOTA_URL, quota_body)
+            let response = JsonRequest::post_json(&self.quota_url, quota_body)
                 .bearer(&access_token)
                 .send(&self.http)
                 .await?;
@@ -420,6 +587,430 @@ impl UsageProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::credential_source::{VaultCredential, VaultGetError};
+    use crate::provider::CredentialResolution;
+    use crate::refresh::{
+        classify, next_slot_after_attempt, FetchClass, Incarnation, ProviderSlot,
+    };
+
+    type Reports = Arc<Mutex<Vec<(u16, u64)>>>;
+
+    struct MockCredentialSource {
+        get_result: Result<VaultCredential, VaultGetError>,
+        reports: Reports,
+    }
+
+    #[async_trait]
+    impl CredentialSource for MockCredentialSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            assert_eq!(min_ttl_ms, 120_000);
+            self.get_result.clone()
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            provider_status: u16,
+            record_version: u64,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((provider_status, record_version));
+        }
+    }
+
+    fn source(
+        get_result: Result<VaultCredential, VaultGetError>,
+    ) -> (Arc<dyn CredentialSource>, Reports) {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(MockCredentialSource {
+                get_result,
+                reports: Arc::clone(&reports),
+            }),
+            reports,
+        )
+    }
+
+    fn credential(
+        payload: &[u8],
+        record_version: u64,
+        project_id: Option<&str>,
+    ) -> VaultCredential {
+        VaultCredential {
+            payload: payload.to_vec(),
+            expires_at_ms: None,
+            record_version,
+            account_id: Some("   ".to_string()),
+            project_id: project_id.map(str::to_string),
+        }
+    }
+
+    fn test_provider(source: Arc<dyn CredentialSource>, base_url: &str) -> GeminiProvider {
+        let mut provider = GeminiProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(None)),
+        );
+        provider.token_url = format!("{base_url}/token");
+        provider.load_code_assist_url = format!("{base_url}/load");
+        provider.quota_url = format!("{base_url}/quota");
+        provider.projects_url = format!("{base_url}/projects");
+        provider
+    }
+
+    struct VaultOnlyProvider {
+        provider: GeminiProvider,
+        handle: CredentialHandle,
+    }
+
+    #[async_trait]
+    impl UsageProvider for VaultOnlyProvider {
+        fn name(&self) -> &str {
+            PROVIDER_NAME
+        }
+
+        fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+            Ok(vec![self.handle.clone()])
+        }
+
+        async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+            self.provider.fetch_handle(handle).await
+        }
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    async fn serve_sequence(
+        responses: Vec<(u16, Vec<u8>)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                let reason = if status == 200 {
+                    "OK"
+                } else if status == 429 {
+                    "Too Many Requests"
+                } else {
+                    "Unauthorized"
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn write_handles(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ck-quota-gemini-handles-{}.json",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    fn quota_body() -> Vec<u8> {
+        br#"{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.4,"resetTime":"2026-07-16T00:00:00Z"}]}"#.to_vec()
+    }
+
+    #[test]
+    fn handles_include_both_google_vault_id_families_when_source_is_wired() {
+        let path = write_handles(
+            r#"{"handles":{"antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","oauth:xai":"ckh_grok"}}"#,
+        );
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = GeminiProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles.len(), 3);
+        assert_eq!(handles[0], CredentialHandle::implicit());
+        assert_eq!(handles[1].stable_id(), "antigravity:google");
+        assert_eq!(handles[2].stable_id(), "oauth:google:cli");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn served_project_skips_discovery_and_vault_ignores_local_token_cache() {
+        let (base_url, requests) = serve_sequence(vec![(200, quota_body())]).await;
+        let (source, _) = source(Ok(credential(
+            b"ya29.served-google-token",
+            116,
+            Some("served-project"),
+        )));
+        let provider = test_provider(source, &base_url);
+        let cached_expiry = Instant::now() + Duration::from_secs(300);
+        *provider.token.lock().unwrap() = Some(CachedToken {
+            token: "cached-local-token".to_string(),
+            expires_at: cached_expiry,
+        });
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt.observed.unwrap(),
+            AccountObservation::new(None, Some(116))
+        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 60.0);
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1, "served project must skip discovery");
+        let request = requests[0].to_ascii_lowercase();
+        assert!(request.starts_with("post /quota "));
+        assert!(request.contains("authorization: bearer ya29.served-google-token"));
+        assert!(!request.contains("cached-local-token"));
+        assert!(request.contains(r#"{"project":"served-project"}"#));
+        let cached = provider.token.lock().unwrap();
+        let cached = cached.as_ref().unwrap();
+        assert_eq!(cached.token, "cached-local-token");
+        assert_eq!(cached.expires_at, cached_expiry);
+    }
+
+    #[tokio::test]
+    async fn vault_happy_path_serves_one_unlabeled_entry() {
+        let (base_url, _) = serve_sequence(vec![(200, quota_body())]).await;
+        let (source, _) = source(Ok(credential(
+            b"ya29.served-google-token",
+            121,
+            Some("served-project"),
+        )));
+        let handle =
+            CredentialHandle::vault("antigravity:google", VaultCapability::new("ckh_google"));
+        let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
+            provider: test_provider(source, &base_url),
+            handle,
+        })]);
+
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].account, None);
+        assert_eq!(
+            entries[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            60.0
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_served_project_discovers_with_the_served_token() {
+        let load_body = br#"{"cloudaicompanionProject":{"id":"discovered-project"}}"#.to_vec();
+        let (base_url, requests) =
+            serve_sequence(vec![(200, load_body), (200, quota_body())]).await;
+        let (source, _) = source(Ok(credential(b"ya29.discovery-token", 117, None)));
+        let provider = test_provider(source, &base_url);
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert!(attempt.usage.is_ok());
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let load = requests[0].to_ascii_lowercase();
+        let quota = requests[1].to_ascii_lowercase();
+        assert!(load.starts_with("post /load "));
+        assert!(quota.starts_with("post /quota "));
+        for request in [&load, &quota] {
+            assert!(request.contains("authorization: bearer ya29.discovery-token"));
+        }
+        assert!(quota.contains(r#"{"project":"discovered-project"}"#));
+    }
+
+    #[tokio::test]
+    async fn failed_get_is_unverified_and_clears_prior_observation() {
+        let (source, _) = source(Err(VaultGetError::Transient));
+        let provider = test_provider(source, "http://unused.invalid");
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert_eq!(
+            attempt.credential_resolution,
+            CredentialResolution::Unverified
+        );
+
+        let now = Instant::now();
+        let cold = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        let prior = next_slot_after_attempt(
+            &cold,
+            PROVIDER_NAME,
+            FetchAttempt::success(
+                Some(AccountObservation::new(
+                    Some("prior-account".to_string()),
+                    Some(1),
+                )),
+                "vault",
+                Usage::default(),
+            ),
+            now,
+            now,
+        );
+        let next = next_slot_after_attempt(&prior, PROVIDER_NAME, attempt, now, now);
+        assert!(next.entry.is_none());
+        assert!(next.label_in_flux);
+        assert!(next.last_success_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn vault_401_reports_served_version_while_local_keeps_legacy_error() {
+        let (vault_base, _) = serve_sequence(vec![(401, Vec::new())]).await;
+        let (source, reports) = source(Ok(credential(
+            b"ya29.expired-vault-token",
+            118,
+            Some("served-project"),
+        )));
+        let mut provider = test_provider(Arc::clone(&source), &vault_base);
+        let vault = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert!(matches!(&vault.usage, Err(FetchError::ProviderStatus(401))));
+        assert_eq!(
+            classify(vault.usage.as_ref().unwrap_err()),
+            FetchClass::NonTransient
+        );
+        for _ in 0..20 {
+            if !reports.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 118)]);
+
+        reports.lock().unwrap().clear();
+        let load_body = br#"{"cloudaicompanionProject":"local-project"}"#.to_vec();
+        let (local_base, _) = serve_sequence(vec![(200, load_body), (401, Vec::new())]).await;
+        provider.load_code_assist_url = format!("{local_base}/load");
+        provider.quota_url = format!("{local_base}/quota");
+        provider.projects_url = format!("{local_base}/projects");
+        let cached_expiry = Instant::now() + Duration::from_secs(300);
+        *provider.token.lock().unwrap() = Some(CachedToken {
+            token: "local-cached-token".to_string(),
+            expires_at: cached_expiry,
+        });
+        let local = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        assert!(matches!(
+            local.usage,
+            Err(FetchError::Unauthorized(message)) if message == "HTTP 401"
+        ));
+        tokio::task::yield_now().await;
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vault_429_remains_transient() {
+        let (base_url, _) = serve_sequence(vec![(429, Vec::new())]).await;
+        let (source, _) = source(Ok(credential(
+            b"ya29.rate-limited-token",
+            119,
+            Some("served-project"),
+        )));
+        let provider = test_provider(source, &base_url);
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        let error = attempt.usage.unwrap_err();
+        assert!(matches!(error, FetchError::ProviderStatus(429)));
+        assert_eq!(classify(&error), FetchClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn non_utf8_vault_payload_is_a_verified_decode_failure() {
+        let (source, _) = source(Ok(credential(&[0xff, 0xfe], 120, Some("project"))));
+        let provider = test_provider(source, "http://unused.invalid");
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "antigravity:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert_eq!(
+            attempt.credential_resolution,
+            CredentialResolution::Verified
+        );
+        assert_eq!(attempt.observed.unwrap().record_version, Some(120));
+        assert!(matches!(attempt.usage, Err(FetchError::Decode(_))));
+    }
 
     #[test]
     fn oauth_credentials_debug_redacts_both_tokens() {

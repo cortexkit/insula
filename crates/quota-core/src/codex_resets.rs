@@ -729,7 +729,9 @@ impl ResetTransport for ReqwestResetTransport {
             http_request = http_request.header(header);
         }
         let response = if request.auth_failure.is_some() {
-            http_request.send_codex_status_first(&self.http).await?
+            http_request
+                .send_provider_status_first(&self.http, "codex")
+                .await?
         } else {
             http_request.send_full(&self.http).await?
         };
@@ -757,7 +759,7 @@ impl ResetTransport for ReqwestResetTransport {
         }
         if request.auth_failure.is_some() {
             http_request
-                .send_codex_status_first(&self.http)
+                .send_provider_status_first(&self.http, "codex")
                 .await
                 .map(|response| response.body)
         } else {
