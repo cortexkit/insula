@@ -644,15 +644,14 @@ mod tests {
             Some(source),
             Arc::new(VaultHandleLoader::new(Some(path.clone()))),
         );
-        // The implicit-local lane is always emitted even without an env var;
-        // the fetch itself degrades to NoSession when the env is absent. Set
-        // the env so both lanes produce real units.
-        std::env::set_var(ENV_API_KEY, "kimi-coding-local-token");
+        // The implicit-local lane is always emitted whether or not the env var
+        // is set (enumeration never reads the environment; only the fetch
+        // does, degrading to NoSession when the key is absent), so no env
+        // mutation is needed here.
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 2);
         assert_eq!(handles[0], CredentialHandle::implicit());
         assert_eq!(handles[1].stable_id(), "kimi-for-coding");
-        std::env::remove_var(ENV_API_KEY);
         let _ = std::fs::remove_file(path);
     }
 
