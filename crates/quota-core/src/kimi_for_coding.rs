@@ -693,9 +693,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_get_is_unverified_and_clears_prior_observation() {
-        // F1 regression: a failed `credential.get` clears any prior
-        // observation and is reported as Unverified, with `last_success_at`
-        // cleared and `label_in_flux` set.
+        // Fail-closed regression: a failed `credential.get` means the account
+        // behind the handle is unverified this tick, so the slot clears any
+        // prior observation (`last_success_at` reset, `label_in_flux` set)
+        // instead of stale-serving a window that may belong to a different
+        // account after a handle re-point.
         let (source, _) = source(Err(VaultGetError::Transient));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
