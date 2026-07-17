@@ -28,6 +28,7 @@ pub mod http;
 pub mod jetbrains;
 pub mod kilo;
 pub mod kimi;
+pub mod kimi_for_coding;
 pub mod llmproxy;
 pub mod manus;
 pub mod mimo;
@@ -254,6 +255,12 @@ impl Registry {
             )),
             Box::new(jetbrains::JetBrainsProvider::new()),
             Box::new(kimi::KimiProvider::new()),
+            Box::new(
+                kimi_for_coding::KimiForCodingProvider::new_with_handle_loader(
+                    credential_source.clone(),
+                    Arc::clone(&vault_handle_loader),
+                ),
+            ),
             Box::new(llmproxy::LlmProxyProvider::new()),
             Box::new(manus::ManusProvider::new()),
             Box::new(mimo::MimoProvider::new()),
