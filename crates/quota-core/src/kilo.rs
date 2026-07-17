@@ -312,6 +312,7 @@ fn pass_window(pass: &PassFields) -> Option<RateWindow> {
     };
     Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: None,
     })

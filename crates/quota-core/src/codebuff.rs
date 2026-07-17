@@ -137,6 +137,7 @@ fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
     let resets_at = field_str(usage, "next_quota_reset")?;
     Some(RateWindow {
         used_percent: ((used / total) * 100.0).clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: None,
     })
@@ -152,6 +153,7 @@ fn weekly_window(subscription: &serde_json::Value) -> Option<RateWindow> {
     let resets_at = field_str(rate, "weeklyResetsAt")?;
     Some(RateWindow {
         used_percent: ((used / limit) * 100.0).clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(WEEKLY_MINUTES),
     })

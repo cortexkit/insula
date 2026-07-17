@@ -113,6 +113,7 @@ fn rate_window_from_left_and_reset(
     let resets_at = env::epoch_to_iso8601(reset)?;
     Some(RateWindow {
         used_percent: used_percent_from_left_rate(left),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })

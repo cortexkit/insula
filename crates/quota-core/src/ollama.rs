@@ -172,6 +172,7 @@ fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> 
             {
                 return Some(RateWindow {
                     used_percent,
+                    raw_used_percent: None,
                     resets_at: Some(resets_at),
                     window_minutes: *window_minutes,
                 });

@@ -222,6 +222,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             .clamp(0.0, 100.0);
         Some(RateWindow {
             used_percent,
+            raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: window_minutes_from_refresh_interval(
                 response.refresh_interval.as_deref(),

@@ -423,6 +423,7 @@ fn window_from_map(
     let resets_at = env::epoch_to_iso8601(reset_epoch)?;
     Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })
@@ -599,6 +600,7 @@ fn window_from_parts(
     let resets_at = env::epoch_to_iso8601(reset_epoch)?;
     Some(RateWindow {
         used_percent: p.clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })

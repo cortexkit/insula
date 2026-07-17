@@ -350,6 +350,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         pool: pool_of(&group.display_name),
         window: RateWindow {
             used_percent,
+            raw_used_percent: None,
             resets_at: Some(reset),
             window_minutes: window_minutes_of(bucket),
         },

@@ -141,6 +141,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
 
             resets_at.map(|resets_at| RateWindow {
                 used_percent,
+                raw_used_percent: None,
                 resets_at: Some(resets_at),
                 window_minutes: Some((window_hours * 60.0).round() as i64),
             })

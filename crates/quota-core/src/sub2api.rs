@@ -223,6 +223,7 @@ fn rate_limit_to_extra(rate_limit: RateLimitResponse) -> Option<ExtraWindow> {
         id: Some(rate_limit.window.clone()),
         window: Some(RateWindow {
             used_percent: used_percent.clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: reported_reset_at(rate_limit.reset_at),
             window_minutes: window_minutes(&rate_limit.window),
         }),

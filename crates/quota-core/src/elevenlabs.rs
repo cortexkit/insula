@@ -75,6 +75,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 .and_then(env::epoch_to_iso8601);
             resets_at.map(|resets_at| RateWindow {
                 used_percent,
+                raw_used_percent: None,
                 resets_at: Some(resets_at),
                 window_minutes: None,
             })

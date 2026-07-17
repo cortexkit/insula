@@ -66,6 +66,7 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWi
     let used_percent = window.utilization?;
     Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: window.resets_at.clone(),
         window_minutes: Some(window_minutes),
     })

@@ -232,6 +232,7 @@ fn parse_window(
 
     Ok(Some(RateWindow {
         used_percent: percent,
+        raw_used_percent: None,
         resets_at,
         window_minutes: Some(window_minutes),
     }))

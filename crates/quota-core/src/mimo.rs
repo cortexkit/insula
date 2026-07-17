@@ -130,6 +130,7 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
     let primary = match (used_percent, resets_at) {
         (Some(pct), Some(reset)) => Some(RateWindow {
             used_percent: pct,
+            raw_used_percent: None,
             resets_at: Some(reset),
             window_minutes: Some(43200),
         }),

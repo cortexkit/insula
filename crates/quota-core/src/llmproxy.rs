@@ -98,6 +98,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let primary = match (min_remaining, min_reset) {
         (Some(remaining), Some(resets_at)) => Some(RateWindow {
             used_percent: (100.0 - remaining).clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: None,
         }),

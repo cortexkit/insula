@@ -166,6 +166,11 @@ fn relax_usage_for_read(entry: &mut ProviderUsage) {
     let Some(usage) = entry.usage.as_mut() else {
         return;
     };
+    // The effective percent consumers pace on becomes 0 (a banked reset
+    // guarantees the window resets before the wall), while the
+    // provider-reported truth moves to `raw_used_percent` so human-facing
+    // UIs can show real usage alongside the effective number. Windows
+    // already at 0 stay un-annotated: there is no divergence to surface.
     for window in [
         usage.primary.as_mut(),
         usage.secondary.as_mut(),
@@ -174,14 +179,20 @@ fn relax_usage_for_read(entry: &mut ProviderUsage) {
     .into_iter()
     .flatten()
     {
-        window.used_percent = 0.0;
+        if window.used_percent != 0.0 {
+            window.raw_used_percent = Some(window.used_percent);
+            window.used_percent = 0.0;
+        }
     }
     if let Some(extra) = usage.extra_rate_windows.as_mut() {
         for window in extra
             .iter_mut()
             .filter_map(|extra_window| extra_window.window.as_mut())
         {
-            window.used_percent = 0.0;
+            if window.used_percent != 0.0 {
+                window.raw_used_percent = Some(window.used_percent);
+                window.used_percent = 0.0;
+            }
         }
     }
 }

@@ -29,8 +29,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
-    /// 0..100 percent of the window's quota consumed.
+    /// 0..100 percent of the window's quota consumed. This is the EFFECTIVE
+    /// number consumers pace on: when banked-reset relaxation applies it is
+    /// zeroed, and the provider-reported percent moves to `raw_used_percent`.
     pub used_percent: f64,
+    /// The provider-reported percent when `used_percent` has been relaxed to
+    /// an effective value (banked resets guarantee the window resets before
+    /// the wall). Present only on relaxed windows; human-facing UIs should
+    /// display this truth alongside the effective number.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_used_percent: Option<f64>,
     /// ISO 8601 / RFC 3339 timestamp when the window resets. Omitted when the
     /// provider reports no reset (e.g. an idle session window with nothing
     /// pending) — never fabricated. Mirrors CodexBar's optional `resetsAt`.
@@ -170,6 +178,7 @@ mod tests {
             Usage {
                 primary: Some(RateWindow {
                     used_percent: 41.0,
+                    raw_used_percent: None,
                     resets_at: Some("2026-06-22T13:44:39Z".to_string()),
                     window_minutes: Some(300),
                 }),
@@ -178,6 +187,33 @@ mod tests {
         );
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("balance"), "balance must be omitted: {json}");
+    }
+
+    #[test]
+    fn raw_used_percent_is_absent_from_unrelaxed_windows_and_camel_case_when_present() {
+        // Unrelaxed windows (every provider except a relax-eligible codex read)
+        // must serialize byte-identically to before the field existed.
+        let plain = RateWindow {
+            used_percent: 41.0,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: None,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, r#"{"usedPercent":41.0}"#);
+
+        // A relaxed window carries the provider-reported truth camelCased, and
+        // consumers that predate the field can still decode the entry.
+        let relaxed = RateWindow {
+            used_percent: 0.0,
+            raw_used_percent: Some(49.0),
+            resets_at: None,
+            window_minutes: None,
+        };
+        let json = serde_json::to_string(&relaxed).unwrap();
+        assert_eq!(json, r#"{"usedPercent":0.0,"rawUsedPercent":49.0}"#);
+        let decoded: RateWindow = serde_json::from_str(r#"{"usedPercent":7.0}"#).unwrap();
+        assert_eq!(decoded.raw_used_percent, None);
     }
 
     #[test]

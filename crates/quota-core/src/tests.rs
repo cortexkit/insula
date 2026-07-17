@@ -2000,6 +2000,7 @@ fn primary_percent(entry: &ProviderUsage) -> f64 {
 fn full_usage(percent: f64) -> Usage {
     let window = |used_percent: f64, label: &str, minutes| RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: Some(format!("2026-07-15T{label}:00Z")),
         window_minutes: Some(minutes),
     };
@@ -2103,6 +2104,28 @@ async fn relaxation_is_read_time_only_and_expires_at_the_freshness_horizon() {
             .used_percent,
         0.0
     );
+    // The provider-reported truth rides beside the effective zero so human
+    // UIs can display real usage.
+    assert_eq!(
+        fresh_usage.primary.as_ref().unwrap().raw_used_percent,
+        Some(41.0)
+    );
+    assert_eq!(
+        fresh_usage.secondary.as_ref().unwrap().raw_used_percent,
+        Some(42.0)
+    );
+    assert_eq!(
+        fresh_usage.tertiary.as_ref().unwrap().raw_used_percent,
+        Some(43.0)
+    );
+    assert_eq!(
+        fresh_usage.extra_rate_windows.as_ref().unwrap()[0]
+            .window
+            .as_ref()
+            .unwrap()
+            .raw_used_percent,
+        Some(44.0)
+    );
     assert_eq!(
         fresh_usage.primary.as_ref().unwrap().resets_at,
         stored_usage.primary.as_ref().unwrap().resets_at
@@ -2124,6 +2147,11 @@ async fn relaxation_is_read_time_only_and_expires_at_the_freshness_horizon() {
     let stale = registry.get_usage(None).await;
     let stale_usage = stale[0].usage.as_ref().unwrap();
     assert_eq!(stale_usage.primary.as_ref().unwrap().used_percent, 41.0);
+    assert_eq!(
+        stale_usage.primary.as_ref().unwrap().raw_used_percent,
+        None,
+        "an unrelaxed window must not carry a raw annotation"
+    );
     assert_eq!(stale_usage.secondary.as_ref().unwrap().used_percent, 42.0);
     assert_eq!(
         stale_usage.extra_rate_windows.as_ref().unwrap()[0]

@@ -218,6 +218,7 @@ fn window_from_used_total_reset(
     let resets_at = any_date(reset_keys, quota)?;
     Some(RateWindow {
         used_percent: (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })

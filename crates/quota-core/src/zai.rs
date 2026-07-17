@@ -206,6 +206,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .or(time_limit.clone())
         .map(|limit| RateWindow {
             used_percent: limit.used_percent,
+            raw_used_percent: None,
             resets_at: Some(limit.resets_at),
             window_minutes: limit.window_minutes,
         });
@@ -213,6 +214,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let secondary = if token_limit.is_some() && time_limit.is_some() {
         time_limit.map(|limit| RateWindow {
             used_percent: limit.used_percent,
+            raw_used_percent: None,
             resets_at: Some(limit.resets_at),
             window_minutes: limit.window_minutes,
         })
@@ -222,6 +224,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
     let tertiary = session_token_limit.map(|limit| RateWindow {
         used_percent: limit.used_percent,
+        raw_used_percent: None,
         resets_at: Some(limit.resets_at),
         window_minutes: limit.window_minutes,
     });

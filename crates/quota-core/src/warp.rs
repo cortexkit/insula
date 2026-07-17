@@ -105,6 +105,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         let resets_at = info.next_refresh_time?;
         Some(RateWindow {
             used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: None,
         })

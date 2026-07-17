@@ -240,6 +240,7 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
     let resets_at = parse_reset_time(detail.reset_time.as_deref())?;
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes,
     })
@@ -294,6 +295,7 @@ fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<Ex
         id: Some("kimi-monthly".to_string()),
         window: Some(RateWindow {
             used_percent: (ratio * 100.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: parse_reset_time(balance.expire_time.as_deref()),
             window_minutes: None,
         }),
@@ -311,6 +313,7 @@ fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option
         id: Some("kimi-code-7d".to_string()),
         window: Some(RateWindow {
             used_percent: (ratio * 100.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: parse_reset_time(limit.reset_time.as_deref()),
             window_minutes: Some(7 * 24 * 60),
         }),

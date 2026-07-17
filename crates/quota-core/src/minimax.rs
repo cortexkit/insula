@@ -231,6 +231,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
 
         return Some(RateWindow {
             used_percent: remaining_percent_to_used(remaining_percent),
+            raw_used_percent: None,
             resets_at: resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs),
             window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
         });
@@ -244,6 +245,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs)?;
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
     })
@@ -260,6 +262,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             if is_general_model(m) {
                 return Some(RateWindow {
                     used_percent: 0.0,
+                    raw_used_percent: None,
                     resets_at: None,
                     window_minutes: Some(7 * 24 * 60),
                 });
@@ -271,6 +274,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
 
         return Some(RateWindow {
             used_percent: remaining_percent_to_used(remaining_percent),
+            raw_used_percent: None,
             resets_at: resets_at_iso(
                 opt_int(&m.weekly_end_time),
                 opt_int(&m.weekly_remains_time),
@@ -292,6 +296,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     )?;
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: window_minutes(opt_int(&m.weekly_start_time), opt_int(&m.weekly_end_time)),
     })

@@ -156,6 +156,7 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
     Ok(Usage {
         primary: Some(RateWindow {
             used_percent: used,
+            raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: None,
         }),

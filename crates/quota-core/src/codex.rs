@@ -280,6 +280,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         .map(|s| s / 60);
     Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at,
         window_minutes,
     })

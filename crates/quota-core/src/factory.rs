@@ -182,6 +182,7 @@ fn rate_window_from(
     let resets_at = reset_at_for_window(window, now)?;
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
     })

@@ -157,6 +157,7 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
 
     let primary = Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: None,
     });
@@ -199,6 +200,7 @@ fn coding_plan_window(
 
     Some(RateWindow {
         used_percent: quota.percent.clamp(0.0, 100.0),
+        raw_used_percent: None,
         resets_at,
         window_minutes: Some(window_minutes),
     })
@@ -574,6 +576,7 @@ mod tests {
             usage.primary,
             Some(RateWindow {
                 used_percent: 37.5,
+                raw_used_percent: None,
                 resets_at: Some("2023-11-14T22:13:20Z".to_string()),
                 window_minutes: Some(300),
             })
@@ -582,6 +585,7 @@ mod tests {
             usage.secondary,
             Some(RateWindow {
                 used_percent: 0.0,
+                raw_used_percent: None,
                 resets_at: Some("2027-01-15T08:00:00Z".to_string()),
                 window_minutes: Some(10_080),
             })
@@ -590,6 +594,7 @@ mod tests {
             usage.tertiary,
             Some(RateWindow {
                 used_percent: 100.0,
+                raw_used_percent: None,
                 resets_at: Some("2030-03-17T17:46:40Z".to_string()),
                 window_minutes: Some(43_200),
             })

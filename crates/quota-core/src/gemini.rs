@@ -255,6 +255,7 @@ pub fn normalize_quota(body: &[u8]) -> Result<Usage, FetchError> {
         let resets_at = reset?;
         Some(RateWindow {
             used_percent: (100.0 - fraction * 100.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: Some(WINDOW_MINUTES_24H),
         })

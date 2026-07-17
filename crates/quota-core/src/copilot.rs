@@ -139,6 +139,7 @@ fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
     let resets_at = normalize_reset(reset?);
     Some(RateWindow {
         used_percent,
+        raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(MONTHLY_WINDOW_MINUTES),
     })
