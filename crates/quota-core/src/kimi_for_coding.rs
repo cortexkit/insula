@@ -474,9 +474,15 @@ mod tests {
     }
 
     fn write_handles(body: &str) -> std::path::PathBuf {
+        // Unique per call, not just per process: tests in one binary run in
+        // parallel threads, and a shared path would let one test truncate or
+        // delete the file another test is reading.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ck-quota-kimi-for-coding-handles-{}.json",
-            std::process::id()
+            "ck-quota-kimi-for-coding-handles-{}-{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
