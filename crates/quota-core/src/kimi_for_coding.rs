@@ -277,7 +277,7 @@ impl KimiForCodingProvider {
             .and_then(|body| normalize_usage(&body));
         match result {
             Ok(usage) => {
-                FetchAttempt::success(Some(AccountObservation::new(None, None)), "oauth", usage)
+                FetchAttempt::success(Some(AccountObservation::new(None, None)), "api", usage)
             }
             Err(error) => FetchAttempt::failure(None, None, error),
         }
