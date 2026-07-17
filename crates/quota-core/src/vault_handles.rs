@@ -108,6 +108,7 @@ enum ProviderKind {
     Anthropic,
     Grok,
     Gemini,
+    KimiForCoding,
 }
 
 #[derive(Clone, Default)]
@@ -116,6 +117,7 @@ struct ProviderHandleSnapshot {
     anthropic: Vec<CredentialHandle>,
     grok: Vec<CredentialHandle>,
     gemini: Vec<CredentialHandle>,
+    kimi_for_coding: Vec<CredentialHandle>,
 }
 
 impl ProviderHandleSnapshot {
@@ -125,6 +127,7 @@ impl ProviderHandleSnapshot {
             ProviderKind::Anthropic => &self.anthropic,
             ProviderKind::Grok => &self.grok,
             ProviderKind::Gemini => &self.gemini,
+            ProviderKind::KimiForCoding => &self.kimi_for_coding,
         }
     }
 
@@ -134,6 +137,7 @@ impl ProviderHandleSnapshot {
             ProviderKind::Anthropic => self.anthropic.push(handle),
             ProviderKind::Grok => self.grok.push(handle),
             ProviderKind::Gemini => self.gemini.push(handle),
+            ProviderKind::KimiForCoding => self.kimi_for_coding.push(handle),
         }
     }
 }
@@ -181,6 +185,12 @@ impl VaultHandleLoader {
     /// Return the authoritative Gemini vault handle snapshot for this scheduler turn.
     pub fn gemini_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Gemini)
+    }
+
+    /// Return the authoritative Kimi coding-plan vault handle snapshot for this
+    /// scheduler turn.
+    pub fn kimi_for_coding_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::KimiForCoding)
     }
 
     fn provider_handles(
@@ -372,6 +382,8 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             Some(ProviderKind::Grok)
         } else if id == "antigravity:google" || prefixed_id(id, "oauth:google") {
             Some(ProviderKind::Gemini)
+        } else if id == "kimi-for-coding" {
+            Some(ProviderKind::KimiForCoding)
         } else {
             None
         }
@@ -525,7 +537,7 @@ mod tests {
     fn all_supported_provider_ids_are_mapped_without_an_ignored_warning() {
         let path = write_file(
             "all-providers",
-            r#"{"handles":{"chatgpt:openai":"ckh_codex","oauth:anthropic":"ckh_anthropic","oauth:anthropic:work":"ckh_anthropic_work","oauth:xai":"ckh_grok","oauth:xai:work":"ckh_grok_work","antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","unknown:provider":"ckh_unknown"}}"#,
+            r#"{"handles":{"chatgpt:openai":"ckh_codex","oauth:anthropic":"ckh_anthropic","oauth:anthropic:work":"ckh_anthropic_work","oauth:xai":"ckh_grok","oauth:xai:work":"ckh_grok_work","antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","kimi-for-coding":"ckh_kimi","unknown:provider":"ckh_unknown"}}"#,
         );
         let loader = VaultHandleLoader::new(Some(path.clone()));
 
@@ -533,9 +545,15 @@ mod tests {
         assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
         assert_eq!(loader.grok_handles().unwrap().len(), 2);
         assert_eq!(loader.gemini_handles().unwrap().len(), 2);
+        assert_eq!(loader.kimi_for_coding_handles().unwrap().len(), 1);
         let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
         assert!(warning.contains("unknown:provider"));
-        for mapped_id in ["oauth:anthropic", "oauth:xai", "antigravity:google"] {
+        for mapped_id in [
+            "oauth:anthropic",
+            "oauth:xai",
+            "antigravity:google",
+            "kimi-for-coding",
+        ] {
             assert!(!warning.contains(mapped_id));
         }
         let _ = std::fs::remove_file(path);
