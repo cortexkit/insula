@@ -46,7 +46,7 @@
 //! :771-775, request/headers :1467-1505/:1651-1660, representative :231-244, bucket
 //! kinds :362-371) + `AntigravityQuotaSummaryParser.swift:96-173`.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -265,20 +265,46 @@ fn pool_of(group_title: &str) -> Pool {
     }
 }
 
-/// Window length in minutes for a bucket, by its 5-hour/weekly kind (faithful
-/// derivation from the bucket's own id/name, not invention). None when unknown.
-fn window_minutes_of(bucket: &QuotaBucket) -> Option<i64> {
-    // Prefer the explicit `window` field, else infer from bucketId/displayName.
-    let combined = format!(
-        "{} {} {}",
+const SESSION_CADENCE_ALIASES: &[&str] = &["session", "5h", "5-hour", "five hour", "five-hour"];
+
+fn quota_cadence_candidates(bucket: &QuotaBucket) -> HashSet<String> {
+    let mut candidates = HashSet::new();
+    for raw_value in [
         bucket.window.as_deref().unwrap_or(""),
-        bucket.bucket_id,
-        bucket.display_name
-    )
-    .to_ascii_lowercase();
-    if combined.contains("5h") || combined.contains("5-hour") || combined.contains("five hour") {
+        bucket.bucket_id.as_str(),
+        bucket.display_name.as_str(),
+    ] {
+        let normalized = raw_value.trim().to_ascii_lowercase().replace('_', "-");
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let mut normalized_candidates = vec![normalized.clone()];
+        if let Some(stripped) = normalized.strip_suffix(" limit") {
+            normalized_candidates.push(stripped.to_string());
+        }
+        for candidate in normalized_candidates {
+            candidates.insert(candidate.clone());
+            for alias in SESSION_CADENCE_ALIASES.iter().copied().chain(["weekly"]) {
+                if candidate.ends_with(&format!("-{alias}")) {
+                    candidates.insert(alias.to_string());
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// Window length in minutes for a bucket, by its 5-hour/weekly kind (faithful
+/// derivation from the bucket's own cadence fields, not invention). None when unknown.
+fn window_minutes_of(bucket: &QuotaBucket) -> Option<i64> {
+    let candidates = quota_cadence_candidates(bucket);
+    if SESSION_CADENCE_ALIASES
+        .iter()
+        .any(|alias| candidates.contains(*alias))
+    {
         Some(SESSION_WINDOW_MINUTES)
-    } else if combined.contains("weekly") {
+    } else if candidates.contains("weekly") {
         Some(WEEKLY_WINDOW_MINUTES)
     } else {
         None
@@ -592,6 +618,23 @@ mod tests {
         assert!(usage.secondary.is_none());
         // All three buckets surfaced as extra windows.
         assert_eq!(usage.extra_rate_windows.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cadence_aliases_cover_session_and_underscore_weekly_limit() {
+        let body = r#"{"groups":[{"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-session","displayName":"Session Limit","window":"session",
+             "remainingFraction":0.8,"resetTime":"2026-07-24T18:34:51Z"},
+            {"bucketId":"gemini-weekly","displayName":"Weekly_Limit","window":"Weekly_Limit",
+             "remainingFraction":0.6,"resetTime":"2026-07-30T18:34:51Z"}
+        ]}]}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras[0].window.as_ref().unwrap().window_minutes, Some(300));
+        assert_eq!(
+            extras[1].window.as_ref().unwrap().window_minutes,
+            Some(10080)
+        );
     }
 
     #[test]

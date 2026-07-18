@@ -61,6 +61,8 @@ struct QuotaSnapshot {
     percent_remaining: Option<f64>,
     #[serde(default)]
     quota_id: String,
+    #[serde(default)]
+    unlimited: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +107,7 @@ fn snapshot_from_counts(
         remaining,
         percent_remaining: Some(percent_remaining),
         quota_id: quota_id.to_string(),
+        unlimited: false,
     })
 }
 
@@ -131,7 +134,7 @@ fn normalize_reset(raw: &str) -> String {
 }
 
 fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
-    if !snapshot.usable() {
+    if snapshot.unlimited || !snapshot.usable() {
         return None;
     }
     let used_percent = snapshot.used_percent()?;
@@ -311,6 +314,46 @@ mod tests {
         }"#;
         let usage = normalize_usage(body).unwrap();
         // premium is a placeholder → primary empty; chat falls into secondary.
+        assert!(usage.primary.is_none());
+        assert_eq!(usage.secondary.unwrap().used_percent, 50.0);
+    }
+
+    #[test]
+    fn unlimited_snapshots_do_not_become_metered_windows() {
+        let body = br#"{
+            "quota_reset_date": "2026-07-01",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 300, "remaining": 300, "percent_remaining": 100.0,
+                    "quota_id": "premium_interactions", "unlimited": true
+                },
+                "chat": {
+                    "entitlement": 1000, "remaining": 1000, "percent_remaining": 100.0,
+                    "quota_id": "chat", "unlimited": true
+                }
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+    }
+
+    #[test]
+    fn unlimited_premium_keeps_metered_chat_window() {
+        let body = br#"{
+            "quota_reset_date": "2026-07-01",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 300, "remaining": 300, "percent_remaining": 100.0,
+                    "quota_id": "premium_interactions", "unlimited": true
+                },
+                "chat": {
+                    "entitlement": 1000, "remaining": 500, "percent_remaining": 50.0,
+                    "quota_id": "chat"
+                }
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
         assert!(usage.primary.is_none());
         assert_eq!(usage.secondary.unwrap().used_percent, 50.0);
     }
