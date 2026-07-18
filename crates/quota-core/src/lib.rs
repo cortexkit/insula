@@ -319,7 +319,16 @@ impl Registry {
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            store.snapshot()
+            let mut snapshot = store.snapshot();
+            for (_, slot) in &mut snapshot {
+                if let Some(entry) = slot.entry.as_mut() {
+                    entry.fetched_at = slot
+                        .last_success_at
+                        .and_then(|timestamp| store.wall_time(timestamp))
+                        .map(|timestamp| timestamp.to_rfc3339());
+                }
+            }
+            snapshot
         };
         let provider_index: HashMap<&str, usize> = self
             .providers

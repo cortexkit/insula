@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::model::ProviderUsage;
+use crate::model::{AccountInfo, ProviderUsage, SavedResets};
 use crate::provider::{AccountObservation, CredentialResolution, FetchAttempt, FetchError};
 
 /// Nominal refresh cadence for a healthy fetch unit.
@@ -151,11 +151,16 @@ fn healthy_entry(
     observation: Option<&AccountObservation>,
     source: Option<String>,
     usage: crate::model::Usage,
+    account_info: Option<AccountInfo>,
+    saved_resets: Option<SavedResets>,
 ) -> ProviderUsage {
     ProviderUsage {
         provider: provider_name.to_string(),
         account: observation.and_then(|value| value.account_id.clone()),
         source,
+        account_info: account_info.filter(|info| !info.is_empty()),
+        fetched_at: None,
+        saved_resets,
         usage: Some(usage),
         balance: None,
         error: None,
@@ -251,6 +256,8 @@ fn next_slot_after_attempt_inner(
                 observation.as_ref(),
                 attempt.source,
                 usage,
+                attempt.account_info,
+                attempt.saved_resets,
             )),
             observation,
             label_in_flux: false,
@@ -322,6 +329,8 @@ mod tests {
             )),
             source: Some("test".to_string()),
             usage,
+            account_info: None,
+            saved_resets: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }

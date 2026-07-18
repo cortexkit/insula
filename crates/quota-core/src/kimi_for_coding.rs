@@ -298,6 +298,7 @@ impl KimiForCodingProvider {
         // contract: apikey:* has no refresh adapter and no account identity), so
         // the served observation is structurally None here.
         let record_version = credential.record_version;
+        let account_info = credential.account_info();
         let observed = Some(AccountObservation::new(
             canonical_account_id(credential.account_id.clone()),
             Some(record_version),
@@ -324,7 +325,9 @@ impl KimiForCodingProvider {
             self.report_auth_failure(capability, record_version, error);
         }
         match result {
-            Ok(usage) => FetchAttempt::success(observed, "vault", usage),
+            Ok(usage) => {
+                FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+            }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
     }
@@ -436,6 +439,8 @@ mod tests {
             expires_at_ms: None,
             record_version,
             account_id: None,
+            email: None,
+            org_name: None,
             project_id: None,
         }
     }

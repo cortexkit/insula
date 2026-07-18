@@ -667,6 +667,10 @@ struct VaultSuccessResult {
     account_id: Option<String>,
     #[serde(default)]
     project_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -722,6 +726,8 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
         "record_version",
         "account_id",
         "project_id",
+        "email",
+        "org_name",
     ]
     .iter()
     .any(|field| result.contains_key(*field));
@@ -739,6 +745,14 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
                     .filter(|value| !value.is_empty()),
                 project_id: success
                     .project_id
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                email: success
+                    .email
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                org_name: success
+                    .org_name
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty()),
             })
@@ -1102,7 +1116,24 @@ mod tests {
         let credential = decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(credential.payload, secret);
         assert_eq!(credential.account_id.as_deref(), Some("acct-9"));
+        assert_eq!(credential.email, None);
+        assert_eq!(credential.org_name, None);
         assert!(!format!("{credential:?}").contains("vault-token-secret"));
+    }
+
+    #[test]
+    fn get_result_decodes_optional_email_and_org_name() {
+        let body = serde_json::json!({
+            "result": {
+                "payload": b"vault-token",
+                "record_version": 10,
+                "email": "  user@example.com ",
+                "org_name": "  Example Org  "
+            }
+        });
+        let credential = decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(credential.email.as_deref(), Some("user@example.com"));
+        assert_eq!(credential.org_name.as_deref(), Some("Example Org"));
     }
 
     #[tokio::test]

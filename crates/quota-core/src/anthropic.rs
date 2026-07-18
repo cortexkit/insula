@@ -15,7 +15,7 @@
 //!     ISO 8601 — unlike codex's int-percent + epoch. So normalization is a
 //!     near-passthrough here, mapping window names to known window lengths.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -54,6 +54,63 @@ struct OAuthUsageResponse {
     seven_day: Option<OAuthWindow>,
     seven_day_opus: Option<OAuthWindow>,
     seven_day_sonnet: Option<OAuthWindow>,
+    limits: Option<Vec<ApiLimitEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimitEntry {
+    kind: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    is_active: Option<bool>,
+    scope: Option<ApiLimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimitScope {
+    model: Option<ApiLimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimitModel {
+    display_name: Option<String>,
+}
+
+fn scoped_weekly_extras(
+    limits: Option<&[ApiLimitEntry]>,
+) -> Option<Vec<crate::model::ExtraWindow>> {
+    let mut seen = HashSet::new();
+    let extras: Vec<_> = limits
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.kind.as_deref() == Some("weekly_scoped") && entry.is_active != Some(false)
+        })
+        .filter_map(|entry| {
+            let display_name = entry
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.model.as_ref())
+                .and_then(|model| model.display_name.as_deref())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())?;
+            let percent = entry.percent?;
+            if !percent.is_finite() || !seen.insert(display_name.to_string()) {
+                return None;
+            }
+            Some(crate::model::ExtraWindow {
+                title: Some(format!("7 Day ({display_name})")),
+                id: Some(display_name.to_string()),
+                window: Some(RateWindow {
+                    used_percent: percent.clamp(0.0, 100.0),
+                    raw_used_percent: None,
+                    resets_at: entry.resets_at.clone(),
+                    window_minutes: Some(SEVEN_DAY_MINUTES),
+                }),
+            })
+        })
+        .collect();
+    (!extras.is_empty()).then_some(extras)
 }
 
 fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWindow> {
@@ -91,7 +148,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 .or(response.seven_day_sonnet.as_ref()),
             SEVEN_DAY_MINUTES,
         ),
-        extra_rate_windows: None,
+        extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
     })
 }
 
@@ -180,6 +237,7 @@ impl AnthropicProvider {
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
         let record_version = credential.record_version;
+        let account_info = credential.account_info();
         let observed = Some(AccountObservation::new(
             canonical_account_id(credential.account_id.clone()),
             Some(record_version),
@@ -206,7 +264,9 @@ impl AnthropicProvider {
             self.report_auth_failure(capability, record_version, error);
         }
         match result {
-            Ok(usage) => FetchAttempt::success(observed, "vault", usage),
+            Ok(usage) => {
+                FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+            }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
     }
@@ -317,6 +377,8 @@ mod tests {
             expires_at_ms: None,
             record_version,
             account_id: Some("   ".to_string()),
+            email: None,
+            org_name: None,
             project_id: None,
         }
     }
@@ -410,7 +472,10 @@ mod tests {
     async fn vault_happy_path_uses_served_bearer_and_record_version() {
         let body = br#"{"five_hour":{"utilization":12.0,"resets_at":null}}"#.to_vec();
         let (url, request) = serve_once(200, body).await;
-        let (source, _) = source(Ok(credential(b"anthropic-vault-token", 27)));
+        let mut vault_credential = credential(b"anthropic-vault-token", 27);
+        vault_credential.email = Some("user@example.com".to_string());
+        vault_credential.org_name = Some("Example Org".to_string());
+        let (source, _) = source(Ok(vault_credential));
         let provider = test_provider(source, url);
         let attempt = provider
             .fetch_handle(&CredentialHandle::vault(
@@ -424,6 +489,10 @@ mod tests {
             attempt.observed.unwrap(),
             AccountObservation::new(None, Some(27))
         );
+        let account_info = attempt.account_info.as_ref().unwrap();
+        assert_eq!(account_info.email.as_deref(), Some("user@example.com"));
+        assert_eq!(account_info.org_name.as_deref(), Some("Example Org"));
+        assert_eq!(account_info.plan_type, None);
         assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
         assert!(request
             .await
@@ -570,8 +639,62 @@ mod tests {
             Some("2026-06-22T17:00:00.175593+00:00")
         );
         assert_eq!(usage.secondary.unwrap().used_percent, 48.0);
+        assert!(usage.extra_rate_windows.is_none());
         // opus is null, so tertiary falls back to sonnet.
         assert_eq!(usage.tertiary.unwrap().used_percent, 4.0);
+    }
+
+    #[test]
+    fn scoped_weekly_limits_become_named_extra_windows() {
+        let usage = normalize_usage(
+            br#"{
+                "five_hour": {"utilization": 12.0, "resets_at": "2026-07-18T12:00:00Z"},
+                "seven_day": {"utilization": 60.0, "resets_at": "2026-07-20T12:00:00Z"},
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 100.0,
+                        "resets_at": "2026-07-18T12:00:00Z",
+                        "scope": {"model": {"display_name": "Fable"}},
+                        "is_active": true
+                    },
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 20.0,
+                        "resets_at": "2026-07-18T12:00:00Z",
+                        "scope": {"model": {"display_name": "Fable"}},
+                        "is_active": true
+                    },
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 80.0,
+                        "scope": {"model": {"display_name": "Inactive"}},
+                        "is_active": false
+                    },
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 80.0,
+                        "scope": {"model": {}},
+                        "is_active": true
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
+        assert_eq!(extras[0].id.as_deref(), Some("Fable"));
+        let window = extras[0].window.as_ref().unwrap();
+        assert_eq!(window.used_percent, 100.0);
+        assert_eq!(window.window_minutes, Some(SEVEN_DAY_MINUTES));
+    }
+
+    #[test]
+    fn missing_anthropic_limits_do_not_add_extra_windows() {
+        let usage =
+            normalize_usage(br#"{"five_hour":{"utilization":1.0,"resets_at":null}}"#).unwrap();
+        assert!(usage.extra_rate_windows.is_none());
     }
 
     #[test]

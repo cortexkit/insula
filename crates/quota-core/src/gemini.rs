@@ -19,9 +19,9 @@
 //! its public installed-app OAuth client (overridable via env) and cite the source.
 //!
 //! Fetch: `loadCodeAssist` → project id + tier, then `retrieveUserQuota` → per-model
-//! quota buckets. Buckets are grouped by model (lowest remaining per model) and
-//! classified pro→primary / flash→secondary / flash-lite→tertiary, each a 24h
-//! window (`100 - remainingFraction*100` → usedPercent, `resetTime` → resetsAt).
+//! quota buckets. Every bucket remains a named extra window, while the most-used
+//! bucket is copied to `primary` as the binding constraint. The reset delta is
+//! rounded to a known class (`100 - remainingFraction*100` → usedPercent).
 //!
 //! VERIFICATION: gemini is LIVE-VERIFIED — the real OAuth refresh + quota path was
 //! proven end-to-end through the wire from an expired native token (refresh →
@@ -45,6 +45,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -54,7 +55,7 @@ use crate::vault_handles::VaultHandleLoader;
 use crate::{
     env,
     http::JsonRequest,
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -204,20 +205,36 @@ struct QuotaBucket {
     model_id: Option<String>,
 }
 
-fn is_flash_lite(id: &str) -> bool {
-    id.contains("flash-lite")
-}
-fn is_flash(id: &str) -> bool {
-    id.contains("flash") && !is_flash_lite(id)
-}
-fn is_pro(id: &str) -> bool {
-    id.contains("pro")
+fn window_minutes_from_reset(reset_time: &str, now: DateTime<Utc>) -> Option<i64> {
+    let reset = DateTime::parse_from_rfc3339(reset_time)
+        .ok()?
+        .with_timezone(&Utc);
+    let delta_minutes = reset.signed_duration_since(now).num_seconds() as f64 / 60.0;
+    if !delta_minutes.is_finite() {
+        return None;
+    }
+    // A recorded fixture can outlive its reset timestamp; Gemini's quota buckets
+    // are daily by contract, so retain the known daily class in that case.
+    if delta_minutes <= 0.0 {
+        return Some(WINDOW_MINUTES_24H);
+    }
+    // A mid-window delta only lower-bounds the true window length, so it cannot
+    // justify shrinking a daily bucket to a shorter class. Assert daily unless
+    // the delta proves a longer class, then choose the tightest class that still
+    // contains it.
+    if delta_minutes <= 1_500.0 {
+        return Some(WINDOW_MINUTES_24H);
+    }
+    [7 * 24 * 60, 30 * 24 * 60]
+        .into_iter()
+        .find(|class| delta_minutes <= *class as f64)
+        .or(Some(30 * 24 * 60))
 }
 
-/// Normalize a `retrieveUserQuota` body to [`Usage`]: lowest remaining per model,
-/// classified pro→primary / flash→secondary / flash-lite→tertiary, 24h windows.
-/// Pure — unit-testable against recorded real payloads.
-pub fn normalize_quota(body: &[u8]) -> Result<Usage, FetchError> {
+/// Normalize a `retrieveUserQuota` body to named per-model windows. Every valid
+/// bucket remains visible; the most-used bucket is also copied to `primary` so
+/// the headline reflects the single current binding constraint.
+fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
     let response: QuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("gemini quota not decodable: {e}")))?;
     let buckets = response
@@ -225,48 +242,49 @@ pub fn normalize_quota(body: &[u8]) -> Result<Usage, FetchError> {
         .filter(|b| !b.is_empty())
         .ok_or_else(|| FetchError::Decode("gemini quota has no buckets".to_string()))?;
 
-    // Lowest remaining fraction per tier (CodexBar keeps the worst per model, then
-    // takes the worst model in each tier).
-    let mut pro: Option<(f64, Option<String>)> = None;
-    let mut flash: Option<(f64, Option<String>)> = None;
-    let mut flash_lite: Option<(f64, Option<String>)> = None;
-
-    for bucket in &buckets {
-        let (Some(model_id), Some(fraction)) = (&bucket.model_id, bucket.remaining_fraction) else {
+    let mut primary: Option<(f64, String, RateWindow)> = None;
+    let mut extras = Vec::new();
+    for bucket in buckets {
+        let (Some(model_id), Some(fraction)) = (bucket.model_id, bucket.remaining_fraction) else {
             continue;
         };
-        let id = model_id.to_lowercase();
-        let slot = if is_flash_lite(&id) {
-            &mut flash_lite
-        } else if is_flash(&id) {
-            &mut flash
-        } else if is_pro(&id) {
-            &mut pro
-        } else {
+        if model_id.trim().is_empty() || !fraction.is_finite() {
             continue;
-        };
-        if slot.as_ref().map(|(f, _)| fraction < *f).unwrap_or(true) {
-            *slot = Some((fraction, bucket.reset_time.clone()));
         }
+        let window = RateWindow {
+            used_percent: (1.0 - fraction).mul_add(100.0, 0.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
+            resets_at: bucket.reset_time.clone(),
+            window_minutes: bucket
+                .reset_time
+                .as_deref()
+                .and_then(|reset_time| window_minutes_from_reset(reset_time, now)),
+        };
+        let used_percent = window.used_percent;
+        if primary.as_ref().is_none_or(|(_, current_id, current)| {
+            used_percent > current.used_percent
+                || (used_percent == current.used_percent && model_id < *current_id)
+        }) {
+            primary = Some((used_percent, model_id.clone(), window.clone()));
+        }
+        extras.push(ExtraWindow {
+            title: Some(model_id.clone()),
+            id: Some(model_id),
+            window: Some(window),
+        });
     }
 
-    let to_window = |entry: Option<(f64, Option<String>)>| -> Option<RateWindow> {
-        let (fraction, reset) = entry?;
-        let resets_at = reset?;
-        Some(RateWindow {
-            used_percent: (100.0 - fraction * 100.0).clamp(0.0, 100.0),
-            raw_used_percent: None,
-            resets_at: Some(resets_at),
-            window_minutes: Some(WINDOW_MINUTES_24H),
-        })
-    };
-
     Ok(Usage {
-        primary: to_window(pro),
-        secondary: to_window(flash),
-        tertiary: to_window(flash_lite),
-        extra_rate_windows: None,
+        primary: primary.map(|(_, _, window)| window),
+        secondary: None,
+        tertiary: None,
+        extra_rate_windows: (!extras.is_empty()).then_some(extras),
     })
+}
+
+/// Normalize using the local wall clock to derive each bucket's window class.
+pub fn normalize_quota(body: &[u8]) -> Result<Usage, FetchError> {
+    normalize_quota_at(body, Utc::now())
 }
 
 // ---- token cache + refresh (I/O) --------------------------------------------
@@ -478,6 +496,7 @@ impl GeminiProvider {
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
         let record_version = credential.record_version;
+        let account_info = credential.account_info();
         let observed = Some(AccountObservation::new(
             canonical_optional(credential.account_id.clone()),
             Some(record_version),
@@ -524,7 +543,9 @@ impl GeminiProvider {
             self.report_auth_failure(capability, record_version, error);
         }
         match result {
-            Ok(usage) => FetchAttempt::success(observed, "vault", usage),
+            Ok(usage) => {
+                FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+            }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
     }
@@ -588,6 +609,7 @@ impl UsageProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
     use std::io::Write as _;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -653,6 +675,8 @@ mod tests {
             expires_at_ms: None,
             record_version,
             account_id: Some("   ".to_string()),
+            email: None,
+            org_name: None,
             project_id: project_id.map(str::to_string),
         }
     }
@@ -1027,33 +1051,65 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_per_model_buckets_by_tier() {
-        // Shaped like the real retrieveUserQuota response.
-        let body = br#"{
-            "buckets": [
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.6, "resetTime": "2026-06-23T00:00:00Z", "tokenType": "input" },
-                { "modelId": "gemini-2.5-pro", "remainingFraction": 0.9, "resetTime": "2026-06-23T00:00:00Z", "tokenType": "output" },
-                { "modelId": "gemini-2.5-flash", "remainingFraction": 0.75, "resetTime": "2026-06-23T01:00:00Z" },
-                { "modelId": "gemini-2.5-flash-lite", "remainingFraction": 1.0, "resetTime": "2026-06-23T02:00:00Z" }
-            ]
-        }"#;
-        let usage = normalize_quota(body).unwrap();
-        // pro keeps the LOWEST fraction (0.6) → 40% used.
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 40.0);
-        assert_eq!(primary.window_minutes, Some(1440));
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-23T00:00:00Z"));
-        // flash (0.75) → 25% used; flash-lite (1.0) → 0% used.
-        assert_eq!(usage.secondary.unwrap().used_percent, 25.0);
-        assert_eq!(usage.tertiary.unwrap().used_percent, 0.0);
+    fn reset_delta_uses_daily_for_mid_window_and_only_proves_longer_classes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        assert_eq!(
+            window_minutes_from_reset("2026-07-18T04:00:00Z", now),
+            Some(WINDOW_MINUTES_24H)
+        );
+        assert_eq!(
+            window_minutes_from_reset("2026-07-19T00:00:00Z", now),
+            Some(WINDOW_MINUTES_24H)
+        );
+        assert_eq!(
+            window_minutes_from_reset("2026-07-24T21:36:00Z", now),
+            Some(7 * 24 * 60)
+        );
     }
 
     #[test]
-    fn bucket_without_reset_drops_that_window() {
+    fn normalizes_all_live_per_model_buckets_and_selects_binding_primary() {
+        let body = br#"{
+            "buckets": [
+                {"modelId":"gemini-2.5-flash","remainingFraction":0.60,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-2.5-flash-lite","remainingFraction":1.00,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-2.5-pro","remainingFraction":0.90,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-3-flash-preview","remainingFraction":0.80,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-3-pro-preview","remainingFraction":0.70,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-3.1-flash-lite","remainingFraction":0.50,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-3.1-flash-lite-preview","remainingFraction":0.40,"resetTime":"2026-07-19T00:00:00Z"},
+                {"modelId":"gemini-3.1-pro-preview","remainingFraction":0.30,"resetTime":"2026-07-19T00:00:00Z"}
+            ]
+        }"#;
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        let usage = normalize_quota_at(body, now).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 70.0);
+        assert_eq!(primary.window_minutes, Some(WINDOW_MINUTES_24H));
+        assert!(usage.secondary.is_none());
+        assert!(usage.tertiary.is_none());
+
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 8);
+        assert_eq!(extras[0].title.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(
+            extras[6].id.as_deref(),
+            Some("gemini-3.1-flash-lite-preview")
+        );
+        assert!(extras.iter().all(|extra| {
+            extra.window.as_ref().unwrap().window_minutes == Some(WINDOW_MINUTES_24H)
+        }));
+    }
+
+    #[test]
+    fn bucket_without_reset_keeps_named_window_without_reset() {
         let body =
             br#"{ "buckets": [ { "modelId": "gemini-2.5-pro", "remainingFraction": 0.5 } ] }"#;
-        // No resetTime → no well-formed window.
-        assert!(normalize_quota(body).unwrap().primary.is_none());
+        let usage = normalize_quota(body).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
+        assert_eq!(usage.extra_rate_windows.unwrap().len(), 1);
     }
 
     #[test]
@@ -1065,9 +1121,12 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_models_are_skipped() {
-        let body = br#"{ "buckets": [ { "modelId": "some-embedding-model", "remainingFraction": 0.1, "resetTime": "2026-06-23T00:00:00Z" } ] }"#;
-        let usage = normalize_quota(body).unwrap();
-        assert!(usage.primary.is_none() && usage.secondary.is_none() && usage.tertiary.is_none());
+    fn every_valid_model_bucket_is_named_even_without_a_known_tier() {
+        let body = br#"{ "buckets": [ { "modelId": "some-embedding-model", "remainingFraction": 0.1, "resetTime": "2026-07-19T00:00:00Z" } ] }"#;
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        let usage = normalize_quota_at(body, now).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 90.0);
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras[0].title.as_deref(), Some("some-embedding-model"));
     }
 }

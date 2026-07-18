@@ -110,6 +110,47 @@ pub struct Balance {
     pub kind: BalanceKind,
 }
 
+/// Account labels and subscription information supplied by a provider or vault.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfo {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub org_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub plan_type: Option<String>,
+}
+
+impl AccountInfo {
+    pub fn is_empty(&self) -> bool {
+        self.email.is_none() && self.org_name.is_none() && self.plan_type.is_none()
+    }
+}
+
+/// One saved reset credit and its expiry time.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditExpiry {
+    pub expires_at: String,
+}
+
+/// Saved reset credits reported by Codex's read-only credits endpoint.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedResets {
+    #[serde(default)]
+    pub available_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub soonest_expires_at: Option<String>,
+    #[serde(default)]
+    pub credits: Vec<CreditExpiry>,
+}
+
+fn account_info_is_empty(value: &Option<AccountInfo>) -> bool {
+    value.as_ref().map(AccountInfo::is_empty).unwrap_or(true)
+}
+
 /// One provider/account's usage entry. The `/usage` response is an array of
 /// these. A fetch failure becomes an entry carrying `error` (silent-degrade),
 /// never a failure of the whole array.
@@ -123,6 +164,12 @@ pub struct ProviderUsage {
     /// Which retrieval path produced this (e.g. "oauth") — observability only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "account_info_is_empty", default)]
+    pub account_info: Option<AccountInfo>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fetched_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub saved_resets: Option<SavedResets>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     /// RESERVED SEAM — a prepaid balance signal alongside (or instead of) the
@@ -143,6 +190,9 @@ impl ProviderUsage {
             provider: provider.to_string(),
             account,
             source: Some(source.to_string()),
+            account_info: None,
+            fetched_at: None,
+            saved_resets: None,
             usage: Some(usage),
             balance: None,
             error: None,
@@ -156,6 +206,9 @@ impl ProviderUsage {
             provider: provider.to_string(),
             account: None,
             source: None,
+            account_info: None,
+            fetched_at: None,
+            saved_resets: None,
             usage: None,
             balance: None,
             error: Some(error.to_string()),
@@ -186,7 +239,60 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            json,
+            r#"{"provider":"codex","source":"oauth","usage":{"primary":{"usedPercent":41.0,"resetsAt":"2026-06-22T13:44:39Z","windowMinutes":300}}}"#
+        );
         assert!(!json.contains("balance"), "balance must be omitted: {json}");
+    }
+
+    #[test]
+    fn account_info_is_omitted_when_empty_and_keeps_partial_labels() {
+        let empty = ProviderUsage {
+            provider: "codex".to_string(),
+            account: None,
+            source: None,
+            account_info: Some(AccountInfo::default()),
+            fetched_at: None,
+            saved_resets: None,
+            usage: None,
+            balance: None,
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&empty).unwrap(),
+            r#"{"provider":"codex"}"#
+        );
+
+        let partial = ProviderUsage {
+            account_info: Some(AccountInfo {
+                email: Some("user@example.com".to_string()),
+                org_name: None,
+                plan_type: None,
+            }),
+            ..empty
+        };
+        assert_eq!(
+            serde_json::to_string(&partial).unwrap(),
+            r#"{"provider":"codex","accountInfo":{"email":"user@example.com"}}"#
+        );
+    }
+
+    #[test]
+    fn saved_resets_use_camel_case_and_round_trip() {
+        let saved = SavedResets {
+            available_count: 2,
+            soonest_expires_at: Some("2026-07-15T12:00:00Z".to_string()),
+            credits: vec![CreditExpiry {
+                expires_at: "2026-07-15T12:00:00Z".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(
+            json,
+            r#"{"availableCount":2,"soonestExpiresAt":"2026-07-15T12:00:00Z","credits":[{"expiresAt":"2026-07-15T12:00:00Z"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<SavedResets>(&json).unwrap(), saved);
     }
 
     #[test]
