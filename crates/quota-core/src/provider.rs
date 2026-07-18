@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 use crate::credential_source::{VaultCapability, VaultGetError};
-use crate::model::{ProviderUsage, Usage};
+use crate::model::{AccountInfo, ProviderUsage, SavedResets, Usage};
 
 /// Stable identity for one credential fetch unit.
 ///
@@ -149,6 +149,10 @@ pub struct FetchAttempt {
     pub observed: Option<AccountObservation>,
     pub source: Option<String>,
     pub usage: Result<Usage, FetchError>,
+    /// Optional provider/account labels attached to a successful usage fetch.
+    pub account_info: Option<AccountInfo>,
+    /// Optional read-only reset inventory attached to a successful usage fetch.
+    pub saved_resets: Option<SavedResets>,
     /// The slot may relax raw percentages only while this success remains fresh.
     pub relax_eligible: bool,
     pub credential_resolution: CredentialResolution,
@@ -164,6 +168,8 @@ impl FetchAttempt {
             observed,
             source: Some(source.into()),
             usage: Ok(usage),
+            account_info: None,
+            saved_resets: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }
@@ -178,6 +184,8 @@ impl FetchAttempt {
             observed,
             source,
             usage: Err(error),
+            account_info: None,
+            saved_resets: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }
@@ -202,9 +210,23 @@ impl FetchAttempt {
             observed: None,
             source: None,
             usage: Err(fetch_error),
+            account_info: None,
+            saved_resets: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Unverified,
         }
+    }
+
+    /// Attach account labels discovered while resolving the credential.
+    pub fn with_account_info(mut self, account_info: Option<AccountInfo>) -> Self {
+        self.account_info = account_info.filter(|info| !info.is_empty());
+        self
+    }
+
+    /// Attach a successful read-only reset inventory without changing mutation policy.
+    pub fn with_saved_resets(mut self, saved_resets: Option<SavedResets>) -> Self {
+        self.saved_resets = saved_resets;
+        self
     }
 
     /// Set read-time relaxation eligibility without changing other providers'
@@ -216,8 +238,7 @@ impl FetchAttempt {
 
     /// Adapt an existing single-credential provider body while preserving its
     /// normalization and error mapping. The refresher still rebuilds the served
-    /// entry from this envelope; only Codex currently has an observable account
-    /// identity and therefore uses the explicit constructors above.
+    /// entry from this envelope.
     pub fn from_provider_usage(result: Result<ProviderUsage, FetchError>) -> Self {
         match result {
             Ok(entry) => {
@@ -226,6 +247,8 @@ impl FetchAttempt {
                 // Outer `None` is reserved for an unavailable observation.
                 let observed = Some(AccountObservation::new(entry.account, None));
                 let source = entry.source;
+                let account_info = entry.account_info;
+                let saved_resets = entry.saved_resets;
                 let usage = entry.usage.ok_or_else(|| {
                     FetchError::Decode("provider returned a healthy entry without usage".into())
                 });
@@ -233,6 +256,8 @@ impl FetchAttempt {
                     observed,
                     source,
                     usage,
+                    account_info,
+                    saved_resets,
                     relax_eligible: false,
                     credential_resolution: CredentialResolution::Verified,
                 }

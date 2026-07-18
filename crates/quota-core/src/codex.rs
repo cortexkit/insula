@@ -40,7 +40,7 @@ use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::{
     http::{Header, JsonRequest},
-    model::{RateWindow, Usage},
+    model::{AccountInfo, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -55,6 +55,8 @@ const ARMED_USAGE_TIMEOUT: Duration = Duration::from_secs(12);
 pub struct CodexCredentials {
     pub bearer: String,
     pub account_id: Option<String>,
+    /// Email from the local OAuth id_token profile claim, when present.
+    pub email: Option<String>,
     /// True when `bearer` is the OAuth access token (account-scoped), false when
     /// it is a fallback API key.
     pub is_oauth: bool,
@@ -72,6 +74,7 @@ struct AuthFile {
 struct AuthTokens {
     access_token: Option<String>,
     account_id: Option<String>,
+    id_token: Option<String>,
 }
 
 impl std::fmt::Debug for CodexCredentials {
@@ -80,6 +83,7 @@ impl std::fmt::Debug for CodexCredentials {
             .debug_struct("CodexCredentials")
             .field("bearer", &"<redacted>")
             .field("account_id", &self.account_id)
+            .field("email", &self.email)
             .field("is_oauth", &self.is_oauth)
             .finish()
     }
@@ -107,6 +111,7 @@ impl std::fmt::Debug for AuthTokens {
                 &self.access_token.as_ref().map(|_| "<redacted>"),
             )
             .field("account_id", &self.account_id)
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -116,6 +121,8 @@ struct ServedCodexContext {
     bearer: String,
     canonical_account_id: Option<String>,
     record_version: Option<u64>,
+    email: Option<String>,
+    org_name: Option<String>,
     capability: Option<VaultCapability>,
     is_oauth: bool,
     source: &'static str,
@@ -128,6 +135,8 @@ impl std::fmt::Debug for ServedCodexContext {
             .field("bearer", &"<redacted>")
             .field("canonical_account_id", &self.canonical_account_id)
             .field("record_version", &self.record_version)
+            .field("email", &self.email)
+            .field("org_name", &self.org_name)
             .field("capability", &self.capability)
             .field("is_oauth", &self.is_oauth)
             .field("source", &self.source)
@@ -161,12 +170,29 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
     )
 }
 
+fn id_token_email(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    canonical_label(
+        claims
+            .get("https://api.openai.com/profile")
+            .and_then(|profile| profile.get("email"))
+            .and_then(serde_json::Value::as_str)
+            .map(|email| email.trim().to_ascii_lowercase()),
+    )
+}
+
 impl ServedCodexContext {
     fn local(credentials: CodexCredentials) -> Self {
         Self {
             canonical_account_id: credentials.account_id,
             bearer: credentials.bearer,
             record_version: None,
+            email: canonical_label(credentials.email),
+            org_name: None,
             capability: None,
             is_oauth: credentials.is_oauth,
             source: if credentials.is_oauth { "oauth" } else { "api" },
@@ -189,10 +215,14 @@ impl ServedCodexContext {
         };
         let canonical_account_id = canonical_account_id(credential.account_id.clone())
             .or_else(|| chatgpt_account_id(&bearer));
+        let email = canonical_label(credential.email.clone());
+        let org_name = canonical_label(credential.org_name.clone());
         Ok(Self {
             bearer,
             canonical_account_id,
             record_version: Some(credential.record_version),
+            email,
+            org_name,
             capability: Some(capability),
             is_oauth: true,
             source: "vault",
@@ -203,6 +233,7 @@ impl ServedCodexContext {
         CodexCredentials {
             bearer: self.bearer.clone(),
             account_id: self.canonical_account_id.clone(),
+            email: self.email.clone(),
             is_oauth: self.is_oauth,
         }
     }
@@ -210,6 +241,21 @@ impl ServedCodexContext {
     fn observation(&self) -> AccountObservation {
         AccountObservation::new(self.canonical_account_id.clone(), self.record_version)
     }
+
+    fn account_info(&self, plan_type: Option<String>) -> Option<AccountInfo> {
+        let info = AccountInfo {
+            email: self.email.clone(),
+            org_name: self.org_name.clone(),
+            plan_type: plan_type.and_then(|value| canonical_label(Some(value))),
+        };
+        (!info.is_empty()).then_some(info)
+    }
+}
+
+fn canonical_label(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Parse credentials from raw `auth.json` bytes, preferring the OAuth token.
@@ -227,6 +273,7 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
                     .account_id
                     .clone()
                     .filter(|account_id| !account_id.is_empty()),
+                email: tokens.id_token.as_deref().and_then(id_token_email),
                 is_oauth: true,
             });
         }
@@ -236,6 +283,7 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
         return Ok(CodexCredentials {
             bearer: key.to_string(),
             account_id: None,
+            email: None,
             is_oauth: false,
         });
     }
@@ -248,6 +296,8 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
 /// Upstream `/wham/usage` response (the subset we normalize).
 #[derive(Debug, Deserialize)]
 struct UsageResponse {
+    #[serde(default)]
+    plan_type: Option<String>,
     rate_limit: Option<RateLimit>,
 }
 
@@ -291,6 +341,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
 pub struct CodexUsageSnapshot {
     pub usage: Usage,
     pub limit_reached: Option<bool>,
+    pub plan_type: Option<String>,
 }
 
 /// Normalize a full `/wham/usage` JSON body without relaxing any percentages.
@@ -301,6 +352,7 @@ pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, Fetch
         .rate_limit
         .ok_or_else(|| FetchError::Decode("usage response missing rate_limit".to_string()))?;
     Ok(CodexUsageSnapshot {
+        plan_type: canonical_label(response.plan_type),
         usage: Usage {
             primary: rate_limit
                 .primary_window
@@ -563,31 +615,38 @@ impl CodexProvider {
         let credentials = context.credentials();
         let preserve_provider_status = context.capability.is_some();
         let usage_url = resolve_usage_url(config_toml.as_deref());
-
-        let Some(account_id) = context
+        let account_id = context
             .canonical_account_id
             .as_deref()
-            .filter(|_| reset_credentials_eligible(&self.reset_config, &credentials))
-        else {
+            .filter(|account_id| context.is_oauth && !account_id.trim().is_empty());
+        let reset_eligible = account_id.is_some_and(|account_id| {
+            reset_credentials_eligible(&self.reset_config, &credentials)
+                && !account_id.trim().is_empty()
+        });
+
+        let Some(account_id) = account_id else {
             let usage = send_codex_request(
                 usage_request(usage_url, &credentials, REQUEST_TIMEOUT),
                 &self.http,
                 preserve_provider_status,
             )
             .await
-            .and_then(|body| normalize_usage(&body));
+            .and_then(|body| normalize_usage_snapshot(&body));
             if let Err(error) = &usage {
                 self.report_auth_failure(&context, error);
             }
             if self.reset_config.is_enabled() {
-                let facts = usage
-                    .as_ref()
-                    .ok()
-                    .map(|usage| UsageFacts::from_usage(usage, None));
+                let facts = usage.as_ref().ok().map(|snapshot| {
+                    UsageFacts::from_usage(&snapshot.usage, snapshot.limit_reached)
+                });
                 log_reset_tick(facts.as_ref(), None, None, false, false);
             }
             return match usage {
-                Ok(usage) => FetchAttempt::success(observed, source, usage),
+                Ok(snapshot) => {
+                    let plan_type = snapshot.plan_type.clone();
+                    unarmed_usage_attempt(observed, source, snapshot)
+                        .with_account_info(context.account_info(plan_type))
+                }
                 Err(error) => FetchAttempt::failure(observed, Some(source.to_string()), error),
             };
         };
@@ -612,11 +671,18 @@ impl CodexProvider {
             account_id: account_id.to_string(),
             auth_failure,
         };
+        let usage_timeout = if reset_eligible {
+            ARMED_USAGE_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
         let usage_future = send_codex_request(
-            usage_request(usage_url, &credentials, ARMED_USAGE_TIMEOUT),
+            usage_request(usage_url, &credentials, usage_timeout),
             &self.http,
             preserve_provider_status,
         );
+        // Metadata reads are always allowed for account-scoped OAuth contexts;
+        // only the coordinator below can authorize a consume POST.
         let credits_future = self.reset_transport.fetch_credits(&reset_request);
         let (usage_http, credits_http) = tokio::join!(usage_future, credits_future);
         if let Err(error) = &credits_http {
@@ -642,16 +708,34 @@ impl CodexProvider {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: codex credits GET failed account_id={account_id}: {error}; tick unarmed"
+                    "[ck-quota] warning: codex credits GET failed account_id={account_id}: {error}; usage metadata unavailable"
                 );
                 log_reset_tick(Some(&facts), None, None, false, false);
-                return unarmed_usage_attempt(observed, source, usage_snapshot);
+                return FetchAttempt::success(observed, source, usage_snapshot.usage)
+                    .with_account_info(context.account_info(usage_snapshot.plan_type));
             }
         };
+        let saved_resets = Some(credits.saved_resets());
+        let account_info = context.account_info(usage_snapshot.plan_type);
         let Some(earliest_expiry) = reset_trigger_expiry(&credits, now) else {
             log_reset_tick(Some(&facts), Some(&credits), None, false, false);
-            return FetchAttempt::success(observed, source, usage_snapshot.usage);
+            return FetchAttempt::success(observed, source, usage_snapshot.usage)
+                .with_account_info(account_info)
+                .with_saved_resets(saved_resets);
         };
+
+        if !reset_eligible {
+            log_reset_tick(
+                Some(&facts),
+                Some(&credits),
+                Some(earliest_expiry),
+                false,
+                false,
+            );
+            return FetchAttempt::success(observed, source, usage_snapshot.usage)
+                .with_account_info(account_info)
+                .with_saved_resets(saved_resets);
+        }
 
         let coordinator = match &self.reset_coordinator {
             Ok(coordinator) => coordinator,
@@ -666,7 +750,9 @@ impl CodexProvider {
                     false,
                     false,
                 );
-                return FetchAttempt::success(observed, source, usage_snapshot.usage);
+                return FetchAttempt::success(observed, source, usage_snapshot.usage)
+                    .with_account_info(account_info)
+                    .with_saved_resets(saved_resets);
             }
         };
         let result = coordinator
@@ -692,6 +778,8 @@ impl CodexProvider {
             result.relax_eligible,
         );
         FetchAttempt::success(observed, source, usage_snapshot.usage)
+            .with_account_info(account_info)
+            .with_saved_resets(saved_resets)
             .with_relax_eligible(result.relax_eligible)
     }
 }
@@ -796,6 +884,8 @@ impl UsageProvider for CodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_resets::RedemptionJournal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -841,8 +931,296 @@ mod tests {
         format!("http://{address}/backend-api")
     }
 
+    async fn serve_codex_metadata_routes(
+        usage_body: Vec<u8>,
+        credits_body: Vec<u8>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let usage_gets = Arc::new(AtomicUsize::new(0));
+        let credits_gets = Arc::new(AtomicUsize::new(0));
+        let consume_posts = Arc::new(AtomicUsize::new(0));
+        let usage_gets_server = Arc::clone(&usage_gets);
+        let credits_gets_server = Arc::clone(&credits_gets);
+        let consume_posts_server = Arc::clone(&consume_posts);
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or("");
+                let (body, method) = if path.ends_with("/wham/usage") {
+                    usage_gets_server.fetch_add(1, Ordering::SeqCst);
+                    (&usage_body, "GET")
+                } else if path.ends_with("/wham/rate-limit-reset-credits") {
+                    credits_gets_server.fetch_add(1, Ordering::SeqCst);
+                    (&credits_body, "GET")
+                } else if path.ends_with("/wham/rate-limit-reset-credits/consume") {
+                    consume_posts_server.fetch_add(1, Ordering::SeqCst);
+                    (&credits_body, "POST")
+                } else {
+                    (&credits_body, "GET")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                let _ = method;
+            }
+        });
+        (
+            format!("http://{address}/backend-api"),
+            usage_gets,
+            credits_gets,
+            consume_posts,
+            task,
+        )
+    }
+
     fn context_config(base_url: &str) -> Option<String> {
         Some(format!("chatgpt_base_url = {base_url:?}\n"))
+    }
+
+    struct CountingResetTransport {
+        gets: AtomicUsize,
+        posts: AtomicUsize,
+        fail_get: bool,
+    }
+
+    #[async_trait]
+    impl ResetTransport for CountingResetTransport {
+        async fn fetch_credits(
+            &self,
+            _request: &ResetRequest,
+        ) -> Result<CreditsHttpResponse, FetchError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            if self.fail_get {
+                return Err(FetchError::Upstream("credits unavailable".to_string()));
+            }
+            Ok(CreditsHttpResponse {
+                body: br#"{
+                    "credits": [{
+                        "id": "credit-unarmed",
+                        "status": "available",
+                        "expires_at": "2026-07-15T12:00:00Z"
+                    }],
+                    "available_count": 1
+                }"#
+                .to_vec(),
+                date_header: None,
+            })
+        }
+
+        async fn consume(
+            &self,
+            _request: &ResetRequest,
+            _redeem_request_id: &str,
+        ) -> Result<Vec<u8>, FetchError> {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            Err(FetchError::Upstream(
+                "consume should not be called".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unarmed_registry_fetches_credits_without_consume_post() {
+        let usage_body = br#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 41.0}
+            }
+        }"#;
+        let usage_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            usage_body.len(),
+            String::from_utf8_lossy(usage_body)
+        );
+        let usage_base = serve_one_raw_response(usage_response.into_bytes()).await;
+        let home =
+            std::env::temp_dir().join(format!("ck-quota-codex-unarmed-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"tokens":{"access_token":"oauth-token","account_id":"acct-unarmed"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            context_config(&usage_base).unwrap(),
+        )
+        .unwrap();
+
+        let transport = Arc::new(CountingResetTransport {
+            gets: AtomicUsize::new(0),
+            posts: AtomicUsize::new(0),
+            fail_get: false,
+        });
+        let journal_dir = home.join("state");
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(journal_dir.join("redemptions.json")))
+                .unwrap(),
+        );
+        let provider = CodexProvider::new_for_test(
+            CodexConfig::default(),
+            None,
+            Arc::clone(&transport) as Arc<dyn ResetTransport>,
+            coordinator,
+            VaultHandleLoader::new(None),
+            home.clone(),
+        );
+        let registry = crate::Registry::new(vec![Box::new(provider)]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let usage = registry.get_usage(None).await;
+
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].account.as_deref(), Some("acct-unarmed"));
+        assert_eq!(
+            usage[0].account_info.as_ref().unwrap().plan_type.as_deref(),
+            Some("pro")
+        );
+        assert_eq!(usage[0].saved_resets.as_ref().unwrap().available_count, 1);
+        assert_eq!(transport.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn unarmed_registry_http_gets_credits_without_consume_post() {
+        let usage_body = br#"{
+            "plan_type": "pro",
+            "rate_limit": {"primary_window": {"used_percent": 41.0}}
+        }"#
+        .to_vec();
+        let credits_body = br#"{
+            "credits": [{
+                "id": "credit-http",
+                "status": "available",
+                "expires_at": "2026-07-15T12:00:00Z"
+            }],
+            "available_count": 1
+        }"#
+        .to_vec();
+        let (base_url, usage_gets, credits_gets, consume_posts, server) =
+            serve_codex_metadata_routes(usage_body, credits_body).await;
+        let home = std::env::temp_dir().join(format!(
+            "ck-quota-codex-http-unarmed-{}-{}",
+            std::process::id(),
+            usage_gets.as_ref() as *const _ as usize
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"tokens":{"access_token":"oauth-token","account_id":"acct-http-unarmed"}}"#,
+        )
+        .unwrap();
+        std::fs::write(home.join("config.toml"), context_config(&base_url).unwrap()).unwrap();
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(home.join("redemptions.json"))).unwrap(),
+        );
+        let provider = CodexProvider::new_for_test(
+            CodexConfig::default(),
+            None,
+            Arc::new(ReqwestResetTransport::new(reqwest::Client::new())),
+            coordinator,
+            VaultHandleLoader::new(None),
+            home.clone(),
+        );
+        let registry = crate::Registry::new(vec![Box::new(provider)]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let usage = registry.get_usage(None).await;
+        server.await.unwrap();
+
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].saved_resets.as_ref().unwrap().available_count, 1);
+        assert_eq!(usage_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(credits_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(consume_posts.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn credits_get_failure_keeps_codex_usage_healthy() {
+        let usage_body = br#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 41.0}
+            }
+        }"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            usage_body.len(),
+            String::from_utf8_lossy(usage_body)
+        );
+        let base_url = serve_one_raw_response(response.into_bytes()).await;
+        let transport = Arc::new(CountingResetTransport {
+            gets: AtomicUsize::new(0),
+            posts: AtomicUsize::new(0),
+            fail_get: true,
+        });
+        let state_dir = std::env::temp_dir().join(format!(
+            "ck-quota-codex-credits-failure-{}",
+            std::process::id()
+        ));
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(state_dir.join("redemptions.json")))
+                .unwrap(),
+        );
+        let provider = CodexProvider::new_for_test(
+            CodexConfig::default(),
+            None,
+            Arc::clone(&transport) as Arc<dyn ResetTransport>,
+            coordinator,
+            VaultHandleLoader::new(None),
+            state_dir.clone(),
+        );
+        let attempt = provider
+            .fetch_context(
+                ServedCodexContext {
+                    bearer: "oauth-token".to_string(),
+                    canonical_account_id: Some("acct-credits-failure".to_string()),
+                    record_version: None,
+                    email: None,
+                    org_name: None,
+                    capability: None,
+                    is_oauth: true,
+                    source: "oauth",
+                },
+                context_config(&base_url),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(attempt.usage.is_ok());
+        assert!(attempt.saved_resets.is_none());
+        assert_eq!(transport.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
@@ -856,6 +1234,7 @@ mod tests {
                 ServedCodexContext::local(CodexCredentials {
                     bearer: "local-secret".to_string(),
                     account_id: None,
+                    email: None,
                     is_oauth: true,
                 }),
                 context_config(&local_url),
@@ -873,6 +1252,8 @@ mod tests {
                 ServedCodexContext {
                     bearer: "vault-secret".to_string(),
                     canonical_account_id: None,
+                    email: None,
+                    org_name: None,
                     record_version: Some(4),
                     capability: Some(VaultCapability::new("ckh_test")),
                     is_oauth: true,
@@ -900,6 +1281,8 @@ mod tests {
                 ServedCodexContext {
                     bearer: "vault-secret".to_string(),
                     canonical_account_id: None,
+                    email: None,
+                    org_name: None,
                     record_version: Some(44),
                     capability: Some(VaultCapability::new("ckh_truncated")),
                     is_oauth: true,
@@ -928,6 +1311,7 @@ mod tests {
         let credentials = CodexCredentials {
             bearer: secret.to_string(),
             account_id: Some("acct".to_string()),
+            email: None,
             is_oauth: true,
         };
         let auth: AuthFile = serde_json::from_value(serde_json::json!({
@@ -957,12 +1341,18 @@ mod tests {
                 expires_at_ms: None,
                 record_version: 17,
                 account_id: None,
+                email: Some("vault@example.com".to_string()),
+                org_name: None,
                 project_id: None,
             },
         )
         .unwrap();
         assert_eq!(context.canonical_account_id.as_deref(), Some("jwt-account"));
         assert_eq!(context.observation().record_version, Some(17));
+        assert_eq!(
+            context.account_info(None).unwrap().email.as_deref(),
+            Some("vault@example.com")
+        );
         assert!(!format!("{context:?}").contains("ckh_context_secret"));
     }
 
@@ -984,6 +1374,8 @@ mod tests {
         let context = ServedCodexContext {
             bearer: "secret".to_string(),
             canonical_account_id: Some("acct".to_string()),
+            email: None,
+            org_name: None,
             record_version: Some(23),
             capability: Some(VaultCapability::new("ckh_report_secret")),
             is_oauth: true,
@@ -992,6 +1384,50 @@ mod tests {
         provider.report_auth_failure(&context, &FetchError::ProviderStatus(401));
         tokio::task::yield_now().await;
         assert_eq!(*reports.lock().unwrap(), vec![(401, 23)]);
+    }
+
+    fn jwt_with_payload(payload: serde_json::Value) -> String {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("header.{encoded}.signature")
+    }
+
+    #[test]
+    fn local_id_token_profile_email_is_trimmed_and_lowercased() {
+        let id_token = jwt_with_payload(serde_json::json!({
+            "https://api.openai.com/profile": {"email": "  User@Example.COM "}
+        }));
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "tokens": {
+                "access_token": "oauth",
+                "account_id": "acct",
+                "id_token": id_token
+            }
+        }))
+        .unwrap();
+        let credentials = parse_credentials(&raw).unwrap();
+        assert_eq!(credentials.email.as_deref(), Some("user@example.com"));
+        assert_eq!(
+            ServedCodexContext::local(credentials)
+                .account_info(None)
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn malformed_or_missing_id_token_email_is_not_a_credential_error() {
+        for id_token in [None, Some("not-a-jwt")] {
+            let mut tokens = serde_json::json!({"access_token": "oauth"});
+            if let Some(id_token) = id_token {
+                tokens["id_token"] = serde_json::Value::String(id_token.to_string());
+            }
+            let raw = serde_json::to_vec(&serde_json::json!({"tokens": tokens})).unwrap();
+            let credentials = parse_credentials(&raw).unwrap();
+            assert_eq!(credentials.email, None);
+        }
     }
 
     #[test]
@@ -1024,6 +1460,7 @@ mod tests {
         let oauth = CodexCredentials {
             bearer: "oauth".to_string(),
             account_id: Some("acct".to_string()),
+            email: None,
             is_oauth: true,
         };
         assert!(reset_credentials_eligible(&enabled, &oauth));
@@ -1073,7 +1510,9 @@ mod tests {
                 "secondary_window": { "used_percent": 28, "limit_window_seconds": 604800, "reset_at": 1782667719 }
             }
         }"#;
-        let usage = normalize_usage(body).unwrap();
+        let snapshot = normalize_usage_snapshot(body).unwrap();
+        assert_eq!(snapshot.plan_type.as_deref(), Some("pro"));
+        let usage = snapshot.usage;
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 41.0);
         assert_eq!(primary.window_minutes, Some(300)); // 18000s / 60 = 300m (5h)

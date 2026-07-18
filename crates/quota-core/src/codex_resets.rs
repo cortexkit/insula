@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::http::{Header, JsonRequest};
-use crate::model::Usage;
+use crate::model::{CreditExpiry, SavedResets, Usage};
 use crate::provider::FetchError;
 
 pub const CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
@@ -46,6 +46,9 @@ pub struct ResetCredit {
 pub struct CreditsSnapshot {
     pub available: Vec<ResetCredit>,
     pub reported_available_count: u64,
+    /// Expiries from every available response item, including entries without an
+    /// id that are unsafe to redeem but still useful for display.
+    pub available_expiries: Vec<DateTime<Utc>>,
 }
 
 impl CreditsSnapshot {
@@ -69,6 +72,24 @@ impl CreditsSnapshot {
             .filter(|credit| credit.expires_at > safety_cutoff)
             .count()
     }
+
+    pub fn saved_resets(&self) -> SavedResets {
+        SavedResets {
+            available_count: self.reported_available_count.min(u32::MAX as u64) as u32,
+            soonest_expires_at: self
+                .available_expiries
+                .iter()
+                .min()
+                .map(DateTime::to_rfc3339),
+            credits: self
+                .available_expiries
+                .iter()
+                .map(|expires_at| CreditExpiry {
+                    expires_at: expires_at.to_rfc3339(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,25 +108,35 @@ struct RawCredit {
 }
 
 /// Normalize the live credits response. Available entries without a trustworthy
-/// id and RFC3339 expiry are discarded, so they can never arm mutation.
+/// id are excluded from mutation inventory, while valid expiries remain displayable.
+/// Entries without an RFC3339 expiry are discarded because neither path can use them.
 pub fn normalize_credits(body: &[u8]) -> Result<CreditsSnapshot, FetchError> {
     let response: RawCreditsResponse = serde_json::from_slice(body)
         .map_err(|error| FetchError::Decode(format!("credits response not decodable: {error}")))?;
-    let available = response
+    let mut available = Vec::new();
+    let mut available_expiries = Vec::new();
+    for credit in response
         .credits
         .into_iter()
         .filter(|credit| credit.status.as_deref() == Some("available"))
-        .filter_map(|credit| {
-            let id = credit.id.filter(|id| !id.is_empty())?;
-            let expires_at = DateTime::parse_from_rfc3339(credit.expires_at.as_deref()?)
-                .ok()?
-                .with_timezone(&Utc);
-            Some(ResetCredit { id, expires_at })
-        })
-        .collect();
+    {
+        let Some(expires_at) = credit
+            .expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        available_expiries.push(expires_at);
+        if let Some(id) = credit.id.filter(|id| !id.is_empty()) {
+            available.push(ResetCredit { id, expires_at });
+        }
+    }
     Ok(CreditsSnapshot {
         available,
         reported_available_count: response.available_count,
+        available_expiries,
     })
 }
 

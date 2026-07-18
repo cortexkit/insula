@@ -6,6 +6,8 @@
 
 use async_trait::async_trait;
 
+use crate::model::AccountInfo;
+
 /// An owned snapshot of one opaque vault capability.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VaultCapability(String);
@@ -35,6 +37,26 @@ pub struct VaultCredential {
     pub record_version: u64,
     pub account_id: Option<String>,
     pub project_id: Option<String>,
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+}
+
+impl VaultCredential {
+    /// Convert optional vault labels into the public account metadata shape.
+    pub fn account_info(&self) -> Option<AccountInfo> {
+        let info = AccountInfo {
+            email: canonical_label(self.email.clone()),
+            org_name: canonical_label(self.org_name.clone()),
+            plan_type: None,
+        };
+        (!info.is_empty()).then_some(info)
+    }
+}
+
+fn canonical_label(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 impl std::fmt::Debug for VaultCredential {
@@ -46,6 +68,8 @@ impl std::fmt::Debug for VaultCredential {
             .field("record_version", &self.record_version)
             .field("account_id", &self.account_id)
             .field("project_id", &self.project_id)
+            .field("email", &self.email)
+            .field("org_name", &self.org_name)
             .finish()
     }
 }

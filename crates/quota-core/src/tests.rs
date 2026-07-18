@@ -1196,6 +1196,7 @@ enum MockConsumeBehavior {
 
 struct MockResetTransport {
     behavior: MockConsumeBehavior,
+    gets: AtomicUsize,
     posts: AtomicUsize,
     consume_accounts: Mutex<Vec<String>>,
     reservation_visible: AtomicBool,
@@ -1209,6 +1210,7 @@ impl MockResetTransport {
     fn new(behavior: MockConsumeBehavior) -> Self {
         Self {
             behavior,
+            gets: AtomicUsize::new(0),
             posts: AtomicUsize::new(0),
             consume_accounts: Mutex::new(Vec::new()),
             reservation_visible: AtomicBool::new(false),
@@ -1244,6 +1246,7 @@ impl ResetTransport for MockResetTransport {
         &self,
         _request: &ResetRequest,
     ) -> Result<CreditsHttpResponse, FetchError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         if self.credits_error {
             return Err(FetchError::Upstream("mock credits failure".into()));
         }
@@ -1400,6 +1403,8 @@ impl CredentialSource for SameAccountVaultSource {
             expires_at_ms: None,
             record_version: 8,
             account_id: Some("real-provider-account".to_string()),
+            email: None,
+            org_name: None,
             project_id: None,
         })
     }
@@ -2207,6 +2212,40 @@ impl UsageProvider for TransientlyFailingRelaxProvider {
 }
 
 #[tokio::test]
+async fn fetched_at_is_stable_for_fresh_and_stale_slot_entries() {
+    let registry = Registry::new(vec![Box::new(TransientlyFailingRelaxProvider {
+        calls: AtomicUsize::new(0),
+    })]);
+    tick(&registry).await;
+
+    let fresh = registry.get_usage(Some("codex-stale-transient")).await;
+    assert_eq!(fresh.len(), 1);
+    let fetched_at = fresh[0].fetched_at.clone().expect("fresh slot timestamp");
+    let parsed = chrono::DateTime::parse_from_rfc3339(&fetched_at).unwrap();
+    assert!(
+        (Utc::now() - parsed.with_timezone(&Utc))
+            .num_seconds()
+            .abs()
+            < 5
+    );
+
+    force_due(&registry, "codex-stale-transient");
+    tick(&registry).await;
+    let stale = registry.get_usage(Some("codex-stale-transient")).await;
+    assert_eq!(stale[0].fetched_at.as_deref(), Some(fetched_at.as_str()));
+}
+
+#[tokio::test]
+async fn pending_and_degraded_entries_have_no_fetched_at() {
+    let registry = registry(&[("pending-or-degraded", false, false)]);
+    assert!(registry.get_usage(None).await.is_empty());
+    tick(&registry).await;
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1);
+    assert!(usage[0].fetched_at.is_none());
+}
+
+#[tokio::test]
 async fn f8_stale_transient_success_serves_raw_usage_after_failure() {
     let registry = Registry::new(vec![Box::new(TransientlyFailingRelaxProvider {
         calls: AtomicUsize::new(0),
@@ -2647,4 +2686,10 @@ fn credits_normalizer_matches_live_captured_contract() {
             .single()
             .unwrap()
     );
+    assert_eq!(credits.saved_resets().available_count, 1);
+    assert_eq!(
+        credits.saved_resets().soonest_expires_at.as_deref(),
+        Some("2026-07-14T13:00:01+00:00")
+    );
+    assert_eq!(credits.saved_resets().credits.len(), 1);
 }
