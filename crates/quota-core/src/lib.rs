@@ -34,6 +34,7 @@ pub mod manus;
 pub mod mimo;
 pub mod minimax;
 pub mod model;
+pub mod neuralwatt;
 pub mod ollama;
 pub mod opencode;
 pub mod opencode_auth;
