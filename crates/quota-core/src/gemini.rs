@@ -218,19 +218,17 @@ fn window_minutes_from_reset(reset_time: &str, now: DateTime<Utc>) -> Option<i64
     if delta_minutes <= 0.0 {
         return Some(WINDOW_MINUTES_24H);
     }
-    // Gemini currently reports daily buckets, while the same response shape has
-    // historically carried five-hour and weekly windows. Choose the nearest
-    // known class so small clock/rounding skew does not create odd labels.
-    [300_i64, WINDOW_MINUTES_24H, 7 * 24 * 60, 30 * 24 * 60]
+    // A mid-window delta only lower-bounds the true window length, so it cannot
+    // justify shrinking a daily bucket to a shorter class. Assert daily unless
+    // the delta proves a longer class, then choose the tightest class that still
+    // contains it.
+    if delta_minutes <= 1_500.0 {
+        return Some(WINDOW_MINUTES_24H);
+    }
+    [7 * 24 * 60, 30 * 24 * 60]
         .into_iter()
-        .min_by(|left, right| {
-            let left_distance = ((*left as f64) - delta_minutes).abs();
-            let right_distance = ((*right as f64) - delta_minutes).abs();
-            left_distance
-                .partial_cmp(&right_distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.cmp(right))
-        })
+        .find(|class| delta_minutes <= *class as f64)
+        .or(Some(30 * 24 * 60))
 }
 
 /// Normalize a `retrieveUserQuota` body to named per-model windows. Every valid
@@ -1050,6 +1048,23 @@ mod tests {
         assert!(!debug.contains("gemini-access-secret"));
         assert!(!debug.contains("gemini-refresh-secret"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn reset_delta_uses_daily_for_mid_window_and_only_proves_longer_classes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        assert_eq!(
+            window_minutes_from_reset("2026-07-18T04:00:00Z", now),
+            Some(WINDOW_MINUTES_24H)
+        );
+        assert_eq!(
+            window_minutes_from_reset("2026-07-19T00:00:00Z", now),
+            Some(WINDOW_MINUTES_24H)
+        );
+        assert_eq!(
+            window_minutes_from_reset("2026-07-24T21:36:00Z", now),
+            Some(7 * 24 * 60)
+        );
     }
 
     #[test]
