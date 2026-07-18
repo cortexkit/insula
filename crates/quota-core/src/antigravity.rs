@@ -17,8 +17,10 @@
 //!     `Content-Type: application/json` + `Connect-Protocol-Version: 1` +
 //!     `X-Codeium-Csrf-Token: <token>` (omitted for the CLI).
 //!  4. Parse the quota summary: groups → buckets, each with `remainingFraction`
-//!     (0..1) and `resetTime`; the Gemini pool maps to `primary`, Claude/GPT to
-//!     `secondary`, and every bucket is also surfaced as a per-pool extra window.
+//!     (0..1) and `resetTime`. The two pools (native Gemini models vs external
+//!     Claude/GPT models) are independent meters: only the Gemini pool maps to
+//!     the unnamed `primary`; every bucket (both pools) is surfaced as a named
+//!     per-pool extra window.
 //!
 //! The local server uses a SELF-SIGNED cert on loopback, so this provider builds ONE
 //! dedicated reqwest client with cert validation disabled — used EXCLUSIVELY for
@@ -403,8 +405,13 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
         ));
     }
 
+    // Antigravity meters two independent pools: the native Gemini models and the
+    // external Claude/GPT models. Only the native pool represents the product's
+    // own capacity, so only it may claim the unnamed `primary` slot — an unnamed
+    // slot reads as "this account's window", and a walled external pool in it
+    // would misreport the whole provider as exhausted while Gemini is free.
+    // Both pools stay fully visible as named extra windows below.
     let primary = representative(&resolved, Pool::Gemini);
-    let secondary = representative(&resolved, Pool::ClaudeGpt);
 
     // Every resolved bucket is also surfaced as a per-pool extra window.
     let extra: Vec<ExtraWindow> = resolved
@@ -416,16 +423,24 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
         })
         .collect();
 
-    // If neither named pool resolved, fall back to the first resolved window as primary
-    // so a non-Gemini/Claude account still reports something rather than degrading.
-    let (primary, secondary) = match (primary, secondary) {
-        (None, None) => (Some(resolved[0].window.clone()), None),
-        pair => pair,
-    };
+    // If no Gemini-pool bucket resolved, fall back to the most-used resolved
+    // window so a non-Gemini account still reports something rather than
+    // degrading.
+    let primary = primary.or_else(|| {
+        resolved
+            .iter()
+            .max_by(|a, b| {
+                a.window
+                    .used_percent
+                    .partial_cmp(&b.window.used_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|w| w.window.clone())
+    });
 
     Ok(Usage {
         primary,
-        secondary,
+        secondary: None,
         tertiary: None,
         extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
     })
@@ -564,7 +579,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_gemini_primary_and_claude_secondary() {
+    fn gemini_pool_owns_primary_and_no_secondary_is_emitted() {
         let usage = parse_quota_summary(SUMMARY_FIXTURE).unwrap();
         // Gemini pool: 5h used 20% vs weekly used 47% → representative is the
         // most-used (weekly), mirroring CodexBar.
@@ -572,12 +587,50 @@ mod tests {
         assert_eq!(primary.used_percent, 47.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
         assert_eq!(primary.window_minutes, Some(10080));
-        // Claude/GPT pool has only the 5-hour bucket: used = (1 - 0.95) * 100 = 5.
-        let secondary = usage.secondary.unwrap();
-        assert_eq!(secondary.used_percent, 5.0);
-        assert_eq!(secondary.window_minutes, Some(300));
+        // The external Claude/GPT pool never occupies an unnamed slot; it is
+        // visible only as its named extra window.
+        assert!(usage.secondary.is_none());
         // All three buckets surfaced as extra windows.
         assert_eq!(usage.extra_rate_windows.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn walled_external_pool_does_not_take_primary_from_a_healthy_gemini_pool() {
+        // The exact live shape that misled the headline: Gemini nearly free,
+        // Claude/GPT walled at 100%. Primary must stay the Gemini pool.
+        let body = r#"{"response":{"groups":[
+            {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.883,"resetTime":"2026-07-24T18:34:51Z"}
+            ]},
+            {"displayName":"Claude and GPT models","buckets":[
+                {"bucketId":"3p-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.0,"resetTime":"2026-07-18T13:08:36Z"}
+            ]}
+        ]}}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 11.7);
+        assert!(usage.secondary.is_none());
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 2);
+        assert_eq!(
+            extras[1].window.as_ref().unwrap().used_percent,
+            100.0,
+            "the walled external pool stays visible as a named extra"
+        );
+    }
+
+    #[test]
+    fn account_without_gemini_pool_falls_back_to_most_used_window() {
+        let body = r#"{"groups":[{"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-5h","displayName":"Five Hour Limit","window":"5h",
+             "remainingFraction":0.95,"resetTime":"2026-06-24T08:00:00Z"},
+            {"bucketId":"3p-weekly","displayName":"Weekly Limit","window":"weekly",
+             "remainingFraction":0.4,"resetTime":"2026-06-30T00:00:00Z"}
+        ]}]}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 60.0);
+        assert!(usage.secondary.is_none());
     }
 
     #[test]
