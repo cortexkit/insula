@@ -323,11 +323,20 @@ impl UsageProvider for AnthropicProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
         if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.anthropic_handles()?);
+            let vault = self.handle_loader.anthropic_handles()?;
+            if !vault.is_empty() {
+                // Vault-only custody once anthropic vault handles exist: the
+                // implicit-local lane (opencode auth.json) can never resolve an
+                // account_id (opaque token, no identity in the usage payload),
+                // so keeping it alongside labeled vault lanes would force the
+                // emission gate to collapse every account into one unlabeled
+                // entry. The vault also owns refresh, so its lanes strictly
+                // dominate the local token for availability.
+                return Ok(vault);
+            }
         }
-        Ok(handles)
+        Ok(vec![CredentialHandle::implicit()])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -473,9 +482,13 @@ mod tests {
     }
 
     fn write_handles(body: &str) -> std::path::PathBuf {
+        // Unique per call: parallel test threads sharing one pid-keyed path
+        // would truncate each other's file mid-read.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ck-quota-anthropic-handles-{}.json",
-            std::process::id()
+            "ck-quota-anthropic-handles-{}-{}.json",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -490,9 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_include_mapped_vault_entries_when_source_is_wired() {
+    fn vault_handles_replace_the_implicit_local_lane() {
+        // Vault-only custody: the local lane can never resolve an account_id,
+        // so keeping it alongside labeled vault lanes would collapse the
+        // emission gate to one unlabeled entry for every account.
         let path = write_handles(
-            r#"{"handles":{"oauth:anthropic":"ckh_anthropic","oauth:xai":"ckh_grok"}}"#,
+            r#"{"handles":{"oauth:anthropic":"ckh_anthropic","oauth:anthropic:ufuk2":"ckh_a2","oauth:xai":"ckh_grok"}}"#,
         );
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = AnthropicProvider::new_with_handle_loader(
@@ -501,8 +517,22 @@ mod tests {
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "oauth:anthropic");
+        assert!(handles.iter().all(|h| h.vault_capability().is_some()));
+        assert_eq!(handles[0].stable_id(), "oauth:anthropic");
+        assert_eq!(handles[1].stable_id(), "oauth:anthropic:ufuk2");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn implicit_local_lane_survives_when_no_vault_handles_are_mapped() {
+        let path = write_handles(r#"{"handles":{"oauth:xai":"ckh_grok"}}"#);
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = AnthropicProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
         let _ = std::fs::remove_file(path);
     }
 
