@@ -64,6 +64,116 @@ struct RateLimitResponse {
         default
     )]
     weekly_usage_reset_time: Option<i64>,
+    #[serde(
+        rename = "plan_family",
+        deserialize_with = "deserialize_optional_flexible_f64",
+        default
+    )]
+    plan_family: Option<f64>,
+    #[serde(rename = "plan_credit_rate_limit", default)]
+    plan_credit_rate_limit: Option<CreditRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditRateLimit {
+    #[serde(
+        rename = "subscription_credit_left_rate",
+        deserialize_with = "deserialize_optional_flexible_f64",
+        default
+    )]
+    subscription_credit_left_rate: Option<f64>,
+    #[serde(
+        rename = "subscription_credit_reset_time",
+        deserialize_with = "deserialize_optional_flexible_i64",
+        default
+    )]
+    subscription_credit_reset_time: Option<i64>,
+    #[serde(
+        rename = "topup_credit_left_rate",
+        deserialize_with = "deserialize_optional_flexible_f64",
+        default
+    )]
+    topup_credit_left_rate: Option<f64>,
+    #[serde(rename = "credit_buckets", default)]
+    credit_buckets: Option<Vec<CreditBucket>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditBucket {
+    #[serde(
+        rename = "credit_total",
+        deserialize_with = "deserialize_optional_flexible_f64",
+        default
+    )]
+    credit_total: Option<f64>,
+    #[serde(
+        rename = "credit_residual",
+        deserialize_with = "deserialize_optional_flexible_f64",
+        default
+    )]
+    credit_residual: Option<f64>,
+}
+
+impl RateLimitResponse {
+    /// A positive `plan_family` explicitly selects family 2; when it is absent
+    /// (or non-positive), the legacy zero-rate/no-reset heuristic identifies credit plans.
+    fn is_credit_plan(&self) -> bool {
+        if let Some(family) = self.plan_family {
+            if family.is_finite() && family > 0.0 {
+                return family == 2.0;
+            }
+        }
+
+        let Some(credit) = self.plan_credit_rate_limit.as_ref() else {
+            return false;
+        };
+        if credit.subscription_credit_left_rate.unwrap_or(0.0) <= 0.0 {
+            return false;
+        }
+
+        let five_hour_zero = self.five_hour_usage_left_rate.unwrap_or(1.0) == 0.0;
+        let weekly_zero = self.weekly_usage_left_rate.unwrap_or(1.0) == 0.0;
+        let five_hour_no_reset = self.five_hour_usage_reset_time.unwrap_or(0) == 0;
+        let weekly_no_reset = self.weekly_usage_reset_time.unwrap_or(0) == 0;
+        (five_hour_zero && five_hour_no_reset) || (weekly_zero && weekly_no_reset)
+    }
+}
+
+impl CreditRateLimit {
+    fn credit_left_rate(&self) -> Option<f64> {
+        if let Some(buckets) = self
+            .credit_buckets
+            .as_ref()
+            .filter(|buckets| !buckets.is_empty())
+        {
+            let balances: Option<Vec<(f64, f64)>> = buckets
+                .iter()
+                .map(|bucket| {
+                    let total = bucket.credit_total?;
+                    let residual = bucket.credit_residual?;
+                    (total.is_finite() && residual.is_finite() && total > 0.0)
+                        .then_some((total, residual))
+                        .filter(|(_, residual)| *residual >= 0.0 && *residual <= total)
+                })
+                .collect();
+            if let Some(balances) = balances {
+                let total: f64 = balances.iter().map(|(total, _)| total).sum();
+                let residual: f64 = balances.iter().map(|(_, residual)| residual).sum();
+                if total > 0.0 {
+                    return Some(residual / total);
+                }
+            }
+        }
+        self.subscription_credit_left_rate
+            .or(self.topup_credit_left_rate)
+    }
+
+    fn reset_time(&self) -> Option<i64> {
+        // If the reset time is absent or invalid, return no reset timestamp rather
+        // than fabricating a dummy value; credit buckets only affect rate math.
+        self.subscription_credit_reset_time
+            .filter(|reset| *reset > 0)
+    }
 }
 
 fn deserialize_optional_flexible_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -109,6 +219,8 @@ fn rate_window_from_left_and_reset(
     window_minutes: i64,
 ) -> Option<RateWindow> {
     let left = left_rate?;
+    // Credit plans report zero reset times for these legacy fields: no window is
+    // configured, rather than a fully consumed window.
     let reset = reset_secs.filter(|&s| s > 0)?;
     let resets_at = env::epoch_to_iso8601(reset)?;
     Some(RateWindow {
@@ -116,6 +228,20 @@ fn rate_window_from_left_and_reset(
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
+    })
+}
+
+fn credit_window(credit: Option<&CreditRateLimit>) -> Option<RateWindow> {
+    let credit = credit?;
+    let credit_rate = credit.credit_left_rate()?;
+    if !credit_rate.is_finite() {
+        return None;
+    }
+    Some(RateWindow {
+        used_percent: ((1.0 - credit_rate) * 100.0).clamp(0.0, 100.0),
+        raw_used_percent: None,
+        resets_at: credit.reset_time().and_then(env::epoch_to_iso8601),
+        window_minutes: None,
     })
 }
 
@@ -130,6 +256,15 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             .or_else(|| response.code.map(|c| c.to_string()))
             .unwrap_or_else(|| "unknown".to_string());
         return Err(FetchError::Upstream(format!("stepfun API error: {msg}")));
+    }
+
+    if response.is_credit_plan() {
+        return Ok(Usage {
+            primary: credit_window(response.plan_credit_rate_limit.as_ref()),
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: None,
+        });
     }
 
     let primary = rate_window_from_left_and_reset(
@@ -270,6 +405,112 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         assert!(usage.primary.is_none());
         assert!(usage.secondary.is_some());
+    }
+
+    #[test]
+    fn zero_rate_windows_with_zero_resets_are_not_an_error() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+    }
+
+    #[test]
+    fn credit_plan_emits_credit_window_instead_of_legacy_windows() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0,
+            "plan_family": 2,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.75,
+                "subscription_credit_reset_time": "1782135879",
+                "credit_buckets": [{"next_reset_at": "1782000000"}]
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
+        assert_eq!(primary.window_minutes, None);
+        assert!(usage.secondary.is_none());
+    }
+
+    #[test]
+    fn credit_reset_without_subscription_reset_stays_absent() {
+        let body = br#"{
+            "status": 1,
+            "plan_family": 2,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.5,
+                "credit_buckets": [{"next_reset_at": 1782135879}]
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!(usage.primary.unwrap().resets_at.is_none());
+    }
+
+    #[test]
+    fn absent_plan_family_uses_zero_window_credit_heuristic() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.6,
+                "subscription_credit_reset_time": 1782135879
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 40.0);
+        assert!(usage.secondary.is_none());
+    }
+
+    #[test]
+    fn absent_plan_family_with_healthy_windows_keeps_legacy_usage() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0.8,
+            "weekly_usage_left_rate": 0.6,
+            "five_hour_usage_reset_time": 1782135879,
+            "weekly_usage_reset_time": 1782135879,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.6,
+                "subscription_credit_reset_time": 1782135879
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!((usage.primary.unwrap().used_percent - 20.0).abs() < 1e-9);
+        assert!((usage.secondary.unwrap().used_percent - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_credit_plan_does_not_emit_credit_window() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0,
+            "plan_family": 1,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.5,
+                "subscription_credit_reset_time": 1782135879
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
     }
 
     #[test]
