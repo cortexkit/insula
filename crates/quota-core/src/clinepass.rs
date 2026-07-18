@@ -64,7 +64,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .map_err(|e| FetchError::Decode(format!("clinepass limits not decodable: {e}")))?;
 
     if !response.success {
-        return Err(FetchError::Decode("ClinePass response success was false".to_string()));
+        return Err(FetchError::Decode(
+            "ClinePass response success was false".to_string(),
+        ));
     }
 
     let mut primary = None;
@@ -84,7 +86,11 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 let trimmed = raw.trim();
                 let dt = chrono::DateTime::parse_from_rfc3339(trimmed)
                     .map_err(|e| FetchError::Decode(format!("invalid resetsAt timestamp: {e}")))?;
-                Some(dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                Some(
+                    dt.with_timezone(&chrono::Utc)
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                )
             }
             None => None,
         };
@@ -336,7 +342,10 @@ mod tests {
         assert_eq!(clean_key("  key  ".to_string()), Some("key".to_string()));
         assert_eq!(clean_key("\"key\"".to_string()), Some("key".to_string()));
         assert_eq!(clean_key("'key'".to_string()), Some("key".to_string()));
-        assert_eq!(clean_key("  \"key\"  ".to_string()), Some("key".to_string()));
+        assert_eq!(
+            clean_key("  \"key\"  ".to_string()),
+            Some("key".to_string())
+        );
         assert_eq!(clean_key("".to_string()), None);
         assert_eq!(clean_key("\"\"".to_string()), None);
     }

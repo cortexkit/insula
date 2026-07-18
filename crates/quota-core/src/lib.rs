@@ -10,6 +10,7 @@ pub mod amp;
 pub mod anthropic;
 pub mod antigravity;
 pub mod browser_cookies;
+pub mod clinepass;
 pub mod codebuff;
 pub mod codex;
 pub mod codex_resets;
@@ -274,10 +275,12 @@ impl Registry {
                     Arc::clone(&vault_handle_loader),
                 ),
             ),
+            Box::new(clinepass::ClinePassProvider::new()),
             Box::new(llmproxy::LlmProxyProvider::new()),
             Box::new(manus::ManusProvider::new()),
             Box::new(mimo::MimoProvider::new()),
             Box::new(minimax::MinimaxProvider::new()),
+            Box::new(neuralwatt::NeuralWattProvider::new()),
             Box::new(ollama::OllamaProvider::new()),
             Box::new(opencode::OpenCodeProvider::new()),
             Box::new(opencodego::OpenCodeGoProvider::new()),
@@ -288,6 +291,7 @@ impl Registry {
             Box::new(warp::WarpProvider::new()),
             Box::new(synthetic::SyntheticProvider::new()),
             Box::new(zai::ZaiProvider::new()),
+            Box::new(zenmux::ZenMuxProvider::new()),
             Box::new(kilo::KiloProvider::new()),
             Box::new(alibaba::AlibabaProvider::new()),
             Box::new(amp::AmpProvider::new()),
