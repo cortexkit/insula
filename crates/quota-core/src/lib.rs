@@ -49,6 +49,7 @@ pub mod synthetic;
 pub mod vault_handles;
 pub mod warp;
 pub mod zai;
+pub mod zenmux;
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
