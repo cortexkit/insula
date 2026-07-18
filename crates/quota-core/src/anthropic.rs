@@ -60,6 +60,7 @@ struct OAuthUsageResponse {
 #[derive(Debug, Deserialize)]
 struct ApiLimitEntry {
     kind: Option<String>,
+    group: Option<String>,
     percent: Option<f64>,
     resets_at: Option<String>,
     is_active: Option<bool>,
@@ -73,7 +74,34 @@ struct ApiLimitScope {
 
 #[derive(Debug, Deserialize)]
 struct ApiLimitModel {
+    id: Option<String>,
     display_name: Option<String>,
+}
+
+fn slug(value: &str) -> String {
+    let mut result = String::new();
+    let mut last_was_dash = false;
+    for character in value.trim().to_ascii_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            result.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            result.push('-');
+            last_was_dash = true;
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
+fn is_all_models_scope(model_id: Option<&str>, model_name: &str) -> bool {
+    if slug(model_name) == "all-models" {
+        return true;
+    }
+    let Some(model_id) = model_id else {
+        return false;
+    };
+    let id_slug = slug(model_id);
+    id_slug == "all-models" || id_slug.ends_with("-all-models")
 }
 
 fn scoped_weekly_extras(
@@ -84,23 +112,33 @@ fn scoped_weekly_extras(
         .into_iter()
         .flatten()
         .filter(|entry| {
-            entry.kind.as_deref() == Some("weekly_scoped") && entry.is_active != Some(false)
+            entry.kind.as_deref() == Some("weekly_scoped")
+                && entry.group.as_deref().unwrap_or("weekly") == "weekly"
+                && entry.is_active != Some(false)
         })
         .filter_map(|entry| {
-            let display_name = entry
-                .scope
-                .as_ref()
-                .and_then(|scope| scope.model.as_ref())
-                .and_then(|model| model.display_name.as_deref())
+            let model = entry.scope.as_ref()?.model.as_ref()?;
+            let display_name = model
+                .display_name
+                .as_deref()
                 .map(str::trim)
                 .filter(|name| !name.is_empty())?;
+            let model_id = model
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            if is_all_models_scope(model_id, display_name) {
+                return None;
+            }
+            let identity = model_id.unwrap_or(display_name).to_string();
             let percent = entry.percent?;
-            if !percent.is_finite() || !seen.insert(display_name.to_string()) {
+            if !percent.is_finite() || !seen.insert(identity.clone()) {
                 return None;
             }
             Some(crate::model::ExtraWindow {
                 title: Some(format!("7 Day ({display_name})")),
-                id: Some(display_name.to_string()),
+                id: Some(identity),
                 window: Some(RateWindow {
                     used_percent: percent.clamp(0.0, 100.0),
                     raw_used_percent: None,
@@ -688,6 +726,83 @@ mod tests {
         let window = extras[0].window.as_ref().unwrap();
         assert_eq!(window.used_percent, 100.0);
         assert_eq!(window.window_minutes, Some(SEVEN_DAY_MINUTES));
+    }
+
+    #[test]
+    fn all_models_scopes_are_skipped() {
+        let usage = normalize_usage(
+            br#"{
+                "seven_day": {"utilization": 10.0, "resets_at": "2026-07-20T12:00:00Z"},
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 50.0,
+                    "scope": {"model": {"id": "claude-all-models", "display_name": "All Models"}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn non_weekly_scopes_are_skipped() {
+        let usage = normalize_usage(
+            br#"{
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "group": "session",
+                    "percent": 50.0,
+                    "scope": {"model": {"id": "fable", "display_name": "Fable"}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn absent_group_keeps_weekly_scoped_window() {
+        let usage = normalize_usage(
+            br#"{
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "percent": 25.0,
+                    "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}
+                }]
+            }"#,
+        )
+        .unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
+    }
+
+    #[test]
+    fn scoped_windows_deduplicate_by_model_id() {
+        let usage = normalize_usage(
+            br#"{
+                "limits": [
+                    {
+                        "kind": "weekly_scoped", "group": "weekly", "percent": 10.0,
+                        "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}
+                    },
+                    {
+                        "kind": "weekly_scoped", "group": "weekly", "percent": 20.0,
+                        "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}
+                    },
+                    {
+                        "kind": "weekly_scoped", "group": "weekly", "percent": 30.0,
+                        "scope": {"model": {"id": "fable-v2", "display_name": "Fable"}}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras[0].id.as_deref(), Some("fable-v1"));
+        assert_eq!(extras[1].id.as_deref(), Some("fable-v2"));
     }
 
     #[test]
