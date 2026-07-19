@@ -16,6 +16,12 @@
 //! fractions (0–1) from their field semantics and observed values. The shared
 //! cookie transport in `browser_cookies.rs` is live-proven; the gateway call shape
 //! is HAR-verified.
+//!
+//! Two hosts: the token-plan PAGE (`home.qwencloud.com`) is loaded only to extract
+//! the per-session `SEC_TOKEN`; the quota call itself goes to the console data
+//! gateway at `cs-data.qwencloud.com` (same-site, so the `qwencloud.com` cookies
+//! apply), with `Origin: https://home.qwencloud.com`. Posting the quota action to
+//! `home.qwencloud.com` instead returns an empty success — the gateway host matters.
 
 use std::time::Duration;
 
@@ -35,7 +41,7 @@ pub const PROVIDER_NAME: &str = "qwen-cloud";
 const DOMAIN: &str = "qwencloud.com";
 const TOKEN_PLAN_URL: &str =
     "https://home.qwencloud.com/billing/subscription/token-plan-individual";
-const USAGE_URL: &str = "https://home.qwencloud.com/data/api.json?action=IntlBroadScopeAspnGateway";
+const USAGE_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
@@ -262,6 +268,7 @@ impl UsageProvider for QwenCloudProvider {
             .timeout(REQUEST_TIMEOUT)
             .header(Header::new("Cookie", cookie_header))
             .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+            .header(Header::new("Origin", "https://home.qwencloud.com"))
             .header(Header::new("Referer", TOKEN_PLAN_URL))
             .send(&self.http)
             .await?;
