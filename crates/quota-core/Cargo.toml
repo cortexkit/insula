@@ -6,6 +6,7 @@ publish = false
 description = "Provider usage fetchers + RateWindow normalization + TTL cache for the ai-provider-quota subc module. Pure logic, wire-agnostic."
 
 [dependencies]
+cortexkit-provider-usage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

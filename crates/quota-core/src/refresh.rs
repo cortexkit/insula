@@ -162,7 +162,6 @@ fn healthy_entry(
         fetched_at: None,
         saved_resets,
         usage: Some(usage),
-        balance: None,
         error: None,
     }
 }
