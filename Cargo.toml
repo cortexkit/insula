@@ -16,6 +16,13 @@ subc-transport = { path = "../subconscious/crates/subc-transport" }
 subc-core = { path = "../subconscious/crates/subc-core" }
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 
+# The shared usage.get wire types (ProviderUsage/Usage/RateWindow + account/reset
+# metadata), extracted to cortexkit/commons so every consumer (ALF's router,
+# astrocyte's capacity axis, the ck CLI renderer) compiles against one definition.
+# PATH dep on the sibling commons repo for local development; swaps to the
+# published crates.io version (cortexkit-provider-usage = "0.1") once released.
+cortexkit-provider-usage = { path = "../commons/crates/cortexkit-provider-usage" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
