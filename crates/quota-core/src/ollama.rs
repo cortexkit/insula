@@ -159,21 +159,23 @@ fn looks_signed_out(html: &str) -> bool {
     has_form && ((has_heading && has_password) || has_auth_route)
 }
 
-/// A window for the first matching label, only when BOTH a percent AND a real reset
-/// are present — a percent without a reset is dropped (degrade-never-wrong: no
-/// fabricated reset). `window_minutes` is per-label: an "Hourly usage" block carries
-/// no fixed length (matching CodexBar, which stamps 5h only on "Session usage"),
-/// so a short hourly window is never mislabeled as the 5-hour session window.
+/// A window for the first matching label that carries a percent. The reset is
+/// carried through when the block has a `data-time` and OMITTED otherwise — a
+/// depleted window (e.g. a weekly quota at 100% used) shows no reset timestamp
+/// on the settings page, but its percent is still real and must surface rather
+/// than vanish (matching the fleet-wide rule: `usedPercent` is load-bearing,
+/// `resetsAt` is optional, never fabricated). `window_minutes` is per-label: an
+/// "Hourly usage" block carries no fixed length (matching CodexBar, which stamps
+/// 5h only on "Session usage"), so a short hourly window is never mislabeled as
+/// the 5-hour session window.
 fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> {
     for (label, window_minutes) in labels {
         if let Some(block) = block_after(html, label) {
-            if let (Some(used_percent), Some(resets_at)) =
-                (parse_percent(block), parse_reset(block))
-            {
+            if let Some(used_percent) = parse_percent(block) {
                 return Some(RateWindow {
                     used_percent,
                     raw_used_percent: None,
-                    resets_at: Some(resets_at),
+                    resets_at: parse_reset(block),
                     window_minutes: *window_minutes,
                 });
             }
@@ -351,17 +353,52 @@ mod tests {
     }
 
     #[test]
-    fn percent_without_reset_drops_that_window() {
-        // A Session block with a percent but NO data-time → no window (never a
-        // fabricated reset). Weekly is well-formed and still emitted.
+    fn percent_without_reset_keeps_the_window_with_no_resets_at() {
+        // A Session block with a percent but NO data-time still surfaces (reset
+        // omitted, never fabricated) — the percent is the load-bearing field.
+        // Weekly is well-formed and carries its reset.
         let html = r#"
           <span>Session usage</span><span>50% used</span>
           <span>Weekly usage</span><span>10% used</span>
           <div data-time="2026-06-29T00:00:00Z">Resets in 5 days.</div>
         "#;
         let usage = normalize_usage(html).unwrap();
-        assert!(usage.primary.is_none(), "session has no reset → dropped");
+        let session = usage.primary.unwrap();
+        assert_eq!(session.used_percent, 50.0);
+        assert_eq!(
+            session.resets_at, None,
+            "no data-time → reset omitted, not dropped"
+        );
         assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn depleted_weekly_at_full_percent_without_a_reset_still_surfaces() {
+        // Captured-live shape: a depleted weekly quota shows "100% used" (red) with
+        // NO data-time reset on the settings page. It must surface as a 100% window
+        // with no reset, not vanish — the old percent-and-reset-required rule dropped
+        // it, hiding a real (exhausted) 7-day window.
+        let html = r#"
+          <span>Session usage</span>
+          <div data-usage-track aria-label="Session usage 36.3% used">
+            <div style="width: 100%; background: #d4d4d4;"></div>
+          </div>
+          <div class="text-xs local-time" data-time="2026-07-20T03:00:00Z">Resets in 5 hours.</div>
+          <span>Weekly usage</span>
+          <span class="text-red-500">100% used</span>
+          <div data-usage-track aria-label="Weekly usage 100% used">
+            <div style="width: 100%"></div>
+          </div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 36.3);
+        let weekly = usage.secondary.expect("depleted weekly must surface");
+        assert_eq!(weekly.used_percent, 100.0);
+        assert_eq!(
+            weekly.resets_at, None,
+            "depleted window has no reset timestamp"
+        );
+        assert_eq!(weekly.window_minutes, Some(10080));
     }
 
     #[test]
