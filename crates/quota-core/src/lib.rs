@@ -42,6 +42,7 @@ pub mod opencode_auth;
 pub mod opencodego;
 pub mod provider;
 pub mod qoder;
+pub mod qwen_cloud;
 pub mod refresh;
 pub mod sakana;
 pub mod stepfun;
@@ -285,6 +286,7 @@ impl Registry {
             Box::new(opencode::OpenCodeProvider::new()),
             Box::new(opencodego::OpenCodeGoProvider::new()),
             Box::new(qoder::QoderProvider::new()),
+            Box::new(qwen_cloud::QwenCloudProvider::new()),
             Box::new(sakana::SakanaProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(sub2api::Sub2ApiProvider::new()),
