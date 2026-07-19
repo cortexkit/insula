@@ -264,7 +264,7 @@ impl AnthropicProvider {
         }
     }
 
-    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle_id: &str, capability: &VaultCapability) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
@@ -272,7 +272,15 @@ impl AnthropicProvider {
         };
         let mut credential = match credential_source.get(capability, 120_000).await {
             Ok(credential) => credential,
-            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+            Err(error) => {
+                // Name the failure class: the F1 fence collapses any get error into
+                // "unverified", so without this the cause (dead handle vs transient
+                // vs fail-closed timeout) is invisible when a lane goes dark.
+                eprintln!(
+                    "[ck-quota] warning: anthropic vault credential.get failed ({handle_id}): {error:?}"
+                );
+                return FetchAttempt::unverified_vault_failure(error);
+            }
         };
         let record_version = credential.record_version;
         let account_info = credential.account_info();
@@ -341,7 +349,7 @@ impl UsageProvider for AnthropicProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(capability).await;
+            return self.fetch_vault(handle.stable_id(), capability).await;
         }
 
         let access = match opencode_auth::read_provider(OPENCODE_PROVIDER)
