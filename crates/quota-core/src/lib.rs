@@ -201,6 +201,41 @@ fn relax_usage_for_read(entry: &mut ProviderUsage) {
     }
 }
 
+/// Map a CodexBar provider name to its canonical models.dev slug, when one
+/// exists. Returns `None` for providers with no exact models.dev counterpart —
+/// including `kimi`, whose www.kimi.com consumer subscription is distinct from
+/// models.dev's `moonshotai`/`moonshotai-cn` developer APIs — where consumers
+/// fall back to the CodexBar `provider` name. Kept total over providers that
+/// HAVE a counterpart and absent otherwise, never guessed (astrocyte's pricing
+/// joins key on this). Populated onto the wire as `apiProvider` so every
+/// consumer keys on one canonical name instead of maintaining its own
+/// CodexBar→canonical map.
+fn api_provider_name(provider: &str) -> Option<&'static str> {
+    match provider {
+        "codex" => Some("openai"),
+        "claude" => Some("anthropic"),
+        "gemini" => Some("google"),
+        "grok" => Some("xai"),
+        "copilot" => Some("github-copilot"),
+        "kimi-for-coding" => Some("kimi-for-coding"),
+        "kilo" => Some("kilo"),
+        "minimax" => Some("minimax"),
+        "stepfun" => Some("stepfun"),
+        "zai" => Some("zai"),
+        "synthetic" => Some("synthetic"),
+        "opencode" => Some("opencode"),
+        "opencodego" => Some("opencode-go"),
+        "ollama" => Some("ollama-cloud"),
+        "sakana" => Some("sakana"),
+        "neuralwatt" => Some("neuralwatt"),
+        "zenmux" => Some("zenmux"),
+        "alibaba" => Some("alibaba-coding-plan"),
+        "qwen-cloud" => Some("alibaba-token-plan"),
+        "mimo" => Some("xiaomi"),
+        _ => None,
+    }
+}
+
 /// Provider registry with a cache-only read path and one background refresher.
 pub struct Registry {
     providers: Vec<RegisteredProvider>,
@@ -406,6 +441,7 @@ impl Registry {
                 if let Some(primary) = primary {
                     if let Some(mut entry) = primary.entry.clone() {
                         entry.account = None;
+                        entry.api_provider = api_provider_name(name).map(String::from);
                         if primary.relax_eligible && primary.is_fresh(read_now) {
                             relax_usage_for_read(&mut entry);
                         }
@@ -436,6 +472,7 @@ impl Registry {
             for (account_id, (_, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
+                    entry.api_provider = api_provider_name(name).map(String::from);
                     if slot.relax_eligible && slot.is_fresh(read_now) {
                         relax_usage_for_read(&mut entry);
                     }
