@@ -20,8 +20,7 @@ subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 # metadata), extracted to cortexkit/commons so every consumer (ALF's router,
 # astrocyte's capacity axis, the ck CLI renderer) compiles against one definition.
 # Published on crates.io (cortexkit/commons); CI fetches it like any other dep.
-# TEMP path dep while 0.3.0 (usedCount/totalCount) is in review — swaps back to "0.3" post-publish.
-cortexkit-provider-usage = { path = "../commons/crates/cortexkit-provider-usage" }
+cortexkit-provider-usage = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

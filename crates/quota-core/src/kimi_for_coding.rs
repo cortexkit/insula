@@ -56,9 +56,12 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "kimi-for-coding";
 const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
+const SUBSCRIPTION_STATS_URL: &str =
+    "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats";
 const ENV_API_KEY: &str = "KIMI_CODE_API_KEY";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEEKLY_MINUTES: i64 = 7 * 24 * 60;
+const FIVE_HOUR_MINUTES: i64 = 5 * 60;
 
 /// One `usage` object in the response. `limit` is required; `used` and
 /// `remaining` are optional and arrive as JSON string OR number (CodexBar
@@ -79,9 +82,9 @@ struct KimiUsageDetail {
 }
 
 /// The `KimiCodeAPIUsageResponse` body. `usage` is the primary weekly detail;
-/// `limits[0].detail` is the secondary rate-limit detail (skipped for v1).
+/// `limits[0].detail` is the 5-hour rate-limit window (CodexBar v0.45.2
+/// `parseCodeAPIUsage` line 184).
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct KimiCodeApiResponse {
     usage: KimiUsageDetail,
     #[serde(default)]
@@ -89,9 +92,38 @@ struct KimiCodeApiResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct KimiRateLimit {
     detail: Option<KimiUsageDetail>,
+}
+
+/// Response from `GetSubscriptionStats` — carries the monthly subscription
+/// balance and the code-specific 7-day rate limit (CodexBar v0.45.2
+/// `KimiSubscriptionStatsResponse`).
+#[derive(Debug, Deserialize)]
+struct SubscriptionStatsResponse {
+    #[serde(rename = "subscriptionBalance")]
+    subscription_balance: Option<SubscriptionBalance>,
+    #[serde(rename = "ratelimitCode7d")]
+    ratelimit_code_7d: Option<SubscriptionRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionBalance {
+    feature: Option<String>,
+    #[serde(rename = "type")]
+    balance_type: Option<String>,
+    #[serde(rename = "amountUsedRatio")]
+    amount_used_ratio: Option<f64>,
+    #[serde(rename = "expireTime")]
+    expire_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionRateLimit {
+    ratio: Option<f64>,
+    enabled: Option<bool>,
+    #[serde(rename = "resetTime")]
+    reset_time: Option<String>,
 }
 
 /// Parse a JSON string OR number into an `i64`. Returns `None` on any other
@@ -165,48 +197,143 @@ fn parse_reset(value: &str) -> Option<String> {
         .map(|dt| dt.to_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
+/// Build a `RateWindow` from a `KimiUsageDetail` (used/limit/remaining + reset).
+/// Returns `None` when the detail has no parseable limit or neither used nor
+/// remaining.
+#[allow(clippy::question_mark)]
+fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Option<RateWindow> {
+    let limit = string_or_number(detail.limit.as_ref())?;
+    if limit <= 0 {
+        return None;
+    }
+    let used_percent = if let Some(used) = string_or_number(detail.used.as_ref()) {
+        round_2dp((used as f64 / limit as f64) * 100.0)
+    } else if let Some(remaining) = string_or_number(detail.remaining.as_ref()) {
+        let used = (limit - remaining).max(0);
+        round_2dp((used as f64 / limit as f64) * 100.0)
+    } else {
+        return None;
+    };
+    let resets_at = pick_reset_field(detail).and_then(parse_reset);
+    Some(RateWindow {
+        used_percent,
+        raw_used_percent: None,
+        resets_at,
+        window_minutes,
+        used_count: None,
+        total_count: None,
+    })
+}
+
 /// Decode the coding-API usage body to [`Usage`]. Pure — unit-testable.
 ///
-/// Returns `Err(Decode(..))` if neither `used` nor `remaining` parses, or if
-/// `limit` is absent / non-positive (no meaningful percent to emit).
+/// Maps `usage` → primary (weekly/7d), `limits[0].detail` → secondary (5h).
+/// The monthly + code-7d extras come from a separate `GetSubscriptionStats`
+/// call and are merged by the caller.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: KimiCodeApiResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("kimi coding usage not decodable: {e}")))?;
 
-    let limit = string_or_number(response.usage.limit.as_ref())
-        .ok_or_else(|| FetchError::Decode("kimi coding usage missing limit".to_string()))?;
-    if limit <= 0 {
-        return Err(FetchError::Decode(
-            "kimi coding usage limit is non-positive".to_string(),
-        ));
-    }
+    let primary = window_from_detail(&response.usage, Some(WEEKLY_MINUTES)).ok_or_else(|| {
+        FetchError::Decode("kimi coding usage missing valid weekly window".to_string())
+    })?;
 
-    let used_percent = if let Some(used) = string_or_number(response.usage.used.as_ref()) {
-        round_2dp((used as f64 / limit as f64) * 100.0)
-    } else if let Some(remaining) = string_or_number(response.usage.remaining.as_ref()) {
-        let used = (limit - remaining).max(0);
-        round_2dp((used as f64 / limit as f64) * 100.0)
-    } else {
-        return Err(FetchError::Decode(
-            "kimi coding usage missing used/remaining".to_string(),
-        ));
-    };
-
-    let resets_at = pick_reset_field(&response.usage).and_then(parse_reset);
+    let secondary = response
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.first())
+        .and_then(|rate_limit| rate_limit.detail.as_ref())
+        .and_then(|detail| window_from_detail(detail, Some(FIVE_HOUR_MINUTES)));
 
     Ok(Usage {
-        primary: Some(RateWindow {
-            used_percent,
-            raw_used_percent: None,
-            resets_at,
-            window_minutes: Some(WEEKLY_MINUTES),
-            used_count: None,
-            total_count: None,
-        }),
-        secondary: None,
+        primary: Some(primary),
+        secondary,
         tertiary: None,
         extra_rate_windows: None,
     })
+}
+
+/// Parse the `GetSubscriptionStats` response into extra windows (monthly
+/// subscription balance + code-specific 7-day rate limit). Best-effort:
+/// returns an empty vec on any parse failure or missing data.
+///
+/// CodexBar v0.45.2 `KimiUsageSnapshot.toUsageSnapshot()`:
+/// - monthly: `subscriptionBalance.amountUsedRatio * 100`, guarded by
+///   feature == nil || "FEATURE_OMNI" and type == nil || "SUBSCRIPTION"
+/// - code-7d: `ratelimitCode7d.ratio * 100`, guarded by enabled != false
+fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
+    let response: SubscriptionStatsResponse = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut extras = Vec::new();
+
+    if let Some(balance) = response.subscription_balance {
+        let feature_ok = balance
+            .feature
+            .as_deref()
+            .is_none_or(|f| f == "FEATURE_OMNI");
+        let type_ok = balance
+            .balance_type
+            .as_deref()
+            .is_none_or(|t| t == "SUBSCRIPTION");
+        if feature_ok && type_ok {
+            if let Some(ratio) = balance.amount_used_ratio {
+                if ratio.is_finite() {
+                    let used_percent = (ratio * 100.0).clamp(0.0, 100.0);
+                    let resets_at = balance.expire_time.as_deref().and_then(parse_reset);
+                    extras.push(crate::model::ExtraWindow {
+                        id: Some("kimi-monthly".to_string()),
+                        title: Some("Monthly".to_string()),
+                        window: Some(RateWindow {
+                            used_percent: round_2dp(used_percent),
+                            raw_used_percent: None,
+                            resets_at,
+                            window_minutes: None,
+                            used_count: None,
+                            total_count: None,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(limit) = response.ratelimit_code_7d {
+        if limit.enabled != Some(false) {
+            if let Some(ratio) = limit.ratio {
+                if ratio.is_finite() {
+                    let used_percent = (ratio * 100.0).clamp(0.0, 100.0);
+                    let resets_at = limit.reset_time.as_deref().and_then(parse_reset);
+                    extras.push(crate::model::ExtraWindow {
+                        id: Some("kimi-code-7d".to_string()),
+                        title: Some("Code 7-day".to_string()),
+                        window: Some(RateWindow {
+                            used_percent: round_2dp(used_percent),
+                            raw_used_percent: None,
+                            resets_at,
+                            window_minutes: Some(WEEKLY_MINUTES),
+                            used_count: None,
+                            total_count: None,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    extras
+}
+
+/// Merge subscription-stats extras into a `Usage` value.
+fn merge_extras(usage: &mut Usage, extras: Vec<crate::model::ExtraWindow>) {
+    if extras.is_empty() {
+        return;
+    }
+    match usage.extra_rate_windows {
+        Some(ref mut existing) => existing.extend(extras),
+        None => usage.extra_rate_windows = Some(extras),
+    }
 }
 
 fn canonical_account_id(account_id: Option<String>) -> Option<String> {
@@ -220,6 +347,17 @@ fn usage_request(url: &str, bearer: &str) -> JsonRequest {
         .timeout(REQUEST_TIMEOUT)
         .bearer(bearer)
         .header(Header::new("Accept", "application/json"))
+}
+
+fn subscription_stats_request(bearer: &str) -> JsonRequest {
+    JsonRequest::post_json(SUBSCRIPTION_STATS_URL, b"{}".to_vec())
+        .timeout(REQUEST_TIMEOUT)
+        .bearer(bearer)
+        .header(Header::new("Content-Type", "application/json"))
+        .header(Header::new("Accept", "application/json"))
+        .header(Header::new("Cookie", format!("kimi-auth={bearer}")))
+        .header(Header::new("Origin", "https://www.kimi.com"))
+        .header(Header::new("Referer", "https://www.kimi.com/code/console"))
 }
 
 /// The kimi-for-coding usage provider.
@@ -270,16 +408,16 @@ impl KimiForCodingProvider {
     }
 
     async fn fetch_local_bearer(&self, bearer: &str) -> FetchAttempt {
-        // Local lane: the env-var API key is a static token the user already
-        // owns. Use the legacy `JsonRequest::send` so the byte-identical
-        // `FetchError::Unauthorized("HTTP 401")` mapping stays intact (vault
-        // requests get the status-first variant instead).
         let result = usage_request(&self.usage_url, bearer)
             .send(&self.http)
             .await
             .and_then(|body| normalize_usage(&body));
         match result {
-            Ok(usage) => {
+            Ok(mut usage) => {
+                // Best-effort subscription stats for monthly + code-7d extras.
+                if let Ok(stats_body) = subscription_stats_request(bearer).send(&self.http).await {
+                    merge_extras(&mut usage, parse_subscription_extras(&stats_body));
+                }
                 FetchAttempt::success(Some(AccountObservation::new(None, None)), "api", usage)
             }
             Err(error) => FetchAttempt::failure(None, None, error),
@@ -327,7 +465,11 @@ impl KimiForCodingProvider {
             self.report_auth_failure(capability, record_version, error);
         }
         match result {
-            Ok(usage) => {
+            Ok(mut usage) => {
+                // Best-effort subscription stats for monthly + code-7d extras.
+                if let Ok(stats_body) = subscription_stats_request(&bearer).send(&self.http).await {
+                    merge_extras(&mut usage, parse_subscription_extras(&stats_body));
+                }
                 FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
