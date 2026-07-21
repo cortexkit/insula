@@ -22,6 +22,30 @@
 //! gateway at `cs-data.qwencloud.com` (same-site, so the `qwencloud.com` cookies
 //! apply), with `Origin: https://home.qwencloud.com`. Posting the quota action to
 //! `home.qwencloud.com` instead returns an empty success — the gateway host matters.
+//!
+//! KNOWN LIMITATION (entitled view; no enforced signal in the console): the
+//! `/usage` percentages are the *entitled* view — consumed usage divided by the
+//! current tier cap from `/quota-config`. The console exposes NO enforced-cap,
+//! absolute-used, or exhausted/limited field: the live `/usage`, `/quota-config`,
+//! and `/subscription` field sets are identical whether a window is healthy or
+//! walled (`/usage` returns only the four per*Percentage/per*ResetTime fields;
+//! `/quota-config` returns every tier's `{five_hour, weekly}` cap; `/subscription`
+//! returns specCode/remainingDays/status). Absolute consumed is derivable as
+//! `percentage * quota-config[specCode].window`, but a stateless reader still
+//! cannot tell which cap the inference edge enforces. Consequence: on a
+//! mid-window plan upgrade, *if* the edge keeps enforcing the old cap until the
+//! reset while the console already divides by the new one, the percentage would
+//! read healthy while the edge 429s, and that desync is undetectable from any
+//! console read (probing the inference edge is out: token-plan ToS forbids
+//! automated calls). Whether the edge actually lags an upgrade is provider-
+//! dependent and was NOT observed on 2026-07-21: the edge kept up, so post-upgrade
+//! the weekly window was honestly healthy at ~26% (matching Alibaba's dashboard);
+//! the 429 seen that day predated the upgrade and was genuine exhaustion, and the
+//! post-upgrade failures were 403 model-entitlement on newly-onboarded models, not
+//! quota. The limitation is therefore structural/latent — the console gives no
+//! signal to detect an edge lag — so routing consumers that observe a 429 must
+//! apply their own cooldown. This module reports the console's entitled figure,
+//! the most accurate value the console provides.
 
 use std::time::Duration;
 
