@@ -108,6 +108,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             raw_used_percent: None,
             resets_at: Some(resets_at),
             window_minutes: None,
+            used_count: None,
+            total_count: None,
         })
     });
 

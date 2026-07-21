@@ -433,6 +433,8 @@ fn window_from_map(
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -610,6 +612,8 @@ fn window_from_parts(
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 

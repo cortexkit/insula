@@ -227,6 +227,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             window_minutes: window_minutes_from_refresh_interval(
                 response.refresh_interval.as_deref(),
             ),
+            used_count: None,
+            total_count: None,
         })
     } else {
         return Err(FetchError::Decode("manus: no refilling window".into()));

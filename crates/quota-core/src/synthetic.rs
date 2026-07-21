@@ -320,6 +320,8 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes,
+        used_count: None,
+        total_count: None,
     })
 }
 

@@ -243,6 +243,8 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes,
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -298,6 +300,8 @@ fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<Ex
             raw_used_percent: None,
             resets_at: parse_reset_time(balance.expire_time.as_deref()),
             window_minutes: None,
+            used_count: None,
+            total_count: None,
         }),
     })
 }
@@ -316,6 +320,8 @@ fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option
             raw_used_percent: None,
             resets_at: parse_reset_time(limit.reset_time.as_deref()),
             window_minutes: Some(7 * 24 * 60),
+            used_count: None,
+            total_count: None,
         }),
     })
 }

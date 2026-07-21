@@ -177,6 +177,8 @@ fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> 
                     raw_used_percent: None,
                     resets_at: parse_reset(block),
                     window_minutes: *window_minutes,
+                    used_count: None,
+                    total_count: None,
                 });
             }
         }

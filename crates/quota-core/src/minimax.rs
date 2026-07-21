@@ -234,6 +234,8 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             raw_used_percent: None,
             resets_at: resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs),
             window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
+            used_count: None,
+            total_count: None,
         });
     }
 
@@ -248,6 +250,8 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -265,6 +269,8 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
                     raw_used_percent: None,
                     resets_at: None,
                     window_minutes: Some(7 * 24 * 60),
+                    used_count: None,
+                    total_count: None,
                 });
             }
             if weekly_total(m) == 0 && opt_int(&m.current_weekly_usage_count).unwrap_or(0) == 0 {
@@ -281,6 +287,8 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
                 now_secs,
             ),
             window_minutes: Some(7 * 24 * 60),
+            used_count: None,
+            total_count: None,
         });
     }
 
@@ -299,6 +307,8 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: window_minutes(opt_int(&m.weekly_start_time), opt_int(&m.weekly_end_time)),
+        used_count: None,
+        total_count: None,
     })
 }
 

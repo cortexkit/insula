@@ -140,6 +140,8 @@ fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: None,
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -156,6 +158,8 @@ fn weekly_window(subscription: &serde_json::Value) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(WEEKLY_MINUTES),
+        used_count: None,
+        total_count: None,
     })
 }
 

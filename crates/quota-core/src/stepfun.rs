@@ -238,6 +238,8 @@ fn rate_window_from_left_and_reset(
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -252,6 +254,8 @@ fn credit_window(credit: Option<&CreditRateLimit>) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: credit.reset_time().and_then(env::epoch_to_iso8601),
         window_minutes: None,
+        used_count: None,
+        total_count: None,
     })
 }
 

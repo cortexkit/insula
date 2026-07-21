@@ -100,6 +100,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             raw_used_percent: None,
             resets_at,
             window_minutes: Some(window_minutes),
+            used_count: None,
+            total_count: None,
         };
 
         match limit.limit_type.as_str() {

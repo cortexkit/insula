@@ -2008,6 +2008,8 @@ fn full_usage(percent: f64) -> Usage {
         raw_used_percent: None,
         resets_at: Some(format!("2026-07-15T{label}:00Z")),
         window_minutes: Some(minutes),
+        used_count: None,
+        total_count: None,
     };
     Usage {
         primary: Some(window(percent, "01:00", 300)),

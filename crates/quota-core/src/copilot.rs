@@ -145,6 +145,8 @@ fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(MONTHLY_WINDOW_MINUTES),
+        used_count: None,
+        total_count: None,
     })
 }
 

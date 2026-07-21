@@ -221,6 +221,8 @@ fn window_from_used_total_reset(
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 

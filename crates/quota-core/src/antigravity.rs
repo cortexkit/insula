@@ -381,6 +381,8 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
             raw_used_percent: None,
             resets_at: Some(reset),
             window_minutes: window_minutes_of(bucket),
+            used_count: None,
+            total_count: None,
         },
         title,
         id: bucket.bucket_id.clone(),

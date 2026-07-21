@@ -333,6 +333,8 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         raw_used_percent: None,
         resets_at,
         window_minutes,
+        used_count: None,
+        total_count: None,
     })
 }
 

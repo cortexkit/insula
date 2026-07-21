@@ -133,6 +133,8 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
             raw_used_percent: None,
             resets_at: Some(reset),
             window_minutes: Some(43200),
+            used_count: None,
+            total_count: None,
         }),
         _ => None,
     };

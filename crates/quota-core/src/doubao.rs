@@ -160,6 +160,8 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
         raw_used_percent: None,
         resets_at: Some(resets_at),
         window_minutes: None,
+        used_count: None,
+        total_count: None,
     });
 
     Ok(Usage {
@@ -203,6 +205,8 @@ fn coding_plan_window(
         raw_used_percent: None,
         resets_at,
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 
@@ -579,6 +583,8 @@ mod tests {
                 raw_used_percent: None,
                 resets_at: Some("2023-11-14T22:13:20Z".to_string()),
                 window_minutes: Some(300),
+                used_count: None,
+                total_count: None,
             })
         );
         assert_eq!(
@@ -588,6 +594,8 @@ mod tests {
                 raw_used_percent: None,
                 resets_at: Some("2027-01-15T08:00:00Z".to_string()),
                 window_minutes: Some(10_080),
+                used_count: None,
+                total_count: None,
             })
         );
         assert_eq!(
@@ -597,6 +605,8 @@ mod tests {
                 raw_used_percent: None,
                 resets_at: Some("2030-03-17T17:46:40Z".to_string()),
                 window_minutes: Some(43_200),
+                used_count: None,
+                total_count: None,
             })
         );
         assert_eq!(usage.extra_rate_windows, None);

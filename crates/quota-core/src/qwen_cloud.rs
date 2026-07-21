@@ -66,10 +66,14 @@ const DOMAIN: &str = "qwencloud.com";
 const TOKEN_PLAN_URL: &str =
     "https://home.qwencloud.com/billing/subscription/token-plan-individual";
 const USAGE_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
+const QUOTA_CONFIG_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config";
+const SUBSCRIPTION_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const GATEWAY_PARAMS: &str = r#"{"Api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage","Data":{"cornerstoneParam":{"domain":"home.qwencloud.com","consoleSite":"QWENCLOUD","console":"ONE_CONSOLE","xsp_lang":"en-US","protocol":"V2","productCode":"p_efm"}},"V":"1.0"}"#;
+const QUOTA_CONFIG_PARAMS: &str = r#"{"Api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config","Data":{"cornerstoneParam":{"domain":"home.qwencloud.com","consoleSite":"QWENCLOUD","console":"ONE_CONSOLE","xsp_lang":"en-US","protocol":"V2","productCode":"p_efm"}},"V":"1.0"}"#;
+const SUBSCRIPTION_PARAMS: &str = r#"{"Api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription","Data":{"cornerstoneParam":{"domain":"home.qwencloud.com","consoleSite":"QWENCLOUD","console":"ONE_CONSOLE","xsp_lang":"en-US","protocol":"V2","productCode":"p_efm"}},"V":"1.0"}"#;
 
 const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
@@ -89,10 +93,11 @@ struct GatewayData {
 
 #[derive(Debug, Deserialize)]
 struct DataV2 {
-    data: Option<TokenPlanResult>,
+    data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TokenPlanResult {
     msg: Option<String>,
     code: Option<String>,
@@ -110,6 +115,107 @@ struct TokenPlanUsage {
     per_week_percentage: Option<f64>,
     #[serde(rename = "per1WeekResetTime")]
     per_week_reset_time: Option<i64>,
+}
+
+/// Per-tier quota caps from `/quota-config`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct QuotaConfigResult {
+    msg: Option<String>,
+    code: Option<String>,
+    success: Option<bool>,
+    data: Option<std::collections::HashMap<String, TierCaps>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TierCaps {
+    five_hour: Option<f64>,
+    weekly: Option<f64>,
+}
+
+/// Plan metadata from `/subscription`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SubscriptionResult {
+    msg: Option<String>,
+    code: Option<String>,
+    success: Option<bool>,
+    data: Option<SubscriptionData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionData {
+    #[serde(rename = "specCode")]
+    spec_code: Option<String>,
+}
+
+/// Enrich windows with absolute counts from the quota-config + subscription
+/// responses. Best-effort: if either call fails or the tier is unknown, the
+/// windows keep `used_count: None, total_count: None` (the percentage is still
+/// honest).
+fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_body: &[u8]) {
+    let config: GatewayResponse = match serde_json::from_slice(quota_config_body) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let sub: GatewayResponse = match serde_json::from_slice(subscription_body) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if config.success_response != Some(true) || sub.success_response != Some(true) {
+        return;
+    }
+    let config_result: QuotaConfigResult = match config
+        .data
+        .as_ref()
+        .and_then(|d| d.data_v2.as_ref())
+        .and_then(|d| d.data.as_ref())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    let sub_result: SubscriptionResult = match sub
+        .data
+        .as_ref()
+        .and_then(|d| d.data_v2.as_ref())
+        .and_then(|d| d.data.as_ref())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    if config_result.success != Some(true) || sub_result.success != Some(true) {
+        return;
+    }
+    let caps = match config_result.data {
+        Some(c) => c,
+        None => return,
+    };
+    let spec = match sub_result
+        .data
+        .as_ref()
+        .and_then(|d| d.spec_code.as_deref())
+    {
+        Some(s) => s,
+        None => return,
+    };
+    let tier = match caps.get(spec) {
+        Some(t) => t,
+        None => return,
+    };
+    if let Some(ref mut primary) = usage.primary {
+        if let Some(cap) = tier.five_hour {
+            primary.total_count = Some(cap);
+            primary.used_count = Some(primary.used_percent / 100.0 * cap);
+        }
+    }
+    if let Some(ref mut secondary) = usage.secondary {
+        if let Some(cap) = tier.weekly {
+            secondary.total_count = Some(cap);
+            secondary.used_count = Some(secondary.used_percent / 100.0 * cap);
+        }
+    }
 }
 
 /// Extract the per-page CSRF token from Qwen Cloud's console configuration.
@@ -139,19 +245,22 @@ fn window_from_fraction(
         raw_used_percent: None,
         resets_at: reset_epoch_ms.and_then(epoch_ms_to_iso8601),
         window_minutes: Some(window_minutes),
+        used_count: None,
+        total_count: None,
     })
 }
 
-fn degraded_response_error(result: Option<&TokenPlanResult>, reason: &str) -> FetchError {
-    let detail = result
-        .map(|result| {
-            [result.code.as_deref(), result.msg.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(": ")
-        })
-        .filter(|detail| !detail.is_empty());
+fn degraded_response_error(result: Option<&serde_json::Value>, reason: &str) -> FetchError {
+    let detail = result.and_then(|v| {
+        let code = v.get("code").and_then(|c| c.as_str());
+        let msg = v.get("msg").and_then(|m| m.as_str());
+        let parts: Vec<&str> = [code, msg].into_iter().flatten().collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(": "))
+        }
+    });
     let suffix = detail
         .map(|detail| format!(": {detail}"))
         .unwrap_or_default();
@@ -182,15 +291,22 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let result = result.ok_or_else(|| {
         degraded_response_error(None, "response is missing the token-plan result")
     })?;
+    let result_value = result.clone();
+    let result: TokenPlanResult = serde_json::from_value(result_value.clone()).map_err(|e| {
+        FetchError::Decode(format!("qwen-cloud token-plan result not decodable: {e}"))
+    })?;
     if result.success != Some(true) || result.code.as_deref() != Some("SUCCESS") {
         return Err(degraded_response_error(
-            Some(result),
+            Some(&result_value),
             "token-plan result did not report success",
         ));
     }
 
     let quota = result.data.as_ref().ok_or_else(|| {
-        degraded_response_error(Some(result), "response is missing token-plan quota data")
+        degraded_response_error(
+            Some(&result_value),
+            "response is missing token-plan quota data",
+        )
     })?;
     let primary = window_from_fraction(
         quota.per_five_hour_percentage,
@@ -290,7 +406,7 @@ impl UsageProvider for QwenCloudProvider {
                 ],
             )
             .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", cookie_header))
+            .header(Header::new("Cookie", &cookie_header))
             .header(Header::new("User-Agent", BROWSER_USER_AGENT))
             .header(Header::new("Origin", "https://home.qwencloud.com"))
             .header(Header::new("Referer", TOKEN_PLAN_URL))
@@ -298,7 +414,50 @@ impl UsageProvider for QwenCloudProvider {
             .await?;
 
             let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let mut enriched = usage;
+
+            // Best-effort enrichment: fetch quota-config + subscription to derive
+            // absolute counts. If either call fails the windows stay without counts
+            // (the percentage is still honest).
+            let config_body = JsonRequest::post_form(
+                QUOTA_CONFIG_URL,
+                &[
+                    ("product", "sfm_bailian"),
+                    ("action", "IntlBroadScopeAspnGateway"),
+                    ("sec_token", sec_token),
+                    ("region", "ap-southeast-1"),
+                    ("params", QUOTA_CONFIG_PARAMS),
+                ],
+            )
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Cookie", &cookie_header))
+            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+            .header(Header::new("Origin", "https://home.qwencloud.com"))
+            .header(Header::new("Referer", TOKEN_PLAN_URL))
+            .send(&self.http)
+            .await;
+            let sub_body = JsonRequest::post_form(
+                SUBSCRIPTION_URL,
+                &[
+                    ("product", "sfm_bailian"),
+                    ("action", "IntlBroadScopeAspnGateway"),
+                    ("sec_token", sec_token),
+                    ("region", "ap-southeast-1"),
+                    ("params", SUBSCRIPTION_PARAMS),
+                ],
+            )
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Cookie", &cookie_header))
+            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+            .header(Header::new("Origin", "https://home.qwencloud.com"))
+            .header(Header::new("Referer", TOKEN_PLAN_URL))
+            .send(&self.http)
+            .await;
+            if let (Ok(config_bytes), Ok(sub_bytes)) = (config_body, sub_body) {
+                enrich_with_counts(&mut enriched, &config_bytes, &sub_bytes);
+            }
+
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", enriched))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

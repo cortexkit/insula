@@ -153,6 +153,8 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_5h.resets_at),
         window_minutes: Some(5 * 60),
+        used_count: None,
+        total_count: None,
     };
 
     let secondary = RateWindow {
@@ -160,6 +162,8 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_7d.resets_at),
         window_minutes: Some(7 * 24 * 60),
+        used_count: None,
+        total_count: None,
     };
 
     let usage = Usage {

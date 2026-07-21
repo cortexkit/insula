@@ -144,6 +144,8 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 raw_used_percent: None,
                 resets_at: Some(resets_at),
                 window_minutes: Some((window_hours * 60.0).round() as i64),
+                used_count: None,
+                total_count: None,
             })
         }
     } else {
