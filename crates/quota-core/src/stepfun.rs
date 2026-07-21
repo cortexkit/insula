@@ -5,16 +5,26 @@
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! `STEPFUN_TOKEN` available. Endpoint, request body `{}`, base headers, Cookie
-//! (`Oasis-Token` + fixed `Oasis-Webid`), and response fields ported from CodexBar
+//! (`Oasis-Token` + `Oasis-Webid`), and response fields ported from CodexBar
 //! (`Sources/CodexBarCore/Providers/StepFun/StepFunUsageFetcher.swift:214-221,
 //! 227-234, 393-401, 465-491, 141-158`; `StepFunSettingsReader.swift:6,20-24`).
 //! `five_hour_usage_left_rate` / `weekly_usage_left_rate` are 0..1 fractions
 //! (CodexBar: `(1.0 - left_rate) * 100` at lines 143-152). Reset times are Unix
 //! seconds (string or integer JSON). Rides the live-proven `http.rs`.
+//!
+//! Webid fidelity: the `oasis-webid` header and the `Oasis-Webid=` cookie value
+//! are derived from the token's JWT `device_id` claim (the refresh half of an
+//! "access...refresh" pair, else a bare JWT), matching CodexBar's
+//! `webID(forToken:)` (StepFunUsageFetcher.swift:357-400). The server ties the
+//! webid to the session device, so a hard-coded webid risks rejection; deriving
+//! it keeps the request faithful. A token with no `device_id` (an opaque
+//! `STEPFUN_TOKEN`) falls back to the static `OASIS_WEB_ID`, i.e. the
+//! pre-derivation behavior, so an opaque token never regresses.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
@@ -305,6 +315,40 @@ impl Default for StepFunProvider {
     }
 }
 
+/// Derive the Oasis-Webid from a token, matching CodexBar's `webID(forToken:)`.
+///
+/// The token is either a bare JWT or an "access...refresh" pair; the `device_id`
+/// lives in the refresh half, so the halves are scanned in reverse. A token with
+/// no decodable `device_id` (e.g. an opaque `STEPFUN_TOKEN`) falls back to the
+/// static [`OASIS_WEB_ID`], preserving the pre-derivation request shape.
+fn webid_for_token(token: &str) -> String {
+    for half in token.rsplit("...") {
+        if let Some(device_id) = extract_device_id(half) {
+            if !device_id.is_empty() {
+                return device_id;
+            }
+        }
+    }
+    OASIS_WEB_ID.to_string()
+}
+
+/// Base64url-decode a JWT's payload (no signature verification) and return its
+/// `device_id` claim, if any. Returns `None` for anything that is not a JWT with
+/// a string `device_id`.
+fn extract_device_id(jwt: &str) -> Option<String> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    // JWT payloads are unpadded base64url; strip any stray padding so the NO_PAD
+    // engine accepts both padded and unpadded forms.
+    let payload = payload.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("device_id")?.as_str().map(str::to_string)
+}
+
 #[async_trait]
 impl UsageProvider for StepFunProvider {
     fn name(&self) -> &str {
@@ -316,14 +360,17 @@ impl UsageProvider for StepFunProvider {
             let token = env::first_env(TOKEN_ENV)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {TOKEN_ENV:?} is set")))?;
 
-            let cookie = format!("Oasis-Token={token}; Oasis-Webid={OASIS_WEB_ID}");
+            // Derive the webid from the token's device_id so the header and the
+            // Oasis-Webid cookie agree with the session (see webid_for_token).
+            let webid = webid_for_token(&token);
+            let cookie = format!("Oasis-Token={token}; Oasis-Webid={webid}");
             let body = b"{}".to_vec();
 
             let response = JsonRequest::post_json(API_URL, body)
                 .header(Header::new("content-type", "application/json"))
                 .header(Header::new("oasis-appid", OASIS_APP_ID))
                 .header(Header::new("oasis-platform", "web"))
-                .header(Header::new("oasis-webid", OASIS_WEB_ID))
+                .header(Header::new("oasis-webid", webid))
                 .header(Header::new("User-Agent", USER_AGENT))
                 .header(Header::new("Cookie", cookie))
                 .timeout(REQUEST_TIMEOUT)
@@ -528,5 +575,40 @@ mod tests {
             normalize_usage(b"not json"),
             Err(FetchError::Decode(_))
         ));
+    }
+
+    fn jwt_payload(payload: &str) -> String {
+        use base64::Engine as _;
+        // header.payload.sig with an unpadded base64url payload, like a real JWT.
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("hdr.{enc}.sig")
+    }
+
+    #[test]
+    fn webid_derives_device_id_from_a_bare_jwt() {
+        let jwt = jwt_payload(r#"{"device_id":"dev-123","sub":"x"}"#);
+        assert_eq!(webid_for_token(&jwt), "dev-123");
+    }
+
+    #[test]
+    fn webid_derives_device_id_from_the_refresh_half_of_a_pair() {
+        let refresh = jwt_payload(r#"{"device_id":"refresh-dev"}"#);
+        let token = format!("opaque-access...{refresh}");
+        assert_eq!(webid_for_token(&token), "refresh-dev");
+    }
+
+    #[test]
+    fn webid_falls_back_to_static_when_token_has_no_device_id() {
+        // An opaque STEPFUN_TOKEN (no JWT, no device_id) keeps the pre-derivation
+        // static webid, so an opaque token never regresses.
+        assert_eq!(webid_for_token("opaque-token-no-jwt"), OASIS_WEB_ID);
+        let jwt = jwt_payload(r#"{"sub":"no-device-id-here"}"#);
+        assert_eq!(webid_for_token(&jwt), OASIS_WEB_ID);
+    }
+
+    #[test]
+    fn webid_falls_back_when_device_id_is_empty() {
+        let jwt = jwt_payload(r#"{"device_id":""}"#);
+        assert_eq!(webid_for_token(&jwt), OASIS_WEB_ID);
     }
 }

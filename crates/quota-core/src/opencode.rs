@@ -393,7 +393,14 @@ fn reset_epoch_for_map(map: &serde_json::Map<String, Value>, now_secs: i64) -> O
 }
 
 fn percent_from_map(map: &serde_json::Map<String, Value>) -> Option<f64> {
-    let mut p = first_f64(map, PERCENT_KEYS).or_else(|| {
+    // A direct percent field (e.g. `usagePercent`) may arrive as a 0..1 fraction
+    // or a 0..100 percent, so it goes through the fraction heuristic below. A
+    // computed used/limit ratio is already 0..100 and must NOT be rescaled,
+    // otherwise a genuine sub-1% account (used=1, limit=100 -> 1.0) reads as a
+    // false 100% exhausted. Track which path produced the value (CodexBar
+    // v0.45.2 `percentIsDirect` gate).
+    let direct = first_f64(map, PERCENT_KEYS);
+    let mut p = direct.or_else(|| {
         const USED: &[&str] = &["used", "usage", "consumed", "count", "usedTokens"];
         const LIMIT: &[&str] = &["limit", "total", "quota", "max", "cap", "tokenLimit"];
         let used = first_f64(map, USED)?;
@@ -407,7 +414,7 @@ fn percent_from_map(map: &serde_json::Map<String, Value>) -> Option<f64> {
     if !p.is_finite() {
         return None;
     }
-    if (0.0..=1.0).contains(&p) {
+    if direct.is_some() && (0.0..=1.0).contains(&p) {
         p *= 100.0;
     }
     Some(p.clamp(0.0, 100.0))
@@ -814,5 +821,44 @@ mod tests {
         let text = r#"id:"wrk_abc123xyz",name:"Main""#;
         let ids = parse_workspace_ids(text);
         assert_eq!(ids, vec!["wrk_abc123xyz"]);
+    }
+
+    #[test]
+    fn computed_sub_one_percent_is_not_rescaled_to_exhausted() {
+        // used=1, limit=100 -> a genuine 1% computed ratio. The fraction
+        // heuristic must NOT touch the computed path, else 1.0 is misread as a
+        // 0..1 fraction and rescaled to a false 100% (CodexBar v0.45.2 fix).
+        let map = serde_json::json!({ "used": 1, "limit": 100 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(percent_from_map(&map), Some(1.0));
+    }
+
+    #[test]
+    fn computed_half_percent_stays_half() {
+        let map = serde_json::json!({ "used": 1, "limit": 200 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(percent_from_map(&map), Some(0.5));
+    }
+
+    #[test]
+    fn direct_fraction_is_scaled_but_direct_percent_is_not() {
+        // A direct percent field may be a 0..1 fraction (scaled to a percent) or
+        // already a 0..100 percent (left alone). `percent` is a PERCENT_KEYS
+        // entry that is not a used/limit key, so it routes through the direct
+        // path and exercises the gated heuristic.
+        let frac = serde_json::json!({ "percent": 0.5 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(percent_from_map(&frac), Some(50.0));
+        let pct = serde_json::json!({ "percent": 50.0 })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(percent_from_map(&pct), Some(50.0));
     }
 }
