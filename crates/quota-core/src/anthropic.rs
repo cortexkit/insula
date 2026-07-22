@@ -63,7 +63,6 @@ struct ApiLimitEntry {
     group: Option<String>,
     percent: Option<f64>,
     resets_at: Option<String>,
-    is_active: Option<bool>,
     scope: Option<ApiLimitScope>,
 }
 
@@ -111,10 +110,18 @@ fn scoped_weekly_extras(
     let extras: Vec<_> = limits
         .into_iter()
         .flatten()
+        // Match CodexBar's ClaudeScopedWeeklyLimitMapper: filter on group +
+        // kind only. Do NOT filter on `is_active` — that flag marks which single
+        // limit is *currently binding* (the tightest one), not whether a window
+        // is valid to show. A Fable window with `is_active:false` still carries a
+        // real percent and reset and must be reported (the account has that
+        // weekly limit); dropping it hides Fable for every account not currently
+        // walled on Fable. The named `seven_day`/`five_hour` windows are shown
+        // regardless of their own `is_active`, so honoring it only here was an
+        // inconsistency, not a rule.
         .filter(|entry| {
             entry.kind.as_deref() == Some("weekly_scoped")
                 && entry.group.as_deref().unwrap_or("weekly") == "weekly"
-                && entry.is_active != Some(false)
         })
         .filter_map(|entry| {
             let model = entry.scope.as_ref()?.model.as_ref()?;
@@ -748,12 +755,6 @@ mod tests {
                     {
                         "kind": "weekly_scoped",
                         "percent": 80.0,
-                        "scope": {"model": {"display_name": "Inactive"}},
-                        "is_active": false
-                    },
-                    {
-                        "kind": "weekly_scoped",
-                        "percent": 80.0,
                         "scope": {"model": {}},
                         "is_active": true
                     }
@@ -768,6 +769,33 @@ mod tests {
         let window = extras[0].window.as_ref().unwrap();
         assert_eq!(window.used_percent, 100.0);
         assert_eq!(window.window_minutes, Some(SEVEN_DAY_MINUTES));
+    }
+
+    #[test]
+    fn inactive_scoped_weekly_window_is_still_reported() {
+        // The exact live bug: an account not currently walled on Fable returns
+        // its Fable weekly_scoped entry with `is_active: false` and a real
+        // percent. It must still be reported — `is_active` marks which limit is
+        // currently binding, not whether a window is valid. CodexBar's mapper
+        // does not filter on it.
+        let usage = normalize_usage(
+            br#"{
+                "seven_day": {"utilization": 5.0, "resets_at": "2026-07-29T04:00:00Z"},
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 6.0,
+                    "resets_at": "2026-07-29T04:00:00Z",
+                    "scope": {"model": {"display_name": "Fable"}},
+                    "is_active": false
+                }]
+            }"#,
+        )
+        .unwrap();
+        let extras = usage.extra_rate_windows.expect("Fable window must be kept");
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
+        assert_eq!(extras[0].window.as_ref().unwrap().used_percent, 6.0);
     }
 
     #[test]
