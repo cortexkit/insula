@@ -209,8 +209,15 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         }
     }
     if frames.is_empty() {
-        return Err(FetchError::Decode(
-            "grok: no gRPC-web data frame".to_string(),
+        // An empty HTTP 200 body (no data frame, no error trailer) is grok's
+        // edge-limiter flap under rapid probing — the endpoint returns nothing
+        // rather than a malformed payload. Classify it as Upstream (transient)
+        // so the refresher serves the last-healthy window stale through the
+        // flap instead of replacing a real 98%-used window with a degraded
+        // entry (which the router reads as "quota signal: none"). A genuine
+        // decode failure (garbled protobuf, missing reset) still degrades.
+        return Err(FetchError::Upstream(
+            "grok: empty gRPC-web response (transient edge limit)".to_string(),
         ));
     }
 
@@ -810,7 +817,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_body_is_decode_error() {
-        assert!(matches!(normalize_usage(&[]), Err(FetchError::Decode(_))));
+    fn empty_body_is_transient_upstream() {
+        // grok's edge limiter returns an empty HTTP 200 (no data frame) under
+        // rapid probing. This must classify as Upstream/transient so the
+        // refresher serves the last-healthy window stale through the flap,
+        // rather than Decode/non-transient which would replace a real 98%-used
+        // window with a degraded entry the router reads as "no signal".
+        assert!(matches!(normalize_usage(&[]), Err(FetchError::Upstream(_))));
+        assert_eq!(
+            crate::refresh::classify(&normalize_usage(&[]).unwrap_err()),
+            crate::refresh::FetchClass::Transient
+        );
     }
 }
