@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::provider::CredentialHandle;
 use crate::refresh::{AttemptSequence, Incarnation, ProviderSlot};
@@ -134,12 +134,9 @@ impl SlotStore {
         self.created_at
     }
 
-    /// Convert a monotonic slot timestamp to a stable wall-clock timestamp for
-    /// read-time metadata without storing it in the usage entry.
-    pub fn wall_time(&self, timestamp: Instant) -> Option<DateTime<Utc>> {
-        let elapsed =
-            ChronoDuration::from_std(timestamp.saturating_duration_since(self.created_at)).ok()?;
-        self.created_at_wall.checked_add_signed(elapsed)
+    /// Copy the clock anchors needed for timestamp conversion after unlocking.
+    pub(crate) fn wall_time_anchor(&self) -> (Instant, DateTime<Utc>) {
+        (self.created_at, self.created_at_wall)
     }
 }
 
