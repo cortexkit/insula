@@ -401,6 +401,10 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         "fresh": snapshot.fresh,
         "stale": snapshot.stale,
         "degraded": snapshot.degraded,
+        // Registered providers that resolved no credential handle, so they appear
+        // in none of the counts above. Reported by name so the buckets can be
+        // reconciled against providersTotal rather than silently under-summing.
+        "withoutHandles": snapshot.without_handles,
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieCohortDegraded": snapshot.cookie_cohort_degraded,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),

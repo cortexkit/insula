@@ -33,6 +33,15 @@ pub struct HealthSnapshot {
     /// Names of providers in a degraded state (non-transient failure: no creds,
     /// expired session, bad shape) — they serve an error entry, not a window.
     pub degraded: Vec<String>,
+    /// Registered providers that resolved no credential handle at all, so they
+    /// hold no slots and appear in none of the counts above.
+    ///
+    /// Without this they would be counted in `providers_total` and then be
+    /// invisible everywhere else, so `fresh + stale + degraded` could silently
+    /// under-sum and a provider that never came up would read as an absence
+    /// rather than as a problem. Only populated once the refresher has completed
+    /// a tick: before that every provider legitimately has no slots yet.
+    pub without_handles: Vec<String>,
     /// Browser-cookie providers registered (the desktop-coupled cohort).
     pub cookie_cohort_total: usize,
     /// Cookie-cohort providers that are degraded — a stale browser-login signal
@@ -57,6 +66,7 @@ impl HealthSnapshot {
             fresh: 0,
             stale: 0,
             degraded: Vec::new(),
+            without_handles: Vec::new(),
             cookie_cohort_total,
             cookie_cohort_degraded: Vec::new(),
             last_tick_age: None,

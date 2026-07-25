@@ -2987,3 +2987,39 @@ async fn duplicate_account_with_equal_status_serves_the_newer_observation() {
         "the newer observation must win; serving the older one understates usage"
     );
 }
+
+#[tokio::test]
+async fn a_provider_that_resolves_no_handle_is_named_rather_than_skipped() {
+    // A provider whose credential enumeration keeps failing holds no slots, so it
+    // lands in none of the fresh/stale/degraded buckets while still counting
+    // toward providers_total. Skipping it silently would let the buckets
+    // under-sum, and "configured but never came up" would read as an absence
+    // rather than as a problem worth acting on.
+    let provider = EnumerationProvider {
+        handles: Arc::new(Mutex::new(vec![handle("H1")])),
+        fail_enumeration: Arc::new(Mutex::new(true)),
+        calls: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    // Before the first tick every provider legitimately has no slots yet, so
+    // reporting then would name all of them for the first seconds after start.
+    assert!(
+        registry.health().without_handles.is_empty(),
+        "a provider must not be reported as handle-less before the refresher runs"
+    );
+
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert_eq!(
+        health.without_handles,
+        vec!["enumerated"],
+        "a provider that resolved no handle must be visible by name"
+    );
+    assert_eq!(health.fresh + health.stale + health.degraded.len(), 0);
+    assert_eq!(
+        health.providers_total, 1,
+        "it still counts in the total, which is why its absence must be reported"
+    );
+}

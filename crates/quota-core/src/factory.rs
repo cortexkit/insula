@@ -35,7 +35,7 @@ use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError, CookieJar},
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -239,6 +239,59 @@ fn pool_from_limits(limits: &FactoryBillingLimits) -> Option<&FactoryBillingPool
     limits.standard.as_ref().or(limits.core.as_ref())
 }
 
+/// Normalize the Core pool into named extra windows.
+///
+/// Core is an independent allowance from the standard pool, so it must stay
+/// visible without claiming an unnamed slot: those slots are read as "this
+/// provider's pressure", and letting a walled Core pool headline would report
+/// the account as exhausted while standard-model traffic still flows. The
+/// reverse error is what this exists to fix — dropping Core entirely hides a
+/// genuine wall from anything routing Core-model traffic.
+fn core_extra_windows(
+    limits: &FactoryBillingLimits,
+    now: DateTime<Utc>,
+) -> Option<Vec<ExtraWindow>> {
+    // Only when Core is a distinct pool. A payload carrying core alone routes it
+    // into the unnamed slots instead, so emitting it here as well would report
+    // the same allowance twice.
+    let core = limits.core.as_ref().filter(|_| limits.standard.is_some())?;
+
+    let windows = [
+        (
+            "factory-core-5h",
+            "Core 5h",
+            core.five_hour.as_ref(),
+            FIVE_HOUR_MINUTES,
+        ),
+        (
+            "factory-core-7d",
+            "Core 7-day",
+            core.weekly.as_ref(),
+            WEEKLY_MINUTES,
+        ),
+        (
+            "factory-core-monthly",
+            "Core Monthly",
+            core.monthly.as_ref(),
+            MONTHLY_MINUTES,
+        ),
+    ];
+
+    let extras: Vec<ExtraWindow> = windows
+        .into_iter()
+        .filter_map(|(id, title, window, minutes)| {
+            let window = rate_window_from(window?, minutes, now)?;
+            Some(ExtraWindow {
+                title: Some(title.to_string()),
+                id: Some(id.to_string()),
+                window: Some(window),
+            })
+        })
+        .collect();
+
+    (!extras.is_empty()).then_some(extras)
+}
+
 /// Normalize billing limits JSON to [`Usage`] (pure — unit-testable).
 pub fn normalize_billing_limits(value: &Value, now: DateTime<Utc>) -> Result<Usage, FetchError> {
     let root: FactoryBillingLimitsResponse = serde_json::from_value(value.clone())
@@ -275,7 +328,7 @@ pub fn normalize_billing_limits(value: &Value, now: DateTime<Utc>) -> Result<Usa
         primary,
         secondary,
         tertiary,
-        extra_rate_windows: None,
+        extra_rate_windows: core_extra_windows(limits, now),
     })
 }
 
@@ -570,5 +623,96 @@ mod tests {
             resolve_direct_bearer(&jar).as_deref(),
             Some("eyJhb.header.sig")
         );
+    }
+
+    #[test]
+    fn an_exhausted_core_pool_is_reported_as_named_extras() {
+        // Core is an allowance independent of standard, so a walled Core pool must
+        // stay visible. Dropping it reports the account as comfortable while
+        // Core-model traffic is refused; letting it claim an unnamed slot would
+        // report the opposite. Named extras are the only shape that says both.
+        let now = Utc::now();
+        let reset = (now + chrono::Duration::hours(3)).to_rfc3339();
+        let value: Value = serde_json::from_str(&format!(
+            r#"{{ "limits": {{
+                "standard": {{
+                    "fiveHour": {{ "usedPercent": 5, "windowEnd": "{reset}" }},
+                    "weekly":   {{ "usedPercent": 10, "windowEnd": "{reset}" }}
+                }},
+                "core": {{
+                    "fiveHour": {{ "usedPercent": 100, "windowEnd": "{reset}" }},
+                    "monthly":  {{ "usedPercent": 80, "windowEnd": "{reset}" }}
+                }}
+            }} }}"#
+        ))
+        .unwrap();
+
+        let usage = normalize_billing_limits(&value, now).expect("both pools are usable");
+
+        assert_eq!(
+            usage.primary.expect("standard 5h headlines").used_percent,
+            5.0,
+            "the standard pool keeps the unnamed slot a consumer reads as provider pressure"
+        );
+
+        let extras = usage
+            .extra_rate_windows
+            .expect("an exhausted core pool must not vanish");
+        let core_5h = extras
+            .iter()
+            .find(|e| e.id.as_deref() == Some("factory-core-5h"))
+            .expect("core 5h window");
+        assert_eq!(
+            core_5h.window.as_ref().expect("window").used_percent,
+            100.0,
+            "the core wall is the fact this test exists to keep visible"
+        );
+        assert!(extras
+            .iter()
+            .any(|e| e.id.as_deref() == Some("factory-core-monthly")));
+        assert!(
+            !extras
+                .iter()
+                .any(|e| e.id.as_deref() == Some("factory-core-7d")),
+            "an absent core cadence is omitted rather than invented"
+        );
+    }
+
+    #[test]
+    fn a_core_only_payload_still_headlines_without_duplicating_itself() {
+        // The pre-existing fallback: with no standard pool, core routes into the
+        // unnamed slots. It must not ALSO appear as an extra, which would report
+        // one allowance twice.
+        let now = Utc::now();
+        let reset = (now + chrono::Duration::hours(3)).to_rfc3339();
+        let value: Value = serde_json::from_str(&format!(
+            r#"{{ "limits": {{ "core": {{
+                "fiveHour": {{ "usedPercent": 42, "windowEnd": "{reset}" }}
+            }} }} }}"#
+        ))
+        .unwrap();
+
+        let usage = normalize_billing_limits(&value, now).expect("core alone is usable");
+        assert_eq!(usage.primary.expect("core headlines").used_percent, 42.0);
+        assert!(
+            usage.extra_rate_windows.is_none(),
+            "core already occupies the unnamed slot, so it must not repeat as an extra"
+        );
+    }
+
+    #[test]
+    fn a_standard_only_payload_emits_no_extras() {
+        let now = Utc::now();
+        let reset = (now + chrono::Duration::hours(3)).to_rfc3339();
+        let value: Value = serde_json::from_str(&format!(
+            r#"{{ "limits": {{ "standard": {{
+                "fiveHour": {{ "usedPercent": 7, "windowEnd": "{reset}" }}
+            }} }} }}"#
+        ))
+        .unwrap();
+
+        let usage = normalize_billing_limits(&value, now).unwrap();
+        assert_eq!(usage.primary.expect("standard 5h").used_percent, 7.0);
+        assert!(usage.extra_rate_windows.is_none());
     }
 }

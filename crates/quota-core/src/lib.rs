@@ -741,6 +741,7 @@ impl Registry {
         let mut fresh = 0;
         let mut stale = 0;
         let mut degraded = Vec::new();
+        let mut without_handles = Vec::new();
         let mut cookie_cohort_degraded = Vec::new();
 
         for provider in &self.providers {
@@ -751,6 +752,18 @@ impl Registry {
                 .map(|(_, slot)| slot)
                 .collect();
             if slots.is_empty() {
+                // Registered but holding no slots, so it contributes to no count
+                // below. Report it by name rather than skipping it: otherwise the
+                // buckets silently under-sum against providers_total, and a
+                // provider whose credential enumeration keeps failing reads as an
+                // absence instead of a problem.
+                //
+                // Before the refresher's first tick every provider legitimately
+                // has no slots, so reporting then would name all of them for the
+                // first few seconds after start.
+                if last_tick_at.is_some() {
+                    without_handles.push(name.to_string());
+                }
                 continue;
             }
             let has_fresh = slots
@@ -784,6 +797,7 @@ impl Registry {
             fresh,
             stale,
             degraded,
+            without_handles,
             cookie_cohort_total,
             cookie_cohort_degraded,
             last_tick_age,
