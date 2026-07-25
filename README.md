@@ -14,6 +14,9 @@ See `docs/charter.md` for the mission and reverse-engineered contracts, and
 `docs/provider-matrix.md` for the full per-provider archetype/verification matrix.
 **Adding or changing a provider: read `docs/provider-invariants.md` first.** It lists
 the properties a normalizer must uphold, each recovered from a defect that shipped.
+**Consuming `usage.get`: read `docs/consumer-contract.md`.** It states what you can
+rely on and what you must not infer, and every rule in it was settled against a real
+consumer.
 
 ## What it serves
 
