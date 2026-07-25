@@ -34,7 +34,6 @@ use serde_json::Value;
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     browser_cookies::{self, CookieError, CookieJar},
-    env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -100,7 +99,7 @@ fn flex_f64(v: &Value) -> Option<f64> {
 
 /// Parse `windowEnd` — epoch seconds, epoch milliseconds, or ISO8601 (CodexBar
 /// `FlexibleFactoryDate` `:285-307`).
-fn parse_flexible_factory_date(value: &Value) -> Option<String> {
+fn parse_flexible_factory_date(value: &Value) -> Option<DateTime<Utc>> {
     if let Some(n) = flex_f64(value) {
         let secs = if n > 1_000_000_000_000.0 {
             (n / 1000.0) as i64
@@ -109,20 +108,19 @@ fn parse_flexible_factory_date(value: &Value) -> Option<String> {
         } else {
             return None;
         };
-        return env::epoch_to_iso8601(secs);
+        return DateTime::from_timestamp(secs, 0);
     }
     let s = value.as_str()?.trim();
     if s.is_empty() {
         return None;
     }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(
-            dt.with_timezone(&Utc)
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string(),
-        );
-    }
-    None
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn format_reset(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,18 +157,47 @@ struct FactoryBillingLimitsResponse {
     limits: Option<FactoryBillingLimits>,
 }
 
-fn reset_at_for_window(window: &FactoryBillingWindow, now: DateTime<Utc>) -> Option<String> {
-    if let Some(ref end) = window.window_end {
-        if let Some(iso) = parse_flexible_factory_date(end) {
-            return Some(iso);
+/// How a window's reset metadata resolved, which decides both the reset we emit
+/// and which utilization is truthful.
+enum ResetState {
+    /// A live reset: `secondsRemaining` in the future, or a `windowEnd` that
+    /// parsed and is still ahead of `now`.
+    Live(String),
+    /// `windowEnd` parsed cleanly and lies in the past: the window really rolled.
+    Expired,
+    /// Reset metadata is present but unresolvable (unparseable `windowEnd`, or a
+    /// non-finite/negative `secondsRemaining`). We cannot tell whether it expired.
+    Unresolvable,
+    /// No reset metadata at all. A legitimate provider answer: emit the window
+    /// from the percent alone (ratified in db7a205 — percent is load-bearing,
+    /// reset optional, never fabricated).
+    Absent,
+}
+
+/// Resolve a window's reset, mirroring CodexBar's `resetAt` precedence —
+/// `secondsRemaining` first, then `windowEnd`, and a `windowEnd` counts only
+/// while it is still in the future (`FactoryStatusProbe.swift:260-268`).
+fn reset_state_for_window(window: &FactoryBillingWindow, now: DateTime<Utc>) -> ResetState {
+    if let Some(secs) = window.seconds_remaining {
+        if secs.is_finite() && secs > 0.0 {
+            let reset = now + chrono::Duration::milliseconds((secs * 1000.0).round() as i64);
+            return ResetState::Live(format_reset(reset));
         }
     }
-    let secs = window.seconds_remaining?;
-    if !secs.is_finite() || secs < 0.0 {
-        return None;
+    let Some(ref end) = window.window_end else {
+        // No windowEnd. Either secondsRemaining was absent entirely (no reset
+        // metadata at all) or it was present but unusable.
+        return if window.seconds_remaining.is_some() {
+            ResetState::Unresolvable
+        } else {
+            ResetState::Absent
+        };
+    };
+    match parse_flexible_factory_date(end) {
+        Some(parsed) if parsed > now => ResetState::Live(format_reset(parsed)),
+        Some(_) => ResetState::Expired,
+        None => ResetState::Unresolvable,
     }
-    let reset = now + chrono::Duration::milliseconds((secs * 1000.0).round() as i64);
-    Some(reset.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 fn rate_window_from(
@@ -179,10 +206,25 @@ fn rate_window_from(
     now: DateTime<Utc>,
 ) -> Option<RateWindow> {
     let used_percent = window.used_percent?;
-    let resets_at = reset_at_for_window(window, now);
-    if resets_at.is_none() && (window.window_end.is_some() || window.seconds_remaining.is_some()) {
-        return None;
-    }
+    let (resets_at, used_percent) = match reset_state_for_window(window, now) {
+        ResetState::Live(at) => (Some(at), used_percent),
+        // Factory leaves a stale percent behind after a short rolling window
+        // expires, and its own web UI treats that state as reset, so a window
+        // proven to have rolled reports 0 rather than the expired figure
+        // (CodexBar `effectiveUsedPercent`, FactoryStatusProbe.swift:270-277).
+        ResetState::Expired => (None, 0.0),
+        // DELIBERATE DIVERGENCE from CodexBar, which zeroes this case too: its
+        // FlexibleFactoryDate cannot distinguish "unparseable" from "past", so it
+        // treats both as expiry. We can tell them apart, and reporting 0% here
+        // would fabricate good news out of a decode failure — announcing a
+        // provider as fully available on the strength of a field we failed to
+        // read. The two errors are not symmetric: a wrong 0% sends traffic into
+        // a wall, while keeping the real percent only makes an available
+        // provider look busy. When we cannot tell which case we are in, we take
+        // the recoverable error and emit the reported percent with no reset.
+        ResetState::Unresolvable => (None, used_percent),
+        ResetState::Absent => (None, used_percent),
+    };
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
@@ -416,15 +458,59 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_window_end_without_seconds_remaining_still_drops_window() {
+    fn unparseable_window_end_keeps_the_reported_percent_and_emits_no_reset() {
+        // The deliberate divergence from CodexBar: it zeroes this case, we do not.
+        // Reporting 0% off a field we failed to read would announce an exhausted
+        // provider as fully available.
         let value: Value = serde_json::from_str(
-            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0,"windowEnd":"not-a-date"}}}}"#,
+            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":97.0,"windowEnd":"not-a-date"}}}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            normalize_billing_limits(&value, fixed_now()),
-            Err(FetchError::Decode(_))
-        ));
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 97.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn expired_window_end_reports_zero_used_and_no_reset() {
+        // A windowEnd that parsed cleanly and lies in the past proves the window
+        // rolled, so the stale percent is not the truth: 0 is.
+        let value: Value = serde_json::from_str(
+            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":93.0,"windowEnd":"2026-06-24T01:00:00Z"}}}}"#,
+        )
+        .unwrap();
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 0.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn seconds_remaining_wins_over_window_end() {
+        // CodexBar's precedence: secondsRemaining is consulted first, so a live
+        // countdown beats an already-past windowEnd instead of reading as expiry.
+        let value: Value = serde_json::from_str(
+            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":61.0,"windowEnd":"2026-06-24T01:00:00Z","secondsRemaining":3600.0}}}}"#,
+        )
+        .unwrap();
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 61.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
+    }
+
+    #[test]
+    fn unusable_seconds_remaining_keeps_the_reported_percent() {
+        // Present-but-unusable reset metadata is Unresolvable, not expiry.
+        let value: Value = serde_json::from_str(
+            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":88.0,"secondsRemaining":-5.0}}}}"#,
+        )
+        .unwrap();
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 88.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]
