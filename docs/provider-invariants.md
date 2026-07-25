@@ -31,6 +31,24 @@ validating the upstream vocabulary would turn a new limit type into an outage.
 Swept 2026-07-25 across all `Ok`-producing normalization paths. Re-run the
 enumeration when a provider is added.
 
+## Porting from a reference implementation
+
+Fidelity is to observable meaning, not to expressions. Where our type asserts
+more than the reference's does, copying the arithmetic exactly is how you assert
+something false.
+
+The reference keeps a minimum remaining percent and a minimum reset time as two
+independent scalars, and never claims they describe the same pool. A
+`RateWindow` claims exactly that — *this much of this window is used, and this
+window resets then*. Reducing both minima faithfully and then pairing them
+inside one manufactured a claim the source data did not support: the defect was
+in the container, not the maths, which is why it survived a correct port and
+passing tests.
+
+The same applies wherever we hold information the reference cannot represent.
+When its type cannot distinguish two cases and ours can, matching it exactly
+means deliberately discarding what we know.
+
 ## An independent pool must stay visible without headlining
 
 Providers that bill more than one pool have two opposite failure modes, and the
@@ -118,7 +136,7 @@ usage. Two traps:
 
 ## Testing these
 
-A regression for any of the above must fail *for the reason it names*. Four ways
+A regression for any of the above must fail *for the reason it names*. Five ways
 a suite can be uninformative while looking decisive, only one of which has a
 colour that suggests a problem:
 
@@ -128,8 +146,28 @@ colour that suggests a problem:
 3. it **fails** for a reason unrelated to the defect (a fixture using field
    names the model does not have)
 4. it never runs at all
+5. it **encodes the defect as the specification** — a passing test asserting the
+   wrong behaviour is correct
+
+The fifth is the most hostile, because the test is not merely silent about the
+broken case: it actively certifies it. Two of the defects behind this document
+were pinned that way, so fixing them meant deleting a green test. If a change
+you believe in breaks an existing test, establish which of the two encodes the
+intended behaviour before assuming it is your change — and when a rule here and
+a test disagree, say in the commit message why the test moved.
 
 Watching a test fail proves only that it can change colour. Read the failure
 message and confirm it names the mechanism. For byte-level or encoding
 regressions, assert the input's own length so a future miscount fails loudly
 instead of silently testing nothing.
+
+When auditing coverage, enumerate the **input shapes** a guard must handle and
+check each has a test, rather than checking that the guard has tests. And when
+sweeping a property across providers, take the population count from the
+registry rather than from whoever asked: a sweep that adopts the requester's
+count cannot find a missing member.
+
+One more trap specific to this codebase. A module doc and a function doc in the
+same file have disagreed about the intended behaviour, and each looked
+authoritative alone. When they conflict, the conflict itself is the finding, and
+neither half is citable until the upstream contract settles it.
