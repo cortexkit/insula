@@ -136,10 +136,25 @@ fn select_due_round_robin(
             queues[index].push_back((key, slot));
         }
     }
+    // Most-overdue first, then stable handle order as a deterministic tie-break.
+    //
+    // Sorting by handle alone makes admission order identical every turn, so the
+    // same handle is taken each time its provider is visited. While a provider has
+    // more due handles than it gets admissions per turn, a later handle can then be
+    // passed over indefinitely: it never becomes "next", because the earlier handle
+    // keeps returning to the front as it falls due again. Ordering by due time
+    // instead makes waiting itself advance a handle's position, so a passed-over
+    // handle overtakes one that was just refreshed. A never-attempted handle carries
+    // the oldest due time of all, so it is admitted first rather than last.
     for queue in &mut queues {
         queue
             .make_contiguous()
-            .sort_by(|(left, _), (right, _)| left.handle.sort_cmp(&right.handle));
+            .sort_by(|(left, left_slot), (right, right_slot)| {
+                left_slot
+                    .next_due_at
+                    .cmp(&right_slot.next_due_at)
+                    .then_with(|| left.handle.sort_cmp(&right.handle))
+            });
     }
 
     let provider_count = providers.len();

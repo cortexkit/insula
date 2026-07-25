@@ -2852,3 +2852,63 @@ fn credits_normalizer_matches_live_captured_contract() {
     );
     assert_eq!(credits.saved_resets().credits.len(), 1);
 }
+
+#[tokio::test]
+async fn a_saturated_provider_still_advances_its_later_handles() {
+    // Enough due providers to fill the concurrency cap on the first pass, so each
+    // provider gets roughly one admission per turn while holding two due handles.
+    //
+    // This is the pressure case: if admission order were fixed, the same handle
+    // would be taken every turn and the second would never be reached, leaving it
+    // permanently unattempted. An unattempted handle has no resolved account, and
+    // the read path collapses a provider to a single unlabeled entry unless every
+    // handle resolves one — so the visible cost is that the provider's accounts
+    // stop being reported separately.
+    let provider_count = refresh::CONCURRENCY_CAP + 1;
+    let calls: Vec<_> = (0..provider_count)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let providers: Vec<Box<dyn UsageProvider>> = (0..provider_count)
+        .map(|index| {
+            Box::new(CursorProvider {
+                name: format!("provider-{index:02}"),
+                handles: 2,
+                calls: Arc::clone(&calls[index]),
+            }) as Box<dyn UsageProvider>
+        })
+        .collect();
+    let registry = Registry::new(providers);
+
+    // Sustained pressure: a handle that was just refreshed falls due again before
+    // the next turn, which is what a refresh interval shorter than a full turn
+    // looks like. Slots that have NOT been attempted keep their original due time,
+    // because nothing has refreshed them — overwriting it would erase how long
+    // they have been waiting, which is the signal fair admission depends on.
+    for _ in 0..6 {
+        tick(&registry).await;
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            if slot.last_success_at.is_none() {
+                continue;
+            }
+            slot.next_due_at = Instant::now();
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+    }
+
+    let store = registry.store.lock().unwrap();
+    let never_attempted: Vec<_> = store
+        .snapshot()
+        .into_iter()
+        .filter(|(_, slot)| slot.status == SlotStatus::Pending)
+        .map(|(key, _)| format!("{}/{}", key.provider, key.handle.stable_id()))
+        .collect();
+
+    assert!(
+        never_attempted.is_empty(),
+        "every handle must eventually be admitted under sustained pressure; \
+         these were never attempted: {never_attempted:?}"
+    );
+}
