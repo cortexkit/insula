@@ -18,6 +18,74 @@ use crate::provider::FetchError;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Safety bound, not a limit tuned to observed provider payloads. A 32 MiB quota
+/// response is already implausibly large, so this leaves generous compatibility
+/// headroom while keeping an untrusted response from growing memory without bound.
+/// Crossing the bound is a provider contract violation and therefore `Decode`:
+/// retrying it as a transient upstream failure would stale-serve indefinitely.
+const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Preserve far more than the 200 characters used in diagnostics while bounding
+/// rejected-body draining. Normal short errors are still drained to EOF so their
+/// connections remain reusable; only oversized errors forfeit pool reuse.
+const ERROR_BODY_PREFIX_BYTES: usize = 8 * 1024;
+
+fn body_too_large() -> FetchError {
+    FetchError::Decode(format!(
+        "HTTP response body exceeds {MAX_RESPONSE_BODY_BYTES}-byte safety limit"
+    ))
+}
+
+async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, FetchError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(body_too_large());
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_RESPONSE_BODY_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?
+    {
+        if chunk.len() > MAX_RESPONSE_BODY_BYTES - body.len() {
+            return Err(body_too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_error_body_prefix(mut response: reqwest::Response) -> Result<Vec<u8>, FetchError> {
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(ERROR_BODY_PREFIX_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while body.len() < ERROR_BODY_PREFIX_BYTES {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?
+        else {
+            break;
+        };
+        let remaining = ERROR_BODY_PREFIX_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            break;
+        }
+    }
+    Ok(body)
+}
+
 /// Percent-encode form pairs into an `application/x-www-form-urlencoded` body.
 fn encode_form(pairs: &[(&str, &str)]) -> String {
     fn enc(s: &str) -> String {
@@ -214,7 +282,7 @@ impl JsonRequest {
             .map_err(|error| FetchError::Upstream(error.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            if response.bytes().await.is_err() {
+            if read_error_body_prefix(response).await.is_err() {
                 eprintln!(
                     "[ck-quota] warning: {provider} rejected-response body was incomplete status={status}"
                 );
@@ -231,14 +299,11 @@ impl JsonRequest {
                 )
             })
             .collect();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?;
+        let body = read_success_body(response).await?;
         Ok(HttpResponse {
             status,
             headers,
-            body: body.to_vec(),
+            body,
         })
     }
 
@@ -267,15 +332,221 @@ impl JsonRequest {
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| FetchError::Upstream(format!("reading body: {e}")))?;
+        let body = if (200..300).contains(&status) {
+            read_success_body(response).await?
+        } else {
+            read_error_body_prefix(response).await?
+        };
 
         Ok(HttpResponse {
             status,
             headers,
-            body: body.to_vec(),
+            body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before completing its request");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
+    async fn serve_fixed(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let headers = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            let _ = stream.write_all(&body).await;
+        });
+        (format!("http://{address}/response"), server)
+    }
+
+    #[tokio::test]
+    async fn normal_success_body_is_returned_byte_for_byte() {
+        let expected = vec![0, 1, b'{', b'}', b'\n', 0xff];
+        let (url, server) = serve_fixed(200, expected.clone()).await;
+
+        let actual = JsonRequest::get(url)
+            .send(&reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_oversized_success_is_rejected_before_body_read() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let declared_length = MAX_RESPONSE_BODY_BYTES + 1;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {declared_length}\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let result = JsonRequest::get(format!("http://{address}/oversized"))
+            .timeout(Duration::from_millis(200))
+            .send(&reqwest::Client::new())
+            .await;
+        server.abort();
+
+        match result {
+            Err(FetchError::Decode(message)) => assert_eq!(
+                message,
+                format!("HTTP response body exceeds {MAX_RESPONSE_BODY_BYTES}-byte safety limit")
+            ),
+            Err(other) => panic!("expected Decode, got {other:?}"),
+            Ok(_) => panic!("oversized declared body unexpectedly succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_success_is_rejected_while_streaming() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = MAX_RESPONSE_BODY_BYTES + 1;
+            while remaining > 0 {
+                let length = remaining.min(chunk.len());
+                let frame = format!("{length:X}\r\n");
+                if stream.write_all(frame.as_bytes()).await.is_err()
+                    || stream.write_all(&chunk[..length]).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                remaining -= length;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            JsonRequest::get(format!("http://{address}/chunked")).send(&reqwest::Client::new()),
+        )
+        .await
+        .expect("oversized chunked response should be rejected promptly");
+
+        assert!(
+            matches!(result, Err(FetchError::Decode(_))),
+            "expected Decode, got {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_success_excerpt_is_unchanged_when_drain_is_bounded() {
+        let mut body = "é".repeat(250).into_bytes();
+        body.resize(ERROR_BODY_PREFIX_BYTES * 2, b'x');
+        let (url, server) = serve_fixed(500, body).await;
+
+        let result = JsonRequest::get(url).send(&reqwest::Client::new()).await;
+
+        match result {
+            Err(FetchError::Upstream(message)) => {
+                assert_eq!(message, format!("HTTP 500: {}", "é".repeat(200)));
+            }
+            Err(other) => panic!("expected Upstream, got {other:?}"),
+            Ok(_) => panic!("non-success response unexpectedly succeeded"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_error_body_is_drained_for_connection_reuse() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 500 Error\r\ncontent-length: 4\r\n\r\noops")
+                .await
+                .unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let first = JsonRequest::get(format!("http://{address}/first"))
+            .send(&client)
+            .await;
+        assert!(matches!(first, Err(FetchError::Upstream(_))));
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            JsonRequest::get(format!("http://{address}/second")).send(&client),
+        )
+        .await
+        .expect("fully drained error body should leave the connection reusable")
+        .unwrap();
+        assert_eq!(second, b"ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_status_mapping_survives_bounded_error_drain() {
+        let body = vec![b'x'; ERROR_BODY_PREFIX_BYTES * 2];
+        let (url, server) = serve_fixed(429, body).await;
+
+        let result = JsonRequest::get(url)
+            .send_provider_status_first(&reqwest::Client::new(), "test")
+            .await;
+
+        match result {
+            Err(FetchError::ProviderStatus(429)) => {}
+            Err(other) => panic!("expected ProviderStatus(429), got {other:?}"),
+            Ok(_) => panic!("non-success response unexpectedly succeeded"),
+        }
+        server.await.unwrap();
     }
 }
