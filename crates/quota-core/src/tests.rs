@@ -2912,3 +2912,78 @@ async fn a_saturated_provider_still_advances_its_later_handles() {
          these were never attempted: {never_attempted:?}"
     );
 }
+
+/// Two handles resolving the same account, both serving stale data after their
+/// own transient failures, with different observation ages.
+struct StaleDuplicateProvider;
+
+#[async_trait]
+impl UsageProvider for StaleDuplicateProvider {
+    fn name(&self) -> &str {
+        "stale-dup"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        // Deliberately ordered so the handle carrying the OLDER snapshot sorts
+        // first: if selection fell back to handle order, it would win.
+        Ok(vec![handle("A-early"), handle("B-late")])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let used_percent = if handle.stable_id() == "A-early" {
+            10.0
+        } else {
+            90.0
+        };
+        let usage = Usage {
+            primary: Some(RateWindow {
+                used_percent,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: Some(300),
+                used_count: None,
+                total_count: None,
+            }),
+            ..Usage::default()
+        };
+        FetchAttempt::success(observed(Some("shared")), "test", usage)
+    }
+}
+
+#[tokio::test]
+async fn duplicate_account_with_equal_status_serves_the_newer_observation() {
+    let registry = Registry::new(vec![Box::new(StaleDuplicateProvider)]);
+    tick(&registry).await;
+
+    // Both slots end up stale-serving, but one observation is ten minutes older
+    // than the other. Usage only grows within a window, so the older snapshot
+    // necessarily understates pressure — serving it can report a near-exhausted
+    // account as comfortable, which is the direction that costs a consumer most.
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            slot.status = SlotStatus::StaleTransient;
+            let age_secs = if key.handle.stable_id() == "A-early" {
+                600
+            } else {
+                5
+            };
+            slot.last_success_at = Some(Instant::now() - Duration::from_secs(age_secs));
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+    }
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1, "one entry per account");
+    assert_eq!(
+        usage[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.primary.as_ref())
+            .map(|window| window.used_percent),
+        Some(90.0),
+        "the newer observation must win; serving the older one understates usage"
+    );
+}

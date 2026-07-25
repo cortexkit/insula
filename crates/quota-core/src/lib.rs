@@ -500,8 +500,21 @@ impl Registry {
                 let Some(account_id) = slot.account_id() else {
                     continue;
                 };
+                // Prefer the better service status, then the more recent
+                // observation. Two handles can resolve the SAME account (a local
+                // lane beside a vault lane, or two vault handles), and when both
+                // are serving stale data the newer snapshot is the one worth
+                // showing: comparing status alone leaves them tied, so the winner
+                // would be decided by handle order and could be arbitrarily older.
+                // That matters because usage only ever grows within a window, so
+                // the older snapshot always understates pressure — it can report a
+                // near-exhausted account as comfortable.
                 let should_replace = match candidates.get(account_id) {
-                    Some((_, current)) => service_rank(slot.status) < service_rank(current.status),
+                    Some((_, current)) => {
+                        let rank = service_rank(slot.status).cmp(&service_rank(current.status));
+                        rank.then_with(|| current.last_success_at.cmp(&slot.last_success_at))
+                            .is_lt()
+                    }
                     None => true,
                 };
                 if should_replace {
