@@ -392,14 +392,16 @@ impl UsageProvider for QwenCloudProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|error| match error {
-                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                    FetchError::NoSession(error.to_string())
-                }
-                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                    FetchError::Upstream(error.to_string())
-                }
-            })?;
+            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
+                .await
+                .map_err(|error| match error {
+                    CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                        FetchError::NoSession(error.to_string())
+                    }
+                    CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                        FetchError::Upstream(error.to_string())
+                    }
+                })?;
             if !jar.has_cookie_named(|name| name == "login_qwencloud_ticket") {
                 return Err(FetchError::NoSession(
                     "no Qwen Cloud login ticket in browser".to_string(),

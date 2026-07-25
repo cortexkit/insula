@@ -17,7 +17,7 @@ use crate::{
     http::{Header, JsonRequest},
     model::ProviderUsage,
     opencode::{
-        fetch_workspace_id, load_cookie_header, looks_signed_out, parse_windows, USER_AGENT,
+        fetch_workspace_id, load_cookie_header_async, looks_signed_out, parse_windows, USER_AGENT,
     },
     provider::{FetchError, UsageProvider},
 };
@@ -86,7 +86,7 @@ impl UsageProvider for OpenCodeGoProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let cookie = load_cookie_header()?;
+            let cookie = load_cookie_header_async().await?;
             let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
             let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
             let now = chrono::Utc::now().timestamp();

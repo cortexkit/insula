@@ -647,12 +647,23 @@ pub fn parse_windows(
 
 pub fn load_cookie_header() -> Result<String, FetchError> {
     let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(map_cookie_err)?;
-    if !has_session_cookie(&jar) {
+    cookie_header_from_jar(&jar)
+}
+
+pub async fn load_cookie_header_async() -> Result<String, FetchError> {
+    let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
+        .await
+        .map_err(map_cookie_err)?;
+    cookie_header_from_jar(&jar)
+}
+
+fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
+    if !has_session_cookie(jar) {
         return Err(FetchError::NoSession(
             "no opencode auth cookie in browser".to_string(),
         ));
     }
-    request_cookie_header(&jar).ok_or_else(|| {
+    request_cookie_header(jar).ok_or_else(|| {
         FetchError::NoSession("opencode auth cookies empty after filter".to_string())
     })
 }
@@ -698,7 +709,7 @@ impl UsageProvider for OpenCodeProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let cookie = load_cookie_header()?;
+            let cookie = load_cookie_header_async().await?;
             let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
             let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
             let now = Utc::now().timestamp();
