@@ -145,16 +145,33 @@ fn scan_message(bytes: &[u8], path: &[u64], scan: &mut Scan) {
                 i += 8;
             }
             2 => {
-                // length-delimited — recurse as a possible sub-message
+                // Length-delimited — recurse as a possible sub-message.
+                //
+                // The declared length comes off the wire and can be any u64, so
+                // every step to the end offset is checked. Casting it to usize and
+                // adding unchecked overflows the cursor: with overflow checks on
+                // that is an immediate panic, and without them the sum wraps to a
+                // value that passes the bounds test below and then panics on a
+                // backwards slice. Either way a malformed frame takes down the
+                // fetch, and because a fetch panic is classified non-transient it
+                // would clear a working provider's cached window and suppress it
+                // for the backoff — the provider would read as absent rather than
+                // degraded. A length we cannot honour is simply malformed input,
+                // so stop scanning and let the caller report a decode failure.
                 let Some(len) = read_varint(bytes, &mut i) else {
                     break;
                 };
-                let len = len as usize;
-                if i + len > bytes.len() {
+                let Ok(len) = usize::try_from(len) else {
+                    break;
+                };
+                let Some(end) = i.checked_add(len) else {
+                    break;
+                };
+                if end > bytes.len() {
                     break;
                 }
-                scan_message(&bytes[i..i + len], &field_path, scan);
-                i += len;
+                scan_message(&bytes[i..end], &field_path, scan);
+                i = end;
             }
             _ => break,
         }
@@ -828,5 +845,44 @@ mod tests {
             crate::refresh::classify(&normalize_usage(&[]).unwrap_err()),
             crate::refresh::FetchClass::Transient
         );
+    }
+
+    #[test]
+    fn oversized_length_varint_decodes_rather_than_panicking() {
+        // A length-delimited field whose declared length is u64::MAX. Adding it to
+        // the scan cursor unchecked panics on overflow when overflow checks are on,
+        // and without them the sum wraps past the bounds test and panics on a
+        // backwards slice — so this input took the fetch down in both profiles.
+        // That matters beyond the crash: a fetch panic is classified non-transient,
+        // so a working provider would lose its cached window and read as absent
+        // rather than degraded.
+        let body: Vec<u8> = vec![
+            // frame header: flags 0, length 11
+            0x00, 0x00, 0x00, 0x00, 0x0b, // field 1, wire type 2
+            0x0a, // 10-byte varint = u64::MAX
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ];
+        // Pin the frame length. An edit that miscounts these bytes makes the
+        // declared length exceed the buffer, so the frame is rejected before the
+        // scanner ever runs and the test passes without exercising anything.
+        assert_eq!(body.len(), 16, "frame must be exactly 16 bytes");
+        assert!(
+            matches!(normalize_usage(&body), Err(FetchError::Decode(_))),
+            "an unusable declared length is malformed input, not a transient edge \
+             condition: it recurs on every fetch, so it must degrade with a reason"
+        );
+    }
+
+    #[test]
+    fn declared_length_past_the_buffer_decodes_rather_than_panicking() {
+        // The neighbouring input class: a length that fits in usize but overruns
+        // the remaining bytes. Same handling, no separate code path.
+        let body: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x00,
+            0x03, // field 1, wire type 2, declaring 200 bytes in a 2-byte payload
+            0x0a, 0xc8, 0x01,
+        ];
+        assert_eq!(body.len(), 8, "frame must be exactly 8 bytes");
+        assert!(matches!(normalize_usage(&body), Err(FetchError::Decode(_))));
     }
 }
