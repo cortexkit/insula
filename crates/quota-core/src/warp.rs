@@ -23,7 +23,7 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
@@ -47,6 +47,8 @@ const USER_AGENT: &str = "Warp/1.0";
 const OS_CATEGORY: &str = "macOS";
 const OS_NAME: &str = "macOS";
 const OS_VERSION: &str = "1.0.0";
+const MAX_GRAPHQL_ERROR_MESSAGES: usize = 3;
+const MAX_GRAPHQL_ERROR_SUMMARY_BYTES: usize = 512;
 
 const GRAPHQL_QUERY: &str = "query GetRequestLimitInfo($requestContext: RequestContext!) { \
 user(requestContext: $requestContext) { __typename ... on UserOutput { user { \
@@ -55,6 +57,7 @@ requestLimitInfo { isUnlimited nextRefreshTime requestLimit requestsUsedSinceLas
 #[derive(Debug, Deserialize)]
 struct GraphQlResponse {
     data: Option<DataField>,
+    errors: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,8 @@ struct DataField {
 
 #[derive(Debug, Deserialize)]
 struct UserOutput {
+    #[serde(rename = "__typename")]
+    type_name: Option<String>,
     user: Option<InnerUser>,
 }
 
@@ -85,40 +90,104 @@ struct RequestLimitInfo {
     requests_used: Option<f64>,
 }
 
+fn graph_ql_error_message(value: &Value) -> Option<&str> {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+}
+
+fn graph_ql_error_summary(errors: &[Value]) -> String {
+    let mut summary = errors
+        .iter()
+        .filter_map(graph_ql_error_message)
+        .take(MAX_GRAPHQL_ERROR_MESSAGES)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.is_empty() {
+        summary = "GraphQL request failed".to_string();
+    }
+    if summary.len() > MAX_GRAPHQL_ERROR_SUMMARY_BYTES {
+        let budget = MAX_GRAPHQL_ERROR_SUMMARY_BYTES.saturating_sub('…'.len_utf8());
+        let end = crate::text::floor_char_boundary(&summary, budget);
+        summary.truncate(end);
+        summary.push('…');
+    }
+    summary
+}
+
 /// Normalize the GraphQL body to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: GraphQlResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("warp response not decodable: {e}")))?;
-    let info = response
-        .data
-        .and_then(|d| d.user)
-        .and_then(|u| u.user)
-        .and_then(|u| u.request_limit_info);
 
-    let primary = info.and_then(|info| {
-        if info.is_unlimited == Some(true) {
-            // Unlimited plan: 0% used, no reset window.
-            return Some(RateWindow {
-                used_percent: 0.0,
-                raw_used_percent: None,
-                resets_at: None,
-                window_minutes: None,
-                used_count: None,
-                total_count: None,
-            });
-        }
-        let limit = info.request_limit.filter(|l| *l > 0.0)?;
-        let used = info.requests_used.unwrap_or(0.0);
-        let resets_at = info.next_refresh_time?;
+    // HTTP 200 GraphQL errors and missing required links are real provider answers,
+    // not transport flaps. Classify them as Decode so recurring failures degrade
+    // with a visible reason; only an endpoint that returned no body is transient.
+    if let Some(errors) = response
+        .errors
+        .as_deref()
+        .filter(|errors| !errors.is_empty())
+    {
+        return Err(FetchError::Decode(format!(
+            "warp GraphQL request failed: {}",
+            graph_ql_error_summary(errors)
+        )));
+    }
+
+    let data = response
+        .data
+        .ok_or_else(|| FetchError::Decode("warp response missing data".to_string()))?;
+    let user = data
+        .user
+        .ok_or_else(|| FetchError::Decode("warp response missing data.user".to_string()))?;
+    let type_name = user
+        .type_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let inner_user = user.user.ok_or_else(|| {
+        let type_detail = type_name
+            .filter(|name| *name != "UserOutput")
+            .map(|name| format!("; unexpected data.user.__typename {name:?}"))
+            .unwrap_or_default();
+        FetchError::Decode(format!("warp response missing data.user.user{type_detail}"))
+    })?;
+    let info = inner_user.request_limit_info.ok_or_else(|| {
+        FetchError::Decode("warp response missing data.user.user.requestLimitInfo".to_string())
+    })?;
+
+    let primary = if info.is_unlimited == Some(true) {
+        // Unlimited plan: 0% used, no reset window.
         Some(RateWindow {
-            used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
+            used_percent: 0.0,
             raw_used_percent: None,
-            resets_at: Some(resets_at),
+            resets_at: None,
             window_minutes: None,
             used_count: None,
             total_count: None,
         })
-    });
+    } else {
+        match (
+            info.request_limit.filter(|limit| *limit > 0.0),
+            info.next_refresh_time,
+        ) {
+            (Some(limit), Some(resets_at)) => {
+                let used = info.requests_used.unwrap_or(0.0);
+                Some(RateWindow {
+                    used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
+                    raw_used_percent: None,
+                    resets_at: Some(resets_at),
+                    window_minutes: None,
+                    used_count: None,
+                    total_count: None,
+                })
+            }
+            _ => None,
+        }
+    };
 
     Ok(Usage {
         primary,
@@ -200,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_request_limit_info() {
+    fn well_formed_metered_response_remains_unchanged() {
         // Shaped like the real GraphQL response.
         let body = br#"{
             "data": { "user": { "__typename": "UserOutput", "user": {
@@ -217,6 +286,9 @@ mod tests {
         assert_eq!(primary.used_percent, 20.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
         assert_eq!(primary.window_minutes, None);
+        assert!(usage.secondary.is_none());
+        assert!(usage.tertiary.is_none());
+        assert!(usage.extra_rate_windows.is_none());
     }
 
     #[test]
@@ -230,8 +302,88 @@ mod tests {
     }
 
     #[test]
-    fn missing_user_yields_no_window() {
+    fn missing_data_user_is_a_decode_error() {
         let body = br#"{ "data": { "user": null } }"#;
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+        let error = normalize_usage(body).unwrap_err();
+        match error {
+            FetchError::Decode(message) => assert!(
+                message.contains("data.user"),
+                "missing-link error was opaque: {message}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphql_errors_are_decode_errors_with_provider_message() {
+        let body = br#"{
+            "errors": [{"message": "failed to resolve requestLimitInfo"}],
+            "data": null
+        }"#;
+        let error = normalize_usage(body).unwrap_err();
+        match error {
+            FetchError::Decode(message) => assert!(
+                message.contains("failed to resolve requestLimitInfo"),
+                "provider error text was lost: {message}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_missing_required_graphql_link_is_named() {
+        let cases: &[(&[u8], &str)] = &[
+            (br#"{}"#, "data"),
+            (
+                br#"{ "data": { "user": { "__typename": "UserOutput", "user": null } } }"#,
+                "data.user.user",
+            ),
+            (
+                br#"{ "data": { "user": { "user": {} } } }"#,
+                "data.user.user.requestLimitInfo",
+            ),
+        ];
+
+        for (body, missing_link) in cases {
+            let error = normalize_usage(body).unwrap_err();
+            match error {
+                FetchError::Decode(message) => assert!(
+                    message.contains(missing_link),
+                    "missing-link error did not name {missing_link}: {message}"
+                ),
+                other => panic!("expected Decode for {missing_link}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn graphql_error_summary_is_bounded_and_caps_message_count() {
+        let four_messages = serde_json::to_vec(&json!({
+            "errors": [
+                {"message": "first"},
+                {"message": "second"},
+                {"message": "third"},
+                {"message": "fourth"}
+            ],
+            "data": null
+        }))
+        .unwrap();
+        let FetchError::Decode(message) = normalize_usage(&four_messages).unwrap_err() else {
+            panic!("expected Decode");
+        };
+        assert!(message.contains("first | second | third"));
+        assert!(!message.contains("fourth"));
+
+        let long_message = "é".repeat(MAX_GRAPHQL_ERROR_SUMMARY_BYTES);
+        let oversized = serde_json::to_vec(&json!({
+            "errors": [{"message": long_message}],
+            "data": null
+        }))
+        .unwrap();
+        let FetchError::Decode(message) = normalize_usage(&oversized).unwrap_err() else {
+            panic!("expected Decode");
+        };
+        assert!(message.len() <= MAX_GRAPHQL_ERROR_SUMMARY_BYTES + 40);
+        assert!(message.ends_with('…'));
     }
 }
