@@ -166,21 +166,29 @@ pub fn parse_workspace_ids(text: &str) -> Vec<String> {
     ids
 }
 
+/// Scan a raw response for `wrk_...` identifiers.
+///
+/// The cursor walks one BYTE at a time, so every comparison and slice here must
+/// be byte-based: a workspace name is user-chosen, so the response can carry any
+/// UTF-8, and slicing the `&str` at a cursor that has landed inside a multibyte
+/// scalar panics. The matched id itself is always ASCII (`wrk_` plus alphanumerics
+/// and underscores), so it is safe to build from bytes.
 fn scan_wrk_ids(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let needle = "wrk_";
+    let needle = b"wrk_";
     let bytes = text.as_bytes();
     let mut i = 0;
     while i + needle.len() < bytes.len() {
-        if text[i..].starts_with(needle) {
+        if bytes[i..].starts_with(needle) {
             let start = i;
             i += needle.len();
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            let id = &text[start..i];
-            if id.len() > 4 && !out.contains(&id.to_string()) {
-                out.push(id.to_string());
+            // ASCII by construction, so this is a lossless conversion.
+            let id = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+            if id.len() > 4 && !out.contains(&id) {
+                out.push(id);
             }
         } else {
             i += 1;
@@ -823,6 +831,19 @@ mod tests {
     #[test]
     fn parse_workspace_ids_from_serialized() {
         let text = r#"id:"wrk_abc123xyz",name:"Main""#;
+        let ids = parse_workspace_ids(text);
+        assert_eq!(ids, vec!["wrk_abc123xyz"]);
+    }
+
+    #[test]
+    fn parse_workspace_ids_handles_multibyte_names() {
+        // A workspace name is user-chosen, so the response can contain any
+        // UTF-8. Scanning must use byte comparisons, because slicing a &str at
+        // an arbitrary byte offset panics if the offset lands inside a multibyte
+        // character. The refresher contains such a panic rather than crashing,
+        // but records it as a permanent provider failure, which discards the
+        // usage figures cached from the last successful fetch.
+        let text = "{\"name\":\"Café 中文 😀\",\"id\":\"wrk_abc123xyz\"}";
         let ids = parse_workspace_ids(text);
         assert_eq!(ids, vec!["wrk_abc123xyz"]);
     }
