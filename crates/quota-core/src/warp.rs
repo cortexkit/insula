@@ -170,23 +170,24 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             total_count: None,
         })
     } else {
-        match (
-            info.request_limit.filter(|limit| *limit > 0.0),
-            info.next_refresh_time,
-        ) {
-            (Some(limit), Some(resets_at)) => {
+        // The percent is the load-bearing field: a window is emitted from the
+        // limit alone, and the reset is carried through when present and omitted
+        // when absent rather than being fabricated. A metered plan that reports
+        // its limit but not its next refresh still has real usage to report, and
+        // dropping the window would make a used-up plan read as no signal.
+        info.request_limit
+            .filter(|limit| *limit > 0.0)
+            .map(|limit| {
                 let used = info.requests_used.unwrap_or(0.0);
-                Some(RateWindow {
+                RateWindow {
                     used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
                     raw_used_percent: None,
-                    resets_at: Some(resets_at),
+                    resets_at: info.next_refresh_time,
                     window_minutes: None,
                     used_count: None,
                     total_count: None,
-                })
-            }
-            _ => None,
-        }
+                }
+            })
     };
 
     Ok(Usage {
@@ -312,6 +313,32 @@ mod tests {
             ),
             other => panic!("expected Decode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn metered_window_without_a_refresh_time_still_reports_its_percent() {
+        // The percent is load-bearing and the reset is optional: a plan that
+        // reports its limit but not its next refresh still has real usage. The
+        // dangerous direction is a used-up plan vanishing, so this pins the 100%
+        // case specifically.
+        let body = br#"{
+            "data": { "user": { "__typename": "UserOutput", "user": {
+              "requestLimitInfo": {
+                "isUnlimited": false,
+                "requestLimit": 250,
+                "requestsUsedSinceLastRefresh": 250
+              }
+            } } }
+        }"#;
+        let primary = normalize_usage(body)
+            .expect("a limit without a reset is still a usable window")
+            .primary
+            .expect("window must survive an absent refresh time");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(
+            primary.resets_at, None,
+            "an absent reset is carried as absent, never fabricated"
+        );
     }
 
     #[test]
