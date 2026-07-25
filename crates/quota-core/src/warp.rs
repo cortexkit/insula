@@ -98,7 +98,14 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let primary = info.and_then(|info| {
         if info.is_unlimited == Some(true) {
             // Unlimited plan: 0% used, no reset window.
-            return None;
+            return Some(RateWindow {
+                used_percent: 0.0,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: None,
+                used_count: None,
+                total_count: None,
+            });
         }
         let limit = info.request_limit.filter(|l| *l > 0.0)?;
         let used = info.requests_used.unwrap_or(0.0);
@@ -213,11 +220,13 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_plan_has_no_window() {
+    fn unlimited_plan_emits_zero_percent_window_without_reset() {
         let body = br#"{ "data": { "user": { "user": { "requestLimitInfo": {
             "isUnlimited": true, "requestLimit": 0, "requestsUsedSinceLastRefresh": 0
         } } } } }"#;
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+        let primary = normalize_usage(body).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 0.0);
+        assert!(primary.resets_at.is_none());
     }
 
     #[test]
