@@ -276,6 +276,19 @@ fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchErr
         });
     }
 
+    // Buckets were present but every one was unusable. Returning Ok here would
+    // publish a window-less entry as a SUCCESS, and a successful fetch is stored
+    // fresh — so it would replace whatever good windows the provider had and
+    // report it healthy while consumers saw no quota signal at all. A degraded
+    // entry carries a reason and a transient failure keeps serving the last good
+    // window; an empty success does neither. Rejecting costs nothing here, since
+    // there is no window to lose.
+    if primary.is_none() {
+        return Err(FetchError::Decode(
+            "gemini quota buckets carried no usable model fraction".to_string(),
+        ));
+    }
+
     Ok(Usage {
         primary: primary.map(|(_, _, window)| window),
         secondary: None,
@@ -1116,10 +1129,51 @@ mod tests {
 
     #[test]
     fn empty_buckets_is_decode_error() {
-        assert!(matches!(
-            normalize_quota(br#"{ "buckets": [] }"#),
-            Err(FetchError::Decode(_))
-        ));
+        let error = normalize_quota(br#"{ "buckets": [] }"#).unwrap_err();
+        match error {
+            FetchError::Decode(message) => assert!(
+                message.contains("no buckets"),
+                "an absent bucket list must stay distinguishable from a present but \
+                 unusable one: {message}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buckets_present_but_all_unusable_is_a_decode_error() {
+        // A syntactically valid 2xx whose only bucket carries no remainingFraction.
+        // Returning Ok here would publish a window-less entry as a SUCCESS, which is
+        // stored fresh and REPLACES the provider's previously good windows while
+        // reporting it healthy — a silent outage rather than a visible failure.
+        let error =
+            normalize_quota(br#"{ "buckets": [ { "modelId": "gemini-2.5-pro" } ] }"#).unwrap_err();
+        match error {
+            FetchError::Decode(message) => assert!(
+                message.contains("no usable model fraction"),
+                "the all-unusable case must name itself, not reuse the empty-list \
+                 message: {message}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_partially_usable_bucket_list_still_succeeds() {
+        // The guard must reject only a WHOLLY unusable response. One good bucket
+        // beside a skipped one is a valid answer and must still emit its window,
+        // otherwise the fix would over-reject and break a working provider.
+        let body = br#"{ "buckets": [
+            { "modelId": "gemini-2.5-flash" },
+            { "modelId": "gemini-2.5-pro", "remainingFraction": 0.25 }
+        ] }"#;
+        let usage = normalize_quota(body).expect("one usable bucket is a valid response");
+        assert_eq!(usage.primary.expect("usable window").used_percent, 75.0);
+        let extras = usage
+            .extra_rate_windows
+            .expect("the usable bucket is named");
+        assert_eq!(extras.len(), 1, "the unusable bucket must not be emitted");
+        assert_eq!(extras[0].title.as_deref(), Some("gemini-2.5-pro"));
     }
 
     #[test]
