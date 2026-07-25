@@ -180,6 +180,26 @@ The cheap way to check either: delete the condition and see which tests redden.
 If the only failures are in tests named for something else, the condition is
 defended by accident and one refactor from being unguarded.
 
+### The grants this module makes
+
+This list exists so the check does not depend on remembering to run it. Every
+row is something the wire asserts that a consumer acts on. **If you add a field
+or a transform that asserts anything, add a row** — and if a row has no guard or
+no test naming that site, that is the finding.
+
+| the claim | where it is granted | what withholds it | test |
+|---|---|---|---|
+| relaxed `usedPercent` (0% while the provider reported more) | unlabeled emission | slot opted in **and** is fresh | yes, per site |
+| relaxed `usedPercent` | labeled emission | same | yes, per site |
+| `account` label (this usage belongs to that account) | unlabeled emission | identity not in flux | yes, per site |
+| `account` label | labeled emission | identity not in flux | yes, per site |
+| `fetchedAt` (the data was true at this time) | both | set only from a successful fetch, by construction | structural |
+| a healthy entry (`error` absent, `usage` present) | both | a fetch that returned windows | structural |
+
+Two of these rows were added *after* deleting the condition and finding nothing
+reddened. The table is the defence: a warning asks you to feel differently, a
+list asks you to check something.
+
 ## Testing these
 
 A regression for any of the above must fail *for the reason it names*. Five ways
