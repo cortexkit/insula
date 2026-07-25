@@ -527,10 +527,19 @@ fn try_parse_json_usage(text: &str, now_secs: i64, include_monthly: bool) -> Opt
     None
 }
 
+/// Bound one window's block at its closing brace, or at a fixed byte budget when
+/// the brace is missing.
+///
+/// That fallback is a BYTE budget and the response can carry user-chosen text
+/// (workspace and plan names), so it is rounded down to a character boundary
+/// before slicing — an offset landing inside a multibyte character would panic.
+/// The brace position needs no rounding, since a match is always on a boundary.
 fn window_block<'a>(text: &'a str, window_key: &str) -> Option<&'a str> {
     let pos = text.find(window_key)?;
     let slice = &text[pos..];
-    let end = slice.find('}').unwrap_or(slice.len().min(2500));
+    let end = slice
+        .find('}')
+        .unwrap_or_else(|| crate::text::floor_char_boundary(slice, slice.len().min(2500)));
     Some(&slice[..end])
 }
 
@@ -746,6 +755,29 @@ mod tests {
     "#;
 
     const SIGNED_OUT: &str = r#"{"error":"Please sign in to continue","login":true}"#;
+
+    #[test]
+    fn brace_less_block_with_a_multibyte_character_at_the_cap_does_not_panic() {
+        // window_block falls back to a fixed BYTE budget when no closing brace is
+        // found. The response carries user-chosen text (workspace and plan names),
+        // so a multibyte character can straddle that cutoff; slicing at the raw
+        // byte offset would panic, and a fetch panic is classified non-transient,
+        // which would make a working provider read as absent rather than degraded.
+        let mut text = String::from("rollingUsage");
+        text.push_str(&"a".repeat(2500 - "rollingUsage".len() - 1));
+        text.push('\u{e9}'); // straddles the 2500-byte fallback cap
+        text.push_str("trailing");
+        assert!(
+            !text.contains('}'),
+            "the fallback path requires a brace-less block"
+        );
+
+        let block = window_block(&text, "rollingUsage").expect("block is present");
+        assert!(
+            block.len() < 2500,
+            "the cap must round back off the split character"
+        );
+    }
 
     #[test]
     fn parses_subscription_rolling_and_weekly() {

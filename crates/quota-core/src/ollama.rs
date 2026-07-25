@@ -63,6 +63,11 @@ const ALL_LABELS: &[&str] = &["Session usage", "Hourly usage", "Weekly usage"];
 
 /// Slice from just after `label` to the next other-label (or `MAX_BLOCK`), so a
 /// percent/reset is attributed to the right window (mirrors CodexBar's bounding).
+///
+/// `MAX_BLOCK` is a BYTE budget, and the page carries user-facing text that can
+/// hold any UTF-8, so the cutoff is rounded down to a character boundary before
+/// slicing. A label match is always on a boundary; only the fixed cap can land
+/// mid-character.
 fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
     let start = html.find(label)? + label.len();
     let tail = &html[start..];
@@ -73,7 +78,7 @@ fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
         .min()
         .unwrap_or(tail.len())
         .min(MAX_BLOCK);
-    Some(&tail[..end])
+    Some(&tail[..crate::text::floor_char_boundary(tail, end)])
 }
 
 /// Parse `N% used` (preferred) else `width: N%` from a block. Hand-scanned to avoid
@@ -474,6 +479,29 @@ mod tests {
             Some("2026-07-27T00:00:00Z"),
             "the timestamp describes the weekly reset, so it must ride the weekly \
              window — that horizon is what a blocked consumer waits on"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_character_straddling_the_block_cap_does_not_panic() {
+        // The block bound is a fixed BYTE budget, but the page carries user-facing
+        // text that can hold any UTF-8. When a multibyte character straddles that
+        // cutoff, slicing at the raw byte offset panics — and because a fetch panic
+        // is classified non-transient, a working provider would lose its cached
+        // window and read as absent rather than degraded. The percent sits before
+        // the cap, so it must still parse.
+        let mut html = String::from("Session usage");
+        html.push_str(" 42% used ");
+        let consumed = html.len() - "Session usage".len();
+        html.push_str(&"a".repeat(MAX_BLOCK - consumed - 1));
+        html.push('\u{e9}'); // straddles the cap: bytes (MAX_BLOCK - 1)..(MAX_BLOCK + 1)
+        html.push_str(" Weekly usage 50% used ");
+
+        let usage = normalize_usage(&html).expect("a valid page must still parse");
+        assert_eq!(
+            usage.primary.expect("session window").used_percent,
+            42.0,
+            "the percent precedes the cap, so truncation must not lose it"
         );
     }
 
