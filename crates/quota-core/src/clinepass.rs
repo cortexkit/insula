@@ -112,6 +112,23 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         }
     }
 
+    // The loop skips any limit whose type is not one of the three known windows,
+    // so a response can be well-formed and still yield nothing. Returning Ok in
+    // that case would publish a window-less entry as a SUCCESS, and a successful
+    // fetch is stored fresh — it would replace whatever good windows the provider
+    // had, reset its retry state, and report it healthy while consumers saw no
+    // quota signal. A degraded entry carries a reason and a transient failure
+    // keeps serving the last good window; an empty success does neither.
+    //
+    // Only the zero-output case is rejected: a response carrying one recognized
+    // window beside several unrecognized ones is still a usable answer, and the
+    // upstream type vocabulary is deliberately not validated.
+    if primary.is_none() && secondary.is_none() && tertiary.is_none() {
+        return Err(FetchError::Decode(
+            "clinepass limits carried no recognized window type".to_string(),
+        ));
+    }
+
     Ok(Usage {
         primary,
         secondary,
@@ -287,7 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn garbage_timestamp_on_unknown_type_is_ignored() {
+    fn only_unrecognized_limit_types_is_a_decode_error() {
+        // A well-formed response whose every limit is skipped. Returning Ok here
+        // would publish an empty entry as a success, which is stored fresh and
+        // replaces the provider's previously good windows while reporting it
+        // healthy — a silent outage rather than a visible failure. The garbage
+        // timestamp is incidental: it is never parsed, because the unrecognized
+        // type is skipped first.
         let body = br#"{
             "success": true,
             "data": {
@@ -301,9 +324,39 @@ mod tests {
             }
         }"#;
 
-        let usage = normalize_usage(body).unwrap();
-        assert!(usage.primary.is_none());
-        assert!(usage.secondary.is_none());
+        match normalize_usage(body).unwrap_err() {
+            FetchError::Decode(message) => assert!(
+                message.contains("no recognized window type"),
+                "the all-skipped case must name itself: {message}"
+            ),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_limit_list_is_a_decode_error() {
+        let body = br#"{ "success": true, "data": { "limits": [] } }"#;
+        assert!(matches!(normalize_usage(body), Err(FetchError::Decode(_))));
+    }
+
+    #[test]
+    fn one_recognized_window_beside_unrecognized_ones_still_succeeds() {
+        // The guard must reject only the zero-output case. A partially understood
+        // response is a usable answer, and rejecting it would break a working
+        // provider whenever the upstream adds a new limit kind.
+        let body = br#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "quarterly", "percentUsed": 10.0 },
+                    { "type": "weekly", "percentUsed": 60.0 }
+                ]
+            }
+        }"#;
+
+        let usage = normalize_usage(body).expect("one recognized window is a valid response");
+        assert!(usage.primary.is_none(), "no five_hour limit was reported");
+        assert_eq!(usage.secondary.expect("weekly window").used_percent, 60.0);
         assert!(usage.tertiary.is_none());
     }
 
