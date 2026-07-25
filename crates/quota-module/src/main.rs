@@ -353,6 +353,10 @@ async fn handle_control_request(
     send(writer, response).await
 }
 
+/// The git commit this binary was built from, stamped by `build.rs`. Falls back
+/// to "unknown" when the build could not resolve a repository.
+const BUILD_COMMIT: &str = env!("CK_QUOTA_BUILD_COMMIT");
+
 /// Map the core health snapshot onto the subc health-report wire shape. Status
 /// ladder: `failing` when the slot store is poisoned (a serving/refresher task
 /// panicked); `degraded` when the refresher loop is stalled (wedged/dead — its
@@ -387,6 +391,12 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         None
     };
     let metrics = json!({
+        // The commit this binary was built from. The module is supervised and
+        // long-lived, so the repository's HEAD says nothing about what is actually
+        // serving — a fix can be merged and green while an older binary still runs.
+        // Reporting it here makes "is the deployed build current?" answerable from
+        // the RUNNING process, which a file's modification time cannot establish.
+        "buildCommit": BUILD_COMMIT,
         "providersTotal": snapshot.providers_total,
         "fresh": snapshot.fresh,
         "stale": snapshot.stale,
