@@ -12,6 +12,8 @@ connects to subc (not an external binary) for its quota signal.
 
 See `docs/charter.md` for the mission and reverse-engineered contracts, and
 `docs/provider-matrix.md` for the full per-provider archetype/verification matrix.
+**Adding or changing a provider: read `docs/provider-invariants.md` first.** It lists
+the properties a normalizer must uphold, each recovered from a defect that shipped.
 
 ## What it serves
 
@@ -21,16 +23,22 @@ A subc `ManagementSurface` exposing one query operation, `usage.get`, which retu
 a silent-degraded entry carrying `error` when that provider has no usable session —
 a single provider's failure never fails the whole array.
 
-## Providers (v1: window-bearing)
+## Providers (window-bearing)
 
-19 providers are registered, each fetching a real rate/usage window:
+35 providers are registered, each fetching a real rate/usage window:
 
-`codex`, `claude`, `copilot`, `gemini`, `grok`, `jetbrains`, `doubao`, `elevenlabs`,
-`kimi`, `llmproxy`, `manus`, `minimax`, `stepfun`, `warp`, `synthetic`, `zai`,
-`kilo`, `alibaba`, `codebuff`.
+`codex`, `claude`, `antigravity`, `codebuff`, `copilot`, `cursor`, `doubao`,
+`elevenlabs`, `factory`, `gemini`, `grok`, `jetbrains`, `kimi`, `kimi-for-coding`,
+`clinepass`, `llmproxy`, `manus`, `mimo`, `minimax`, `neuralwatt`, `ollama`,
+`opencode`, `opencodego`, `qoder`, `qwen-cloud`, `sakana`, `stepfun`, `sub2api`,
+`warp`, `synthetic`, `zai`, `zenmux`, `kilo`, `alibaba`, `amp`.
+
+A provider may serve more than one account, so the served entry count exceeds the
+provider count.
 
 Verification (see each module's `VERIFICATION:` doc block):
-- **Live-verified** (real window proven through the wire): codex, claude, gemini, grok.
+- **Live-verified** (real window proven through the wire): codex, claude, gemini,
+  grok, ollama, antigravity.
 - **Hybrid**: jetbrains (file-read/parse/degrade proven on real disk; active-window
   mapping fixture-verified).
 - **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
