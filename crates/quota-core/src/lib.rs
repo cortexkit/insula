@@ -72,6 +72,21 @@ use refresh::{
 };
 use store::{SlotKey, SlotStore};
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_FETCHED_AT_FORMAT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn before_fetched_at_format() {
+    BEFORE_FETCHED_AT_FORMAT.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
 enum FetchOutcome {
     Attempt(Box<FetchAttempt>),
     TimedOut,
@@ -164,6 +179,15 @@ fn service_rank(status: SlotStatus) -> u8 {
         SlotStatus::Degraded => 2,
         SlotStatus::Pending => 3,
     }
+}
+
+fn wall_time_from_anchor(
+    (created_at, created_at_wall): &(Instant, chrono::DateTime<chrono::Utc>),
+    timestamp: Instant,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let elapsed =
+        chrono::Duration::from_std(timestamp.saturating_duration_since(*created_at)).ok()?;
+    created_at_wall.checked_add_signed(elapsed)
 }
 
 fn relax_usage_for_read(entry: &mut ProviderUsage) {
@@ -357,22 +381,23 @@ impl Registry {
     /// are collapsed. A label transition without successful usage remains
     /// unavailable.
     pub async fn get_usage(&self, provider_filter: Option<&str>) -> Vec<ProviderUsage> {
-        let mut snapshot = {
+        let (mut snapshot, wall_time_anchor) = {
             let store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut snapshot = store.snapshot();
-            for (_, slot) in &mut snapshot {
-                if let Some(entry) = slot.entry.as_mut() {
-                    entry.fetched_at = slot
-                        .last_success_at
-                        .and_then(|timestamp| store.wall_time(timestamp))
-                        .map(|timestamp| timestamp.to_rfc3339());
-                }
-            }
-            snapshot
+            (store.snapshot(), store.wall_time_anchor())
         };
+        for (_, slot) in &mut snapshot {
+            if let Some(entry) = slot.entry.as_mut() {
+                #[cfg(test)]
+                before_fetched_at_format();
+                entry.fetched_at = slot
+                    .last_success_at
+                    .and_then(|timestamp| wall_time_from_anchor(&wall_time_anchor, timestamp))
+                    .map(|timestamp| timestamp.to_rfc3339());
+            }
+        }
         let provider_index: HashMap<&str, usize> = self
             .providers
             .iter()

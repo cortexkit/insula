@@ -2214,6 +2214,30 @@ impl UsageProvider for TransientlyFailingRelaxProvider {
 }
 
 #[tokio::test]
+async fn timestamp_formatting_runs_after_store_unlock() {
+    let registry = Arc::new(registry(&[("format-lock", false, true)]));
+    tick(&registry).await;
+    let hook_ran = Arc::new(AtomicBool::new(false));
+
+    BEFORE_FETCHED_AT_FORMAT.with(|hook| {
+        let registry = Arc::clone(&registry);
+        let hook_ran = Arc::clone(&hook_ran);
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                registry.store.try_lock().is_ok(),
+                "store lock held during fetched_at formatting"
+            );
+            hook_ran.store(true, Ordering::SeqCst);
+        }));
+    });
+
+    let usage = registry.get_usage(Some("format-lock")).await;
+    assert_eq!(usage.len(), 1);
+    assert!(hook_ran.load(Ordering::SeqCst));
+    BEFORE_FETCHED_AT_FORMAT.with(|hook| *hook.borrow_mut() = None);
+}
+
+#[tokio::test]
 async fn fetched_at_is_stable_for_fresh_and_stale_slot_entries() {
     let registry = Registry::new(vec![Box::new(TransientlyFailingRelaxProvider {
         calls: AtomicUsize::new(0),
