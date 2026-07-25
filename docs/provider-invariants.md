@@ -158,6 +158,19 @@ Two habits follow, both of which this codebase needed:
   nothing about the other, and the temptation to guard once and call the class
   closed is strongest right after finding the first gap.
 
+The read path has two emission branches — one for entries carrying an account
+label, one for entries without — so **every guard in it exists twice**. Both
+grants found so far were guarded at one branch and tested only there: the
+relaxation, and the account label itself, which asserts that this usage belongs
+to that account and is the most expensive claim in the module to get wrong.
+
+In both cases the tested branch was the simpler one. That is not chance: the
+simple path is easier to write a test for, so it attracts the test, while the
+richer path carries more information and therefore more consequence. When
+reading either branch, diff it against its twin rather than reading it alone —
+any condition present in one and absent in the other is either a deliberate
+difference worth a comment or a gap.
+
 The cheap way to check either: delete the condition and see which tests redden.
 If the only failures are in tests named for something else, the condition is
 defended by accident and one refactor from being unguarded.
