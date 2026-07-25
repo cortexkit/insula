@@ -29,6 +29,28 @@ impl SlotKey {
     }
 }
 
+/// Successful handle enumerations indexed before acquiring the store mutex.
+pub(crate) struct AuthoritativeHandles<'a> {
+    ordered: Vec<(&'a str, &'a [CredentialHandle])>,
+    by_provider: HashMap<&'a str, HashSet<&'a CredentialHandle>>,
+}
+
+impl<'a> AuthoritativeHandles<'a> {
+    pub(crate) fn new(
+        providers: impl IntoIterator<Item = (&'a str, &'a [CredentialHandle])>,
+    ) -> Self {
+        let ordered: Vec<_> = providers.into_iter().collect();
+        let by_provider = ordered
+            .iter()
+            .map(|(provider, handles)| (*provider, handles.iter().collect()))
+            .collect();
+        Self {
+            ordered,
+            by_provider,
+        }
+    }
+}
+
 /// Refresher state protected by [`Registry`](crate::Registry)'s mutex.
 pub struct SlotStore {
     slots: HashMap<SlotKey, ProviderSlot>,
@@ -58,6 +80,29 @@ impl SlotStore {
         self.slots
             .retain(|key, _| key.provider != provider || active.contains(&key.handle));
 
+        self.insert_missing(provider, handles, now);
+    }
+
+    /// Apply every successful provider enumeration with one store-wide retain pass.
+    pub(crate) fn reconcile_batch(
+        &mut self,
+        authoritative: &AuthoritativeHandles<'_>,
+        now: Instant,
+    ) {
+        self.slots.retain(|key, _| {
+            let Some(active) = authoritative.by_provider.get(key.provider.as_str()) else {
+                // An absent provider failed enumeration, so its last-known slots remain active.
+                return true;
+            };
+            active.contains(&key.handle)
+        });
+
+        for (provider, handles) in &authoritative.ordered {
+            self.insert_missing(provider, handles, now);
+        }
+    }
+
+    fn insert_missing(&mut self, provider: &str, handles: &[CredentialHandle], now: Instant) {
         for handle in handles {
             let key = SlotKey::new(provider, handle.clone());
             if self.slots.contains_key(&key) {
@@ -143,6 +188,51 @@ impl SlotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_reconciliation_preserves_slots_for_failed_providers() {
+        let now = Instant::now();
+        let a_old = CredentialHandle::new("A-old");
+        let a_new = CredentialHandle::new("A-new");
+        let b_handles = [CredentialHandle::new("B1"), CredentialHandle::new("B2")];
+        let mut store = SlotStore::new(now);
+        store.reconcile("a", std::slice::from_ref(&a_old), now);
+        store.reconcile("b", &b_handles, now);
+
+        for handle in &b_handles {
+            let key = SlotKey::new("b", handle.clone());
+            store.slots.get_mut(&key).unwrap().entry = Some(crate::model::ProviderUsage {
+                provider: "b".to_string(),
+                api_provider: None,
+                account: Some(handle.stable_id().to_string()),
+                source: Some("cached".to_string()),
+                account_info: None,
+                fetched_at: None,
+                saved_resets: None,
+                usage: Some(crate::model::Usage::default()),
+                error: None,
+            });
+        }
+        let b_before: Vec<_> = b_handles
+            .iter()
+            .map(|handle| {
+                let slot = store.get(&SlotKey::new("b", handle.clone())).unwrap();
+                (slot.incarnation, slot.entry.clone())
+            })
+            .collect();
+
+        let a_handles = [a_new.clone()];
+        let authoritative = AuthoritativeHandles::new([("a", a_handles.as_slice())]);
+        store.reconcile_batch(&authoritative, now);
+
+        assert!(store.get(&SlotKey::new("a", a_old)).is_none());
+        assert!(store.get(&SlotKey::new("a", a_new)).is_some());
+        for (handle, (incarnation, entry)) in b_handles.iter().zip(b_before) {
+            let slot = store.get(&SlotKey::new("b", handle.clone())).unwrap();
+            assert_eq!(slot.incarnation, incarnation);
+            assert_eq!(slot.entry, entry);
+        }
+    }
 
     #[test]
     fn remove_and_readd_assigns_a_new_incarnation() {

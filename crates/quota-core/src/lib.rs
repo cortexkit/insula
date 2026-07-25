@@ -70,7 +70,7 @@ use refresh::{
     next_slot_after_attempt, next_slot_after_unverified_failure, AttemptSequence, Incarnation,
     ProviderSlot, SlotStatus, STALL_HORIZON,
 };
-use store::{SlotKey, SlotStore};
+use store::{AuthoritativeHandles, SlotKey, SlotStore};
 
 #[cfg(test)]
 thread_local! {
@@ -535,16 +535,20 @@ impl Registry {
             })
             .collect();
 
+        let authoritative =
+            AuthoritativeHandles::new(self.providers.iter().zip(enumerated.iter()).filter_map(
+                |(provider, handles)| {
+                    handles
+                        .as_deref()
+                        .map(|handles| (provider.name.as_str(), handles))
+                },
+            ));
         let snapshot = {
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (provider, handles) in self.providers.iter().zip(enumerated.iter()) {
-                if let Some(handles) = handles {
-                    store.reconcile(&provider.name, handles, turn_start);
-                }
-            }
+            store.reconcile_batch(&authoritative, turn_start);
             store.mark_tick(turn_start);
             store.snapshot()
         };
