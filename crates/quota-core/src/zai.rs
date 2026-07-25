@@ -57,7 +57,7 @@ struct ZaiLimitRaw {
 struct ValidLimit {
     used_percent: f64,
     window_minutes: Option<i64>,
-    resets_at: String,
+    resets_at: Option<String>,
 }
 
 struct ZaiTeamContext {
@@ -160,13 +160,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         if limit.limit_type != "TOKENS_LIMIT" && limit.limit_type != "TIME_LIMIT" {
             continue;
         }
-        let resets_at = match limit
+        let resets_at = limit
             .next_reset_time
-            .and_then(|ms| env::epoch_to_iso8601(ms / 1000))
-        {
-            Some(r) => r,
-            None => continue, // Drop the window if no nextResetTime
-        };
+            .and_then(|ms| env::epoch_to_iso8601(ms / 1000));
         let used_percent = get_used_percent(
             limit.usage,
             limit.remaining,
@@ -207,7 +203,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .map(|limit| RateWindow {
             used_percent: limit.used_percent,
             raw_used_percent: None,
-            resets_at: Some(limit.resets_at),
+            resets_at: limit.resets_at,
             window_minutes: limit.window_minutes,
             used_count: None,
             total_count: None,
@@ -217,7 +213,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         time_limit.map(|limit| RateWindow {
             used_percent: limit.used_percent,
             raw_used_percent: None,
-            resets_at: Some(limit.resets_at),
+            resets_at: limit.resets_at,
             window_minutes: limit.window_minutes,
             used_count: None,
             total_count: None,
@@ -229,7 +225,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let tertiary = session_token_limit.map(|limit| RateWindow {
         used_percent: limit.used_percent,
         raw_used_percent: None,
-        resets_at: Some(limit.resets_at),
+        resets_at: limit.resets_at,
         window_minutes: limit.window_minutes,
         used_count: None,
         total_count: None,
@@ -564,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_drops_window() {
+    fn missing_reset_keeps_the_window() {
         let body = br#"{
             "code": 200,
             "msg": "success",
@@ -585,7 +581,36 @@ mod tests {
             }
         }"#;
         let usage = normalize_usage(body).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 20.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn exhausted_time_limit_without_reset_is_reported() {
+        let body = br#"{
+            "code": 200,
+            "msg": "success",
+            "success": true,
+            "data": {
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "usage": 100,
+                        "currentValue": 100,
+                        "remaining": 0,
+                        "percentage": 100,
+                        "nextResetTime": null
+                    }
+                ]
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]
