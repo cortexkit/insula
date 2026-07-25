@@ -3023,3 +3023,79 @@ async fn a_provider_that_resolves_no_handle_is_named_rather_than_skipped() {
         "it still counts in the total, which is why its absence must be reported"
     );
 }
+
+#[tokio::test]
+async fn an_ineligible_slot_is_served_raw_even_when_fresh() {
+    // The relaxation transform GRANTS a capacity claim: it reports 0% used while
+    // the provider actually reported far more, so that a router treats the account
+    // as having room. Two conditions must BOTH hold before that claim is made —
+    // the slot opted in, and it is fresh.
+    //
+    // This pins the opt-in half directly. The freshness half has its own test, but
+    // dropping the eligibility check reddened only unrelated happy-path tests,
+    // which means the condition was defended by accident rather than on purpose.
+    // A grant that is only incidentally guarded is one refactor away from being
+    // handed out unearned, and the failure is silent: the wire would assert spare
+    // capacity that does not exist.
+    let registry = Registry::new(vec![Box::new(RelaxingProvider {
+        name: "never-opted-in",
+        eligible: false,
+        usage: full_usage(88.0),
+    })]);
+    tick(&registry).await;
+
+    let entries = registry.get_usage(Some("never-opted-in")).await;
+    let primary = entries[0]
+        .usage
+        .as_ref()
+        .expect("a healthy window")
+        .primary
+        .as_ref()
+        .expect("primary window");
+
+    assert_eq!(
+        primary.used_percent, 88.0,
+        "a slot that never opted in must be served exactly as the provider reported"
+    );
+    assert_eq!(
+        primary.raw_used_percent, None,
+        "the raw annotation marks a relaxed window, so an untransformed one must \
+         not carry it"
+    );
+}
+
+struct LabeledIneligibleProvider;
+
+#[async_trait]
+impl UsageProvider for LabeledIneligibleProvider {
+    fn name(&self) -> &str {
+        "codex-labeled-ineligible"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(observed(Some("codex-account")), "test", full_usage(73.0))
+    }
+}
+
+#[tokio::test]
+async fn an_ineligible_labeled_slot_is_served_raw() {
+    // The labeled path is where banked resets actually operate, since arming
+    // requires a resolved account. It has a test proving it DOES relax when the
+    // slot opted in; this pins the other side, that it does not otherwise.
+    //
+    // Both emission paths grant the same claim and each needs its own guard: a
+    // test on one says nothing about the other, and the labeled branch is the one
+    // that matters most, because a router reads a labeled entry as a specific
+    // account's spare capacity.
+    let registry = Registry::new(vec![Box::new(LabeledIneligibleProvider)]);
+    tick(&registry).await;
+
+    let served = registry.get_usage(Some("codex-labeled-ineligible")).await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].account.as_deref(), Some("codex-account"));
+    assert_eq!(
+        primary_percent(&served[0]),
+        73.0,
+        "a labeled slot that never opted in must report the provider's own number"
+    );
+}
