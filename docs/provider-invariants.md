@@ -134,6 +134,34 @@ usage. Two traps:
   an account. A lane that cannot resolve identity therefore suppresses the
   accounts that can.
 
+## A grant needs a guard at every site that makes it
+
+Most checks in this codebase *refuse* something: a malformed payload, an
+unusable credential, an unverifiable identity. A refusal is an outcome someone
+writes a test for, because it is visibly an outcome.
+
+The read-time banked-reset relaxation does the opposite — it **grants** a claim.
+It reports `usedPercent: 0` while the provider reported far more, so a consumer
+treats the account as having room. The read still succeeds and nothing errors,
+so it reads as a happy path and attracts no rejection vector. When the grant is
+unearned, the wire asserts spare capacity that does not exist, in the permissive
+direction, and nothing downstream can tell.
+
+Two habits follow, both of which this codebase needed:
+
+- **Read what the nearest guard asserts, rather than noting that a guard
+  exists.** A test asserting `!slot.relax_eligible` checks that the flag is not
+  *set*; it never checks that an unset flag is not *honoured*. Those look like
+  the same check and only one of them is one.
+- **Guard every site that applies the grant.** The relaxation transform runs at
+  two separate emission sites, unlabeled and labeled. A test covering one says
+  nothing about the other, and the temptation to guard once and call the class
+  closed is strongest right after finding the first gap.
+
+The cheap way to check either: delete the condition and see which tests redden.
+If the only failures are in tests named for something else, the condition is
+defended by accident and one refactor from being unguarded.
+
 ## Testing these
 
 A regression for any of the above must fail *for the reason it names*. Five ways
