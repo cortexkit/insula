@@ -153,6 +153,11 @@ Two habits follow, both of which this codebase needed:
   exists.** A test asserting `!slot.relax_eligible` checks that the flag is not
   *set*; it never checks that an unset flag is not *honoured*. Those look like
   the same check and only one of them is one.
+- **Ask whether the condition is tested *at this site*, not whether it is
+  tested.** Where a guard exists twice, a search for "is there a test for this"
+  returns yes, correctly, and the answer is useless — the named test exists and
+  is attached to the other branch. The first question has a misleading true
+  answer whenever a twin exists.
 - **Guard every site that applies the grant.** The relaxation transform runs at
   two separate emission sites, unlabeled and labeled. A test covering one says
   nothing about the other, and the temptation to guard once and call the class
