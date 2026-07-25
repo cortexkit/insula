@@ -269,10 +269,18 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
         if let Some(access) = tokens.access_token.as_deref().filter(|t| !t.is_empty()) {
             return Ok(CodexCredentials {
                 bearer: access.to_string(),
+                // The explicit field duplicates a claim the access token already
+                // carries, so fall back to the token when it is absent. Losing the
+                // identity is not cosmetic: it disarms account-scoped banked resets,
+                // and because the read path emits a single unlabeled entry unless
+                // EVERY handle resolves an account, one identity-less lane collapses
+                // all of this provider's accounts into one row. The vault path
+                // already resolves identity this way.
                 account_id: tokens
                     .account_id
                     .clone()
-                    .filter(|account_id| !account_id.is_empty()),
+                    .filter(|account_id| !account_id.is_empty())
+                    .or_else(|| chatgpt_account_id(access)),
                 email: tokens.id_token.as_deref().and_then(id_token_email),
                 is_oauth: true,
             });
@@ -1442,6 +1450,46 @@ mod tests {
         let creds = parse_credentials(raw).unwrap();
         assert_eq!(creds.bearer, "oauth-wins");
         assert_eq!(creds.account_id.as_deref(), Some("acct-1"));
+        assert!(creds.is_oauth);
+    }
+
+    #[test]
+    fn local_account_id_falls_back_to_the_access_token_claim() {
+        // auth.json's account_id duplicates a claim the access token already
+        // carries, and it is not guaranteed to be written. Losing the identity
+        // disarms account-scoped banked resets, and because the read path emits a
+        // single unlabeled entry unless EVERY handle resolves an account, one
+        // identity-less lane collapses all Codex accounts into one row.
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-from-jwt"}}"#);
+        let raw = format!(r#"{{ "tokens": {{ "access_token": "hdr.{claims}.sig" }} }}"#);
+
+        let creds = parse_credentials(raw.as_bytes()).unwrap();
+        assert_eq!(creds.account_id.as_deref(), Some("acct-from-jwt"));
+        assert!(creds.is_oauth);
+    }
+
+    #[test]
+    fn an_explicit_local_account_id_wins_over_the_token_claim() {
+        // The fallback must not override an explicit value: the file is the
+        // authority when it states one, and a token can outlive a re-login.
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-from-jwt"}}"#);
+        let raw = format!(
+            r#"{{ "tokens": {{ "access_token": "hdr.{claims}.sig", "account_id": "acct-explicit" }} }}"#
+        );
+
+        let creds = parse_credentials(raw.as_bytes()).unwrap();
+        assert_eq!(creds.account_id.as_deref(), Some("acct-explicit"));
+    }
+
+    #[test]
+    fn an_opaque_local_token_still_resolves_no_account() {
+        // A token carrying no claim must stay None rather than acquiring a
+        // fabricated identity — the fallback recovers identity, never invents it.
+        let raw = br#"{ "tokens": { "access_token": "opaque-not-a-jwt" } }"#;
+        let creds = parse_credentials(raw).unwrap();
+        assert_eq!(creds.account_id, None);
         assert!(creds.is_oauth);
     }
 
