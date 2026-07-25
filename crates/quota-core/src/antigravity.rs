@@ -550,7 +550,9 @@ impl UsageProvider for AntigravityProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let servers = discover_servers();
+            let servers = tokio::task::spawn_blocking(discover_servers)
+                .await
+                .unwrap_or_else(|_join_error| Vec::new());
             if servers.is_empty() {
                 return Err(FetchError::NoSession(
                     "no Antigravity language server or agy CLI process running".to_string(),
@@ -560,7 +562,10 @@ impl UsageProvider for AntigravityProvider {
             let mut last_err =
                 FetchError::NoSession("no Antigravity loopback port served quota".to_string());
             for server in &servers {
-                let ports = discover_ports(server.pid);
+                let pid = server.pid;
+                let ports = tokio::task::spawn_blocking(move || discover_ports(pid))
+                    .await
+                    .unwrap_or_else(|_join_error| Vec::new());
                 for port in ports {
                     match self.probe(server, port).await {
                         Ok(usage) => {
