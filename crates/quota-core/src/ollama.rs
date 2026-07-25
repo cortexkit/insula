@@ -251,15 +251,17 @@ impl UsageProvider for OllamaProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-                // No store / no cookie / unsupported platform → simply not logged in here.
-                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                    FetchError::NoSession(e.to_string())
-                }
-                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                    FetchError::Upstream(e.to_string())
-                }
-            })?;
+            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
+                .await
+                .map_err(|e| match e {
+                    // No store / no cookie / unsupported platform → simply not logged in here.
+                    CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                        FetchError::NoSession(e.to_string())
+                    }
+                    CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                        FetchError::Upstream(e.to_string())
+                    }
+                })?;
 
             // A jar without a recognized session cookie is not a usable login.
             if !jar.has_cookie_named(is_session_cookie) {

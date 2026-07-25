@@ -237,7 +237,9 @@ impl UsageProvider for QoderProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(map_cookie_error)?;
+            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
+                .await
+                .map_err(map_cookie_error)?;
             // Qoder's importer does not designate one session-cookie name, so send
             // every cookie from its two exact international hosts.
             let cookie = request_cookie_header(&jar).ok_or_else(|| {

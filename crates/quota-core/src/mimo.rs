@@ -186,13 +186,19 @@ impl UsageProvider for MimoProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(|e| match e {
-                browser_cookies::CookieError::NoStore
-                | browser_cookies::CookieError::NoCookie
-                | browser_cookies::CookieError::Unsupported => FetchError::NoSession(e.to_string()),
-                browser_cookies::CookieError::NoKeychainKey(_)
-                | browser_cookies::CookieError::Extract(_) => FetchError::Upstream(e.to_string()),
-            })?;
+            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
+                .await
+                .map_err(|e| match e {
+                    browser_cookies::CookieError::NoStore
+                    | browser_cookies::CookieError::NoCookie
+                    | browser_cookies::CookieError::Unsupported => {
+                        FetchError::NoSession(e.to_string())
+                    }
+                    browser_cookies::CookieError::NoKeychainKey(_)
+                    | browser_cookies::CookieError::Extract(_) => {
+                        FetchError::Upstream(e.to_string())
+                    }
+                })?;
 
             let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
             let has_user_id = jar.has_cookie_named(|n| n == "userId");

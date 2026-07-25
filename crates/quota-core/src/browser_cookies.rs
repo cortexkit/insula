@@ -88,6 +88,15 @@ impl CookieJar {
     }
 }
 
+/// Extract cookies without running keychain, filesystem, and SQLite work on an
+/// async runtime worker.
+pub async fn chrome_cookies_for_async(domain_suffix: &str) -> Result<CookieJar, CookieError> {
+    let domain_suffix = domain_suffix.to_owned();
+    tokio::task::spawn_blocking(move || chrome_cookies_for(&domain_suffix))
+        .await
+        .map_err(|error| CookieError::Extract(format!("extraction task failed: {error}")))?
+}
+
 /// Extract + decrypt all Chrome cookies whose `host_key` ends with `domain_suffix`
 /// (e.g. `"ollama.com"` matches `ollama.com` and `signin.ollama.com`).
 #[cfg(not(target_os = "macos"))]
