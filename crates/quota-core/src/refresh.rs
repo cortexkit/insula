@@ -237,7 +237,30 @@ fn next_slot_after_attempt_inner(
     }
 
     let observed_account_changed = match (&prev.observation, &attempt.observed) {
-        (Some(old), Some(new)) => old.account_id != new.account_id,
+        (Some(old), Some(new)) => {
+            if old.account_id.is_some() || new.account_id.is_some() {
+                old.account_id != new.account_id
+            } else {
+                // Neither observation carries an account id, so a change of
+                // account cannot be seen directly. Some credential records are
+                // unlabeled by contract, yet the same durable handle can be
+                // repointed at a different account, and the record version is the
+                // only evidence of that: it identifies the served record and
+                // always advances when the record is replaced.
+                //
+                // Treating a version change as a possible identity change can
+                // discard a still-valid entry when a record is re-versioned
+                // without changing account. That costs one refresh cycle. The
+                // alternative is serving one account's usage under another
+                // account's credential for as long as fetches keep failing, which
+                // a consumer cannot detect and would act on.
+                //
+                // Local sources leave the version absent and re-resolve every
+                // fetch, so absent-vs-absent compares equal and they are
+                // unaffected.
+                old.record_version != new.record_version
+            }
+        }
         _ => false,
     };
     let identity_may_have_changed = identity_unverified && prev.observation.is_some();
@@ -535,5 +558,130 @@ mod tests {
             .entry
             .as_ref()
             .is_some_and(|entry| entry.error.is_some()));
+    }
+
+    #[test]
+    fn an_unlabeled_record_repointed_to_another_account_fails_closed() {
+        // Some vault records carry no account id by contract, yet the same durable
+        // handle can be repointed to a different account. In that case a changed
+        // record version is the only available signal that the handle now refers to
+        // a different account. If a usage fetch then fails transiently, keeping the
+        // cached entry would serve the previous account's usage under the new
+        // account's credential, and repeated failures could extend that
+        // indefinitely.
+        let t0 = Instant::now();
+        let healthy = next_slot_after_attempt(
+            &ProviderSlot::due_now(t0, incarnation()),
+            "gemini",
+            FetchAttempt::success(
+                Some(AccountObservation::new(None, Some(116))),
+                "vault",
+                Usage::default(),
+            ),
+            t0,
+            t0,
+        );
+        assert!(
+            healthy.entry.is_some(),
+            "precondition: a healthy window exists"
+        );
+
+        let after = next_slot_after_attempt(
+            &healthy,
+            "gemini",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(None, Some(117))),
+                None,
+                FetchError::Upstream("429".to_string()),
+            ),
+            t0,
+            t0,
+        );
+
+        assert!(
+            after.entry.is_none(),
+            "the previous account's window must not survive a record replacement"
+        );
+        assert!(
+            after.label_in_flux,
+            "identity is unconfirmed until a fetch succeeds"
+        );
+        assert_eq!(
+            after.last_success_at, None,
+            "backoff restarts from the change"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_unlabeled_record_still_stale_serves_through_a_flap() {
+        // The boundary that keeps the rule above from over-reacting: same record,
+        // same version, ordinary transient failure. This is the common case, and
+        // discarding the window here would throw away good data on every flap.
+        let t0 = Instant::now();
+        let healthy = next_slot_after_attempt(
+            &ProviderSlot::due_now(t0, incarnation()),
+            "gemini",
+            FetchAttempt::success(
+                Some(AccountObservation::new(None, Some(116))),
+                "vault",
+                Usage::default(),
+            ),
+            t0,
+            t0,
+        );
+        let after = next_slot_after_attempt(
+            &healthy,
+            "gemini",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(None, Some(116))),
+                None,
+                FetchError::Upstream("429".to_string()),
+            ),
+            t0,
+            t0,
+        );
+
+        assert!(
+            after.entry.is_some(),
+            "an unchanged record keeps serving stale"
+        );
+        assert_eq!(after.status, SlotStatus::StaleTransient);
+        assert!(!after.label_in_flux);
+    }
+
+    #[test]
+    fn a_local_source_without_versions_is_unaffected() {
+        // Local sources leave the record version absent and re-resolve identity on
+        // every fetch, so absent-vs-absent must compare equal rather than reading
+        // as a change on every single attempt.
+        let t0 = Instant::now();
+        let healthy = next_slot_after_attempt(
+            &ProviderSlot::due_now(t0, incarnation()),
+            "local",
+            FetchAttempt::success(
+                Some(AccountObservation::new(None, None)),
+                "local",
+                Usage::default(),
+            ),
+            t0,
+            t0,
+        );
+        let after = next_slot_after_attempt(
+            &healthy,
+            "local",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(None, None)),
+                None,
+                FetchError::Upstream("timeout".to_string()),
+            ),
+            t0,
+            t0,
+        );
+
+        assert!(
+            after.entry.is_some(),
+            "an unversioned local slot keeps serving stale"
+        );
+        assert!(!after.label_in_flux);
     }
 }
