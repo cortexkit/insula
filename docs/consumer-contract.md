@@ -35,17 +35,33 @@ the next has not necessarily changed state — it may simply have finished.
 ## An empty array is not "nothing configured"
 
 Degraded entries *are* entries, so a host with zero usable credentials returns a
-**full array of degraded entries**. An empty array therefore means one of two
+**full array of degraded entries**. An empty array therefore means one of three
 much narrower things:
 
-- the module is cold, and its first sweep has not published yet, or
-- every provider resolved zero credential handles, which is structural.
+- **cold** — the refresher has not published a first result yet, so slots exist
+  but hold no entry,
+- **structural** — providers resolved no credential handles at all, so there are
+  no slots, or
+- **withheld** — entries exist but every one is suppressed because its account
+  identity is unconfirmed. This is deliberate: serving usage under an identity
+  that may have changed is the one error this module refuses to risk, so it
+  emits nothing until the next fetch settles it.
 
-Distinguish them from the health check's metrics — `withoutHandles` names
-providers that resolved no handle, and `lastTickAgeSecs` says whether the
-refresher has ticked at all. Never infer the difference from the array itself,
-and do not flip a staleness flag on elapsed time: a duration-based guess is the
-weakest available signal for a question that has a precise answer one call away.
+The third resolves on its own within a refresh cycle and is not a fault.
+
+Which causes are plausible depends on the request. An **unfiltered** query goes
+empty only if *every* provider is simultaneously cold, handle-less, or withheld
+— so in practice that means cold or structural. A query **filtered to one
+provider** goes empty whenever that single provider is in any of the three
+states, and withheld is entirely ordinary there. Do not carry an inference from
+one shape of request to the other.
+
+Distinguish cold from structural using the health check's metrics —
+`withoutHandles` names providers that resolved no handle, and `lastTickAgeSecs`
+says whether the refresher has ticked at all. Never infer the difference from
+the array itself, and do not flip a staleness flag on elapsed time: a
+duration-based guess is the weakest available signal for a question that has a
+precise answer one call away.
 
 The failure this prevents is specific. A renderer that treats zero rows as
 all-quiet shows its calmest possible screen in the one case where something is
