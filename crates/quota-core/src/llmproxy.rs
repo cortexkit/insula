@@ -1,10 +1,9 @@
 //! LLMProxy usage fetcher — credential from an environment variable.
 //!
 //! LLMProxy fronts multiple upstream providers and reports a `quota_groups` list
-//! per upstream; the account-wide signal is the WORST remaining group (the first
-//! pool to exhaust gates the account). We mirror CodexBar's aggregate: take the
-//! minimum `remaining_percent` across all groups → `usedPercent = 100 -
-//! min_remaining`, and the matching group's `reset_time` → `resetsAt`.
+//! per upstream; the account-wide signal is the WORST remaining group, since the
+//! first pool to exhaust gates the account. Both emitted numbers come from that
+//! same group: `usedPercent = 100 - remaining_percent` and its own `reset_time`.
 //!
 //! Endpoint: `GET {base}/v1/quota-stats` (base from `LLM_PROXY_BASE_URL`, already
 //! `/v1`-aware). Credential: `LLM_PROXY_API_KEY` as an `Authorization: Bearer`.
@@ -65,47 +64,47 @@ fn quota_stats_url(base: &str) -> Option<String> {
 
 /// Normalize the quota-stats body to [`Usage`].
 ///
-/// Faithful to CodexBar's aggregate (`LLMProxyUsageFetcher.swift:265-267`):
-/// `usedPercent = 100 - min(remaining_percent)` and `resetsAt = min(reset_time)`
-/// are computed INDEPENDENTLY across every group of every upstream provider — the
-/// account is gated by the most-depleted pool and the soonest reset, which need
-/// not be the same group.
+/// The account is gated by its most-depleted pool, so the worst group across every
+/// upstream provider is selected and BOTH numbers are taken from that one group.
+///
+/// The reference implementation reduces the minimum remaining percent and the
+/// minimum reset time independently, but it keeps them as two separate scalars and
+/// never claims they describe the same pool. A [`RateWindow`] does make that claim:
+/// it means "this much of THIS window is used, and THIS window resets then". Pairing
+/// independent minima inside one would assert something the source data does not
+/// support, and the error has a direction — the minimum reset is always at or before
+/// the binding group's, so the window would promise relief that has not arrived and
+/// a consumer pacing on it would resume into a still-exhausted pool.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: QuotaStatsResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("llmproxy quota-stats not decodable: {e}")))?;
 
-    let mut min_remaining: Option<f64> = None;
-    let mut min_reset: Option<String> = None;
+    let mut binding: Option<(f64, Option<&str>)> = None;
     for stats in response.providers.values() {
         let Some(groups) = &stats.quota_groups else {
             continue;
         };
         for group in groups {
-            if let Some(remaining) = group.remaining_percent {
-                min_remaining = Some(min_remaining.map_or(remaining, |m| m.min(remaining)));
-            }
-            if let Some(reset) = &group.reset_time {
-                // Lexicographic min works for like-formatted RFC 3339 timestamps,
-                // which is what the proxy emits for every group.
-                min_reset = Some(match min_reset {
-                    Some(current) if current <= *reset => current,
-                    _ => reset.clone(),
-                });
+            let Some(remaining) = group.remaining_percent else {
+                continue;
+            };
+            if binding.is_none_or(|(worst, _)| remaining < worst) {
+                binding = Some((remaining, group.reset_time.as_deref()));
             }
         }
     }
 
-    let primary = match (min_remaining, min_reset) {
-        (Some(remaining), Some(resets_at)) => Some(RateWindow {
-            used_percent: (100.0 - remaining).clamp(0.0, 100.0),
-            raw_used_percent: None,
-            resets_at: Some(resets_at),
-            window_minutes: None,
-            used_count: None,
-            total_count: None,
-        }),
-        _ => None,
-    };
+    // The percent is load-bearing and the reset is optional: a pool reporting how
+    // depleted it is without saying when it refills is still real pressure, and
+    // dropping it would make an exhausted account read as no signal at all.
+    let primary = binding.map(|(remaining, resets_at)| RateWindow {
+        used_percent: (100.0 - remaining).clamp(0.0, 100.0),
+        raw_used_percent: None,
+        resets_at: resets_at.map(str::to_string),
+        window_minutes: None,
+        used_count: None,
+        total_count: None,
+    });
 
     Ok(Usage {
         primary,
@@ -181,10 +180,17 @@ mod tests {
         }"#;
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
-        // Independent aggregation: min remaining = 30% → used 70%; min reset =
-        // 17:00 (openai's group), which need not be the most-depleted group's.
+        // The worst group is anthropic's 30%-remaining pool, so the window reports
+        // 70% used and ITS reset. Taking the earliest reset across all groups would
+        // pair this pressure with openai's 17:00 — an hour before the pool that
+        // actually gates the account recovers, so a consumer would resume into a
+        // still-exhausted upstream.
         assert_eq!(primary.used_percent, 70.0);
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-06-22T18:00:00Z"),
+            "the reset must belong to the group whose depletion is being reported"
+        );
         assert_eq!(primary.window_minutes, None);
     }
 
@@ -195,11 +201,37 @@ mod tests {
     }
 
     #[test]
-    fn group_without_reset_is_dropped() {
+    fn worst_group_without_a_reset_still_reports_its_pressure() {
+        // The percent is load-bearing and the reset is optional. Dropping the window
+        // here would make a 90%-depleted account read as no signal rather than as
+        // nearly exhausted, which is the more expensive of the two errors.
         let body =
             br#"{ "providers": { "x": { "quota_groups": [ { "remaining_percent": 10.0 } ] } } }"#;
-        // Worst group has no reset_time → no well-formed window.
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("real pressure");
+        assert_eq!(primary.used_percent, 90.0);
+        assert_eq!(
+            primary.resets_at, None,
+            "an absent reset is carried as absent, never borrowed from another group"
+        );
+    }
+
+    #[test]
+    fn a_reset_is_never_borrowed_from_a_healthier_group() {
+        // The dangerous pairing: the depleted group reports no reset while a
+        // healthy one does. Borrowing it would promise relief for pressure that
+        // reset does not relieve.
+        let body = br#"{
+            "providers": {
+                "a": { "quota_groups": [ { "remaining_percent": 5.0 } ] },
+                "b": { "quota_groups": [ { "remaining_percent": 90.0, "reset_time": "2026-06-22T17:00:00Z" } ] }
+            }
+        }"#;
+        let primary = normalize_usage(body).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 95.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]
