@@ -179,11 +179,14 @@ fn rate_window_from(
     now: DateTime<Utc>,
 ) -> Option<RateWindow> {
     let used_percent = window.used_percent?;
-    let resets_at = reset_at_for_window(window, now)?;
+    let resets_at = reset_at_for_window(window, now);
+    if resets_at.is_none() && (window.window_end.is_some() || window.seconds_remaining.is_some()) {
+        return None;
+    }
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
@@ -222,7 +225,7 @@ pub fn normalize_billing_limits(value: &Value, now: DateTime<Utc>) -> Result<Usa
 
     if primary.is_none() && secondary.is_none() && tertiary.is_none() {
         return Err(FetchError::Decode(
-            "factory: no usage windows with both usedPercent and reset".to_string(),
+            "factory: no usable usage windows".to_string(),
         ));
     }
 
@@ -382,14 +385,42 @@ mod tests {
         assert_eq!(secondary.used_percent, 40.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-25T17:20:00Z"));
         assert_eq!(secondary.window_minutes, Some(10080));
-        assert!(usage.tertiary.is_none(), "monthly has no reset → dropped");
+        let tertiary = usage.tertiary.unwrap();
+        assert_eq!(tertiary.used_percent, 5.0);
+        assert_eq!(tertiary.resets_at, None);
+        assert_eq!(tertiary.window_minutes, Some(43200));
     }
 
     #[test]
-    fn drops_window_with_percent_but_no_reset() {
+    fn keeps_window_with_percent_but_no_reset() {
         let value: Value =
             serde_json::from_str(r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0}}}}"#)
                 .unwrap();
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_minutes, Some(300));
+    }
+
+    #[test]
+    fn exhausted_monthly_window_without_reset_is_kept() {
+        let value: Value =
+            serde_json::from_str(r#"{"limits":{"standard":{"monthly":{"usedPercent":100.0}}}}"#)
+                .unwrap();
+        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+        let tertiary = usage.tertiary.unwrap();
+        assert_eq!(tertiary.used_percent, 100.0);
+        assert_eq!(tertiary.resets_at, None);
+        assert_eq!(tertiary.window_minutes, Some(43200));
+    }
+
+    #[test]
+    fn unparseable_window_end_without_seconds_remaining_still_drops_window() {
+        let value: Value = serde_json::from_str(
+            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0,"windowEnd":"not-a-date"}}}}"#,
+        )
+        .unwrap();
         assert!(matches!(
             normalize_billing_limits(&value, fixed_now()),
             Err(FetchError::Decode(_))
