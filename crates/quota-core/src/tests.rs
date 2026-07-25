@@ -3099,3 +3099,47 @@ async fn an_ineligible_labeled_slot_is_served_raw() {
         "a labeled slot that never opted in must report the provider's own number"
     );
 }
+
+#[tokio::test]
+async fn a_labeled_entry_is_withheld_while_its_identity_is_in_flux() {
+    // Attaching an account to an entry GRANTS a claim: it says this usage
+    // belongs to that account, and a consumer routes and meters on it. The claim
+    // must be withheld while identity is unconfirmed, because the alternative is
+    // attributing one account's usage to another — the most expensive thing this
+    // module can get wrong, and undetectable downstream.
+    //
+    // The unlabeled path has its own test for this. The labeled path is the one
+    // that carries an account on the wire, so it needs its own: the guards are
+    // separate expressions and a test on one proves nothing about the other.
+    let registry = Registry::new(vec![Box::new(LabeledRelaxingProvider)]);
+    tick(&registry).await;
+    assert_eq!(
+        registry.get_usage(Some("codex-labeled")).await.len(),
+        1,
+        "precondition: the account resolved and is served"
+    );
+
+    let key = SlotKey::new("codex-labeled", CredentialHandle::implicit());
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut slot = store.get(&key).unwrap().clone();
+        assert!(
+            slot.entry.is_some(),
+            "a cached entry is what makes this a risk"
+        );
+        assert!(
+            slot.account_id().is_some(),
+            "precondition: an account label exists to be withheld"
+        );
+        slot.label_in_flux = true;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+
+    assert!(
+        registry.get_usage(Some("codex-labeled")).await.is_empty(),
+        "a cached entry whose identity is unconfirmed must not be served under \
+         its previous account label"
+    );
+}
