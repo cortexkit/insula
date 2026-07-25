@@ -186,18 +186,46 @@ fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> 
     None
 }
 
+/// True when the session block carries a "Weekly limit reached" notice.
+///
+/// While the weekly quota is exhausted the settings page replaces the session
+/// block's usual "Resets in N hours" caption with that notice, and the only
+/// timestamp it then renders is the WEEKLY reset. The check names the weekly
+/// limit specifically: a session-scoped notice must not move a session reset.
+fn session_block_reports_weekly_limit(html: &str) -> bool {
+    SESSION_LABELS
+        .iter()
+        .filter_map(|(label, _)| block_after(html, label))
+        .any(|block| block.contains("Weekly limit reached"))
+}
+
+/// "Session usage" is the 5-hour window; "Hourly usage" is a distinct shorter
+/// window with no fixed length on the wire (CodexBar leaves it nil).
+const SESSION_LABELS: &[(&str, Option<i64>)] = &[
+    ("Session usage", Some(SESSION_WINDOW_MINUTES)),
+    ("Hourly usage", None),
+];
+
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
-    // "Session usage" is the 5-hour window; "Hourly usage" is a distinct shorter
-    // window with no fixed length on the wire (CodexBar leaves it nil).
-    let session = window_for(
-        html,
-        &[
-            ("Session usage", Some(SESSION_WINDOW_MINUTES)),
-            ("Hourly usage", None),
-        ],
-    );
-    let weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))]);
+    let mut session = window_for(html, SESSION_LABELS);
+    let mut weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))]);
+
+    // Re-attribute the reset when the weekly quota is exhausted. In that state
+    // the page stops stating when the session window rolls and renders only the
+    // weekly reset — inside the session block, because that is where the notice
+    // lives. Reading it positionally would claim a 5-hour window resets days
+    // from now, which is impossible and reads as a mislabeled window. Move it to
+    // the window it actually describes, and leave the session reset absent since
+    // the page no longer reports it (never fabricated).
+    if session_block_reports_weekly_limit(html) {
+        let borrowed = session.as_mut().and_then(|window| window.resets_at.take());
+        if let Some(weekly_window) = weekly.as_mut() {
+            if weekly_window.resets_at.is_none() {
+                weekly_window.resets_at = borrowed;
+            }
+        }
+    }
 
     if session.is_none() && weekly.is_none() {
         if looks_signed_out(html) {
@@ -403,6 +431,71 @@ mod tests {
             "depleted window has no reset timestamp"
         );
         assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn weekly_limit_reached_moves_the_reset_off_the_session_window() {
+        // Captured live 2026-07-25 while the weekly quota was exhausted. In that
+        // state the settings page replaces the session block's "Resets in N hours"
+        // caption with a "Weekly limit reached" notice, and the only timestamp it
+        // renders sits inside the SESSION block while describing the WEEKLY reset.
+        // Read positionally, that claimed a 5-hour window resetting ~36 hours out
+        // — impossible for its length — while the exhausted weekly window, the one
+        // a consumer must wait on, carried no horizon at all.
+        let html = r#"
+          <span>Session usage</span>
+          <span class="text-sm text-neutral-500">Weekly limit reached</span>
+          <div data-usage-track aria-label="Session usage 49.8% used">
+            <div style="width: 100%; background: #d4d4d4;"></div>
+          </div>
+          <div class="text-xs local-time" data-time="2026-07-27T00:00:00Z">Resets Monday.</div>
+          <span>Weekly usage</span>
+          <span class="text-red-500">100% used</span>
+          <div data-usage-track aria-label="Weekly usage 100% used">
+            <div style="width: 100%"></div>
+          </div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+
+        let session = usage.primary.expect("session window still reported");
+        assert_eq!(session.used_percent, 49.8);
+        assert_eq!(session.window_minutes, Some(300));
+        assert_eq!(
+            session.resets_at, None,
+            "a 5-hour window must not claim a reset ~36 hours out; the page stops \
+             reporting the session reset in this state, so it is absent, not invented"
+        );
+
+        let weekly = usage.secondary.expect("exhausted weekly window");
+        assert_eq!(weekly.used_percent, 100.0);
+        assert_eq!(weekly.window_minutes, Some(10080));
+        assert_eq!(
+            weekly.resets_at.as_deref(),
+            Some("2026-07-27T00:00:00Z"),
+            "the timestamp describes the weekly reset, so it must ride the weekly \
+             window — that horizon is what a blocked consumer waits on"
+        );
+    }
+
+    #[test]
+    fn session_reset_is_untouched_when_no_weekly_limit_notice() {
+        // Boundary: without the notice, the session block's own timestamp is a real
+        // session reset and must stay on the session window.
+        let html = r#"
+          <span>Session usage</span><span>12% used</span>
+          <div data-time="2026-07-25T16:00:00Z">Resets in 5 hours.</div>
+          <span>Weekly usage</span><span>40% used</span>
+          <div data-time="2026-07-27T00:00:00Z">Resets Monday.</div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+        assert_eq!(
+            usage.primary.unwrap().resets_at.as_deref(),
+            Some("2026-07-25T16:00:00Z")
+        );
+        assert_eq!(
+            usage.secondary.unwrap().resets_at.as_deref(),
+            Some("2026-07-27T00:00:00Z")
+        );
     }
 
     #[test]
