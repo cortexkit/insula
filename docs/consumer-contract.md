@@ -81,6 +81,16 @@ staleness, it **actively resets** it, and the reset is driven by the consumer's
 poll cadence rather than the producer's failure duration. Polling more often
 makes it strictly worse.
 
+The mirror of that mistake is easy to make while fixing it. If you preserve
+windows across a response that did not mention them — an empty array, or a
+provider absent mid-sweep — **keep aging them on `fetchedAt` anyway**. Freezing
+their age because nothing arrived produces data that never grows stale, since
+the only thing that could have aged it is the thing that stopped coming.
+
+Both halves of one rule: never reset age on your own activity, and never pause
+it on the producer's silence. The decay clock belongs to whoever knew when the
+data was true, and it keeps running through the quiet.
+
 `fetchedAt` is per-entry and **never a common instant**. Two accounts of the
 same provider routinely differ, because they are separate slots on separate
 backoff schedules. Build no snapshot-moment invariant on one response.
