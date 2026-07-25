@@ -250,6 +250,20 @@ fn window_from_fraction(
     })
 }
 
+/// True when the gateway envelope carries no diagnostic content at all: no
+/// `code`, no `msg`, and no `data`.
+///
+/// This is the observed shape when the console gateway itself answers 200 but
+/// the inner token-plan API never executed (`{}` with an empty `ret`) — i.e.
+/// nothing came back to decode. It is deliberately NOT the same as a rejection
+/// that names itself (`code`/`msg` present), which is a real provider answer.
+fn envelope_is_empty(result: &serde_json::Value) -> bool {
+    let has_code = result.get("code").and_then(|c| c.as_str()).is_some();
+    let has_msg = result.get("msg").and_then(|m| m.as_str()).is_some();
+    let has_data = result.get("data").is_some_and(|d| !d.is_null());
+    !has_code && !has_msg && !has_data
+}
+
 fn degraded_response_error(result: Option<&serde_json::Value>, reason: &str) -> FetchError {
     let detail = result.and_then(|v| {
         let code = v.get("code").and_then(|c| c.as_str());
@@ -288,14 +302,29 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         ));
     }
 
+    // A success envelope with no inner payload at all means the gateway answered
+    // but the token-plan API never ran — nothing was returned to decode. That is a
+    // transient edge condition, so classify it Upstream and let the refresher keep
+    // serving the last-healthy window rather than replacing it with a degraded
+    // entry. Mirrors grok.rs's empty-frame path and alibaba.rs's empty body.
     let result = result.ok_or_else(|| {
-        degraded_response_error(None, "response is missing the token-plan result")
+        FetchError::Upstream(
+            "qwen-cloud gateway returned an empty envelope (transient)".to_string(),
+        )
     })?;
     let result_value = result.clone();
     let result: TokenPlanResult = serde_json::from_value(result_value.clone()).map_err(|e| {
         FetchError::Decode(format!("qwen-cloud token-plan result not decodable: {e}"))
     })?;
     if result.success != Some(true) || result.code.as_deref() != Some("SUCCESS") {
+        // Same boundary as above: a content-free envelope is "nothing came back"
+        // (transient), while a rejection that names itself with a code/msg is a
+        // real provider answer and still degrades.
+        if envelope_is_empty(&result_value) {
+            return Err(FetchError::Upstream(
+                "qwen-cloud gateway returned an empty token-plan result (transient)".to_string(),
+            ));
+        }
         return Err(degraded_response_error(
             Some(&result_value),
             "token-plan result did not report success",

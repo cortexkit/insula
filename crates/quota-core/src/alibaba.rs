@@ -229,8 +229,17 @@ fn window_from_used_total_reset(
 /// Normalize the Coding Plan API body to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     if body.is_empty() {
-        return Err(FetchError::Decode(
-            "alibaba empty response body".to_string(),
+        // An empty 200 body is "the endpoint returned nothing" — a transient
+        // transport/edge condition, not a malformed payload. Classify it as
+        // Upstream (transient) so the refresher serves the last-healthy window
+        // stale through the flap instead of replacing it with a degraded entry
+        // (which a router reads as "quota signal: none"). This mirrors grok.rs's
+        // empty-frame path, and the boundary is exact: only a genuinely EMPTY
+        // body is transient. A parse failure on a NON-EMPTY body stays a Decode
+        // failure below, because real bytes that will not parse are ambiguous —
+        // they may be a permanent contract break, where degrading is correct.
+        return Err(FetchError::Upstream(
+            "alibaba empty response body (transient)".to_string(),
         ));
     }
     let root: Value = serde_json::from_slice(body)

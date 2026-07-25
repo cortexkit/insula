@@ -696,6 +696,139 @@ impl UsageProvider for FlipProvider {
     }
 }
 
+/// A provider whose first fetch succeeds and whose later fetches return whatever
+/// the real normalizer produces for an EMPTY response body. This drives the
+/// classification through the actual refresher state machine rather than
+/// asserting `classify()`'s return value, which would pass trivially.
+struct EmptyBodyProvider {
+    name: &'static str,
+    calls: Mutex<usize>,
+    empty_body_error: fn() -> FetchError,
+}
+
+#[async_trait]
+impl UsageProvider for EmptyBodyProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            let usage = Usage {
+                primary: Some(RateWindow {
+                    used_percent: 42.0,
+                    raw_used_percent: None,
+                    resets_at: Some("2026-08-01T00:00:00Z".to_string()),
+                    window_minutes: Some(300),
+                    used_count: None,
+                    total_count: None,
+                }),
+                ..Usage::default()
+            };
+            FetchAttempt::success(None, "test", usage)
+        } else {
+            FetchAttempt::failure(None, None, (self.empty_body_error)())
+        }
+    }
+}
+
+/// An empty response body must not discard a known-good window.
+///
+/// This asserts the OBSERVABLE stale-serving behavior through a real refresh
+/// cycle: after a healthy fetch, a fetch whose body is empty must keep serving
+/// the last-healthy 42% window (status stale) instead of replacing it with a
+/// degraded entry. Reverting either normalizer's empty-body branch to
+/// `FetchError::Decode` makes this fail, because `classify` routes Decode to
+/// NonTransient, which replaces the entry and drops the window.
+#[tokio::test]
+async fn empty_response_body_keeps_serving_the_last_healthy_window() {
+    for (name, empty_body_error) in [
+        (
+            "alibaba",
+            (|| crate::alibaba::normalize_usage(b"").expect_err("empty body must error"))
+                as fn() -> FetchError,
+        ),
+        ("qwen-cloud", || {
+            crate::qwen_cloud::normalize_usage(br#"{"successResponse":true}"#)
+                .expect_err("empty envelope must error")
+        }),
+        ("grok", || {
+            crate::grok::normalize_usage(b"").expect_err("empty frames must error")
+        }),
+    ] {
+        let registry = Registry::new(vec![Box::new(EmptyBodyProvider {
+            name,
+            calls: Mutex::new(0),
+            empty_body_error,
+        })]);
+        tick(&registry).await;
+
+        let healthy = registry.get_usage(None).await;
+        assert_eq!(healthy.len(), 1, "{name}: expected one entry after success");
+        assert_eq!(
+            healthy[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(42.0),
+            "{name}: first fetch should serve the real window"
+        );
+
+        force_due(&registry, name);
+        tick(&registry).await;
+
+        let after_empty = registry.get_usage(None).await;
+        assert_eq!(after_empty.len(), 1, "{name}: expected one entry");
+        assert!(
+            after_empty[0].error.is_none(),
+            "{name}: an empty body must not produce a degraded entry, got {:?}",
+            after_empty[0].error
+        );
+        assert_eq!(
+            after_empty[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(42.0),
+            "{name}: the last-healthy window must still be served"
+        );
+        assert_eq!(
+            registry.health().stale,
+            1,
+            "{name}: the slot should be stale-serving, not degraded"
+        );
+    }
+}
+
+/// The boundary that makes the rule above safe: a parse failure on a NON-EMPTY
+/// body stays non-transient and DOES degrade, because real bytes that will not
+/// parse may be a permanent contract break.
+#[tokio::test]
+async fn malformed_non_empty_body_still_degrades() {
+    let registry = Registry::new(vec![Box::new(EmptyBodyProvider {
+        name: "alibaba",
+        calls: Mutex::new(0),
+        empty_body_error: || {
+            crate::alibaba::normalize_usage(b"{not json").expect_err("garbage must error")
+        },
+    })]);
+    tick(&registry).await;
+    force_due(&registry, "alibaba");
+    tick(&registry).await;
+
+    let after_garbage = registry.get_usage(None).await;
+    assert_eq!(after_garbage.len(), 1);
+    assert!(
+        after_garbage[0].error.is_some(),
+        "a malformed non-empty body must degrade, not stale-serve"
+    );
+    assert_eq!(registry.health().stale, 0);
+}
+
 #[tokio::test]
 async fn transient_failure_keeps_serving_last_good_window() {
     let registry = Registry::new(vec![Box::new(FlipProvider {
