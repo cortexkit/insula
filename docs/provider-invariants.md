@@ -200,6 +200,40 @@ Two of these rows were added *after* deleting the condition and finding nothing
 reddened. The table is the defence: a warning asks you to feel differently, a
 list asks you to check something.
 
+## Do not add a guard you cannot calibrate
+
+Most rules above say *reject*, *withhold*, or *fail closed*, so the obvious way
+to comply is to guard more. That direction has its own cost, and it is the
+larger one: **wrongly rejecting a good response turns a working provider into a
+broken one, while wrongly accepting a questionable one costs at most one stale
+read.**
+
+So weigh the two sides before adding a check:
+
+- When **both** costs are bounded, decline the guard.
+- When one side is **unbounded and silent** — an error that persists
+  undetectably, like serving one account's usage under another's credential —
+  take it, and accept a bounded cost to avoid an unbounded one.
+
+The rule cuts both ways. One that only ever says "do not guard" is a preference
+wearing a rule's clothes.
+
+The specific trap this exists to stop: **a guard whose correctness depends on a
+value that cannot be measured from this machine must not ship.** Most providers
+have no live credential here, so a size cap, a timeout, or a vocabulary of
+valid status values "measured with margin" is a guess wearing measurement's
+clothes — and one set too low converts a working provider into a failing one
+against a payload nobody could observe. Two proposals were rejected on exactly
+this ground.
+
+Where a bound is genuinely needed with nothing to calibrate against, make it
+absurd rather than tight — orders of magnitude beyond any plausible value — and
+say in a comment that it is a safety bound rather than a tuned limit, so nobody
+later "optimises" it toward observed sizes.
+
+Rejecting a response that produced **no** windows is the one free case: there is
+nothing to lose, so the asymmetry does not apply.
+
 ## Testing these
 
 A regression for any of the above must fail *for the reason it names*. Five ways
