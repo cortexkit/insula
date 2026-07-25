@@ -6,6 +6,20 @@ on:
   pull_request:
   workflow_call:
 
+# Rapid pushes supersede each other: only the tip ships, so paying for a full run
+# of every intermediate commit buys nothing.
+#
+# READING THE RUN LIST LATER, ESPECIALLY MID-BISECT: a cancelled run means a newer
+# push arrived first, NOT that the commit failed, and a commit with no run at all
+# was superseded before its run started rather than never pushed. Neither is
+# evidence about that commit. What this list supports is "the tip is green", not
+# "every commit is green" — and since history here is cumulative, a later green run
+# on a descendant did execute the earlier commits' code.
+#
+# The exception, and the reason to watch a run to completion rather than trust the
+# badge: when the WORKFLOW ITSELF changes. A run cancelled before it reached a newly
+# added step never executed that step anywhere, and nothing in the run's status says
+# so. Verify a new step's own result the first time it ships.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
