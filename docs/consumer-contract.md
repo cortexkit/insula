@@ -138,6 +138,31 @@ if you need to branch on the class, ask for a machine-readable field rather than
 parsing it — a retention policy keyed on prose is how the next seam defect gets
 built.
 
+## 100% used does not mean requests are being refused
+
+`usedPercent` is a **capacity reading**, not an enforcement state. A window at
+100 says the accounting reached the limit; it does not say the next request is
+rejected, and the two genuinely diverge:
+
+- A provider can serve past a reported 100% — soft limits, grace, or an
+  allowance the reported figure does not cover.
+- A provider can refuse *below* 100%, when the enforced cap differs from the one
+  the usage figures are computed against. This is not hypothetical: a plan
+  change can leave the console reporting against the new cap while the edge
+  still enforces the previous one until the window resets.
+
+Only one upstream in this module reports enforcement directly, and it is
+consumed internally rather than published. Everywhere else, a 100% window is
+inferred from counts or percentages, so **no field on this wire states that a
+provider is currently refusing requests**. Do not read one into `usedPercent`.
+
+What follows for a consumer: treat 100% as *expect no headroom* rather than
+*calls will fail*, and let the actual API error be what proves refusal. If you
+need enforcement as a fact rather than an inference, ask — it would be an
+explicit optional field with three states (refusing / not refusing / not
+reported), and absence would have to mean unknown rather than false, since for
+most providers here it is genuinely unknown.
+
 ## Verdict versus unfinished
 
 A degraded entry is a **verdict**: this module concluded the credential or
