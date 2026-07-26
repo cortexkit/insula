@@ -1,5 +1,17 @@
 # quota module — charter & handoff
 
+> **This is the founding brief, kept as a record of what was decided and why.**
+> It describes the module as it was being planned, so its interface sketches and
+> counts have been overtaken — most visibly, the consumer contract is now the
+> subc `usage.get` route rather than an HTTP `/usage` endpoint, and the entry
+> shape carries several fields this document does not list.
+>
+> For what the module does today, read `../README.md`,
+> `provider-invariants.md` (properties a provider must uphold), and
+> `consumer-contract.md` (what a consumer may rely on — the authoritative
+> statement of the output shape). This file is retained for its rationale, not
+> as a current description.
+
 You own this module. This doc is the spec your driver (Alfonso @ subc) reverse-engineered
 from the real code on both sides, so you start from facts, not a blank page.
 

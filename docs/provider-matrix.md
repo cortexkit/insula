@@ -1,22 +1,36 @@
 # Provider matrix — the 46 CodexBar providers, by auth archetype
 
+> **This document maps the UPSTREAM CodexBar inventory, not this module's
+> registry.** It was written to plan the porting effort and its per-provider
+> statuses — BUILD, DEFER, v1 — record what was decided at the time each row was
+> written. Many have since been built, so **a status here is not evidence of what
+> is registered today**.
+>
+> The registry is the only current inventory:
+> `Registry::with_defaults` in `crates/quota-core/src/lib.rs`, and the provider
+> list in the README is generated from it. Six registered providers have no row
+> here at all, because they were ported after this document was last revised.
+>
+> What stays useful is the per-provider research: endpoints, auth archetypes,
+> response shapes, and the reasoning behind each deferral. Read it as a study of
+> upstream, and check the registry for what we actually serve.
+
 Reverse-engineered from CodexBar source (`/Users/ufukaltinok/Work/OSS/CodexBar/Sources/CodexBarCore/Providers/*`),
 every row cited to `file:line` in the study transcripts. This is the map that
 makes parallel fan-out safe: the **auth archetype** is the unit of effort (shared
 auth+fetch scaffolding within a group), so one worker owns one archetype group.
 
-Two providers are already built and proven live end-to-end:
+At the time of writing, two providers were built and proven live end-to-end:
 **codex** (oauth-local-file) and **claude** (oauth-bearer via opencode store).
 
 ---
 
 ## Parity status
 
-**Current parity: CodexBar v0.42.0** (29 providers registered; verified
-2026-07-11 with no code changes needed — zero window-shape drift on any served
-provider). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.45.2** (35 providers registered; verified
+2026-07-21). CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.42.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.45.2..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
 providers (deferred to the Balance axis). When a diff touches a provider we serve,
@@ -161,7 +175,9 @@ and we CANNOT measure how stale:
   length (daily ≤24h, weekly ≤7d) via mtime. This is the tightest bound the data
   supports — but ≤24h on a daily window still means reporting this-morning's 0% as
   current after the user burned 90%, indistinguishable-to-the-consumer from a live
-  ±60s value. Every other v1 provider is live (within the 60s TTL); windsurf would be
+  ±60s value. Every other v1 provider is refreshed on the background refresher's
+  cadence (a nominal 60s interval — not a TTL, and reads never fetch inline);
+  windsurf would be
   the lone silently-stale-as-live outlier = the misleading-metric case the user
   rules out, for one provider.
 UNBLOCK CONDITIONS (revisit precisely when any lands): (1) windsurf exposes a real
