@@ -2395,13 +2395,82 @@ async fn fetched_at_is_stable_for_fresh_and_stale_slot_entries() {
 }
 
 #[tokio::test]
-async fn pending_and_degraded_entries_have_no_fetched_at() {
+async fn entries_for_a_never_successful_slot_have_no_fetched_at() {
+    // Only covers a slot that has NEVER succeeded. A degraded entry whose slot
+    // succeeded earlier does carry a timestamp — see the test below, which is
+    // the case a credential-poor host cannot produce.
     let registry = registry(&[("pending-or-degraded", false, false)]);
     assert!(registry.get_usage(None).await.is_empty());
     tick(&registry).await;
     let usage = registry.get_usage(None).await;
     assert_eq!(usage.len(), 1);
     assert!(usage[0].fetched_at.is_none());
+}
+
+/// A provider whose first fetch succeeds and whose later fetches fail
+/// non-transiently, producing a degraded entry on a slot that has a recorded
+/// success.
+struct SucceedsThenAuthFailsProvider {
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl UsageProvider for SucceedsThenAuthFailsProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            FetchAttempt::success(None, "test", Usage::default())
+        } else {
+            FetchAttempt::failure(None, None, FetchError::Unauthorized("401".into()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_degraded_entry_keeps_the_timestamp_of_its_last_success() {
+    // The timestamp survives the failure that degrades the entry, so it reports
+    // when the provider last SUCCEEDED — not when the error was observed, and not
+    // when anything now in the entry was true. Consumers are told this, so it is
+    // pinned here: presence of a timestamp says nothing about whether an entry is
+    // usable, and the value must not be read as a failure time.
+    //
+    // This shape cannot be captured from a host lacking the credential, because
+    // there every degraded provider has never succeeded and so carries no
+    // timestamp at all — which is consistent with the opposite claim and is not
+    // evidence for it. It has to be constructed.
+    let registry = Registry::new(vec![Box::new(SucceedsThenAuthFailsProvider {
+        calls: Mutex::new(0),
+    })]);
+
+    tick(&registry).await;
+    let healthy = registry.get_usage(Some("codex")).await;
+    let first_seen = healthy[0]
+        .fetched_at
+        .clone()
+        .expect("a successful fetch stamps its entry");
+    assert!(healthy[0].usage.is_some());
+
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    let degraded = registry.get_usage(Some("codex")).await;
+    assert_eq!(degraded.len(), 1);
+    assert!(
+        degraded[0].error.is_some() && degraded[0].usage.is_none(),
+        "the auth failure must degrade the entry"
+    );
+    assert_eq!(
+        degraded[0].fetched_at.as_deref(),
+        Some(first_seen.as_str()),
+        "a degraded entry keeps its last success time, so the timestamp dates \
+         content that is no longer present and must not be read as usability \
+         or as when the failure happened"
+    );
 }
 
 #[tokio::test]
