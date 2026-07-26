@@ -248,6 +248,8 @@ colour that suggests a problem:
 4. it never runs at all
 5. it **encodes the defect as the specification** — a passing test asserting the
    wrong behaviour is correct
+6. it is **true of its fixture and false in general**, under a name that states
+   the general claim
 
 The fifth is the most hostile, because the test is not merely silent about the
 broken case: it actively certifies it. Two of the defects behind this document
@@ -255,6 +257,19 @@ were pinned that way, so fixing them meant deleting a green test. If a change
 you believe in breaks an existing test, establish which of the two encodes the
 intended behaviour before assuming it is your change — and when a rule here and
 a test disagree, say in the commit message why the test moved.
+
+The sixth is the only one where the suite becomes the **source** of a wrong
+belief rather than merely failing to catch one. The assertion is what CI checks;
+the **name** is what a human reads, and a name that generalises beyond its
+inputs will be believed by the next reader — including its author. Nothing can
+ever go red, so the belief survives indefinitely and gets repeated as a
+guarantee. Name a test after the case it constructs, and put the general rule in
+a comment where it cannot be mistaken for something CI verifies.
+
+A corollary worth holding onto: **when a document and a test name agree, that is
+not two sources.** If the document was written by someone reading the suite, it
+is one source counted twice, and it feels exactly like corroboration. The only
+independent check is the code path.
 
 Watching a test fail proves only that it can change colour. Read the failure
 message and confirm it names the mechanism. For byte-level or encoding
