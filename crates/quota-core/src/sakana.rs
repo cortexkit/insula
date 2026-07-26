@@ -42,33 +42,19 @@ struct Paragraph {
 
 /// Normalize the environment setting and the optional literal `Cookie:` prefix.
 fn normalize_cookie_header(raw: &str) -> Option<String> {
-    let mut value = raw.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-
-    if is_wrapped_in_matching_quotes(&value) {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-
-    if value
+    // Quotes are stripped on both sides of the `Cookie:` prefix removal, because a
+    // value pasted from a devtools copy can arrive as `"cookie: a=b"` or as
+    // `cookie: "a=b"`.
+    let unquoted = crate::text::strip_wrapping_quotes(raw)?;
+    let has_prefix = unquoted
         .get(.."cookie:".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
-    {
-        value = value["cookie:".len()..].trim().to_string();
-    }
-
-    if is_wrapped_in_matching_quotes(&value) {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-
-    (!value.is_empty()).then_some(value)
-}
-
-fn is_wrapped_in_matching_quotes(value: &str) -> bool {
-    value.len() >= 2
-        && ((value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\'')))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"));
+    let without_prefix = if has_prefix {
+        unquoted["cookie:".len()..].trim()
+    } else {
+        &unquoted
+    };
+    crate::text::strip_wrapping_quotes(without_prefix)
 }
 
 fn load_cookie_header() -> Result<String, FetchError> {

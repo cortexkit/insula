@@ -89,20 +89,7 @@ struct KimiSubscriptionRateLimit {
 
 /// Trim env token and strip surrounding quotes (CodexBar `KimiSettingsReader.cleaned`).
 fn clean_auth_token(raw: &str) -> Option<String> {
-    let mut value = raw.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
-    {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    crate::text::strip_wrapping_quotes(raw)
 }
 
 fn resolve_auth_token() -> Option<String> {

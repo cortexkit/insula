@@ -297,20 +297,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 }
 
 fn cleaned_host(raw: &str) -> Option<String> {
-    let mut value = raw.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
-    {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    crate::text::strip_wrapping_quotes(raw)
 }
 
 fn quota_url_from_host(host: &str, region: &RegionConfig) -> Option<String> {

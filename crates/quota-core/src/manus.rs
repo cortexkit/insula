@@ -78,20 +78,7 @@ fn resolve_session_token() -> Option<String> {
 }
 
 fn cleaned_env(raw: &str) -> Option<String> {
-    let mut value = raw.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
-    {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    crate::text::strip_wrapping_quotes(raw)
 }
 
 fn token_from_env_value(raw: &str) -> Option<String> {

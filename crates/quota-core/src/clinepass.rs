@@ -48,14 +48,7 @@ struct ClinePassLimit {
 }
 
 fn clean_key(key: String) -> Option<String> {
-    let mut value = key.trim().to_string();
-    if value.len() >= 2
-        && ((value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\'')))
-    {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-    (!value.is_empty()).then_some(value)
+    crate::text::strip_wrapping_quotes(&key)
 }
 
 /// Normalize a ClinePass `/api/v1/users/me/plan/usage-limits` body to rate-limit windows.

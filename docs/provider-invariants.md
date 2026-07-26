@@ -134,6 +134,13 @@ Two recurring sources here:
 - **Wire-supplied lengths.** A length read off the wire can be any `u64`.
   Convert with `usize::try_from` and advance with `checked_add`; treat a length
   that cannot be honoured as malformed input.
+- **A delimiter that is its own pair.** Stripping surrounding quotes from a
+  credential looks total — until the value is a single `"`, which satisfies both
+  `starts_with` and `ends_with` because it is the same character answering both,
+  so the strip slices `[1..0]` and panics. Use `text::strip_wrapping_quotes`
+  rather than writing this again; it requires two distinct characters before
+  stripping anything. The general shape is worth recognising: **a test for a
+  matched pair must establish that there are two of them.**
 
 ## Identity must fail closed
 

@@ -21,9 +21,107 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
     end
 }
 
+/// Trim `raw`, strip one matching pair of surrounding ASCII quotes, and trim
+/// again. Returns `None` when nothing is left.
+///
+/// Every provider that reads a credential from an environment variable or a
+/// settings file needs this, because a value pasted into a shell profile or a
+/// JSON blob routinely arrives wrapped in quotes.
+///
+/// The subtlety is why this is shared rather than repeated: a one-character
+/// input of `"` satisfies BOTH `starts_with('"')` and `ends_with('"')` — the
+/// same character answers both — so the obvious strip computes `value[1..0]`
+/// and panics on a backwards range. A panicking fetch is classified
+/// non-transient, which clears the provider's cached window and suppresses it
+/// for the backoff, so a stray quote in a config file reads downstream as a
+/// provider that has stopped existing rather than one that is misconfigured.
+pub(crate) fn strip_wrapping_quotes(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    // A single quote character is its own opening AND closing quote, so the pair
+    // must be two DISTINCT characters before anything is stripped.
+    let unwrapped = if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let cleaned = unwrapped.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lone_quote_character_is_not_treated_as_a_wrapping_pair() {
+        // The regression this helper exists for: `"` starts with a quote and ends
+        // with a quote because it IS one character, so an unguarded strip slices
+        // [1..0] and panics.
+        assert_eq!(strip_wrapping_quotes("\""), Some("\"".to_string()));
+        assert_eq!(strip_wrapping_quotes("'"), Some("'".to_string()));
+        assert_eq!(strip_wrapping_quotes("  \"  "), Some("\"".to_string()));
+    }
+
+    #[test]
+    fn a_matching_pair_is_stripped_once() {
+        assert_eq!(
+            strip_wrapping_quotes("\"token\""),
+            Some("token".to_string())
+        );
+        assert_eq!(strip_wrapping_quotes("'token'"), Some("token".to_string()));
+        assert_eq!(
+            strip_wrapping_quotes("  \"  token  \"  "),
+            Some("token".to_string())
+        );
+        // Only one pair: a doubly-wrapped value keeps its inner quotes.
+        assert_eq!(
+            strip_wrapping_quotes("\"\"token\"\""),
+            Some("\"token\"".to_string())
+        );
+    }
+
+    #[test]
+    fn mismatched_or_one_sided_quotes_are_left_alone() {
+        assert_eq!(
+            strip_wrapping_quotes("\"token"),
+            Some("\"token".to_string())
+        );
+        assert_eq!(
+            strip_wrapping_quotes("token\""),
+            Some("token\"".to_string())
+        );
+        assert_eq!(
+            strip_wrapping_quotes("\"token'"),
+            Some("\"token'".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_and_quote_only_values_are_none() {
+        assert_eq!(strip_wrapping_quotes(""), None);
+        assert_eq!(strip_wrapping_quotes("   "), None);
+        assert_eq!(strip_wrapping_quotes("\"\""), None);
+        assert_eq!(strip_wrapping_quotes("''"), None);
+        assert_eq!(strip_wrapping_quotes("\"   \""), None);
+    }
+
+    #[test]
+    fn multibyte_content_is_not_sliced_mid_character() {
+        assert_eq!(
+            strip_wrapping_quotes("\"caf\u{e9}\""),
+            Some("caf\u{e9}".to_string())
+        );
+        // A multibyte character alone: len() >= 2 in BYTES but it is one char, so
+        // the quote test must fail on content rather than on length.
+        assert_eq!(strip_wrapping_quotes("\u{e9}"), Some("\u{e9}".to_string()));
+        assert_eq!(
+            strip_wrapping_quotes("\u{1f600}"),
+            Some("\u{1f600}".to_string())
+        );
+    }
 
     #[test]
     fn boundary_index_is_unchanged() {

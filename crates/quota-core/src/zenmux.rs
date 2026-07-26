@@ -69,14 +69,7 @@ struct Quota {
 }
 
 fn clean_setting(value: Option<String>) -> Option<String> {
-    let mut value = value?.trim().to_string();
-    if value.len() >= 2
-        && ((value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\'')))
-    {
-        value = value[1..value.len() - 1].trim().to_string();
-    }
-    (!value.is_empty()).then_some(value)
+    crate::text::strip_wrapping_quotes(&value?)
 }
 
 fn settings_from_env() -> Result<String, FetchError> {

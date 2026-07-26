@@ -69,14 +69,7 @@ struct CredentialsProfile {
 
 /// Trim + strip surrounding quotes (CodexBar `CodebuffSettingsReader.cleaned`).
 fn clean(raw: &str) -> Option<String> {
-    let mut v = raw.trim().to_string();
-    if v.is_empty() {
-        return None;
-    }
-    if (v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')) {
-        v = v[1..v.len() - 1].trim().to_string();
-    }
-    (!v.is_empty()).then_some(v)
+    crate::text::strip_wrapping_quotes(raw)
 }
 
 /// Env key first, then the manicode credentials file (`default.authToken` then

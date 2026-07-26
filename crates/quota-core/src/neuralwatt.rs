@@ -133,19 +133,7 @@ fn parse_iso8601(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 fn clean_env_value(raw: &str) -> Option<String> {
-    let mut value = raw.trim();
-    if ((value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\'')))
-        && value.len() >= 2
-    {
-        value = &value[1..value.len() - 1];
-    }
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    crate::text::strip_wrapping_quotes(raw)
 }
 
 fn validate_and_normalize_url(raw: &str) -> Option<url::Url> {
