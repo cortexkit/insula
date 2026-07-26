@@ -91,6 +91,10 @@ entry pointing `program` at the built binary — see `examples/subc.jsonc`:
 }
 ```
 
+Once it is installed, **`docs/deploying.md` is how you replace a running build** —
+including why a bare `kill` is the wrong way to restart it, and how to verify from
+the running process that the deployed binary is the one you think it is.
+
 `args`/`env`/`enabled` are optional. The daemon appends `--subc <connection-file>`
 and injects `SUBC_MODULE_ID` itself — do **not** put those in `args`/`env`. On its
 next start the daemon spawns the module, which HELLO-registers its ManagementSurface;
