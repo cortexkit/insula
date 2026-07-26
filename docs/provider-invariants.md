@@ -193,12 +193,18 @@ no test naming that site, that is the finding.
 | relaxed `usedPercent` | labeled emission | same | yes, per site |
 | `account` label (this usage belongs to that account) | unlabeled emission | identity not in flux | yes, per site |
 | `account` label | labeled emission | identity not in flux | yes, per site |
-| `fetchedAt` (the data was true at this time) | both | set only from a successful fetch, by construction | structural |
+| `fetchedAt` (this slot last succeeded then — **not** that the entry beside it is usable) | both | set only from a successful fetch, by construction | yes |
 | a healthy entry (`error` absent, `usage` present) | both | a fetch that returned windows | structural |
 
 Two of these rows were added *after* deleting the condition and finding nothing
 reddened. The table is the defence: a warning asks you to feel differently, a
 list asks you to check something.
+
+The `fetchedAt` row is worded carefully because the natural reading is wrong.
+The timestamp survives the failure that degrades an entry, so a degraded entry
+carries the time of the success *before* it — dating content that is no longer
+there. It therefore grants a fact about the slot, never about the entry's
+usability, and reading it as the latter is a claim this module does not make.
 
 ## Do not add a guard you cannot calibrate
 
@@ -236,7 +242,7 @@ nothing to lose, so the asymmetry does not apply.
 
 ## Testing these
 
-A regression for any of the above must fail *for the reason it names*. Five ways
+A regression for any of the above must fail *for the reason it names*. Six ways
 a suite can be uninformative while looking decisive, only one of which has a
 colour that suggests a problem:
 
