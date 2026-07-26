@@ -89,6 +89,22 @@ The middle case is the dangerous one: it is a decode failure wearing the costume
 of a provider answer. Reporting a number derived from a field we could not read
 would announce an exhausted provider as fully available.
 
+**The rule assumes the percent is identified.** It holds wherever a percent
+arrives in a named field, which is everywhere but one: `grok.rs` decodes an
+opaque protobuf with no field names, so its percent is recognised by shape alone
+— the shallowest 32-bit float that happens to fall in 0..=100 — and any
+unrelated in-range ratio can match it. There the reset is not decoration but the
+*evidence* that the scan found the right message, since it must appear at an
+exact field path a coincidental value will not occupy. Without it, a percent has
+unknown provenance and must not reach the wire.
+
+So the precondition is worth stating on its own: **a rule about what to do with
+a value assumes you know what the value is.** Where a field is identified
+positionally or by shape rather than by name, the corroborating field is load
+bearing too, and dropping it silently converts a guess into a published fact.
+That divergence is pinned by a test at its own site, so a future sweep of this
+rule cannot quietly undo it.
+
 ## An empty response body is transient, not a decode failure
 
 "The endpoint returned nothing" is a transport or edge condition — classify it

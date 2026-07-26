@@ -272,7 +272,24 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .or_else(|| future.iter().map(|v| v.value).min());
 
     let Some(reset_epoch) = reset_epoch else {
-        // No reset => no well-formed window; degrade rather than emit a bare percent.
+        // DELIBERATE DIVERGENCE from "the percent is load-bearing, the reset is
+        // optional", which holds everywhere a percent arrives in a NAMED field.
+        // It does not hold here, because this response is an opaque protobuf with
+        // no field names: the percent above is identified by shape alone (the
+        // shallowest 32-bit float that happens to fall in 0..=100), so any
+        // unrelated ratio or score in range can match it.
+        //
+        // The reset is what confirms the scan found the right message: it is
+        // required at the exact path [1,5,1], which a coincidental value will not
+        // occupy. Without it there is no evidence the float is a quota percent at
+        // all, and emitting it would publish a number of unknown provenance as
+        // this account's capacity.
+        //
+        // The asymmetry with the line below is intentional. A reset WITHOUT a
+        // percent still proves the shape, so it yields 0% (no usage recorded); a
+        // percent WITHOUT a reset proves nothing. Do not "restore" this window
+        // when sweeping the reset-optional rule — the rule assumes an identified
+        // percent, which is exactly what is missing here.
         return Err(FetchError::Decode("grok: no reset timestamp".to_string()));
     };
     let resets_at = env::epoch_to_iso8601(reset_epoch as i64)
@@ -844,6 +861,46 @@ mod tests {
         assert_eq!(
             crate::refresh::classify(&normalize_usage(&[]).unwrap_err()),
             crate::refresh::FetchClass::Transient
+        );
+    }
+
+    #[test]
+    fn a_percent_without_a_reset_degrades_rather_than_emitting_a_window() {
+        // Everywhere a percent arrives in a NAMED field, a missing reset is carried
+        // as absent and the window is still emitted. This provider is the deliberate
+        // exception, and this test exists so a sweep of that rule cannot quietly
+        // convert it: the percent here is identified by SHAPE (shallowest fixed32 in
+        // 0..=100), so without the reset at its exact path there is no evidence the
+        // float is a quota percent rather than any other in-range number.
+        //
+        // Frame payload: field 1 wiretype 2, wrapping field 1 wiretype 5 = the f32
+        // 50.0. That lands a fixed32 at path [1,1], which the percent scan accepts.
+        // No varint anywhere, so no reset is found.
+        let inner: Vec<u8> = vec![0x0d, 0x00, 0x00, 0x48, 0x42];
+        let mut payload: Vec<u8> = vec![0x0a, inner.len() as u8];
+        payload.extend_from_slice(&inner);
+        let mut body: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00, payload.len() as u8];
+        body.extend_from_slice(&payload);
+
+        // Prove the fixture actually carries the percent, so this cannot pass by
+        // failing to parse anything at all.
+        let mut scan = Scan::default();
+        scan_message(&payload, &[], &mut scan);
+        assert_eq!(
+            scan.fixed32.len(),
+            1,
+            "fixture must contain exactly one fixed32"
+        );
+        assert_eq!(scan.fixed32[0].path, vec![1, 1]);
+        assert_eq!(scan.fixed32[0].value, 50.0);
+        assert!(
+            scan.varints.is_empty(),
+            "fixture must contain no reset candidate"
+        );
+
+        assert!(
+            matches!(normalize_usage(&body), Err(FetchError::Decode(_))),
+            "a percent of unverified provenance must not reach the wire"
         );
     }
 
