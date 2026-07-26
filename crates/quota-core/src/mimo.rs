@@ -127,21 +127,23 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         .current_period_end
         .and_then(|s| parse_reset_time(&s));
 
-    let primary = match (used_percent, resets_at) {
-        (Some(pct), Some(reset)) => Some(RateWindow {
-            used_percent: pct,
-            raw_used_percent: None,
-            resets_at: Some(reset),
-            window_minutes: Some(43200),
-            used_count: None,
-            total_count: None,
-        }),
-        _ => None,
-    };
+    // The percent is load-bearing and the reset is optional: a window is emitted
+    // from the percent alone, carrying the reset when the upstream reports one.
+    // Requiring both would discard a fully-exhausted allowance whenever the
+    // period end is missing, and a consumer reads an absent window as unused
+    // capacity rather than as a wall.
+    let primary = used_percent.map(|pct| RateWindow {
+        used_percent: pct,
+        raw_used_percent: None,
+        resets_at,
+        window_minutes: Some(43200),
+        used_count: None,
+        total_count: None,
+    });
 
     if primary.is_none() {
         return Err(FetchError::Decode(
-            "mimo: no valid usage window (missing percent or reset time)".to_string(),
+            "mimo: no valid usage window (missing percent)".to_string(),
         ));
     }
 
@@ -368,9 +370,16 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_reset_drops_window() {
-        let res = normalize(DETAIL_MISSING_RESET, USAGE_HEALTHY);
-        assert!(matches!(res, Err(FetchError::Decode(_))));
+    fn missing_reset_keeps_the_window_with_its_percent() {
+        // A missing period end must not discard a window built from real usage:
+        // an absent window reads downstream as unused capacity, which is the
+        // dangerous direction when the allowance is actually spent.
+        let primary = normalize(DETAIL_MISSING_RESET, USAGE_HEALTHY)
+            .expect("usage data should emit a window")
+            .primary
+            .expect("a real percent is a real window even with no reset reported");
+        assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_minutes, Some(43200));
     }
 
     #[test]

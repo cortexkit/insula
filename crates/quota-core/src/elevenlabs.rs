@@ -61,8 +61,9 @@ fn subscription_url(base: &str) -> String {
 /// Normalize the subscription body to [`Usage`]. Pure — unit-testable.
 ///
 /// `character_count / character_limit * 100` → the primary window's
-/// utilization; `next_character_count_reset_unix` → `resetsAt`. Emits nothing
-/// when the limit is missing or zero (no meaningful utilization).
+/// utilization; `next_character_count_reset_unix` → `resetsAt` when present.
+/// Emits nothing when the limit is missing or zero (no meaningful utilization);
+/// a missing reset is carried as absent rather than discarding the window.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: SubscriptionResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("elevenlabs subscription not decodable: {e}")))?;
@@ -70,13 +71,17 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let primary = match (response.character_count, response.character_limit) {
         (Some(count), Some(limit)) if limit > 0.0 => {
             let used_percent = (count / limit * 100.0).clamp(0.0, 100.0);
+            // The percent is load-bearing and the reset is optional: a real
+            // character limit is a real window even when the upstream omits the
+            // next reset. Dropping it would make an exhausted allowance report as
+            // no signal at all, which reads downstream as unused capacity.
             let resets_at = response
                 .next_character_count_reset_unix
                 .and_then(env::epoch_to_iso8601);
-            resets_at.map(|resets_at| RateWindow {
+            Some(RateWindow {
                 used_percent,
                 raw_used_percent: None,
-                resets_at: Some(resets_at),
+                resets_at,
                 window_minutes: None,
                 used_count: None,
                 total_count: None,
@@ -166,10 +171,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_drops_window() {
-        let body = br#"{ "character_count": 10, "character_limit": 100 }"#;
-        // No reset timestamp → no well-formed window.
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+    fn exhausted_allowance_without_reset_still_reports_its_percent() {
+        // The percent is load-bearing and the reset is optional. Pinned at 100%
+        // because a vanishing exhausted window is the dangerous direction: a
+        // consumer cannot distinguish "no window" from "plenty of room".
+        let body = br#"{ "character_count": 100, "character_limit": 100 }"#;
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("a real limit is a real window even with no reset reported");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(
+            primary.resets_at, None,
+            "an absent reset is carried as absent, never fabricated"
+        );
     }
 
     #[test]
