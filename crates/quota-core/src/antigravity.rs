@@ -363,7 +363,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         return None;
     }
     let remaining = remaining_fraction_of(bucket)?;
-    let reset = bucket.reset_time.as_ref().and_then(parse_reset)?;
+    let reset = bucket.reset_time.as_ref().and_then(parse_reset);
     // Round to 2dp: the fraction→percent arithmetic exposes float noise
     // (e.g. (1 - 0.8) * 100 = 19.999999999999996), same cleanup grok applies.
     let used_percent = (((1.0 - remaining) * 100.0).clamp(0.0, 100.0) * 100.0).round() / 100.0;
@@ -379,7 +379,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         window: RateWindow {
             used_percent,
             raw_used_percent: None,
-            resets_at: Some(reset),
+            resets_at: reset,
             window_minutes: window_minutes_of(bucket),
             used_count: None,
             total_count: None,
@@ -429,7 +429,7 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
 
     if resolved.is_empty() {
         return Err(FetchError::Decode(
-            "antigravity: no quota buckets with both a known fraction and a reset".to_string(),
+            "antigravity: no quota buckets with a known fraction".to_string(),
         ));
     }
 
@@ -684,14 +684,29 @@ mod tests {
     }
 
     #[test]
-    fn bucket_without_reset_is_dropped() {
+    fn bucket_without_reset_is_kept() {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
             {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.5}
         ]}]}"#;
-        assert!(matches!(
-            parse_quota_summary(body),
-            Err(FetchError::Decode(_))
-        ));
+        let primary = parse_quota_summary(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn exhausted_bucket_without_reset_is_kept() {
+        let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
+            {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.0}
+        ]}]}"#;
+        let primary = parse_quota_summary(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]

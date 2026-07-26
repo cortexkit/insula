@@ -434,12 +434,11 @@ fn window_from_map(
     window_minutes: i64,
 ) -> Option<RateWindow> {
     let used_percent = percent_from_map(map)?;
-    let reset_epoch = reset_epoch_for_map(map, now_secs)?;
-    let resets_at = env::epoch_to_iso8601(reset_epoch)?;
+    let resets_at = reset_epoch_for_map(map, now_secs).and_then(env::epoch_to_iso8601);
     Some(RateWindow {
         used_percent,
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
@@ -813,11 +812,24 @@ mod tests {
     }
 
     #[test]
-    fn percent_without_reset_drops_window() {
+    fn percent_without_reset_keeps_window() {
         let html = r#"{"rollingUsage":{"usagePercent":50},"weeklyUsage":{"usagePercent":10,"resetInSec":3600}}"#;
         let usage = parse_windows(html, 1_700_000_000, false).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
         assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
+    }
+
+    #[test]
+    fn exhausted_percent_without_reset_is_kept() {
+        let html = r#"{"rollingUsage":{"usagePercent":100}}"#;
+        let primary = parse_windows(html, 1_700_000_000, false)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]
@@ -832,13 +844,15 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_reset_drops_window_without_fabricating() {
-        // An absurd resetAt ("1e308") is not a real timestamp; the window is
-        // dropped rather than emitted with a fabricated or saturated reset.
+    fn out_of_range_reset_omits_reset_without_dropping_window() {
+        // An absurd resetAt ("1e308") is not a real timestamp; the window remains
+        // available with no reset rather than receiving a fabricated timestamp.
         let json = r#"{"rollingUsage":{"usagePercent":50,"resetAt":1e308},
                        "weeklyUsage":{"usagePercent":10,"resetInSec":3600}}"#;
         let usage = parse_windows(json, 1_700_000_000, false).unwrap();
-        assert!(usage.primary.is_none(), "garbage reset → no window");
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
         assert_eq!(usage.secondary.unwrap().used_percent, 10.0);
     }
 

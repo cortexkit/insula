@@ -237,11 +237,11 @@ fn detail_used_percent(detail: &KimiUsageDetail) -> Option<f64> {
 
 fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Option<RateWindow> {
     let used_percent = detail_used_percent(detail)?;
-    let resets_at = parse_reset_time(detail.reset_time.as_deref())?;
+    let resets_at = parse_reset_time(detail.reset_time.as_deref());
     Some(RateWindow {
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes,
         used_count: None,
         total_count: None,
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_drops_window() {
+    fn missing_reset_keeps_primary_window() {
         let body = br#"{
             "usages": [{
                 "scope": "FEATURE_CODING",
@@ -585,8 +585,27 @@ mod tests {
             }]
         }"#;
         let usage = normalize_usage(body).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 10.0);
+        assert_eq!(primary.resets_at, None);
         assert!(usage.secondary.is_some());
+    }
+
+    #[test]
+    fn exhausted_usage_without_reset_is_kept() {
+        let body = br#"{
+            "usages": [{
+                "scope": "FEATURE_CODING",
+                "detail": { "limit": "10", "used": "10" },
+                "limits": []
+            }]
+        }"#;
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]

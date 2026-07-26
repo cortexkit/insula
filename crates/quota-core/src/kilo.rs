@@ -304,7 +304,7 @@ fn pass_window(pass: &PassFields) -> Option<RateWindow> {
     let used = pass
         .used
         .unwrap_or_else(|| pass.remaining.map(|r| (total - r).max(0.0)).unwrap_or(0.0));
-    let resets_at = pass.resets_at.clone()?;
+    let resets_at = pass.resets_at.clone();
     let used_percent = if total > 0.0 {
         (used / total * 100.0).clamp(0.0, 100.0)
     } else {
@@ -313,7 +313,7 @@ fn pass_window(pass: &PassFields) -> Option<RateWindow> {
     Some(RateWindow {
         used_percent,
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: None,
         used_count: None,
         total_count: None,
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn pass_without_reset_is_dropped() {
+    fn pass_without_reset_keeps_real_window() {
         let body = br#"
         [
           { "result": { "data": { "creditBlocks": [] } } },
@@ -610,7 +610,38 @@ mod tests {
           { "result": { "data": {} } }
         ]
         "#;
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 1.0 / 19.0 * 100.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn exhausted_pass_without_reset_is_kept() {
+        let body = br#"
+        [
+          { "result": { "data": { "creditBlocks": [] } } },
+          {
+            "result": {
+              "data": {
+                "subscription": {
+                  "currentPeriodUsageUsd": 19.0,
+                  "currentPeriodBaseCreditsUsd": 19.0
+                }
+              }
+            }
+          },
+          { "result": { "data": {} } }
+        ]
+        "#;
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]

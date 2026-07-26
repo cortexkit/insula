@@ -117,8 +117,8 @@ fn field_str(obj: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 /// Credits window from `/api/v1/usage` (CodexBar `resolvedTotal`/`resolvedUsed`).
-/// Emits a window only with a real total AND a real `next_quota_reset` — never the
-/// fabricated "100% used, no reset" placeholder.
+/// Emits a window when a real total is available; `next_quota_reset` is optional and
+/// is never fabricated.
 fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
     let used = field_f64(usage, &["usage", "used"]);
     let total = field_f64(usage, &["quota", "limit"]);
@@ -134,11 +134,11 @@ fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
         .or_else(|| remaining.map(|r| (total - r).max(0.0)))
         .unwrap_or(0.0);
 
-    let resets_at = field_str(usage, "next_quota_reset")?;
+    let resets_at = field_str(usage, "next_quota_reset");
     Some(RateWindow {
         used_percent: ((used / total) * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: None,
         used_count: None,
         total_count: None,
@@ -152,11 +152,11 @@ fn weekly_window(subscription: &serde_json::Value) -> Option<RateWindow> {
     let used = field_f64(rate, &["weeklyUsed", "used"])
         .unwrap_or(0.0)
         .max(0.0);
-    let resets_at = field_str(rate, "weeklyResetsAt")?;
+    let resets_at = field_str(rate, "weeklyResetsAt");
     Some(RateWindow {
         used_percent: ((used / limit) * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: Some(WEEKLY_MINUTES),
         used_count: None,
         total_count: None,
@@ -276,20 +276,40 @@ mod tests {
     }
 
     #[test]
-    fn credits_without_reset_is_dropped_not_fabricated() {
-        // The degenerate case CodexBar renders as a fake 100%/no-reset — we DROP it.
+    fn credits_without_reset_keeps_real_window() {
         let usage = br#"{ "usage": 50, "quota": 100 }"#;
         let result = normalize_usage(usage, None).unwrap();
-        assert!(result.primary.is_none());
+        let primary = result.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]
-    fn weekly_dropped_without_real_reset() {
+    fn credits_without_reset_keeps_exhausted_window() {
+        let result = normalize_usage(br#"{ "usage": 100, "quota": 100 }"#, None).unwrap();
+        let primary = result.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn weekly_without_real_reset_keeps_real_window() {
         let usage = br#"{ "usage": 1, "quota": 10, "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
         let subscription = br#"{ "rateLimit": { "weeklyUsed": 5, "weeklyLimit": 100 } }"#;
         let result = normalize_usage(usage, Some(subscription)).unwrap();
         assert!(result.primary.is_some());
-        assert!(result.secondary.is_none());
+        let secondary = result.secondary.expect("usage data should emit a window");
+        assert_eq!(secondary.used_percent, 5.0);
+        assert_eq!(secondary.resets_at, None);
+    }
+
+    #[test]
+    fn weekly_without_reset_keeps_exhausted_window() {
+        let subscription = br#"{ "rateLimit": { "weeklyUsed": 100, "weeklyLimit": 100 } }"#;
+        let result = normalize_usage(br#"{}"#, Some(subscription)).unwrap();
+        let secondary = result.secondary.expect("usage data should emit a window");
+        assert_eq!(secondary.used_percent, 100.0);
+        assert_eq!(secondary.resets_at, None);
     }
 
     #[test]
