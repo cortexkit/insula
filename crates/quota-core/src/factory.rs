@@ -21,8 +21,10 @@
 //! `:1315-1324` auth failures, `:1424-1439` direct bearer). WorkOS token
 //! exchange (`:807-816`, `:1488-1576`) is deferred — see `resolve_direct_bearer`.
 //!
-//! `// TODO(primary): WorkOS-exchange fallback` when only WorkOS refresh cookies
-//! exist and no direct bearer is available.
+//! When only WorkOS refresh cookies are present and no direct bearer is
+//! available, this provider resolves no credential and degrades: exchanging
+//! those cookies at the WorkOS token endpoint is not implemented here, and a
+//! refresh cookie is not itself usable as a bearer.
 
 use std::time::Duration;
 
@@ -85,7 +87,10 @@ fn resolve_direct_bearer(jar: &CookieJar) -> Option<String> {
             return Some(bearer_from_cookie_value(value));
         }
     }
-    // TODO(primary): WorkOS-exchange fallback when only wos-session / refresh cookies exist.
+    // No fallback when only wos-session / refresh cookies are present: exchanging
+    // those for a bearer needs the WorkOS token endpoint, which is not
+    // implemented here. Returning None degrades this provider with a reason
+    // rather than guessing at a credential.
     None
 }
 

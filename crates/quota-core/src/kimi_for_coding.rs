@@ -434,9 +434,10 @@ impl KimiForCodingProvider {
             Ok(credential) => credential,
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
-        // apikey records have no account_id by contract (see CKCRED enumeration
-        // contract: apikey:* has no refresh adapter and no account identity), so
-        // the served observation is structurally None here.
+        // API-key credential records carry no account identity by contract — they
+        // have no refresh adapter and nothing that resolves an account — so the
+        // served observation is structurally None here, and this provider emits a
+        // single unlabeled entry rather than a per-account one.
         let record_version = credential.record_version;
         let account_info = credential.account_info();
         let observed = Some(AccountObservation::new(
