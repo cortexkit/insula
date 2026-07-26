@@ -156,6 +156,32 @@ consumed internally rather than published. Everywhere else, a 100% window is
 inferred from counts or percentages, so **no field on this wire states that a
 provider is currently refusing requests**. Do not read one into `usedPercent`.
 
+### An exhausted window may carry no reset at all
+
+`resetsAt` is optional and is never fabricated. The percent is the load-bearing
+field: a window is emitted from the percent alone, and a reset is carried
+through only when the upstream reports one. **A window at 100% with no
+`resetsAt` is a legal, intended shape**, not a parse failure.
+
+It is also reachable rather than theoretical, and it clusters exactly where it
+hurts most. At least one upstream *moves* its reset timestamp out of the
+exhausted window's block once that window is spent, so the depleted window
+honestly reports no recovery time. Others simply omit it, and dropping such a
+window once made a fully-exhausted account read as no signal at all — which is
+why they are emitted.
+
+The consequence for any logic that sorts or selects on reset time: decide
+explicitly what an absent reset means there, because the answer that falls out
+of a comparator by default is rarely the one you want. Treating absent as
+"soonest" makes a provider with no evidence of recovery win every retry;
+treating it as "never" excludes it from recovery paths permanently rather than
+until it resets. Neither is wrong by construction, but it should be a decision.
+
+A live sample will not reveal this. At any given moment most exhausted windows
+do carry a reset, so a check against today's wire agrees with the assumption
+that one is always present. That agreement is not evidence — the case is
+structurally absent from the sample rather than impossible.
+
 What follows for a consumer: treat 100% as *expect no headroom* rather than
 *calls will fail*, and let the actual API error be what proves refusal. If you
 need enforcement as a fact rather than an inference, ask — it would be an
