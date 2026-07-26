@@ -31,6 +31,15 @@ fn is_session_cookie(name: &str) -> bool {
 
 // ---- HTML parsing (pure) ----------------------------------------------------
 
+/// Find `field_name`'s numeric value in an HTML/JS blob, requiring the match to
+/// be a whole word.
+///
+/// `field_name` must be ASCII. The scan advances one byte past a rejected match
+/// to allow an overlapping candidate, which is a character boundary only because
+/// the byte at the match start is single-byte. A non-ASCII needle would make that
+/// advance land inside a character and panic on the next slice — and the panic
+/// would surface here rather than at the caller that chose the needle. All four
+/// callers pass ASCII literals.
 fn find_numeric_field(html: &str, field_name: &str) -> Option<f64> {
     let bytes = html.as_bytes();
     let mut start = 0;
@@ -88,6 +97,12 @@ fn find_numeric_field(html: &str, field_name: &str) -> Option<f64> {
                 }
             }
         }
+        // One byte past the match start, so an overlapping candidate is still
+        // found. Safe only while the needle is ASCII (see the doc comment).
+        debug_assert!(
+            field_name.is_ascii(),
+            "find_numeric_field needs an ASCII needle"
+        );
         start = match_pos + 1;
     }
     None
@@ -329,6 +344,22 @@ mod tests {
         };
       </script>
     "#;
+
+    #[test]
+    fn multibyte_html_around_the_needle_does_not_panic() {
+        // The scan advances one byte past a rejected match, which is a character
+        // boundary only because the needle is ASCII. Multibyte text elsewhere in
+        // the document must not reach that cursor: a rejected candidate here is
+        // one whose neighbouring character makes it part of a longer identifier,
+        // and the walk past it has to stay on character boundaries.
+        //
+        // The real value is findable only AFTER a rejected candidate, so this
+        // fails if the scan gives up on the first non-match rather than passing
+        // because nothing was parsed at all.
+        let html = "{\"caf\u{e9}Label\":\"caf\u{e9} \u{2014} plan\",\"myquota\":1,\"quota\":42}";
+        assert!(!html.is_ascii(), "fixture must be multibyte");
+        assert_eq!(find_numeric_field(html, "quota"), Some(42.0));
+    }
 
     #[test]
     fn parses_healthy_usage() {

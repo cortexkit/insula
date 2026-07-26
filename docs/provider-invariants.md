@@ -158,6 +158,25 @@ Two recurring sources here:
   stripping anything. The general shape is worth recognising: **a test for a
   matched pair must establish that there are two of them.**
 
+Every remaining slice site in the HTML and text scrapers is boundary-safe today,
+and they are all safe for the *same* two reasons. Preserve both when writing a
+new one, because neither is visible at the slice itself:
+
+- **The needles are ASCII literals.** A `find` result is a boundary, and adding
+  the length of an ASCII needle to it lands on another one. A needle containing
+  any non-ASCII character breaks that silently, and the panic surfaces at the
+  slice rather than at the literal that caused it.
+- **Cursor walks stop on ASCII bytes.** A scan that advances while a byte is an
+  ASCII digit stops on a byte that is not one, and a UTF-8 continuation byte is
+  never an ASCII digit — so the cursor cannot come to rest inside a character.
+  A walk whose stop condition admits non-ASCII bytes loses that property.
+
+So the class is currently closed, and it is closed by circumstance rather than
+by construction. The one form to avoid outright is advancing a cursor by a fixed
+small number of bytes (`pos + 1`) to continue a search: it is correct only while
+the byte at `pos` is single-byte, which is a fact about the needle rather than
+about the loop. Advance by the needle's length instead.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's
