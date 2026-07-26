@@ -103,6 +103,15 @@ data was true, and it keeps running through the quiet.
 same provider routinely differ, because they are separate slots on separate
 backoff schedules. Build no snapshot-moment invariant on one response.
 
+**A degraded entry can carry a `fetchedAt` too, and it means something
+different.** The timestamp survives the failure that degraded the entry, so it
+reports when that provider last succeeded — not when the error was observed, and
+not when anything now in the entry was true. On a usable entry `fetchedAt` dates
+the content you are holding; on a degraded one it dates content that is no
+longer there. Its presence therefore says nothing about whether an entry is
+usable: test `usage` for that. It is absent only where a slot has never
+succeeded, which is the common case on a host lacking that credential.
+
 ## Degraded means "we cannot read it", not "the provider is down"
 
 The set that produces a degraded entry is the non-transient failures, defined by
