@@ -234,8 +234,26 @@ impl JsonRequest {
     /// - 401/403 → [`FetchError::Unauthorized`]
     /// - other non-2xx → [`FetchError::Upstream`] (with a short body excerpt)
     /// - transport/timeout → [`FetchError::Upstream`]
+    /// - 2xx with an empty body → [`FetchError::Upstream`] (see below)
     pub async fn send(self, client: &reqwest::Client) -> Result<Vec<u8>, FetchError> {
-        Ok(self.send_full(client).await?.body)
+        let body = self.send_full(client).await?.body;
+        // A 2xx that carries nothing is a transport or edge condition, not an
+        // answer: an edge that drops the payload, a proxy that closes early, a
+        // gateway that acknowledges without serving. Every normalizer downstream
+        // would fail to parse it and report `Decode`, which is non-transient and
+        // therefore REPLACES the last healthy window with a degraded entry — so a
+        // provider that is merely flapping reads as dead for as long as the flap
+        // lasts. Classifying it here keeps the whole class right for every caller
+        // rather than one provider at a time.
+        //
+        // Callers that legitimately expect an empty 2xx must not use this method:
+        // `send_raw` returns the body verbatim with no classification.
+        if body.is_empty() {
+            return Err(FetchError::Upstream(
+                "empty response body on a success status".to_string(),
+            ));
+        }
+        Ok(body)
     }
 
     /// Like [`send`](Self::send) but also returns the response status + headers
@@ -394,6 +412,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual, expected);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_success_body_is_transient_so_a_flap_keeps_the_cached_window() {
+        // An edge that returns 200 with nothing is flapping, not answering. Every
+        // normalizer would fail to parse an empty body and report Decode, which
+        // `refresh::classify` treats as non-transient and which therefore replaces
+        // the last healthy window with a degraded entry. Classifying it Upstream
+        // here is what keeps a flapping provider readable instead of dead.
+        let (url, server) = serve_fixed(200, Vec::new()).await;
+
+        let error = JsonRequest::get(url)
+            .send(&reqwest::Client::new())
+            .await
+            .expect_err("an empty success body must not be handed to a normalizer");
+
+        assert!(
+            matches!(error, FetchError::Upstream(_)),
+            "an empty 2xx must be Upstream, got {error:?}"
+        );
+        assert_eq!(
+            crate::refresh::classify(&error),
+            crate::refresh::FetchClass::Transient,
+            "an empty 2xx must be transient so the refresher keeps serving the last healthy window"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_send_returns_an_empty_success_body_unclassified() {
+        // `send_raw` is the escape hatch for callers whose status/body policy is
+        // bespoke, so it must not apply the empty-body rule: a caller reading a
+        // header off a body-less response is entitled to that response.
+        let (url, server) = serve_fixed(200, Vec::new()).await;
+
+        let response = JsonRequest::get(url)
+            .send_raw(&reqwest::Client::new())
+            .await
+            .expect("send_raw must not classify an empty body");
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
         server.await.unwrap();
     }
 

@@ -101,6 +101,21 @@ Getting this backwards makes a healthy provider read as dead on every
 intermittent flap. A rejection that names itself with a code is a real provider
 answer and still degrades; only a content-free response is transient.
 
+The empty-body case is handled **centrally**, in `http.rs` `send`: a 2xx whose
+body is empty never reaches a normalizer, because every normalizer would fail to
+parse it and report `Decode`. Providers do not need their own guard for it, and
+adding one is duplicated logic rather than defence in depth. The exception is
+`send_raw`, which deliberately applies no classification for callers whose
+status and body policy is bespoke — those callers own this decision themselves.
+
+This rule was ratified and then applied to three providers one at a time, over
+three separate incidents, while every other provider kept the defect. That is
+the general failure and it is worth stating on its own: **fixing instances is
+not closing a class.** If a rule here has been applied more than twice without
+anyone enumerating where else it applies, the enumeration is the outstanding
+work, not the next instance. Where the class has a single choke point, put the
+rule there — a rule enforced in one place cannot be half-applied.
+
 ## Never panic on input we do not control
 
 A fetch panic is contained, but classified non-transient — so it clears the
