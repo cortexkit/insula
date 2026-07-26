@@ -244,11 +244,11 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     if total <= 0 {
         return None;
     }
-    let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs)?;
+    let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs);
     Some(RateWindow {
         used_percent: used_percent(total, remaining),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
         used_count: None,
         total_count: None,
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_drops_window() {
+    fn missing_reset_keeps_interval_window() {
         let body = br#"{
           "base_resp": { "status_code": 0 },
           "model_remains": [{
@@ -540,7 +540,26 @@ mod tests {
           }]
         }"#;
         let usage = normalize_usage_at(body, NOW).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
+    fn exhausted_interval_without_reset_is_kept() {
+        let body = br#"{
+          "base_resp": { "status_code": 0 },
+          "model_remains": [{
+            "current_interval_total_count": 100,
+            "current_interval_usage_count": 0
+          }]
+        }"#;
+        let primary = normalize_usage_at(body, NOW)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]

@@ -215,11 +215,11 @@ fn window_from_used_total_reset(
     if total <= 0 {
         return None;
     }
-    let resets_at = any_date(reset_keys, quota)?;
+    let resets_at = any_date(reset_keys, quota);
     Some(RateWindow {
         used_percent: (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
@@ -506,13 +506,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_reset_drops_that_window() {
+    fn missing_reset_preserves_primary_window() {
         let mut quota = sample_quota();
         quota.remove("per5HourQuotaNextRefreshTime");
         let payload = json!({ "codingPlanQuotaInfo": quota });
         let usage = normalize_usage(payload.to_string().as_bytes()).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.resets_at, None);
         assert!(usage.secondary.is_some());
+    }
+
+    #[test]
+    fn exhausted_window_without_reset_is_kept() {
+        let mut quota = sample_quota();
+        quota.insert("per5HourUsedQuota".to_string(), Value::Number(100.into()));
+        quota.insert("per5HourTotalQuota".to_string(), Value::Number(100.into()));
+        quota.remove("per5HourQuotaNextRefreshTime");
+        let payload = json!({ "codingPlanQuotaInfo": quota });
+        let usage = normalize_usage(payload.to_string().as_bytes()).unwrap();
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
     }
 
     #[test]

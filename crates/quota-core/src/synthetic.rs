@@ -312,13 +312,13 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
     let used_percent = used_percent?;
     let clamped = used_percent.clamp(0.0, 100.0);
 
-    let resets_at = first_date(map, RESET_KEYS)?;
+    let resets_at = first_date(map, RESET_KEYS);
     let window_minutes = window_minutes(map);
 
     Some(RateWindow {
         used_percent: clamped,
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes,
         used_count: None,
         total_count: None,
@@ -612,6 +612,23 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_window_without_reset_is_kept() {
+        let body = br#"{
+            "rollingFiveHourLimit": {
+                "used": 100,
+                "limit": 100,
+                "window": "5hr"
+            }
+        }"#;
+        let primary = normalize_usage(body)
+            .unwrap()
+            .primary
+            .expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.resets_at, None);
+    }
+
+    #[test]
     fn test_duration_string_parse() {
         assert_eq!(window_minutes_from_text("5hr"), Some(300));
         assert_eq!(window_minutes_from_text("30min"), Some(30));
@@ -622,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_reset_drops_window() {
+    fn test_missing_reset_keeps_window() {
         let body = br#"{
             "rollingFiveHourLimit": {
                 "used": 20,
@@ -631,6 +648,8 @@ mod tests {
             }
         }"#;
         let usage = normalize_usage(body).unwrap();
-        assert!(usage.primary.is_none());
+        let primary = usage.primary.expect("usage data should emit a window");
+        assert_eq!(primary.used_percent, 20.0);
+        assert_eq!(primary.resets_at, None);
     }
 }
