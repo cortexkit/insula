@@ -74,12 +74,20 @@ Each entry carries its own `fetchedAt`: the wall-clock time of that slot's last
 on it.
 
 Do not stamp poll time. On a transient failure this module keeps serving the
-last healthy window for the whole exponential backoff — a nominal 60s doubling
-to a 15-minute cap — so an entry can legitimately be much older than the
+last healthy window, so an entry can legitimately be much older than the
 response containing it. Stamping poll time does not merely under-report that
 staleness, it **actively resets** it, and the reset is driven by the consumer's
 poll cadence rather than the producer's failure duration. Polling more often
 makes it strictly worse.
+
+**There is no upper bound on how stale a served entry can be.** The retry
+interval is capped — a nominal 60s doubling to 15 minutes — but that caps how
+often this module *retries*, not how long it will keep serving. Nothing expires
+an entry on age: while failures stay transient, a provider down for six hours
+serves a six-hour-old window, retried every fifteen minutes throughout. Do not
+size a staleness threshold against the retry cap, and do not treat any duration
+as "too old to still be served" — `fetchedAt` is the only thing that says how
+old an entry is, and it is authoritative without limit.
 
 The mirror of that mistake is easy to make while fixing it. If you preserve
 windows across a response that did not mention them — an empty array, or a
