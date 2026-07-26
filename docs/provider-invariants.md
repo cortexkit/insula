@@ -266,6 +266,16 @@ ever go red, so the belief survives indefinitely and gets repeated as a
 guarantee. Name a test after the case it constructs, and put the general rule in
 a comment where it cannot be mistaken for something CI verifies.
 
+The check that finds it is narrower than "does this name generalise", which
+catches too much to be useful — plenty of names quantify over cases the fixture
+really does enumerate. Ask instead: **could this fixture have produced the
+counterexample?** A name is safe over a fixture that could have failed it. The
+dangerous shape is a name asserting an ABSENCE over inputs that cannot generate
+the presence, which is unfalsifiable by construction rather than merely
+untested. Sweeping every test name here on that question found exactly one
+instance, so it is rare — but it produced a false guarantee in a published
+contract, which is as far as a defect in a test name can travel.
+
 A corollary worth holding onto: **when a document and a test name agree, that is
 not two sources.** If the document was written by someone reading the suite, it
 is one source counted twice, and it feels exactly like corroboration. The only
