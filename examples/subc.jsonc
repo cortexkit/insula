@@ -3,7 +3,8 @@
 // Install: merge this `modules` entry into your real subc config at
 //   $XDG_CONFIG_HOME/cortexkit/subc.jsonc   (default: ~/.config/cortexkit/subc.jsonc)
 // and point `program` at your built binary (cargo build --release →
-// target/release/ck-quota). On its next start, subc-core spawns + supervises it.
+// target/release/ck-quota). On its next start, the ck-subc daemon spawns +
+// supervises it.
 //
 // The daemon appends `--subc <connection-file>` and injects the SUBC_MODULE_ID env
 // var itself — do NOT add those to args/env here. The map KEY ("ai-provider-quota")

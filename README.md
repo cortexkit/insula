@@ -60,7 +60,7 @@ cargo test -p quota-module       # in-process wire e2e (skeleton_e2e)
 ```
 
 Live and real-daemon proofs are `#[ignore]` (need real sessions / a built
-`subc-core`):
+`ck-subc`):
 
 ```sh
 # real provider windows through the wire (needs the provider's real session):
@@ -68,14 +68,15 @@ cargo test -p quota-core --test gemini_live    -- --ignored --nocapture
 cargo test -p quota-core --test grok_live      -- --ignored --nocapture
 cargo test -p quota-module --test skeleton_e2e -- --ignored --nocapture
 
-# real-daemon supervision: a standalone subc-core spawns the module from subc.jsonc
-# and routes usage.get (builds subc-core in ../subconscious):
+# real-daemon supervision: a standalone ck-subc daemon spawns the module from
+# subc.jsonc and routes usage.get (builds ck-subc in ../subconscious):
 cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture
 ```
 
 ## Install as a supervised subc module
 
-The subc daemon (`subc-core`) spawns and supervises modules listed in its config at
+The subc daemon binary (`ck-subc`, built from the `subc-core` crate) spawns and
+supervises modules listed in its config at
 `$XDG_CONFIG_HOME/cortexkit/subc.jsonc` (`~/.config/cortexkit/subc.jsonc`). Add an
 entry pointing `program` at the built binary — see `examples/subc.jsonc`:
 
