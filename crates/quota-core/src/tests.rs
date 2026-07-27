@@ -221,6 +221,67 @@ async fn read_never_blocks_on_an_inflight_fetch() {
     running.await.unwrap();
 }
 
+#[test]
+fn every_api_provider_key_names_a_registered_provider() {
+    // `apiProvider` is a claim about identity, not a label: consumers join
+    // pricing and spend data on it. The mapping is keyed by this module's own
+    // provider name, so renaming a provider silently strips the canonical slug
+    // from its wire entries -- the stale key simply stops matching and the
+    // lookup returns None, which is also what "no counterpart exists" looks
+    // like. Nothing else would fail.
+    //
+    // Checking every key resolves to a registered provider makes that drift
+    // visible at the moment of the rename.
+    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    let registered: std::collections::HashSet<&str> =
+        registry.provider_names().into_iter().collect();
+
+    let source = include_str!("lib.rs");
+    let start = source
+        .find("fn api_provider_name")
+        .expect("api_provider_name must exist");
+    let body_end = source[start..]
+        .find("\n}")
+        .expect("api_provider_name must have a body");
+    let body = &source[start..start + body_end];
+
+    let mut keys = Vec::new();
+    for line in body.lines() {
+        let Some((left, right)) = line.split_once("=> Some(") else {
+            continue;
+        };
+        let Some(key) = left.split('"').nth(1) else {
+            continue;
+        };
+        let value = right.split('"').nth(1).unwrap_or_default().to_string();
+        keys.push((key.to_string(), value));
+    }
+
+    assert!(
+        keys.len() >= 15,
+        "parsed too few mapping keys ({}), the extraction is broken rather than the map",
+        keys.len()
+    );
+
+    let unknown: Vec<&str> = keys
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !registered.contains(key))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "api_provider_name maps provider names that are not registered: {unknown:?} -- \
+         a provider was renamed and its canonical slug silently stopped reaching the wire"
+    );
+
+    for (key, value) in &keys {
+        assert!(
+            !value.is_empty(),
+            "provider {key} maps to an empty canonical name"
+        );
+    }
+}
+
 struct LabelProvider {
     labels: Arc<Mutex<HashMap<String, Option<String>>>>,
 }

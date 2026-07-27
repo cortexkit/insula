@@ -266,6 +266,16 @@ The cheap way to check either: delete the condition and see which tests redden.
 If the only failures are in tests named for something else, the condition is
 defended by accident and one refactor from being unguarded.
 
+A grant can also fail by **going silent** rather than by being unearned, and
+that direction has no guard to delete — there is nothing to mutate, because the
+claim is simply absent. `apiProvider` is keyed by this module's own provider
+name, so renaming a provider leaves a stale key that stops matching; the lookup
+then returns the same "no counterpart exists" answer it gives for a provider
+that genuinely has none, and the canonical name quietly disappears from the
+wire. When a claim is optional by design, its absence cannot be distinguished
+from its correct absence, so the check has to be that **the thing it is keyed to
+still exists**.
+
 ### The grants this module makes
 
 This list exists so the check does not depend on remembering to run it. Every
@@ -281,6 +291,7 @@ no test naming that site, that is the finding.
 | `account` label | labeled emission | identity not in flux | yes, per site |
 | `fetchedAt` (this slot last succeeded then — **not** that the entry beside it is usable) | both | set only from a successful fetch, by construction | yes |
 | a healthy entry (`error` absent, `usage` present) | both | a fetch that returned windows | structural |
+| `apiProvider` (this usage is that upstream's, in a shared vocabulary consumers join spend and pricing on) | both | a mapping entry exists for this provider | key‑drift only |
 
 Two of these rows were added *after* deleting the condition and finding nothing
 reddened. The table is the defence: a warning asks you to feel differently, a
