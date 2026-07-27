@@ -227,6 +227,17 @@ is stale, otherwise `ok`. Per-provider degradation deliberately does not flip
 module status — most providers lack credentials on any given host, so it would
 sit permanently degraded and mean nothing.
 
+**Health counts providers; the array carries accounts.** A provider with several
+credentialed accounts contributes several entries to `usage.get` and exactly one
+to these buckets, so the array is normally longer than `providersTotal` and the
+two are not reconcilable by counting. On this host today: 39 entries against 35
+providers. When a provider's accounts disagree, the buckets take the best one —
+any fresh account makes it fresh, any stale one makes it stale, and it counts as
+degraded only when *every* account is. So a provider showing `fresh` here can
+still have a dead account visible in the array, which is the intended reading:
+this axis answers whether the module is serving a provider at all, not whether
+every account under it is healthy.
+
 The metrics carry a conservation identity that must balance:
 
 ```
