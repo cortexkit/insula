@@ -227,6 +227,14 @@ is stale, otherwise `ok`. Per-provider degradation deliberately does not flip
 module status — most providers lack credentials on any given host, so it would
 sit permanently degraded and mean nothing.
 
+Aggregating across a provider's accounts is a consumer decision, and it is not
+the same decision for every question. "Can I use this provider at all" takes the
+best account. "Is this account exhausted" must stay per-account, or one dead
+account walls a provider that has a live sibling. One caution if you collapse
+entries at all: `rawUsedPercent` is an **entitlement held by one account**, not
+a property of the provider, so the effective and raw figures of two accounts are
+not comparable and must never be mixed across a merge.
+
 **Health counts providers; the array carries accounts.** A provider with several
 credentialed accounts contributes several entries to `usage.get` and exactly one
 to these buckets, so the array is normally longer than `providersTotal` and the
