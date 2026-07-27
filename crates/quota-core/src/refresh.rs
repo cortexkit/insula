@@ -457,6 +457,45 @@ mod tests {
         assert_eq!(next.last_success_at, good.last_success_at);
     }
 
+    /// A transient failure stale-serves only when there is something to serve.
+    /// On a slot that has never succeeded there is no prior window, so the
+    /// transient class degrades like any other -- which is what a consumer sees
+    /// first from a provider whose opening fetch times out. The resulting entry
+    /// carries a transient cause and no success timestamp, so it is a verdict
+    /// about the attempt rather than about the credential.
+    #[test]
+    fn a_transient_failure_with_no_prior_success_degrades() {
+        let t0 = Instant::now();
+        let cold = ProviderSlot::due_now(t0, incarnation());
+        assert!(cold.entry.is_none(), "precondition: nothing to stale-serve");
+
+        let next = next_slot_after_attempt(
+            &cold,
+            "codex",
+            attempt(
+                Some("A"),
+                Err(FetchError::Upstream("connect timeout".into())),
+            ),
+            t0,
+            t0,
+        );
+
+        // Pin the reason for the degradation below. The error is Transient --
+        // the class that stale-serves -- so the slot degrades for lack of a
+        // prior window, not because the failure was classified non-transient.
+        assert_eq!(
+            classify(&FetchError::Upstream("connect timeout".into())),
+            FetchClass::Transient,
+        );
+        assert_eq!(next.status, SlotStatus::Degraded);
+        let entry = next.entry.as_ref().expect("a degraded entry is emitted");
+        assert!(entry.error.is_some(), "it carries the transient cause");
+        assert!(entry.usage.is_none());
+        // No success has ever happened, so the entry dates nothing: a consumer
+        // has nothing to retain or hard-age here.
+        assert!(next.last_success_at.is_none());
+    }
+
     #[test]
     fn non_transient_failure_replaces_a_prior_healthy_entry() {
         let t0 = Instant::now();

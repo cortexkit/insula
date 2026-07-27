@@ -196,10 +196,21 @@ payload is unusable. An absent entry is **unfinished**: a sweep is still
 running.
 
 Retaining a last-known-good value through an absent entry is correct. Retaining
-it through a degraded entry overrides a conclusion already reached — and since
-the transient path never emits a degraded entry, every degraded entry a consumer
-retains through is one this module has already judged. Hard-age rather than drop
-if you keep anything, since only some of the class self-recovers.
+it through a degraded entry overrides a conclusion already reached. Hard-age
+rather than drop if you keep anything, since only some of the class
+self-recovers.
+
+One exception, and it matters because it is the *first* thing a consumer sees
+from a provider: a transient failure serves the last healthy window stale only
+when there **is** one. A slot that has never yet succeeded has nothing to serve,
+so a transient failure there degrades like any other — a provider whose very
+first fetch times out reports a degraded entry carrying a timeout error, not an
+absent one. Such an entry is a *verdict about this attempt*, not about the
+credential, and it flips to a window on the first success without any state
+change on your side. Concretely: a degraded entry with **no** `fetchedAt` has
+never produced data, so there is nothing to retain and nothing to hard-age, and
+its error text may name a transient cause. The retention question only arises
+for a degraded entry that *does* carry a `fetchedAt`.
 
 ## Health is a separate axis
 
@@ -212,8 +223,16 @@ sit permanently degraded and mean nothing.
 The metrics carry a conservation identity that must balance:
 
 ```
-fresh + stale + degraded + withoutHandles == providersTotal
+fresh + stale + len(degraded) + len(withoutHandles) == providersTotal
 ```
+
+**The four terms are not the same type on the wire.** `fresh` and `stale` are
+numbers; `degraded` and `withoutHandles` are arrays of provider names, because
+knowing *which* providers are degraded is worth more than knowing how many.
+Take their lengths. A language that coerces rather than complaining will happily
+evaluate the wrong expression here — in JavaScript, `7 + 0 + [..28 names..] +
+[]` is a string, and the comparison is simply false forever, which reads as a
+standing imbalance rather than as a bug in the assertion.
 
 Assert it and alert on imbalance. It cannot be tuned into silence and cannot
 pass by sampling healthy members. It is **not** a liveness signal, though: it
