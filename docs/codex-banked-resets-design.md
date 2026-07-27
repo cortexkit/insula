@@ -118,8 +118,21 @@ Rules:
   next attempt for that account REUSES the pending record's id — the server's
   `already_redeemed` resolves it without a second spend. A NEW id is never
   minted while a pending record exists for the account.
-- A pending record older than 24h with repeated resolution failures is marked
-  abandoned (logged); abandonment never mints a new id in the same tick.
+- A pending record is **never abandoned**. There are two statuses, `pending` and
+  `resolved`, and only a server outcome (`reset`, `nothing_to_reset`,
+  `no_credit`, `already_redeemed`) moves a record to `resolved`. Past 24h the
+  record is logged as pending-old on each inspection and nothing else changes:
+  the id stays the only id for its logical redemption, because the alternative
+  — retiring it locally — would allow a second id for a redemption that may
+  already have landed, which is the double-spend this journal exists to prevent.
+  Recovery is by retry, not by expiry: while a pending record exists the account
+  retries that same id about once a minute, and the server resolves it.
+- Consequence worth stating, because it is the operational failure mode: an
+  account whose pending record never resolves is **fenced indefinitely** — it
+  will not consume another credit, and it reports raw usage rather than relaxed,
+  which is the safe direction but is silent. The only signal is the pending-old
+  line on stderr; the journal file is the authority. If an account stops
+  relaxing while credits remain, read `redemptions.json` before anything else.
 - Resolved records double as the durable spend-rate bound (F3/F4): a new
   redemption for an account is not opened within 30 minutes of the previous
   record's `created_at` (survives restart, unlike the v1 in-memory cooldown).
@@ -218,8 +231,15 @@ pending journal record; journal I/O failure; slot stale or degraded.
 
 stderr per tick when the feature is on: raw percents, credit count, earliest
 expiry, armed state, relax_eligible, and every journal transition
-(reserve/resolve/abandon) with outcome codes. The truth is always in the log
-even when the wire is relaxed.
+(reserve/resolve) with outcome codes. The truth is always in the log even when
+the wire is relaxed.
+
+That is the whole of it, and it is worth being blunt about the limit: none of
+this reaches the health check or the wire, and the supervisor does not persist a
+module's stderr, so on a running host the log is effectively unreadable after
+the fact. **The journal file is the only durable record of what this feature
+did.** Read it directly — it is small, it is JSON, and it answers "did this
+account spend a credit, when, and did the server confirm it" exactly.
 
 ## What we deliberately do NOT do
 
