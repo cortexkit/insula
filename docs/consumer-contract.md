@@ -212,6 +212,13 @@ never produced data, so there is nothing to retain and nothing to hard-age, and
 its error text may name a transient cause. The retention question only arises
 for a degraded entry that *does* carry a `fetchedAt`.
 
+That split is exhaustive: on the wire, a degraded entry without `fetchedAt`
+means the slot has never succeeded, with no third case. The only thing that
+clears the timestamp is an account change, and an account change also puts the
+label in flux — which suppresses the entry entirely rather than publishing it
+without a timestamp. So there is no "succeeded once, but the timestamp is gone"
+entry to account for.
+
 ## Health is a separate axis
 
 Module health comes from the health check, not from the array: `failing` only
