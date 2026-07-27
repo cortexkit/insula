@@ -230,10 +230,29 @@ sit permanently degraded and mean nothing.
 Aggregating across a provider's accounts is a consumer decision, and it is not
 the same decision for every question. "Can I use this provider at all" takes the
 best account. "Is this account exhausted" must stay per-account, or one dead
-account walls a provider that has a live sibling. One caution if you collapse
-entries at all: `rawUsedPercent` is an **entitlement held by one account**, not
-a property of the provider, so the effective and raw figures of two accounts are
-not comparable and must never be mixed across a merge.
+account walls a provider that has a live sibling.
+
+If you collapse entries at all, the scope of each field decides what is safe to
+carry across. Only two are properties of the provider:
+
+| Field | Scope | Why |
+|---|---|---|
+| `provider` | provider | the module's own name for the upstream |
+| `apiProvider` | provider | derived from `provider` at read time, identical on every entry |
+| `account` | account | the credential's account id |
+| `accountInfo` | account | that account's email, org, plan |
+| `source` | account | set per credential lane, so two entries of one provider can differ |
+| `fetchedAt` | account | that slot's own last success |
+| `savedResets` | account | reset credits are granted to **one** account |
+| `usage` (incl. `rawUsedPercent`) | account | measured against that account's own limits |
+| `error` | account | that lane's failure, not the provider's |
+
+So a merged per-provider view is safe only if it **selects a whole entry** and
+uses its fields together. Taking fields from more than one entry produces a
+coherent-looking record describing no actual account — one account's effective
+percent beside another's `rawUsedPercent`, or a `savedResets` count belonging to
+a third. Nothing on the wire marks the difference, which is why it is stated
+here.
 
 **Health counts providers; the array carries accounts.** A provider with several
 credentialed accounts contributes several entries to `usage.get` and exactly one
