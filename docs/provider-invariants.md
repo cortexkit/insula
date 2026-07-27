@@ -177,6 +177,27 @@ small number of bytes (`pos + 1`) to continue a search: it is correct only while
 the byte at `pos` is single-byte, which is a fact about the needle rather than
 about the loop. Advance by the needle's length instead.
 
+## Validate what a served value is *used as*, not what it looks like
+
+A reply from another module gets checked field by field, and the fields that
+invite checking are the ones a human reads — an identifier, an email, an
+organisation name. Those are labels. The field that decides whether anything
+works is usually the opaque one, and it attracts no scrutiny precisely because
+there is nothing to eyeball.
+
+Credential bytes served by the vault are the case here: they are converted
+straight into a bearer, and empty bytes convert *cleanly* into an empty bearer.
+Nothing fails until the upstream answers 401 — which is a non-transient class,
+so it clears the cached window and reports the account as auth-dead. A momentary
+wrong answer from the credential module would be recorded as a dead credential.
+
+So ask what a field is *used as* rather than what it is named. A value converted
+into a request header, a URL, or a token needs to be valid **for that use**, and
+emptiness is the case that survives every type-level check: it parses, it
+converts, it serialises, and it is silently meaningless. Reject it where the
+value enters, so the failure is attributed to the source that sent it rather
+than to the upstream that rejected it.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's

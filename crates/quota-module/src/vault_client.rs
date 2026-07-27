@@ -735,6 +735,16 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
         (true, false) => {
             let success: VaultSuccessResult = serde_json::from_value(Value::Object(result.clone()))
                 .map_err(|_| VaultGetError::FailClosed)?;
+            // A success reply carrying no credential bytes is malformed, not a
+            // credential. Every lane converts the payload straight into a bearer,
+            // and an empty one converts cleanly into an empty bearer -- which the
+            // upstream answers with 401, a NON-TRANSIENT class that clears the
+            // cached window and reports the account as auth-dead. Rejecting it
+            // here fails closed instead, so the lane retries a vault that is
+            // briefly answering wrongly rather than condemning the account.
+            if success.payload.is_empty() {
+                return Err(VaultGetError::FailClosed);
+            }
             Ok(VaultCredential {
                 payload: success.payload,
                 expires_at_ms: success.expires_at_ms,
@@ -1134,6 +1144,35 @@ mod tests {
         let credential = decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(credential.email.as_deref(), Some("user@example.com"));
         assert_eq!(credential.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn a_success_reply_with_an_empty_payload_fails_closed() {
+        // Well-formed in every other respect: the reply parses, carries a record
+        // version, and resolves an account. Only the credential bytes are absent.
+        let body = serde_json::json!({
+            "result": {
+                "payload": Vec::<u8>::new(),
+                "record_version": 11,
+                "account_id": "acct-11"
+            }
+        });
+        let decoded = decode_get_response(&serde_json::to_vec(&body).unwrap());
+        assert!(
+            matches!(decoded, Err(VaultGetError::FailClosed)),
+            "an empty payload must fail closed rather than serve an empty bearer"
+        );
+
+        // Non-vacuity: the identical reply with one byte of payload decodes, so
+        // the rejection above is the emptiness and not the rest of the shape.
+        let body = serde_json::json!({
+            "result": {
+                "payload": b"t",
+                "record_version": 11,
+                "account_id": "acct-11"
+            }
+        });
+        assert!(decode_get_response(&serde_json::to_vec(&body).unwrap()).is_ok());
     }
 
     #[tokio::test]
