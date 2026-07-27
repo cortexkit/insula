@@ -191,6 +191,35 @@ usage. Two traps:
   an account. A lane that cannot resolve identity therefore suppresses the
   accounts that can.
 
+That second trap is **latent rather than absent** wherever a provider keeps an
+implicit local lane alongside vault lanes, and it is worth understanding before
+adding a lane to any provider.
+
+It needs two things to fire: the vault lane starts resolving an account, and the
+provider has more than one vault lane. Neither is a change to this repository —
+the first happens in the credential store, the second when someone adds a second
+account — so the defect arrives without any commit here, in a provider that has
+worked for months. It has fired once already, and the fix was to make vault
+handles *replace* the local lane once any exist.
+
+Which providers this applies to is not uniform, and the answer is a property of
+the lanes rather than of the provider:
+
+- A local lane that resolves an account is safe. It participates in labeling
+  like any other lane, so nothing is suppressed.
+- A provider whose vault records **cannot** carry an account by contract is
+  also safe, because no lane will ever resolve one and the provider stays
+  legitimately unlabeled.
+- The exposed shape is a local lane that can never resolve identity beside a
+  vault lane that could start to.
+
+Do not apply the replace-the-local-lane fix pre-emptively to all of them. It is
+right where both lanes are the same account and the vault copy strictly
+dominates — it owns refresh, so the local token is only ever a staler duplicate.
+It is **wrong** where the local lane is a genuinely different account, because
+then dropping it removes real usage from the wire rather than removing a
+duplicate. Establish which case a provider is in before changing its handles.
+
 ## A grant needs a guard at every site that makes it
 
 Most checks in this codebase *refuse* something: a malformed payload, an

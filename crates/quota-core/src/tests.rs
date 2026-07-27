@@ -283,6 +283,45 @@ async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_dedupli
     assert_eq!(deduplicated[0].account.as_deref(), Some("A"));
 }
 
+#[tokio::test]
+async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
+    // The mixed case: one handle resolves an account and the other cannot. The
+    // read path emits labeled entries only when EVERY handle resolves one, so a
+    // single identity-less lane collapses the whole provider to one unlabeled
+    // entry and the account that WAS resolved becomes invisible.
+    //
+    // The shape that reaches this state: a provider whose vault lanes carry
+    // identity beside a local lane that can never resolve one. It is invisible
+    // while both lanes are identity-less, and appears the moment the credential
+    // store starts capturing identity for that provider — without any change
+    // here.
+    let labels = Arc::new(Mutex::new(HashMap::from([
+        ("H1".to_string(), Some("A".to_string())),
+        ("H2".to_string(), None),
+    ])));
+    let registry = Registry::new(vec![Box::new(LabelProvider {
+        labels: Arc::clone(&labels),
+    })]);
+
+    tick(&registry).await;
+    let mixed = registry.get_usage(None).await;
+    assert_eq!(mixed.len(), 1, "mixed resolution must not emit two entries");
+    assert_eq!(
+        mixed[0].account, None,
+        "one identity-less handle forces the whole provider unlabeled"
+    );
+
+    // Remove the identity-less lane and the resolved account becomes visible,
+    // which is what proves the suppression above was caused by that lane rather
+    // than by the label never being resolved at all.
+    labels.lock().unwrap().insert("H2".into(), Some("A".into()));
+    force_due(&registry, "multi");
+    tick(&registry).await;
+    let labeled = registry.get_usage(None).await;
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].account.as_deref(), Some("A"));
+}
+
 struct UnresolvedSelectionProvider;
 
 #[async_trait]
