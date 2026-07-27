@@ -10,6 +10,14 @@
 //! not depend on a git binary being present. An unavailable or unreadable
 //! repository yields "unknown" rather than failing the build, because a stamp is
 //! diagnostic and must never be the reason a release cannot be built.
+//!
+//! The stamp is `HEAD`, which is the commit the build STARTED FROM rather than a
+//! description of what was compiled: a build from a dirty tree carries the clean
+//! sha verbatim. It therefore answers "is this build missing commits", and
+//! cannot answer "does it contain anything extra". Checking the tree is clean
+//! before building a release binary is what closes that half, and it is a
+//! deliberate division — hashing the tree would make every uncommitted edit
+//! during development produce a new stamp and a full rebuild.
 
 use std::path::{Path, PathBuf};
 

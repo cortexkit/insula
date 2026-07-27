@@ -56,6 +56,20 @@ A tree that is not a git checkout stamps `unknown` rather than guessing, because
 a wrong commit would make a stale deploy look current — the one failure the
 stamp exists to prevent.
 
+**The stamp reads `HEAD`, not the working tree, so it says which commit the
+build started from and not what was compiled.** A build from a dirty tree
+carries the clean `HEAD` sha verbatim, and the comparison above then passes for
+a binary containing code that exists in no commit. Confirm the tree was clean
+when the release binary was built:
+
+```sh
+git status --porcelain    # empty before you build the binary you intend to ship
+```
+
+The stamp answers *is this build missing commits*. It cannot answer *does this
+build contain anything extra*, and a matching sha is not evidence that it does
+not.
+
 ## When a deploy is not needed
 
 Commits touching only tests or documentation change no runtime behaviour, and
