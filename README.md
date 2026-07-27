@@ -10,13 +10,33 @@ user's OWN existing session (OAuth token, API key, local CLI file), normalizes i
 a uniform `ProviderUsage[]` shape, and serves it **through subc** — so Alfonso
 connects to subc (not an external binary) for its quota signal.
 
-See `docs/charter.md` for the mission and reverse-engineered contracts, and
-`docs/provider-matrix.md` for the full per-provider archetype/verification matrix.
 **Adding or changing a provider: read `docs/provider-invariants.md` first.** It lists
 the properties a normalizer must uphold, each recovered from a defect that shipped.
 **Consuming `usage.get`: read `docs/consumer-contract.md`.** It states what you can
 rely on and what you must not infer, and every rule in it was settled against a real
 consumer.
+
+### The rest of `docs/`
+
+Current, and kept true against the code:
+
+| Doc | What it answers |
+|---|---|
+| `provider-invariants.md` | what a provider normalizer must and must not do |
+| `consumer-contract.md` | what `usage.get` promises a consumer, and what it does not |
+| `deploying.md` | how to replace a running build, and how to verify which one is live |
+| `provider-matrix.md` | per-provider auth archetype, endpoint, and verification status |
+| `codex-banked-resets-design.md` | how the one mutating feature is fenced against double-spend |
+
+Written before the code and kept for the reasoning, **not** as descriptions of
+what is there — each carries a list of the details that shipped differently:
+
+| Doc | What it argues |
+|---|---|
+| `charter.md` | the original mission and the contracts it was reverse-engineered from |
+| `refresher-spike-design.md` | why reads are cache-only and a single background task owns fetching |
+| `multi-account-fetch-design.md` | why slots key on credential handle rather than account |
+| `vault-consumer-design.md` | how credentials are fetched from the vault, and what fails closed |
 
 ## What it serves
 
