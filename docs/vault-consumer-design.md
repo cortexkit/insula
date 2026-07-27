@@ -106,6 +106,11 @@ pub struct VaultCredential {
     pub record_version: u64,
     pub account_id: Option<String>,  // canonicalized: trimmed, empty→None
     pub project_id: Option<String>,
+    // Two more fields shipped later and are absent from this sketch:
+    // `email` and `org_name`, both Option<String>, both canonicalized the same
+    // way. They carry the account labels the wire's `accountInfo` is built from.
+    // `ServedCodexContext` below likewise gained `email`, `org_name`,
+    // `is_oauth` and `source`.
 }
 
 /// Fixed, secret-free variants (V7): NO upstream text rides these — the

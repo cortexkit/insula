@@ -1,10 +1,15 @@
 # Background Refresher + Cache-Only Read (Q4 spike)
 
-Status: IMPLEMENTED on branch `spike/refresher`, BOTH Oracle passes folded
-(bg_f9972eaf design + bg_44d017b4 implementation). 169 unit tests + real-daemon
-e2e + live codex/claude real-window proofs green; clippy/fmt clean. NOT on
-master — graduation to prod is gated only on a LIVE SMOKE now. 2nd-pass
-implementation fixes folded: (1) CRITICAL panic containment — a panicking
+Status: **LANDED on master and in production**, and has been since the spike
+graduated; the `spike/refresher` branch no longer exists. This document is the
+design as it was proposed and reviewed, kept for the reasoning behind the
+shape — it is not a description of the current code, and several details below
+shipped differently (each is flagged where it appears). For what the code does
+now, read `crates/quota-core/src/refresh.rs`, `store.rs`, and the read path in
+`lib.rs`; for what the wire promises, `docs/consumer-contract.md`.
+
+Both Oracle passes were folded before it landed. 2nd-pass implementation fixes
+folded: (1) CRITICAL panic containment — a panicking
 provider is `catch_unwind`-contained into its own non-transient failure, never
 crashing the refresher (would silently drop Q4); (2) transient-after-degraded
 stays degraded (a prior degraded entry is not relabelled stale-transient); (3)
@@ -68,6 +73,19 @@ provider_name -> ProviderSlot {
     retry_count: u32,
 }
 ```
+
+This sketch is what was proposed; four details shipped differently, and the
+source is `crates/quota-core/src/refresh.rs` and `store.rs`:
+
+| Sketched here | Shipped as |
+|---|---|
+| `last_status` | the field is `status` — `last_status` exists nowhere |
+| `Degraded(FetchClass)` | `Degraded` is a **unit** variant, carrying no class |
+| keyed by `provider_name` | keyed by `SlotKey { provider, handle }`, once multi-account landed |
+| `last_tick_at: Instant` (below) | `Option<Instant>`, `None` until the first tick |
+
+The concurrency cap below is also described as a semaphore; the implementation
+uses `buffer_unordered(CONCURRENCY_CAP)`. The cap value of 8 is accurate.
 
 - **Whole-slot atomic write (Oracle fix #3):** the refresher computes the entire
   next `ProviderSlot` OUTSIDE the lock, then does a single `insert` under it.

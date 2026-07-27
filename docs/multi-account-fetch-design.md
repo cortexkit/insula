@@ -107,7 +107,9 @@ units. Concretely:
    behave exactly as today.
 
 2. **Slot key.** `SlotStore` keys on `SlotKey { provider: String, handle:
-   HandleId }`, plus an **incarnation token** per active key (H4) so a stale
+   HandleId }` — the shipped type is `CredentialHandle`; `HandleId` was a
+   working name here and exists nowhere in the source. Plus an
+   **incarnation token** per active key (H4) so a stale
    in-flight write for a removed-then-readded handle is fenced out. `ProviderSlot`
    caches `(account_id, record_version)`; the label re-resolves when
    `record_version` changes (any change, not just increase — monotonicity is not
