@@ -235,6 +235,19 @@ an excerpt is what distinguishes one upstream rejection from another. That is a
 considered trade, not an oversight — but it means a body excerpt must never be
 assumed safe to widen.
 
+And where upstream text is admitted, it must be **bounded**. The deliberate
+excerpt is capped, but a decode failure carries upstream text too, without
+anyone choosing to include it: `serde_json` quotes the value it rejected
+verbatim and does not truncate, so a response with a one-megabyte string where
+a number belonged yields a one-megabyte published error. The bound belongs in
+the type's `Display`, the one point every variant becomes wire text, rather
+than at the sites that construct the error — those are the ones that will be
+added later without the guard.
+
+The general form: **the cap that matters is the one nearest the wire, not the
+one nearest the reader**. A caller-side limit only bounds the text that caller
+knows about, and the dangerous text is the text nobody wrote.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's

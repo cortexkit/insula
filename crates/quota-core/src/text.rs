@@ -21,6 +21,27 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
     end
 }
 
+/// Bound a string that is about to be published, keeping the front and naming
+/// what was dropped.
+///
+/// Text destined for the wire can be upstream-controlled and arbitrarily long:
+/// a decode failure quotes the value it choked on verbatim, so a response with
+/// a one-megabyte string where a number belonged produces a one-megabyte error
+/// message. Consumers store these, so the size has to be bounded here rather
+/// than trusted to stay small.
+///
+/// The suffix is deliberate. Silent truncation reads as a complete message that
+/// happens to end oddly, which sends a reader looking for a parsing bug that
+/// does not exist; naming the dropped byte count says the text was cut and how
+/// much is missing.
+pub(crate) fn truncate_for_wire(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let end = floor_char_boundary(text, limit);
+    format!("{}… [{} more bytes]", &text[..end], text.len() - end)
+}
+
 /// Trim `raw`, strip one matching pair of surrounding ASCII quotes, and trim
 /// again. Returns `None` when nothing is left.
 ///
@@ -154,6 +175,39 @@ mod tests {
             let end = floor_char_boundary(text, index);
             // The point of the helper: the result is always safe to slice at.
             let _ = &text[..end];
+        }
+    }
+
+    #[test]
+    fn a_string_within_the_limit_is_returned_unchanged() {
+        assert_eq!(truncate_for_wire("short", 64), "short");
+        // Exactly at the limit is still unchanged: the bound is inclusive.
+        let exact = "x".repeat(64);
+        assert_eq!(truncate_for_wire(&exact, 64), exact);
+    }
+
+    #[test]
+    fn an_oversized_string_is_cut_and_says_how_much_was_dropped() {
+        let text = "y".repeat(5_000);
+        let out = truncate_for_wire(&text, 100);
+
+        assert!(out.len() < text.len(), "it must actually shrink");
+        assert!(out.starts_with(&"y".repeat(100)), "the front is kept");
+        // Not vacuous: an empty or placeholder return would satisfy "shrinks",
+        // so pin that the retained prefix and the reported remainder together
+        // account for the whole input.
+        assert!(out.contains("[4900 more bytes]"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // A multibyte character straddling the limit would panic a naive slice.
+        let text = format!("{}中中中中", "a".repeat(30));
+        for limit in 28..36 {
+            let out = truncate_for_wire(&text, limit);
+            // Reaching here at all is the assertion: building `out` slices the
+            // input, so a boundary error would panic rather than fail.
+            assert!(!out.is_empty());
         }
     }
 }

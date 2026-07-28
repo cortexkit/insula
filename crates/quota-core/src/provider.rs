@@ -305,16 +305,90 @@ pub enum FetchError {
     Decode(String),
 }
 
+/// Cap on the detail carried by a published error message.
+///
+/// Generous enough for any message this codebase writes, and for the 200-char
+/// response excerpt that non-2xx failures deliberately carry, so bounding here
+/// costs no diagnostic detail in practice. It exists for the messages this
+/// codebase does *not* write: a decode failure quotes the offending value
+/// verbatim, and that value comes from the upstream.
+const MAX_ERROR_DETAIL_BYTES: usize = 1024;
+
 impl std::fmt::Display for FetchError {
+    /// This text is published: it becomes the `error` field of a degraded entry,
+    /// which consumers read and at least one stores. So the detail is bounded
+    /// here, at the single point where any variant becomes wire text, rather
+    /// than at each of the sites that construct one.
+    ///
+    /// Errors are not logged to stderr anywhere in this module, so this string
+    /// is the only account of a failure -- truncation keeps the front, where
+    /// the classification and the start of the detail are.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = |m: &String| crate::text::truncate_for_wire(m, MAX_ERROR_DETAIL_BYTES);
         match self {
-            Self::NoSession(m) => write!(f, "no session: {m}"),
-            Self::Unauthorized(m) => write!(f, "unauthorized: {m}"),
+            Self::NoSession(m) => write!(f, "no session: {}", detail(m)),
+            Self::Unauthorized(m) => write!(f, "unauthorized: {}", detail(m)),
             Self::ProviderStatus(status) => write!(f, "provider returned HTTP {status}"),
-            Self::Upstream(m) => write!(f, "upstream error: {m}"),
-            Self::Decode(m) => write!(f, "decode error: {m}"),
+            Self::Upstream(m) => write!(f, "upstream error: {}", detail(m)),
+            Self::Decode(m) => write!(f, "decode error: {}", detail(m)),
         }
     }
 }
 
 impl std::error::Error for FetchError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The message a decode failure carries is written by `serde_json`, not by
+    /// this codebase: it quotes the value it choked on verbatim and does not
+    /// bound it. Since that value comes from the upstream, the published string
+    /// inherits whatever size the upstream chose.
+    #[test]
+    fn a_decode_failure_over_upstream_text_publishes_a_bounded_string() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Window {
+            #[allow(dead_code)]
+            window_minutes: u64,
+        }
+
+        // A number was expected and a very long string arrived.
+        let body = format!(r#"{{"window_minutes":"{}"}}"#, "A".repeat(200_000));
+        let parse_error = serde_json::from_str::<Window>(&body)
+            .expect_err("a string where a number belongs must fail to parse");
+
+        // Pin the premise rather than assuming it: the error really does carry
+        // the upstream's text, so this test would be meaningless if serde ever
+        // stopped echoing it.
+        let raw = parse_error.to_string();
+        assert!(
+            raw.len() > 100_000,
+            "premise: serde echoes the value: {}",
+            raw.len()
+        );
+
+        let published = FetchError::Decode(raw).to_string();
+
+        assert!(
+            published.len() < 2_000,
+            "published {} bytes: the wire string is unbounded",
+            published.len()
+        );
+        // Not vacuous: bounding must not empty the message. The classification
+        // and the start of the detail survive, and the cut is announced.
+        assert!(published.starts_with("decode error: invalid type"));
+        assert!(published.contains("more bytes]"), "truncation is named");
+    }
+
+    #[test]
+    fn an_ordinary_error_message_is_published_verbatim() {
+        // The bound must not disturb the messages this codebase writes, which
+        // are the ones a reader normally sees.
+        let published = FetchError::NoSession("gemini creds have no refresh_token".into());
+        assert_eq!(
+            published.to_string(),
+            "no session: gemini creds have no refresh_token"
+        );
+    }
+}
