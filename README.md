@@ -93,6 +93,20 @@ cargo test -p quota-module --test skeleton_e2e -- --ignored --nocapture
 cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture
 ```
 
+Two examples run the real fetchers against this machine's credentials — they
+warm the cache themselves, since reads are cache-only and a cold registry serves
+nothing:
+
+```sh
+# check every live window for internal inconsistency (a reset further out than
+# the window is long, counts that disagree with the percent, a percent out of
+# range). Exits non-zero on a finding, and also when it examined nothing:
+cargo run -p quota-core --example wire-sanity
+
+# dump the live usage.get array as JSON, for eyeballing or diffing:
+cargo run -p quota-core --example accuracy-dump
+```
+
 ## Install as a supervised subc module
 
 The subc daemon binary (`ck-subc`, built from the `subc-core` crate) spawns and
