@@ -128,6 +128,8 @@ pub fn classify(err: &FetchError) -> FetchClass {
         FetchError::Upstream(_) => FetchClass::Transient,
         FetchError::ProviderStatus(401 | 403)
         | FetchError::NoSession(_)
+        | FetchError::CredentialUnusable(_)
+        | FetchError::NoQuotaReported(_)
         | FetchError::Unauthorized(_)
         | FetchError::Decode(_) => FetchClass::NonTransient,
         FetchError::ProviderStatus(_) => FetchClass::Transient,

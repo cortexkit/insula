@@ -146,8 +146,11 @@ impl UsageProvider for LlmProxyProvider {
             let base = env::first_env(BASE_URL_ENV).ok_or_else(|| {
                 FetchError::NoSession("LLM_PROXY_BASE_URL is not set".to_string())
             })?;
-            let url = quota_stats_url(&base)
-                .ok_or_else(|| FetchError::NoSession("LLM_PROXY_BASE_URL is empty".to_string()))?;
+            // The key and the base URL are both present; the URL just does not
+            // resolve to a usable endpoint, which is a misconfiguration.
+            let url = quota_stats_url(&base).ok_or_else(|| {
+                FetchError::CredentialUnusable("LLM_PROXY_BASE_URL is empty".to_string())
+            })?;
 
             let body = JsonRequest::get(url)
                 .bearer(&api_key)

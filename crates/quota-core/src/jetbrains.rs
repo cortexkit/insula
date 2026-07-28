@@ -133,11 +133,14 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
     let quota: QuotaInfo = serde_json::from_str(&decode_html_entities(&quota_raw))
         .map_err(|e| FetchError::Decode(format!("jetbrains quotaInfo not JSON: {e}")))?;
 
-    // type Unknown/Error (or absent current/maximum) = no active AI quota — a normal
-    // not-configured state, surfaced as NoSession (folds into silent-degrade).
+    // type Unknown/Error (or absent current/maximum) means the IDE is installed
+    // and its config was read, but this account has no AI quota to report. The
+    // credential is fine and nothing is broken, so this is neither an absent
+    // credential nor a failure -- a consumer must not count it as something to
+    // fix, or the number never reaches zero.
     let used =
         used_percent(quota.current.as_deref(), quota.maximum.as_deref()).ok_or_else(|| {
-            FetchError::NoSession(format!(
+            FetchError::NoQuotaReported(format!(
                 "jetbrains: no active quota (type {:?})",
                 quota.kind.as_deref().unwrap_or("?")
             ))
@@ -232,13 +235,17 @@ mod tests {
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
 
+    /// The live state on a machine whose JetBrains IDE has no AI quota: the
+    /// config was read and the account simply has nothing to report. Nothing is
+    /// broken and nothing is fixable, so this must not be classed with the
+    /// failures a user is expected to act on -- a permanent entry in that
+    /// bucket would keep the count above zero when nothing is wrong.
     #[test]
-    fn unknown_type_degrades_as_no_session() {
-        // The live state on a machine without active JetBrains AI quota.
-        assert!(matches!(
-            normalize_usage(UNKNOWN_XML.as_bytes()),
-            Err(FetchError::NoSession(_))
-        ));
+    fn an_account_with_no_ai_quota_reports_no_quota_rather_than_a_failure() {
+        let error =
+            normalize_usage(UNKNOWN_XML.as_bytes()).expect_err("no quota means no usage windows");
+        assert!(matches!(error, FetchError::NoQuotaReported(_)), "{error:?}");
+        assert_eq!(error.error_class(), "no_quota_reported");
     }
 
     #[test]

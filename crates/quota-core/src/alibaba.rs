@@ -355,7 +355,10 @@ fn should_retry_alternate_region(err: &FetchError) -> bool {
         FetchError::Decode(msg) => {
             msg.contains("missing coding plan quota data") || msg.contains("no quota windows found")
         }
-        FetchError::NoSession(_) => false,
+        // A local credential problem is not something another region can fix.
+        FetchError::NoSession(_)
+        | FetchError::CredentialUnusable(_)
+        | FetchError::NoQuotaReported(_) => false,
     }
 }
 

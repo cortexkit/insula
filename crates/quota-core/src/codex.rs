@@ -296,7 +296,8 @@ pub fn parse_credentials(data: &[u8]) -> Result<CodexCredentials, FetchError> {
         });
     }
 
-    Err(FetchError::NoSession(
+    // auth.json was found and parsed; it simply carries no usable credential.
+    Err(FetchError::CredentialUnusable(
         "auth.json has neither tokens.access_token nor OPENAI_API_KEY".to_string(),
     ))
 }
@@ -1539,13 +1540,19 @@ mod tests {
         ));
     }
 
+    /// An auth.json that exists and parses but carries no token is a credential
+    /// that was found and cannot be used -- not an absent one. The distinction
+    /// is published, and reporting this as absent would file a broken login
+    /// under "never configured", where nobody looks.
     #[test]
-    fn no_session_when_empty() {
+    fn an_auth_file_with_no_token_is_unusable_not_absent() {
         let raw = br#"{ "auth_mode": "chatgpt", "tokens": {} }"#;
-        assert!(matches!(
-            parse_credentials(raw),
-            Err(FetchError::NoSession(_))
-        ));
+        let error = parse_credentials(raw).expect_err("an empty token set cannot authenticate");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.error_class(), "credential_unusable");
     }
 
     #[test]

@@ -679,8 +679,10 @@ fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
             "no opencode auth cookie in browser".to_string(),
         ));
     }
+    // A session cookie exists but nothing survives the filter, so the browser
+    // holds a login that cannot be used: found, not absent.
     request_cookie_header(jar).ok_or_else(|| {
-        FetchError::NoSession("opencode auth cookies empty after filter".to_string())
+        FetchError::CredentialUnusable("opencode auth cookies empty after filter".to_string())
     })
 }
 

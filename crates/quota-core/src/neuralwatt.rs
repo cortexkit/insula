@@ -344,15 +344,23 @@ impl UsageProvider for NeuralWattProvider {
         let result: Result<ProviderUsage, FetchError> = async {
             let api_key_raw = env::first_env(API_KEY_ENV)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-            let api_key = clean_env_value(&api_key_raw)
-                .ok_or_else(|| FetchError::NoSession("NEURALWATT_API_KEY is empty".to_string()))?;
+            // The variable is set but holds nothing usable, which is a
+            // configuration mistake rather than an absent credential.
+            let api_key = clean_env_value(&api_key_raw).ok_or_else(|| {
+                FetchError::CredentialUnusable("NEURALWATT_API_KEY is empty".to_string())
+            })?;
 
             let base_url_raw = env::first_env(BASE_URL_ENV);
             let base_url = if let Some(raw) = base_url_raw {
-                let cleaned = clean_env_value(&raw)
-                    .ok_or_else(|| FetchError::NoSession("NEURALWATT_API_URL is empty".to_string()))?;
-                validate_and_normalize_url(&cleaned)
-                    .ok_or_else(|| FetchError::NoSession("Neuralwatt endpoint override NEURALWATT_API_URL must use HTTPS or a bare host.".to_string()))?
+                let cleaned = clean_env_value(&raw).ok_or_else(|| {
+                    FetchError::CredentialUnusable("NEURALWATT_API_URL is empty".to_string())
+                })?;
+                validate_and_normalize_url(&cleaned).ok_or_else(|| {
+                    FetchError::CredentialUnusable(
+                        "Neuralwatt endpoint override NEURALWATT_API_URL must use HTTPS or a bare host."
+                            .to_string(),
+                    )
+                })?
             } else {
                 url::Url::parse(DEFAULT_BASE).unwrap()
             };

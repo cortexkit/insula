@@ -384,11 +384,14 @@ impl GeminiProvider {
             return Ok(tok);
         }
 
+        // The credentials file was found and parsed; it simply cannot mint a
+        // token without a refresh token. Someone configured this and it needs
+        // fixing, so it must not report as an absent credential.
         let refresh_token = creds
             .refresh_token
             .filter(|t| !t.is_empty())
             .ok_or_else(|| {
-                FetchError::NoSession("gemini creds have no refresh_token".to_string())
+                FetchError::CredentialUnusable("gemini creds have no refresh_token".to_string())
             })?;
 
         let cid = client_id();

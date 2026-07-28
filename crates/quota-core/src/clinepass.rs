@@ -159,8 +159,10 @@ impl UsageProvider for ClinePassProvider {
         let result: Result<ProviderUsage, FetchError> = async {
             let raw_key = env::first_env(API_KEY_ENV)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
-            let api_key = clean_key(raw_key)
-                .ok_or_else(|| FetchError::NoSession("ClinePass API key is empty".to_string()))?;
+            // Set but empty: configured wrong rather than not configured.
+            let api_key = clean_key(raw_key).ok_or_else(|| {
+                FetchError::CredentialUnusable("ClinePass API key is empty".to_string())
+            })?;
 
             let body = JsonRequest::get("https://api.cline.bot/api/v1/users/me/plan/usage-limits")
                 .bearer(&api_key)
