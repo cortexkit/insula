@@ -215,28 +215,15 @@ fn relax_usage_for_read(entry: &mut ProviderUsage) {
     // provider-reported truth moves to `raw_used_percent` so human-facing
     // UIs can show real usage alongside the effective number. Windows
     // already at 0 stay un-annotated: there is no divergence to surface.
-    for window in [
-        usage.primary.as_mut(),
-        usage.secondary.as_mut(),
-        usage.tertiary.as_mut(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    //
+    // Enumerated through the shared helper so a slot added to the wire type
+    // cannot be missed here: publishing a raw percent as the effective one
+    // would have a consumer pace against a wall this account's credits are
+    // about to remove.
+    for window in model::windows_mut(usage) {
         if window.used_percent != 0.0 {
             window.raw_used_percent = Some(window.used_percent);
             window.used_percent = 0.0;
-        }
-    }
-    if let Some(extra) = usage.extra_rate_windows.as_mut() {
-        for window in extra
-            .iter_mut()
-            .filter_map(|extra_window| extra_window.window.as_mut())
-        {
-            if window.used_percent != 0.0 {
-                window.raw_used_percent = Some(window.used_percent);
-                window.used_percent = 0.0;
-            }
         }
     }
 }

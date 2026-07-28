@@ -167,21 +167,13 @@ pub struct UsageFacts {
 
 impl UsageFacts {
     pub fn from_usage(usage: &Usage, limit_reached: Option<bool>) -> Self {
-        let mut raw_percents = Vec::new();
-        for window in [&usage.primary, &usage.secondary, &usage.tertiary]
-            .into_iter()
-            .flatten()
-        {
-            raw_percents.push(window.used_percent);
-        }
-        if let Some(extra) = &usage.extra_rate_windows {
-            raw_percents.extend(
-                extra
-                    .iter()
-                    .filter_map(|extra| extra.window.as_ref())
-                    .map(|window| window.used_percent),
-            );
-        }
+        // Enumerated through the shared helper so a slot added to the wire type
+        // cannot be missed here. These percents decide whether the account is at
+        // its wall, and a missed slot reads as *lower* usage than the account
+        // really has -- reporting a walled account as having room.
+        let raw_percents: Vec<f64> = crate::model::windows(usage)
+            .map(|window| window.used_percent)
+            .collect();
         Self {
             any_used_floor: raw_percents.iter().any(|percent| *percent >= 1.0),
             at_wall: limit_reached == Some(true)

@@ -244,6 +244,15 @@ And prove the checks fire: loosen a threshold until real data must trip it, and
 read *which* findings appear. A check whose inputs are always absent is
 indistinguishable from one that passes.
 
+The same reasoning applies to production code that walks all of an account's
+windows, and there it is not only a checker's blind spot: a decision that misses
+a slot sees *less* usage than the account has. `model::windows` and
+`windows_mut` exist so those sites enumerate in one place, destructured, and
+their callers include the read-time relaxation and the banked-reset wall test —
+two places where under-counting publishes a walled account as having room. A
+provider's own parser is deliberately not a caller: it knows which slots it
+fills, and a compile error there would be noise.
+
 ## A wire error string is published, so treat it as output
 
 The `error` on a degraded entry is not a log line: consumers read it, and at
