@@ -218,6 +218,23 @@ about the other. Mutate each site separately — a leak at the innermost type ma
 be caught only by a test named for something else entirely, which is one
 refactor away from covering nothing.
 
+## A wire error string is published, so treat it as output
+
+The `error` on a degraded entry is not a log line: consumers read it, and at
+least one stores it. So the question for anything interpolated into one is not
+whether it looks sensitive but whether we *chose* it.
+
+The risk is in text we did not write. A dependency's error `Display` may append
+context of its own — `reqwest` appends the request URL, which prints a query
+parameter verbatim — so a value that never appears in our own `format!` still
+reaches the wire. Convert third-party errors at a single site and strip what
+the consumer cannot act on; the entry already names the provider.
+
+Upstream response bodies are the other source, and they are deliberately kept:
+an excerpt is what distinguishes one upstream rejection from another. That is a
+considered trade, not an oversight — but it means a body excerpt must never be
+assumed safe to widen.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's

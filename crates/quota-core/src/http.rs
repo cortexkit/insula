@@ -29,6 +29,23 @@ const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// connections remain reusable; only oversized errors forfeit pool reuse.
 const ERROR_BODY_PREFIX_BYTES: usize = 8 * 1024;
 
+/// Render a transport failure for the wire, without the request URL.
+///
+/// `reqwest::Error`'s `Display` appends ` for url (<the request URL>)`, so any
+/// credential in that URL reaches the `error` string of a degraded entry, which
+/// is published to consumers and stored by them. A query parameter is the
+/// reachable case and prints verbatim; userinfo is not, because reqwest removes
+/// it from the URL it retains.
+///
+/// The URL adds nothing a consumer can act on -- the entry already names the
+/// provider -- and reqwest documents `without_url` for exactly this situation.
+/// Stripping it here, at the one place transport errors become text, keeps the
+/// property from depending on every provider keeping credentials out of its
+/// URLs.
+fn transport_error(error: reqwest::Error) -> FetchError {
+    FetchError::Upstream(error.without_url().to_string())
+}
+
 fn body_too_large() -> FetchError {
     FetchError::Decode(format!(
         "HTTP response body exceeds {MAX_RESPONSE_BODY_BYTES}-byte safety limit"
@@ -49,11 +66,7 @@ async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, F
         .unwrap_or(0)
         .min(MAX_RESPONSE_BODY_BYTES);
     let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
         if chunk.len() > MAX_RESPONSE_BODY_BYTES - body.len() {
             return Err(body_too_large());
         }
@@ -70,11 +83,7 @@ async fn read_error_body_prefix(mut response: reqwest::Response) -> Result<Vec<u
         .min(ERROR_BODY_PREFIX_BYTES);
     let mut body = Vec::with_capacity(capacity);
     while body.len() < ERROR_BODY_PREFIX_BYTES {
-        let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| FetchError::Upstream(format!("reading body: {error}")))?
-        else {
+        let Some(chunk) = response.chunk().await.map_err(transport_error)? else {
             break;
         };
         let remaining = ERROR_BODY_PREFIX_BYTES - body.len();
@@ -294,10 +303,7 @@ impl JsonRequest {
             builder = builder.header(header.name, &header.value);
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| FetchError::Upstream(error.to_string()))?;
+        let response = builder.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             if read_error_body_prefix(response).await.is_err() {
@@ -340,10 +346,7 @@ impl JsonRequest {
             builder = builder.header(header.name, &header.value);
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|e| FetchError::Upstream(e.to_string()))?;
+        let response = builder.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
         let headers: Vec<(String, String)> = response
             .headers()
@@ -609,5 +612,38 @@ mod tests {
             Ok(_) => panic!("non-success response unexpectedly succeeded"),
         }
         server.await.unwrap();
+    }
+
+    /// The `error` text of a degraded entry is published to consumers, so a
+    /// transport failure must not carry the request URL into it: a credential
+    /// in a query parameter prints verbatim there.
+    ///
+    /// The request here cannot connect, which is the failure that produces a
+    /// transport error with a URL attached. The userinfo assertion is a
+    /// belt-and-braces check -- reqwest strips userinfo from the URL it keeps,
+    /// so that half is already unreachable today.
+    #[tokio::test]
+    async fn a_transport_failure_does_not_publish_the_request_url() {
+        // Port 1 on loopback refuses immediately, so this fails in `send`
+        // rather than anywhere that would bypass the mapping under test.
+        let url = "http://user:tok_secret_value@127.0.0.1:1/usage?api_key=key_secret_value";
+
+        let error = JsonRequest::get(url)
+            .send(&reqwest::Client::new())
+            .await
+            .expect_err("connecting to a closed port must fail");
+
+        let text = error.to_string();
+        assert!(
+            !text.contains("tok_secret_value"),
+            "userinfo leaked: {text}"
+        );
+        assert!(!text.contains("key_secret_value"), "query leaked: {text}");
+        assert!(!text.contains("127.0.0.1"), "host leaked: {text}");
+        // Not vacuous: the error still describes the failure, so this cannot
+        // pass by producing an empty string.
+        assert!(matches!(error, FetchError::Upstream(_)));
+        assert!(!text.is_empty());
+        assert!(text.contains("error sending request"), "unexpected: {text}");
     }
 }
