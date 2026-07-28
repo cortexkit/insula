@@ -198,6 +198,26 @@ converts, it serialises, and it is silently meaningless. Reject it where the
 value enters, so the failure is attributed to the source that sent it rather
 than to the upstream that rejected it.
 
+## A negative assertion needs a witness that the value was reachable
+
+`assert!(!output.contains(secret))` passes for two reasons: the secret was
+redacted, or it was never there. Only one of them is the property under test,
+and the difference is invisible in a green run — a formatter that writes nothing
+at all, a capture that read no bytes, or a fixture that never carried the value
+all satisfy it.
+
+So pair every negative assertion with a positive one on the *same* output, plus
+evidence the value really was present in the input. A redaction test should
+assert that the safe fields still appear, and that the value is genuinely
+retrievable through whatever accessor exposes it.
+
+Redaction has a second trap of its own: a type that *contains* a secret usually
+redacts with its own literal rather than delegating to the secret type's
+formatter. Those are independent sites, and a test covering one says nothing
+about the other. Mutate each site separately — a leak at the innermost type may
+be caught only by a test named for something else entirely, which is one
+refactor away from covering nothing.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's
