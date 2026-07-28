@@ -218,6 +218,32 @@ about the other. Mutate each site separately — a leak at the innermost type ma
 be caught only by a test named for something else entirely, which is one
 refactor away from covering nothing.
 
+## A clean result must report how much it examined
+
+The same trap one level up: a checker that examined *nothing* reports exactly
+what a checker that examined everything and found nothing reports. "No problems"
+and "no inputs" are the same sentence, and the second is far more common,
+because a checker silently stops finding its inputs whenever the thing it reads
+changes shape.
+
+Both live examples in `crates/quota-core/examples/` had this. They call
+`get_usage`, which is cache-only by design and serves an empty array until the
+background refresher publishes — so a freshly built registry gives them nothing,
+and they reported success. One of them describes itself as the live-verification
+step before trusting this module as the daily quota source; it had been printing
+an empty array. Nothing was broken *in* them, and nothing said so.
+
+So: print the denominator next to the verdict, and exit non-zero when the
+denominator is zero. An empty run is a failure to check, not a check that
+passed. Enumerate what to examine by destructuring the type rather than by
+naming fields, so a slot added to the wire fails to compile instead of being
+quietly skipped — a hand-written field list is the usual reason the denominator
+shrinks without anyone noticing.
+
+And prove the checks fire: loosen a threshold until real data must trip it, and
+read *which* findings appear. A check whose inputs are always absent is
+indistinguishable from one that passes.
+
 ## A wire error string is published, so treat it as output
 
 The `error` on a degraded entry is not a log line: consumers read it, and at
