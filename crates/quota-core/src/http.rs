@@ -42,7 +42,7 @@ const ERROR_BODY_PREFIX_BYTES: usize = 8 * 1024;
 /// Stripping it here, at the one place transport errors become text, keeps the
 /// property from depending on every provider keeping credentials out of its
 /// URLs.
-fn transport_error(error: reqwest::Error) -> FetchError {
+pub(crate) fn transport_error(error: reqwest::Error) -> FetchError {
     FetchError::Upstream(error.without_url().to_string())
 }
 

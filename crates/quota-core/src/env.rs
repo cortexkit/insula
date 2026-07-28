@@ -24,6 +24,31 @@ pub fn first_env(names: &[&str]) -> Option<String> {
 ///
 /// Returns `None` for an out-of-range timestamp so a provider drops the window
 /// rather than emit a malformed `resetsAt`.
+/// Read a local credential file, describing a failure by the file's NAME rather
+/// than its path.
+///
+/// Credential files live under the account's home directory, and a read failure
+/// becomes the `error` string of a degraded entry, which is published to other
+/// processes. Interpolating the path would put the operating-system username in
+/// that string.
+///
+/// Nothing is lost by omitting it: `std::io::Error` does not name the path it
+/// failed on (a missing file reports only `No such file or directory (os error
+/// 2)`), so the path in these messages was contributed entirely by the caller's
+/// own formatting.
+///
+/// Callers pass a `description` instead of the path, which is why this exists as
+/// a helper rather than as a rule to remember: the unsafe version cannot be
+/// written through it.
+pub fn read_credential_file(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<Vec<u8>, crate::provider::FetchError> {
+    std::fs::read(path).map_err(|error| {
+        crate::provider::FetchError::NoSession(format!("reading {description}: {error}"))
+    })
+}
+
 pub fn epoch_to_iso8601(epoch_secs: i64) -> Option<String> {
     match Utc.timestamp_opt(epoch_secs, 0) {
         chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
@@ -62,5 +87,25 @@ mod tests {
             epoch_to_iso8601(1782135879).as_deref(),
             Some("2026-06-22T13:44:39Z")
         );
+    }
+
+    /// A failed credential read is published to consumers, so it must describe
+    /// the file without naming where it lives: the path runs through the
+    /// account's home directory.
+    #[test]
+    fn a_failed_credential_read_names_the_file_and_not_its_path() {
+        let path = std::path::Path::new("/nonexistent-home-dir/alice/.gemini/oauth_creds.json");
+        let error = read_credential_file(path, "gemini oauth_creds.json")
+            .expect_err("a path that cannot exist must fail to read");
+
+        let published = error.to_string();
+        assert!(
+            !published.contains("alice") && !published.contains("nonexistent-home-dir"),
+            "the path reached the wire: {published}"
+        );
+        // Not vacuous: the message must still identify the file and carry the
+        // reason, so this cannot pass by returning something empty or generic.
+        assert!(published.contains("gemini oauth_creds.json"), "{published}");
+        assert!(published.contains("No such file"), "{published}");
     }
 }

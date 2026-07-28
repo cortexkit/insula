@@ -194,8 +194,7 @@ impl UsageProvider for JetBrainsProvider {
             let path = discover_quota_file().ok_or_else(|| {
                 FetchError::NoSession("no JetBrains AIAssistantQuotaManager2.xml found".to_string())
             })?;
-            let bytes = std::fs::read(&path)
-                .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", path.display())))?;
+            let bytes = crate::env::read_credential_file(&path, "JetBrains quota XML")?;
             let usage = normalize_usage(&bytes)?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
         }

@@ -248,6 +248,20 @@ The general form: **the cap that matters is the one nearest the wire, not the
 one nearest the reader**. A caller-side limit only bounds the text that caller
 knows about, and the dangerous text is the text nobody wrote.
 
+Local paths are the other thing to keep out. A credential file lives under the
+account's home directory, so interpolating its path into a read failure puts the
+operating-system username in a published string. Nothing is gained by it:
+`std::io::Error` does not name the path it failed on, so the path in such a
+message was contributed entirely by our own formatting. Read credential files
+through the helper that takes a description instead of a path, so the unsafe
+version cannot be written.
+
+One provider drives `reqwest` directly rather than through the shared request
+builder, because it needs the final URL after redirects. A provider that steps
+outside a shared helper steps outside every rule the helper enforces, which is
+worth checking whenever one appears — the reason for going direct is usually
+unrelated to the reason the helper exists.
+
 ## Identity must fail closed
 
 A handle whose account cannot be confirmed must not serve the previous account's

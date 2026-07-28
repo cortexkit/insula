@@ -308,7 +308,12 @@ impl SakanaProvider {
             http: reqwest::Client::builder()
                 .redirect(redirect_policy())
                 .build()
-                .map_err(|error| error.to_string()),
+                // reqwest appends the request URL to every error message, and
+                // a URL can carry a credential in a query parameter. This text
+                // is published to consumers, so the URL comes off here as well
+                // as on the request errors, rather than by case-by-case
+                // judgement about which errors are likely to be seen.
+                .map_err(|error| error.without_url().to_string()),
         }
     }
 }
@@ -339,12 +344,19 @@ impl UsageProvider for SakanaProvider {
                 .header("Cookie", cookie)
                 .send()
                 .await
-                .map_err(|error| FetchError::Upstream(error.to_string()))?;
+                .map_err(crate::http::transport_error)?;
             let status = response.status().as_u16();
             let final_url = response.url().clone();
-            let body = response.bytes().await.map_err(|error| {
-                FetchError::Upstream(format!("reading Sakana response: {error}"))
-            })?;
+            // This provider drives reqwest directly rather than through
+            // `JsonRequest`, because it needs the final URL after redirects to
+            // detect a login bounce. That means its transport errors must be
+            // converted through the same helper, which strips the request URL:
+            // reqwest appends it to every error message, and a URL can carry a
+            // credential in a query parameter.
+            let body = response
+                .bytes()
+                .await
+                .map_err(crate::http::transport_error)?;
             let usage = normalize_response(status, &final_url, &body)?;
 
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))

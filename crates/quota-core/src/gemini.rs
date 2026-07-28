@@ -134,8 +134,7 @@ fn creds_path() -> Option<PathBuf> {
 fn read_creds() -> Result<OauthCreds, FetchError> {
     let path = creds_path()
         .ok_or_else(|| FetchError::NoSession("cannot resolve $HOME/.gemini".to_string()))?;
-    let data = std::fs::read(&path)
-        .map_err(|e| FetchError::NoSession(format!("reading {}: {e}", path.display())))?;
+    let data = env::read_credential_file(&path, "gemini oauth_creds.json")?;
     serde_json::from_slice(&data)
         .map_err(|e| FetchError::Decode(format!("gemini oauth_creds.json not decodable: {e}")))
 }

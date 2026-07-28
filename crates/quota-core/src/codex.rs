@@ -855,9 +855,7 @@ impl UsageProvider for CodexProvider {
                         )
                     })?;
                     let auth_path = home.join("auth.json");
-                    let data = std::fs::read(&auth_path).map_err(|error| {
-                        FetchError::NoSession(format!("reading {}: {error}", auth_path.display()))
-                    })?;
+                    let data = crate::env::read_credential_file(&auth_path, "codex auth.json")?;
                     let credentials = parse_credentials(&data)?;
                     let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
                     Ok::<_, FetchError>((ServedCodexContext::local(credentials), config_toml))
