@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::codex_resets::{
     evaluate_trigger, normalize_credits, reporting_eligible, response_now, AuthFailureContext,
-    ConsumeOutcome, CreditsHttpResponse, RedemptionJournal, Reservation, ResetCoordinator,
-    ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
+    ConsumeOutcome, CreditsHttpResponse, RedemptionJournal, ReqwestResetTransport, Reservation,
+    ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
 use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential, VaultGetError};
 use crate::model::{ExtraWindow, RateWindow, Usage};
@@ -1649,6 +1649,63 @@ fn reporting_reset_request(
             record_version: 31,
         }),
     }
+}
+
+/// A rejected vault credential must reach the credential store as a reportable
+/// failure, and that depends on which error the HTTP layer produces.
+///
+/// The reporting gate matches only `ProviderStatus`, so a 401 mapped to
+/// `Unauthorized` is dropped silently: the store is never told the credential
+/// is dead, no re-login is prompted, and the account stays dark until someone
+/// investigates by hand. Which mapping happens is decided by a dispatch inside
+/// the transport, and every other test in this area hands the gate a
+/// pre-built error, so none of them exercise that decision.
+///
+/// This drives a real request at a loopback server answering 401.
+#[tokio::test]
+async fn a_rejected_vault_credential_surfaces_as_a_reportable_status() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0; 8 * 1024];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        let body = r#"{"error":"invalid_token"}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let source = Arc::new(MockReportingCredentialSource::default());
+    let request = ResetRequest {
+        base_url: format!("http://{address}/backend-api"),
+        ..reporting_reset_request(Arc::clone(&source), "reset-bearer-secret")
+    };
+
+    let transport = ReqwestResetTransport::new(reqwest::Client::new());
+    let error = transport
+        .fetch_credits(&request)
+        .await
+        .expect_err("a 401 must fail");
+
+    // The gate's own condition, asserted against what the transport actually
+    // produced rather than against a value constructed here.
+    assert!(
+        matches!(error, FetchError::ProviderStatus(401)),
+        "a rejected credential produced {error:?}, which the reporting gate drops"
+    );
+
+    // And the consequence: the store is told, with the version that was served.
+    request.report_auth_failure(&error);
+    tokio::task::yield_now().await;
+    assert_eq!(*source.reports.lock().unwrap(), vec![(401, 31)]);
+
+    server.await.unwrap();
 }
 
 #[tokio::test]
