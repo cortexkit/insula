@@ -54,11 +54,22 @@ reader can fail to ask, but cannot report a stale answer as current.
 
 One limit of the reading path, as opposed to the stamp itself: `ck module
 status` reports the health record the supervisor last collected, not a fresh
-probe issued for your question, and the reply carries no timestamp saying when
-that collection happened. Immediately after a restart the record can still be
-the one from before it. Confirm the process actually changed — `pid` differs, or
-`restart_count` advanced — before reading the stamp as evidence of *this*
-deploy, and re-read it a few seconds later if either is ambiguous.
+probe issued for your question. Immediately after a restart that record can
+still be the one from before it, so the stamp you read is the *previous*
+binary's — which looks exactly like a deploy that did not take, and invites a
+second pointless deploy.
+
+The reply dates itself, so this is checkable rather than a matter of waiting:
+
+```sh
+ck module status ai-provider-quota --json    # module.last_probe_ms, epoch ms
+```
+
+If that timestamp predates the restart, the health block beside it describes the
+old process and the stamp in it proves nothing yet. Re-read once it advances.
+
+Note the field sits under `module`, not under `health` — next to the stamp it
+dates, but not inside it.
 
 ### `unknown` is a third outcome, not a failed comparison
 
