@@ -1057,6 +1057,45 @@ impl UsageProvider for OuterTimeoutSwapProvider {
     }
 }
 
+/// A fetch that outruns the scheduler deadline is reported as an upstream
+/// failure, and that attribution is load-bearing rather than cosmetic: it is
+/// the only transient class among the three synthetic failures, so a slow
+/// provider keeps serving its last healthy window instead of losing it.
+///
+/// Calling this our own defect -- as a panic correctly is -- would make it
+/// non-transient, and a provider that merely answered slowly would have its
+/// cached window replaced by a degraded entry.
+#[tokio::test]
+async fn a_deadline_overrun_is_attributed_to_the_upstream_and_stays_transient() {
+    let registry = Registry::new(vec![Box::new(BlockingProvider {
+        name: "codex",
+        started: Arc::new(Notify::new()),
+        gate: Arc::new(Notify::new()),
+    })]);
+
+    registry
+        .refresh_tick_with_deadline(&CancellationToken::new(), Duration::from_millis(20))
+        .await;
+
+    let entry = &registry.get_usage(None).await[0];
+    let text = entry
+        .error
+        .as_deref()
+        .expect("the overrun degrades the slot");
+    assert!(
+        text.starts_with("upstream error:"),
+        "deadline overrun attributed as {text:?}"
+    );
+    // Not vacuous: it is the overrun being described, not some other failure.
+    assert!(text.contains("deadline"), "unexpected: {text:?}");
+
+    // The consequence the attribution buys, asserted rather than implied.
+    assert_eq!(
+        crate::refresh::classify(&crate::provider::FetchError::Upstream(String::new())),
+        crate::refresh::FetchClass::Transient,
+    );
+}
+
 #[tokio::test]
 async fn outer_timeout_after_credential_swap_fails_closed() {
     let current_account = Arc::new(Mutex::new("A"));
