@@ -131,7 +131,10 @@ pub fn classify(err: &FetchError) -> FetchClass {
         | FetchError::CredentialUnusable(_)
         | FetchError::NoQuotaReported(_)
         | FetchError::Unauthorized(_)
-        | FetchError::Decode(_) => FetchClass::NonTransient,
+        | FetchError::Decode(_)
+        // A defect here reproduces on the next fetch with the same input, so
+        // retrying quickly buys nothing.
+        | FetchError::Internal(_) => FetchClass::NonTransient,
         FetchError::ProviderStatus(_) => FetchClass::Transient,
     }
 }

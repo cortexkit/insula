@@ -991,12 +991,22 @@ async fn panicking_provider_is_contained_and_other_provider_resolves() {
     tick(&registry).await;
 
     let usage = registry.get_usage(None).await;
-    assert!(usage
+    let panicked = usage
         .iter()
         .find(|entry| entry.provider == "boom")
-        .unwrap()
-        .error
-        .is_some());
+        .expect("the panicking provider still produces an entry");
+    assert!(panicked.error.is_some());
+    // The panic is ours, and the entry must say so. Reporting it as a decode
+    // failure would blame the upstream's payload for a crash in this module and
+    // send anyone investigating to the wrong codebase.
+    assert!(
+        panicked
+            .error
+            .as_deref()
+            .is_some_and(|text| text.starts_with("internal error:")),
+        "panic attributed as {:?}",
+        panicked.error
+    );
     assert!(usage
         .iter()
         .find(|entry| entry.provider == "codex")

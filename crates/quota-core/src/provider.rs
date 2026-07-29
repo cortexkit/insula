@@ -328,6 +328,15 @@ pub enum FetchError {
     Upstream(String),
     /// The response was not the shape we expected.
     Decode(String),
+    /// This module failed, not the provider: a fetch panicked, or an internal
+    /// invariant refused to continue.
+    ///
+    /// Distinct from [`Self::Decode`] because the two name different culprits
+    /// and different actions. A decode failure says the upstream changed its
+    /// payload and someone should watch for their fix; this says the defect is
+    /// here and should be reported against this module. Folding a crash of ours
+    /// into a decode failure sends the reader to the wrong codebase.
+    Internal(String),
 }
 
 impl FetchError {
@@ -351,6 +360,7 @@ impl FetchError {
             Self::Unauthorized(_) | Self::ProviderStatus(401 | 403) => "credential_rejected",
             Self::ProviderStatus(_) | Self::Upstream(_) => "upstream_failed",
             Self::Decode(_) => "decode_failed",
+            Self::Internal(_) => "internal_error",
         }
     }
 }
@@ -383,6 +393,7 @@ impl std::fmt::Display for FetchError {
             Self::ProviderStatus(status) => write!(f, "provider returned HTTP {status}"),
             Self::Upstream(m) => write!(f, "upstream error: {}", detail(m)),
             Self::Decode(m) => write!(f, "decode error: {}", detail(m)),
+            Self::Internal(m) => write!(f, "internal error: {}", detail(m)),
         }
     }
 }
@@ -445,6 +456,7 @@ mod tests {
             FetchError::NoSession("x".into()),
             FetchError::CredentialUnusable("x".into()),
             FetchError::NoQuotaReported("x".into()),
+            FetchError::Internal("x".into()),
             FetchError::Unauthorized("x".into()),
             FetchError::ProviderStatus(401),
             FetchError::ProviderStatus(500),
@@ -464,6 +476,7 @@ mod tests {
                 }
                 FetchError::ProviderStatus(_) | FetchError::Upstream(_) => "upstream_failed",
                 FetchError::Decode(_) => "decode_failed",
+                FetchError::Internal(_) => "internal_error",
             };
             assert_eq!(case.error_class(), expected, "{case:?}");
         }
@@ -472,13 +485,20 @@ mod tests {
         // cannot pass by mapping everything to one string.
         let distinct: std::collections::BTreeSet<_> =
             cases.iter().map(FetchError::error_class).collect();
-        assert_eq!(distinct.len(), 6);
+        assert_eq!(distinct.len(), 7);
 
         // The load-bearing split: an absent credential and a broken one must
         // never share a class, since only the second is worth acting on.
         assert_ne!(
             FetchError::NoSession("x".into()).error_class(),
             FetchError::CredentialUnusable("x".into()).error_class(),
+        );
+
+        // A crash of ours and a malformed upstream payload name different
+        // culprits, so a reader is sent to the right codebase.
+        assert_ne!(
+            FetchError::Internal("x".into()).error_class(),
+            FetchError::Decode("x".into()).error_class(),
         );
     }
 

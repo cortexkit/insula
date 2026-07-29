@@ -649,10 +649,14 @@ impl Registry {
                     attempt_start,
                     completed_at,
                 ),
+                // A panic in our own fetch code, reported as ours: calling it a
+                // decode failure would tell consumers the upstream sent a
+                // malformed payload and send anyone investigating to the
+                // provider's API rather than to this module.
                 FetchOutcome::Panicked => next_slot_after_unverified_failure(
                     &unit.prev,
                     &unit.key.provider,
-                    provider::FetchError::Decode("provider fetch panicked".to_string()),
+                    provider::FetchError::Internal("provider fetch panicked".to_string()),
                     attempt_start,
                     completed_at,
                 ),

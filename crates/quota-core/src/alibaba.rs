@@ -358,7 +358,10 @@ fn should_retry_alternate_region(err: &FetchError) -> bool {
         // A local credential problem is not something another region can fix.
         FetchError::NoSession(_)
         | FetchError::CredentialUnusable(_)
-        | FetchError::NoQuotaReported(_) => false,
+        | FetchError::NoQuotaReported(_)
+        // Not worth another region: a defect in this module reproduces there,
+        // because every region runs the same code against the same input.
+        | FetchError::Internal(_) => false,
     }
 }
 
