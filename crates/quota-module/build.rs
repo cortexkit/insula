@@ -76,24 +76,66 @@ fn head_ref_path(git_dir: &Path) -> Option<PathBuf> {
     common.exists().then_some(common)
 }
 
-/// The commit `HEAD` resolves to: the ref's contents, or `HEAD` itself when
-/// detached. Packed refs are not consulted, so a build from a fully packed
-/// checkout stamps "unknown" rather than a wrong value.
+/// The commit `HEAD` resolves to: the ref's file, the packed-refs table, or
+/// `HEAD` itself when detached.
+///
+/// Packing is not an unusual state to find a repository in -- `git gc` packs
+/// refs as part of routine maintenance, and it runs automatically. Without the
+/// packed table a maintained checkout stamps "unknown", which fails safe but
+/// costs the deploy check its only instrument: it can no longer answer whether
+/// the running binary is the one that was built.
 fn head_commit(git_dir: &Path) -> Option<String> {
-    match head_ref_path(git_dir) {
-        Some(path) => read_sha(&path),
-        None => {
-            let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-            let head = head.trim();
-            (!head.starts_with("ref:")).then(|| short(head))
+    if let Some(sha) = head_ref_path(git_dir).as_deref().and_then(read_sha) {
+        return sha_if_valid(&sha);
+    }
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(reference) => packed_ref(git_dir, reference.trim()),
+        None => sha_if_valid(head),
+    }
+}
+
+/// Look `reference` up in the packed-refs table.
+///
+/// Its lines are `<sha> <refname>`, with `#` comments and `^<sha>` peel lines
+/// for annotated tags -- neither of which can match, since a peel line has no
+/// second field and a comment's first field is not a ref name.
+///
+/// A worktree keeps its own `HEAD` but shares the main repository's refs, so the
+/// table is read from the common directory when the local one has no entry.
+fn packed_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let mut candidates = vec![git_dir.join("packed-refs")];
+    if let Some(common) = git_dir.parent().and_then(Path::parent) {
+        candidates.push(common.join("packed-refs"));
+    }
+    for path in candidates {
+        let Ok(table) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in table.lines() {
+            let Some((sha, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if name.trim() == reference {
+                return sha_if_valid(sha);
+            }
         }
     }
+    None
+}
+
+/// Accept only a full hex object id, so a malformed line cannot become a stamp
+/// that looks like a commit.
+fn sha_if_valid(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    (raw.len() >= 40 && raw.chars().all(|c| c.is_ascii_hexdigit())).then(|| short(raw))
 }
 
 fn read_sha(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let raw = raw.trim();
-    (!raw.is_empty()).then(|| short(raw))
+    let raw = raw.trim().to_string();
+    (!raw.is_empty()).then_some(raw)
 }
 
 fn short(sha: &str) -> String {
