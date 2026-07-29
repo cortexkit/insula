@@ -613,6 +613,79 @@ mod tests {
 
     static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
+    /// A snapshot of a module serving normally, to be perturbed one field at a
+    /// time by the tests that care about a single fault.
+    fn healthy_snapshot() -> quota_core::health::HealthSnapshot {
+        quota_core::health::HealthSnapshot {
+            providers_total: 3,
+            fresh: 3,
+            stale: 0,
+            degraded: Vec::new(),
+            without_handles: Vec::new(),
+            cookie_cohort_total: 0,
+            cookie_cohort_degraded: Vec::new(),
+            last_tick_age: Some(std::time::Duration::from_secs(5)),
+            refresher_stalled: false,
+            cache_poisoned: false,
+        }
+    }
+
+    fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
+        let ModuleControlResponse::HealthCheck { status, .. } = health_report(snapshot) else {
+            panic!("health_report must produce a HealthCheck response");
+        };
+        status
+    }
+
+    /// The status this module reports is not a label: the daemon branches on
+    /// it, and its default action for `failing` is to restart the module. So a
+    /// fault reported one step too high restarts a module that is serving, and
+    /// one reported too low leaves a faulted module running untouched.
+    ///
+    /// Each fault is asserted to produce its own status. Asserting only that
+    /// some status is produced would pass if any two of them were swapped.
+    #[test]
+    fn each_fault_reports_the_status_the_daemon_acts_on() {
+        assert_eq!(status_of(&healthy_snapshot()), HealthStatus::Ok);
+
+        // A poisoned store means the data path is faulted: a task panicked
+        // while holding the lock and nothing will serve again without a
+        // restart, which is the one condition worth restarting for.
+        let poisoned = quota_core::health::HealthSnapshot {
+            cache_poisoned: true,
+            ..healthy_snapshot()
+        };
+        assert_eq!(status_of(&poisoned), HealthStatus::Failing);
+
+        // A stalled refresher still serves its last-known windows -- only
+        // freshness decays -- so it must NOT reach the restart action.
+        let stalled = quota_core::health::HealthSnapshot {
+            refresher_stalled: true,
+            ..healthy_snapshot()
+        };
+        assert_eq!(status_of(&stalled), HealthStatus::Degraded);
+
+        // Both at once takes the higher of the two rather than the later
+        // branch: a poisoned store is not made less severe by also being stale.
+        let both = quota_core::health::HealthSnapshot {
+            cache_poisoned: true,
+            refresher_stalled: true,
+            ..healthy_snapshot()
+        };
+        assert_eq!(status_of(&both), HealthStatus::Failing);
+
+        // Every provider degraded is the resting state of a host that has
+        // credentials for none of them. It is not a module fault and must not
+        // be reported as one, or this module restarts forever on a laptop that
+        // is behaving exactly as expected.
+        let all_degraded = quota_core::health::HealthSnapshot {
+            fresh: 0,
+            degraded: vec!["a".into(), "b".into(), "c".into()],
+            ..healthy_snapshot()
+        };
+        assert_eq!(status_of(&all_degraded), HealthStatus::Ok);
+    }
+
     fn temp_config_path(label: &str) -> PathBuf {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
