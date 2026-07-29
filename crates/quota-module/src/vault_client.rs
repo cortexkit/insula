@@ -1131,6 +1131,48 @@ mod tests {
         assert!(!format!("{credential:?}").contains("vault-token-secret"));
     }
 
+    /// The credential store's reply field names are a cross-repository join:
+    /// this struct names them, the vault daemon writes them, and nothing but a
+    /// matching string connects the two.
+    ///
+    /// `account_id` is the load-bearing one. Every field here is optional, so a
+    /// renamed or misspelled key parses cleanly and yields `None` -- and an
+    /// identity-less handle collapses every account of that provider into a
+    /// single unlabeled entry, because labeled entries are emitted only when
+    /// all handles resolve an account. Multi-account visibility disappears with
+    /// nothing failing anywhere.
+    ///
+    /// Kept separate from the normalization test below even though both parse a
+    /// reply. That one is named for trimming and redaction, so narrowing it to
+    /// its stated subject would take this assertion with it, and the person
+    /// narrowing would have no reason to look for it.
+    #[test]
+    fn the_served_account_identity_survives_the_reply_field_names() {
+        // Exactly the keys the credential store writes.
+        let body = serde_json::json!({
+            "result": {
+                "payload": b"token",
+                "record_version": 4,
+                "account_id": "acct-live",
+                "email": "person@example.test",
+                "org_name": "Example Org"
+            }
+        });
+
+        let credential = decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+
+        assert_eq!(
+            credential.account_id.as_deref(),
+            Some("acct-live"),
+            "the identity field did not join: entries would collapse to one unlabeled row"
+        );
+        // Not vacuous: a decode that dropped every optional field would still
+        // satisfy an assertion written only about absence.
+        assert_eq!(credential.email.as_deref(), Some("person@example.test"));
+        assert_eq!(credential.org_name.as_deref(), Some("Example Org"));
+        assert_eq!(credential.record_version, 4);
+    }
+
     #[test]
     fn get_result_decodes_optional_email_and_org_name() {
         let body = serde_json::json!({
