@@ -201,17 +201,16 @@ mod tests {
 
         for handle in &b_handles {
             let key = SlotKey::new("b", handle.clone());
-            store.slots.get_mut(&key).unwrap().entry = Some(crate::model::ProviderUsage {
-                provider: "b".to_string(),
-                api_provider: None,
-                account: Some(handle.stable_id().to_string()),
-                source: Some("cached".to_string()),
-                account_info: None,
-                fetched_at: None,
-                saved_resets: None,
-                usage: Some(crate::model::Usage::default()),
-                error: None,
-            });
+            // Built through the constructor rather than as a struct literal:
+            // a literal here would silently keep its own defaults for any field
+            // added later, so this fixture could drift from a real entry
+            // without anything failing.
+            store.slots.get_mut(&key).unwrap().entry = Some(crate::model::ProviderUsage::healthy(
+                "b",
+                Some(handle.stable_id().to_string()),
+                "cached",
+                crate::model::Usage::default(),
+            ));
         }
         let b_before: Vec<_> = b_handles
             .iter()
