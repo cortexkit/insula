@@ -85,6 +85,14 @@ pub struct ProviderSlot {
     pub last_success_at: Option<Instant>,
     pub last_attempt_at: Option<Instant>,
     pub status: SlotStatus,
+    /// Why the most recent attempt failed, as a stable class name.
+    ///
+    /// Kept beside the entry rather than read back out of its message, because
+    /// the message is prose with no stability promise -- the same reason
+    /// consumers are told not to branch on it. Without this, a caller wanting to
+    /// separate "nobody configured this provider" from "it is configured and
+    /// broken" has only the text to go on.
+    pub error_class: Option<&'static str>,
     pub next_due_at: Instant,
     pub retry_count: u32,
 }
@@ -96,6 +104,7 @@ impl ProviderSlot {
             incarnation,
             attempt_sequence: AttemptSequence::from_counter(0),
             entry: None,
+            error_class: None,
             observation: None,
             label_in_flux: false,
             relax_eligible: false,
@@ -230,6 +239,8 @@ fn next_slot_after_attempt_inner(
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             entry: None,
+            // Suppressed rather than failed: there is no failure to classify.
+            error_class: None,
             observation: prev.observation.clone(),
             label_in_flux: true,
             relax_eligible: false,
@@ -279,6 +290,7 @@ fn next_slot_after_attempt_inner(
         Ok(usage) => ProviderSlot {
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
+            error_class: None,
             entry: Some(healthy_entry(
                 provider_name,
                 observation.as_ref(),
@@ -322,6 +334,10 @@ fn next_slot_after_attempt_inner(
                 incarnation: prev.incarnation,
                 attempt_sequence: prev.attempt_sequence,
                 entry: if label_in_flux { None } else { entry },
+                // The class of THIS attempt, even when a prior healthy window is
+                // still being served: a caller asking why a provider is failing
+                // wants the current cause, not the one that produced the entry.
+                error_class: Some(error.error_class()),
                 observation,
                 label_in_flux,
                 relax_eligible: false,

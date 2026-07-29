@@ -44,8 +44,14 @@ pub struct HealthSnapshot {
     pub without_handles: Vec<String>,
     /// Browser-cookie providers registered (the desktop-coupled cohort).
     pub cookie_cohort_total: usize,
-    /// Cookie-cohort providers that are degraded — a stale browser-login signal
-    /// distinct from an ordinary missing credential.
+    /// Cookie-cohort providers whose browser login went stale: a cookie was
+    /// found and the upstream rejected it, or the page no longer parses.
+    ///
+    /// A provider with no cookie at all is deliberately excluded. Not being
+    /// logged into a service is the correct state on any host that does not use
+    /// it, so counting those would pin this at the cohort size on every machine
+    /// and leave a real stale login to show up as one more in a number nobody
+    /// reads.
     pub cookie_cohort_degraded: Vec<String>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,

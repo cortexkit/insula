@@ -159,6 +159,53 @@ async fn f4_in_flight_refresh_revokes_previous_relaxation() {
     refresh.await.unwrap();
 }
 
+/// A cookie provider that is not logged in and one whose live cookie was
+/// rejected are different facts, and only the second is worth acting on.
+///
+/// The cohort count exists to say "a browser login went stale". If an absent
+/// cookie counted too, the number would sit at the cohort size forever on any
+/// host that does not use every one of these services -- which is every host --
+/// and a real stale login would move it from seven to eight.
+#[tokio::test]
+async fn only_a_failed_cookie_counts_as_a_stale_login() {
+    struct CookieProvider {
+        name: &'static str,
+        error: fn() -> FetchError,
+    }
+
+    #[async_trait]
+    impl UsageProvider for CookieProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn is_cookie_based(&self) -> bool {
+            true
+        }
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            FetchAttempt::failure(None, None, (self.error)())
+        }
+    }
+
+    let registry = Registry::new(vec![
+        Box::new(CookieProvider {
+            name: "not-logged-in",
+            error: || FetchError::NoSession("no session cookie in browser".into()),
+        }),
+        Box::new(CookieProvider {
+            name: "login-expired",
+            error: || FetchError::Unauthorized("HTTP 401".into()),
+        }),
+    ]);
+    tick(&registry).await;
+
+    let health = registry.health();
+    // Both are degraded: neither is serving a window.
+    assert_eq!(health.degraded, vec!["not-logged-in", "login-expired"]);
+    // Only the rejected cookie is a stale-login signal.
+    assert_eq!(health.cookie_cohort_degraded, vec!["login-expired"]);
+    assert_eq!(health.cookie_cohort_total, 2);
+}
+
 #[tokio::test]
 async fn health_reflects_provider_outcomes() {
     let registry = registry(&[
@@ -174,7 +221,11 @@ async fn health_reflects_provider_outcomes() {
     let health = registry.health();
     assert_eq!(health.fresh, 2);
     assert_eq!(health.degraded, vec!["cursor", "elevenlabs"]);
-    assert_eq!(health.cookie_cohort_degraded, vec!["cursor"]);
+    // Both failures here are absent credentials, so neither is a stale-login
+    // signal: a cookie provider nobody has logged into is behaving correctly.
+    // The cohort count is exercised with a real failure in
+    // `only_a_failed_cookie_counts_as_a_stale_login`.
+    assert!(health.cookie_cohort_degraded.is_empty());
     assert!(health.last_tick_age.is_some());
 }
 

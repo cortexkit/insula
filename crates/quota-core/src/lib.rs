@@ -772,7 +772,16 @@ impl Registry {
                 stale += 1;
             } else if all_degraded {
                 degraded.push(name.to_string());
-                if provider.cookie_based {
+                // Only a cookie that FAILED is a stale-login signal. A provider
+                // whose cookie is simply absent is not logged in, which is a
+                // permanent and correct state on any host the user does not use
+                // for that service -- counting it here would keep this number
+                // pinned at the cohort size and make it mean nothing.
+                if provider.cookie_based
+                    && slots
+                        .iter()
+                        .any(|slot| !matches!(slot.error_class, Some("credential_absent") | None))
+                {
                     cookie_cohort_degraded.push(name.to_string());
                 }
             }
