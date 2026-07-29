@@ -991,28 +991,48 @@ async fn panicking_provider_is_contained_and_other_provider_resolves() {
     tick(&registry).await;
 
     let usage = registry.get_usage(None).await;
-    let panicked = usage
+    assert!(usage
         .iter()
         .find(|entry| entry.provider == "boom")
-        .expect("the panicking provider still produces an entry");
-    assert!(panicked.error.is_some());
-    // The panic is ours, and the entry must say so. Reporting it as a decode
-    // failure would blame the upstream's payload for a crash in this module and
-    // send anyone investigating to the wrong codebase.
-    assert!(
-        panicked
-            .error
-            .as_deref()
-            .is_some_and(|text| text.starts_with("internal error:")),
-        "panic attributed as {:?}",
-        panicked.error
-    );
+        .expect("the panicking provider still produces an entry")
+        .error
+        .is_some());
     assert!(usage
         .iter()
         .find(|entry| entry.provider == "codex")
         .unwrap()
         .error
         .is_none());
+}
+
+/// A panic is this module's defect, and the published entry must say so.
+///
+/// Reporting it as a decode failure would state that the upstream sent a
+/// payload we could not parse, sending anyone who acts on it to the provider's
+/// API rather than to this codebase.
+///
+/// Separate from the containment test above even though the setup is
+/// identical. That test is named for containment, so a later pass narrowing it
+/// to its stated subject would delete this assertion without anything looking
+/// wrong -- and an audit listing test names would report attribution as
+/// untested while a mutation run reported it as covered.
+#[tokio::test]
+async fn a_contained_panic_is_attributed_to_this_module_not_the_upstream() {
+    let registry = Registry::new(vec![Box::new(PanicProvider)]);
+    tick(&registry).await;
+
+    let usage = registry.get_usage(None).await;
+    let text = usage[0]
+        .error
+        .as_deref()
+        .expect("a contained panic still publishes an entry");
+    assert!(
+        text.starts_with("internal error:"),
+        "panic attributed as {text:?}"
+    );
+    // Not vacuous: it is the panic being described, not some other failure that
+    // happens to carry the same prefix.
+    assert!(text.contains("panicked"), "unexpected: {text:?}");
 }
 
 #[tokio::test]
