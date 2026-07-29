@@ -805,6 +805,43 @@ mod tests {
         assert_eq!(tertiary.window_minutes, Some(43200));
     }
 
+    /// A healthy payload must not be read as a sign-in page.
+    ///
+    /// This predicate is consulted *before* parsing, so unlike the other HTML
+    /// providers here -- where it is a last resort after extraction has already
+    /// failed -- a false positive costs a working provider its usage. It would
+    /// report the credential as rejected, which asks someone to re-login a
+    /// session that never expired.
+    ///
+    /// The needles are broad by necessity (`login` matches anywhere in the
+    /// body), so this asserts the real fixtures against them: adding a needle
+    /// that a healthy payload contains has to fail here rather than in
+    /// production. The signed-out fixture is the control, so this cannot pass by
+    /// a predicate that never matches anything.
+    #[test]
+    fn a_healthy_payload_is_not_mistaken_for_a_sign_in_page() {
+        for (name, fixture) in [
+            ("subscription", SUBSCRIPTION_FIXTURE),
+            ("go html", GO_HTML_FIXTURE),
+        ] {
+            assert!(
+                !looks_signed_out(fixture),
+                "{name} fixture classified as signed out"
+            );
+            // Not vacuous: the fixture really is one this provider parses, so a
+            // pass here is about the predicate and not about an inert string.
+            assert!(
+                parse_windows(fixture, 1_700_000_000, false).is_ok(),
+                "{name} fixture must be parseable"
+            );
+        }
+
+        assert!(
+            looks_signed_out(SIGNED_OUT),
+            "control: a real sign-in body must still be detected"
+        );
+    }
+
     #[test]
     fn signed_out_body_is_unauthorized() {
         assert!(matches!(
