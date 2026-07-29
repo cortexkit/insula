@@ -114,7 +114,12 @@ fn get_used_percent(
             }
         }
     }
-    percentage as f64
+    // Clamped on the same terms as the computed branch above. This upstream
+    // omits or misreports its quota fields, and the percentage it supplies
+    // directly can fall outside 0..=100 -- which reaches consumers as a
+    // capacity reading and would price an account as more or less exhausted
+    // than any real window can be.
+    (percentage as f64).clamp(0.0, 100.0)
 }
 
 fn get_window_minutes(unit: i64, number: i64) -> Option<i64> {
@@ -637,5 +642,38 @@ mod tests {
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 45.0);
+    }
+
+    /// The directly-supplied percentage is clamped like the computed one.
+    ///
+    /// This upstream omits or misreports its quota fields, so the percentage it
+    /// hands over can fall outside 0..=100. It reaches consumers as a capacity
+    /// reading, where an out-of-range value prices an account as more or less
+    /// exhausted than any real window can be.
+    ///
+    /// Both directions are asserted: the branch clamps at each end, and a test
+    /// covering only the high side would pass against a `min`.
+    #[test]
+    fn an_out_of_range_fallback_percentage_is_clamped_at_both_ends() {
+        let payload = |percentage: &str| {
+            format!(
+                r#"{{"code":200,"msg":"success","success":true,"data":{{"limits":[{{
+                    "type":"TOKENS_LIMIT","unit":3,"number":5,
+                    "usage":null,"currentValue":null,"remaining":null,
+                    "percentage":{percentage},"nextResetTime":1782135879000}}]}}}}"#
+            )
+            .into_bytes()
+        };
+
+        let over = normalize_usage(&payload("150")).unwrap().primary.unwrap();
+        assert_eq!(over.used_percent, 100.0, "over-quota must clamp to full");
+
+        let under = normalize_usage(&payload("-20")).unwrap().primary.unwrap();
+        assert_eq!(under.used_percent, 0.0, "negative must clamp to empty");
+
+        // Not vacuous: an in-range value still passes through untouched, so
+        // this cannot pass by flattening every percentage to a constant.
+        let ordinary = normalize_usage(&payload("45")).unwrap().primary.unwrap();
+        assert_eq!(ordinary.used_percent, 45.0);
     }
 }
