@@ -864,6 +864,80 @@ mod tests {
         );
     }
 
+    /// Encode a protobuf varint, so a test can choose the value a scan will see.
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    /// A frame carrying a percent at `[1,1]` and one varint at `[1,5,1]`, which
+    /// is the path this decoder reads a reset timestamp from.
+    fn frame_with_percent_and_varint_at_reset_path(percent: f32, value: u64) -> Vec<u8> {
+        let mut inner: Vec<u8> = vec![0x0d];
+        inner.extend_from_slice(&percent.to_le_bytes());
+        let nested = {
+            let mut field = vec![0x08];
+            field.extend_from_slice(&varint(value));
+            field
+        };
+        inner.push(0x2a);
+        inner.push(nested.len() as u8);
+        inner.extend_from_slice(&nested);
+
+        let mut payload: Vec<u8> = vec![0x0a, inner.len() as u8];
+        payload.extend_from_slice(&inner);
+        let mut body: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00, payload.len() as u8];
+        body.extend_from_slice(&payload);
+        body
+    }
+
+    /// This response has no schema, so a reset timestamp is identified by its
+    /// field path plus a plausibility window on the value. The window is what
+    /// stops an ordinary counter that happens to sit at that path from being
+    /// read as a date -- and a counter is far more likely to be small or large
+    /// than to land inside a four-hundred-million-second range.
+    ///
+    /// Driven with a value that violates the window rather than one inside it:
+    /// an in-range value exercises the same code and can never show the check
+    /// missing. The in-range case is kept as the control, so this cannot pass
+    /// by rejecting everything.
+    #[test]
+    fn a_varint_outside_the_plausible_epoch_window_is_not_read_as_a_reset() {
+        // Comfortably past the window: a counter, not a timestamp.
+        let implausible = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MAX + 1);
+
+        // Pin the premise: the fixture really does put a varint where a reset
+        // would be read from, so a rejection below is the window's doing and
+        // not a fixture that never carried a candidate.
+        let mut scan = Scan::default();
+        scan_message(&implausible[5..], &[], &mut scan);
+        assert_eq!(
+            scan.varints.iter().filter(|v| v.path == [1, 5, 1]).count(),
+            1,
+            "fixture must carry exactly one varint at the reset path"
+        );
+
+        // With no plausible reset the window has no horizon, and this provider
+        // deliberately degrades rather than emitting a percent alone.
+        assert!(
+            normalize_usage(&implausible).is_err(),
+            "an implausible varint was accepted as a reset timestamp"
+        );
+
+        // Control: the identical shape with a plausible epoch does produce a
+        // window, so the rejection above is about the value, not the shape.
+        let plausible = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MIN + 1);
+        let usage = normalize_usage(&plausible).expect("a plausible epoch must decode");
+        let primary = usage.primary.expect("a window is emitted");
+        assert_eq!(primary.used_percent, 50.0);
+        assert!(primary.resets_at.is_some());
+    }
+
     #[test]
     fn a_percent_without_a_reset_degrades_rather_than_emitting_a_window() {
         // Everywhere a percent arrives in a NAMED field, a missing reset is carried
