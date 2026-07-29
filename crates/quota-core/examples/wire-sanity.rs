@@ -13,6 +13,20 @@
 //! Filter to one provider: `cargo run -p quota-core --example wire-sanity -- codex`
 //!
 //! Exits non-zero when something disagrees, so it can gate a deploy.
+//!
+//! **This examines the local-credential lane only.** The registry it builds has
+//! no credential-vault client, because that client lives in the module crate
+//! rather than here, so every provider whose credentials are served by the vault
+//! falls back to whatever local credentials exist and reports no account. Rows
+//! here therefore read `unlabeled` for providers that serve several labelled
+//! accounts in production, and a provider with no local credentials at all shows
+//! as degraded even while it is healthy on the deployed module.
+//!
+//! What that means for a reader: the window checks are still meaningful, since
+//! they compare fields against each other rather than against an expected value.
+//! But absence of a finding here is not evidence about the vault lane, and the
+//! account labels are not the ones the deployed module publishes. Read those
+//! from the running module instead.
 
 use chrono::{DateTime, Utc};
 use cortexkit_provider_usage::{ProviderUsage, RateWindow};

@@ -1,4 +1,12 @@
-//! Dump the live `usage.get` array as JSON, exactly as the subc module serves it.
+//! Dump the live `usage.get` array as JSON, as this crate's registry serves it.
+//!
+//! **Not identical to what the deployed module serves.** The registry built here
+//! has no credential-vault client -- that lives in the module crate -- so
+//! vault-served providers fall back to local credentials, report no account, and
+//! appear here as a single unlabelled row (or as degraded, when no local
+//! credential exists) even while the deployed module publishes several healthy
+//! labelled accounts for them. Compare account labels against the running module,
+//! not against this dump.
 //!
 //! This is the module side of the codexbar-vs-module accuracy diff: run codexbar's
 //! `/usage` and this dump against the same machine credentials and compare the
