@@ -119,7 +119,8 @@ The set that produces a degraded entry is the non-transient failures, defined by
 trusting this list to stay current:
 
 - HTTP 401 and 403
-- no session, unauthorized
+- no session, credential unusable, unauthorized
+- no quota reported
 - decode failure
 - a caught panic in a provider fetch
 
@@ -133,10 +134,43 @@ needs a human, and a panic recurs on every fetch until the code is fixed. So
 "degraded implies a dead credential" is wrong, and so is "most degraded entries
 recover on their own".
 
+## Not every degraded entry is a problem
+
+The list above answers *how* a fetch failed. It does not answer the question a
+reader of your output actually has, which is **whether anything is wrong**, and
+those come apart sharply:
+
+- A provider nobody configured on this host fails every fetch, forever, and that
+  is the correct steady state. Nothing is broken and nothing is fixable.
+- A provider whose credential worked yesterday and was rejected this morning
+  fails identically on the wire, and is worth someone's attention.
+- A provider whose credential is fine but whose account genuinely has no quota
+  to report is a third thing again: not absent, not broken.
+
+On the host these docs are written from, that split is 24 / 3 / 1 — so an
+undifferentiated count of degraded entries is dominated by the case that can
+never mean anything, and a real breakage moves it by one.
+
+`errorClass` is the machine-readable answer (`credential_absent`,
+`credential_unusable`, `credential_rejected`, `no_quota_reported`,
+`upstream_failed`, `decode_failed`). It is merged into
+`cortexkit-provider-usage` and **not yet on the wire** — this section describes
+where it will appear so that consumers stop deriving the distinction from prose
+in the meantime. When it arrives it is additive and absent on healthy entries,
+and an unrecognised class must render as a degraded entry with an unknown
+reason: never dropped, never folded into an existing bucket.
+
+Until then, the distinction exists in the taxonomy but not on the wire. If you
+need it now, ask rather than parsing the message.
+
 The error string is prose, not a stable taxonomy. Use it for observability, and
 if you need to branch on the class, ask for a machine-readable field rather than
 parsing it — a retention policy keyed on prose is how the next seam defect gets
-built.
+built. **The prose is not stable across releases and has already changed**:
+failures that once read `no session: …` now read `credential unusable: …` or
+`no quota reported: …` where that is what actually happened. Anything storing
+these strings will see a discontinuity at that release, and anything matching on
+them was relying on a promise this contract never made.
 
 ## 100% used does not mean requests are being refused
 
