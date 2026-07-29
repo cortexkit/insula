@@ -408,8 +408,11 @@ impl UsageProvider for FactoryProvider {
                 ));
             }
 
+            // A session cookie was found immediately above, so the browser does
+            // hold a factory login -- it just carries no cookie this provider
+            // can use as a bearer. Found and unusable, not absent.
             let bearer = resolve_direct_bearer(&jar).ok_or_else(|| {
-                FetchError::NoSession(
+                FetchError::CredentialUnusable(
                     "factory: no direct bearer cookie (access-token/session); WorkOS exchange not implemented"
                         .to_string(),
                 )

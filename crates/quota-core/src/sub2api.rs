@@ -111,8 +111,10 @@ fn settings_from_values(
         .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
     let raw_base_url = clean_setting(base_url)
         .ok_or_else(|| FetchError::NoSession(format!("none of {BASE_URL_ENV:?} is set")))?;
+    // The variable is set and non-empty; the value is just not a usable base
+    // URL. That is a configuration someone can fix, not an absent credential.
     let base_url = validate_base_url(&raw_base_url).ok_or_else(|| {
-        FetchError::NoSession(
+        FetchError::CredentialUnusable(
             "SUB2API_BASE_URL must be HTTPS, or loopback HTTP, without credentials, query, or fragment"
                 .to_string(),
         )

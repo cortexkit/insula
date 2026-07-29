@@ -45,7 +45,17 @@ pub fn read_credential_file(
     description: &str,
 ) -> Result<Vec<u8>, crate::provider::FetchError> {
     std::fs::read(path).map_err(|error| {
-        crate::provider::FetchError::NoSession(format!("reading {description}: {error}"))
+        let message = format!("reading {description}: {error}");
+        // A missing file means nobody configured this provider here, which is a
+        // permanent and correct state. Any other read failure -- no permission,
+        // a directory where a file belongs, an I/O error -- means the file is
+        // there and we cannot use it, which someone can act on. Reporting both
+        // as absent files the second under "nothing to fix", where nobody looks.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            crate::provider::FetchError::NoSession(message)
+        } else {
+            crate::provider::FetchError::CredentialUnusable(message)
+        }
     })
 }
 
@@ -78,6 +88,36 @@ mod tests {
     #[test]
     fn first_env_none_when_all_absent() {
         assert_eq!(first_env(&["QUOTA_TEST_DEFINITELY_UNSET_XYZ"]), None);
+    }
+
+    /// A missing credential file and an unreadable one are different states,
+    /// and only the second is worth anyone's attention. Both used to report as
+    /// absent, which filed a real problem under "nothing to fix".
+    #[test]
+    fn an_unreadable_credential_file_is_not_reported_as_an_absent_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "qta-credfile-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let absent = read_credential_file(&dir.join("nothing-here.json"), "test creds")
+            .expect_err("a missing file must fail");
+        assert_eq!(absent.error_class(), "credential_absent");
+
+        // A directory where a file belongs: present on disk, unreadable as a
+        // file. Any non-NotFound I/O error would do; this one is portable.
+        let unusable = read_credential_file(&dir, "test creds")
+            .expect_err("reading a directory as a file must fail");
+        assert_eq!(unusable.error_class(), "credential_unusable");
+
+        // Not vacuous: both still describe the failure, so this cannot pass by
+        // returning an empty or identical message.
+        assert!(absent.to_string().contains("test creds"));
+        assert!(unusable.to_string().contains("test creds"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
