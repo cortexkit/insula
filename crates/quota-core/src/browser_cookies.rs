@@ -212,6 +212,16 @@ fn read_encrypted_cookies(
         let conn =
             rusqlite::Connection::open_with_flags(&tmp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
+        // Deliberately unfiltered on expiry. An expired cookie is sent, the
+        // upstream rejects it, and that arrives as a rejected credential --
+        // which is the honest reading: the login is no longer usable.
+        //
+        // Filtering here would be easy to get wrong in the expensive direction.
+        // `expires_utc` is 0 for a SESSION cookie, which is valid until the
+        // browser closes, so the obvious `expires_utc < now` predicate discards
+        // live logins and reports a working provider as never configured. The
+        // gain would be turning one rejected fetch into a slightly different
+        // label; the loss is a provider that silently stops reporting.
         let mut stmt = conn
             .prepare("SELECT host_key, name, encrypted_value FROM cookies WHERE host_key LIKE ?1")
             .map_err(|e| CookieError::Extract(format!("prepare: {e}")))?;
