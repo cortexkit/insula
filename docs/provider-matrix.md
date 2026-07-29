@@ -27,16 +27,28 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.45.2** (35 providers registered; verified
-2026-07-21). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.46.0** (35 providers registered; verified
+2026-07-28). CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.45.2..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.46.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
 providers (deferred to the Balance axis). When a diff touches a provider we serve,
 confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
 `/api/oauth/usage`, not CodexBar's CLI/web fetcher) and that the field actually
 changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
+
+v0.45.2 → v0.46.0 carried one behaviour fix for a provider we serve: **zai** now
+clamps the percentage it reports directly, not just the one it computes. Our port
+had the same split — computed branch clamped, fallback branch verbatim — and it is
+fixed. The rest is deliberately not ported. **ZoomMate** is a new prepaid-credits
+provider with no rate window (Balance axis). **QwenCloud** was restructured onto a
+new shared OneConsole layer with a cookie importer and SEC-token resolver; our
+`qwen_cloud.rs` reaches live 5h and weekly windows with absolute counts by a
+different route, so this is an upstream refactor rather than a behaviour gap —
+revisit if ours starts failing. `UsagePercent.swift` is a new shared clamp helper
+whose equivalent here is per-provider. `switcherWeeklyWindow` and the OpenCodeGo
+`pace:` attribute are CodexBar display surfaces with no counterpart on this wire.
 
 v0.41.0 → v0.42.0 delta was all additive/non-window on served providers: Codex
 credits (balance axis), Gemini `paidTierName` label, Antigravity port-detection
