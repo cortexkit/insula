@@ -380,6 +380,48 @@ impl FetchError {
 /// verbatim, and that value comes from the upstream.
 const MAX_ERROR_DETAIL_BYTES: usize = 1024;
 
+/// Whether a failure class means a stored credential that used to work has
+/// stopped working.
+///
+/// Answers a narrower question than "did this fail": the caller wants the
+/// failures a person can act on by signing in again. A provider nobody
+/// configured, an upstream having an outage, an account with no plan, and a
+/// defect in this module are all failures that no amount of re-authenticating
+/// would fix.
+///
+/// Unrecognised classes are **not** counted. That direction is deliberate: this
+/// feeds a number whose whole value is that it stays near zero until something
+/// needs attention, and a class that defaults to counting would inflate it for
+/// reasons the reader cannot see. The fence against silently dropping a class
+/// that *should* count is
+/// `every_error_class_is_classified_for_credential_staleness`, which fails when
+/// a new class appears here unjudged.
+pub fn class_means_credential_stopped_working(class: &str) -> bool {
+    match class {
+        // The upstream saw the credential and refused it.
+        "credential_rejected" => true,
+        // A credential was found and cannot be used as it stands.
+        "credential_unusable" => true,
+        // The response arrived but did not carry usage. For a scraped page this
+        // is what an expired session looks like when the site answers 200 with a
+        // login form instead of data -- which is how several cookie providers
+        // fail, since they have no explicit signed-out detection.
+        "decode_failed" => true,
+        // No credential was ever found: not logged in, which is the correct and
+        // permanent state on a host that does not use the service.
+        "credential_absent" => false,
+        // The credential worked; the account simply has no quota to report.
+        "no_quota_reported" => false,
+        // The upstream could not be reached or errored. A site outage is not an
+        // expired login, and signing in again would change nothing.
+        "upstream_failed" => false,
+        // Our own defect. Reporting it as a credential problem would send the
+        // reader to re-authenticate a working account.
+        "internal_error" => false,
+        _ => false,
+    }
+}
+
 impl std::fmt::Display for FetchError {
     /// This text is published: it becomes the `error` field of a degraded entry,
     /// which consumers read and at least one stores. So the detail is bounded
@@ -506,6 +548,77 @@ mod tests {
             FetchError::Internal("x".into()).error_class(),
             FetchError::Decode("x".into()).error_class(),
         );
+    }
+
+    /// Every class must be judged explicitly for whether it means a stored
+    /// credential stopped working.
+    ///
+    /// `class_means_credential_stopped_working` ends in a catch-all returning
+    /// false, which is the safe default for an unknown value arriving from
+    /// elsewhere but would silently swallow a class added *here* -- so a new
+    /// failure kind could belong in that count and be omitted with nothing
+    /// failing. This lists the judged classes separately: the exhaustive match
+    /// below stops compiling when a variant is added, and the assertion fails
+    /// when its class is missing from the list.
+    #[test]
+    fn every_error_class_is_classified_for_credential_staleness() {
+        // Maintained by hand, deliberately: an author adding a class has to
+        // decide which side it falls on and record it here.
+        let judged = [
+            "credential_absent",
+            "credential_unusable",
+            "credential_rejected",
+            "no_quota_reported",
+            "upstream_failed",
+            "decode_failed",
+            "internal_error",
+        ];
+
+        let all = [
+            FetchError::NoSession("x".into()),
+            FetchError::CredentialUnusable("x".into()),
+            FetchError::NoQuotaReported("x".into()),
+            FetchError::Unauthorized("x".into()),
+            FetchError::ProviderStatus(401),
+            FetchError::ProviderStatus(500),
+            FetchError::Upstream("x".into()),
+            FetchError::Decode("x".into()),
+            FetchError::Internal("x".into()),
+        ];
+
+        for case in &all {
+            // Fails to compile when a variant is added, so the list above cannot
+            // fall behind the enum without someone noticing.
+            match case {
+                FetchError::NoSession(_)
+                | FetchError::CredentialUnusable(_)
+                | FetchError::NoQuotaReported(_)
+                | FetchError::Unauthorized(_)
+                | FetchError::ProviderStatus(_)
+                | FetchError::Upstream(_)
+                | FetchError::Decode(_)
+                | FetchError::Internal(_) => {}
+            }
+
+            let class = case.error_class();
+            assert!(
+                judged.contains(&class),
+                "{class:?} reaches the wire but no one decided whether it means \
+                 a credential stopped working; it would default to 'no'"
+            );
+        }
+
+        // Not vacuous: the predicate genuinely separates the classes rather than
+        // answering the same way for all of them.
+        assert!(class_means_credential_stopped_working(
+            "credential_rejected"
+        ));
+        assert!(!class_means_credential_stopped_working("credential_absent"));
+
+        // An unknown class from anywhere else stays out of the count.
+        assert!(!class_means_credential_stopped_working(
+            "a_class_from_a_newer_build"
+        ));
     }
 
     #[test]

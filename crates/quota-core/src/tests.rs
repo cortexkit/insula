@@ -195,15 +195,54 @@ async fn only_a_failed_cookie_counts_as_a_stale_login() {
             name: "login-expired",
             error: || FetchError::Unauthorized("HTTP 401".into()),
         }),
+        // The site is down. A visitor with a perfectly good session sees the
+        // same failure, so re-authenticating would change nothing.
+        Box::new(CookieProvider {
+            name: "site-erroring",
+            error: || FetchError::Upstream("HTTP 500".into()),
+        }),
+        // The credential works and the account has no plan to report on.
+        Box::new(CookieProvider {
+            name: "no-plan",
+            error: || FetchError::NoQuotaReported("no active quota".into()),
+        }),
+        // Our own defect. Reporting it as a credential problem would send the
+        // reader to re-authenticate an account that is fine.
+        Box::new(CookieProvider {
+            name: "our-bug",
+            error: || FetchError::Internal("provider fetch panicked".into()),
+        }),
+        // A scraped page that answered 200 without usage data. Several cookie
+        // providers have no explicit signed-out detection, so this is what their
+        // expired session actually looks like.
+        Box::new(CookieProvider {
+            name: "page-unparseable",
+            error: || FetchError::Decode("no usage windows in response".into()),
+        }),
     ]);
     tick(&registry).await;
 
     let health = registry.health();
-    // Both are degraded: neither is serving a window.
-    assert_eq!(health.degraded, vec!["not-logged-in", "login-expired"]);
-    // Only the rejected cookie is a stale-login signal.
-    assert_eq!(health.cookie_cohort_degraded, vec!["login-expired"]);
-    assert_eq!(health.cookie_cohort_total, 2);
+    // Every one is degraded: none is serving a window.
+    assert_eq!(
+        health.degraded,
+        vec![
+            "not-logged-in",
+            "login-expired",
+            "site-erroring",
+            "no-plan",
+            "our-bug",
+            "page-unparseable"
+        ]
+    );
+    // Only the two that mean a stored login stopped working. Asserted as the
+    // whole list rather than by membership, so a class wrongly joining the count
+    // fails here instead of passing unnoticed.
+    assert_eq!(
+        health.cookie_cohort_degraded,
+        vec!["login-expired", "page-unparseable"]
+    );
+    assert_eq!(health.cookie_cohort_total, 6);
 }
 
 #[tokio::test]

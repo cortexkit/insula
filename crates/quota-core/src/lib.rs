@@ -773,15 +773,19 @@ impl Registry {
                 stale += 1;
             } else if all_degraded {
                 degraded.push(name.to_string());
-                // Only a cookie that FAILED is a stale-login signal. A provider
-                // whose cookie is simply absent is not logged in, which is a
-                // permanent and correct state on any host the user does not use
-                // for that service -- counting it here would keep this number
-                // pinned at the cohort size and make it mean nothing.
+                // Only a stored login that stopped working counts. A cookie that
+                // is simply absent means nobody signed in, which is permanent and
+                // correct on a host that does not use the service, and an upstream
+                // outage is not something re-authenticating would fix.
+                //
+                // Asked as "which classes count" rather than "which are excluded",
+                // so a class added to the taxonomy later does not join this number
+                // by default -- see `class_means_credential_stopped_working`.
                 if provider.cookie_based
-                    && slots
-                        .iter()
-                        .any(|slot| !matches!(slot.error_class, Some("credential_absent") | None))
+                    && slots.iter().any(|slot| {
+                        slot.error_class
+                            .is_some_and(provider::class_means_credential_stopped_working)
+                    })
                 {
                     cookie_cohort_degraded.push(name.to_string());
                 }
