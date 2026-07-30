@@ -25,7 +25,26 @@ ck module restart ai-provider-quota
 # 4. verify the running build is the one you just installed
 ck module status ai-provider-quota --json    # health.metrics.buildCommit
 git rev-parse --short=12 HEAD                # must match
+
+# 5. check what it now publishes is internally coherent
+cargo run -p quota-module --example deployed-sanity
 ```
+
+Step 5 answers a different question from step 4. The stamp says the right *code*
+is running; the sanity sweep says the *data* that code publishes does not
+contradict itself — a percent outside 0..=100, a reset further out than its
+window is long, counts that disagree with their own percent. Those are
+well-formed values that parse cleanly, so nothing else catches them, and one such
+defect reached production and was found by a person reading the output.
+
+It exits non-zero both when a check fails and when it could not examine anything,
+so it can gate the deploy rather than merely inform it.
+
+Use the module-side example, not `quota-core`'s `wire-sanity`. The latter builds
+its own registry with no credential-vault client, so it cannot see the lane that
+serves most of the labelled accounts here — on this host it examines 16 windows
+against the deployed module's 30. A clean result from it is not a statement about
+what production publishes.
 
 ## Do not kill the process
 

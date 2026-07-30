@@ -52,6 +52,7 @@ pub mod synthetic;
 mod text;
 pub mod vault_handles;
 pub mod warp;
+pub mod wire_sanity;
 pub mod zai;
 pub mod zenmux;
 
