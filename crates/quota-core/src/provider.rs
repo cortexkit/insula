@@ -328,14 +328,20 @@ pub enum FetchError {
     Upstream(String),
     /// The response was not the shape we expected.
     Decode(String),
-    /// This module failed, not the provider: a fetch panicked, or an internal
-    /// invariant refused to continue.
+    /// This module failed, not the provider.
     ///
     /// Distinct from [`Self::Decode`] because the two name different culprits
     /// and different actions. A decode failure says the upstream changed its
     /// payload and someone should watch for their fix; this says the defect is
     /// here and should be reported against this module. Folding a crash of ours
     /// into a decode failure sends the reader to the wrong codebase.
+    ///
+    /// Currently reached from one place: when a provider's fetch panics, the
+    /// background refresh loop catches it and reports it as this. Use it for any
+    /// other failure whose cause is this module's own state rather than anything
+    /// the upstream sent -- but choose it because that is what happened, not to
+    /// avoid naming a provider: a defect filed against the wrong codebase costs
+    /// more than an unhelpful class name.
     Internal(String),
 }
 
