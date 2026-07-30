@@ -23,6 +23,15 @@ use cortexkit_provider_usage::{ProviderUsage, RateWindow};
 /// How far past a window's own length its reset may sit before it is
 /// misattributed. A window resets at most one window-length from now, plus a
 /// margin for clock skew and for upstreams that round to the next hour.
+/// How far ahead of the reader's clock a `fetchedAt` may sit before it is
+/// treated as wrong rather than as clock skew.
+///
+/// The producer stamps this from its own clock and a consumer reads it from
+/// another, so a small lead is ordinary. A large one is not skew: it means the
+/// timestamp was derived rather than observed, and an entry stamped in the
+/// future ages backwards.
+const FUTURE_TOLERANCE_SECS: i64 = 120;
+
 const RESET_SLACK_RATIO: f64 = 1.05;
 const RESET_SLACK_MINUTES: f64 = 60.0;
 
@@ -89,7 +98,7 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
     };
 
     for entry in entries {
-        check_entry_shape(entry, &mut report.findings);
+        check_entry_shape(entry, now, &mut report.findings);
         if entry.error.is_some() {
             report.degraded += 1;
             continue;
@@ -111,16 +120,55 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 }
 
 /// Check one entry against the promise that it says something.
-fn check_entry_shape(entry: &ProviderUsage, findings: &mut Vec<String>) {
+fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut Vec<String>) {
+    let where_ = format!(
+        "{}/{}",
+        entry.provider,
+        entry.account.as_deref().unwrap_or("unlabeled")
+    );
+
     // An entry is a capacity reading or a stated failure. Carrying neither says
     // nothing at all while still occupying a row, so a consumer counting
     // published providers counts it and a consumer reading capacity finds none:
     // the two disagree about the same entry.
     if entry.usage.is_none() && entry.error.is_none() {
+        findings.push(format!("{where_}: entry carries neither usage nor error"));
+    }
+
+    // Consumers are told to age every entry on `fetchedAt` and never on their own
+    // poll time, so usage without it leaves them no honest way to decide how old
+    // the reading is. Both available answers are wrong: treat it as current and a
+    // window from hours ago prices as live, or discard it and a healthy provider
+    // vanishes.
+    //
+    // Unreachable by construction -- a slot serving usage has always succeeded at
+    // least once, and the one path that clears that timestamp also suppresses the
+    // entry -- which is exactly why it is worth asserting against the published
+    // array rather than against the code that builds it.
+    if entry.usage.is_some() && entry.fetched_at.is_none() {
         findings.push(format!(
-            "{}/{}: entry carries neither usage nor error",
-            entry.provider,
-            entry.account.as_deref().unwrap_or("unlabeled")
+            "{where_}: carries usage but no fetchedAt, leaving consumers no way to age it"
+        ));
+    }
+
+    let Some(text) = entry.fetched_at.as_deref() else {
+        return;
+    };
+    let Ok(fetched_at) = DateTime::parse_from_rfc3339(text) else {
+        findings.push(format!("{where_}: fetchedAt is unparseable: {text}"));
+        return;
+    };
+
+    // A timestamp ahead of now makes an entry age backwards: it reads as fresher
+    // the longer it sits, so a stale window never crosses any threshold a
+    // consumer sets. The tolerance covers ordinary clock movement between the
+    // module stamping the value and this reading it; anything beyond that means
+    // the timestamp was computed rather than observed.
+    let ahead = fetched_at.with_timezone(&Utc).signed_duration_since(now);
+    if ahead > chrono::Duration::seconds(FUTURE_TOLERANCE_SECS) {
+        findings.push(format!(
+            "{where_}: fetchedAt is {}s in the future",
+            ahead.num_seconds()
         ));
     }
 }
@@ -314,8 +362,14 @@ mod tests {
         }
     }
 
+    /// A published entry, stamped the way the module stamps one.
+    ///
+    /// `fetched_at` is set because every entry carrying usage has it in
+    /// production: a slot serving a window has succeeded at least once. A
+    /// fixture without it would model a state the module cannot emit, and would
+    /// have quietly disabled the timestamp checks for every test built on it.
     fn entry(window: RateWindow) -> ProviderUsage {
-        ProviderUsage::healthy(
+        let mut entry = ProviderUsage::healthy(
             "codex",
             Some("acct".into()),
             "oauth",
@@ -323,8 +377,23 @@ mod tests {
                 primary: Some(window),
                 ..Usage::default()
             },
-        )
+        );
+        entry.fetched_at = Some(stamped_at());
+        entry
     }
+
+    /// A plausible last-success time, anchored to the clock the tests drive.
+    ///
+    /// The checks take an explicit `now` so they can be tested against fixed
+    /// timestamps; a fixture reading the real clock instead would sit days from
+    /// that instant and fail for a reason that has nothing to do with the test.
+    fn stamped_at() -> String {
+        (at(FIXTURE_NOW) - chrono::Duration::minutes(2)).to_rfc3339()
+    }
+
+    /// The instant the fixtures are built around. Tests that care about a
+    /// different clock pass their own to `check_entries`.
+    const FIXTURE_NOW: &str = "2026-07-28T10:00:00Z";
 
     fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -430,7 +499,7 @@ mod tests {
     }
 
     fn labelled(provider: &str, account: &str) -> ProviderUsage {
-        ProviderUsage::healthy(
+        let mut entry = ProviderUsage::healthy(
             provider,
             Some(account.into()),
             "vault",
@@ -438,11 +507,13 @@ mod tests {
                 primary: Some(window(10.0)),
                 ..Usage::default()
             },
-        )
+        );
+        entry.fetched_at = Some(stamped_at());
+        entry
     }
 
     fn unlabelled(provider: &str) -> ProviderUsage {
-        ProviderUsage::healthy(
+        let mut entry = ProviderUsage::healthy(
             provider,
             None,
             "oauth",
@@ -450,7 +521,9 @@ mod tests {
                 primary: Some(window(10.0)),
                 ..Usage::default()
             },
-        )
+        );
+        entry.fetched_at = Some(stamped_at());
+        entry
     }
 
     /// Several labelled accounts under one provider is the normal multi-account
@@ -597,6 +670,101 @@ mod tests {
                 .any(|f| f.contains("2 unlabelled entries")),
             "{:?}",
             report.findings
+        );
+    }
+    /// Consumers age every entry on `fetchedAt` and are told never to substitute
+    /// their own poll time, so usage without it leaves them no honest option:
+    /// treating it as current prices an old window as live, and discarding it
+    /// makes a healthy provider disappear.
+    #[test]
+    fn usage_without_a_fetched_at_is_reported() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = None;
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(
+            report.findings,
+            vec!["codex/acct: carries usage but no fetchedAt, leaving consumers no way to age it"]
+        );
+        // Not vacuous: the window was still examined, so this is a finding from
+        // checking rather than a side effect of skipping the entry.
+        assert_eq!(report.windows_checked, 1);
+    }
+
+    /// A degraded entry legitimately has no `fetchedAt` when its slot has never
+    /// succeeded, which is the ordinary state on a host without that credential.
+    /// Reporting it would fire on most providers here and bury the real findings.
+    #[test]
+    fn a_degraded_entry_without_a_fetched_at_is_not_reported() {
+        let report = check_entries(
+            &[ProviderUsage::degraded(
+                "codex",
+                "no session: not configured",
+            )],
+            at(FIXTURE_NOW),
+        );
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.degraded, 1);
+    }
+
+    /// An entry stamped ahead of the reader's clock ages *backwards*: it looks
+    /// fresher the longer it sits, so a stale window never crosses a staleness
+    /// threshold and a consumer keeps pacing against data that stopped updating.
+    #[test]
+    fn a_fetched_at_in_the_future_is_reported() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some((at(FIXTURE_NOW) + chrono::Duration::hours(3)).to_rfc3339());
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("fetchedAt is 10800s in the future"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Clock skew between the module and whoever reads it is ordinary and must
+    /// not be reported, or the check fires on healthy output and gets ignored.
+    #[test]
+    fn a_fetched_at_slightly_ahead_is_tolerated_as_clock_skew() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some((at(FIXTURE_NOW) + chrono::Duration::seconds(30)).to_rfc3339());
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.windows_checked, 1);
+    }
+
+    /// There is no upper bound on how stale a served entry may be: while
+    /// failures stay transient this module keeps serving the last healthy
+    /// window, so an old timestamp is honest reporting rather than a defect.
+    /// Flagging it would turn a correct behaviour into a permanent finding.
+    #[test]
+    fn a_very_old_fetched_at_is_not_a_finding() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some((at(FIXTURE_NOW) - chrono::Duration::days(7)).to_rfc3339());
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.windows_checked, 1);
+    }
+
+    #[test]
+    fn an_unparseable_fetched_at_is_reported() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some("last tuesday".into());
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(
+            report.findings,
+            vec!["codex/acct: fetchedAt is unparseable: last tuesday"]
         );
     }
 }
