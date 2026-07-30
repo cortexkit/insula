@@ -865,6 +865,57 @@ async fn one_healthy_handle_prevents_provider_wide_degradation() {
     assert!(health.degraded.is_empty());
 }
 
+/// A provider counted as healthy can still be publishing a dead account.
+///
+/// The health buckets count providers and take the best account; the array
+/// carries one entry per account. So a consumer reading a provider out of the
+/// `fresh` bucket and concluding its accounts are all usable skips a failed one
+/// silently -- the failure is in the array the whole time, and health is not the
+/// place to look for it.
+///
+/// Separate from the aggregation test above even though the setup is identical.
+/// That test is named for the health rule; this asserts the consequence a
+/// consumer acts on, and neither should be able to delete the other's coverage.
+///
+/// The state cannot be observed from this host's live output -- both
+/// multi-account providers here are uniformly healthy -- so the disagreement has
+/// to be constructed.
+#[tokio::test]
+async fn a_provider_in_the_fresh_bucket_can_still_publish_a_failed_account() {
+    let registry = Registry::new(vec![Box::new(MixedHealthProvider)]);
+    tick(&registry).await;
+
+    // The health axis says this provider is fine.
+    let health = registry.health();
+    assert_eq!(health.fresh, 1);
+    assert!(health.degraded.is_empty());
+
+    // The array says one of its two accounts is not.
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 2, "one entry per account: {usage:?}");
+
+    let healthy = usage
+        .iter()
+        .find(|entry| entry.account.as_deref() == Some("A"))
+        .expect("the healthy account is published");
+    assert!(healthy.usage.is_some());
+    assert!(healthy.error.is_none());
+
+    let failed = usage
+        .iter()
+        .find(|entry| entry.account.as_deref() == Some("B"))
+        .expect("the failed account is published rather than hidden by its healthy sibling");
+    assert!(failed.usage.is_none());
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("logged out")),
+        "the failed account states its own reason: {:?}",
+        failed.error
+    );
+}
+
 struct FlipProvider {
     calls: Mutex<usize>,
 }
