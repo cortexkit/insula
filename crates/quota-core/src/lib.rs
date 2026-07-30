@@ -732,6 +732,7 @@ impl Registry {
         let now = Instant::now();
         let mut fresh = 0;
         let mut stale = 0;
+        let mut pending = 0;
         let mut degraded = Vec::new();
         let mut without_handles = Vec::new();
         let mut cookie_cohort_degraded = Vec::new();
@@ -771,7 +772,18 @@ impl Registry {
                 fresh += 1;
             } else if has_stale {
                 stale += 1;
-            } else if all_degraded {
+            } else if !all_degraded {
+                // Serving nothing, and at least one handle has not finished its
+                // first fetch. Reachable whenever there are more fetch units than
+                // the concurrency cap admits per turn, so with this many providers
+                // it is the ordinary state for the first few turns after a start.
+                //
+                // Counted rather than skipped: every provider must land in exactly
+                // one bucket, or the buckets under-sum against providers_total and
+                // a consumer asserting that identity sees an imbalance that means
+                // nothing is wrong.
+                pending += 1;
+            } else {
                 degraded.push(name.to_string());
                 // Only a stored login that stopped working counts. A cookie that
                 // is simply absent means nobody signed in, which is permanent and
@@ -801,6 +813,7 @@ impl Registry {
             providers_total,
             fresh,
             stale,
+            pending,
             degraded,
             without_handles,
             cookie_cohort_total,

@@ -400,6 +400,13 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         "providersTotal": snapshot.providers_total,
         "fresh": snapshot.fresh,
         "stale": snapshot.stale,
+        // Providers whose first fetch has not completed. The refresher admits a
+        // bounded number of fetch units per turn, so after a start the providers
+        // beyond that cap are queued for several turns -- ordinary, not a fault.
+        // Published because the conservation identity under-sums without it, and
+        // an identity that is briefly false after every restart trains its reader
+        // to ignore the imbalance that matters.
+        "pending": snapshot.pending,
         "degraded": snapshot.degraded,
         // Registered providers that resolved no credential handle, so they appear
         // in none of the counts above. Reported by name so the buckets can be
@@ -620,6 +627,7 @@ mod tests {
             providers_total: 3,
             fresh: 3,
             stale: 0,
+            pending: 0,
             degraded: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total: 0,

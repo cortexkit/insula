@@ -30,6 +30,18 @@ pub struct HealthSnapshot {
     /// Providers serving a prior good window after a transient failure (stale,
     /// but not wrong — the session is presumed intact).
     pub stale: usize,
+    /// Providers serving nothing yet because at least one handle has not
+    /// completed its first fetch.
+    ///
+    /// Ordinary rather than exceptional: the refresher admits a bounded number
+    /// of fetch units per turn, so with more units than that cap some providers
+    /// wait several turns after a start. Counted rather than omitted because
+    /// every provider must land in exactly one bucket — see the conservation
+    /// identity on `without_handles`.
+    ///
+    /// Not a fault, and distinct from `without_handles`: this provider resolved
+    /// its credentials and is queued, rather than failing to enumerate any.
+    pub pending: usize,
     /// Names of providers in a degraded state (non-transient failure: no creds,
     /// expired session, bad shape) — they serve an error entry, not a window.
     pub degraded: Vec<String>,
@@ -37,10 +49,16 @@ pub struct HealthSnapshot {
     /// hold no slots and appear in none of the counts above.
     ///
     /// Without this they would be counted in `providers_total` and then be
-    /// invisible everywhere else, so `fresh + stale + degraded` could silently
-    /// under-sum and a provider that never came up would read as an absence
-    /// rather than as a problem. Only populated once the refresher has completed
-    /// a tick: before that every provider legitimately has no slots yet.
+    /// invisible everywhere else, so the buckets could silently under-sum and a
+    /// provider that never came up would read as an absence rather than as a
+    /// problem. Only populated once the refresher has completed a tick: before
+    /// that every provider legitimately has no slots yet.
+    ///
+    /// The conservation identity this exists to preserve is
+    /// `fresh + stale + pending + degraded.len() + without_handles.len() ==
+    /// providers_total`, and it holds only once `last_tick_age` is `Some`.
+    /// Consumers are told to assert it, so every branch that classifies a
+    /// provider must increment exactly one bucket.
     pub without_handles: Vec<String>,
     /// Browser-cookie providers registered (the desktop-coupled cohort).
     pub cookie_cohort_total: usize,
@@ -71,6 +89,11 @@ impl HealthSnapshot {
             providers_total,
             fresh: 0,
             stale: 0,
+            // Every bucket is empty here and the identity does not balance, which
+            // is correct: the store could not be read, so no provider was
+            // classified at all. Consumers gate the identity on `last_tick_age`
+            // being set, and this snapshot leaves it `None`.
+            pending: 0,
             degraded: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total,

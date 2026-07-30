@@ -1333,6 +1333,88 @@ impl UsageProvider for CursorProvider {
     }
 }
 
+/// Every registered provider lands in exactly one health bucket, including one
+/// whose first fetch has not run yet.
+///
+/// Consumers are told to assert `fresh + stale + pending + degraded +
+/// withoutHandles == providersTotal` and alert on an imbalance, so a state that
+/// breaks it without anything being wrong is worse than no invariant at all: it
+/// fires after every restart and trains the reader to ignore the alert.
+///
+/// The unbucketed state is ordinary rather than exotic. The refresher admits a
+/// bounded number of fetch units per turn, so any registry with more units than
+/// that cap has providers still queued after the first tick -- which is when the
+/// documented precondition (`lastTickAgeSecs` is set) says the identity holds.
+#[tokio::test]
+async fn every_provider_lands_in_exactly_one_health_bucket() {
+    let provider_count = refresh::CONCURRENCY_CAP + 1;
+    let calls: Vec<_> = (0..provider_count)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    // The providers before the cap take two handles each, so the cap is spent
+    // before the last provider is reached and its slots stay Pending.
+    let providers: Vec<Box<dyn UsageProvider>> = (0..provider_count)
+        .map(|index| {
+            Box::new(CursorProvider {
+                name: format!("provider-{index:02}"),
+                handles: if index < refresh::CONCURRENCY_CAP {
+                    2
+                } else {
+                    1
+                },
+                calls: Arc::clone(&calls[index]),
+            }) as Box<dyn UsageProvider>
+        })
+        .collect();
+    let registry = Registry::new(providers);
+
+    tick(&registry).await;
+
+    let health = registry.health();
+    // The precondition consumers gate on: the identity is only claimed once the
+    // refresher has ticked.
+    assert!(health.last_tick_age.is_some());
+
+    // Not vacuous: this is the state that breaks the identity when Pending has
+    // no bucket. Without it the assertion below would pass on any all-fresh run.
+    assert_eq!(
+        calls[provider_count - 1].load(Ordering::SeqCst),
+        0,
+        "the last provider must not have been fetched yet"
+    );
+    assert_eq!(health.pending, 1, "the unfetched provider is pending");
+
+    assert_eq!(
+        health.fresh
+            + health.stale
+            + health.pending
+            + health.degraded.len()
+            + health.without_handles.len(),
+        health.providers_total,
+        "buckets: fresh {} stale {} pending {} degraded {:?} withoutHandles {:?} total {}",
+        health.fresh,
+        health.stale,
+        health.pending,
+        health.degraded,
+        health.without_handles,
+        health.providers_total
+    );
+
+    // And it still balances once everything has been fetched, so the fix is not
+    // simply moving the imbalance to a later turn.
+    tick(&registry).await;
+    let health = registry.health();
+    assert_eq!(health.pending, 0);
+    assert_eq!(
+        health.fresh
+            + health.stale
+            + health.pending
+            + health.degraded.len()
+            + health.without_handles.len(),
+        health.providers_total
+    );
+}
+
 #[tokio::test]
 async fn persisted_round_robin_cursor_admits_provider_after_the_first_cap() {
     let provider_count = refresh::CONCURRENCY_CAP + 1;
