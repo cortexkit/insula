@@ -86,21 +86,24 @@ async fn main() {
         .count();
 
     println!(
-        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}",
-        report.entries, report.degraded, report.windows_checked
+        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   providers compared: {}",
+        report.entries, report.degraded, report.windows_checked, report.providers_compared
     );
 
+    // Findings are reported before the no-windows exit. The cross-entry checks
+    // examine degraded entries too, so an all-degraded array can still carry real
+    // findings -- exiting on "nothing examined" first would discard precisely the
+    // ones that survived the condition suppressing everything else.
+    if !report.findings.is_empty() {
+        println!("findings: {}", report.findings.len());
+        for finding in &report.findings {
+            println!("  {finding}");
+        }
+        std::process::exit(1);
+    }
     if report.examined_nothing() {
         println!("no windows to check: every entry is degraded");
         std::process::exit(2);
     }
-    if report.findings.is_empty() {
-        println!("findings: none");
-        return;
-    }
-    println!("findings: {}", report.findings.len());
-    for finding in &report.findings {
-        println!("  {finding}");
-    }
-    std::process::exit(1);
+    println!("findings: none");
 }

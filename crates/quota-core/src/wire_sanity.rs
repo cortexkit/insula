@@ -15,6 +15,8 @@
 //! checks themselves can be unit-tested. A checker whose logic exists only
 //! inside an example is the one piece of the pipeline nothing verifies.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Utc};
 use cortexkit_provider_usage::{ProviderUsage, RateWindow};
 
@@ -54,6 +56,13 @@ pub struct SanityReport {
     pub entries: usize,
     pub degraded: usize,
     pub windows_checked: usize,
+    /// How many providers had their sibling entries compared against each other.
+    ///
+    /// Separate from `windows_checked` because the two can diverge sharply: an
+    /// array of entirely degraded entries examines no window while still
+    /// admitting every cross-entry check, and a single-account host admits the
+    /// within-provider checks while never exercising a multi-account one.
+    pub providers_compared: usize,
     pub findings: Vec<String>,
 }
 
@@ -62,6 +71,10 @@ impl SanityReport {
     ///
     /// Distinct from having no findings: this is the answer being unavailable
     /// rather than favourable.
+    ///
+    /// Only about windows. The cross-entry checks run over degraded entries too,
+    /// so a caller must report `findings` before acting on this — otherwise the
+    /// condition that says "nothing was examined" also discards what was found.
     pub fn examined_nothing(&self) -> bool {
         self.windows_checked == 0
     }
@@ -76,6 +89,7 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
     };
 
     for entry in entries {
+        check_entry_shape(entry, &mut report.findings);
         if entry.error.is_some() {
             report.degraded += 1;
             continue;
@@ -91,7 +105,100 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
         }
     }
 
+    check_across_entries(entries, &mut report);
+
     report
+}
+
+/// Check one entry against the promise that it says something.
+fn check_entry_shape(entry: &ProviderUsage, findings: &mut Vec<String>) {
+    // An entry is a capacity reading or a stated failure. Carrying neither says
+    // nothing at all while still occupying a row, so a consumer counting
+    // published providers counts it and a consumer reading capacity finds none:
+    // the two disagree about the same entry.
+    if entry.usage.is_none() && entry.error.is_none() {
+        findings.push(format!(
+            "{}/{}: entry carries neither usage nor error",
+            entry.provider,
+            entry.account.as_deref().unwrap_or("unlabeled")
+        ));
+    }
+}
+
+/// Check the invariants that hold between sibling entries of one provider.
+///
+/// These are promises the emission path makes and consumers rely on, and they
+/// are invisible to any check that reads one entry at a time. They are asserted
+/// against the published array rather than against the code that builds it,
+/// because that is the artifact consumers actually receive.
+fn check_across_entries(entries: &[ProviderUsage], report: &mut SanityReport) {
+    let mut by_provider: BTreeMap<&str, Vec<&ProviderUsage>> = BTreeMap::new();
+    for entry in entries {
+        by_provider
+            .entry(entry.provider.as_str())
+            .or_default()
+            .push(entry);
+    }
+
+    for (provider, siblings) in &by_provider {
+        report.providers_compared += 1;
+
+        let unlabelled = siblings.iter().filter(|e| e.account.is_none()).count();
+        let labelled = siblings.len() - unlabelled;
+
+        // One provider may publish several labelled accounts, or exactly one
+        // unlabelled entry when identity could not be resolved for all of its
+        // credentials. Two unlabelled entries are indistinguishable from each
+        // other, so a consumer keying on (provider, account) cannot tell which
+        // is which and has no basis for preferring either.
+        if unlabelled > 1 {
+            report.findings.push(format!(
+                "{provider}: {unlabelled} unlabelled entries, which are indistinguishable to a consumer"
+            ));
+        }
+
+        // Mixing the two is worse than either alone: the unlabelled row may be
+        // the same account as one of the labelled ones, so a consumer summing
+        // per-account capacity can count one account twice without any duplicate
+        // key to notice.
+        if unlabelled > 0 && labelled > 0 {
+            report.findings.push(format!(
+                "{provider}: {labelled} labelled and {unlabelled} unlabelled entries in the same array"
+            ));
+        }
+
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in siblings {
+            if let Some(account) = entry.account.as_deref() {
+                *seen.entry(account).or_default() += 1;
+            }
+        }
+        for (account, count) in seen {
+            if count > 1 {
+                report.findings.push(format!(
+                    "{provider}/{account}: {count} entries for one account"
+                ));
+            }
+        }
+
+        // `apiProvider` is a property of the provider, not of the account, so
+        // every sibling must agree. A consumer that reads it from whichever
+        // entry it happens to hold would otherwise route two accounts of one
+        // provider to different pricing tables.
+        let distinct: BTreeSet<Option<&str>> =
+            siblings.iter().map(|e| e.api_provider.as_deref()).collect();
+        if distinct.len() > 1 {
+            let mut rendered: Vec<&str> = distinct
+                .iter()
+                .map(|value| value.unwrap_or("(absent)"))
+                .collect();
+            rendered.sort_unstable();
+            report.findings.push(format!(
+                "{provider}: sibling entries disagree on apiProvider: {}",
+                rendered.join(", ")
+            ));
+        }
+    }
 }
 
 /// Every window an entry publishes.
@@ -318,5 +425,178 @@ mod tests {
         assert!(report.examined_nothing());
         assert_eq!(report.degraded, 1);
         assert_eq!(report.findings, Vec::<String>::new());
+        // The cross-entry checks do not need a window, so they still ran.
+        assert_eq!(report.providers_compared, 1);
+    }
+
+    fn labelled(provider: &str, account: &str) -> ProviderUsage {
+        ProviderUsage::healthy(
+            provider,
+            Some(account.into()),
+            "vault",
+            Usage {
+                primary: Some(window(10.0)),
+                ..Usage::default()
+            },
+        )
+    }
+
+    fn unlabelled(provider: &str) -> ProviderUsage {
+        ProviderUsage::healthy(
+            provider,
+            None,
+            "oauth",
+            Usage {
+                primary: Some(window(10.0)),
+                ..Usage::default()
+            },
+        )
+    }
+
+    /// Several labelled accounts under one provider is the normal multi-account
+    /// shape and must not be reported — otherwise the checks below could pass by
+    /// flagging every provider that has more than one entry.
+    #[test]
+    fn sibling_entries_with_distinct_accounts_produce_no_findings() {
+        let report = check_entries(
+            &[labelled("claude", "acct-a"), labelled("claude", "acct-b")],
+            at("2026-07-28T10:00:00Z"),
+        );
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.providers_compared, 1);
+        assert_eq!(report.windows_checked, 2);
+    }
+
+    /// Two unlabelled entries cannot be told apart by a consumer keying on
+    /// (provider, account), so it has no basis for preferring either.
+    #[test]
+    fn two_unlabelled_entries_for_one_provider_are_reported() {
+        let report = check_entries(
+            &[unlabelled("grok"), unlabelled("grok")],
+            at("2026-07-28T10:00:00Z"),
+        );
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("2 unlabelled entries")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A single unlabelled entry is the legitimate shape when identity could not
+    /// be resolved, so the check above must not fire on it.
+    #[test]
+    fn one_unlabelled_entry_alone_is_not_reported() {
+        let report = check_entries(&[unlabelled("grok")], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+    }
+
+    /// Mixing labelled and unlabelled entries lets a consumer count one account
+    /// twice: the unlabelled row may be the same account as a labelled one, and
+    /// no duplicate key exists to reveal it.
+    #[test]
+    fn a_labelled_and_an_unlabelled_entry_together_are_reported() {
+        let report = check_entries(
+            &[labelled("codex", "acct-a"), unlabelled("codex")],
+            at("2026-07-28T10:00:00Z"),
+        );
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("labelled and 1 unlabelled")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn two_entries_for_the_same_account_are_reported() {
+        let report = check_entries(
+            &[labelled("claude", "acct-a"), labelled("claude", "acct-a")],
+            at("2026-07-28T10:00:00Z"),
+        );
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("2 entries for one account")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// `apiProvider` is derived from the provider name, so siblings disagreeing
+    /// about it means a consumer reading it from an arbitrary entry would route
+    /// two accounts of one provider to different pricing tables.
+    #[test]
+    fn sibling_entries_disagreeing_on_api_provider_are_reported() {
+        let mut first = labelled("codex", "acct-a");
+        first.api_provider = Some("openai".into());
+        let second = labelled("codex", "acct-b");
+
+        let report = check_entries(&[first, second], at("2026-07-28T10:00:00Z"));
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("disagree on apiProvider")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// An entry with neither usage nor error occupies a row while saying nothing,
+    /// so a consumer counting published providers and one reading capacity
+    /// disagree about the same entry.
+    #[test]
+    fn an_entry_with_neither_usage_nor_error_is_reported() {
+        let mut empty = labelled("kimi", "acct-a");
+        empty.usage = None;
+
+        let report = check_entries(&[empty], at("2026-07-28T10:00:00Z"));
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("neither usage nor error")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The cross-entry checks do not read windows, so they survive an array in
+    /// which every entry is degraded — the state that suppresses every other
+    /// check. A caller must therefore report findings before acting on
+    /// `examined_nothing`, or this finding is discarded by the condition that
+    /// says nothing was examined.
+    #[test]
+    fn a_finding_survives_an_array_that_examined_no_window() {
+        let report = check_entries(
+            &[
+                ProviderUsage::degraded("grok", "upstream error: flapped"),
+                ProviderUsage::degraded("grok", "upstream error: flapped"),
+            ],
+            at("2026-07-28T10:00:00Z"),
+        );
+
+        assert!(report.examined_nothing());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("2 unlabelled entries")),
+            "{:?}",
+            report.findings
+        );
     }
 }

@@ -43,13 +43,25 @@ fn main() {
 
     let report = wire_sanity::check_entries(&entries, Utc::now());
     println!(
-        "entries: {} ({} degraded)   windows checked: {}   warm-up {:.0}s",
+        "entries: {} ({} degraded)   windows checked: {}   providers compared: {}   warm-up {:.0}s",
         report.entries,
         report.degraded,
         report.windows_checked,
+        report.providers_compared,
         warm_up.as_secs_f64()
     );
 
+    // Findings are reported before the no-windows exit. The cross-entry checks
+    // examine degraded entries too, so an all-degraded array can still carry real
+    // findings -- exiting on "nothing examined" first would discard precisely the
+    // ones that survived the condition suppressing everything else.
+    if !report.findings.is_empty() {
+        println!("findings: {}", report.findings.len());
+        for finding in &report.findings {
+            println!("  {finding}");
+        }
+        std::process::exit(1);
+    }
     // Every entry could be degraded, which is a legitimate state but means no
     // window was examined. Saying "no findings" there would claim a check that
     // did not happen.
@@ -57,13 +69,5 @@ fn main() {
         println!("no windows to check: every entry is degraded");
         std::process::exit(2);
     }
-    if report.findings.is_empty() {
-        println!("findings: none");
-        return;
-    }
-    println!("findings: {}", report.findings.len());
-    for finding in &report.findings {
-        println!("  {finding}");
-    }
-    std::process::exit(1);
+    println!("findings: none");
 }
