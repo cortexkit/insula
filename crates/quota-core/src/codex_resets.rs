@@ -1163,3 +1163,108 @@ impl ResetCoordinator {
             });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{RateWindow, Usage};
+
+    fn usage_at(percent: f64) -> Usage {
+        Usage {
+            primary: Some(RateWindow {
+                used_percent: percent,
+                raw_used_percent: None,
+                window_minutes: Some(10080),
+                resets_at: None,
+                used_count: None,
+                total_count: None,
+            }),
+            ..Usage::default()
+        }
+    }
+
+    /// The at-wall threshold decides whether an account is treated as having hit
+    /// its limit, which is one of the two conditions that spend a banked credit.
+    ///
+    /// Driven from percentages rather than by handing `at_wall` in directly. The
+    /// trigger tests take it as a parameter, so they exercise what the gate does
+    /// with the answer and never how the answer is reached -- and the derivation
+    /// is where a mis-set threshold would live.
+    ///
+    /// Both sides are asserted because the two directions fail differently and
+    /// each survives a test of the other. Too high and a walled account is never
+    /// relieved, so the credits it holds expire unspent while it sits blocked.
+    /// Too low and a credit is spent on an account that still had room, which
+    /// cannot be undone.
+    #[test]
+    fn the_at_wall_threshold_holds_on_both_sides() {
+        let below = UsageFacts::from_usage(&usage_at(98.9), None);
+        assert!(!below.at_wall, "98.9% must not read as walled");
+
+        let at = UsageFacts::from_usage(&usage_at(99.0), None);
+        assert!(at.at_wall, "99.0% is the wall");
+
+        let above = UsageFacts::from_usage(&usage_at(99.5), None);
+        assert!(above.at_wall, "99.5% must read as walled");
+
+        // The upstream saying so outranks the percentages: a provider that
+        // reports a limit reached is believed even when its figures look low,
+        // because it knows its own enforcement and the percentages are inference.
+        let stated = UsageFacts::from_usage(&usage_at(3.0), Some(true));
+        assert!(
+            stated.at_wall,
+            "a stated limit is the wall regardless of percent"
+        );
+    }
+
+    /// The used floor stops a credit being spent on an account that has consumed
+    /// nothing.
+    ///
+    /// Without it an expiring credit would be redeemed against an untouched
+    /// window, spending something irreplaceable to reset a limit nobody had
+    /// approached.
+    #[test]
+    fn the_used_floor_holds_on_both_sides() {
+        assert!(
+            !UsageFacts::from_usage(&usage_at(0.9), None).any_used_floor,
+            "0.9% is below the floor"
+        );
+        assert!(
+            UsageFacts::from_usage(&usage_at(1.0), None).any_used_floor,
+            "1.0% is the floor"
+        );
+    }
+
+    /// The facts read every window, not only the headline slot.
+    ///
+    /// An account is walled when *any* of its windows is exhausted, and the
+    /// exhausted one is routinely not the first: the headline slot is the
+    /// shortest window, while the weekly limit is the one that blocks work.
+    #[test]
+    fn a_wall_in_a_later_window_is_still_a_wall() {
+        let usage = Usage {
+            primary: Some(RateWindow {
+                used_percent: 4.0,
+                raw_used_percent: None,
+                window_minutes: Some(300),
+                resets_at: None,
+                used_count: None,
+                total_count: None,
+            }),
+            secondary: Some(RateWindow {
+                used_percent: 99.4,
+                raw_used_percent: None,
+                window_minutes: Some(10080),
+                resets_at: None,
+                used_count: None,
+                total_count: None,
+            }),
+            ..Usage::default()
+        };
+
+        let facts = UsageFacts::from_usage(&usage, None);
+        assert!(facts.at_wall, "an exhausted weekly window is a wall");
+        // Not vacuous: the headline window alone would not have tripped it.
+        assert!(!UsageFacts::from_usage(&usage_at(4.0), None).at_wall);
+    }
+}
