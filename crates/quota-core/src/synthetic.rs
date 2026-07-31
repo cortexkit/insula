@@ -652,4 +652,56 @@ mod tests {
         assert_eq!(primary.used_percent, 20.0);
         assert_eq!(primary.resets_at, None);
     }
+
+    /// A percent field may arrive as a fraction or as a percentage, so a value at
+    /// or below 1.0 is read as a fraction and scaled. That guess is only safe for
+    /// a value the upstream *labelled* as a percent.
+    ///
+    /// A used/limit ratio computed here is already a percentage, and applying the
+    /// same guess to it turns a barely-touched account into an exhausted one: one
+    /// request against a limit of a hundred is 1.0, which would be rescaled to
+    /// 100. The upstream that reports counts rather than percentages is exactly
+    /// the one where a single request is a plausible reading.
+    ///
+    /// The two are kept apart by which path produced the number, so this pins
+    /// both: the ratio must survive untouched, and the labelled field must still
+    /// be scaled.
+    #[test]
+    fn a_computed_ratio_is_not_rescaled_but_a_labelled_fraction_is() {
+        // The five-hour key fills `usage.primary`; a weekly key would fill
+        // `usage.secondary` instead, so the assertions below would read an empty
+        // slot and fail for a reason unrelated to the rescaling under test.
+        let counts = br#"{
+            "rollingFiveHourLimit": {
+                "used": 1,
+                "limit": 100,
+                "window": "5hr"
+            }
+        }"#;
+        let percent = normalize_usage(counts)
+            .unwrap()
+            .primary
+            .expect("counts must produce a window")
+            .used_percent;
+        assert_eq!(
+            percent, 1.0,
+            "one request in a hundred is 1%, not an exhausted account"
+        );
+
+        // The control: without it this test would also pass if the fraction
+        // heuristic were deleted outright, which would misread every upstream
+        // that reports a 0..1 fraction as a fully idle account.
+        let fraction = br#"{
+            "rollingFiveHourLimit": {
+                "usedPercent": 0.42,
+                "window": "5hr"
+            }
+        }"#;
+        let scaled = normalize_usage(fraction)
+            .unwrap()
+            .primary
+            .expect("a labelled percent must produce a window")
+            .used_percent;
+        assert_eq!(scaled, 42.0, "a labelled 0..1 fraction is still scaled");
+    }
 }
