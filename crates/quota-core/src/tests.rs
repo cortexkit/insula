@@ -239,7 +239,7 @@ async fn only_a_failed_cookie_counts_as_a_stale_login() {
     // whole list rather than by membership, so a class wrongly joining the count
     // fails here instead of passing unnoticed.
     assert_eq!(
-        health.cookie_cohort_degraded,
+        health.cookie_logins_stale,
         vec!["login-expired", "page-unparseable"]
     );
     assert_eq!(health.cookie_cohort_total, 6);
@@ -264,7 +264,7 @@ async fn health_reflects_provider_outcomes() {
     // signal: a cookie provider nobody has logged into is behaving correctly.
     // The cohort count is exercised with a real failure in
     // `only_a_failed_cookie_counts_as_a_stale_login`.
-    assert!(health.cookie_cohort_degraded.is_empty());
+    assert!(health.cookie_logins_stale.is_empty());
     assert!(health.last_tick_age.is_some());
 }
 

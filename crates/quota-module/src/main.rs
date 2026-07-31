@@ -391,7 +391,7 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
             snapshot.degraded.len(),
             snapshot.providers_total,
             snapshot.serving(),
-            snapshot.cookie_cohort_degraded.len(),
+            snapshot.cookie_logins_stale.len(),
             snapshot.cookie_cohort_total,
         ))
     } else {
@@ -420,7 +420,7 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         // reconciled against providersTotal rather than silently under-summing.
         "withoutHandles": snapshot.without_handles,
         "cookieCohortTotal": snapshot.cookie_cohort_total,
-        "cookieCohortDegraded": snapshot.cookie_cohort_degraded,
+        "cookieLoginsStale": snapshot.cookie_logins_stale,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
     });
@@ -638,7 +638,7 @@ mod tests {
             degraded: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total: 0,
-            cookie_cohort_degraded: Vec::new(),
+            cookie_logins_stale: Vec::new(),
             last_tick_age: Some(std::time::Duration::from_secs(5)),
             refresher_stalled: false,
             cache_poisoned: false,
@@ -670,7 +670,7 @@ mod tests {
             fresh: 7,
             degraded: (0..28).map(|index| format!("provider-{index}")).collect(),
             cookie_cohort_total: 9,
-            cookie_cohort_degraded: vec!["opencodego".into(), "qoder".into()],
+            cookie_logins_stale: vec!["opencodego".into(), "qoder".into()],
             ..healthy_snapshot()
         };
 
@@ -821,18 +821,32 @@ mod tests {
         assert_eq!(status, HealthStatus::Ok);
         let metrics = metrics.expect("health report carries metrics");
         let obj = metrics.as_object().expect("metrics is a JSON object");
-        for key in [
+        // Every published key, not a sample: consumers are told these exist, and
+        // a field silently dropped from the payload is invisible to a test that
+        // lists only some of them. The equality check is what makes it an
+        // enumeration -- a `contains_key` loop over a subset would still pass
+        // with a key missing.
+        let expected = [
+            "buildCommit",
             "providersTotal",
             "fresh",
             "stale",
+            "pending",
             "degraded",
+            "withoutHandles",
             "cookieCohortTotal",
-            "cookieCohortDegraded",
+            "cookieLoginsStale",
             "lastTickAgeSecs",
             "refresherStalled",
-        ] {
-            assert!(obj.contains_key(key), "metrics include {key}");
-        }
+        ];
+        let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
+        published.sort_unstable();
+        let mut wanted = expected;
+        wanted.sort_unstable();
+        assert_eq!(
+            published, wanted,
+            "the published metric keys changed: update docs/consumer-contract.md too"
+        );
         // The default registry has the full provider set and a non-empty cookie
         // cohort — a real count, not a placeholder.
         assert!(obj["providersTotal"].as_u64().unwrap() >= 27);

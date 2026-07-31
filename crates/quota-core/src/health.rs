@@ -65,12 +65,17 @@ pub struct HealthSnapshot {
     /// Cookie-cohort providers whose browser login went stale: a cookie was
     /// found and the upstream rejected it, or the page no longer parses.
     ///
-    /// A provider with no cookie at all is deliberately excluded. Not being
-    /// logged into a service is the correct state on any host that does not use
-    /// it, so counting those would pin this at the cohort size on every machine
-    /// and leave a real stale login to show up as one more in a number nobody
-    /// reads.
-    pub cookie_cohort_degraded: Vec<String>,
+    /// **Not** the cookie providers that are degraded, which is a larger set and
+    /// what the name previously suggested. A provider with no cookie at all is
+    /// deliberately excluded: not being logged into a service is the correct
+    /// state on any host that does not use it, so counting those would pin this
+    /// at the cohort size on every machine and leave a real stale login to show
+    /// up as one more in a number nobody reads.
+    ///
+    /// Read alongside `cookie_cohort_total` as "N of C logins stale", never as a
+    /// share of `degraded` — the two answer different questions and a host can
+    /// easily have eight degraded cookie providers and two stale logins.
+    pub cookie_logins_stale: Vec<String>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,
     /// The refresher loop is wedged/dead: its heartbeat is older than the stall
@@ -97,7 +102,7 @@ impl HealthSnapshot {
             degraded: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total,
-            cookie_cohort_degraded: Vec::new(),
+            cookie_logins_stale: Vec::new(),
             last_tick_age: None,
             refresher_stalled: false,
             cache_poisoned: true,

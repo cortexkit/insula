@@ -735,7 +735,7 @@ impl Registry {
         let mut pending = 0;
         let mut degraded = Vec::new();
         let mut without_handles = Vec::new();
-        let mut cookie_cohort_degraded = Vec::new();
+        let mut cookie_logins_stale = Vec::new();
 
         for provider in &self.providers {
             let name = provider.name.as_str();
@@ -799,7 +799,7 @@ impl Registry {
                             .is_some_and(provider::class_means_credential_stopped_working)
                     })
                 {
-                    cookie_cohort_degraded.push(name.to_string());
+                    cookie_logins_stale.push(name.to_string());
                 }
             }
         }
@@ -817,7 +817,7 @@ impl Registry {
             degraded,
             without_handles,
             cookie_cohort_total,
-            cookie_cohort_degraded,
+            cookie_logins_stale,
             last_tick_age,
             refresher_stalled,
             cache_poisoned: false,
