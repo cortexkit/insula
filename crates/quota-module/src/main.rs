@@ -379,13 +379,20 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
             None => "refresher never ticked since startup".to_string(),
         })
     } else if !snapshot.degraded.is_empty() {
+        // The two counts measure different things, so they are not rendered in
+        // parallel: `degraded` counts every provider that failed for any reason,
+        // while the cookie count is narrower -- only browser logins that went
+        // stale, excluding the far more common case of never having logged in.
+        // Phrasing them as "N/35 degraded (M of 9 cookie-cohort)" reads as M of
+        // the 9 cookie providers being degraded, which is a different and much
+        // larger number.
         Some(format!(
-            "{}/{} providers degraded ({} of {} cookie-cohort); {} serving",
+            "{}/{} providers degraded, {} serving; {} of {} cookie logins stale",
             snapshot.degraded.len(),
             snapshot.providers_total,
+            snapshot.serving(),
             snapshot.cookie_cohort_degraded.len(),
             snapshot.cookie_cohort_total,
-            snapshot.serving(),
         ))
     } else {
         None
@@ -643,6 +650,54 @@ mod tests {
             panic!("health_report must produce a HealthCheck response");
         };
         status
+    }
+
+    /// The health detail is read by a person deciding whether anything needs
+    /// attention, so its two counts must not read as one measurement.
+    ///
+    /// `degraded` counts every provider that failed for any reason — on a host
+    /// with credentials for a handful of providers that is most of them, and
+    /// entirely normal. The cookie count is narrower: browser logins that went
+    /// stale, deliberately excluding services never logged into. Rendering them
+    /// as "N/M degraded (K of C cookie-cohort)" invites reading K as the cookie
+    /// providers that are degraded, which is a different and larger number.
+    #[test]
+    fn the_health_detail_does_not_conflate_its_two_counts() {
+        // Modelled on this host: most providers have no credentials, most cookie
+        // providers were never logged into, and two live logins went stale.
+        let snapshot = quota_core::health::HealthSnapshot {
+            providers_total: 35,
+            fresh: 7,
+            degraded: (0..28).map(|index| format!("provider-{index}")).collect(),
+            cookie_cohort_total: 9,
+            cookie_cohort_degraded: vec!["opencodego".into(), "qoder".into()],
+            ..healthy_snapshot()
+        };
+
+        let ModuleControlResponse::HealthCheck { detail, .. } = health_report(&snapshot) else {
+            panic!("health_report must produce a HealthCheck response");
+        };
+        let detail = detail.expect("a degraded provider produces a detail line");
+
+        // Each count is attached to what it measures.
+        assert!(
+            detail.contains("28/35 providers degraded"),
+            "detail: {detail}"
+        );
+        assert!(
+            detail.contains("2 of 9 cookie logins stale"),
+            "detail: {detail}"
+        );
+
+        // Not vacuous: the phrasing that invited reading the cookie count as a
+        // degraded count must not come back. The two are independent -- on this
+        // host 8 of the 9 cookie providers are degraded while only 2 of them are
+        // stale logins -- so a reader who conflates them sees a quarter of the
+        // real number.
+        assert!(
+            !detail.contains("cookie-cohort"),
+            "the cohort count is being rendered as a degraded count: {detail}"
+        );
     }
 
     /// The status this module reports is not a label: the daemon branches on
