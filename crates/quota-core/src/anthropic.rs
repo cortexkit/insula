@@ -731,6 +731,37 @@ mod tests {
         assert_eq!(usage.tertiary.unwrap().used_percent, 4.0);
     }
 
+    /// The upstream reports each window independently, so a filled `tertiary`
+    /// beside an empty `secondary` is a shape this provider really produces.
+    ///
+    /// The slots are positions rather than a contiguous list, and this is the
+    /// payload that proves it: anything walking them until the first empty one
+    /// would miss the 91% window entirely and read this account as idle.
+    #[test]
+    fn an_absent_weekly_leaves_a_hole_above_a_filled_tertiary() {
+        // A live-shaped body with seven_day absent while an opus weekly is
+        // present -- each field is independently optional upstream.
+        let body = br#"{
+            "five_hour": { "utilization": 3.0, "resets_at": "2026-06-22T17:00:00Z" },
+            "seven_day": null,
+            "seven_day_opus": { "utilization": 91.0, "resets_at": "2026-06-24T14:00:00Z" },
+            "seven_day_sonnet": null
+        }"#;
+
+        let usage = normalize_usage(body).unwrap();
+
+        assert_eq!(usage.primary.as_ref().unwrap().used_percent, 3.0);
+        assert!(usage.secondary.is_none(), "the hole is the point");
+        assert_eq!(usage.tertiary.as_ref().unwrap().used_percent, 91.0);
+
+        // What any consumer of this shape must see: the worst window is past the
+        // hole, so the account is at 91%, not the 3% its first slot reports.
+        let worst = crate::model::windows(&usage)
+            .map(|window| window.used_percent)
+            .fold(f64::MIN, f64::max);
+        assert_eq!(worst, 91.0);
+    }
+
     #[test]
     fn scoped_weekly_limits_become_named_extra_windows() {
         let usage = normalize_usage(

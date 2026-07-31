@@ -67,3 +67,116 @@ pub fn windows_mut(usage: &mut Usage) -> impl Iterator<Item = &mut RateWindow> {
                 .filter_map(|extra| extra.window.as_mut()),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(used_percent: f64) -> RateWindow {
+        RateWindow {
+            used_percent,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: None,
+            used_count: None,
+            total_count: None,
+        }
+    }
+
+    /// A filled slot after an empty one must still be reached.
+    ///
+    /// The slots are independent positions rather than a contiguous list, and
+    /// upstreams report each of their windows separately: one provider fills
+    /// `tertiary` from a field that can arrive while the field behind
+    /// `secondary` is absent, so a hole is a shape this module really emits.
+    ///
+    /// This matters because these helpers feed decisions rather than displays.
+    /// One decides whether an account has hit its wall, which spends a banked
+    /// reset credit; the other rewrites what consumers pace on. Both read the
+    /// account's worst window, so a window skipped here reads as *less* usage
+    /// than the account has -- a walled account looking like it has room.
+    #[test]
+    fn a_gap_between_slots_does_not_stop_the_walk() {
+        let usage = Usage {
+            primary: Some(window(10.0)),
+            secondary: None,
+            tertiary: Some(window(99.0)),
+            extra_rate_windows: None,
+        };
+
+        let percents: Vec<f64> = windows(&usage).map(|w| w.used_percent).collect();
+
+        // Not vacuous: the 99 is the whole point. An implementation that stopped
+        // at the empty slot would collect only [10.0] and report an account at
+        // 10% when it is at 99%.
+        assert_eq!(percents, vec![10.0, 99.0]);
+    }
+
+    #[test]
+    fn extra_windows_are_walked_after_the_slots() {
+        let usage = Usage {
+            primary: Some(window(1.0)),
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: Some(vec![
+                ExtraWindow {
+                    title: Some("named".into()),
+                    id: Some("named".into()),
+                    window: Some(window(50.0)),
+                },
+                // An entry naming a limit whose figure could not be read. It
+                // must not end the walk: the entries after it are real.
+                ExtraWindow {
+                    title: Some("unreadable".into()),
+                    id: Some("unreadable".into()),
+                    window: None,
+                },
+                ExtraWindow {
+                    title: Some("last".into()),
+                    id: Some("last".into()),
+                    window: Some(window(88.0)),
+                },
+            ]),
+        };
+
+        let percents: Vec<f64> = windows(&usage).map(|w| w.used_percent).collect();
+        assert_eq!(percents, vec![1.0, 50.0, 88.0]);
+    }
+
+    /// The mutable walk must reach exactly the same windows as the shared one.
+    ///
+    /// They are separate implementations of one rule, so nothing but a test
+    /// keeps them in step: a window the read-time transform misses would be
+    /// published with the provider's raw percent as its effective one.
+    #[test]
+    fn the_mutable_walk_reaches_the_same_windows() {
+        let mut usage = Usage {
+            primary: Some(window(10.0)),
+            secondary: None,
+            tertiary: Some(window(99.0)),
+            extra_rate_windows: Some(vec![
+                ExtraWindow {
+                    title: None,
+                    id: None,
+                    window: Some(window(7.0)),
+                },
+                ExtraWindow {
+                    title: None,
+                    id: None,
+                    window: None,
+                },
+            ]),
+        };
+
+        let read: Vec<f64> = windows(&usage).map(|w| w.used_percent).collect();
+        let written: Vec<f64> = windows_mut(&mut usage).map(|w| w.used_percent).collect();
+        assert_eq!(read, written);
+        assert_eq!(read, vec![10.0, 99.0, 7.0]);
+    }
+
+    #[test]
+    fn an_empty_usage_walks_nothing() {
+        let usage = Usage::default();
+        assert_eq!(windows(&usage).count(), 0);
+    }
+}
