@@ -229,6 +229,74 @@ explicit optional field with three states (refusing / not refusing / not
 reported), and absence would have to mean unknown rather than false, since for
 most providers here it is genuinely unknown.
 
+## The window slots are positions, not a ranking
+
+A `usage` object carries up to three named slots — `primary`, `secondary`,
+`tertiary` — plus `extraRateWindows`, a list of named windows for anything that
+does not fit three. It is tempting to read `primary` as *the* number for a
+provider. It is not.
+
+**`primary` is the provider's shortest window, not its most constrained one.**
+For most upstreams here the slots are filled in cadence order: the session or
+five-hour window lands in `primary`, the weekly in `secondary`. Nothing checks
+that `primary` is the one closest to its limit, and usually it is not — a short
+window refills quickly and reads low most of the time, while the long window
+accumulates.
+
+On this host as this was written, three of the four entries carrying a `primary`
+had a **more used** secondary: one showed `primary 0%` over five hours beside a
+weekly at 36.5%. A consumer reading only `primary` would have seen an idle
+provider that was in fact a third of the way through its week. This is not a
+rare alignment; it is the normal state of a short window.
+
+So for "how much headroom does this account have", take the **maximum**
+`usedPercent` across every slot and every entry in `extraRateWindows`, or apply
+whatever policy you want deliberately. Do not let slot position stand in for a
+judgement about which limit binds.
+
+The slots are also not stable across providers. One provider's `primary` may be
+a five-hour window and another's a monthly one, so `primary` is not comparable
+between providers. Read `windowMinutes` — the window's length — when the cadence
+matters, rather than inferring it from the slot.
+
+### The other window fields
+
+`windowMinutes` is the window's length, and it is optional. It is set when the
+upstream states a cadence or the field name implies one; it is absent when the
+upstream reports usage without saying over what period. Absent means unknown —
+not "unlimited", and not a default worth inventing.
+
+`usedCount` and `totalCount` are the absolute figures behind the percentage,
+carried only where the upstream supplies them, which is a small minority of
+providers. They exist because a percentage alone cannot distinguish a plan whose
+cap changed from one whose usage did. Do not compute one from the other and the
+percent: the percent can be reported directly by the upstream against a cap that
+differs from the one you would divide by.
+
+Each entry in `extraRateWindows` carries an `id` (a stable identifier), a `title`
+(human-facing text), and a `window` — all three optional. Match on `id`; render
+`title`; and handle an entry whose `window` is absent, which is how a provider
+names a limit it could not read a figure for. A window whose meaning has no slot
+— a per-model pool, a scoped weekly — lives here rather than being forced into
+one, so a consumer ignoring `extraRateWindows` silently ignores real limits.
+
+`id` is stable within a provider but not unique across providers, and it is not
+drawn from any shared vocabulary: one provider's ids are model names, another's
+are its own scope labels. Key on `(provider, id)`, never on `id` alone.
+
+### Fields on the account, not the window
+
+`accountInfo` carries `email`, `orgName` and `planType`, each optional and each
+present only when the upstream identifies the account that way. They are
+display- and grouping-only: nothing in this module derives behaviour from them,
+and `planType` in particular is the upstream's own label rather than a
+normalised vocabulary, so it is not comparable across providers.
+
+`savedResets` describes banked quota-reset credits, which exactly one upstream
+grants. `availableCount` is how many are held, `soonestExpiresAt` when the next
+one lapses, and `credits` lists each with its own `expiresAt`. They are granted
+to **one account**, never to a provider — see the field-scope table below.
+
 ## Verdict versus unfinished
 
 A degraded entry is a **verdict**: this module concluded the credential or
