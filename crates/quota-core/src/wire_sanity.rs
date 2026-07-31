@@ -349,7 +349,7 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_provider_usage::Usage;
+    use cortexkit_provider_usage::{ExtraWindow, Usage};
 
     fn window(percent: f64) -> RateWindow {
         RateWindow {
@@ -360,6 +360,56 @@ mod tests {
             used_count: None,
             total_count: None,
         }
+    }
+
+    /// The checker's walk must reach every window the decision paths reach.
+    ///
+    /// `windows_of` here and `model::windows` are separate implementations of
+    /// one rule: the first names windows for a report, the second feeds the
+    /// at-wall test that spends a banked credit and the transform that rewrites
+    /// what consumers pace on. Nothing but this keeps them in step.
+    ///
+    /// A disagreement is invisible in the direction that matters. If this walk
+    /// reaches fewer windows, the checker examines a smaller denominator than
+    /// exists and reports a clean sweep over the part it happened to look at --
+    /// the windows it skipped are exactly the ones no check ever runs against.
+    #[test]
+    fn the_checker_walks_the_same_windows_as_the_decision_paths() {
+        // Every shape at once: a hole between slots, an extra window, and an
+        // extra entry naming a limit whose figure could not be read.
+        let usage = Usage {
+            primary: Some(window(10.0)),
+            secondary: None,
+            tertiary: Some(window(99.0)),
+            extra_rate_windows: Some(vec![
+                ExtraWindow {
+                    title: Some("named".into()),
+                    id: None,
+                    window: Some(window(50.0)),
+                },
+                ExtraWindow {
+                    title: Some("unreadable".into()),
+                    id: None,
+                    window: None,
+                },
+            ]),
+        };
+        let mut published =
+            ProviderUsage::healthy("codex", Some("acct".into()), "oauth", usage.clone());
+        published.fetched_at = Some(stamped_at());
+
+        let checker: Vec<f64> = windows_of(&published)
+            .into_iter()
+            .map(|(_, window)| window.used_percent)
+            .collect();
+        let decisions: Vec<f64> = crate::model::windows(&usage)
+            .map(|window| window.used_percent)
+            .collect();
+
+        assert_eq!(checker, decisions);
+        // Not vacuous: both must actually span the hole and the unreadable
+        // extra, rather than agreeing on a truncated list.
+        assert_eq!(checker, vec![10.0, 99.0, 50.0]);
     }
 
     /// A published entry, stamped the way the module stamps one.
