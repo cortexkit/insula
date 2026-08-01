@@ -1169,6 +1169,72 @@ mod tests {
     use super::*;
     use crate::model::{RateWindow, Usage};
 
+    /// Facts describing an account with room left and no wall reported.
+    fn relaxable_facts() -> UsageFacts {
+        UsageFacts::from_usage(&usage_at(70.0), Some(false))
+    }
+
+    /// Every condition guarding relaxed output must be load-bearing.
+    ///
+    /// When this returns true the module publishes `usedPercent: 0` for an
+    /// account that is really part-way through its quota, on the promise that a
+    /// banked credit will reset the window before it runs out. Consumers pace on
+    /// that zero, so each condition is what keeps the promise honest: relaxing
+    /// without one claims capacity that may not exist, and the consumer has no
+    /// way to tell the difference.
+    ///
+    /// Asserted here rather than through the tick that calls it, because a test
+    /// driving the whole tick fixes every input at once and cannot show which
+    /// condition did the work.
+    #[test]
+    fn every_condition_guarding_relaxed_output_is_required() {
+        let facts = relaxable_facts();
+
+        // The control: with every condition met, relaxation is permitted. Without
+        // this the assertions below would pass against a gate that never relaxes
+        // at all.
+        assert!(
+            reporting_eligible(true, &facts, false, false, true),
+            "a fresh, below-wall, mutation-free, journal-clean tick must relax"
+        );
+
+        // Not armed: the feature is off, or this account has no credits to spend.
+        // Relaxing here reports capacity that nothing will ever restore.
+        assert!(
+            !reporting_eligible(false, &facts, false, false, true),
+            "relaxed output must require the feature to be armed"
+        );
+
+        // At the wall: the upstream is already refusing. A zero here tells a
+        // consumer to keep routing work at an account that cannot serve it.
+        let walled = UsageFacts::from_usage(&usage_at(100.0), Some(true));
+        assert!(
+            !reporting_eligible(true, &walled, false, false, true),
+            "relaxed output must require the account to be below its wall"
+        );
+
+        // A consume was attempted this tick, so the credit balance is mid-flight:
+        // the spend may have failed, and the percents in hand predate its result.
+        assert!(
+            !reporting_eligible(true, &facts, true, false, true),
+            "a tick that attempted a consume must report the true numbers"
+        );
+
+        // A journal record is pending, so a previous spend never resolved. Until
+        // it does, whether a credit was actually redeemed is unknown.
+        assert!(
+            !reporting_eligible(true, &facts, false, true, true),
+            "an unresolved redemption must report the true numbers"
+        );
+
+        // The journal could not be read or written, so double-spend protection is
+        // unavailable -- and with it any basis for promising a reset.
+        assert!(
+            !reporting_eligible(true, &facts, false, false, false),
+            "an unusable journal must report the true numbers"
+        );
+    }
+
     fn usage_at(percent: f64) -> Usage {
         Usage {
             primary: Some(RateWindow {
