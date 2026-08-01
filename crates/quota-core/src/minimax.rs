@@ -720,4 +720,80 @@ mod tests {
         assert!(usage.primary.is_some());
         assert!(usage.secondary.is_some());
     }
+
+    /// Every condition in the placeholder gate must be load-bearing.
+    ///
+    /// This upstream reports lanes that exist in its schema but are not part of
+    /// the account's subscription, and marks them with status 3, a zero total, a
+    /// zero count, and 100% remaining all at once. Suppressing that combination
+    /// keeps a lane the account does not have from rendering as an idle one.
+    ///
+    /// Each condition is what stops the suppression from reaching a lane the
+    /// account really does have, so dropping any one of them deletes a genuine
+    /// window from the wire -- and a missing window reads as capacity that was
+    /// never measured rather than as an error. A fixture that satisfies all four
+    /// proves the gate fires; only a fixture that breaks exactly one proves the
+    /// gate is narrow.
+    #[test]
+    fn each_condition_of_the_placeholder_gate_keeps_a_real_lane_visible() {
+        let now = 1_780_347_620;
+
+        // Exactly one field differs from the suppressed shape in each case, so a
+        // failure names the condition that stopped being enforced.
+        let cases = [
+            ("status is not the unavailable marker", 1, 0, 0, 100.0),
+            ("the lane has a real allowance", 3, 50, 0, 100.0),
+            ("the lane has been used", 3, 0, 5, 100.0),
+            ("the lane is not full", 3, 0, 0, 40.0),
+        ];
+
+        for (why, status, total, used, remaining) in cases {
+            let body = format!(
+                r#"{{
+                  "base_resp": {{ "status_code": 0 }},
+                  "model_remains": [
+                    {{
+                      "model_name": "general",
+                      "current_interval_total_count": {total},
+                      "current_interval_usage_count": {used},
+                      "current_interval_status": {status},
+                      "current_interval_remaining_percent": {remaining},
+                      "start_time": 1780347600000,
+                      "end_time": 1780365600000
+                    }}
+                  ]
+                }}"#
+            );
+            let payload: CodingPlanPayload = serde_json::from_slice(body.as_bytes()).unwrap();
+            let model = &model_remains_list(&payload)[0];
+            assert!(
+                make_interval_window(model, now).is_some(),
+                "a lane was suppressed although {why}"
+            );
+        }
+
+        // The control: with every condition met the window really is suppressed,
+        // so the assertions above cannot pass because the gate stopped working
+        // altogether.
+        let suppressed = br#"{
+              "base_resp": { "status_code": 0 },
+              "model_remains": [
+                {
+                  "model_name": "general",
+                  "current_interval_total_count": 0,
+                  "current_interval_usage_count": 0,
+                  "current_interval_status": 3,
+                  "current_interval_remaining_percent": 100,
+                  "start_time": 1780347600000,
+                  "end_time": 1780365600000
+                }
+              ]
+            }"#;
+        let payload: CodingPlanPayload = serde_json::from_slice(suppressed).unwrap();
+        let model = &model_remains_list(&payload)[0];
+        assert!(
+            make_interval_window(model, now).is_none(),
+            "the unavailable-lane shape must still be suppressed"
+        );
+    }
 }
