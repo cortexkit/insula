@@ -459,7 +459,7 @@ nothing to lose, so the asymmetry does not apply.
 
 ## Testing these
 
-A regression for any of the above must fail *for the reason it names*. Six ways
+A regression for any of the above must fail *for the reason it names*. Eight ways
 a suite can be uninformative while looking decisive, only one of which has a
 colour that suggests a problem:
 
@@ -473,6 +473,10 @@ colour that suggests a problem:
    wrong behaviour is correct
 6. it is **true of its fixture and false in general**, under a name that states
    the general claim
+7. it hands a gate an input the test built, so the **derivation** that produces
+   that input in production is never exercised
+8. its fixture models a state the producer cannot emit, so a later check that
+   would catch a real defect fails against the fixture and reads as too strict
 
 The fifth is the most hostile, because the test is not merely silent about the
 broken case: it actively certifies it. Two of the defects behind this document
@@ -509,11 +513,36 @@ message and confirm it names the mechanism. For byte-level or encoding
 regressions, assert the input's own length so a future miscount fails loudly
 instead of silently testing nothing.
 
+The seventh is the one that survives the most scrutiny, because **both halves
+look tested**. The gate has tests proving it reacts correctly to each value, and
+the derivation runs somewhere in the suite; what nothing covers is that the
+derivation produces the value the gate expects. A test that constructs its own
+input cannot cover a derivation, however thoroughly it exercises what happens
+afterwards. Two decisions here sat undefended that way — the auth-failure report
+that tells the credential store a credential died, and the threshold that spends
+a banked reset credit — because every test handed the gate a pre-built value. Ask
+which tests pass an input that production *computed*, not one the test chose.
+
+The eighth does no damage on the day it is written: the fixture is legal and its
+test is honest. The damage is to the **next** check. When someone adds a check
+for a field the fixture never sets, the fixture goes red, and the natural reading
+is that the new check is too strict — weaken it, and it is permanently disabled
+for every test built on that fixture while still reading as coverage. A fixture
+is a claim about what the producer can emit, so a fixture modelling an
+unreachable state pre-emptively neuters checks on that field. When a new check
+reddens an old fixture, establish which one is wrong about production before
+touching either.
+
 When auditing coverage, enumerate the **input shapes** a guard must handle and
 check each has a test, rather than checking that the guard has tests. And when
 sweeping a property across providers, take the population count from the
 registry rather than from whoever asked: a sweep that adopts the requester's
 count cannot find a missing member.
+
+An assertion over a **growing** set must enumerate it rather than sample it.
+Checking that each key you thought of is present will not notice the one added
+later, nor the one that silently stopped being published — compare the whole
+sorted set, so both directions fail.
 
 One more trap specific to this codebase. A module doc and a function doc in the
 same file have disagreed about the intended behaviour, and each looked
