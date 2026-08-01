@@ -529,11 +529,34 @@ impl AntigravityProvider {
     }
 }
 
+/// Whether a URL really addresses this machine, for a client that has certificate
+/// validation switched off.
+///
+/// The host is read from the parsed URL rather than from the start of the string.
+/// Userinfo precedes the host in a URL, so `http://localhost:8080@example.test/`
+/// begins with a loopback-looking prefix while actually addressing
+/// `example.test` -- a string test says yes and the request leaves the machine.
+///
+/// Userinfo is refused outright rather than merely ignored: nothing here builds
+/// a URL containing any, so its presence means the input did not come from where
+/// this function's caller assumes, and that is worth refusing rather than
+/// parsing around.
 fn is_loopback_url(url: &str) -> bool {
-    url.starts_with("https://127.0.0.1:")
-        || url.starts_with("https://localhost:")
-        || url.starts_with("http://127.0.0.1:")
-        || url.starts_with("http://localhost:")
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 impl Default for AntigravityProvider {
@@ -585,6 +608,50 @@ impl UsageProvider for AntigravityProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The containment guard on the probe must read the URL's real host.
+    ///
+    /// The client behind this guard runs with certificate validation disabled,
+    /// so it accepts any certificate from whatever it connects to. The guard is
+    /// the only thing keeping that client on this machine, which makes it worth
+    /// holding to a stricter standard than its caller currently needs: today the
+    /// URL is assembled from a literal host and a `u16` port, so nothing hostile
+    /// can reach it, but a guard that is only correct because its input is
+    /// already trusted provides no containment at all.
+    #[test]
+    fn the_probe_guard_reads_the_real_host_not_the_string_prefix() {
+        // Controls: the URLs this provider actually builds must still pass, or
+        // the refusals below would hold for a guard that blocks everything.
+        assert!(is_loopback_url("http://127.0.0.1:8080/quota"));
+        assert!(is_loopback_url("https://127.0.0.1:9999/quota"));
+        assert!(is_loopback_url("http://localhost:8080/quota"));
+        assert!(is_loopback_url("https://[::1]:8080/quota"));
+
+        // Userinfo comes before the host, so this string begins with a loopback
+        // prefix while addressing another machine entirely. A prefix test accepts
+        // it and the request -- with certificate checking off -- leaves the host.
+        assert!(!is_loopback_url("http://localhost:8080@example.test/quota"));
+        assert!(!is_loopback_url("https://127.0.0.1:443@example.test/quota"));
+
+        // Ordinary non-loopback hosts, including one that merely starts with a
+        // loopback-looking label.
+        assert!(!is_loopback_url("https://example.test:8080/quota"));
+        assert!(!is_loopback_url(
+            "https://localhost.example.test:8080/quota"
+        ));
+        assert!(!is_loopback_url(
+            "https://127.0.0.1.example.test:8080/quota"
+        ));
+
+        // A different scheme is not something this probe should ever speak, and
+        // a file URL has no host to compare at all.
+        assert!(!is_loopback_url("file:///etc/passwd"));
+        assert!(!is_loopback_url("ftp://127.0.0.1:21/quota"));
+
+        // Not a URL at all.
+        assert!(!is_loopback_url("http://"));
+        assert!(!is_loopback_url("127.0.0.1:8080/quota"));
+    }
 
     // Envelope shape confirmed on the live `agy` wire: groups under `response`,
     // buckets carry an explicit `window` field.
