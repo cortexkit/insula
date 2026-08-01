@@ -197,6 +197,13 @@ fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> 
 /// block's usual "Resets in N hours" caption with that notice, and the only
 /// timestamp it then renders is the WEEKLY reset. The check names the weekly
 /// limit specifically: a session-scoped notice must not move a session reset.
+///
+/// `any` rather than `all`: `SESSION_LABELS` holds two captions the page has used
+/// for the session block at different times, so normally only one appears and the
+/// choice does not arise. Should a page ever render both, a notice under either
+/// caption still says the session reset is missing, and treating it as missing is
+/// the safe reading. Requiring the notice under *both* captions would skip the
+/// move below and leave the five-hour window holding a timestamp days away.
 fn session_block_reports_weekly_limit(html: &str) -> bool {
     SESSION_LABELS
         .iter()
@@ -436,6 +443,86 @@ mod tests {
             "depleted window has no reset timestamp"
         );
         assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    /// A reset is moved off the session window only when the notice sits in the
+    /// session block.
+    ///
+    /// Each window takes its reset from the timestamp that follows its own caption
+    /// on the page. When the weekly quota is spent, the page stops printing the
+    /// session reset and prints the weekly one under the session caption instead --
+    /// so that positional read hands a five-hour window a timestamp days away, and
+    /// `normalize_usage` moves it to the weekly window to correct that.
+    ///
+    /// The notice is not fixed to the session block. Printed under the weekly
+    /// caption instead, the session block still states its own real reset, and
+    /// moving it would produce the mirror of the defect the move exists to fix: a
+    /// seven-day window claiming a horizon five hours out, while the five-hour
+    /// window reports none.
+    #[test]
+    fn a_notice_outside_the_session_block_leaves_both_resets_alone() {
+        let html = r#"
+          <span>Session usage</span>
+          <div data-usage-track aria-label="Session usage 12% used"></div>
+          <div class="text-xs local-time" data-time="2026-07-25T18:00:00Z">Resets in 5 hours.</div>
+          <span>Weekly usage</span>
+          <span class="text-red-500">100% used</span>
+          <span class="text-sm text-neutral-500">Weekly limit reached</span>
+          <div data-usage-track aria-label="Weekly usage 100% used"></div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+
+        let session = usage.primary.expect("session window reported");
+        assert_eq!(session.window_minutes, Some(300));
+        assert_eq!(
+            session.resets_at.as_deref(),
+            Some("2026-07-25T18:00:00Z"),
+            "the session block states its own reset here, so nothing may take it"
+        );
+
+        let weekly = usage.secondary.expect("weekly window reported");
+        assert_eq!(weekly.used_percent, 100.0);
+        assert_eq!(weekly.window_minutes, Some(10080));
+        assert_eq!(
+            weekly.resets_at, None,
+            "the page reports no weekly horizon in this state, and a borrowed \
+             session timestamp would describe the wrong window"
+        );
+    }
+
+    /// A weekly reset the page prints itself is never replaced by the moved one.
+    ///
+    /// Moving the session block's timestamp fills a gap: the page normally stops
+    /// printing a weekly reset in this state, so the weekly window would otherwise
+    /// have none. When the page prints one under the weekly caption, that is its
+    /// own account of when the weekly window rolls, and the timestamp taken from
+    /// the session block can only be a worse copy of it.
+    #[test]
+    fn a_stated_weekly_reset_survives_the_re_attribution() {
+        let html = r#"
+          <span>Session usage</span>
+          <span class="text-sm text-neutral-500">Weekly limit reached</span>
+          <div data-usage-track aria-label="Session usage 49.8% used"></div>
+          <div class="text-xs local-time" data-time="2026-07-27T00:00:00Z">Resets Monday.</div>
+          <span>Weekly usage</span>
+          <div data-usage-track aria-label="Weekly usage 100% used"></div>
+          <div class="text-xs local-time" data-time="2026-07-28T09:30:00Z">Resets Tuesday.</div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+
+        let weekly = usage.secondary.expect("weekly window reported");
+        assert_eq!(
+            weekly.resets_at.as_deref(),
+            Some("2026-07-28T09:30:00Z"),
+            "the weekly block states its own reset, so the borrowed one is discarded"
+        );
+
+        // The session reset is still surrendered: in this state the page is not
+        // reporting when the session window rolls, so keeping it would leave a
+        // five-hour window carrying a timestamp that describes the weekly one.
+        let session = usage.primary.expect("session window reported");
+        assert_eq!(session.window_minutes, Some(300));
+        assert_eq!(session.resets_at, None);
     }
 
     #[test]
