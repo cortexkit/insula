@@ -445,6 +445,66 @@ mod tests {
         ));
     }
 
+    /// Which hosts may be reached over plain `http`, and which may not.
+    ///
+    /// Every request built from this base URL carries a bearer token, so
+    /// accepting a non-loopback host over `http` puts that token on the network
+    /// in clear. The outer validator is well covered, but it delegates this
+    /// decision, and the branches below are what decide it.
+    #[test]
+    fn only_loopback_hosts_may_carry_a_bearer_token_over_plain_http() {
+        // Accepted: a self-hosted endpoint on this machine, which is the reason
+        // plain http is permitted at all. `localhost` by name was not covered
+        // before -- only the numeric forms were -- so nothing held that branch.
+        assert!(validate_base_url("http://localhost:8080").is_some());
+        assert!(validate_base_url("http://127.0.0.1:8080").is_some());
+        assert!(validate_base_url("http://[::1]:8080").is_some());
+        // The whole 127/8 range is loopback, not only .0.1.
+        assert!(validate_base_url("http://127.0.0.2:8080").is_some());
+
+        // Refused: over plain http each of these would send the bearer token in
+        // clear to a machine that is not this one. A public address and a
+        // private-network one fail for the same reason -- neither is loopback.
+        assert!(validate_base_url("http://8.8.8.8:8080").is_none());
+        assert!(validate_base_url("http://10.0.0.5:8080").is_none());
+        assert!(validate_base_url("http://[2001:db8::1]:8080").is_none());
+        assert!(validate_base_url("http://api.example.com:8080").is_none());
+        // A hostname that merely contains the loopback label is not loopback.
+        assert!(validate_base_url("http://localhost.example.com:8080").is_none());
+
+        // The same hosts over https are fine, because the token is protected in
+        // transit: this is a rule about the scheme, not about the destination.
+        assert!(validate_base_url("https://8.8.8.8:8080").is_some());
+        assert!(validate_base_url("https://api.example.com:8080").is_some());
+    }
+
+    /// The loopback helper does not rely on its caller normalising the host.
+    ///
+    /// Neither the bracketed IPv6 form nor an upper-case name can reach it
+    /// through `validate_base_url` today, because `Url::parse` lowercases the
+    /// host and strips the brackets first. The helper takes a bare host string,
+    /// so the guarantee belongs to the helper rather than to the one caller that
+    /// happens to normalise -- asserted here so neither branch is removed as
+    /// dead weight by someone who checks only the current call site.
+    #[test]
+    fn the_loopback_helper_does_not_depend_on_its_caller_normalising_the_host() {
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("LocalHost"));
+
+        assert!(!is_loopback_host("[2001:db8::1]"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host(""));
+
+        // An IPv4-mapped IPv6 address is not treated as loopback, so a URL
+        // written that way is refused even though its packets would stay on this
+        // machine. That is the safe direction -- a refused endpoint fails
+        // visibly, where a wrongly accepted one leaks a token quietly -- and it
+        // is recorded here so the behaviour is a decision rather than a surprise.
+        assert!(!is_loopback_host("::ffff:127.0.0.1"));
+    }
+
     #[test]
     fn validates_safe_base_urls_and_builds_the_usage_path() {
         let root = validate_base_url("https://api.example.com").unwrap();
