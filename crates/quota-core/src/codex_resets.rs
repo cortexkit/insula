@@ -1185,6 +1185,60 @@ mod tests {
     ///
     /// Asserted here rather than through the tick that calls it, because a test
     /// driving the whole tick fixes every input at once and cannot show which
+    /// A window at its limit blocks relaxation even when the upstream says the
+    /// account is not limited.
+    ///
+    /// `limit_reached` describes whichever window the upstream is currently
+    /// enforcing, which is typically the shortest one. A longer window can sit
+    /// at its limit while that flag reads false -- so the two disagree, and the
+    /// percent check is the only thing that notices.
+    ///
+    /// Relaxing here would publish `usedPercent: 0` for an account whose weekly
+    /// allowance is spent, on the promise that a banked credit will restore it.
+    /// A consumer cannot tell that zero from an idle account and keeps routing
+    /// work to it.
+    ///
+    /// Separate from the gate test below because that one sets both signals at
+    /// once: an account reported as limited *and* at 100%. Either term alone
+    /// refuses that fixture, so it cannot show that both are required.
+    #[test]
+    fn a_window_at_its_limit_blocks_relaxation_even_when_the_upstream_reports_clear() {
+        let mut usage = usage_at(4.0);
+        usage.secondary = Some(RateWindow {
+            used_percent: 99.5,
+            raw_used_percent: None,
+            window_minutes: Some(10080),
+            resets_at: None,
+            used_count: None,
+            total_count: None,
+        });
+
+        // The upstream is explicit that it is not currently refusing requests.
+        let facts = UsageFacts::from_usage(&usage, Some(false));
+        assert!(
+            facts.wall_clear,
+            "the fixture must model an upstream reporting itself unlimited"
+        );
+        assert!(
+            facts.at_wall,
+            "the fixture must model a window that has reached its limit"
+        );
+
+        assert!(
+            !reporting_eligible(true, &facts, false, false, true),
+            "a spent window must block relaxation even when the upstream reports clear"
+        );
+
+        // The control: with that window well below its limit, the same inputs do
+        // relax -- so the refusal above comes from the percent, not from some
+        // other condition of the fixture.
+        let healthy = UsageFacts::from_usage(&usage_at(4.0), Some(false));
+        assert!(
+            reporting_eligible(true, &healthy, false, false, true),
+            "an account below its wall must still relax"
+        );
+    }
+
     /// condition did the work.
     #[test]
     fn every_condition_guarding_relaxed_output_is_required() {
