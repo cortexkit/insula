@@ -275,6 +275,19 @@ fn normalize_response(status: u16, final_url: &Url, body: &[u8]) -> Result<Usage
     parse_billing_html(html)
 }
 
+/// Whether a redirect target is the same origin as the request that produced it,
+/// and therefore still safe to carry the session cookie to.
+///
+/// This provider sends its cookie as an explicit header, so following a redirect
+/// sends it onward. The HTTP client removes sensitive headers on a cross-host
+/// redirect by itself, but its test is host and port only -- a redirect from
+/// `https://host/x` to `http://host:443/x` keeps the same host and the same
+/// resolved port, so the client considers it same-origin and forwards the cookie
+/// over cleartext. Requiring both ends to be HTTPS closes that downgrade, which
+/// is why the scheme is checked here rather than left to the client.
+///
+/// Ports are compared after defaulting, so `https://host` and `https://host:443`
+/// are one origin rather than two.
 fn same_origin(original: &Url, redirected: &Url) -> bool {
     original.scheme().eq_ignore_ascii_case("https")
         && redirected.scheme().eq_ignore_ascii_case("https")
@@ -373,6 +386,84 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Every condition on the redirect guard must be load-bearing.
+    ///
+    /// A redirect this returns true for carries the session cookie onward, so a
+    /// condition that stops being enforced leaks a live credential to whatever
+    /// the redirect names. Each case below fails on its own, because a test that
+    /// only checked a fully-matching origin would prove the guard permits rather
+    /// than that it refuses.
+    #[test]
+    fn every_condition_on_the_redirect_guard_protects_the_cookie() {
+        let parse = |raw: &str| Url::parse(raw).expect("fixture URLs must parse");
+        let origin = parse("https://console.sakana.ai/billing");
+
+        // The control: a genuine same-origin redirect is followed. Without it the
+        // refusals below would pass against a guard that blocks everything.
+        assert!(same_origin(
+            &origin,
+            &parse("https://console.sakana.ai/billing/summary")
+        ));
+
+        // A different host is a different site, whatever it claims to be.
+        assert!(!same_origin(
+            &origin,
+            &parse("https://evil.example/billing")
+        ));
+
+        // A sibling subdomain is still a different host.
+        assert!(!same_origin(
+            &origin,
+            &parse("https://other.sakana.ai/billing")
+        ));
+
+        // A different port is a different origin even on the same host.
+        assert!(!same_origin(
+            &origin,
+            &parse("https://console.sakana.ai:8443/billing")
+        ));
+
+        // The downgrade the HTTP client does not catch on its own: same host, and
+        // an explicit :443 makes the resolved port match, so only the scheme check
+        // keeps the cookie off the wire in cleartext.
+        assert!(!same_origin(
+            &origin,
+            &parse("http://console.sakana.ai:443/billing")
+        ));
+
+        // The same downgrade without the explicit port, which the client would
+        // catch -- asserted so this guard does not depend on the client's help.
+        assert!(!same_origin(
+            &origin,
+            &parse("http://console.sakana.ai/billing")
+        ));
+
+        // An origin that was never HTTPS must not become followable by matching
+        // itself: the guard requires both ends to be secure, not merely equal.
+        let insecure = parse("http://console.sakana.ai/billing");
+        assert!(!same_origin(&insecure, &insecure));
+
+        // A request that started insecure stays untrusted even when the redirect
+        // is HTTPS on a matching port. This is the only case that requires the
+        // *original* scheme to be checked, and it is unreachable from the single
+        // call site today, where the request always starts at a constant HTTPS
+        // URL. It is asserted so the condition cannot be removed as redundant:
+        // its cost is one comparison, and the caller it protects against is a
+        // future one that starts somewhere else.
+        assert!(!same_origin(
+            &parse("http://console.sakana.ai:443/billing"),
+            &parse("https://console.sakana.ai:443/billing")
+        ));
+
+        // A default port on one side and the same port written out on the other
+        // are one origin, so a redirect that only makes the port explicit is not
+        // treated as a cross-origin hop.
+        assert!(same_origin(
+            &origin,
+            &parse("https://console.sakana.ai:443/billing")
+        ));
+    }
 
     const BILLING_FIXTURE: &str = r#"
     <main>
