@@ -165,6 +165,74 @@ async fn f4_in_flight_refresh_revokes_previous_relaxation() {
 /// The cohort count exists to say "a browser login went stale". If an absent
 /// cookie counted too, the number would sit at the cohort size forever on any
 /// host that does not use every one of these services -- which is every host --
+/// A cookie provider drops off the stale-login list once it succeeds again.
+///
+/// This is what the number depends on to mean anything: it has to reach zero
+/// when the logins are working, or a reader learns to ignore it.
+///
+/// Two independent mechanisms produce it, and either alone is enough. A
+/// successful fetch clears the slot's failure class, and the list is built only
+/// for providers whose every slot is degraded, so a provider serving a window is
+/// never considered for it. The assertion is on the outcome rather than on
+/// either mechanism, which is the level that stays true if one of them is later
+/// restructured -- and it does hold: removing both together fails this test,
+/// while removing either one alone does not.
+#[tokio::test]
+async fn a_cookie_login_leaves_the_stale_list_once_it_works_again() {
+    struct RecoveringProvider {
+        succeed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl UsageProvider for RecoveringProvider {
+        fn name(&self) -> &str {
+            "recovering-cookie"
+        }
+        fn is_cookie_based(&self) -> bool {
+            true
+        }
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            if self.succeed.load(Ordering::SeqCst) {
+                FetchAttempt::success(None, "web", Usage::default())
+            } else {
+                FetchAttempt::failure(
+                    None,
+                    None,
+                    FetchError::Unauthorized("HTTP 401 (session expired)".into()),
+                )
+            }
+        }
+    }
+
+    let succeed = Arc::new(AtomicBool::new(false));
+    let registry = Registry::new(vec![Box::new(RecoveringProvider {
+        succeed: Arc::clone(&succeed),
+    })]);
+
+    tick(&registry).await;
+    assert_eq!(
+        registry.health().cookie_logins_stale,
+        vec!["recovering-cookie"],
+        "a rejected cookie must be listed while it is failing"
+    );
+
+    // The user signs back in.
+    succeed.store(true, Ordering::SeqCst);
+    force_due(&registry, "recovering-cookie");
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert!(
+        health.cookie_logins_stale.is_empty(),
+        "a recovered login is still listed as stale: {:?}",
+        health.cookie_logins_stale
+    );
+    // Not vacuous: the provider really did recover, so the list is empty because
+    // the class was cleared rather than because the slot vanished.
+    assert_eq!(health.fresh, 1);
+    assert!(health.degraded.is_empty());
+}
+
 /// and a real stale login would move it from seven to eight.
 #[tokio::test]
 async fn only_a_failed_cookie_counts_as_a_stale_login() {

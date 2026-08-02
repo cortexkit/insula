@@ -92,6 +92,13 @@ pub struct ProviderSlot {
     /// consumers are told not to branch on it. Without this, a caller wanting to
     /// separate "nobody configured this provider" from "it is configured and
     /// broken" has only the text to go on.
+    ///
+    /// Read in exactly one place today: the health snapshot consults it only for
+    /// providers whose every slot is degraded, to decide which cookie logins have
+    /// gone stale. So the value carried on a slot that is serving a window is
+    /// currently unobservable, and mutating it changes no test. It is still kept
+    /// accurate on every path -- a field that is only right where someone happens
+    /// to look becomes wrong the moment a second reader arrives.
     pub error_class: Option<&'static str>,
     pub next_due_at: Instant,
     pub retry_count: u32,
