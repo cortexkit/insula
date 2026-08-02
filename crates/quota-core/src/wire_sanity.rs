@@ -39,6 +39,13 @@ const RESET_SLACK_MINUTES: f64 = 60.0;
 /// just-crossed. A window whose reset has passed is normal for a few minutes:
 /// the upstream has rolled and the cached copy has not been refetched yet.
 const PAST_RESET_GRACE_MINUTES: f64 = 60.0;
+/// Longest window length treated as a real quota cadence, in minutes.
+///
+/// Deliberately far above any cadence a provider publishes -- the longest here
+/// is monthly -- because the point is not to police plausible values but to
+/// catch a length that is not a duration at all. A year of slack costs nothing
+/// and keeps this from firing on some future quarterly plan.
+const MAX_WINDOW_MINUTES: i64 = 366 * 24 * 60;
 
 /// How far the count pair may drift from the reported percent. The two are often
 /// computed from different precisions upstream, so this is loose enough to
@@ -289,8 +296,30 @@ fn windows_of(entry: &ProviderUsage) -> Vec<(String, &RateWindow)> {
     out
 }
 
+/// Whether a window length is a duration at all, rather than a value that has
+/// lost its meaning on the way here.
+///
+/// Some providers derive this from an upstream number, and the conversion to an
+/// integer saturates rather than failing: a nonsense float arrives as a
+/// nonsense length instead of an error.
+fn plausible_window_length(minutes: i64) -> bool {
+    minutes > 0 && minutes <= MAX_WINDOW_MINUTES
+}
+
 fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings: &mut Vec<String>) {
     let percent = window.used_percent;
+
+    // Checked in its own right, not only where it is used as a bound. A window
+    // length is a claim about cadence that consumers read directly -- and it is
+    // also the ceiling for the reset check below, so a nonsense length silently
+    // disables that check for this window rather than making it fail.
+    if let Some(length) = window.window_minutes {
+        if !plausible_window_length(length) {
+            findings.push(format!(
+                "{where_}: windowMinutes is not a plausible duration: {length}"
+            ));
+        }
+    }
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
         findings.push(format!("{where_}: usedPercent out of range: {percent}"));
     }
@@ -314,7 +343,15 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
                 // The check the misattributed-reset defect would have failed: a
                 // reset further out than the window is long belongs to a
                 // different window.
-                if let Some(length) = window.window_minutes {
+                //
+                // Skipped for an implausible length, which is reported on its own
+                // below. Deriving the ceiling from a nonsense length would put it
+                // beyond any reachable reset time, so the check would pass in
+                // silence for the one window whose data is known to be wrong.
+                if let Some(length) = window
+                    .window_minutes
+                    .filter(|length| plausible_window_length(*length))
+                {
                     let ceiling = length as f64 * RESET_SLACK_RATIO + RESET_SLACK_MINUTES;
                     if minutes_ahead > ceiling {
                         findings.push(format!(
@@ -472,6 +509,77 @@ mod tests {
     /// The defect this whole checker exists for: a reset that belongs to a
     /// different, longer window. It is well-formed and parses; only its
     /// relationship to the window's own length gives it away.
+    /// A length that is not a duration is reported in its own right.
+    ///
+    /// Some providers derive this from an upstream number through a conversion
+    /// that saturates rather than failing, so a nonsense value arrives looking
+    /// like an ordinary length.
+    #[test]
+    fn a_window_length_that_is_not_a_duration_is_reported() {
+        for length in [0, -300, i64::MAX, 400 * 24 * 60] {
+            let mut w = window(50.0);
+            w.window_minutes = Some(length);
+
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.contains("not a plausible duration")),
+                "length {length} produced {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// Real cadences are not reported, including the longest one served.
+    ///
+    /// Without this, a check that rejected everything would pass the test above
+    /// while making every window a finding.
+    #[test]
+    fn ordinary_window_lengths_are_not_reported() {
+        for length in [1, 300, 10080, 43200, MAX_WINDOW_MINUTES] {
+            let mut w = window(50.0);
+            w.window_minutes = Some(length);
+
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+            assert_eq!(
+                report.findings,
+                Vec::<String>::new(),
+                "length {length} was reported"
+            );
+        }
+    }
+
+    /// An implausible length is reported once, not twice.
+    ///
+    /// The reset ceiling is derived from the window's own length, so a negative
+    /// length yields a negative ceiling and every reset looks too far out. That
+    /// second finding is arithmetic on a value already known to be broken, and
+    /// it invites reading the reset as the problem when the length is.
+    ///
+    /// This is the whole of what skipping the ceiling buys. A huge length hides
+    /// the reset check instead of tripping it -- the ceiling lands beyond any
+    /// reachable time -- and no filter can recover a check whose bound is
+    /// nonsense. Reporting the length itself is what covers that case.
+    #[test]
+    fn an_implausible_length_is_reported_once_without_a_derived_finding() {
+        let mut w = window(50.0);
+        w.window_minutes = Some(-300);
+        w.resets_at = Some("2026-07-30T10:00:00Z".into());
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("not a plausible duration"),
+            "{}",
+            report.findings[0]
+        );
+    }
+
     #[test]
     fn a_reset_further_out_than_the_window_is_long_is_reported() {
         let mut w = window(50.0);
