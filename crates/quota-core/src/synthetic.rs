@@ -204,18 +204,38 @@ fn epoch_to_iso8601_f64(n: f64) -> Option<String> {
     env::epoch_to_iso8601(secs)
 }
 
+/// Convert an upstream duration into a window length, refusing anything that is
+/// not a plausible one.
+///
+/// The range is checked before the cast, because `as i64` saturates rather than
+/// failing: an infinite or astronomically large value would otherwise become
+/// `i64::MAX` and read as an ordinary length.
+fn minutes_from(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let minutes = value.round();
+    if !(1.0..=crate::wire_sanity::MAX_WINDOW_MINUTES as f64).contains(&minutes) {
+        return None;
+    }
+    Some(minutes as i64)
+}
+
 fn window_minutes(map: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
+    // A length stated directly in minutes is checked too: it arrives as an
+    // integer, so no cast is involved, but nothing stops the upstream sending a
+    // negative or absurd one.
     if let Some(minutes) = first_int(map, WINDOW_MINUTES_KEYS) {
-        return Some(minutes);
+        return crate::wire_sanity::plausible_window_length(minutes).then_some(minutes);
     }
     if let Some(hours) = first_double(map, WINDOW_HOURS_KEYS) {
-        return Some((hours * 60.0).round() as i64);
+        return minutes_from(hours * 60.0);
     }
     if let Some(days) = first_double(map, WINDOW_DAYS_KEYS) {
-        return Some((days * 24.0 * 60.0).round() as i64);
+        return minutes_from(days * 24.0 * 60.0);
     }
     if let Some(seconds) = first_double(map, WINDOW_SECONDS_KEYS) {
-        return Some((seconds / 60.0).round() as i64);
+        return minutes_from(seconds / 60.0);
     }
     if let Some(text) = first_string(map, WINDOW_STRING_KEYS) {
         return window_minutes_from_text(&text);
@@ -256,7 +276,10 @@ fn window_minutes_from_text(text: &str) -> Option<i64> {
             let value_text = &normalized[..normalized.len() - suffix.len()];
             if let Ok(value) = value_text.parse::<f64>() {
                 if value > 0.0 {
-                    return Some((value * multiplier).round() as i64);
+                    // Range-checked like the numeric paths: a textual length can
+                    // carry an exponent, so "1e400d" parses as infinity and the
+                    // cast would saturate into an ordinary-looking length.
+                    return minutes_from(value * multiplier);
                 }
             }
         }
@@ -703,5 +726,72 @@ mod tests {
             .expect("a labelled percent must produce a window")
             .used_percent;
         assert_eq!(scaled, 42.0, "a labelled 0..1 fraction is still scaled");
+    }
+
+    /// A window length that is not a duration is dropped rather than published.
+    ///
+    /// Four paths reach this: minutes, hours, days and seconds, plus a textual
+    /// form. The numeric ones convert through a cast that saturates rather than
+    /// failing, and the textual one can carry an exponent -- so "1e400d" parses
+    /// as infinity, which saturates to an ordinary-looking length.
+    ///
+    /// Consumers read this field as a cadence, and the checker that would catch
+    /// a bad one uses it as the ceiling for its own reset test, so a nonsense
+    /// length silently disables that check for this window.
+    #[test]
+    fn a_window_length_that_is_not_a_duration_is_dropped() {
+        // No numeric case carries an exponent: the JSON parser rejects a number
+        // it cannot represent, so infinity reaches this code only as text.
+        for field in [
+            r#""windowMinutes": -5"#,
+            r#""windowMinutes": 0"#,
+            r#""windowHours": -3.0"#,
+            r#""windowDays": 99999999.0"#,
+            r#""windowSeconds": -60.0"#,
+            r#""window": "1e400d""#,
+        ] {
+            // The five-hour key fills `usage.primary`; a bare percent outside a
+            // recognised container fills no slot at all.
+            let body =
+                format!(r#"{{ "rollingFiveHourLimit": {{ "used": 42, "limit": 100, {field} }} }}"#)
+                    .into_bytes();
+
+            let usage = normalize_usage(&body).expect("the payload still parses");
+            let primary = usage
+                .primary
+                .expect("the percent is load-bearing and must still be published");
+
+            assert_eq!(
+                primary.window_minutes, None,
+                "{field} was published as a length"
+            );
+            // Not vacuous: the window itself survives, so this cannot pass by
+            // dropping everything.
+            assert_eq!(primary.used_percent, 42.0);
+        }
+    }
+
+    /// Real cadences are still published on every path, so the guard cannot pass
+    /// by refusing everything.
+    #[test]
+    fn ordinary_window_lengths_are_published() {
+        for (field, expected) in [
+            (r#""windowMinutes": 300"#, 300),
+            (r#""windowHours": 5.0"#, 300),
+            (r#""windowDays": 7.0"#, 10080),
+            (r#""windowSeconds": 18000.0"#, 300),
+            (r#""window": "7d""#, 10080),
+        ] {
+            let body =
+                format!(r#"{{ "rollingFiveHourLimit": {{ "used": 42, "limit": 100, {field} }} }}"#)
+                    .into_bytes();
+
+            let usage = normalize_usage(&body).expect("the payload still parses");
+            assert_eq!(
+                usage.primary.expect("a window is published").window_minutes,
+                Some(expected),
+                "{field} was not published"
+            );
+        }
     }
 }

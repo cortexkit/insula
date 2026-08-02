@@ -45,7 +45,7 @@ const PAST_RESET_GRACE_MINUTES: f64 = 60.0;
 /// is monthly -- because the point is not to police plausible values but to
 /// catch a length that is not a duration at all. A year of slack costs nothing
 /// and keeps this from firing on some future quarterly plan.
-const MAX_WINDOW_MINUTES: i64 = 366 * 24 * 60;
+pub const MAX_WINDOW_MINUTES: i64 = 366 * 24 * 60;
 
 /// How far the count pair may drift from the reported percent. The two are often
 /// computed from different precisions upstream, so this is loose enough to
@@ -302,7 +302,11 @@ fn windows_of(entry: &ProviderUsage) -> Vec<(String, &RateWindow)> {
 /// Some providers derive this from an upstream number, and the conversion to an
 /// integer saturates rather than failing: a nonsense float arrives as a
 /// nonsense length instead of an error.
-fn plausible_window_length(minutes: i64) -> bool {
+///
+/// Shared with the normalizers that derive a length, so the value a provider is
+/// willing to emit and the value this checker accepts cannot drift apart --
+/// which would leave one of them reporting on a shape the other never produces.
+pub fn plausible_window_length(minutes: i64) -> bool {
     minutes > 0 && minutes <= MAX_WINDOW_MINUTES
 }
 

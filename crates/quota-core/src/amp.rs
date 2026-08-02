@@ -40,6 +40,23 @@ fn is_session_cookie(name: &str) -> bool {
 /// advance land inside a character and panic on the next slice — and the panic
 /// would surface here rather than at the caller that chose the needle. All four
 /// callers pass ASCII literals.
+/// Convert an upstream hour count into a window length, refusing anything that
+/// is not a plausible duration.
+///
+/// The range is checked before the cast, because `as i64` saturates rather than
+/// failing: an infinite or astronomically large value would otherwise become
+/// `i64::MAX` and read as an ordinary length.
+fn window_minutes_from_hours(hours: f64) -> Option<i64> {
+    if !hours.is_finite() {
+        return None;
+    }
+    let minutes = (hours * 60.0).round();
+    if !(1.0..=crate::wire_sanity::MAX_WINDOW_MINUTES as f64).contains(&minutes) {
+        return None;
+    }
+    Some(minutes as i64)
+}
+
 fn find_numeric_field(html: &str, field_name: &str) -> Option<f64> {
     let bytes = html.as_bytes();
     let mut start = 0;
@@ -158,7 +175,13 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 used_percent,
                 raw_used_percent: None,
                 resets_at: Some(resets_at),
-                window_minutes: Some((window_hours * 60.0).round() as i64),
+                // Dropped rather than emitted when the upstream number is not a
+                // duration: the conversion to an integer saturates instead of
+                // failing, so an absurd `windowHours` would otherwise arrive on
+                // the wire looking like an ordinary length. The window itself is
+                // still published -- the percent is the load-bearing part, and a
+                // cadence nobody can state is better absent than wrong.
+                window_minutes: window_minutes_from_hours(window_hours),
                 used_count: None,
                 total_count: None,
             })
@@ -344,6 +367,51 @@ mod tests {
         };
       </script>
     "#;
+
+    /// A window length that is not a duration is dropped, not published.
+    ///
+    /// `windowHours` comes from the page, and the conversion to an integer
+    /// saturates rather than failing -- so without a range check an absurd value
+    /// arrives on the wire looking like an ordinary length. Consumers read that
+    /// field as a cadence, and the checker that would catch it uses it as the
+    /// ceiling for its own reset test, so a nonsense length silently disables
+    /// that check for this window.
+    #[test]
+    fn an_absurd_window_length_is_dropped_and_the_window_still_published() {
+        // Exponent notation is not among them: the field parser accepts only
+        // digits, `-` and `.`, so "1e400" would read as 1 and prove nothing.
+        // These are the shapes that reach the conversion.
+        for hours in ["-5.0", "0.0", "999999999.0", "99999999999999999999.0"] {
+            let html = format!(
+                r#"<script>const freeTierUsage = {{ quota: 100.0, used: 25.0, hourlyReplenishment: 10.0, windowHours: {hours} }};</script>"#
+            );
+            let now = Utc.with_ymd_and_hms(2026, 7, 29, 10, 0, 0).unwrap();
+
+            let usage = normalize_usage(&html, now).expect("the page still parses");
+            let primary = usage
+                .primary
+                .expect("the percent is load-bearing and must still be published");
+
+            assert_eq!(
+                primary.window_minutes, None,
+                "windowHours {hours} was published as a length"
+            );
+            // Not vacuous: the rest of the window is intact, so this cannot pass
+            // by dropping the window altogether.
+            assert_eq!(primary.used_percent, 25.0);
+            assert!(primary.resets_at.is_some());
+        }
+    }
+
+    /// A real cadence is still published, so the guard cannot pass by refusing
+    /// everything.
+    #[test]
+    fn an_ordinary_window_length_is_published() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 29, 10, 0, 0).unwrap();
+        let usage = normalize_usage(HEALTHY_FIXTURE, now).unwrap();
+
+        assert_eq!(usage.primary.unwrap().window_minutes, Some(300));
+    }
 
     #[test]
     fn multibyte_html_around_the_needle_does_not_panic() {
