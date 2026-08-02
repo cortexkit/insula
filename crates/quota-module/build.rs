@@ -21,9 +21,33 @@
 
 use std::path::{Path, PathBuf};
 
+/// Overrides the resolved commit, so two builds can be made byte-comparable.
+///
+/// The stamp is compiled in, so a binary built from one commit differs from one
+/// built at another even when no runtime code changed between them -- which
+/// makes comparing their hashes useless for the question people actually ask
+/// before a deploy: *does this change affect the running binary at all?*
+///
+/// Pinning both builds to the same stamp makes them comparable. Build the two
+/// commits from the same directory with the same override and compare hashes.
+///
+/// **Only equality is conclusive.** Identical bytes prove the two commits
+/// produce the same binary, so a change that touches only tests needs no
+/// deploy -- which is the case worth having a fast, exact answer for, since it
+/// is the usual one. A difference proves nothing on its own: panic messages
+/// embed their own file and line, so inserting a comment above a function in a
+/// runtime file changes the binary without changing behaviour. Fall back to
+/// reading the diff in that case.
+///
+/// Two conditions, both easy to get wrong: the builds must run from the SAME
+/// directory, because absolute paths are embedded and a worktree elsewhere
+/// produces different bytes for identical source; and both must use this
+/// override, since a commit predating it ignores the variable and stamps its
+/// own sha, making the stamp itself the difference being measured.
+const STAMP_OVERRIDE: &str = "CK_QUOTA_BUILD_COMMIT_OVERRIDE";
+
 fn main() {
     let git_dir = locate_git_dir();
-    let commit = git_dir.as_deref().and_then(head_commit);
 
     // Rebuild when HEAD moves, so the stamp cannot go stale within a worktree.
     if let Some(dir) = git_dir.as_deref() {
@@ -33,10 +57,25 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed={STAMP_OVERRIDE}");
+
+    let commit = match std::env::var(STAMP_OVERRIDE) {
+        // Only a well-formed stamp is honoured, so a stray or malformed value
+        // cannot put an arbitrary string where a commit is expected.
+        Ok(value) if is_stamp(&value) => Some(value),
+        _ => git_dir.as_deref().and_then(head_commit),
+    };
+
     println!(
         "cargo:rustc-env=CK_QUOTA_BUILD_COMMIT={}",
         commit.as_deref().unwrap_or("unknown")
     );
+}
+
+/// Whether a string has the shape this build stamps: short hex, as [`short`]
+/// produces.
+fn is_stamp(raw: &str) -> bool {
+    raw.len() == 12 && raw.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Walk up from the crate directory to the repository root holding `.git`.

@@ -90,6 +90,47 @@ old process and the stamp in it proves nothing yet. Re-read once it advances.
 Note the field sits under `module`, not under `health` — next to the stamp it
 dates, but not inside it.
 
+### Deciding whether a deploy is needed at all
+
+Most commits here touch only tests, comments, or documentation, and rebuilding
+for those is wasted work. Reading the diff to decide is a heuristic, and an
+unreliable one: Rust arranges test code in several ways — an inline `mod tests`,
+a whole file included by `#[cfg(test)] mod tests;`, a `tests/` directory — and a
+rule that counts lines against the first `#[cfg(test)]` marker silently reports
+whichever arrangement it does not model as a runtime change.
+
+Ask the compiler instead. `CK_QUOTA_BUILD_COMMIT_OVERRIDE` pins the stamp, so
+two commits can be built into byte-comparable binaries:
+
+```sh
+# From the SAME directory, so embedded absolute paths match.
+git stash                       # or use a clean tree
+git checkout <deployed-commit>
+CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
+shasum -a 256 target/release/ck-quota
+
+git checkout <head-commit>
+CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
+shasum -a 256 target/release/ck-quota
+```
+
+**Equal hashes mean no deploy is needed** — the commits produce the same binary.
+
+**Unequal hashes prove nothing on their own.** Panic messages embed their own
+file and line, so adding a comment above a function in a runtime file shifts
+every line below it and changes the binary without changing behaviour. On a
+difference, read the diff.
+
+Two conditions are easy to get wrong. Both builds must run from the same
+directory, because absolute paths are embedded and a worktree elsewhere yields
+different bytes for identical source. And both commits must contain the override
+support, since an older `build.rs` ignores the variable and stamps its own sha —
+making the stamp itself the difference being measured. Overlay the current
+`build.rs` onto the older commit if needed.
+
+This cannot be used against the *deployed* binary directly unless it was built
+in the same directory, which is the usual case here but worth confirming.
+
 ### `unknown` is a third outcome, not a failed comparison
 
 The stamp is `unknown` when the build could not resolve `HEAD` — most often
