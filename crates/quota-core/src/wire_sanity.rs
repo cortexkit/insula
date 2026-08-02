@@ -367,6 +367,12 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
         }
     }
 
+    // Note on what the count agreement check can and cannot see: where a
+    // provider recovers `used_count` from the percentage and the cap, this
+    // comparison returns the reported percentage by construction and cannot
+    // fire. It still holds for any provider that publishes an absolute count
+    // the upstream measured, and it catches a producer that computed one of the
+    // three from the other two incorrectly.
     if let (Some(used), Some(total)) = (window.used_count, window.total_count) {
         if used > total {
             findings.push(format!(

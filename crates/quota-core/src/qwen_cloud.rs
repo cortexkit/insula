@@ -599,4 +599,122 @@ mod tests {
         );
         assert_eq!(extract_sec_token("window.ONE_CONSOLE_TOOL={};"), None);
     }
+
+    /// Wrap a body in the console gateway's envelope.
+    ///
+    /// Both extra responses arrive nested this way, so a fixture omitting a
+    /// layer would exercise an early return rather than the mapping under test.
+    fn gateway(inner: &str) -> Vec<u8> {
+        format!(r#"{{"successResponse":true,"data":{{"DataV2":{{"data":{inner}}}}}}}"#).into_bytes()
+    }
+
+    fn caps_body(spec: &str, five_hour: &str, weekly: &str) -> Vec<u8> {
+        gateway(&format!(
+            r#"{{"success":true,"data":{{"{spec}":{{"five_hour":{five_hour},"weekly":{weekly}}}}}}}"#
+        ))
+    }
+
+    fn subscription_body(spec: &str) -> Vec<u8> {
+        gateway(&format!(
+            r#"{{"success":true,"data":{{"specCode":"{spec}"}}}}"#
+        ))
+    }
+
+    fn usage_at(five_hour: f64, weekly: f64) -> Usage {
+        Usage {
+            primary: Some(RateWindow {
+                used_percent: five_hour,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: Some(300),
+                used_count: None,
+                total_count: None,
+            }),
+            secondary: Some(RateWindow {
+                used_percent: weekly,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: Some(10080),
+                used_count: None,
+                total_count: None,
+            }),
+            ..Usage::default()
+        }
+    }
+
+    /// The caps applied are those of the account's own plan.
+    ///
+    /// The quota-config response lists every plan the service sells, so the
+    /// subscription response is what says which row belongs to this account.
+    /// Reading the wrong row yields counts that look ordinary and describe a
+    /// plan the account is not on.
+    #[test]
+    fn counts_come_from_the_caps_of_the_subscribed_plan() {
+        let mut usage = usage_at(27.8, 10.0);
+        let caps = gateway(
+            r#"{"success":true,"data":{"standard":{"five_hour":1000,"weekly":10000},"pro":{"five_hour":4000,"weekly":40000}}}"#,
+        );
+
+        enrich_with_counts(&mut usage, &caps, &subscription_body("pro"));
+
+        let primary = usage.primary.expect("the window survives enrichment");
+        assert_eq!(primary.total_count, Some(4000.0), "cap of the wrong plan");
+        assert_eq!(primary.used_count, Some(1112.0));
+        let secondary = usage.secondary.expect("the window survives enrichment");
+        assert_eq!(secondary.total_count, Some(40000.0));
+        assert_eq!(secondary.used_count, Some(4000.0));
+    }
+
+    /// Enrichment is additive: when no cap can be resolved the percentage stands
+    /// alone, rather than the window being dropped or annotated with a guess.
+    ///
+    /// Each case is a distinct way the two extra calls can fail to yield a cap,
+    /// and every one must leave the window as the usage response described it.
+    #[test]
+    fn a_cap_that_cannot_be_resolved_leaves_the_window_untouched() {
+        let cases: [(&str, Vec<u8>, Vec<u8>); 6] = [
+            (
+                "unparseable caps",
+                b"not json".to_vec(),
+                subscription_body("pro"),
+            ),
+            (
+                "unparseable subscription",
+                caps_body("pro", "4000", "40000"),
+                b"not json".to_vec(),
+            ),
+            (
+                "gateway reported failure",
+                br#"{"successResponse":false}"#.to_vec(),
+                subscription_body("pro"),
+            ),
+            (
+                "inner result reported failure",
+                gateway(r#"{"success":false,"data":{"pro":{"five_hour":4000,"weekly":40000}}}"#),
+                subscription_body("pro"),
+            ),
+            (
+                "the account's plan is absent from the cap table",
+                caps_body("standard", "1000", "10000"),
+                subscription_body("pro"),
+            ),
+            (
+                "the plan states no cap for these windows",
+                caps_body("pro", "null", "null"),
+                subscription_body("pro"),
+            ),
+        ];
+
+        for (name, caps, subscription) in cases {
+            let mut usage = usage_at(27.8, 10.0);
+            enrich_with_counts(&mut usage, &caps, &subscription);
+
+            let primary = usage.primary.expect("the window must survive");
+            assert_eq!(primary.used_count, None, "{name}: invented a used count");
+            assert_eq!(primary.total_count, None, "{name}: invented a total");
+            // Not vacuous: the percentage is untouched, so this cannot pass by
+            // discarding the window.
+            assert_eq!(primary.used_percent, 27.8, "{name}");
+        }
+    }
 }

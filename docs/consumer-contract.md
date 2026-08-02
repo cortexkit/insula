@@ -273,6 +273,18 @@ cap changed from one whose usage did. Do not compute one from the other and the
 percent: the percent can be reported directly by the upstream against a cap that
 differs from the one you would divide by.
 
+**The two are not equally independent, and the difference matters if you plan to
+cross-check them.** `totalCount` is the plan's cap, which the upstream states
+directly. `usedCount` may be *recovered* from the percentage and that cap where
+the upstream publishes no absolute figure of its own — a faithful recovery of
+the number the upstream divided, to the precision at which it transmitted the
+percentage, but not an independent measurement. So `usedCount / totalCount`
+returns the reported percentage by construction: agreement between them confirms
+nothing, and disagreement would indicate a producer defect rather than anything
+about the account. The independent signal is `totalCount` alone: watching it
+change is how a cap change becomes visible, which is what these fields were
+added for.
+
 Each entry in `extraRateWindows` carries an `id` (a stable identifier), a `title`
 (human-facing text), and a `window` — all three optional. Match on `id`; render
 `title`; and handle an entry whose `window` is absent, which is how a provider
