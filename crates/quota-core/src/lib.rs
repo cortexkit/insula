@@ -522,6 +522,10 @@ impl Registry {
                 }
             }
         }
+        // Applied once, to the assembled array, rather than at each of the
+        // twenty-odd sites that compute a percent: a single missed guard there
+        // would publish a null that costs every consumer the whole response.
+        model::drop_uncomputable_windows(&mut out);
         out
     }
 

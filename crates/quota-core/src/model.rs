@@ -48,6 +48,64 @@ pub fn windows(usage: &Usage) -> impl Iterator<Item = &RateWindow> {
         )
 }
 
+/// Drop any window whose percent is not a number, from every entry about to be
+/// published.
+///
+/// `usedPercent` is a plain `f64` on the wire, and a non-finite one serializes
+/// as `null`. A consumer decoding into a typed struct then fails on the WHOLE
+/// response -- not the offending entry, the entire array -- so one provider
+/// computing `0.0 / 0.0` would take every other provider's usage down with it.
+///
+/// Dropping the window keeps that blast radius at one window. The percent is the
+/// load-bearing field, so a window without a usable one has nothing to say; the
+/// alternative of substituting a number would state a capacity nobody measured,
+/// and zero in particular would read as an idle account.
+///
+/// Every division that computes a percent guards its denominator today, so this
+/// is a backstop rather than a live fix. It is here because those guards are one
+/// correct decision per site and this is one decision for all of them, and
+/// because the cost of a single missed guard is not a wrong number but a
+/// response no typed consumer can read.
+pub fn drop_uncomputable_windows(entries: &mut [ProviderUsage]) {
+    for entry in entries {
+        let Some(usage) = entry.usage.as_mut() else {
+            continue;
+        };
+        let Usage {
+            primary,
+            secondary,
+            tertiary,
+            extra_rate_windows,
+        } = usage;
+
+        for slot in [primary, secondary, tertiary] {
+            if slot.as_ref().is_some_and(|w| !w.used_percent.is_finite()) {
+                *slot = None;
+            }
+        }
+        if let Some(extras) = extra_rate_windows.as_mut() {
+            for extra in extras.iter_mut() {
+                if extra
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| !w.used_percent.is_finite())
+                {
+                    extra.window = None;
+                }
+            }
+        }
+
+        // `raw_used_percent` is optional on the wire, so a non-finite one
+        // serializes as null in a field that already admits absence -- it costs
+        // the annotation, not the response.
+        for window in windows_mut(usage) {
+            if window.raw_used_percent.is_some_and(|raw| !raw.is_finite()) {
+                window.raw_used_percent = None;
+            }
+        }
+    }
+}
+
 /// [`windows`], mutably: the same enumeration for read-time transforms.
 pub fn windows_mut(usage: &mut Usage) -> impl Iterator<Item = &mut RateWindow> {
     let Usage {
@@ -81,6 +139,118 @@ mod tests {
             used_count: None,
             total_count: None,
         }
+    }
+
+    /// A percent that is not a number costs its own window and nothing else.
+    ///
+    /// `usedPercent` is a plain `f64` on the wire, so a non-finite value
+    /// serializes as `null`, and a consumer decoding into a typed struct fails
+    /// on the entire array -- every sibling window and every other provider's
+    /// entry lost with it.
+    #[test]
+    fn a_window_whose_percent_is_not_a_number_is_dropped_alone() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut entries = vec![
+                ProviderUsage::healthy(
+                    "broken",
+                    None,
+                    "oauth",
+                    Usage {
+                        primary: Some(window(bad)),
+                        secondary: Some(window(40.0)),
+                        extra_rate_windows: Some(vec![
+                            ExtraWindow {
+                                id: Some("bad-extra".into()),
+                                title: None,
+                                window: Some(window(bad)),
+                            },
+                            ExtraWindow {
+                                id: Some("good-extra".into()),
+                                title: None,
+                                window: Some(window(55.0)),
+                            },
+                        ]),
+                        ..Usage::default()
+                    },
+                ),
+                ProviderUsage::healthy(
+                    "healthy",
+                    None,
+                    "oauth",
+                    Usage {
+                        primary: Some(window(10.0)),
+                        ..Usage::default()
+                    },
+                ),
+            ];
+
+            drop_uncomputable_windows(&mut entries);
+
+            let broken = entries[0].usage.as_ref().unwrap();
+            assert!(broken.primary.is_none(), "{bad} was published");
+            assert!(broken.extra_rate_windows.as_ref().unwrap()[0]
+                .window
+                .is_none());
+
+            // Not vacuous: only the unusable windows go, so this cannot pass by
+            // discarding the entry.
+            assert_eq!(broken.secondary.as_ref().unwrap().used_percent, 40.0);
+            assert_eq!(
+                broken.extra_rate_windows.as_ref().unwrap()[1]
+                    .window
+                    .as_ref()
+                    .unwrap()
+                    .used_percent,
+                55.0
+            );
+            assert_eq!(
+                entries[1]
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .primary
+                    .as_ref()
+                    .unwrap()
+                    .used_percent,
+                10.0,
+                "a sibling entry lost its usage"
+            );
+
+            // The published bytes are what matter: no null reaches the wire.
+            let json = serde_json::to_string(&entries).unwrap();
+            assert!(!json.contains("null"), "a null reached the wire: {json}");
+        }
+    }
+
+    /// An unusable relaxed annotation costs the annotation, not the window.
+    ///
+    /// `rawUsedPercent` is optional on the wire, so its absence is a state
+    /// consumers already handle -- unlike `usedPercent`, dropping it is cheap.
+    #[test]
+    fn an_unusable_raw_percent_costs_the_annotation_not_the_window() {
+        let mut bad_raw = window(30.0);
+        bad_raw.raw_used_percent = Some(f64::NAN);
+        let mut entries = vec![ProviderUsage::healthy(
+            "codex",
+            None,
+            "oauth",
+            Usage {
+                primary: Some(bad_raw),
+                ..Usage::default()
+            },
+        )];
+
+        drop_uncomputable_windows(&mut entries);
+
+        let primary = entries[0]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .expect("the window survives");
+        assert_eq!(primary.raw_used_percent, None);
+        assert_eq!(primary.used_percent, 30.0);
     }
 
     /// A filled slot after an empty one must still be reached.
