@@ -380,11 +380,6 @@ pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, Fetch
     })
 }
 
-/// Compatibility normalizer used by tests and read-only consumers.
-pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    normalize_usage_snapshot(body).map(|snapshot| snapshot.usage)
-}
-
 /// Resolve the codex home directory (`CODEX_HOME` or `~/.codex`).
 fn codex_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
@@ -1598,7 +1593,7 @@ mod tests {
         // idle window) is emitted with resetsAt omitted, not dropped. The reset is
         // never fabricated.
         let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 50 } } }"#;
-        let usage = normalize_usage(body).unwrap();
+        let usage = normalize_usage_snapshot(body).unwrap().usage;
         let primary = usage.primary.expect("window kept with percent, reset-less");
         assert_eq!(primary.used_percent, 50.0);
         assert_eq!(primary.resets_at, None);
@@ -1608,7 +1603,7 @@ mod tests {
     fn window_without_used_percent_is_dropped() {
         // The percent is the load-bearing field; without it there is no window.
         let body = br#"{ "rate_limit": { "primary_window": { "reset_at": 1782135879 } } }"#;
-        let usage = normalize_usage(body).unwrap();
+        let usage = normalize_usage_snapshot(body).unwrap().usage;
         assert!(usage.primary.is_none());
     }
 

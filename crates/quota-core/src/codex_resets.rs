@@ -52,10 +52,27 @@ pub struct CreditsSnapshot {
 }
 
 impl CreditsSnapshot {
+    /// The soonest expiry among all available credits, including ones too close
+    /// to expiry to redeem safely.
+    ///
+    /// For diagnostics only -- it answers "what does the account hold", not
+    /// "what could be spent". Use [`Self::earliest_usable_expiry`] for any
+    /// decision about redeeming, or a credit inside the safety margin will be
+    /// treated as spendable.
     pub fn earliest_available_expiry(&self) -> Option<DateTime<Utc>> {
         self.available.iter().map(|credit| credit.expires_at).min()
     }
 
+    /// The soonest expiry among credits that can still be safely redeemed.
+    ///
+    /// Credits within [`CREDIT_SAFETY_MARGIN_SECS`] of expiring are excluded: a
+    /// redemption is not instantaneous, and one raced against its own expiry can
+    /// be consumed without resetting anything -- spending an irreplaceable credit
+    /// for nothing.
+    ///
+    /// This is the one to reach for when the answer feeds an action. Its
+    /// unfiltered twin above looks equivalent and reads more simply, which is
+    /// exactly how a credit inside the margin gets spent for nothing.
     pub fn earliest_usable_expiry(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let safety_cutoff = now + chrono::Duration::seconds(CREDIT_SAFETY_MARGIN_SECS);
         self.available
@@ -63,14 +80,6 @@ impl CreditsSnapshot {
             .filter(|credit| credit.expires_at > safety_cutoff)
             .map(|credit| credit.expires_at)
             .min()
-    }
-
-    pub fn usable_count(&self, now: DateTime<Utc>) -> usize {
-        let safety_cutoff = now + chrono::Duration::seconds(CREDIT_SAFETY_MARGIN_SECS);
-        self.available
-            .iter()
-            .filter(|credit| credit.expires_at > safety_cutoff)
-            .count()
     }
 
     pub fn saved_resets(&self) -> SavedResets {
