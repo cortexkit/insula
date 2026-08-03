@@ -494,9 +494,16 @@ impl Registry {
                 // are serving stale data the newer snapshot is the one worth
                 // showing: comparing status alone leaves them tied, so the winner
                 // would be decided by handle order and could be arbitrarily older.
-                // That matters because usage only ever grows within a window, so
-                // the older snapshot always understates pressure — it can report a
-                // near-exhausted account as comfortable.
+                //
+                // Recency, not the reported figure. A snapshot is preferred
+                // because it describes the account more recently, and the older
+                // one may describe a state the account has already left. Usage
+                // usually grows within a window -- so the older snapshot usually
+                // understates pressure -- but a window that resets between the
+                // two fetches makes the newer figure lower, and it is still the
+                // one to serve. Choosing by the figure instead would pin the
+                // account at its pre-reset percent until the older handle
+                // succeeded again.
                 let should_replace = match candidates.get(account_id) {
                     Some((_, current)) => {
                         let rank = service_rank(slot.status).cmp(&service_rank(current.status));

@@ -3536,15 +3536,100 @@ impl UsageProvider for StaleDuplicateProvider {
     }
 }
 
+/// The same two handles, but the newer snapshot reports LESS usage.
+///
+/// Reachable whenever a window resets between two fetches, which is the routine
+/// case for a five-hour window on a duplicated account.
+struct ResetDuplicateProvider;
+
+#[async_trait]
+impl UsageProvider for ResetDuplicateProvider {
+    fn name(&self) -> &str {
+        "reset-dup"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![handle("A-early"), handle("B-late")])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        // The older handle saw the window nearly full; the newer one saw it
+        // after the reset.
+        let used_percent = if handle.stable_id() == "A-early" {
+            95.0
+        } else {
+            4.0
+        };
+        let usage = Usage {
+            primary: Some(RateWindow {
+                used_percent,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: Some(300),
+                used_count: None,
+                total_count: None,
+            }),
+            ..Usage::default()
+        };
+        FetchAttempt::success(observed(Some("shared")), "test", usage)
+    }
+}
+
+/// Recency decides the duplicate, even when the newer snapshot reports less.
+///
+/// Two handles can resolve the same account, and when both are stale-serving
+/// the tiebreak is which observation is more recent. It is tempting to justify
+/// that by saying usage only grows within a window, so the older snapshot
+/// understates pressure — but a window that resets between the two fetches
+/// makes the newer snapshot lower, and it is still the one to serve, because
+/// the older one describes a state the account has left.
+///
+/// Without this case a rule of "prefer the higher percent" passes every other
+/// test, and it would pin an account at its pre-reset figure until the older
+/// handle succeeded again.
+#[tokio::test]
+async fn duplicate_account_serves_the_newer_observation_after_a_reset() {
+    let registry = Registry::new(vec![Box::new(ResetDuplicateProvider)]);
+    tick(&registry).await;
+
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            slot.status = SlotStatus::StaleTransient;
+            let age_secs = if key.handle.stable_id() == "A-early" {
+                600
+            } else {
+                5
+            };
+            slot.last_success_at = Some(Instant::now() - Duration::from_secs(age_secs));
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+    }
+
+    let usage = registry.get_usage(None).await;
+    assert_eq!(usage.len(), 1, "one entry per account");
+    assert_eq!(
+        usage[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.primary.as_ref())
+            .map(|window| window.used_percent),
+        Some(4.0),
+        "the newer observation must win even when it reports less usage"
+    );
+}
+
 #[tokio::test]
 async fn duplicate_account_with_equal_status_serves_the_newer_observation() {
     let registry = Registry::new(vec![Box::new(StaleDuplicateProvider)]);
     tick(&registry).await;
 
     // Both slots end up stale-serving, but one observation is ten minutes older
-    // than the other. Usage only grows within a window, so the older snapshot
-    // necessarily understates pressure — serving it can report a near-exhausted
-    // account as comfortable, which is the direction that costs a consumer most.
+    // than the other. The newer one wins because it is newer, not because of
+    // what it reports: the older snapshot describes a state the account has
+    // already left, and only the newer one can reflect a reset.
     {
         let mut store = registry.store.lock().unwrap();
         for (key, mut slot) in store.snapshot() {
