@@ -31,15 +31,6 @@ fn is_session_cookie(name: &str) -> bool {
 
 // ---- HTML parsing (pure) ----------------------------------------------------
 
-/// Find `field_name`'s numeric value in an HTML/JS blob, requiring the match to
-/// be a whole word.
-///
-/// `field_name` must be ASCII. The scan advances one byte past a rejected match
-/// to allow an overlapping candidate, which is a character boundary only because
-/// the byte at the match start is single-byte. A non-ASCII needle would make that
-/// advance land inside a character and panic on the next slice — and the panic
-/// would surface here rather than at the caller that chose the needle. All four
-/// callers pass ASCII literals.
 /// Convert an upstream hour count into a window length, refusing anything that
 /// is not a plausible duration.
 ///
@@ -57,6 +48,15 @@ fn window_minutes_from_hours(hours: f64) -> Option<i64> {
     Some(minutes as i64)
 }
 
+/// Find `field_name`'s numeric value in an HTML/JS blob, requiring the match to
+/// be a whole word.
+///
+/// `field_name` must be ASCII. The scan advances one byte past a rejected match
+/// to allow an overlapping candidate, which is a character boundary only because
+/// the byte at the match start is single-byte. A non-ASCII needle would make that
+/// advance land inside a character and panic on the next slice — and the panic
+/// would surface here rather than at the caller that chose the needle. All four
+/// callers pass ASCII literals.
 fn find_numeric_field(html: &str, field_name: &str) -> Option<f64> {
     let bytes = html.as_bytes();
     let mut start = 0;

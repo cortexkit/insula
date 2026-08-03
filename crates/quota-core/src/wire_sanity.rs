@@ -20,9 +20,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use cortexkit_provider_usage::{ProviderUsage, RateWindow};
 
-/// How far past a window's own length its reset may sit before it is
-/// misattributed. A window resets at most one window-length from now, plus a
-/// margin for clock skew and for upstreams that round to the next hour.
 /// How far ahead of the reader's clock a `fetchedAt` may sit before it is
 /// treated as wrong rather than as clock skew.
 ///
@@ -32,6 +29,18 @@ use cortexkit_provider_usage::{ProviderUsage, RateWindow};
 /// future ages backwards.
 const FUTURE_TOLERANCE_SECS: i64 = 120;
 
+/// How far past a window's own length its reset may sit before the reset is
+/// treated as belonging to a different window.
+///
+/// A window resets at most one window-length from now, so anything beyond that
+/// is either a misattributed timestamp or a mis-stated length. A 300-minute
+/// window claiming a reset 36 hours out is the shape: both fields are
+/// well-formed and only their pairing is impossible, which is why no check of
+/// either field alone would notice.
+///
+/// The allowance is proportional plus fixed: the ratio absorbs rounding on long
+/// cadences, and the fixed minutes keep a short window from being judged by a
+/// margin too small to cover an upstream that rounds up to the next hour.
 const RESET_SLACK_RATIO: f64 = 1.05;
 const RESET_SLACK_MINUTES: f64 = 60.0;
 
@@ -39,6 +48,7 @@ const RESET_SLACK_MINUTES: f64 = 60.0;
 /// just-crossed. A window whose reset has passed is normal for a few minutes:
 /// the upstream has rolled and the cached copy has not been refetched yet.
 const PAST_RESET_GRACE_MINUTES: f64 = 60.0;
+
 /// Longest window length treated as a real quota cadence, in minutes.
 ///
 /// Deliberately far above any cadence a provider publishes -- the longest here
