@@ -49,7 +49,7 @@ pub mod stepfun;
 pub mod store;
 pub mod sub2api;
 pub mod synthetic;
-mod text;
+pub mod text;
 pub mod vault_handles;
 pub mod warp;
 pub mod wire_sanity;

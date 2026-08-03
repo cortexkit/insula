@@ -375,6 +375,13 @@ async fn handle_control_request(
     send(writer, response).await
 }
 
+/// Cap on request-supplied text echoed back in an error reply.
+///
+/// Generous next to any real method name, so a caller that mistyped one still
+/// sees it in full. The bound exists for the case where the value is not a
+/// method name at all.
+const MAX_ECHOED_METHOD_BYTES: usize = 256;
+
 /// Reply to a channel-0 control request with a canonical subc error.
 ///
 /// `code` uses the daemon's own control vocabulary so the message is legible to
@@ -518,6 +525,13 @@ async fn handle_usage_request(
     };
 
     if request.method != USAGE_GET_OP {
+        // The method name is echoed so the caller can see what was rejected, but
+        // it comes from the request and nothing upstream bounds it. An error
+        // reply large enough to exceed the frame limit cannot be built, and the
+        // caller would be left with no reply at all -- turning a clear rejection
+        // into a silent timeout, which is the outcome this surface promises
+        // cannot happen.
+        let echoed = quota_core::text::truncate_for_wire(&request.method, MAX_ECHOED_METHOD_BYTES);
         return send_route_error(
             writer,
             ver,
@@ -525,10 +539,7 @@ async fn handle_usage_request(
             epoch,
             corr,
             "unknown_method",
-            &format!(
-                "unknown method '{}', expected '{USAGE_GET_OP}'",
-                request.method
-            ),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}'"),
         )
         .await;
     }
@@ -894,6 +905,59 @@ mod tests {
             assert!(!error.code.is_empty(), "{label}");
             assert!(!error.message.is_empty(), "{label}");
         }
+    }
+
+    /// An unknown method is rejected with a reply that stays small.
+    ///
+    /// The method name is echoed back so the caller can see what was rejected,
+    /// and it comes from the request -- nothing upstream bounds it. The reply
+    /// must not grow with it: the frame layer caps a body at 64 MiB, and a
+    /// request just under that cap would otherwise produce an error reply just
+    /// over it. That reply cannot be built, so the caller receives nothing and
+    /// waits out its own timeout -- a clear rejection turned into silence.
+    ///
+    /// Driven here at a size that is fast to run rather than at the cap itself;
+    /// the property under test is that the reply size does not follow the
+    /// request's, which a bounded echo gives at every size.
+    #[tokio::test]
+    async fn an_oversized_method_name_still_receives_an_error_reply() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "method": "x".repeat(1024 * 1024),
+        }))
+        .unwrap();
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            3,
+            61,
+            body,
+        )
+        .unwrap();
+
+        let registry = Arc::new(quota_core::Registry::new(Vec::new()));
+        handle_usage_request(frame, &tx, &registry)
+            .await
+            .expect("the rejection must be deliverable");
+
+        let reply = rx.try_recv().expect("the caller received nothing");
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(reply.header.channel, 7);
+        assert_eq!(reply.header.epoch, 3);
+
+        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "unknown_method");
+        // Not vacuous: the reply still names what was rejected and says the
+        // text was cut, so this cannot pass by dropping the echo entirely.
+        assert!(error.message.contains("unknown method 'xxx"));
+        assert!(error.message.contains("more bytes]"), "{}", error.message);
+        assert!(
+            reply.body.len() < 4096,
+            "reply body {} bytes",
+            reply.body.len()
+        );
     }
 
     /// A control body this module cannot decode is answered, not escalated.

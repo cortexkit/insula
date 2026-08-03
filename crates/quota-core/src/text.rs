@@ -34,7 +34,7 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
 /// happens to end oddly, which sends a reader looking for a parsing bug that
 /// does not exist; naming the dropped byte count says the text was cut and how
 /// much is missing.
-pub(crate) fn truncate_for_wire(text: &str, limit: usize) -> String {
+pub fn truncate_for_wire(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
