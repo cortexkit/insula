@@ -457,6 +457,29 @@ later "optimises" it toward observed sizes.
 Rejecting a response that produced **no** windows is the one free case: there is
 nothing to lose, so the asymmetry does not apply.
 
+## An insertion can move a comment off the thing it describes
+
+A doc block belongs to whatever follows it. Insert a function between a block
+and the item it documented and the block silently becomes the new item's
+documentation, while the original is left bare — no warning, and the diff shows
+only an addition.
+
+The result is worse than a missing comment. The orphaned text still reads as
+authoritative, so it can attach a constraint to code that does not have it while
+removing it from the code that does. In this crate a rule requiring an ASCII
+needle — the scan advances one byte past a rejected match, and a multibyte
+needle would land inside a character and panic — ended up on a numeric
+conversion, leaving the function it constrains undocumented.
+
+Neither end looks wrong afterwards. The inserted function reads correctly with
+the block above it, and nothing about the newly bare function looks changed, so
+reviewing the commit that caused it would not surface it.
+
+When inserting between existing items, read the block *above* the insertion
+point and confirm it describes what still follows it. To find existing cases,
+look for a doc block naming something other than what it is attached to, or one
+whose paragraphs open two different subjects.
+
 ## Testing these
 
 A regression for any of the above must fail *for the reason it names*. Eight ways
