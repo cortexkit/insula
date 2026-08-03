@@ -106,6 +106,60 @@ pub fn drop_uncomputable_windows(entries: &mut [ProviderUsage]) {
     }
 }
 
+/// Cap on any single upstream-derived string published on an entry.
+///
+/// An order of magnitude above the longest value any provider produces today
+/// (37 bytes, an account UUID), so it cannot truncate real data. It is a bound
+/// on what an upstream can put on this wire, not a formatting rule.
+const MAX_WIRE_STRING_BYTES: usize = 512;
+
+/// Bound the upstream-derived strings on every entry about to be published.
+///
+/// Several fields are copied from upstream payloads with no length of their own:
+/// a model or bucket identifier becomes an extra window's `id` and `title`, and
+/// the account labels come from a token or a credential store. Nothing between
+/// those sources and the wire caps them.
+///
+/// The cost of leaving them unbounded is not a large response. The frame layer
+/// refuses a body over its maximum, so a sufficiently long string means the
+/// whole reply cannot be sent -- every provider's usage lost to one upstream's
+/// oversized label. Bounding each string keeps a bad value costing its own
+/// field.
+///
+/// Truncation is announced rather than silent, for the same reason the error
+/// text is: a value cut without saying so reads as a complete one, and an
+/// identifier that quietly loses its tail can collide with a sibling.
+pub fn bound_wire_strings(entries: &mut [ProviderUsage]) {
+    fn bound(value: &mut Option<String>) {
+        if let Some(text) = value {
+            if text.len() > MAX_WIRE_STRING_BYTES {
+                *text = crate::text::truncate_for_wire(text, MAX_WIRE_STRING_BYTES);
+            }
+        }
+    }
+
+    for entry in entries {
+        bound(&mut entry.account);
+        if let Some(info) = entry.account_info.as_mut() {
+            bound(&mut info.email);
+            bound(&mut info.org_name);
+            bound(&mut info.plan_type);
+        }
+        if let Some(usage) = entry.usage.as_mut() {
+            if let Some(extras) = usage.extra_rate_windows.as_mut() {
+                for extra in extras.iter_mut() {
+                    bound(&mut extra.id);
+                    bound(&mut extra.title);
+                }
+            }
+        }
+        // `provider` and `api_provider` are this module's own names, and
+        // `fetched_at` and the reset timestamps are formatted here, so none of
+        // them can carry an upstream's length. `error` is bounded already, at
+        // the single point where a failure becomes wire text.
+    }
+}
+
 /// [`windows`], mutably: the same enumeration for read-time transforms.
 pub fn windows_mut(usage: &mut Usage) -> impl Iterator<Item = &mut RateWindow> {
     let Usage {
@@ -251,6 +305,94 @@ mod tests {
             .expect("the window survives");
         assert_eq!(primary.raw_used_percent, None);
         assert_eq!(primary.used_percent, 30.0);
+    }
+
+    /// An upstream string long enough to break the reply is cut to its own
+    /// field.
+    ///
+    /// A model or bucket identifier becomes an extra window's `id` and `title`
+    /// with no length of its own, and the account labels come from a token or a
+    /// credential store. The frame layer refuses a body over its maximum, so
+    /// without a bound one upstream's oversized label costs every provider's
+    /// usage: the reply cannot be sent at all.
+    #[test]
+    fn an_oversized_upstream_string_is_cut_to_its_own_field() {
+        let huge = "A".repeat(4096);
+        let mut entries = vec![ProviderUsage::healthy(
+            "antigravity",
+            Some(huge.clone()),
+            "oauth",
+            Usage {
+                primary: Some(window(10.0)),
+                extra_rate_windows: Some(vec![ExtraWindow {
+                    id: Some(huge.clone()),
+                    title: Some(huge.clone()),
+                    window: Some(window(20.0)),
+                }]),
+                ..Usage::default()
+            },
+        )];
+        entries[0].account_info = Some(AccountInfo {
+            email: Some(huge.clone()),
+            org_name: Some(huge.clone()),
+            plan_type: Some(huge),
+        });
+
+        bound_wire_strings(&mut entries);
+
+        let entry = &entries[0];
+        let info = entry.account_info.as_ref().unwrap();
+        let usage = entry.usage.as_ref().unwrap();
+        let extra = &usage.extra_rate_windows.as_ref().unwrap()[0];
+        for (name, value) in [
+            ("account", entry.account.as_deref()),
+            ("email", info.email.as_deref()),
+            ("orgName", info.org_name.as_deref()),
+            ("planType", info.plan_type.as_deref()),
+            ("extra.id", extra.id.as_deref()),
+            ("extra.title", extra.title.as_deref()),
+        ] {
+            let value = value.expect("the field survives");
+            assert!(
+                value.len() <= 600,
+                "{name} was published at {} bytes",
+                value.len()
+            );
+            // Announced rather than silent: a value cut without saying so reads
+            // as a complete one, and an identifier that quietly loses its tail
+            // can collide with a sibling.
+            assert!(value.contains("more bytes]"), "{name} was cut silently");
+        }
+
+        // Not vacuous: the measurements are untouched, so this cannot pass by
+        // discarding the entry.
+        assert_eq!(usage.primary.as_ref().unwrap().used_percent, 10.0);
+        assert_eq!(extra.window.as_ref().unwrap().used_percent, 20.0);
+    }
+
+    /// Ordinary values pass through byte-identical, so the bound cannot pass by
+    /// rewriting everything it touches.
+    #[test]
+    fn an_ordinary_string_is_published_unchanged() {
+        let mut entries = vec![ProviderUsage::healthy(
+            "codex",
+            Some("291f5165-0a65-4635-b437-5174415ed928".into()),
+            "vault",
+            Usage {
+                primary: Some(window(10.0)),
+                extra_rate_windows: Some(vec![ExtraWindow {
+                    id: Some("gemini-2.5-flash-lite".into()),
+                    title: Some("gemini-2.5-flash-lite".into()),
+                    window: Some(window(20.0)),
+                }]),
+                ..Usage::default()
+            },
+        )];
+        let before = serde_json::to_string(&entries).unwrap();
+
+        bound_wire_strings(&mut entries);
+
+        assert_eq!(serde_json::to_string(&entries).unwrap(), before);
     }
 
     /// A filled slot after an empty one must still be reached.

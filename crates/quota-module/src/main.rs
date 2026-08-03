@@ -490,8 +490,31 @@ async fn handle_usage_request(
     }
 
     let usage = registry.get_usage(request.params.provider.as_deref()).await;
-    let body = serde_json::to_vec(&json!({ "result": usage })).map_err(ModuleError::Json)?;
-    let response = Frame::build_with_version(
+
+    // A reply that cannot be built must still be a reply. Both steps below can
+    // fail on data rather than on programmer error -- the body is assembled from
+    // upstream-derived strings, and the frame layer caps a body at 64 MiB -- and
+    // returning the error here would leave the consumer with no response frame
+    // at all, since the caller discards it to keep the loop alive. It would then
+    // wait out its own timeout with nothing saying why, which is the one
+    // outcome this surface promises cannot happen: every poll either answers or
+    // names its failure.
+    let body = match serde_json::to_vec(&json!({ "result": usage })) {
+        Ok(body) => body,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "internal_error",
+                &format!("usage response could not be serialized: {error}"),
+            )
+            .await;
+        }
+    };
+    let response = match Frame::build_with_version(
         ver,
         FrameType::Response,
         Flags::new(false, Priority::Interactive, false),
@@ -499,8 +522,21 @@ async fn handle_usage_request(
         epoch,
         corr,
         body,
-    )
-    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "internal_error",
+                &format!("usage response could not be framed: {error}"),
+            )
+            .await;
+        }
+    };
     send(writer, response).await
 }
 
@@ -755,6 +791,65 @@ mod tests {
             "ck-quota-config-{label}-{}-{id}.jsonc",
             std::process::id()
         ))
+    }
+
+    /// Every path out of the usage handler sends the consumer a frame.
+    ///
+    /// The frame loop discards this handler's error to stay alive, so a path
+    /// that returns without writing leaves the consumer with no response at
+    /// all -- waiting out its own timeout with nothing saying why. This surface
+    /// promises every poll either answers or names its failure, and silence is
+    /// neither.
+    ///
+    /// The two request-shaped failures are driven here. The two build failures
+    /// (serialization and framing) are backstops: serialization of these types
+    /// cannot fail, and framing fails only on a body past the protocol's 64 MiB
+    /// cap, so neither is reachable from a unit test. They send an error frame
+    /// rather than returning for the same reason these do.
+    #[tokio::test]
+    async fn every_exit_from_the_usage_handler_answers_the_consumer() {
+        for (label, body) in [
+            ("undecodable body", b"not json at all".to_vec()),
+            (
+                "unknown method",
+                serde_json::to_vec(&serde_json::json!({
+                    "method": "usage.nope",
+                    "params": {}
+                }))
+                .unwrap(),
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Frame>(4);
+            let frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                9,
+                3,
+                77,
+                body,
+            )
+            .unwrap();
+
+            let registry = Arc::new(quota_core::Registry::new(Vec::new()));
+            let _ = handle_usage_request(frame, &tx, &registry).await;
+
+            let reply = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{label}: the consumer received nothing"));
+            assert_eq!(reply.header.ty, FrameType::Error, "{label}");
+            // The route identity must be echoed or the daemon drops the frame,
+            // leaving the consumer no better off than with silence.
+            assert_eq!(reply.header.channel, 9, "{label}");
+            assert_eq!(reply.header.epoch, 3, "{label}");
+            assert_eq!(reply.header.corr, 77, "{label}");
+
+            // Not vacuous: the failure is named, so this cannot pass on an
+            // empty error body.
+            let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert!(!error.code.is_empty(), "{label}");
+            assert!(!error.message.is_empty(), "{label}");
+        }
     }
 
     #[test]

@@ -526,6 +526,10 @@ impl Registry {
         // twenty-odd sites that compute a percent: a single missed guard there
         // would publish a null that costs every consumer the whole response.
         model::drop_uncomputable_windows(&mut out);
+        // Same reasoning for length: an upstream-derived string long enough to
+        // push the reply past the frame limit costs every provider's usage, not
+        // just its own field.
+        model::bound_wire_strings(&mut out);
         out
     }
 
