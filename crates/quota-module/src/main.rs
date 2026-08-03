@@ -322,8 +322,30 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
 ) -> Result<(), ModuleError> {
-    let request =
-        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
+    // A body this module cannot decode is answered, not escalated. Returning an
+    // error here propagates to the frame loop, which treats it as fatal and ends
+    // the connection -- so one unrecognised control body would take the module
+    // down, losing every provider's usage until the supervisor restarts it.
+    //
+    // This is reachable without anything being broken: the daemon may add a
+    // control op, or a field to an existing one, and a module built against the
+    // older definition cannot decode it. The daemon handles an error reply
+    // gracefully -- it releases the route reservation and relays the message to
+    // the consumer -- so answering leaves the module serving while the mismatch
+    // is visible in the reply.
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => {
+            return send_control_error(
+                writer,
+                frame.header.ver,
+                frame.header.corr,
+                "invalid_control_body",
+                &format!("control body not decodable: {error}"),
+            )
+            .await;
+        }
+    };
     let response_body = match request {
         ModuleControlRequest::RouteBind { .. } => {
             // Machine-global surface: accept every bind. We key on no identity,
@@ -351,6 +373,28 @@ async fn handle_control_request(
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, response).await
+}
+
+/// Reply to a channel-0 control request with a canonical subc error.
+///
+/// `code` uses the daemon's own control vocabulary so the message is legible to
+/// it and to whatever consumer the failure is relayed to.
+async fn send_control_error(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    corr: u64,
+    code: &str,
+    message: &str,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+    .map_err(ModuleError::Json)?;
+    // Channel-0 control reply: channel and epoch are always 0.
+    let frame = Frame::build_with_version(ver, FrameType::Error, control_flags(), 0, 0, corr, body)
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
 }
 
 /// The git commit this binary was built from, stamped by `build.rs`. Falls back
@@ -848,6 +892,65 @@ mod tests {
             // empty error body.
             let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
             assert!(!error.code.is_empty(), "{label}");
+            assert!(!error.message.is_empty(), "{label}");
+        }
+    }
+
+    /// A control body this module cannot decode is answered, not escalated.
+    ///
+    /// An error returned from the control handler reaches the frame loop, which
+    /// treats it as fatal and ends the connection -- so one unrecognised body
+    /// would take the module down and lose every provider's usage until the
+    /// supervisor restarts it.
+    ///
+    /// This is reachable without anything being broken: the daemon may add a
+    /// control op, or a field to an existing one, and a module built against the
+    /// older definition cannot decode it. The daemon handles an error reply
+    /// gracefully, so answering keeps the module serving while the mismatch
+    /// stays visible.
+    #[tokio::test]
+    async fn an_undecodable_control_body_is_answered_rather_than_fatal() {
+        for (label, body) in [
+            ("not json", b"{{{".to_vec()),
+            (
+                "unknown op from a newer daemon",
+                serde_json::to_vec(&serde_json::json!({ "op": "route.rebind" })).unwrap(),
+            ),
+            (
+                "known op missing a required field",
+                serde_json::to_vec(&serde_json::json!({ "op": "route.bind" })).unwrap(),
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Frame>(4);
+            let frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                51,
+                body,
+            )
+            .unwrap();
+
+            let registry = Arc::new(quota_core::Registry::new(Vec::new()));
+            let result = handle_control_request(frame, &tx, &registry).await;
+
+            // The handler must not signal failure upward: that is what the frame
+            // loop treats as fatal.
+            assert!(result.is_ok(), "{label}: escalated to the frame loop");
+
+            let reply = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{label}: the daemon received nothing"));
+            assert_eq!(reply.header.ty, FrameType::Error, "{label}");
+            assert_eq!(reply.header.channel, 0, "{label}");
+            assert_eq!(reply.header.corr, 51, "{label}");
+
+            // Not vacuous: the reply names the failure in the daemon's own
+            // vocabulary, so this cannot pass on an empty error.
+            let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(error.code, "invalid_control_body", "{label}");
             assert!(!error.message.is_empty(), "{label}");
         }
     }
