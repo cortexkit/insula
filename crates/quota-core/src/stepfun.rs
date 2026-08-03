@@ -125,27 +125,43 @@ struct CreditBucket {
 }
 
 impl RateLimitResponse {
-    /// A positive `plan_family` explicitly selects family 2; when it is absent
-    /// (or non-positive), the legacy zero-rate/no-reset heuristic identifies credit plans.
+    /// Whether this account is metered by a credit pool rather than by rolling
+    /// windows.
+    ///
+    /// Two billing models run side by side: one meters rolling five-hour and
+    /// weekly windows, the other a credit pool whose rate fields come back as
+    /// zero with a reset time of `0` -- meaning "no window configured", not
+    /// "fully consumed".
+    ///
+    /// Classified by the shape the payload carries, with `plan_family` only
+    /// breaking a tie. A live window -- one stating a real reset time -- is
+    /// decisive on its own, because the two mistakes are not equally cheap: a
+    /// windowed account read as credit-metered loses the windows it is actually
+    /// paced by, and they vanish from the wire entirely. The reverse mistake
+    /// requires the upstream to state a live reset, in which case publishing
+    /// that window is right regardless of how the plan is labelled.
+    ///
+    /// That ordering also means a future change to the family numbering cannot
+    /// silently move a windowed account onto the credit reading.
     fn is_credit_plan(&self) -> bool {
-        if let Some(family) = self.plan_family {
-            if family.is_finite() && family > 0.0 {
-                return family == 2.0;
-            }
-        }
-
-        let Some(credit) = self.plan_credit_rate_limit.as_ref() else {
-            return false;
-        };
-        if credit.subscription_credit_left_rate.unwrap_or(0.0) <= 0.0 {
+        let has_live_window = self.five_hour_usage_reset_time.unwrap_or(0) > 0
+            || self.weekly_usage_reset_time.unwrap_or(0) > 0;
+        if has_live_window {
             return false;
         }
 
-        let five_hour_zero = self.five_hour_usage_left_rate.unwrap_or(1.0) == 0.0;
-        let weekly_zero = self.weekly_usage_left_rate.unwrap_or(1.0) == 0.0;
-        let five_hour_no_reset = self.five_hour_usage_reset_time.unwrap_or(0) == 0;
-        let weekly_no_reset = self.weekly_usage_reset_time.unwrap_or(0) == 0;
-        (five_hour_zero && five_hour_no_reset) || (weekly_zero && weekly_no_reset)
+        let has_credit_pool = self.plan_credit_rate_limit.as_ref().is_some_and(|credit| {
+            credit.subscription_credit_left_rate.is_some()
+                || credit.topup_credit_left_rate.is_some()
+        });
+        if has_credit_pool {
+            return true;
+        }
+
+        // Neither a live window nor a credit pool: nothing in the payload
+        // decides, so fall back to the plan's own label.
+        self.plan_family
+            .is_some_and(|family| family.is_finite() && family == 2.0)
     }
 }
 
@@ -545,8 +561,15 @@ mod tests {
         assert!((usage.secondary.unwrap().used_percent - 40.0).abs() < 1e-9);
     }
 
+    /// A credit pool is read as one even when the plan is labelled otherwise.
+    ///
+    /// The payload here states no live window and a real credit balance, so the
+    /// only quota it describes is the pool. Deferring to the `plan_family`
+    /// label would publish nothing at all for an account that has a stated
+    /// balance, and an account with no windows on the wire is indistinguishable
+    /// from one nobody configured.
     #[test]
-    fn non_credit_plan_does_not_emit_credit_window() {
+    fn a_credit_pool_is_published_even_when_the_plan_is_labelled_windowed() {
         let body = br#"{
             "status": 1,
             "five_hour_usage_left_rate": 0,
@@ -560,8 +583,66 @@ mod tests {
             }
         }"#;
         let usage = normalize_usage(body).unwrap();
-        assert!(usage.primary.is_none());
+        assert_eq!(usage.primary.unwrap().used_percent, 50.0);
         assert!(usage.secondary.is_none());
+    }
+
+    /// With neither a live window nor a credit pool, nothing in the payload
+    /// decides, and the plan's own label is the only evidence left.
+    #[test]
+    fn the_plan_label_decides_only_when_the_payload_states_neither() {
+        let windowed = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0,
+            "plan_family": 1
+        }"#;
+        let usage = normalize_usage(windowed).unwrap();
+        assert!(usage.primary.is_none(), "no window is configured yet");
+        assert!(usage.secondary.is_none());
+
+        let credit = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0,
+            "weekly_usage_left_rate": 0,
+            "five_hour_usage_reset_time": 0,
+            "weekly_usage_reset_time": 0,
+            "plan_family": 2
+        }"#;
+        let usage = normalize_usage(credit).unwrap();
+        assert!(usage.primary.is_none(), "no credit pool is stated yet");
+        assert!(usage.secondary.is_none());
+    }
+
+    /// A live window decides on its own, whatever the plan is labelled.
+    ///
+    /// This is the shape the two orderings disagree on. Trusting the label
+    /// first would discard rolling windows the upstream says are live, and
+    /// those are what the account is actually paced by.
+    #[test]
+    fn a_live_window_is_published_even_when_the_plan_is_labelled_credit() {
+        let body = br#"{
+            "status": 1,
+            "five_hour_usage_left_rate": 0.8,
+            "weekly_usage_left_rate": 0.6,
+            "five_hour_usage_reset_time": 1782135879,
+            "weekly_usage_reset_time": 1782740679,
+            "plan_family": 2,
+            "plan_credit_rate_limit": {
+                "subscription_credit_left_rate": 0.5,
+                "subscription_credit_reset_time": 1782135879
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+
+        let primary = usage.primary.expect("the live five-hour window");
+        assert!((primary.used_percent - 20.0).abs() < 1e-9);
+        assert_eq!(primary.window_minutes, Some(300));
+        let secondary = usage.secondary.expect("the live weekly window");
+        assert!((secondary.used_percent - 40.0).abs() < 1e-9);
+        assert_eq!(secondary.window_minutes, Some(10080));
     }
 
     #[test]

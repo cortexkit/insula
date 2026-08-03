@@ -27,10 +27,10 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.46.0** (35 providers registered; verified
-2026-07-28). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.47.0** (35 providers registered; verified
+2026-08-05). CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.46.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.47.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
 providers (deferred to the Balance axis). When a diff touches a provider we serve,
@@ -65,6 +65,27 @@ Code-7d subscription windows), zai (optional `msg` for CN + team scope), minimax
 **Wayfinder**, **ClawRouter**, **KimiK2** (dollar-budget/prepaid credits, no rate
 window). Qoder's CN
 endpoint (`qoder.com.cn`) is deferred — unverifiable without a CN session.
+
+At v0.47.0 two window mappings were ported. **zai**: a `TIME_LIMIT` entry states
+its own window in the same `unit`/`number` pair token limits use, which we were
+discarding — with one exception, `unit: minutes, number: 1`, which is a marker
+rather than a duration (payloads carrying it pair it with a reset weeks away).
+The upstream substitutes a thirty-day constant where nothing is stated; we emit
+nothing, because a fabricated cadence is worse than an absent one. **stepfun**:
+plan classification now reads the payload's shape before its `plan_family`
+label — a live rolling window means windowed, a credit pool with no window means
+credit-metered, and the label breaks ties only when neither is present. The
+label-first order discarded live windows on an account labelled credit-metered,
+and published nothing at all for a credit pool on an account labelled windowed.
+
+Declined at v0.47.0, with reasons: **xAI** and **Notion** are new providers whose
+windows are dollar balances and workspace credit pools (Balance axis); Notion is
+also browser-cookie-only. Doubao gained a second endpoint (`GetAFPUsage`) whose
+windows are additive to the `GetCodingPlanUsage` ones we already serve — real,
+but unverifiable from this host, which has no Doubao credential. The Claude
+changes are OAuth refresh coordination and probe plumbing, with no window-mapping
+change; Alibaba's are credential scoping; the ~100 remaining descriptor edits are
+a mechanical refactor of two to four lines each.
 
 ---
 

@@ -135,6 +135,29 @@ fn get_window_minutes(unit: i64, number: i64) -> Option<i64> {
     }
 }
 
+/// The window length of a `TIME_LIMIT` entry, where the upstream states one.
+///
+/// These entries carry the same `unit`/`number` pair as token limits, so a
+/// stated duration is read the same way. Two cases are refused:
+///
+/// A `number` of one minute is a marker rather than a duration. Payloads
+/// carrying it pair it with a reset weeks out, which no one-minute window could
+/// have -- so reading it literally would publish a cadence contradicted by the
+/// reset beside it, and would disable the reset check that uses the length as
+/// its ceiling.
+///
+/// An unstated duration yields nothing. The upstream reference substitutes a
+/// thirty-day constant here; that is a guess about the account's plan, and a
+/// fabricated cadence is worse than an absent one -- absent is a state
+/// consumers already handle, whereas a wrong one is acted on.
+fn time_limit_window_minutes(unit: i64, number: i64) -> Option<i64> {
+    const UNIT_MINUTES: i64 = 5;
+    if unit == UNIT_MINUTES && number == 1 {
+        return None;
+    }
+    get_window_minutes(unit, number)
+}
+
 /// Normalize the quota limit response body to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: ZaiQuotaLimitResponse = serde_json::from_slice(body)
@@ -177,7 +200,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         let window_minutes = if limit.limit_type == "TOKENS_LIMIT" {
             get_window_minutes(limit.unit, limit.number)
         } else {
-            None
+            time_limit_window_minutes(limit.unit, limit.number)
         };
         let valid = ValidLimit {
             used_percent,
@@ -426,7 +449,11 @@ mod tests {
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 10.0);
-        assert_eq!(secondary.window_minutes, None); // TIME_LIMIT has no window_minutes
+        // Derived from the entry's own `unit: 1` (days) and `number: 30`, not
+        // assumed. It coincides with the thirty-day constant the upstream
+        // reference substitutes when nothing is stated, which is why the
+        // marker case below is asserted separately.
+        assert_eq!(secondary.window_minutes, Some(43_200));
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
 
         assert!(usage.tertiary.is_none());
@@ -482,6 +509,9 @@ mod tests {
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 14.7);
+        // This entry's `unit: 5` (minutes) with `number: 1` is a marker, not a
+        // one-minute window -- its own reset is weeks out. See
+        // `a_time_limit_publishes_a_stated_window_and_refuses_a_marker`.
         assert_eq!(secondary.window_minutes, None);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-22T07:45:44Z"));
 
@@ -675,5 +705,63 @@ mod tests {
         // this cannot pass by flattening every percentage to a constant.
         let ordinary = normalize_usage(&payload("45")).unwrap().primary.unwrap();
         assert_eq!(ordinary.used_percent, 45.0);
+    }
+
+    /// A `TIME_LIMIT` publishes the window the upstream states, and nothing
+    /// where it states none.
+    ///
+    /// These entries carry the same `unit`/`number` pair as token limits, so a
+    /// stated duration was being discarded: consumers saw no cadence for a
+    /// window that has one, and the reset check that uses the length as its
+    /// ceiling had nothing to check against.
+    ///
+    /// The marker case is the reason this is not a one-line change. `unit: 5`
+    /// (minutes) with `number: 1` reads literally as a one-minute window, and
+    /// the payloads carrying it pair it with a reset weeks away -- so
+    /// publishing it would state a cadence its own reset contradicts.
+    #[test]
+    fn a_time_limit_publishes_a_stated_window_and_refuses_a_marker() {
+        // (unit, number, expected window minutes)
+        for (unit, number, expected) in [
+            (1, 30, Some(43_200)), // 30 days, stated plainly
+            (3, 5, Some(300)),     // 5 hours
+            (6, 1, Some(10_080)),  // 1 week
+            (5, 30, Some(30)),     // 30 minutes is a duration, not a marker
+            (5, 1, None),          // the marker
+            (9, 1, None),          // a unit this parser does not know
+            (1, 0, None),          // no duration stated
+        ] {
+            let body = format!(
+                r#"{{
+                  "code": 200,
+                  "success": true,
+                  "data": {{
+                    "limits": [
+                      {{
+                        "type": "TIME_LIMIT",
+                        "unit": {unit},
+                        "number": {number},
+                        "percentage": 14,
+                        "nextResetTime": 1784706344993
+                      }}
+                    ]
+                  }}
+                }}"#
+            )
+            .into_bytes();
+
+            let usage = normalize_usage(&body).expect("the payload parses");
+            let window = usage
+                .primary
+                .expect("the percent is load-bearing and must still be published");
+
+            assert_eq!(
+                window.window_minutes, expected,
+                "unit {unit} number {number}"
+            );
+            // Not vacuous: refusing the length must not cost the window.
+            assert_eq!(window.used_percent, 14.0);
+            assert!(window.resets_at.is_some());
+        }
     }
 }
