@@ -152,11 +152,20 @@ pub fn bound_wire_strings(entries: &mut [ProviderUsage]) {
                     bound(&mut extra.title);
                 }
             }
+            // Reset timestamps are not all locally formatted. Most providers
+            // build one from an epoch, but around a dozen carry the upstream's
+            // own string through -- a provider that reports a reset as text
+            // rather than a number has nothing between its response and this
+            // field.
+            for window in windows_mut(usage) {
+                bound(&mut window.resets_at);
+            }
         }
-        // `provider` and `api_provider` are this module's own names, and
-        // `fetched_at` and the reset timestamps are formatted here, so none of
-        // them can carry an upstream's length. `error` is bounded already, at
-        // the single point where a failure becomes wire text.
+        // `provider` and `api_provider` are this module's own names and
+        // `fetched_at` is formatted here, so neither can carry an upstream's
+        // length. `savedResets` timestamps are formatted from parsed values
+        // too. `error` is bounded already, at the single point where a failure
+        // becomes wire text.
     }
 }
 
@@ -372,6 +381,65 @@ mod tests {
 
     /// Ordinary values pass through byte-identical, so the bound cannot pass by
     /// rewriting everything it touches.
+    /// A reset timestamp is bounded like any other upstream string.
+    ///
+    /// Most providers build this field from an epoch number, so it cannot carry
+    /// an upstream's length -- but around a dozen pass the upstream's own text
+    /// through, and for those there is nothing between the response and the
+    /// wire. The longest real one observed is 32 bytes.
+    #[test]
+    fn an_oversized_reset_timestamp_is_cut_like_any_other_string() {
+        let huge = "9".repeat(4096);
+        let mut slot = window(10.0);
+        slot.resets_at = Some(huge.clone());
+        let mut extra_window = window(20.0);
+        extra_window.resets_at = Some(huge.clone());
+
+        let mut entries = vec![ProviderUsage::healthy(
+            "anthropic",
+            None,
+            "oauth",
+            Usage {
+                primary: Some(slot),
+                extra_rate_windows: Some(vec![ExtraWindow {
+                    id: Some("weekly".into()),
+                    title: None,
+                    window: Some(extra_window),
+                }]),
+                ..Usage::default()
+            },
+        )];
+
+        bound_wire_strings(&mut entries);
+
+        let usage = entries[0].usage.as_ref().unwrap();
+        for (label, window) in [
+            ("primary", usage.primary.as_ref().unwrap()),
+            (
+                "extra",
+                usage.extra_rate_windows.as_ref().unwrap()[0]
+                    .window
+                    .as_ref()
+                    .unwrap(),
+            ),
+        ] {
+            let reset = window.resets_at.as_deref().expect("the field survives");
+            assert!(
+                reset.len() <= MAX_WIRE_STRING_BYTES + 32,
+                "{label} reset published {} bytes",
+                reset.len()
+            );
+            // Not vacuous: the cut is announced, so a truncated timestamp
+            // cannot be mistaken for a complete one.
+            assert!(reset.contains("more bytes]"), "{label}: {reset}");
+            // And the rest of the window is untouched.
+            assert_eq!(
+                window.used_percent,
+                if label == "primary" { 10.0 } else { 20.0 }
+            );
+        }
+    }
+
     #[test]
     fn an_ordinary_string_is_published_unchanged() {
         let mut entries = vec![ProviderUsage::healthy(
