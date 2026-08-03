@@ -29,7 +29,10 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 **Current parity: CodexBar v0.47.0** (35 providers registered; verified
 2026-08-05). CodexBar is a moving upstream; parity is re-checked whenever it
-publishes a newer GitHub release. On a new release, diff `git -C ~/Work/OSS/CodexBar
+publishes a newer GitHub release. Read that release's content with `git show
+<tag>:<path>` or `git grep <tag>` — the checkout usually sits at an older tag, so
+plain `grep` silently reads a different version and reports a symbol added in the
+new release as absent. On a new release, diff `git -C ~/Work/OSS/CodexBar
 diff v0.47.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
