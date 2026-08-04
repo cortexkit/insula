@@ -105,6 +105,11 @@ cargo run -p quota-core --example wire-sanity
 
 # dump the live usage.get array as JSON, for eyeballing or diffing:
 cargo run -p quota-core --example accuracy-dump
+
+# check the health conservation identity across a real warm-up, when every
+# provider is changing bucket at once. Exits non-zero on an imbalance, and also
+# when the warm-up state never occurred and so was not observed:
+cargo run -p quota-core --example warmup-identity
 ```
 
 ## Install as a supervised subc module
