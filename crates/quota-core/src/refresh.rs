@@ -10,8 +10,29 @@ use crate::model::{AccountInfo, ProviderUsage, SavedResets};
 use crate::provider::{AccountObservation, CredentialResolution, FetchAttempt, FetchError};
 
 /// Nominal refresh cadence for a healthy fetch unit.
+///
+/// Nominal because it is a floor, not a period: a unit becomes due this long
+/// after its last completion, and is then admitted subject to the concurrency
+/// cap. Measured from the wire, every serving provider on this host refreshed
+/// every 60-65s, so the cap is not currently the binding constraint -- but with
+/// enough fetch units it would be, and the interval each unit actually gets
+/// would grow beyond this value.
+///
+/// See [`FRESH_HORIZON`] for the relationship that must hold between them.
 pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
 /// A served window is `fresh` while its last success is within this horizon.
+///
+/// **Must stay comfortably above [`BASE_INTERVAL`].** A healthy unit only
+/// refreshes every base interval, so a horizon at or below it would let every
+/// provider age out of `fresh` between its own successful fetches -- while
+/// serving current data, and with nothing failing. Two consequences follow, in
+/// opposite directions: the health metrics would report the whole registry as
+/// `stale`, and the banked-reset relaxation, which is gated on freshness, would
+/// stop applying for most of each cycle and publish the raw percent instead.
+///
+/// The present ratio is two to one, which absorbs a fetch taking most of an
+/// interval. Changing either constant means checking this relationship, not
+/// just the one being changed.
 pub const FRESH_HORIZON: Duration = Duration::from_secs(120);
 /// The refresher is considered stalled if its heartbeat is older than this.
 pub const STALL_HORIZON: Duration = Duration::from_secs(300);
@@ -439,6 +460,50 @@ mod tests {
         slot.last_success_at = Some(now);
         assert!(slot.is_fresh(now + Duration::from_secs(119)));
         assert!(!slot.is_fresh(now + Duration::from_secs(121)));
+    }
+
+    /// A healthy slot must still be `fresh` when its next refresh is due.
+    ///
+    /// The two constants are set independently but are coupled: a unit refreshes
+    /// every base interval, so if the freshness horizon were not comfortably
+    /// larger, a provider would age out of `fresh` between its own successful
+    /// fetches -- current data, nothing failing, and yet reported as stale.
+    ///
+    /// The consequences run in opposite directions, which is why this is
+    /// asserted rather than left to arithmetic. Health would report the whole
+    /// registry as `stale`, understating what is being served; and the
+    /// banked-reset relaxation, gated on freshness, would stop applying for most
+    /// of each cycle, publishing the raw percent where consumers expect the
+    /// effective one.
+    #[test]
+    fn a_healthy_slot_is_still_fresh_when_its_next_refresh_falls_due() {
+        let now = Instant::now();
+        let slot = ProviderSlot {
+            last_success_at: Some(now),
+            ..ProviderSlot::due_now(now, incarnation())
+        };
+
+        // At the moment the next fetch becomes due, the previous success has
+        // aged by exactly one base interval.
+        let due = now + BASE_INTERVAL;
+        assert!(
+            slot.is_fresh(due),
+            "a slot aged out of fresh before its own next refresh: horizon {:?} vs interval {:?}",
+            FRESH_HORIZON,
+            BASE_INTERVAL
+        );
+
+        // With margin for a fetch that itself takes most of an interval, since
+        // freshness is measured from the last success rather than from the
+        // attempt that is now running.
+        assert!(
+            slot.is_fresh(due + BASE_INTERVAL / 2),
+            "no margin for a slow fetch: horizon {FRESH_HORIZON:?} vs interval {BASE_INTERVAL:?}"
+        );
+
+        // Not vacuous: the horizon does expire, so this cannot pass by freshness
+        // being unbounded.
+        assert!(!slot.is_fresh(now + FRESH_HORIZON + Duration::from_secs(1)));
     }
 
     #[test]
