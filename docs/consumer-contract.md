@@ -32,6 +32,24 @@ normal rather than a symptom. A provider missing from one poll and present in
 the next has not necessarily changed state — it may simply have finished.
 **Nothing in the array is a delta.**
 
+### A partial array can look settled for seconds
+
+The array does not fill smoothly. Providers whose credential is simply absent
+fail in microseconds, so they arrive almost immediately; the ones that reach a
+network settle much later. Sampling a real start every 5ms, the array reached 31
+of 35 entries and **stayed there, unchanged, for about six seconds** before the
+last four arrived.
+
+Two polls seconds apart therefore return identical results while the sweep is
+still running, and a consumer treating stability as completeness would take that
+for a finished answer. The four stragglers were the providers holding live
+credentials — the slowest to arrive are the ones doing real network work, which
+is exactly the data worth waiting for.
+
+`pending` is the signal that resolves it: it held at 4 for the whole plateau and
+dropped to 0 as the last entries landed. Read it before concluding an array is
+complete, and never infer completeness from the count being stable across polls.
+
 ## An empty array is not "nothing configured"
 
 Degraded entries *are* entries, so a host with zero usable credentials returns a
@@ -39,7 +57,10 @@ Degraded entries *are* entries, so a host with zero usable credentials returns a
 much narrower things:
 
 - **cold** — the refresher has not published a first result yet, so slots exist
-  but hold no entry,
+  but hold no entry. On an unfiltered query this is briefer than it sounds:
+  measured on a real start, the array was empty for **8 milliseconds** before the
+  first credential-absent providers landed. Treat it as a real state to handle,
+  not one to design around,
 - **structural** — providers resolved no credential handles at all, so there are
   no slots, or
 - **withheld** — entries exist but every one is suppressed because its account
