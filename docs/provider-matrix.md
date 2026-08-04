@@ -41,6 +41,33 @@ confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
 `/api/oauth/usage`, not CodexBar's CLI/web fetcher) and that the field actually
 changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
 
+### Opaque constants, re-checked every round
+
+Four values are copied from the upstream rather than derived from anything we
+can compute. They carry no meaning we can validate, so a stale one is invisible
+here and surfaces only as a request the upstream rejects — which reads exactly
+like an outage, and the confusion is expensive: the provider looks broken
+upstream while the defect is a constant in this repo.
+
+They are also the part of a port most likely to be missed. A parity diff draws
+the eye to logic, and a rotated constant is a one-line change indistinguishable
+from formatting. Check every row against the new tag, not just the providers
+whose logic changed:
+
+| Constant | Where | What it is |
+|---|---|---|
+| `WORKSPACES_SERVER_ID` | `crates/quota-core/src/opencode.rs:36` | Hash naming the upstream server function that lists workspaces. Rotates when they rebundle. |
+| `SUBSCRIPTION_SERVER_ID` | `crates/quota-core/src/opencode.rs:38` | Same, for the subscription call. |
+| `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
+| `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
+
+All four matched CodexBar v0.47.0 and none changed in that release.
+
+A mismatch is not automatically a port: confirm the value changed **within** the
+diff range rather than always having differed, and that we call the same endpoint
+it belongs to. But an unchecked mismatch is the failure mode this table exists
+for.
+
 v0.45.2 → v0.46.0 carried one behaviour fix for a provider we serve: **zai** now
 clamps the percentage it reports directly, not just the one it computes. Our port
 had the same split — computed branch clamped, fallback branch verbatim — and it is
