@@ -39,6 +39,24 @@ pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
 /// `a_healthy_slot_stays_fresh_across_its_whole_refresh_cycle` asserts it.
 pub const FRESH_HORIZON: Duration = Duration::from_secs(120);
 /// The refresher is considered stalled if its heartbeat is older than this.
+///
+/// **Must exceed [`FETCH_DEADLINE`] + [`MAX_TICK_SLEEP`].** The heartbeat is
+/// stamped at the *start* of a turn, so a turn's own duration counts against
+/// this horizon: the loop stamps, runs its fetches (each bounded by the
+/// deadline), then sleeps at most the idle bound before stamping again. The
+/// widest gap a healthy loop can produce is therefore that sum.
+///
+/// A horizon below it reports a refresher that is working normally as stalled,
+/// and this is not a cosmetic metric: it drives the module's health status to
+/// `degraded`, which the supervising daemon acts on. The failure also runs the
+/// wrong way -- the slower the fetches, the more certainly a working module is
+/// declared unhealthy.
+///
+/// Today that is 300 against 35 + 5. The margin is deliberately wide because
+/// this is a liveness signal rather than a freshness one: it should fire when
+/// the loop has genuinely stopped, not when a turn ran slowly.
+/// `a_healthy_refresher_is_not_reported_stalled_between_its_own_turns` asserts
+/// the relationship.
 pub const STALL_HORIZON: Duration = Duration::from_secs(300);
 /// Fixed re-probe delay for a non-transient failure.
 pub const NON_TRANSIENT_BACKOFF: Duration = Duration::from_secs(300);
@@ -53,6 +71,10 @@ pub const CONCURRENCY_CAP: usize = 8;
 /// relationship described on [`FRESH_HORIZON`].
 pub const FETCH_DEADLINE: Duration = Duration::from_secs(35);
 /// Maximum idle sleep, which also bounds discovery of newly added handles.
+///
+/// With [`FETCH_DEADLINE`] it bounds the gap between heartbeats, so it is one of
+/// the three constants in the liveness relationship described on
+/// [`STALL_HORIZON`].
 pub const MAX_TICK_SLEEP: Duration = Duration::from_secs(5);
 
 /// A monotonically assigned lifetime for an active `(provider, handle)` key.
@@ -521,6 +543,33 @@ mod tests {
         // Not vacuous: the horizon does expire, so this cannot pass by freshness
         // being unbounded.
         assert!(!slot.is_fresh(now + FRESH_HORIZON + Duration::from_secs(1)));
+    }
+
+    /// A refresher doing its job must not be reported as stalled.
+    ///
+    /// The same shape as the freshness relationship above, on the liveness
+    /// signal. The heartbeat is stamped at the *start* of a turn, so the turn's
+    /// own duration counts against the stall horizon: stamp, run the fetches
+    /// (each bounded by [`FETCH_DEADLINE`]), sleep at most [`MAX_TICK_SLEEP`],
+    /// stamp again. The widest gap a healthy loop produces is that sum.
+    ///
+    /// If the horizon does not clear it, a working refresher reports `stalled`,
+    /// the module's health goes `degraded`, and the daemon acts on that. The
+    /// failure runs the wrong way too: the slower the fetches, the more surely a
+    /// working module is called unhealthy.
+    #[test]
+    fn a_healthy_refresher_is_not_reported_stalled_between_its_own_turns() {
+        let widest_healthy_gap = FETCH_DEADLINE + MAX_TICK_SLEEP;
+
+        assert!(
+            widest_healthy_gap < STALL_HORIZON,
+            "a healthy turn can outlast the stall horizon: deadline {FETCH_DEADLINE:?} \
+             + idle sleep {MAX_TICK_SLEEP:?} = {widest_healthy_gap:?}, horizon {STALL_HORIZON:?}"
+        );
+
+        // Not vacuous: the horizon is finite, so this cannot pass by the stall
+        // check being unreachable. A genuinely stopped loop still trips it.
+        assert!(STALL_HORIZON < Duration::from_secs(3600));
     }
 
     #[test]
