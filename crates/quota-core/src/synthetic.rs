@@ -107,38 +107,6 @@ const WINDOW_STRING_KEYS: &[&str] = &[
     "period_label",
 ];
 
-fn first_double(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<f64> {
-    for key in keys {
-        if let Some(val) = map.get(*key) {
-            if let Some(n) = val.as_f64() {
-                return Some(n);
-            }
-            if let Some(s) = val.as_str() {
-                if let Ok(n) = s.trim().parse::<f64>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn first_int(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<i64> {
-    for key in keys {
-        if let Some(val) = map.get(*key) {
-            if let Some(n) = val.as_i64() {
-                return Some(n);
-            }
-            if let Some(s) = val.as_str() {
-                if let Ok(n) = s.trim().parse::<i64>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn first_string(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(val) = map.get(*key) {
@@ -225,16 +193,16 @@ fn window_minutes(map: &serde_json::Map<String, serde_json::Value>) -> Option<i6
     // A length stated directly in minutes is checked too: it arrives as an
     // integer, so no cast is involved, but nothing stops the upstream sending a
     // negative or absurd one.
-    if let Some(minutes) = first_int(map, WINDOW_MINUTES_KEYS) {
+    if let Some(minutes) = crate::json_scan::first_i64(map, WINDOW_MINUTES_KEYS) {
         return crate::wire_sanity::plausible_window_length(minutes).then_some(minutes);
     }
-    if let Some(hours) = first_double(map, WINDOW_HOURS_KEYS) {
+    if let Some(hours) = crate::json_scan::first_finite_f64(map, WINDOW_HOURS_KEYS) {
         return minutes_from(hours * 60.0);
     }
-    if let Some(days) = first_double(map, WINDOW_DAYS_KEYS) {
+    if let Some(days) = crate::json_scan::first_finite_f64(map, WINDOW_DAYS_KEYS) {
         return minutes_from(days * 24.0 * 60.0);
     }
-    if let Some(seconds) = first_double(map, WINDOW_SECONDS_KEYS) {
+    if let Some(seconds) = crate::json_scan::first_finite_f64(map, WINDOW_SECONDS_KEYS) {
         return minutes_from(seconds / 60.0);
     }
     if let Some(text) = first_string(map, WINDOW_STRING_KEYS) {
@@ -295,12 +263,18 @@ fn is_quota_payload(map: &serde_json::Map<String, serde_json::Value>) -> bool {
         PERCENT_USED_KEYS,
         PERCENT_REMAINING_KEYS,
     ];
-    checks.iter().any(|keys| first_double(map, keys).is_some())
+    checks
+        .iter()
+        .any(|keys| crate::json_scan::first_finite_f64(map, keys).is_some())
 }
 
 fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateWindow> {
-    let percent_used = normalized_percent(first_double(map, PERCENT_USED_KEYS));
-    let percent_remaining = normalized_percent(first_double(map, PERCENT_REMAINING_KEYS));
+    let percent_used =
+        normalized_percent(crate::json_scan::first_finite_f64(map, PERCENT_USED_KEYS));
+    let percent_remaining = normalized_percent(crate::json_scan::first_finite_f64(
+        map,
+        PERCENT_REMAINING_KEYS,
+    ));
 
     let mut used_percent = percent_used;
     if used_percent.is_none() {
@@ -310,9 +284,9 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
     }
 
     if used_percent.is_none() {
-        let mut limit = first_double(map, LIMIT_KEYS);
-        let mut used = first_double(map, USED_KEYS);
-        let remaining = first_double(map, REMAINING_KEYS);
+        let mut limit = crate::json_scan::first_finite_f64(map, LIMIT_KEYS);
+        let mut used = crate::json_scan::first_finite_f64(map, USED_KEYS);
+        let remaining = crate::json_scan::first_finite_f64(map, REMAINING_KEYS);
 
         if limit.is_none() {
             if let (Some(u), Some(r)) = (used, remaining) {
@@ -726,6 +700,28 @@ mod tests {
             .expect("a labelled percent must produce a window")
             .used_percent;
         assert_eq!(scaled, 42.0, "a labelled 0..1 fraction is still scaled");
+    }
+
+    /// A garbage percent alias must not cost the account its window.
+    ///
+    /// These upstreams publish the same figure under several names, so the
+    /// percent is read by scanning a key list. Returning an unusable value
+    /// rather than skipping it ends the scan at the garbage alias, and that
+    /// value becomes the account's percent -- which is dropped before
+    /// publication, so the account reports no window at all while the upstream
+    /// did state a real figure under a later name.
+    #[test]
+    fn a_garbage_percent_alias_does_not_hide_a_real_one() {
+        // Both aliases sit in the same object the window is read from, which is
+        // where the scan runs.
+        let body = br#"{
+            "rollingFiveHourLimit": { "usedPercent": "NaN", "percent_used": 73.5 }
+        }"#;
+
+        let usage = normalize_usage(body).expect("the payload still parses");
+        let primary = usage.primary.expect("the account must still get a window");
+
+        assert_eq!(primary.used_percent, 73.5);
     }
 
     /// A window length that is not a duration is dropped rather than published.

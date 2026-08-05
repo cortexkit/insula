@@ -27,6 +27,7 @@ pub mod grok;
 pub mod health;
 pub mod http;
 pub mod jetbrains;
+mod json_scan;
 pub mod kilo;
 pub mod kimi;
 pub mod kimi_for_coding;

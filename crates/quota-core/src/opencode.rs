@@ -323,42 +323,6 @@ fn is_explicit_null(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn first_f64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
-    for key in keys {
-        if let Some(v) = map.get(*key) {
-            if let Some(n) = v.as_f64() {
-                return Some(n);
-            }
-            // A string body may parse to a non-finite float ("NaN"/"inf"); reject it
-            // so a garbage value never becomes a served percent.
-            if let Some(s) = v.as_str() {
-                if let Ok(n) = s.trim().parse::<f64>() {
-                    if n.is_finite() {
-                        return Some(n);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn first_i64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i64> {
-    for key in keys {
-        if let Some(v) = map.get(*key) {
-            if let Some(n) = v.as_i64() {
-                return Some(n);
-            }
-            if let Some(s) = v.as_str() {
-                if let Ok(n) = s.trim().parse::<i64>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn parse_date_value(val: &Value) -> Option<i64> {
     if let Some(n) = val.as_f64() {
         // A non-finite or absurd magnitude (e.g. "1e308") is not a real timestamp;
@@ -387,7 +351,7 @@ fn parse_date_value(val: &Value) -> Option<i64> {
 }
 
 fn reset_epoch_for_map(map: &serde_json::Map<String, Value>, now_secs: i64) -> Option<i64> {
-    if let Some(sec) = first_i64(map, RESET_IN_KEYS) {
+    if let Some(sec) = crate::json_scan::first_i64(map, RESET_IN_KEYS) {
         return Some(now_secs + sec.max(0));
     }
     for key in RESET_AT_KEYS {
@@ -407,12 +371,12 @@ fn percent_from_map(map: &serde_json::Map<String, Value>) -> Option<f64> {
     // otherwise a genuine sub-1% account (used=1, limit=100 -> 1.0) reads as a
     // false 100% exhausted. Track which path produced the value (CodexBar
     // v0.45.2 `percentIsDirect` gate).
-    let direct = first_f64(map, PERCENT_KEYS);
+    let direct = crate::json_scan::first_finite_f64(map, PERCENT_KEYS);
     let mut p = direct.or_else(|| {
         const USED: &[&str] = &["used", "usage", "consumed", "count", "usedTokens"];
         const LIMIT: &[&str] = &["limit", "total", "quota", "max", "cap", "tokenLimit"];
-        let used = first_f64(map, USED)?;
-        let limit = first_f64(map, LIMIT)?;
+        let used = crate::json_scan::first_finite_f64(map, USED)?;
+        let limit = crate::json_scan::first_finite_f64(map, LIMIT)?;
         if limit > 0.0 {
             Some((used / limit * 100.0).clamp(0.0, 100.0))
         } else {
