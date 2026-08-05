@@ -202,21 +202,41 @@ fn weekly_total(m: &ModelRemains) -> i64 {
     opt_int(&m.current_weekly_total_count).unwrap_or(0).max(0)
 }
 
-fn pick_representative(
+/// The window to publish for one cadence, chosen from the models the account
+/// reports.
+///
+/// The general bucket is preferred because it is the account-wide figure, but
+/// only when it actually yields a window: it can come back as a placeholder for
+/// a lane the plan does not include, and that placeholder produces no window at
+/// all. Selecting it and stopping would publish nothing while another model
+/// states a real figure -- and a provider with no window is indistinguishable
+/// from capacity nobody measured, whereas the account is genuinely being
+/// metered.
+///
+/// So the choice is made over models that *produce* a window rather than over
+/// the raw list: every candidate is tried in preference order and the first
+/// usable one wins. The ordering is otherwise unchanged -- general first, then
+/// the largest quota among models that declare one, then the largest of the
+/// rest.
+fn representative_window(
     models: &[ModelRemains],
     total_fn: fn(&ModelRemains) -> i64,
-) -> Option<&ModelRemains> {
+    build: impl Fn(&ModelRemains) -> Option<RateWindow>,
+) -> Option<RateWindow> {
+    let mut ranked: Vec<&ModelRemains> = Vec::with_capacity(models.len());
+
     if let Some(general) = models.iter().find(|m| is_general_model(m)) {
-        return Some(general);
+        ranked.push(general);
     }
 
-    let with_quota: Vec<_> = models.iter().filter(|m| total_fn(m) > 0).collect();
-    let pool: Vec<_> = if with_quota.is_empty() {
-        models.iter().collect()
-    } else {
-        with_quota
-    };
-    pool.into_iter().max_by_key(|m| total_fn(m))
+    let mut rest: Vec<&ModelRemains> = models.iter().filter(|m| !is_general_model(m)).collect();
+    // Largest declared quota first, matching the previous preference; models
+    // declaring none sort last rather than being dropped, so an account whose
+    // models all report zero still publishes a window.
+    rest.sort_by_key(|m| std::cmp::Reverse(total_fn(m)));
+    ranked.extend(rest);
+
+    ranked.into_iter().find_map(build)
 }
 
 fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
@@ -384,11 +404,13 @@ fn normalize_usage_at(body: &[u8], now_secs: i64) -> Result<Usage, FetchError> {
         .cloned()
         .collect();
 
-    let session_model = pick_representative(&text_models, interval_total);
-    let primary = session_model.and_then(|m| make_interval_window(m, now_secs));
+    let primary = representative_window(&text_models, interval_total, |m| {
+        make_interval_window(m, now_secs)
+    });
 
-    let weekly_model = pick_representative(&text_models, weekly_total);
-    let secondary = weekly_model.and_then(|m| make_weekly_window(m, now_secs));
+    let secondary = representative_window(&text_models, weekly_total, |m| {
+        make_weekly_window(m, now_secs)
+    });
 
     let tertiary = models
         .iter()
@@ -488,6 +510,87 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000;
+
+    /// A general bucket that yields no window must not hide a model that does.
+    ///
+    /// The general bucket is the account-wide figure and is preferred, but the
+    /// upstream returns it as a placeholder for a lane the plan does not
+    /// include -- status 3, zero counts, nothing consumed. That placeholder
+    /// produces no window, so selecting it and stopping publishes nothing while
+    /// another model states a real figure. A provider with no window reads as
+    /// capacity nobody measured, when the account is in fact being metered.
+    #[test]
+    fn a_general_placeholder_does_not_hide_a_model_with_a_real_window() {
+        let start = 1_700_000_000_000_i64;
+        let end = start + 5 * 60 * 60 * 1000;
+        let json = format!(
+            r#"{{
+              "base_resp": {{ "status_code": 0 }},
+              "model_remains": [
+                {{
+                  "model_name": "general",
+                  "current_interval_status": 3,
+                  "current_interval_total_count": 0,
+                  "current_interval_usage_count": 0,
+                  "current_interval_remaining_percent": 100.0
+                }},
+                {{
+                  "model_name": "MiniMax-M2.7",
+                  "current_interval_total_count": 1000,
+                  "current_interval_usage_count": 250,
+                  "start_time": {start},
+                  "end_time": {end},
+                  "remains_time": 240000
+                }}
+              ]
+            }}"#
+        );
+
+        let usage = normalize_usage_at(json.as_bytes(), NOW).unwrap();
+        let primary = usage
+            .primary
+            .expect("the account is metered, so a window must be published");
+        assert_eq!(primary.used_percent, 75.0);
+        assert_eq!(primary.window_minutes, Some(300));
+    }
+
+    /// The general bucket still wins when it does yield a window.
+    ///
+    /// Without this, the fix above would pass equally if the preference were
+    /// dropped altogether and the largest quota always chosen -- which would
+    /// publish a single model's usage as the account's.
+    #[test]
+    fn the_general_bucket_is_preferred_when_it_yields_a_window() {
+        let start = 1_700_000_000_000_i64;
+        let end = start + 5 * 60 * 60 * 1000;
+        let json = format!(
+            r#"{{
+              "base_resp": {{ "status_code": 0 }},
+              "model_remains": [
+                {{
+                  "model_name": "general",
+                  "current_interval_total_count": 100,
+                  "current_interval_usage_count": 90,
+                  "start_time": {start},
+                  "end_time": {end},
+                  "remains_time": 240000
+                }},
+                {{
+                  "model_name": "MiniMax-M2.7",
+                  "current_interval_total_count": 100000,
+                  "current_interval_usage_count": 50000,
+                  "start_time": {start},
+                  "end_time": {end},
+                  "remains_time": 240000
+                }}
+              ]
+            }}"#
+        );
+
+        let usage = normalize_usage_at(json.as_bytes(), NOW).unwrap();
+        // 10% used comes from the general bucket; the larger model would give 50%.
+        assert_eq!(usage.primary.unwrap().used_percent, 10.0);
+    }
 
     #[test]
     fn normalizes_coding_plan_remains_payload() {
