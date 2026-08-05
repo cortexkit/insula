@@ -174,7 +174,7 @@ Read an OAuth bearer from a local file (or opencode store) → one GET → decod
 |---|---|---|---|---|
 | **codex** ✅ | codex | `~/.codex/auth.json` (oauth access_token) | GET chatgpt.com/backend-api/wham/usage | 5h + weekly |
 | **claude** ✅ | claude | opencode `anthropic` / Keychain | GET api.anthropic.com/api/oauth/usage | 5h + weekly + sonnet/opus |
-| ~~antigravity~~ DEFERRED | antigravity | NO native headless creds source — see below | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model (resetTime) |
+| **antigravity** ⚠ built, local-probe only | antigravity | the RUNNING `agy` CLI or app language server, found via `ps` + `lsof` | POST loopback `/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` | per-model (resetTime) |
 | gemini | gemini | `~/.gemini/oauth_creds.json` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model 24h |
 Notes — the Google-OAuth sub-archetype (gemini/antigravity, cloudcode-pa quota):
 the fetch is a clean POST (loadCodeAssist→retrieveUserQuota, per-model windows),
@@ -187,15 +187,34 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   its public installed-app client (RFC 8252 native-app client — secret not
   confidential), cited to gemini-cli source. Refresh in-memory, cache in cache.rs,
   NEVER write back to oauth_creds.json (read-only consumer).
-- **antigravity = DEFERRED (report-don't-force, same as crof).** It has NO native
-  headless creds source: the token lives ONLY at `~/.codexbar/antigravity/
-  oauth_creds.json` — a CodexBar-CREATED path (CodexBar runs its own OAuth login
-  and writes there; no native antigravity token file to import,
-  AntigravityOAuthCredentialsStore.swift:242-251). The OAuth client is discoverable
-  ONLY from env vars or by parsing the installed `Antigravity.app/.../main.js`
-  bundle (macOS-desktop archaeology, AntigravityOAuthCredentialsStore.swift:155-196).
-  On a headless machine that never ran CodexBar, antigravity has no usable origin.
-  Revisit only if a native antigravity token path appears.
+- **antigravity = BUILT, but on the local probe rather than this endpoint.**
+  The shipped adapter does not use the Google API row above. It finds a running
+  `agy` CLI or app language server with `ps`, discovers its loopback port with
+  `lsof`, and asks that process. The row is kept because the remote endpoint
+  remains the headless option if one is ever built.
+
+  **Consequence, and it is not obvious from the code:** antigravity reports
+  usage only while that process happens to be running, and reports
+  `credential_absent` otherwise. Nothing in this repository starts it. On a
+  desktop the process usually exists because something else started it —
+  CodexBar spawns and supervises its own `agy` instance, with an ownership
+  record at `~/.codexbar/antigravity/agy-session.json` — so antigravity's
+  quota can appear and disappear with an unrelated application's lifecycle,
+  and the disappearance looks identical to a credential that was never
+  configured.
+
+  A headless path exists upstream and is not ported: CodexBar v0.47.0 offers
+  three sources (`auto`, `cli`, `oauth`), where `oauth` fetches from
+  cloudcode-pa.googleapis.com with no local process. Its blocker is the
+  credential, not the request: the token lives only at
+  `~/.codexbar/antigravity/oauth_creds.json`, a path CodexBar itself creates by
+  running its own OAuth login (there is no native antigravity token file to
+  import — AntigravityOAuthCredentialsStore.swift:242-251), and the OAuth
+  client is discoverable only from env vars or by parsing the installed
+  `Antigravity.app/.../main.js` bundle (AntigravityOAuthCredentialsStore.swift:155-196).
+  The remote path also distinguishes itself from gemini on the shared endpoint
+  by `ideType: ANTIGRAVITY` with `pluginType: GEMINI` and a User-Agent of
+  `antigravity`, so the two are not interchangeable despite the shared URL.
 
 ### Group 2 — api-key-env, bearer, HAS WINDOW
 Simplest HTTP archetype: API key from env (or opencode store) → GET → decode window.
