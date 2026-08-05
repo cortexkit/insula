@@ -330,6 +330,58 @@ grants. `availableCount` is how many are held, `soonestExpiresAt` when the next
 one lapses, and `credits` lists each with its own `expiresAt`. They are granted
 to **one account**, never to a provider — see the field-scope table below.
 
+## Which field to key on
+
+Two fields name the provider and they are **different namespaces**:
+
+- `provider` is this module's own name for the upstream, inherited from the
+  reference implementation the adapters were ported from.
+- `apiProvider` is the canonical slug, and is present only where a canonical
+  counterpart exists — it is `null` for roughly a third of entries.
+
+Decide which namespace your lookup key is in and key on that field. A key from
+one namespace matched against the other does not fail loudly; it simply matches
+nothing, and an entry that never matches is indistinguishable from a provider
+that published no signal.
+
+**A wrong guess can land on a real entry rather than on nothing**, which is the
+case worth guarding against, because it produces a confident wrong answer. Two
+entries here carry names close enough to be mapped into each other by hand:
+
+| `provider` | `apiProvider` | what it is |
+|---|---|---|
+| `alibaba` | `alibaba-coding-plan` | the coding-plan subscription |
+| `qwen-cloud` | `alibaba-token-plan` | the token-plan console |
+
+They are separate upstreams with separate credentials, and on a host holding one
+and not the other, a lookup landing on the wrong one reads as a permanently
+degraded provider — a steady "no signal" for a provider that is in fact serving
+full windows under the other name. Prefer the published `apiProvider` over any
+local table: a hand-rolled map is a copy of this one that nothing keeps in step.
+
+## Sizing a staleness threshold
+
+A threshold below the refresh cadence reports a healthy provider as stale for
+most of every cycle, and does it to **every** provider at once, so it looks like
+a producer-wide outage rather than a threshold that is too tight.
+
+A slot is refetched every 60 seconds after its last success, and a fetch may run
+up to 35 seconds before it is abandoned. So the oldest a `fetchedAt` gets while
+everything is working is those two added together, and a threshold has to clear
+the sum, not the interval alone.
+
+Measured on a healthy host, sampling the deployed module: entry ages span 1–62
+seconds and average 32. A consumer calling anything older than 30 seconds stale
+sees a live signal on **45%** of reads; at 60 seconds, 97%; at 90 seconds and
+beyond, 100%. Under 120 seconds — the same figure this module uses internally,
+for this reason — a healthy provider never reads stale.
+
+This is a floor rather than a period: it is time since the last *success*, so a
+provider retrying through failures legitimately ages past it. That is the
+signal working, not the threshold being wrong, and
+[the freshness section](#freshness-comes-from-the-producer-never-from-the-poll)
+covers what to do with it.
+
 ## Verdict versus unfinished
 
 A degraded entry is a **verdict**: this module concluded the credential or
