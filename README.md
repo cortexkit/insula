@@ -110,6 +110,11 @@ cargo run -p quota-core --example accuracy-dump
 # provider is changing bucket at once. Exits non-zero on an imbalance, and also
 # when the warm-up state never occurred and so was not observed:
 cargo run -p quota-core --example warmup-identity
+
+# measure how long a full refresh sweep takes, and how much headroom the
+# per-turn admission cap leaves before the refresh interval degrades. Run it
+# when the provider set grows:
+cargo run -p quota-core --example sweep-probe
 ```
 
 ## Install as a supervised subc module

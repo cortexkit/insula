@@ -63,6 +63,28 @@ pub const NON_TRANSIENT_BACKOFF: Duration = Duration::from_secs(300);
 /// Ceiling on the exponential transient backoff.
 pub const MAX_TRANSIENT_BACKOFF: Duration = Duration::from_secs(900);
 /// Maximum fetch units admitted in one bounded scheduler turn.
+///
+/// A turn drains every unit it admitted before the next one starts, so a turn
+/// costs its *slowest* unit and a full sweep of `n` units takes `ceil(n / cap)`
+/// turns. That makes this constant the one that decides how long a whole fleet
+/// takes to refresh, and the interval on [`BASE_INTERVAL`] is a floor: if a
+/// sweep takes longer than the interval, the achieved period is the sweep time.
+///
+/// Measured on a 35-provider registry from a cold start, where every unit is due
+/// at once: a full sweep completes in 9.5-10.6s, about 2s per turn. Successful
+/// fetches would have to average roughly 24s per turn before a sweep exceeded
+/// [`FRESH_HORIZON`], or the fleet would have to reach several hundred units at
+/// today's latency. Both are far away, so raising this is not currently
+/// warranted -- but the fleet has grown from 19 providers to 35, and this is the
+/// constant to revisit when it grows again.
+///
+/// **Deliberately not asserted as an invariant.** The only constant bound on a
+/// turn is [`FETCH_DEADLINE`], and `ceil(35 / 8) * 35s` already exceeds the
+/// freshness horizon -- yet that costs nothing, because a unit that runs to its
+/// deadline has failed, and a failing slot is *legitimately* stale rather than
+/// wrongly reported so. An assertion over the constants would therefore fire on
+/// a condition that is not a defect, which is worse than no assertion: it would
+/// be tuned into silence and take the real check with it. Re-measure instead.
 pub const CONCURRENCY_CAP: usize = 8;
 /// Hard deadline around a whole handle fetch.
 ///
