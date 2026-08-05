@@ -139,6 +139,31 @@ impl HttpResponse {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// The body, refusing a success response that carries nothing.
+    ///
+    /// Call this instead of reading [`Self::body`] directly wherever the body is
+    /// about to be parsed. An empty body reaches a normalizer as unparseable and
+    /// becomes [`FetchError::Decode`], which is non-transient -- so a flapping
+    /// edge that answers `200` with nothing would replace a healthy cached
+    /// window with a degraded entry, and the provider reads as dead rather than
+    /// briefly unreachable. Reported as [`FetchError::Upstream`] instead, which
+    /// keeps serving the last good window.
+    ///
+    /// [`JsonRequest::send`] applies this rule already. It cannot be applied
+    /// inside [`JsonRequest::send_raw`], because that exists for callers whose
+    /// status and body policy is their own -- one of them reads rate-limit
+    /// headers off a `429` and never looks at the body, and would break if an
+    /// empty one were refused. Hence a helper the body-reading callers opt into.
+    pub fn body_for_parsing(&self) -> Result<&[u8], FetchError> {
+        if (200..300).contains(&self.status) && self.body.is_empty() {
+            return Err(FetchError::Upstream(format!(
+                "HTTP {}: empty response body",
+                self.status
+            )));
+        }
+        Ok(&self.body)
+    }
 }
 
 impl Header {
@@ -245,24 +270,9 @@ impl JsonRequest {
     /// - transport/timeout → [`FetchError::Upstream`]
     /// - 2xx with an empty body → [`FetchError::Upstream`] (see below)
     pub async fn send(self, client: &reqwest::Client) -> Result<Vec<u8>, FetchError> {
-        let body = self.send_full(client).await?.body;
-        // A 2xx that carries nothing is a transport or edge condition, not an
-        // answer: an edge that drops the payload, a proxy that closes early, a
-        // gateway that acknowledges without serving. Every normalizer downstream
-        // would fail to parse it and report `Decode`, which is non-transient and
-        // therefore REPLACES the last healthy window with a degraded entry — so a
-        // provider that is merely flapping reads as dead for as long as the flap
-        // lasts. Classifying it here keeps the whole class right for every caller
-        // rather than one provider at a time.
-        //
-        // Callers that legitimately expect an empty 2xx must not use this method:
-        // `send_raw` returns the body verbatim with no classification.
-        if body.is_empty() {
-            return Err(FetchError::Upstream(
-                "empty response body on a success status".to_string(),
-            ));
-        }
-        Ok(body)
+        // The empty-body rule is applied by `send_full`, which every classifying
+        // helper routes through.
+        Ok(self.send_full(client).await?.body)
     }
 
     /// Like [`send`](Self::send) but also returns the response status + headers
@@ -283,6 +293,7 @@ impl JsonRequest {
                 raw.status
             )));
         }
+        raw.body_for_parsing()?;
         Ok(raw)
     }
 
@@ -324,11 +335,17 @@ impl JsonRequest {
             })
             .collect();
         let body = read_success_body(response).await?;
-        Ok(HttpResponse {
+        let response = HttpResponse {
             status,
             headers,
             body,
-        })
+        };
+        // Applied here as well as in `send_full`: this helper builds its own
+        // response rather than routing through that one, so a rule added there
+        // does not reach these callers. Every caller of this method parses the
+        // body, so none of them wants an empty one.
+        response.body_for_parsing()?;
+        Ok(response)
     }
 
     /// Execute the request and return the raw status + headers + body with NO
@@ -622,6 +639,122 @@ mod tests {
     /// transport error with a URL attached. The userinfo assertion is a
     /// belt-and-braces check -- reqwest strips userinfo from the URL it keeps,
     /// so that half is already unreachable today.
+    /// A success response carrying no body is a flap, not a parse failure.
+    ///
+    /// `send_raw` deliberately classifies nothing, so its callers each decide
+    /// what a status and body mean. Left alone, an empty body reaches a
+    /// normalizer, fails to parse, and becomes `Decode` -- non-transient, which
+    /// discards a healthy cached window and reports the provider as dead. The
+    /// classification here is the whole point of the helper, so it is asserted
+    /// rather than just the error.
+    #[test]
+    fn an_empty_success_body_is_transient_when_it_is_about_to_be_parsed() {
+        let response = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let error = response
+            .body_for_parsing()
+            .expect_err("an empty success body must not reach a parser");
+        assert!(matches!(error, FetchError::Upstream(_)), "{error:?}");
+        assert_eq!(
+            crate::refresh::classify(&error),
+            crate::refresh::FetchClass::Transient,
+            "an empty body must keep the cached window, not degrade the slot"
+        );
+
+        // Not vacuous: a body that is present is returned untouched, so the
+        // helper cannot pass by refusing everything.
+        let ok = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(ok.body_for_parsing().unwrap(), b"{}");
+    }
+
+    /// The refusal is scoped to success responses.
+    ///
+    /// A caller reaches this only after its own status mapping has run, so an
+    /// empty body on a non-success status has already been accounted for -- and
+    /// refusing it here would overwrite that caller's more specific error with a
+    /// generic transport one.
+    #[test]
+    fn an_empty_body_on_a_non_success_status_is_left_to_the_caller() {
+        let response = HttpResponse {
+            status: 503,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        assert_eq!(response.body_for_parsing().unwrap(), b"");
+    }
+
+    /// Every helper that classifies a response applies the empty-body rule.
+    ///
+    /// Two of them build a response themselves rather than routing through one
+    /// point, so a rule added to either does not reach the other's callers. This
+    /// drives both against the same server and asserts the same classification,
+    /// so the pair cannot drift apart.
+    ///
+    /// The pairing matters concretely: the banked-reset credit request chooses
+    /// its helper by whether a vault credential is in play, so without this the
+    /// same request would treat an empty body as a transient flap on one lane
+    /// and as a degrading parse failure on the other.
+    #[tokio::test]
+    async fn every_classifying_helper_treats_an_empty_success_body_alike() {
+        for label in ["send_full", "send_provider_status_first"] {
+            let (url, server) = serve_fixed(200, Vec::new()).await;
+            let request = JsonRequest::get(url);
+            let client = reqwest::Client::new();
+
+            let outcome = match label {
+                "send_full" => request.send_full(&client).await.err(),
+                _ => request
+                    .send_provider_status_first(&client, "test")
+                    .await
+                    .err(),
+            };
+            let Some(error) = outcome else {
+                panic!("{label} accepted an empty success body");
+            };
+
+            assert!(
+                matches!(error, FetchError::Upstream(_)),
+                "{label}: {error:?}"
+            );
+            assert_eq!(
+                crate::refresh::classify(&error),
+                crate::refresh::FetchClass::Transient,
+                "{label} would degrade the slot instead of keeping the cached window"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    /// A body that is present still reaches the caller through both helpers, so
+    /// the rule above cannot pass by refusing everything.
+    #[tokio::test]
+    async fn every_classifying_helper_returns_a_present_body() {
+        for label in ["send_full", "send_provider_status_first"] {
+            let (url, server) = serve_fixed(200, b"{}".to_vec()).await;
+            let request = JsonRequest::get(url);
+            let client = reqwest::Client::new();
+
+            let response = match label {
+                "send_full" => request.send_full(&client).await,
+                _ => request.send_provider_status_first(&client, "test").await,
+            };
+            let response =
+                response.unwrap_or_else(|error| panic!("{label} rejected a real body: {error:?}"));
+
+            assert_eq!(response.body, b"{}");
+            server.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_transport_failure_does_not_publish_the_request_url() {
         // Port 1 on loopback refuses immediately, so this fails in `send`

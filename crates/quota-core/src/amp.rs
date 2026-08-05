@@ -312,7 +312,7 @@ impl UsageProvider for AmpProvider {
                 )));
             }
 
-            let html = String::from_utf8_lossy(&response.body);
+            let html = String::from_utf8_lossy(response.body_for_parsing()?);
             let usage = normalize_usage(&html, chrono::Utc::now())?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
         }

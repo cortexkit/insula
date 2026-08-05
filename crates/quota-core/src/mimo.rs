@@ -287,8 +287,8 @@ impl UsageProvider for MimoProvider {
                 )));
             }
 
-            let detail_json = String::from_utf8_lossy(&detail_res.body);
-            let usage_json = String::from_utf8_lossy(&usage_res.body);
+            let detail_json = String::from_utf8_lossy(detail_res.body_for_parsing()?);
+            let usage_json = String::from_utf8_lossy(usage_res.body_for_parsing()?);
 
             let usage = normalize(&detail_json, &usage_json)?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))

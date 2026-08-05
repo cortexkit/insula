@@ -436,7 +436,7 @@ impl UsageProvider for FactoryProvider {
                 .collect();
             map_billing_http_status(response.status, &excerpt)?;
 
-            let usage = normalize_billing_limits_bytes(&response.body, Utc::now())?;
+            let usage = normalize_billing_limits_bytes(response.body_for_parsing()?, Utc::now())?;
             Ok(ProviderUsage::healthy(
                 PROVIDER_NAME,
                 None,
