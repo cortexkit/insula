@@ -213,6 +213,11 @@ impl FetchAttempt {
             VaultGetError::EmptyPayload => FetchError::CredentialUnusable(
                 "vault served an empty credential for this handle".to_string(),
             ),
+            // A record the vault will not serve. Unusable rather than absent:
+            // the credential exists, so the remedy is not to create one.
+            VaultGetError::Corrupt => FetchError::CredentialUnusable(
+                "vault holds a corrupt or quarantined record for this handle".to_string(),
+            ),
             VaultGetError::FailClosed => {
                 FetchError::Decode("credential vault rejected the request".to_string())
             }
@@ -652,6 +657,7 @@ mod tests {
             VaultGetError::AuthRequired,
             VaultGetError::Permanent,
             VaultGetError::EmptyPayload,
+            VaultGetError::Corrupt,
             VaultGetError::FailClosed,
         ];
 
@@ -663,6 +669,7 @@ mod tests {
                 | VaultGetError::AuthRequired
                 | VaultGetError::Permanent
                 | VaultGetError::EmptyPayload
+                | VaultGetError::Corrupt
                 | VaultGetError::FailClosed => {}
             }
         }

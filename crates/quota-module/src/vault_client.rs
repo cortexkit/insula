@@ -681,9 +681,34 @@ struct VaultErrorResult {
 #[derive(Deserialize)]
 struct VaultReadError {
     class: String,
+    /// The vault's finer-grained reason, where it sends one.
+    ///
+    /// The class decides retry behaviour and is the only field to branch on for
+    /// that. The code exists so a failure can be *described* accurately when two
+    /// situations share a class -- which they do here: a record that was never
+    /// created and one the vault has quarantined as corrupt are both permanent,
+    /// and an operator's next step differs completely between them.
+    #[serde(default)]
+    code: Option<String>,
 }
 
-fn class_to_error(class: &str) -> VaultGetError {
+/// Map a vault failure onto the outcome this module reports.
+///
+/// Retry behaviour follows the **class** alone, per the agreed contract. The
+/// code refines only how the outcome is described, and an unrecognised one
+/// falls back to the class -- so a vault that adds a code cannot change how this
+/// module retries, and a code that stops being sent degrades to the plain class
+/// rather than to a wrong one.
+fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
+    // A quarantined record is permanent like an absent one, and needs the
+    // opposite response: absent means nobody has logged in, corrupt means a
+    // record exists and the vault refuses to serve it. Reported distinctly so
+    // the first sighting -- which will be the day something went wrong -- is not
+    // rendered as "never configured".
+    if class == "permanent" && code == Some("corrupt") {
+        return VaultGetError::Corrupt;
+    }
+
     match class {
         "transient" => VaultGetError::Transient,
         "auth_required" => VaultGetError::AuthRequired,
@@ -704,11 +729,18 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
         }
         _ => {}
     }
+    // The code sits beside the class wherever the vault sends one, so it is read
+    // from the same object rather than defaulted -- otherwise a quarantined
+    // record reaching this path would render as an absent one.
+    let code = value
+        .get("code")
+        .or_else(|| value.pointer("/error/code"))
+        .and_then(Value::as_str);
     value
         .get("class")
         .or_else(|| value.pointer("/error/class"))
         .and_then(Value::as_str)
-        .map(class_to_error)
+        .map(|class| read_error_to_outcome(class, code))
         .map(ClientFailure::Classified)
         .unwrap_or(ClientFailure::Protocol)
 }
@@ -773,7 +805,10 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
         (false, true) => {
             let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
                 .map_err(|_| VaultGetError::FailClosed)?;
-            Err(class_to_error(&failure.error.class))
+            Err(read_error_to_outcome(
+                &failure.error.class,
+                failure.error.code.as_deref(),
+            ))
         }
         (true, true) | (false, false) => Err(VaultGetError::FailClosed),
     }
@@ -829,7 +864,10 @@ impl CredentialSource for VaultClient {
                 .pointer("/result/error/class")
                 .and_then(Value::as_str)
             {
-                return Err(class_to_error(class));
+                let code = response
+                    .pointer("/result/error/code")
+                    .and_then(Value::as_str);
+                return Err(read_error_to_outcome(class, code));
             }
             response
                 .get("result")
@@ -940,14 +978,82 @@ mod tests {
 
     #[test]
     fn class_mapping_is_exhaustive_and_unknown_fails_closed() {
-        assert_eq!(class_to_error("transient"), VaultGetError::Transient);
-        assert_eq!(class_to_error("auth_required"), VaultGetError::AuthRequired);
-        assert_eq!(class_to_error("permanent"), VaultGetError::Permanent);
+        let map = |class| read_error_to_outcome(class, None);
+        assert_eq!(map("transient"), VaultGetError::Transient);
+        assert_eq!(map("auth_required"), VaultGetError::AuthRequired);
+        assert_eq!(map("permanent"), VaultGetError::Permanent);
+        assert_eq!(map("context_overflow"), VaultGetError::FailClosed);
+        assert_eq!(map("future_class"), VaultGetError::FailClosed);
+    }
+
+    /// A quarantined record is told apart from one that never existed.
+    ///
+    /// Both are permanent, so retry behaviour is identical and the class alone
+    /// cannot separate them -- but the operator's next step is opposite: an
+    /// absent credential is created by logging in, while a corrupt one already
+    /// exists and something damaged it. The vault sends a finer-grained code
+    /// beside the class, and reading only the class discards exactly that.
+    #[test]
+    fn a_quarantined_record_is_not_reported_as_an_absent_one() {
         assert_eq!(
-            class_to_error("context_overflow"),
-            VaultGetError::FailClosed
+            read_error_to_outcome("permanent", Some("corrupt")),
+            VaultGetError::Corrupt
         );
-        assert_eq!(class_to_error("future_class"), VaultGetError::FailClosed);
+        assert_eq!(
+            read_error_to_outcome("permanent", Some("not_found")),
+            VaultGetError::Permanent
+        );
+
+        // Retry behaviour is unchanged: the code refines the description only,
+        // and both remain non-transient.
+        for outcome in [VaultGetError::Corrupt, VaultGetError::Permanent] {
+            assert_eq!(
+                quota_core::refresh::classify(
+                    &quota_core::provider::FetchAttempt::unverified_vault_failure(outcome)
+                        .usage
+                        .unwrap_err()
+                ),
+                quota_core::refresh::FetchClass::NonTransient,
+            );
+        }
+
+        // An unrecognised code falls back to the class rather than to a wrong
+        // outcome, so a vault adding one cannot change how this module behaves.
+        assert_eq!(
+            read_error_to_outcome("permanent", Some("a_code_from_a_newer_vault")),
+            VaultGetError::Permanent
+        );
+        // And the code is only consulted for the class it belongs to.
+        assert_eq!(
+            read_error_to_outcome("transient", Some("corrupt")),
+            VaultGetError::Transient
+        );
+    }
+
+    /// The code is read from the wire, not just from the mapping function.
+    ///
+    /// The decode and the mapping are separate steps, so a mapping that handles
+    /// the code correctly still reports the wrong outcome if the decoder drops
+    /// the field before it gets there.
+    #[test]
+    fn a_quarantined_record_survives_the_decode() {
+        let body = serde_json::json!({
+            "result": { "error": { "class": "permanent", "code": "corrupt" } }
+        });
+        assert!(matches!(
+            decode_get_response(&serde_json::to_vec(&body).unwrap()),
+            Err(VaultGetError::Corrupt)
+        ));
+
+        // Not vacuous: the same shape without the code still decodes, as the
+        // plain permanent outcome.
+        let body = serde_json::json!({
+            "result": { "error": { "class": "permanent" } }
+        });
+        assert!(matches!(
+            decode_get_response(&serde_json::to_vec(&body).unwrap()),
+            Err(VaultGetError::Permanent)
+        ));
     }
 
     #[test]

@@ -96,6 +96,15 @@ pub enum VaultGetError {
     /// that should never have been writable, and the record itself is evidence
     /// of that. Folding it into either neighbour discards that evidence.
     EmptyPayload,
+    /// A record exists and the vault refuses to serve it, having found it
+    /// corrupt or quarantined it.
+    ///
+    /// Retried like [`Self::Permanent`] -- neither clears without someone acting
+    /// -- but reported separately, because the actions are opposites: an absent
+    /// credential is created by logging in, while this one already exists and
+    /// something damaged it. Reporting it as absent would send an operator to
+    /// re-authenticate an account whose record is the evidence of a fault.
+    Corrupt,
     FailClosed,
 }
 
@@ -106,6 +115,7 @@ impl std::fmt::Debug for VaultGetError {
             Self::AuthRequired => "AuthRequired",
             Self::Permanent => "Permanent",
             Self::EmptyPayload => "EmptyPayload",
+            Self::Corrupt => "Corrupt",
             Self::FailClosed => "FailClosed",
         })
     }
@@ -118,6 +128,7 @@ impl std::fmt::Display for VaultGetError {
             Self::AuthRequired => "credential requires authentication",
             Self::Permanent => "credential is unavailable",
             Self::EmptyPayload => "credential vault served an empty credential",
+            Self::Corrupt => "credential vault holds a corrupt or quarantined record",
             Self::FailClosed => "credential vault rejected the request",
         })
     }
