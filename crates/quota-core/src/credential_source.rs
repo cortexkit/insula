@@ -86,6 +86,16 @@ pub enum VaultGetError {
     Transient,
     AuthRequired,
     Permanent,
+    /// The lookup succeeded and carried no credential bytes.
+    ///
+    /// Separate from [`Self::Permanent`], which means no record exists, and from
+    /// [`Self::FailClosed`], which means the reply could not be understood. This
+    /// reply was understood and reported success while carrying nothing, so the
+    /// remedies differ: an absent credential is a configuration gap the operator
+    /// closes by logging in, whereas an empty one means something wrote a value
+    /// that should never have been writable, and the record itself is evidence
+    /// of that. Folding it into either neighbour discards that evidence.
+    EmptyPayload,
     FailClosed,
 }
 
@@ -95,6 +105,7 @@ impl std::fmt::Debug for VaultGetError {
             Self::Transient => "Transient",
             Self::AuthRequired => "AuthRequired",
             Self::Permanent => "Permanent",
+            Self::EmptyPayload => "EmptyPayload",
             Self::FailClosed => "FailClosed",
         })
     }
@@ -106,6 +117,7 @@ impl std::fmt::Display for VaultGetError {
             Self::Transient => "credential vault temporarily unavailable",
             Self::AuthRequired => "credential requires authentication",
             Self::Permanent => "credential is unavailable",
+            Self::EmptyPayload => "credential vault served an empty credential",
             Self::FailClosed => "credential vault rejected the request",
         })
     }
@@ -187,6 +199,7 @@ mod tests {
             (VaultGetError::Transient, "Transient"),
             (VaultGetError::AuthRequired, "AuthRequired"),
             (VaultGetError::Permanent, "Permanent"),
+            (VaultGetError::EmptyPayload, "EmptyPayload"),
             (VaultGetError::FailClosed, "FailClosed"),
         ] {
             assert_eq!(format!("{error:?}"), expected);

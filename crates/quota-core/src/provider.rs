@@ -205,6 +205,14 @@ impl FetchAttempt {
             VaultGetError::Permanent => {
                 FetchError::CredentialUnusable("vault credential is unavailable".to_string())
             }
+            // A credential that exists and is empty. Reported as unusable
+            // rather than as a malformed reply, because the reply was not
+            // malformed -- the record is. It names its own cause, since an
+            // absent credential is closed by logging in while this one means
+            // something wrote a value that should never have been writable.
+            VaultGetError::EmptyPayload => FetchError::CredentialUnusable(
+                "vault served an empty credential for this handle".to_string(),
+            ),
             VaultGetError::FailClosed => {
                 FetchError::Decode("credential vault rejected the request".to_string())
             }
@@ -619,6 +627,80 @@ mod tests {
         assert!(!class_means_credential_stopped_working(
             "a_class_from_a_newer_build"
         ));
+    }
+
+    /// Each vault outcome reaches the wire as its own statement.
+    ///
+    /// These four describe different situations with different remedies, and the
+    /// published message is all an operator gets: a credential that is missing
+    /// is closed by logging in, one that is present but empty means something
+    /// wrote a value that should never have been writable, and a reply that
+    /// could not be understood is a fault in the transport rather than in the
+    /// record. Collapsing any pair sends whoever investigates to the wrong
+    /// remedy while the entry still looks accounted for.
+    #[test]
+    fn each_vault_outcome_is_distinguishable_on_the_wire() {
+        let published = |error: VaultGetError| {
+            FetchAttempt::unverified_vault_failure(error)
+                .usage
+                .expect_err("a vault failure produces no usage")
+                .to_string()
+        };
+
+        let all = [
+            VaultGetError::Transient,
+            VaultGetError::AuthRequired,
+            VaultGetError::Permanent,
+            VaultGetError::EmptyPayload,
+            VaultGetError::FailClosed,
+        ];
+
+        // Fails to compile when a variant is added, so this cannot fall behind
+        // the enum silently.
+        for case in &all {
+            match case {
+                VaultGetError::Transient
+                | VaultGetError::AuthRequired
+                | VaultGetError::Permanent
+                | VaultGetError::EmptyPayload
+                | VaultGetError::FailClosed => {}
+            }
+        }
+
+        let messages: Vec<String> = all.into_iter().map(published).collect();
+        let mut unique = messages.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "two vault outcomes publish the same text: {messages:?}"
+        );
+
+        // The distinction that prompted this: an empty credential is not an
+        // absent one, and says so in words rather than only in a variant.
+        let empty = published(VaultGetError::EmptyPayload);
+        assert!(empty.contains("empty"), "{empty:?}");
+
+        // Only the vault being briefly unreachable keeps the last good window;
+        // an empty credential is a fault in the record, so retrying at speed
+        // buys nothing.
+        assert_eq!(
+            crate::refresh::classify(
+                &FetchAttempt::unverified_vault_failure(VaultGetError::Transient)
+                    .usage
+                    .unwrap_err()
+            ),
+            crate::refresh::FetchClass::Transient,
+        );
+        assert_eq!(
+            crate::refresh::classify(
+                &FetchAttempt::unverified_vault_failure(VaultGetError::EmptyPayload)
+                    .usage
+                    .unwrap_err()
+            ),
+            crate::refresh::FetchClass::NonTransient,
+        );
     }
 
     #[test]

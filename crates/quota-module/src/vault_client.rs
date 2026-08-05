@@ -735,15 +735,18 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
         (true, false) => {
             let success: VaultSuccessResult = serde_json::from_value(Value::Object(result.clone()))
                 .map_err(|_| VaultGetError::FailClosed)?;
-            // A success reply carrying no credential bytes is malformed, not a
-            // credential. Every lane converts the payload straight into a bearer,
-            // and an empty one converts cleanly into an empty bearer -- which the
-            // upstream answers with 401, a NON-TRANSIENT class that clears the
-            // cached window and reports the account as auth-dead. Rejecting it
-            // here fails closed instead, so the lane retries a vault that is
-            // briefly answering wrongly rather than condemning the account.
+            // A success reply carrying no credential bytes is not a credential.
+            // Every lane converts the payload straight into a bearer, and an
+            // empty one converts cleanly into an empty bearer -- so without this
+            // the request goes out unauthenticated and the upstream answers 401,
+            // which reads as a dead session and sends whoever investigates to
+            // re-authenticate an account whose credential was never sent.
+            //
+            // Reported as its own class rather than as a rejected reply: this one
+            // parsed correctly, so the fault is in the record, and the remedy
+            // differs from both an absent credential and a malformed response.
             if success.payload.is_empty() {
-                return Err(VaultGetError::FailClosed);
+                return Err(VaultGetError::EmptyPayload);
             }
             Ok(VaultCredential {
                 payload: success.payload,
@@ -1188,8 +1191,19 @@ mod tests {
         assert_eq!(credential.org_name.as_deref(), Some("Example Org"));
     }
 
+    /// An empty credential is refused, and says so in its own words.
+    ///
+    /// Refusing it at all is the load-bearing part: an empty payload converts
+    /// cleanly into an empty bearer, the request goes out unauthenticated, and
+    /// the 401 that comes back reads as a dead session.
+    ///
+    /// The class it is refused under matters separately, because it is what
+    /// someone investigating acts on. An absent credential is closed by logging
+    /// in; an empty one means something wrote a value that should never have
+    /// been writable, and the record is the evidence. Reporting it as a
+    /// malformed reply would also mislead -- this reply parsed correctly.
     #[test]
-    fn a_success_reply_with_an_empty_payload_fails_closed() {
+    fn a_success_reply_with_an_empty_payload_is_refused_as_an_empty_credential() {
         // Well-formed in every other respect: the reply parses, carries a record
         // version, and resolves an account. Only the credential bytes are absent.
         let body = serde_json::json!({
@@ -1201,8 +1215,9 @@ mod tests {
         });
         let decoded = decode_get_response(&serde_json::to_vec(&body).unwrap());
         assert!(
-            matches!(decoded, Err(VaultGetError::FailClosed)),
-            "an empty payload must fail closed rather than serve an empty bearer"
+            matches!(decoded, Err(VaultGetError::EmptyPayload)),
+            "an empty payload must be refused as an empty credential, not served \
+             as a bearer nor reported as a malformed reply"
         );
 
         // Non-vacuity: the identical reply with one byte of payload decodes, so
