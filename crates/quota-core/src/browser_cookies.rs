@@ -42,6 +42,34 @@ pub enum CookieError {
     Unsupported,
 }
 
+impl From<CookieError> for crate::provider::FetchError {
+    /// Classify a cookie failure for the refresher.
+    ///
+    /// The distinction is whether retrying could succeed, because that decides
+    /// what happens to a window already being served: a non-transient failure
+    /// replaces it with a degraded entry, while a transient one keeps serving
+    /// it. Absent store, absent cookie and an unsupported platform are all
+    /// stable facts about this host -- nobody is logged in here, and the next
+    /// attempt will say the same. A keychain that will not open or a store that
+    /// will not decrypt is a condition of the moment: the keychain may be
+    /// locked, or the browser may be mid-write on the file being copied.
+    ///
+    /// Kept here, beside the enum, so the arms are enumerated in one place:
+    /// adding a variant fails to compile here rather than silently taking some
+    /// caller's default.
+    fn from(error: CookieError) -> Self {
+        let detail = error.to_string();
+        match error {
+            CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
+                crate::provider::FetchError::NoSession(detail)
+            }
+            CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
+                crate::provider::FetchError::Upstream(detail)
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for CookieError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -288,6 +316,49 @@ fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::FetchError;
+    use crate::refresh::{classify, FetchClass};
+
+    /// Every cookie failure is classified, and by whether retrying could help.
+    ///
+    /// The classification decides the fate of a window already being served: a
+    /// non-transient failure replaces it with a degraded entry, a transient one
+    /// keeps serving it. So calling a locked keychain permanent would discard a
+    /// healthy window over a momentary condition, and calling an absent login
+    /// transient would keep serving usage for a session that no longer exists.
+    ///
+    /// Matched exhaustively rather than sampled: a variant added later must be
+    /// judged here, not fall into whichever arm happens to catch it.
+    #[test]
+    fn every_cookie_failure_is_classified_by_whether_a_retry_could_help() {
+        let cases = [
+            // Stable facts about this host: nobody is logged in here, and the
+            // next attempt reports the same.
+            (CookieError::NoStore, FetchClass::NonTransient),
+            (CookieError::NoCookie, FetchClass::NonTransient),
+            (CookieError::Unsupported, FetchClass::NonTransient),
+            // Conditions of the moment: the keychain may be locked, or the
+            // browser may be mid-write on the file being copied.
+            (
+                CookieError::NoKeychainKey("locked".into()),
+                FetchClass::Transient,
+            ),
+            (
+                CookieError::Extract("database is locked".into()),
+                FetchClass::Transient,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let label = format!("{error:?}");
+            let converted = FetchError::from(error);
+            assert_eq!(classify(&converted), expected, "{label} -> {converted:?}");
+            // Not vacuous: the failure's own text survives the conversion, so a
+            // reader can tell which condition occurred.
+            assert!(!converted.to_string().is_empty(), "{label}");
+        }
+    }
+
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use sha2::{Digest, Sha256};
 

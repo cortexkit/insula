@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieError, CookieJar},
+    browser_cookies::{self, CookieJar},
     http::{Header, JsonRequest},
     model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -393,14 +393,7 @@ impl UsageProvider for FactoryProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN).await.map_err(|e| match e {
-                CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                    FetchError::NoSession(e.to_string())
-                }
-                CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                    FetchError::Upstream(e.to_string())
-                }
-            })?;
+            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN).await.map_err(FetchError::from)?;
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(

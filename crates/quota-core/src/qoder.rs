@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieError, CookieJar},
+    browser_cookies::{self, CookieJar},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -195,17 +195,6 @@ fn request_cookie_header(jar: &CookieJar) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-fn map_cookie_error(error: CookieError) -> FetchError {
-    match error {
-        CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-            FetchError::NoSession(error.to_string())
-        }
-        CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-            FetchError::Upstream(error.to_string())
-        }
-    }
-}
-
 /// The Qoder browser-cookie usage provider.
 pub struct QoderProvider {
     http: reqwest::Client,
@@ -239,7 +228,7 @@ impl UsageProvider for QoderProvider {
         let result: Result<ProviderUsage, FetchError> = async {
             let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
                 .await
-                .map_err(map_cookie_error)?;
+                .map_err(FetchError::from)?;
             // Qoder's importer does not designate one session-cookie name, so send
             // every cookie from its two exact international hosts.
             let cookie = request_cookie_header(&jar).ok_or_else(|| {

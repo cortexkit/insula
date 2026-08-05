@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieError, CookieJar},
+    browser_cookies::{self, CookieJar},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -662,14 +662,14 @@ pub fn parse_windows(
 }
 
 pub fn load_cookie_header() -> Result<String, FetchError> {
-    let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(map_cookie_err)?;
+    let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(FetchError::from)?;
     cookie_header_from_jar(&jar)
 }
 
 pub async fn load_cookie_header_async() -> Result<String, FetchError> {
     let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
         .await
-        .map_err(map_cookie_err)?;
+        .map_err(FetchError::from)?;
     cookie_header_from_jar(&jar)
 }
 
@@ -684,17 +684,6 @@ fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
     request_cookie_header(jar).ok_or_else(|| {
         FetchError::CredentialUnusable("opencode auth cookies empty after filter".to_string())
     })
-}
-
-fn map_cookie_err(e: CookieError) -> FetchError {
-    match e {
-        CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-            FetchError::NoSession(e.to_string())
-        }
-        CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-            FetchError::Upstream(e.to_string())
-        }
-    }
 }
 
 pub struct OpenCodeProvider {

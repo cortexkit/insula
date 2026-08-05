@@ -30,7 +30,7 @@ use async_trait::async_trait;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieError},
+    browser_cookies::{self},
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -293,15 +293,7 @@ impl UsageProvider for OllamaProvider {
         let result: Result<ProviderUsage, FetchError> = async {
             let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
                 .await
-                .map_err(|e| match e {
-                    // No store / no cookie / unsupported platform → simply not logged in here.
-                    CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                        FetchError::NoSession(e.to_string())
-                    }
-                    CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                        FetchError::Upstream(e.to_string())
-                    }
-                })?;
+                .map_err(FetchError::from)?;
 
             // A jar without a recognized session cookie is not a usable login.
             if !jar.has_cookie_named(is_session_cookie) {

@@ -54,7 +54,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieError},
+    browser_cookies::{self},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -394,14 +394,7 @@ impl UsageProvider for QwenCloudProvider {
         let result: Result<ProviderUsage, FetchError> = async {
             let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
                 .await
-                .map_err(|error| match error {
-                    CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
-                        FetchError::NoSession(error.to_string())
-                    }
-                    CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
-                        FetchError::Upstream(error.to_string())
-                    }
-                })?;
+                .map_err(FetchError::from)?;
             if !jar.has_cookie_named(|name| name == "login_qwencloud_ticket") {
                 return Err(FetchError::NoSession(
                     "no Qwen Cloud login ticket in browser".to_string(),
