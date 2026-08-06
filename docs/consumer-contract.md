@@ -434,7 +434,7 @@ carry across. Only two are properties of the provider:
 | `apiProvider` | provider | derived from `provider` at read time, identical on every entry |
 | `account` | account | the credential's account id |
 | `accountInfo` | account | that account's email, org, plan |
-| `source` | account | set per credential lane, so two entries of one provider can differ |
+| `source` | lane | set per credential lane, and the lane serving one account can change between polls |
 | `fetchedAt` | account | that slot's own last success |
 | `savedResets` | account | reset credits are granted to **one** account |
 | `usage` (incl. `rawUsedPercent`) | account | measured against that account's own limits |
@@ -446,6 +446,19 @@ coherent-looking record describing no actual account — one account's effective
 percent beside another's `rawUsedPercent`, or a `savedResets` count belonging to
 a third. Nothing on the wire marks the difference, which is why it is stated
 here.
+
+**`source` is narrower than account scope, and it moves.** A provider can read
+one account through more than one lane — a local file or process, and a
+credential from the vault. Both describe the same account, and which one answers
+is decided per fetch by whichever is healthy and fresh. So the same account can
+publish `source: "vault"` on one poll and something else on the next, with no
+change to the account, the credential, or anything a consumer did.
+
+It is observability only: read it to know how a figure was obtained, never as an
+identity or a state. Keying on it treats one account as two, and alerting on a
+change reports a lane fallback — which is the system working — as an incident.
+The values in use are `oauth`, `api` and `vault`; treat the set as open, since a
+new lane adds a value without warning.
 
 **Health counts providers; the array carries accounts.** A provider with several
 credentialed accounts contributes several entries to `usage.get` and exactly one
