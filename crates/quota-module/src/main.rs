@@ -563,10 +563,10 @@ async fn handle_usage_request(
     // A second operation would have left the original serving path alive and
     // correct-looking forever, and that path is exactly the one that cannot say
     // whether an account is missing or gone.
-    let body = match serde_json::to_vec(&json!({
-        "result": snapshot.entries,
-        "completeProviders": snapshot.complete_providers,
-    })) {
+    //
+    // Shaped by the snapshot itself so a consumer's reference envelope and the
+    // one served here cannot differ.
+    let body = match serde_json::to_vec(&snapshot.to_envelope()) {
         Ok(body) => body,
         Err(error) => {
             return send_route_error(

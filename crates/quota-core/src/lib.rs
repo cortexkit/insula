@@ -298,6 +298,23 @@ pub struct UsageSnapshot {
     pub complete_providers: Vec<String>,
 }
 
+impl UsageSnapshot {
+    /// Render this snapshot as the `usage.get` reply body.
+    ///
+    /// Lives here rather than at the wire boundary so that anything producing a
+    /// reference envelope -- a consumer's pinned fixture, a diagnostic dump --
+    /// goes through the same construction the module serves. A fixture built
+    /// beside the real path rather than from it is free to drift, and a consumer
+    /// pinned to a shape this module never emits passes forever while testing
+    /// nothing.
+    pub fn to_envelope(&self) -> serde_json::Value {
+        serde_json::json!({
+            "result": self.entries,
+            "completeProviders": self.complete_providers,
+        })
+    }
+}
+
 /// Provider registry with a cache-only read path and one background refresher.
 pub struct Registry {
     providers: Vec<RegisteredProvider>,
