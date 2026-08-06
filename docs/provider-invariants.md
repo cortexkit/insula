@@ -660,3 +660,22 @@ So anchor on the module boundary (`#[cfg(test)]` immediately followed by
 `mod tests`), and before believing any sweep, print how much of each file it
 actually read. A scan reporting on 32% of a file is not a sweep with a caveat;
 it is a different question with the same name.
+
+Writing that down twice did not stop it happening twice, so the boundary now
+lives in `scripts/prod_body.py` and sweeps should go through it:
+
+```sh
+./scripts/prod_body.py --grep-missing report_auth_failure crates/quota-core/src/*.rs
+```
+
+It prints the production body with the test module removed, and warns on stderr
+for any file where the naive cut would have differed — which is the half that
+matters. Fixing the anchor is silent, and the next person to write an extractor
+gets no signal that theirs is wrong; a scan that says it read 5% of `lib.rs`
+cannot be mistaken for one that read all of it.
+
+Five files here truncate under the naive cut, and the worst is not a provider:
+`lib.rs` cuts at 5% (line 78 of 977), on a `#[cfg(test)] thread_local!` used to
+inject a hook. That file holds the emission gate, the completeness claim and the
+whole read path — so any sweep over the module's most consequential logic read
+essentially none of it.
