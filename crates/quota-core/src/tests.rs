@@ -438,6 +438,36 @@ fn every_api_provider_key_names_a_registered_provider() {
             "provider {key} maps to an empty canonical name"
         );
     }
+
+    // No two providers may publish the same slug. Consumers key freshness,
+    // pricing and spend on `apiProvider`, so a shared value merges two different
+    // products into one identity -- and the merge is silent, because both
+    // entries are individually well-formed and the collision is visible only by
+    // comparing them.
+    //
+    // The near miss this guards against is concrete. `antigravity` and `gemini`
+    // are separate products reached through the same Google API, with separate
+    // credentials and separate quota pools, and `gemini` already publishes
+    // `google`. Giving antigravity the obvious-looking slug would make one
+    // product's exhaustion read as the other's.
+    let mut by_slug: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (key, value) in &keys {
+        by_slug
+            .entry(value.as_str())
+            .or_default()
+            .push(key.as_str());
+    }
+    let mut collisions: Vec<String> = by_slug
+        .iter()
+        .filter(|(_, providers)| providers.len() > 1)
+        .map(|(slug, providers)| format!("{slug} <- {providers:?}"))
+        .collect();
+    collisions.sort();
+    assert!(
+        collisions.is_empty(),
+        "two providers publish the same apiProvider slug, merging them into one \
+         identity for every consumer that keys on it: {collisions:?}"
+    );
 }
 
 struct LabelProvider {
