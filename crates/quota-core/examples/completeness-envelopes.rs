@@ -95,12 +95,13 @@ async fn tick(registry: &Registry) {
     registry.refresh_tick(&CancellationToken::new()).await;
 }
 
-async fn emit(label: &str, note: &str, registry: &Registry) {
+async fn emit(label: &str, note: &str, registry: &Registry) -> serde_json::Value {
     let snapshot = registry.usage_snapshot(None).await;
     let envelope = snapshot.to_envelope();
     println!("\n=== {label} ===");
     println!("{note}");
     println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    envelope
 }
 
 #[tokio::main]
@@ -118,30 +119,87 @@ async fn main() {
     )
     .await;
 
-    // GENUINE REMOVAL: two accounts, then one credential is withdrawn and the
-    // enumeration SUCCEEDS without it. The claim stands, so the consumer is
-    // authorised to delete the account the entries no longer name.
-    let removal_stub = Stub::new(
+    // THE PAIR, produced from ONE registry so that the surviving account's
+    // entry is literally the same bytes in both.
+    //
+    // Two registries would each carry their own wall-clock anchor, so `fetchedAt`
+    // would differ by microseconds and the arrays would be merely equivalent.
+    // That is a weaker fact and the wrong one to hand a consumer: it leaves open
+    // that something OTHER than the claim also differs. Here acct-a is fetched
+    // once and never becomes due again during the run, so its entry is fixed
+    // while the account set changes around it.
+    let pair_stub = Stub::new(
         &["h1", "h2"],
         &[("h1", Some("acct-a")), ("h2", Some("acct-b"))],
     );
-    let removal_handles = Arc::clone(&removal_stub.handles);
-    let removal = Registry::new(vec![Box::new(removal_stub)]);
-    tick(&removal).await;
+    let pair_handles = Arc::clone(&pair_stub.handles);
+    let pair = Registry::new(vec![Box::new(pair_stub)]);
+    tick(&pair).await;
     emit(
         "before-removal",
         "Both accounts published and the provider is complete.",
-        &removal,
+        &pair,
     )
     .await;
-    *removal_handles.lock().unwrap() = vec!["h1"];
-    tick(&removal).await;
-    emit(
+
+    // WITHHELD first: acct-b's identity stops being confirmable, so its entry is
+    // suppressed while its identity is kept -- which is what holds the provider
+    // fully resolved and leaves acct-a labelled.
+    {
+        let mut store = pair.slot_store().lock().unwrap();
+        let key = SlotKey::new("codex", CredentialHandle::new("h2"));
+        let mut slot = store.get(&key).expect("h2 has a slot").clone();
+        slot.label_in_flux = true;
+        slot.entry = None;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+    let withheld_envelope = emit(
+        "withheld-account",
+        "acct-b is withheld. Entries look exactly like the removal case; the claim is what differs.",
+        &pair,
+    )
+    .await;
+
+    // Then the removal, on the same registry: acct-b's credential is withdrawn
+    // and the enumeration SUCCEEDS without it, so its slot is reaped. acct-a is
+    // not due again, so it is not refetched and its entry is untouched.
+    *pair_handles.lock().unwrap() = vec!["h1"];
+    tick(&pair).await;
+    let removal_envelope = emit(
         "genuine-removal",
         "acct-b's credential is withdrawn. Complete AND absent: delete acct-b.",
-        &removal,
+        &pair,
     )
     .await;
+
+    // The claim about this pair, enforced rather than asserted in prose. A
+    // consumer pins these two against each other to prove its reconciliation
+    // reads the claim; if the arrays ever differ for another reason, the pair
+    // stops isolating the variable under test and the consumer's fixture starts
+    // passing for a reason nobody chose.
+    let removal_result = serde_json::to_vec(&removal_envelope["result"]).unwrap();
+    let withheld_result = serde_json::to_vec(&withheld_envelope["result"]).unwrap();
+    assert_eq!(
+        removal_result,
+        withheld_result,
+        "\nthe paired envelopes must differ ONLY in completeProviders, but their \
+         result arrays differ:\n  removal:  {}\n  withheld: {}",
+        String::from_utf8_lossy(&removal_result),
+        String::from_utf8_lossy(&withheld_result),
+    );
+    assert_ne!(
+        removal_envelope["completeProviders"], withheld_envelope["completeProviders"],
+        "the pair is only interesting because the claim differs"
+    );
+    println!(
+        "\n=== pair check ===\nresult arrays are byte-identical ({} bytes); \
+         completeProviders differs: {} vs {}",
+        removal_result.len(),
+        removal_envelope["completeProviders"],
+        withheld_envelope["completeProviders"],
+    );
 
     // HEALTHY + DEGRADED: the account set is complete and one member is
     // unusable. The degraded account is still NAMED, so a survivor set built
@@ -157,35 +215,6 @@ async fn main() {
         "healthy-and-degraded",
         "Complete, and acct-b carries an error. It exists: keep the row, drop only its windows.",
         &degraded,
-    )
-    .await;
-
-    // WITHHELD: the account's identity is unconfirmed, so its entry is
-    // suppressed while its siblings stay labelled. Indistinguishable from a
-    // removal in the entries alone -- which is why the claim is withdrawn.
-    let withheld = Registry::new(vec![Box::new(Stub::new(
-        &["h1", "h2"],
-        &[("h1", Some("acct-a")), ("h2", Some("acct-b"))],
-    ))]);
-    tick(&withheld).await;
-    {
-        let mut store = withheld.slot_store().lock().unwrap();
-        let key = SlotKey::new("codex", CredentialHandle::new("h2"));
-        let mut slot = store.get(&key).expect("h2 has a slot").clone();
-        // What the fail-closed path writes when it cannot confirm whose usage a
-        // cached entry describes: suppress the entry, KEEP the identity. Keeping
-        // it is what holds the provider fully resolved, so the siblings stay
-        // labelled and only this account disappears.
-        slot.label_in_flux = true;
-        slot.entry = None;
-        let incarnation = slot.incarnation;
-        let attempt_sequence = slot.attempt_sequence;
-        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
-    }
-    emit(
-        "withheld-account",
-        "acct-b is withheld. Entries look exactly like the removal case; the claim is what differs.",
-        &withheld,
     )
     .await;
 }
