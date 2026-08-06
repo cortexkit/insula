@@ -961,8 +961,11 @@ mod tests {
         assert!(!is_loopback_url("127.0.0.1:8080/quota"));
     }
 
-    // Envelope shape confirmed on the live `agy` wire: groups under `response`,
-    // buckets carry an explicit `window` field.
+    // Captured from the live `agy` wire: groups under `response`, buckets
+    // carrying an explicit `window` field. The identifiers here -- `gemini-5h`,
+    // `gemini-weekly`, `3p-5h` -- are OBSERVED values, unlike the hand-written
+    // `g-*` ones in the tests below, and are the forms a consumer can rely on
+    // this lane publishing.
     const SUMMARY_FIXTURE: &str = r#"{
       "response": {
         "groups": [
@@ -1058,6 +1061,12 @@ mod tests {
         assert!(usage.secondary.is_none());
     }
 
+    /// A window with usage but no reset is still published.
+    ///
+    /// Hand-written input: the identifiers and display names here were chosen to
+    /// make the case reachable, not observed on a live server. Real captures use
+    /// `gemini-5h` / `gemini-weekly` / `3p-*` (see `SUMMARY_FIXTURE`), so nothing
+    /// downstream should treat `g-*` as a shape this upstream sends.
     #[test]
     fn bucket_without_reset_is_kept() {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
@@ -1071,6 +1080,10 @@ mod tests {
         assert_eq!(primary.resets_at, None);
     }
 
+    /// An exhausted window with no reset is published rather than dropped.
+    ///
+    /// Hand-written input, like its sibling above: `g-*` identifiers are
+    /// invented to reach the case, not observed.
     #[test]
     fn exhausted_bucket_without_reset_is_kept() {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
@@ -1084,6 +1097,9 @@ mod tests {
         assert_eq!(primary.resets_at, None);
     }
 
+    /// A bucket the server marks disabled contributes nothing.
+    ///
+    /// Hand-written input; `g-*` identifiers are invented, not observed.
     #[test]
     fn disabled_bucket_is_skipped() {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
@@ -1096,6 +1112,10 @@ mod tests {
         ));
     }
 
+    /// The nested fraction shape and an epoch-seconds reset both parse.
+    ///
+    /// Hand-written input covering encodings the server may use; the `g-*`
+    /// identifier is invented, not observed.
     #[test]
     fn nested_remaining_fraction_and_epoch_reset() {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[

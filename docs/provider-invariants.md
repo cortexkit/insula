@@ -480,6 +480,37 @@ point and confirm it describes what still follows it. To find existing cases,
 look for a doc block naming something other than what it is attached to, or one
 whose paragraphs open two different subjects.
 
+## A fixture records whether its values were observed or invented
+
+Parser tests need input, and the fastest way to get it is to write some. That is
+fine for exercising a branch, but the values in a hand-written fixture are
+*inventions* — plausible-looking strings chosen to make a case reachable — while
+the values in a captured one are *evidence* of what an upstream actually sends.
+A reader cannot tell the two apart afterwards, because both are string literals
+in the same file, and the invented one often looks tidier.
+
+That matters when someone treats a fixture as a record. This crate's local
+Antigravity fixtures carry bucket identifiers of two origins: `gemini-5h`,
+`gemini-weekly`, `3p-5h` and `3p-weekly` appear in captures from a real local
+server, while `g-5h`, `g-weekly` and `gemini-session` were written by hand to
+exercise reset and cadence handling. Asked which identifiers this provider
+publishes, a reader scanning the tests would produce all seven with equal
+confidence — and a consumer building an extractor on the invented ones would be
+pinning shapes no upstream has ever sent.
+
+So say where a fixture's values came from, and say it where the values are:
+captured from a live response, copied from a reference implementation, or
+invented for the case. "Live-verified" on the test *function* does not answer it,
+because a test can drive a real code path with made-up input.
+
+The same distinction governs what a producer can promise a consumer about a
+published string. Values this module composes are stable because it controls
+them, and a change can be announced before it ships. Values passed through from
+an upstream are observed rather than planned: a change arrives on the wire first
+and is noticed afterwards. Both kinds sit side by side in the same field —
+`extraRateWindows[].id` is composed on one Antigravity lane and passed through on
+the other — so the guarantee is a property of the lane, not of the field.
+
 ## Testing these
 
 A regression for any of the above must fail *for the reason it names*. Eight ways
