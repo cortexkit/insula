@@ -636,3 +636,27 @@ level further out.
 One level of checking-the-checker is enough in practice. The regress is real but
 every defect found this way has been at the first level, and a control proven
 once to fire does not need re-proving unless its reporting path changes.
+
+### A hand-rolled scan of this crate needs its boundary checked first
+
+Sweeps across every provider are how several of the rules above were found, and
+the scan that performs one has its own way of lying. Twice now a sweep here has
+reported a provider missing something it had, because the extractor cut the file
+at the first `#[cfg(test)]` attribute rather than at the test module.
+
+That attribute appears on production items in this crate — a test-only
+constructor beside the real one, a `thread_local!` used for injection — so the
+cut can land a third of the way into a file and silently discard everything
+after it. `codex.rs` truncates at 32%, which is enough to hide most of what a
+provider does.
+
+The failure is one-directional and that is what makes it convincing: the scan
+reports things ABSENT that are present, never the reverse. A false "missing"
+looks exactly like a finding, so it is investigated and then explained away as a
+false positive — while a real gap in the same run is indistinguishable from the
+noise.
+
+So anchor on the module boundary (`#[cfg(test)]` immediately followed by
+`mod tests`), and before believing any sweep, print how much of each file it
+actually read. A scan reporting on 32% of a file is not a sweep with a caveat;
+it is a different question with the same name.
