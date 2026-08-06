@@ -46,7 +46,6 @@
 //! :771-775, request/headers :1467-1505/:1651-1660, representative :231-244, bucket
 //! kinds :362-371) + `AntigravityQuotaSummaryParser.swift:96-173`.
 
-use chrono::{DateTime, Utc};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use crate::credential_source::{CredentialSource, VaultCapability, VaultGetError};
@@ -535,7 +534,15 @@ struct RemoteQuotaBucket {
 /// A model whose bucket states no reset is skipped rather than pooled. Those are
 /// the always-available internal models, and folding a permanently-idle bucket
 /// into a metered pool would drag the pool's worst-case reading toward zero.
-fn parse_remote_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
+///
+/// No window length is published. The cloud response states none -- its buckets
+/// carry only a model id, a fraction, a reset and a token type -- and it cannot
+/// be inferred from the reset either: the local server meters each pool on both
+/// a five-hour and a weekly window, while the cloud returns a single reset per
+/// pool, so which of the two meters that reset belongs to is not knowable from
+/// this response. An absent cadence is a state consumers already handle; a
+/// guessed one would be acted on.
+fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
     let response: RemoteQuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
     let buckets = response
@@ -604,9 +611,7 @@ fn parse_remote_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, Fetch
             window: RateWindow {
                 used_percent,
                 raw_used_percent: None,
-                window_minutes: resets_at
-                    .as_deref()
-                    .and_then(|reset| remote_window_minutes(reset, now)),
+                window_minutes: None,
                 resets_at,
                 used_count: None,
                 total_count: None,
@@ -647,30 +652,6 @@ fn parse_remote_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, Fetch
         tertiary: None,
         extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
     })
-}
-
-/// The cadence of a remote pool, inferred from how far out its reset sits.
-///
-/// The cloud response states no window length, unlike the local server which
-/// labels each bucket. Time-to-reset only lower-bounds the true length, so this
-/// rounds up to the nearest cadence this provider is known to meter on rather
-/// than reporting the raw remainder -- a window read mid-cycle would otherwise
-/// publish a length far shorter than its real one.
-fn remote_window_minutes(reset_time: &str, now: DateTime<Utc>) -> Option<i64> {
-    let reset = DateTime::parse_from_rfc3339(reset_time)
-        .ok()?
-        .with_timezone(&Utc);
-    let minutes = reset.signed_duration_since(now).num_seconds() as f64 / 60.0;
-    if !minutes.is_finite() || minutes <= 0.0 {
-        return None;
-    }
-    if minutes <= SESSION_WINDOW_MINUTES as f64 {
-        Some(SESSION_WINDOW_MINUTES)
-    } else if minutes <= WEEKLY_WINDOW_MINUTES as f64 {
-        Some(WEEKLY_WINDOW_MINUTES)
-    } else {
-        None
-    }
 }
 
 // ---- provider ---------------------------------------------------------------
@@ -771,7 +752,7 @@ impl AntigravityProvider {
                 .timeout(REQUEST_TIMEOUT)
                 .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
                 .await?;
-            parse_remote_quota_at(&response.body, Utc::now())
+            parse_remote_quota(&response.body)
         }
         .await;
 
@@ -1210,12 +1191,6 @@ mod tests {
       ]
     }"#;
 
-    fn remote_now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-08-06T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
-    }
-
     /// The cloud lane publishes the same shape as the local probe.
     ///
     /// The two lanes describe one account and are handed different
@@ -1225,7 +1200,7 @@ mod tests {
     /// the cloud lane exists to remove.
     #[test]
     fn the_remote_lane_folds_models_into_the_same_pools_the_local_probe_publishes() {
-        let usage = parse_remote_quota_at(REMOTE_FIXTURE, remote_now()).expect("fixture parses");
+        let usage = parse_remote_quota(REMOTE_FIXTURE).expect("fixture parses");
 
         // The native Gemini pool owns the unnamed slot, as locally: an unnamed
         // window reads as the account's own capacity, and the external pool in
@@ -1261,7 +1236,7 @@ mod tests {
     /// constrained account look free.
     #[test]
     fn a_bucket_with_no_reset_does_not_dilute_a_metered_pool() {
-        let usage = parse_remote_quota_at(REMOTE_FIXTURE, remote_now()).unwrap();
+        let usage = parse_remote_quota(REMOTE_FIXTURE).unwrap();
         let extras = usage.extra_rate_windows.unwrap();
 
         assert!(
@@ -1294,35 +1269,41 @@ mod tests {
             // account with no quota to report.
             &br#"{"buckets":[{"modelId":"chat_1","remainingFraction":1}]}"#[..],
         ] {
-            let error = parse_remote_quota_at(body, remote_now())
+            let error = parse_remote_quota(body)
                 .expect_err("an unusable response must not publish an empty window set");
             assert!(matches!(error, FetchError::Decode(_)), "{error:?}");
         }
     }
 
-    /// The cadence is rounded up to a class this provider meters on.
+    /// The cloud lane states no cadence, because the response does not carry one.
     ///
-    /// The cloud states no window length, and time-to-reset only lower-bounds
-    /// it. Publishing the raw remainder would report a weekly window read an
-    /// hour before its reset as a one-hour cadence.
+    /// Its buckets have only a model id, a fraction, a reset and a token type.
+    /// Deriving a length from time-to-reset would be a guess, and a wrong one:
+    /// the local server meters each pool on both a five-hour and a weekly
+    /// window, while the cloud returns a single reset per pool, so the reset
+    /// alone does not say which meter it belongs to -- one three hours out could
+    /// be either.
+    ///
+    /// Consumers read `windowMinutes` as a cadence, and one check uses it as the
+    /// ceiling for a reset-plausibility test. A fabricated five-hour length on a
+    /// weekly window would both misreport the pace and disable the check that
+    /// would have caught it.
     #[test]
-    fn a_mid_cycle_reset_does_not_shrink_the_published_cadence() {
-        let now = remote_now();
-        let session = (now + chrono::Duration::minutes(30)).to_rfc3339();
-        let weekly = (now + chrono::Duration::hours(70)).to_rfc3339();
+    fn the_remote_lane_publishes_no_cadence_it_cannot_know() {
+        let usage = parse_remote_quota(REMOTE_FIXTURE).unwrap();
 
-        assert_eq!(
-            remote_window_minutes(&session, now),
-            Some(SESSION_WINDOW_MINUTES)
-        );
-        assert_eq!(
-            remote_window_minutes(&weekly, now),
-            Some(WEEKLY_WINDOW_MINUTES)
-        );
-
-        // A reset already past states no usable cadence, rather than a negative
-        // or zero one.
-        let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
-        assert_eq!(remote_window_minutes(&past, now), None);
+        assert_eq!(usage.primary.as_ref().unwrap().window_minutes, None);
+        for extra in usage.extra_rate_windows.as_ref().unwrap() {
+            let window = extra.window.as_ref().unwrap();
+            assert_eq!(
+                window.window_minutes,
+                None,
+                "{:?} published a cadence the response never stated",
+                extra.id.as_deref()
+            );
+            // Not vacuous: the reset the response DOES state is still carried,
+            // so this cannot pass by dropping the window's timing entirely.
+            assert!(window.resets_at.is_some());
+        }
     }
 }
