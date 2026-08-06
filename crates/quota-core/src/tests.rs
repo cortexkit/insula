@@ -662,6 +662,82 @@ async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() 
     assert_eq!(labeled[0].account.as_deref(), Some("A"));
 }
 
+/// A labeled provider can publish one account and omit a sibling that still
+/// exists.
+///
+/// Both accounts resolve, so the read path takes the labeled branch and every
+/// entry carries its own account. A handle whose identity then becomes
+/// unconfirmed is withheld -- its entry is cleared while its observation is
+/// kept, so the provider still counts as fully resolved and its remaining
+/// accounts stay labeled. The result is an array naming account A with no
+/// mention of account B at all.
+///
+/// This is the case a consumer cannot infer from the array: nothing marks the
+/// response as partial, and B's absence is identical in shape to B having been
+/// removed. A consumer that reconciles by provider -- deleting stored accounts
+/// not named in a response that contained a usable entry -- loses B here, and
+/// gets it back only if it refetches. Absence of an account is never a statement
+/// that the account is gone.
+#[tokio::test]
+async fn a_withheld_account_leaves_its_labeled_siblings_published() {
+    let labels = Arc::new(Mutex::new(HashMap::from([
+        ("H1".to_string(), Some("A".to_string())),
+        ("H2".to_string(), Some("B".to_string())),
+    ])));
+    let registry = Registry::new(vec![Box::new(LabelProvider {
+        labels: Arc::clone(&labels),
+    })]);
+
+    tick(&registry).await;
+    let both = registry.get_usage(None).await;
+    assert_eq!(
+        both.iter()
+            .map(|entry| entry.account.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("A"), Some("B")],
+        "both accounts must be published before one is withheld"
+    );
+
+    // Withhold H2 exactly as the fail-closed path does: clear the entry, keep
+    // the observation. Keeping it is what holds the provider "fully resolved",
+    // so the siblings stay labeled instead of collapsing to one unlabeled entry.
+    let key = SlotKey::new("multi", handle("H2"));
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut slot = store.get(&key).unwrap().clone();
+        slot.label_in_flux = true;
+        slot.entry = None;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+
+    let partial = registry.get_usage(None).await;
+    assert_eq!(
+        partial
+            .iter()
+            .map(|entry| entry.account.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("A")],
+        "the withheld account must vanish from the array while its sibling stays labeled"
+    );
+
+    // Not vacuous: B is still a live account, and returns on the next successful
+    // fetch without anything being re-added. If withholding had removed the
+    // account rather than suppressing one response, this would stay absent.
+    force_due(&registry, "multi");
+    tick(&registry).await;
+    let restored = registry.get_usage(None).await;
+    assert_eq!(
+        restored
+            .iter()
+            .map(|entry| entry.account.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("A"), Some("B")],
+        "the withheld account must come back on its own"
+    );
+}
+
 struct UnresolvedSelectionProvider;
 
 #[async_trait]

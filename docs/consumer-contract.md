@@ -413,6 +413,41 @@ signal working, not the threshold being wrong, and
 [the freshness section](#freshness-comes-from-the-producer-never-from-the-poll)
 covers what to do with it.
 
+## An absent account is never a statement that the account is gone
+
+The rule above applies per **entry**, and an entry is per account — so a
+provider with several accounts can publish some and omit others in the same
+response, with nothing marking that response as partial.
+
+Both shapes are reachable and ordinary:
+
+- **A labeled sibling vanishes.** Every account resolves, so entries carry their
+  own account, and one of them is then withheld because its identity became
+  unconfirmed. Its entry is cleared while its identity is kept, so the provider
+  still counts as fully resolved and the remaining accounts stay labeled. The
+  array names account A and does not mention account B at all.
+- **A new account collapses the whole provider.** A credential added for a
+  second account has no identity until its first fetch completes, and while any
+  account of a provider is unidentified all of them publish as a single
+  unlabeled entry. So adding an account briefly makes the accounts you already
+  had stop being named.
+
+Neither is a fault, both clear on their own within a refresh cycle, and neither
+is distinguishable from the account having been removed by looking at the array.
+
+**So do not reconcile by provider.** Deleting stored accounts that a response
+did not name — even a response containing perfectly usable entries for that
+provider — discards capacity that still exists and is merely unmentioned. Key
+retention on `(provider, account)`, update the accounts a response names, and
+leave the rest alone to age on their own `fetchedAt`.
+
+There is no completion or tombstone signal on this wire, and health does not
+supply one either: its counts are per provider, so they cannot tell you how many
+accounts a provider ought to have. Nothing published today distinguishes
+"account removed" from "account not mentioned this time". If you need that
+distinction, ask rather than infer it — it is a wire change, not a reading of
+the current one.
+
 ## Verdict versus unfinished
 
 A degraded entry is a **verdict**: this module concluded the credential or
