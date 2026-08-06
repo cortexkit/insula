@@ -535,6 +535,16 @@ struct RemoteQuotaBucket {
 /// the always-available internal models, and folding a permanently-idle bucket
 /// into a metered pool would drag the pool's worst-case reading toward zero.
 ///
+/// Pooling also keeps this provider's identifiers out of a namespace it shares
+/// with another. Antigravity and Gemini are separate products on the same Google
+/// API, and every model id the Gemini provider publishes appears in this
+/// response too. Publishing per-model detail here would emit identifiers
+/// byte-identical to that provider's while describing a different quota pool
+/// under a different credential -- so a consumer keying on the identifier alone
+/// would merge two products and see plausible numbers throughout. The wire
+/// contract asks consumers to key on `(provider, id)`, but a shape that cannot
+/// collide is worth more than a rule saying it must not.
+///
 /// No window length is published. The cloud response states none -- its buckets
 /// carry only a model id, a fraction, a reset and a token type -- and it cannot
 /// be inferred from the reset either: the local server meters each pool on both

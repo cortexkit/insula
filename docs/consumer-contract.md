@@ -317,6 +317,17 @@ one, so a consumer ignoring `extraRateWindows` silently ignores real limits.
 one provider's ids are model names, another's are its own scope labels. Key on
 `(provider, id)`, never on `id` alone.
 
+That is not a precaution against a coincidence. Two providers here are separate
+products reached through the same Google API and sharing its model catalogue, so
+their identifiers are drawn from one namespace: every model id `gemini` publishes
+— `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.5-pro`,
+`gemini-3.1-flash-lite` — also appears in `antigravity`'s upstream response. They
+do not collide on the wire only because `antigravity` folds its models into pools
+before publishing, which is a property of this module's normalizer rather than of
+the data. The two describe different quota pools under different credentials, so
+a consumer keying on `id` alone would merge them and see plausible numbers
+throughout.
+
 **Nor is it guaranteed stable within a provider.** Where a provider reads one
 account through more than one lane, the lanes can publish different ids for the
 same limit, and which lane answers is decided per fetch. `antigravity` does this
