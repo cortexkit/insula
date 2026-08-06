@@ -3814,3 +3814,95 @@ async fn a_labeled_entry_is_withheld_while_its_identity_is_in_flux() {
          its previous account label"
     );
 }
+
+/// Two lanes of one provider, both healthy, publishing different window sets.
+///
+/// The windows are named so the selected lane is identifiable. Two lanes can
+/// describe the same account at different granularities: `antigravity` reads
+/// per-pool detail from a local process and pooled summaries from its cloud API,
+/// folding a flat per-model response back into pools, so the two do not publish
+/// an identical set of windows.
+struct TwoLaneProvider;
+
+fn named_window(id: &str) -> Usage {
+    Usage {
+        extra_rate_windows: Some(vec![crate::model::ExtraWindow {
+            id: Some(id.to_string()),
+            title: Some(id.to_string()),
+            window: Some(crate::model::RateWindow {
+                used_percent: 10.0,
+                raw_used_percent: None,
+                resets_at: None,
+                window_minutes: None,
+                used_count: None,
+                total_count: None,
+            }),
+        }]),
+        ..Usage::default()
+    }
+}
+
+#[async_trait]
+impl UsageProvider for TwoLaneProvider {
+    fn name(&self) -> &str {
+        "two-lane"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![
+            CredentialHandle::implicit(),
+            CredentialHandle::vault(
+                "remote:lane",
+                crate::credential_source::VaultCapability::new("ckh_two_lane"),
+            ),
+        ])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        // Neither lane resolves an account id, which is the case for a provider
+        // whose upstream does not identify the account -- so both entries are
+        // unlabeled and the read path must pick exactly one.
+        let lane = if handle.is_local() { "local" } else { "remote" };
+        FetchAttempt::success(observed(None), "test", named_window(lane))
+    }
+}
+
+/// When both lanes of one provider are healthy, the local lane is served.
+///
+/// Two handles that resolve no account are indistinguishable to a consumer, so
+/// exactly one entry is published and something has to choose it. Freshness and
+/// health decide first; when those tie -- which is the ordinary case once both
+/// lanes are working -- the tie is broken toward the local one.
+///
+/// This became observable only once a provider gained two lanes that report
+/// DIFFERENT window sets. While every provider's lanes published the same shape,
+/// the choice could not be seen from the wire and any order looked correct. Now
+/// the winner decides which windows a consumer receives, so leaving it to handle
+/// ordering would make the published shape depend on an incidental detail.
+///
+/// Local is preferred because it does not spend a credential: it reads a process
+/// or file on this machine, where the other lane costs a vault lookup and a
+/// network round trip to learn the same thing.
+#[tokio::test]
+async fn the_local_lane_wins_when_both_lanes_of_a_provider_are_healthy() {
+    let registry = Registry::new(vec![Box::new(TwoLaneProvider)]);
+    tick(&registry).await;
+
+    let entries = registry.get_usage(Some("two-lane")).await;
+
+    // Exactly one entry: two unlabeled entries for one provider are
+    // indistinguishable to anything keying on (provider, account).
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+
+    let ids: Vec<&str> = entries[0]
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.extra_rate_windows.as_ref())
+        .map(|extras| extras.iter().filter_map(|x| x.id.as_deref()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        ids,
+        vec!["local"],
+        "the remote lane won a tie against local"
+    );
+}
