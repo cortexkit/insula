@@ -349,8 +349,20 @@ impl GeminiProvider {
         }
     }
 
+    /// Read the cached access token, if one is still valid.
+    ///
+    /// A poisoned lock is recovered rather than propagated, matching every other
+    /// lock in this crate. The guarded value is a token and an expiry, which a
+    /// panicking writer cannot leave torn: the worst case is a stale entry, and
+    /// the expiry check below rejects it. Panicking instead would be worse than
+    /// the corruption being guarded against -- a panic inside a fetch is caught
+    /// by the refresher and classified non-transient, which marks the provider
+    /// dead until the process restarts, on the strength of one poisoned mutex.
     fn cached_token(&self, now: Instant) -> Option<String> {
-        let guard = self.token.lock().expect("gemini token mutex poisoned");
+        let guard = self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard
             .as_ref()
             .filter(|t| t.expires_at > now)
@@ -358,7 +370,10 @@ impl GeminiProvider {
     }
 
     fn store_token(&self, token: String, expires_at: Instant) {
-        *self.token.lock().expect("gemini token mutex poisoned") = Some(CachedToken {
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedToken {
             token: token.clone(),
             expires_at,
         });
@@ -1072,6 +1087,51 @@ mod tests {
         );
         assert_eq!(attempt.observed.unwrap().record_version, Some(120));
         assert!(matches!(attempt.usage, Err(FetchError::Decode(_))));
+    }
+
+    /// A poisoned token lock is recovered, not propagated.
+    ///
+    /// A mutex is poisoned when a thread panics while holding it, and the panic
+    /// need not come from this code -- an allocation failure or a panic in any
+    /// caller on that stack does it. Propagating would be worse than the
+    /// corruption it guards against: the refresher catches a panic inside a
+    /// fetch and classifies it non-transient, which replaces this provider's
+    /// cached window with a degraded entry and keeps it there. One poisoned
+    /// mutex would take the provider down until the process restarted.
+    ///
+    /// Recovering is sound here because the guarded value cannot be torn: it is
+    /// a token with its expiry, so a writer that panicked mid-update leaves
+    /// either the old entry or the new one, and a stale entry is rejected by the
+    /// expiry check on read.
+    #[test]
+    fn a_poisoned_token_lock_is_recovered_rather_than_propagated() {
+        let provider = GeminiProvider::new();
+        let now = Instant::now();
+        provider.store_token("cached-token".to_string(), now + Duration::from_secs(300));
+
+        // Poison it the only way a mutex is ever poisoned: panic while holding it.
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = provider.token.lock().unwrap();
+                    panic!("deliberate panic while holding the token lock");
+                })
+                .join()
+        });
+        assert!(panicked.is_err(), "the helper thread must actually panic");
+        assert!(
+            provider.token.is_poisoned(),
+            "the lock must be poisoned for this test to mean anything"
+        );
+
+        // Both accessors keep working, and the cached value survived.
+        assert_eq!(
+            provider.cached_token(now),
+            Some("cached-token".to_string()),
+            "a poisoned lock must not cost the provider its cached token"
+        );
+        provider.store_token("replacement".to_string(), now + Duration::from_secs(300));
+        assert_eq!(provider.cached_token(now), Some("replacement".to_string()));
     }
 
     #[test]
