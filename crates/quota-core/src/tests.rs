@@ -3068,6 +3068,12 @@ fn f2_legacy_journal_records_default_attempt_metadata() {
     assert_eq!(records[0].attempt_count, 0);
 }
 
+/// Retention removes settled records and only settled ones.
+///
+/// Driven through `inspect_account`, which is the only door production opens:
+/// pruning happens as a side effect of asking about an account, so a test
+/// calling a prune entry point directly would exercise a path the module never
+/// takes and could pass while the production one did nothing.
 #[test]
 fn redemption_journal_prunes_old_resolved_records_only() {
     let temp = ResetTempDir::new("prune");
@@ -3094,10 +3100,57 @@ fn redemption_journal_prunes_old_resolved_records_only() {
         .resolve("recent", &recent_id, ConsumeOutcome::NoCredit)
         .unwrap();
 
-    assert_eq!(journal.prune(now).unwrap(), 1);
+    journal.inspect_account("old", now).unwrap();
+
     let records = journal.records().unwrap();
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].account_id, "recent");
+}
+
+/// A pending record is never pruned, however old it is.
+///
+/// This is the fence against spending a banked credit twice. A pending record
+/// is a redemption whose outcome the server never confirmed, and its id is the
+/// only thing tying a retry to the original attempt. If retention removed it,
+/// the next reservation would mint a FRESH id and post the same logical
+/// redemption a second time -- which spends a real credit on a real account,
+/// and is not recoverable.
+///
+/// The age here is deliberately past the retention horizon that governs settled
+/// records, expressed relative to the horizon rather than as a fixed number of
+/// days, so shortening that constant cannot leave this case inside the window
+/// and silently stop testing anything.
+#[test]
+fn a_pending_redemption_is_never_pruned_however_old() {
+    let temp = ResetTempDir::new("pending-outlives-retention");
+    let now = reset_now();
+    let journal = temp.journal();
+
+    let horizon = chrono::Duration::seconds(crate::codex_resets::RESOLVED_RETENTION_SECS);
+    let reserved_at = now - horizon - chrono::Duration::days(1);
+    let pending_id = match journal.reserve("acct", reserved_at).unwrap() {
+        Reservation::New(id) => id,
+        other => panic!("expected a new pending id, got {other:?}"),
+    };
+
+    // Asking about an account is what triggers retention in production, so this
+    // is the call that would drop the record if the status guard were wrong.
+    let state = journal.inspect_account("acct", now).unwrap();
+    assert_eq!(
+        state.pending_id.as_deref(),
+        Some(pending_id.as_str()),
+        "an unconfirmed redemption was pruned; a retry would mint a second id \
+         for the same redemption and spend the credit twice"
+    );
+
+    // And the id a caller would actually reuse is still that one.
+    assert_eq!(
+        journal.reserve("acct", now),
+        Ok(Reservation::ExistingPending(pending_id.clone()))
+    );
+    let records = journal.records().unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].redeem_request_id, pending_id);
 }
 
 #[test]

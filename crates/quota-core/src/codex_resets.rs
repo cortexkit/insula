@@ -499,15 +499,6 @@ impl RedemptionJournal {
         Ok(())
     }
 
-    pub fn prune(&self, now: DateTime<Utc>) -> Result<usize, JournalError> {
-        let mut records = self.load()?;
-        let removed = prune_records(&mut records, now)?;
-        if removed > 0 {
-            self.save(&records)?;
-        }
-        Ok(removed)
-    }
-
     fn load(&self) -> Result<Vec<RedemptionRecord>, JournalError> {
         let body = match fs::read(&self.path) {
             Ok(body) => body,
