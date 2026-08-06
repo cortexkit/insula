@@ -108,6 +108,7 @@ enum ProviderKind {
     Anthropic,
     Grok,
     Gemini,
+    Antigravity,
     KimiForCoding,
 }
 
@@ -117,6 +118,7 @@ struct ProviderHandleSnapshot {
     anthropic: Vec<CredentialHandle>,
     grok: Vec<CredentialHandle>,
     gemini: Vec<CredentialHandle>,
+    antigravity: Vec<CredentialHandle>,
     kimi_for_coding: Vec<CredentialHandle>,
 }
 
@@ -127,6 +129,7 @@ impl ProviderHandleSnapshot {
             ProviderKind::Anthropic => &self.anthropic,
             ProviderKind::Grok => &self.grok,
             ProviderKind::Gemini => &self.gemini,
+            ProviderKind::Antigravity => &self.antigravity,
             ProviderKind::KimiForCoding => &self.kimi_for_coding,
         }
     }
@@ -136,6 +139,7 @@ impl ProviderHandleSnapshot {
             ProviderKind::Codex => self.codex.push(handle),
             ProviderKind::Anthropic => self.anthropic.push(handle),
             ProviderKind::Grok => self.grok.push(handle),
+            ProviderKind::Antigravity => self.antigravity.push(handle),
             ProviderKind::Gemini => self.gemini.push(handle),
             ProviderKind::KimiForCoding => self.kimi_for_coding.push(handle),
         }
@@ -185,6 +189,12 @@ impl VaultHandleLoader {
     /// Return the authoritative Gemini vault handle snapshot for this scheduler turn.
     pub fn gemini_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Gemini)
+    }
+
+    /// Return the authoritative Antigravity vault handle snapshot for this
+    /// scheduler turn.
+    pub fn antigravity_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Antigravity)
     }
 
     /// Return the authoritative Kimi coding-plan vault handle snapshot for this
@@ -380,7 +390,15 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             Some(ProviderKind::Anthropic)
         } else if prefixed_id(id, "oauth:xai") {
             Some(ProviderKind::Grok)
-        } else if id == "antigravity:google" || prefixed_id(id, "oauth:google") {
+        } else if id == "antigravity:google" {
+            // Antigravity's own Google credential, not a Gemini CLI one. Both
+            // reach the same Code Assist API, but they see different products:
+            // this one's quota response carries Antigravity's model pool
+            // (Claude and GPT alongside Gemini), which a Gemini CLI login has no
+            // access to. Serving it to the Gemini lane would publish another
+            // product's capacity under Gemini's name.
+            Some(ProviderKind::Antigravity)
+        } else if prefixed_id(id, "oauth:google") {
             Some(ProviderKind::Gemini)
         } else if id == "kimi-for-coding" {
             Some(ProviderKind::KimiForCoding)
@@ -544,8 +562,19 @@ mod tests {
         assert_eq!(loader.codex_handles().unwrap().len(), 1);
         assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
         assert_eq!(loader.grok_handles().unwrap().len(), 2);
-        assert_eq!(loader.gemini_handles().unwrap().len(), 2);
         assert_eq!(loader.kimi_for_coding_handles().unwrap().len(), 1);
+
+        // Both are Google credentials reaching the same Code Assist API, and
+        // they must not be pooled: the Antigravity login sees Antigravity's
+        // model quota (Claude and GPT alongside Gemini), which a Gemini CLI
+        // login cannot access. Pooling them lets one product's capacity be
+        // published under the other's name.
+        let gemini = loader.gemini_handles().unwrap();
+        assert_eq!(gemini.len(), 1);
+        assert_eq!(gemini[0].stable_id(), "oauth:google:cli");
+        let antigravity = loader.antigravity_handles().unwrap();
+        assert_eq!(antigravity.len(), 1);
+        assert_eq!(antigravity[0].stable_id(), "antigravity:google");
         let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
         assert!(warning.contains("unknown:provider"));
         for mapped_id in [

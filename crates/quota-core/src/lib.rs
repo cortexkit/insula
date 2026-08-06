@@ -317,7 +317,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(antigravity::AntigravityProvider::new()),
+            Box::new(antigravity::AntigravityProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(codebuff::CodebuffProvider::new()),
             Box::new(copilot::CopilotProvider::new()),
             Box::new(cursor::CursorProvider::new()),

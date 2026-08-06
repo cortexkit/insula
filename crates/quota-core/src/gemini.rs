@@ -811,8 +811,20 @@ mod tests {
         br#"{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.4,"resetTime":"2026-07-16T00:00:00Z"}]}"#.to_vec()
     }
 
+    /// The Antigravity Google credential is not a Gemini credential.
+    ///
+    /// Both are Google logins reaching the same Code Assist API, so pooling them
+    /// looks harmless and the requests even succeed. They answer for different
+    /// products: an Antigravity login's quota response carries Antigravity's own
+    /// model pool, Claude and GPT included, which a Gemini CLI login has no
+    /// access to. Serving it here would publish that pool as Gemini's capacity,
+    /// and the numbers would look entirely plausible.
+    ///
+    /// Today the local lane usually wins this provider's selection, so the
+    /// mistake would surface only once the local credential failed — which is
+    /// the worst moment to start reporting another product's numbers.
     #[test]
-    fn handles_include_both_google_vault_id_families_when_source_is_wired() {
+    fn the_antigravity_google_credential_is_not_offered_to_gemini() {
         let path = write_handles(
             r#"{"handles":{"antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","oauth:xai":"ckh_grok"}}"#,
         );
@@ -822,10 +834,18 @@ mod tests {
             Arc::new(VaultHandleLoader::new(Some(path.clone()))),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles.len(), 3);
+
+        // Not vacuous: the Gemini CLI credential is still offered, so this
+        // cannot pass by dropping every vault handle.
+        assert_eq!(handles.len(), 2);
         assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "antigravity:google");
-        assert_eq!(handles[2].stable_id(), "oauth:google:cli");
+        assert_eq!(handles[1].stable_id(), "oauth:google:cli");
+        assert!(
+            !handles
+                .iter()
+                .any(|handle| handle.stable_id() == "antigravity:google"),
+            "the Antigravity credential reached the Gemini lane"
+        );
         let _ = std::fs::remove_file(path);
     }
 

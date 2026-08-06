@@ -46,7 +46,12 @@
 //! :771-775, request/headers :1467-1505/:1651-1660, representative :231-244, bucket
 //! kinds :362-371) + `AntigravityQuotaSummaryParser.swift:96-173`.
 
-use std::{collections::HashSet, time::Duration};
+use chrono::{DateTime, Utc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+
+use crate::credential_source::{CredentialSource, VaultCapability, VaultGetError};
+use crate::provider::AccountObservation;
+use crate::vault_handles::VaultHandleLoader;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -62,6 +67,11 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "antigravity";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// The cloud Code Assist quota endpoint, used when no local process is running.
+const REMOTE_QUOTA_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+/// Identifies the calling product on that shared endpoint.
+const REMOTE_USER_AGENT: &str = "antigravity";
+
 const QUOTA_SUMMARY_PATH: &str =
     "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 
@@ -259,6 +269,24 @@ fn pool_of(group_title: &str) -> Pool {
     if t.contains("gemini") {
         Pool::Gemini
     } else if t.contains("claude") || t.contains("gpt") {
+        Pool::ClaudeGpt
+    } else {
+        Pool::Other
+    }
+}
+
+/// The pool a model belongs to, for the remote lane.
+///
+/// The local server labels its groups ("Gemini Models", "Claude and GPT
+/// models"); the cloud API does not, and returns a flat list of models. The
+/// model id is the only pool evidence it carries, and the same two-pool split is
+/// visible in it: the native Gemini models meter separately from the external
+/// Claude and GPT ones.
+fn pool_of_model_id(model_id: &str) -> Pool {
+    let id = model_id.to_ascii_lowercase();
+    if id.starts_with("gemini") {
+        Pool::Gemini
+    } else if id.starts_with("claude") || id.contains("gpt") {
         Pool::ClaudeGpt
     } else {
         Pool::Other
@@ -474,22 +502,298 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
     })
 }
 
+// ---- remote lane (cloud, no local process) -----------------------------------
+
+/// A `retrieveUserQuota` response: a flat list of per-model buckets.
+#[derive(Debug, Deserialize)]
+struct RemoteQuotaResponse {
+    buckets: Option<Vec<RemoteQuotaBucket>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteQuotaBucket {
+    #[serde(rename = "modelId")]
+    model_id: Option<String>,
+    #[serde(rename = "remainingFraction")]
+    remaining_fraction: Option<f64>,
+    #[serde(rename = "resetTime")]
+    reset_time: Option<String>,
+}
+
+/// Normalize a cloud `retrieveUserQuota` body into the same shape the local
+/// probe publishes.
+///
+/// The two lanes describe one account and must agree, but they are handed
+/// different granularities: the local server returns named pool groups, while
+/// the cloud returns one bucket per model. Twenty-odd near-identical model rows
+/// are not what a reader wants, and they are not independent meters either --
+/// every model in a pool shares that pool's fraction and reset. So the models
+/// are folded back into their pools here, and the published shape is the same
+/// either way: the native Gemini pool in the unnamed `primary`, both pools as
+/// named extra windows.
+///
+/// A model whose bucket states no reset is skipped rather than pooled. Those are
+/// the always-available internal models, and folding a permanently-idle bucket
+/// into a metered pool would drag the pool's worst-case reading toward zero.
+fn parse_remote_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
+    let response: RemoteQuotaResponse = serde_json::from_slice(body)
+        .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
+    let buckets = response
+        .buckets
+        .filter(|buckets| !buckets.is_empty())
+        .ok_or_else(|| FetchError::Decode("antigravity remote quota has no buckets".to_string()))?;
+
+    // Pool -> (worst used percent seen, its reset, how many models it covers).
+    let mut pools: Vec<(Pool, f64, Option<String>, usize)> = Vec::new();
+    for bucket in &buckets {
+        let (Some(model_id), Some(remaining)) = (
+            bucket
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty()),
+            bucket.remaining_fraction,
+        ) else {
+            continue;
+        };
+        if !remaining.is_finite() {
+            continue;
+        }
+        let Some(reset) = bucket
+            .reset_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|reset| !reset.is_empty())
+        else {
+            continue;
+        };
+        // Same 2dp rounding as the local lane, so one account cannot read
+        // differently depending on which lane answered.
+        let used_percent = (((1.0 - remaining) * 100.0).clamp(0.0, 100.0) * 100.0).round() / 100.0;
+        let pool = pool_of_model_id(model_id);
+        match pools.iter_mut().find(|(existing, ..)| *existing == pool) {
+            Some((_, worst, worst_reset, count)) => {
+                *count += 1;
+                if used_percent > *worst {
+                    *worst = used_percent;
+                    *worst_reset = Some(reset.to_string());
+                }
+            }
+            None => pools.push((pool, used_percent, Some(reset.to_string()), 1)),
+        }
+    }
+
+    if pools.is_empty() {
+        return Err(FetchError::Decode(
+            "antigravity remote quota: no bucket carried a usable fraction and reset".to_string(),
+        ));
+    }
+
+    let mut resolved: Vec<ResolvedWindow> = Vec::new();
+    for (pool, used_percent, reset, models) in pools {
+        let resets_at = reset
+            .as_deref()
+            .and_then(|reset| parse_reset(&Value::String(reset.to_string())));
+        let title = match pool {
+            Pool::Gemini => "Gemini Models",
+            Pool::ClaudeGpt => "Claude and GPT models",
+            Pool::Other => "Other models",
+        };
+        resolved.push(ResolvedWindow {
+            pool,
+            window: RateWindow {
+                used_percent,
+                raw_used_percent: None,
+                window_minutes: resets_at
+                    .as_deref()
+                    .and_then(|reset| remote_window_minutes(reset, now)),
+                resets_at,
+                used_count: None,
+                total_count: None,
+            },
+            title: format!("{title} ({models} models)"),
+            id: title.to_string(),
+        });
+    }
+
+    // Identical pool selection to the local lane: only the native Gemini pool may
+    // claim the unnamed slot, since an unnamed window reads as the account's own
+    // capacity and a walled external pool there would report the whole provider
+    // exhausted while Gemini is free.
+    let primary = representative(&resolved, Pool::Gemini).or_else(|| {
+        resolved
+            .iter()
+            .max_by(|a, b| {
+                a.window
+                    .used_percent
+                    .partial_cmp(&b.window.used_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|w| w.window.clone())
+    });
+
+    let extra: Vec<ExtraWindow> = resolved
+        .iter()
+        .map(|w| ExtraWindow {
+            title: Some(w.title.clone()),
+            id: Some(w.id.clone()),
+            window: Some(w.window.clone()),
+        })
+        .collect();
+
+    Ok(Usage {
+        primary,
+        secondary: None,
+        tertiary: None,
+        extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
+    })
+}
+
+/// The cadence of a remote pool, inferred from how far out its reset sits.
+///
+/// The cloud response states no window length, unlike the local server which
+/// labels each bucket. Time-to-reset only lower-bounds the true length, so this
+/// rounds up to the nearest cadence this provider is known to meter on rather
+/// than reporting the raw remainder -- a window read mid-cycle would otherwise
+/// publish a length far shorter than its real one.
+fn remote_window_minutes(reset_time: &str, now: DateTime<Utc>) -> Option<i64> {
+    let reset = DateTime::parse_from_rfc3339(reset_time)
+        .ok()?
+        .with_timezone(&Utc);
+    let minutes = reset.signed_duration_since(now).num_seconds() as f64 / 60.0;
+    if !minutes.is_finite() || minutes <= 0.0 {
+        return None;
+    }
+    if minutes <= SESSION_WINDOW_MINUTES as f64 {
+        Some(SESSION_WINDOW_MINUTES)
+    } else if minutes <= WEEKLY_WINDOW_MINUTES as f64 {
+        Some(WEEKLY_WINDOW_MINUTES)
+    } else {
+        None
+    }
+}
+
 // ---- provider ---------------------------------------------------------------
 
-/// The Antigravity usage provider (local-process probe).
+/// The Antigravity usage provider: a local-process probe and a cloud lane.
 pub struct AntigravityProvider {
     /// Loopback-only client: cert validation disabled because the editor's local
     /// server uses a self-signed cert. NEVER used for a non-loopback URL (guarded).
     http: reqwest::Client,
+    /// Ordinary client for the cloud lane.
+    ///
+    /// Deliberately separate from `http`: that one accepts any certificate, which
+    /// is only defensible against a server on this machine. Sharing it with a
+    /// public endpoint would silently extend that exemption across the network.
+    remote_http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    quota_url: String,
 }
 
 impl AntigravityProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::new(None)))
+    }
+
+    pub fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http }
+        Self {
+            http,
+            remote_http: reqwest::Client::new(),
+            credential_source,
+            handle_loader,
+            quota_url: REMOTE_QUOTA_URL.to_string(),
+        }
+    }
+
+    /// Fetch quota from the cloud, needing no local process.
+    ///
+    /// The credential is Antigravity's own Google login, served by the vault.
+    /// This is the same Code Assist endpoint the Gemini provider calls, and the
+    /// account behind the token is what makes the answers differ: an Antigravity
+    /// login's quota covers Antigravity's model pool, Claude and GPT included.
+    async fn fetch_remote(&self, capability: &VaultCapability) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(VaultGetError::Permanent);
+        };
+        let mut credential = match credential_source.get(capability, 120_000).await {
+            Ok(credential) => credential,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let record_version = credential.record_version;
+        let account_info = credential.account_info();
+        let observed = Some(AccountObservation::new(
+            credential
+                .account_id
+                .clone()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            Some(record_version),
+        ));
+        let project = credential
+            .project_id
+            .clone()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let access_token = match String::from_utf8(std::mem::take(&mut credential.payload)) {
+            Ok(access_token) => access_token,
+            Err(error) => {
+                let mut payload = error.into_bytes();
+                payload.fill(0);
+                return FetchAttempt::failure(
+                    observed,
+                    Some("vault".to_string()),
+                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
+                );
+            }
+        };
+
+        let result: Result<Usage, FetchError> = async {
+            // The project scopes the query where the vault knows one. The endpoint
+            // also answers without it, so an absent project is not a failure.
+            let body = match &project {
+                Some(project) => serde_json::json!({ "project": project }),
+                None => serde_json::json!({}),
+            };
+            let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
+            let response = JsonRequest::post_json(&self.quota_url, body)
+                .bearer(&access_token)
+                // Identifies the calling product to the shared endpoint, matching
+                // what the Antigravity client sends.
+                .header(Header::new("User-Agent", REMOTE_USER_AGENT))
+                .timeout(REQUEST_TIMEOUT)
+                .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
+                .await?;
+            parse_remote_quota_at(&response.body, Utc::now())
+        }
+        .await;
+
+        if let (Some(source), Err(FetchError::ProviderStatus(status @ (401 | 403)))) =
+            (self.credential_source.as_ref(), &result)
+        {
+            let source = Arc::clone(source);
+            let capability = capability.clone();
+            let status = *status;
+            tokio::spawn(async move {
+                source
+                    .report_auth_failure(&capability, status, record_version)
+                    .await;
+            });
+        }
+
+        match result {
+            Ok(usage) => {
+                FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+            }
+            Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
+        }
     }
 
     /// POST the quota-summary RPC to one discovered server/port. Returns the parsed
@@ -571,7 +875,30 @@ impl UsageProvider for AntigravityProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    /// One handle per available lane.
+    ///
+    /// The local probe is always offered: it needs no credential, and when the
+    /// editor is running it is the cheaper and more detailed answer. The cloud
+    /// lane is offered whenever a vault credential exists, and is what keeps this
+    /// provider reporting with nothing open.
+    ///
+    /// Unlike the vault-served providers, the local lane is NOT replaced when a
+    /// vault handle appears. Both describe the same account, so there is no
+    /// identity ambiguity to avoid, and keeping both means a cloud outage or a
+    /// dead credential still leaves the local answer.
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        let mut handles = vec![CredentialHandle::implicit()];
+        if self.credential_source.is_some() {
+            handles.extend(self.handle_loader.antigravity_handles()?);
+        }
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if let Some(capability) = handle.vault_capability() {
+            return self.fetch_remote(capability).await;
+        }
+
         let result: Result<ProviderUsage, FetchError> = async {
             let servers = tokio::task::spawn_blocking(discover_servers)
                 .await
@@ -861,5 +1188,141 @@ mod tests {
         // App language server: token extracted.
         assert_eq!(servers[1].pid, 456);
         assert_eq!(servers[1].csrf_token, "tok");
+    }
+
+    /// A live capture of the cloud response, trimmed to one model per distinct
+    /// (pool, fraction, reset) so every shape below is one the endpoint really
+    /// returned rather than one convenient to parse.
+    const REMOTE_FIXTURE: &[u8] = br#"{
+      "buckets": [
+        { "tokenType": "WTUS", "modelId": "chat_20706", "remainingFraction": 1 },
+        { "resetTime": "2026-08-06T11:51:11Z", "tokenType": "WTUS",
+          "modelId": "claude-opus-4-6-thinking", "remainingFraction": 1 },
+        { "resetTime": "2026-08-06T11:51:11Z", "tokenType": "WTUS",
+          "modelId": "claude-sonnet-4-6", "remainingFraction": 0.5 },
+        { "resetTime": "2026-08-06T09:38:35Z", "tokenType": "WTUS",
+          "modelId": "gemini-2.5-flash", "remainingFraction": 0.98586655 },
+        { "resetTime": "2026-08-06T09:38:35Z", "tokenType": "WTUS",
+          "modelId": "gemini-3.1-pro-high", "remainingFraction": 0.98586655 },
+        { "resetTime": "2026-08-06T11:51:11Z", "tokenType": "WTUS",
+          "modelId": "gpt-oss-120b-medium", "remainingFraction": 1 },
+        { "tokenType": "WTUS", "modelId": "tab_flash_lite_preview", "remainingFraction": 1 }
+      ]
+    }"#;
+
+    fn remote_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-06T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The cloud lane publishes the same shape as the local probe.
+    ///
+    /// The two lanes describe one account and are handed different
+    /// granularities: named pool groups locally, one bucket per model from the
+    /// cloud. If they disagreed, this provider's reading would change according
+    /// to whether an editor happened to be open, which is exactly the coupling
+    /// the cloud lane exists to remove.
+    #[test]
+    fn the_remote_lane_folds_models_into_the_same_pools_the_local_probe_publishes() {
+        let usage = parse_remote_quota_at(REMOTE_FIXTURE, remote_now()).expect("fixture parses");
+
+        // The native Gemini pool owns the unnamed slot, as locally: an unnamed
+        // window reads as the account's own capacity, and the external pool in
+        // it would report the provider exhausted while Gemini is free.
+        let primary = usage.primary.expect("a gemini pool window");
+        assert_eq!(primary.used_percent, 1.41);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-08-06T09:38:35Z"));
+
+        let extras = usage.extra_rate_windows.expect("both pools are published");
+        let ids: Vec<&str> = extras.iter().filter_map(|x| x.id.as_deref()).collect();
+        assert!(ids.contains(&"Gemini Models"), "{ids:?}");
+        assert!(ids.contains(&"Claude and GPT models"), "{ids:?}");
+
+        // The external pool reports its WORST model, not its average or its
+        // first: one exhausted model in a pool is what constrains the account.
+        let external = extras
+            .iter()
+            .find(|x| x.id.as_deref() == Some("Claude and GPT models"))
+            .and_then(|x| x.window.as_ref())
+            .expect("external pool window");
+        assert_eq!(external.used_percent, 50.0);
+
+        // Not vacuous: seventeen Gemini models collapse to one window rather
+        // than seventeen near-identical rows.
+        assert_eq!(extras.len(), 2, "{ids:?}");
+    }
+
+    /// Models the account is never metered on stay out of the pools.
+    ///
+    /// The always-available internal models (`chat_*`, `tab_*`) report a full
+    /// fraction and no reset. Folding a permanently-idle bucket into a metered
+    /// pool would drag that pool's worst-case reading toward zero and make a
+    /// constrained account look free.
+    #[test]
+    fn a_bucket_with_no_reset_does_not_dilute_a_metered_pool() {
+        let usage = parse_remote_quota_at(REMOTE_FIXTURE, remote_now()).unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+
+        assert!(
+            !extras
+                .iter()
+                .any(|x| x.id.as_deref() == Some("Other models")),
+            "an unmetered bucket became its own pool"
+        );
+        for extra in &extras {
+            let window = extra.window.as_ref().unwrap();
+            assert!(
+                window.resets_at.is_some(),
+                "{:?} has no reset",
+                extra.id.as_deref()
+            );
+        }
+    }
+
+    /// A response carrying nothing usable is an error, not an empty success.
+    ///
+    /// An empty `Usage` would publish as a provider with no windows, which a
+    /// consumer cannot tell from capacity nobody measured. A degraded entry says
+    /// what happened.
+    #[test]
+    fn a_remote_response_with_no_metered_bucket_degrades() {
+        for body in [
+            &br#"{"buckets":[]}"#[..],
+            &br#"{}"#[..],
+            // Present, but every bucket is unmetered: the same shape as an
+            // account with no quota to report.
+            &br#"{"buckets":[{"modelId":"chat_1","remainingFraction":1}]}"#[..],
+        ] {
+            let error = parse_remote_quota_at(body, remote_now())
+                .expect_err("an unusable response must not publish an empty window set");
+            assert!(matches!(error, FetchError::Decode(_)), "{error:?}");
+        }
+    }
+
+    /// The cadence is rounded up to a class this provider meters on.
+    ///
+    /// The cloud states no window length, and time-to-reset only lower-bounds
+    /// it. Publishing the raw remainder would report a weekly window read an
+    /// hour before its reset as a one-hour cadence.
+    #[test]
+    fn a_mid_cycle_reset_does_not_shrink_the_published_cadence() {
+        let now = remote_now();
+        let session = (now + chrono::Duration::minutes(30)).to_rfc3339();
+        let weekly = (now + chrono::Duration::hours(70)).to_rfc3339();
+
+        assert_eq!(
+            remote_window_minutes(&session, now),
+            Some(SESSION_WINDOW_MINUTES)
+        );
+        assert_eq!(
+            remote_window_minutes(&weekly, now),
+            Some(WEEKLY_WINDOW_MINUTES)
+        );
+
+        // A reset already past states no usable cadence, rather than a negative
+        // or zero one.
+        let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(remote_window_minutes(&past, now), None);
     }
 }
