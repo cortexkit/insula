@@ -98,9 +98,19 @@ warm the cache themselves, since reads are cache-only and a cold registry serves
 nothing:
 
 ```sh
-# check every live window for internal inconsistency (a reset further out than
-# the window is long, counts that disagree with the percent, a percent out of
-# range). Exits non-zero on a finding, and also when it examined nothing:
+# check every live window on the DEPLOYED module for internal inconsistency (a
+# reset further out than the window is long, counts that disagree with the
+# percent, a percent out of range), plus cross-entry and health-identity checks.
+# Prefer this one: it reads the running module through the daemon, so it sees
+# vault-served accounts. Exits non-zero on a finding, and when it examined
+# nothing:
+cargo run -p quota-module --example deployed-sanity
+
+# the same window rules against a registry built in-process. Needs no running
+# daemon, so it is what to use while changing a normalizer -- but it has no
+# vault client, so vault-served providers fall back to local credentials or do
+# not report at all. It examined 12 windows here where the deployed checker saw
+# 29, and the difference is entirely accounts it cannot reach:
 cargo run -p quota-core --example wire-sanity
 
 # dump the live usage.get array as JSON, for eyeballing or diffing:
