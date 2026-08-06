@@ -618,3 +618,21 @@ about your coverage. Confirm which test failed, not that the suite did — and
 after restoring, confirm the file is byte-identical to the original, because a
 partially reverted mutation is a silent behaviour change wearing a clean
 `git status`.
+
+The same doubt applies to a **control that has never fired**. The live checkers
+in `examples/` have reported `findings: none` on every run they have ever made,
+which is the expected result and also exactly what a checker that cannot report
+would print. A rule's unit tests do not settle it: they prove the rule
+classifies, not that a finding survives assembly, printing and the exit path.
+
+Prove it the same way — invert one rule so live data must violate it, and check
+both halves of the output contract. Doing that here surfaced something the
+unit tests could not: the finding text and the count printed correctly, but the
+first attempt reported success because the exit status was read from a pipeline
+rather than the process. The rule was fine, the reporting was fine, and the
+measurement was wrong — which is the failure this whole section is about, one
+level further out.
+
+One level of checking-the-checker is enough in practice. The regress is real but
+every defect found this way has been at the first level, and a control proven
+once to fire does not need re-proving unless its reporting path changes.
