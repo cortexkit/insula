@@ -183,11 +183,17 @@ not.
 ## When a deploy is not needed
 
 Commits touching only tests or documentation change no runtime behaviour, and
-`buildCommit` will legitimately lag `HEAD` after them. Check what actually
-changed rather than treating any difference as a pending deploy:
+`buildCommit` will legitimately lag `HEAD` after them, so a difference is not
+by itself a pending deploy.
 
-```sh
-git diff --name-only <deployed-commit>..HEAD -- crates/ | grep -v tests.rs
-```
+To decide, use the pinned-stamp hash comparison above. Do not filter the file
+list by name: which paths hold test code is exactly the judgement that section
+explains is unreliable here, and a filter that misses one arrangement reports a
+runtime change as tests. Reading the diff is for understanding *what* changed
+once the hashes already say *whether* it matters.
 
-Empty output means the running binary is behaviourally current.
+If you do glance at the file list first, read it — do not gate on it. A pipeline
+like `git diff --name-only … | grep -v tests.rs` returns **grep's** exit status,
+and grep exits non-zero when nothing matches, so "no files changed" and "the
+command failed" are the same status. Any check whose exit code you intend to act
+on must not be read through a pipe.
