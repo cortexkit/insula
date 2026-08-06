@@ -174,7 +174,7 @@ Read an OAuth bearer from a local file (or opencode store) → one GET → decod
 |---|---|---|---|---|
 | **codex** ✅ | codex | `~/.codex/auth.json` (oauth access_token) | GET chatgpt.com/backend-api/wham/usage | 5h + weekly |
 | **claude** ✅ | claude | opencode `anthropic` / Keychain | GET api.anthropic.com/api/oauth/usage | 5h + weekly + sonnet/opus |
-| **antigravity** ⚠ built, local-probe only | antigravity | the RUNNING `agy` CLI or app language server, found via `ps` + `lsof` | POST loopback `/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` | per-model (resetTime) |
+| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server via `ps` + `lsof` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary` | per-pool (resetTime) |
 | gemini | gemini | `~/.gemini/oauth_creds.json` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model 24h |
 Notes — the Google-OAuth sub-archetype (gemini/antigravity, cloudcode-pa quota):
 the fetch is a clean POST (loadCodeAssist→retrieveUserQuota, per-model windows),
@@ -187,34 +187,47 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   its public installed-app client (RFC 8252 native-app client — secret not
   confidential), cited to gemini-cli source. Refresh in-memory, cache in cache.rs,
   NEVER write back to oauth_creds.json (read-only consumer).
-- **antigravity = BUILT, but on the local probe rather than this endpoint.**
-  The shipped adapter does not use the Google API row above. It finds a running
-  `agy` CLI or app language server with `ps`, discovers its loopback port with
-  `lsof`, and asks that process. The row is kept because the remote endpoint
-  remains the headless option if one is ever built.
+- **antigravity = TWO LANES, cloud and local probe.** The cloud lane uses the
+  vault's `antigravity:google` credential and needs no local process. The local
+  lane finds a running `agy` CLI or app language server with `ps`, discovers its
+  loopback port with `lsof`, and asks that process.
 
-  **Consequence, and it is not obvious from the code:** antigravity reports
-  usage only while that process happens to be running, and reports
-  `credential_absent` otherwise. Nothing in this repository starts it. On a
-  desktop the process usually exists because something else started it —
-  CodexBar spawns and supervises its own `agy` instance, with an ownership
-  record at `~/.codexbar/antigravity/agy-session.json` — so antigravity's
-  quota can appear and disappear with an unrelated application's lifecycle,
-  and the disappearance looks identical to a credential that was never
-  configured.
+  Both are offered, and the local one is **not** replaced when the vault handle
+  exists — unlike the vault-served providers, where a vault handle replaces the
+  implicit local lane to avoid two identity-less entries. Here both lanes
+  describe the same account, so there is no ambiguity to avoid, and keeping both
+  means a cloud outage or a dead credential still leaves the local answer.
 
-  A headless path exists upstream and is not ported: CodexBar v0.47.0 offers
-  three sources (`auto`, `cli`, `oauth`), where `oauth` fetches from
-  cloudcode-pa.googleapis.com with no local process. Its blocker is the
-  credential, not the request: the token lives only at
-  `~/.codexbar/antigravity/oauth_creds.json`, a path CodexBar itself creates by
-  running its own OAuth login (there is no native antigravity token file to
-  import — AntigravityOAuthCredentialsStore.swift:242-251), and the OAuth
-  client is discoverable only from env vars or by parsing the installed
-  `Antigravity.app/.../main.js` bundle (AntigravityOAuthCredentialsStore.swift:155-196).
-  The remote path also distinguishes itself from gemini on the shared endpoint
-  by `ideType: ANTIGRAVITY` with `pluginType: GEMINI` and a User-Agent of
-  `antigravity`, so the two are not interchangeable despite the shared URL.
+  **Why the cloud lane was needed:** the local probe reports usage only while
+  that process happens to be running, and nothing in this repository starts it.
+  On a desktop the process usually exists because something else started it —
+  CodexBar spawns and supervises its own `agy` instance, with an ownership record
+  at `~/.codexbar/antigravity/agy-session.json`. So the provider's quota tracked
+  an unrelated application's lifecycle, and its disappearance was
+  indistinguishable from a credential nobody configured.
+
+  **The credential is Antigravity's, not Gemini's, and the distinction is
+  load-bearing.** Both are Google logins reaching the same Code Assist API, so a
+  request made with either succeeds and the numbers look plausible. They answer
+  for different products: an Antigravity login's quota response carries
+  Antigravity's own model pool — Claude and GPT alongside Gemini — which a
+  Gemini CLI login has no access to. `vault_handles.rs` routes
+  `antigravity:google` to its own provider for exactly this reason.
+
+  **The cloud response states no window length**, unlike the local server which
+  labels each bucket `5h` or `weekly`. Its buckets carry only a model id, a
+  fraction, a reset and a token type. The reset cannot supply the cadence either:
+  the local server meters each pool on both a five-hour and a weekly window while
+  the cloud returns a single reset per pool, so which meter a given reset belongs
+  to is not knowable from the response. The cloud lane therefore publishes no
+  `windowMinutes` rather than guessing one.
+
+  Granularity differs between the lanes — named pool groups locally, one bucket
+  per model from the cloud — so the cloud lane folds models back into their pools
+  (by model-id prefix, the only pool evidence it carries) and publishes the same
+  shape either way. Buckets with no reset are the always-available internal
+  models and are excluded: folding a permanently-idle bucket into a metered pool
+  would drag its worst-case reading toward zero.
 
 ### Group 2 — api-key-env, bearer, HAS WINDOW
 Simplest HTTP archetype: API key from env (or opencode store) → GET → decode window.
