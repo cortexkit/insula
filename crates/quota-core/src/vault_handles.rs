@@ -376,6 +376,15 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
         );
     }
 
+    /// Whether a handle id names this credential family.
+    ///
+    /// A family's first credential is the bare prefix, and each additional
+    /// account appends `:<label>` -- so every arm must accept both forms or that
+    /// provider silently supports exactly one account. An id matched exactly
+    /// falls through to the unsupported list, where a second account is dropped
+    /// with only a stderr warning: the provider keeps serving its first account
+    /// and looks entirely healthy, so nothing on the wire or in the health
+    /// report says an account is missing.
     fn prefixed_id(id: &str, prefix: &str) -> bool {
         id == prefix
             || id
@@ -390,17 +399,21 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             Some(ProviderKind::Anthropic)
         } else if prefixed_id(id, "oauth:xai") {
             Some(ProviderKind::Grok)
-        } else if id == "antigravity:google" {
+        } else if prefixed_id(id, "antigravity:google") {
             // Antigravity's own Google credential, not a Gemini CLI one. Both
             // reach the same Code Assist API, but they see different products:
             // this one's quota response carries Antigravity's model pool
             // (Claude and GPT alongside Gemini), which a Gemini CLI login has no
             // access to. Serving it to the Gemini lane would publish another
             // product's capacity under Gemini's name.
+            //
+            // Ordered before the `oauth:google` arm, which would otherwise not
+            // match this id anyway -- the two are kept adjacent so the
+            // distinction stays visible to whoever edits either.
             Some(ProviderKind::Antigravity)
         } else if prefixed_id(id, "oauth:google") {
             Some(ProviderKind::Gemini)
-        } else if id == "kimi-for-coding" {
+        } else if prefixed_id(id, "kimi-for-coding") {
             Some(ProviderKind::KimiForCoding)
         } else {
             None
@@ -483,6 +496,91 @@ mod tests {
         let mut file = options.open(&path).unwrap();
         file.write_all(body.as_bytes()).unwrap();
         path
+    }
+
+    /// Every credential family this module maps supports a second account.
+    ///
+    /// The vault mints a family's first credential under the bare id and each
+    /// additional account under `<id>:<label>`. A mapping arm that matches the
+    /// id exactly therefore accepts only the first: the labelled ids fall
+    /// through to the unsupported list and are dropped with a stderr warning,
+    /// while the provider keeps serving its first account and reports healthy.
+    /// Nothing on the wire or in the health report states that an account is
+    /// missing, so the loss shows up as capacity that was never mentioned.
+    ///
+    /// Written as an enumeration over the families rather than a case per
+    /// provider, because the defect is an ARM being written differently from
+    /// its neighbours -- which is invisible when each arm is read on its own,
+    /// and is exactly how two of these came to be exact-matched while four were
+    /// not.
+    #[test]
+    fn every_credential_family_accepts_a_second_account() {
+        // Each family's bare id, and the accessor a provider reads it through.
+        type Accessor = fn(&VaultHandleLoader) -> Result<Vec<CredentialHandle>, HandlesError>;
+        let families: Vec<(&str, Accessor)> = vec![
+            ("chatgpt:openai", |l| l.codex_handles()),
+            ("oauth:anthropic", |l| l.anthropic_handles()),
+            ("oauth:xai", |l| l.grok_handles()),
+            ("oauth:google", |l| l.gemini_handles()),
+            ("antigravity:google", |l| l.antigravity_handles()),
+            ("kimi-for-coding", |l| l.kimi_for_coding_handles()),
+        ];
+
+        for (base, accessor) in families {
+            // Distinct capabilities: identical ones are deduplicated by design,
+            // which would mask the very difference under test.
+            let body =
+                format!(r#"{{"handles":{{"{base}":"ckh_first","{base}:second":"ckh_second"}}}}"#);
+            let path = write_file("family", &body);
+            let handles = accessor(&VaultHandleLoader::new(Some(path.clone())))
+                .expect("a well-formed handle file enumerates");
+            let ids: Vec<String> = handles.iter().map(|h| h.stable_id().to_string()).collect();
+            let _ = std::fs::remove_file(path);
+
+            assert_eq!(
+                ids.len(),
+                2,
+                "{base}: a second account did not reach the provider (got {ids:?}) -- \
+                 this family supports exactly one account, and the rest are dropped \
+                 with no signal on the wire"
+            );
+            assert!(
+                ids.contains(&format!("{base}:second")),
+                "{base}: the labelled account is missing from {ids:?}"
+            );
+        }
+    }
+
+    /// A labelled Antigravity credential stays out of the Gemini lane.
+    ///
+    /// The two are separate products on one Google API, and their ids are close
+    /// enough that a widened match could capture the wrong one. Accepting a
+    /// second Antigravity account must not also route it to Gemini, which would
+    /// publish Antigravity's model pool -- Claude and GPT included -- as Gemini
+    /// capacity.
+    #[test]
+    fn a_labelled_antigravity_account_does_not_reach_the_gemini_lane() {
+        let path = write_file(
+            "agy-vs-gemini",
+            r#"{"handles":{"antigravity:google:second":"ckh_agy","oauth:google":"ckh_gemini"}}"#,
+        );
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        let antigravity: Vec<String> = loader
+            .antigravity_handles()
+            .unwrap()
+            .iter()
+            .map(|h| h.stable_id().to_string())
+            .collect();
+        let gemini: Vec<String> = loader
+            .gemini_handles()
+            .unwrap()
+            .iter()
+            .map(|h| h.stable_id().to_string())
+            .collect();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(antigravity, vec!["antigravity:google:second".to_string()]);
+        assert_eq!(gemini, vec!["oauth:google".to_string()]);
     }
 
     #[test]
