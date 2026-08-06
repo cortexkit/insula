@@ -313,9 +313,29 @@ names a limit it could not read a figure for. A window whose meaning has no slot
 — a per-model pool, a scoped weekly — lives here rather than being forced into
 one, so a consumer ignoring `extraRateWindows` silently ignores real limits.
 
-`id` is stable within a provider but not unique across providers, and it is not
-drawn from any shared vocabulary: one provider's ids are model names, another's
-are its own scope labels. Key on `(provider, id)`, never on `id` alone.
+`id` is not unique across providers and is not drawn from any shared vocabulary:
+one provider's ids are model names, another's are its own scope labels. Key on
+`(provider, id)`, never on `id` alone.
+
+**Nor is it guaranteed stable within a provider.** Where a provider reads one
+account through more than one lane, the lanes can publish different ids for the
+same limit, and which lane answers is decided per fetch. `antigravity` does this
+today: its cloud lane names pools (`Gemini Models`), while its local lane passes
+through the upstream's own bucket identifiers (`gemini-weekly`, `3p-5h`). The
+same account switches between those shapes depending on whether a local process
+happens to be running.
+
+So a consumer matching ids for a provider with more than one lane must enumerate
+every lane's form. Enumerate the ids you positively want rather than the ones you
+mean to skip: a skip-list fails **open** on every form nobody thought of, and
+those are exactly the forms that share no vocabulary with the ones that were.
+
+Provenance differs by lane and decides what a producer can promise. Ids this
+module constructs are stable because it controls them, and a change is
+announced. Ids passed through from an upstream are not: a change there is
+observed, not planned, so it arrives on the wire before anyone can warn you.
+`title` is weaker than both — render it, never match on it, and note that a title
+can legitimately carry mutable detail such as a count of the models in a pool.
 
 ### Fields on the account, not the window
 
