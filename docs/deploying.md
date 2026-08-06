@@ -131,6 +131,18 @@ making the stamp itself the difference being measured. Overlay the current
 This cannot be used against the *deployed* binary directly unless it was built
 in the same directory, which is the usual case here but worth confirming.
 
+**When it is worth the rebuild.** The comparison costs a full release build per
+side, so it earns its keep only where the cheap signal is genuinely ambiguous:
+a SMALL gap that also touches FEW runtime files. A gap of one or two commits
+over a handful of files is exactly the case where the diff might be comments —
+and exactly where a rebuild is cheaper than being wrong.
+
+Elapsed time alone is the wrong thing to sort on. The smallest gaps often carry
+the LARGEST file counts, because a small gap usually means a seat shipped work
+recently. A large gap over few files is not ambiguous either: something real
+landed and nobody rebuilt. Both extremes answer themselves, and the escalation
+is for the middle.
+
 ### `unknown` is a third outcome, not a failed comparison
 
 The stamp is `unknown` when the build could not resolve `HEAD` — most often
