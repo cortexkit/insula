@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self},
+    browser_cookies::{self, SOURCE_LABEL},
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -182,7 +182,12 @@ impl UsageProvider for CursorProvider {
                 .await?;
 
             let usage = normalize_usage(&body_bytes)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

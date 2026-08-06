@@ -30,7 +30,7 @@ use async_trait::async_trait;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self},
+    browser_cookies::{self, SOURCE_LABEL},
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -320,9 +320,12 @@ impl UsageProvider for OllamaProvider {
 
             let html = String::from_utf8_lossy(&html_bytes);
             let usage = normalize_usage(&html)?;
-            // Use the existing "api" label because this fetch uses local credentials
-            // rather than OAuth. A cookie-specific label would require consumer support.
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

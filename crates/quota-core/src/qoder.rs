@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar},
+    browser_cookies::{self, CookieJar, SOURCE_LABEL},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -249,7 +249,12 @@ impl UsageProvider for QoderProvider {
                 .await?;
             let usage = normalize_usage(&body)?;
 
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

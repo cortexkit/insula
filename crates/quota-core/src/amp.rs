@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self},
+    browser_cookies::{self, SOURCE_LABEL},
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -307,7 +307,12 @@ impl UsageProvider for AmpProvider {
 
             let html = String::from_utf8_lossy(response.body_for_parsing()?);
             let usage = normalize_usage(&html, chrono::Utc::now())?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

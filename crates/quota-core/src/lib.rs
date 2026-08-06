@@ -381,6 +381,19 @@ impl Registry {
             .collect()
     }
 
+    /// Names of the providers that authenticate with a browser session cookie.
+    ///
+    /// Derived from the same predicate the stale-login health metric counts, so
+    /// a caller asking "who is in the cookie cohort" cannot get a different
+    /// answer from the one the metric is sized against.
+    pub fn cookie_based_provider_names(&self) -> Vec<&str> {
+        self.providers
+            .iter()
+            .filter(|provider| provider.fetcher.is_cookie_based())
+            .map(|provider| provider.name.as_str())
+            .collect()
+    }
+
     /// Serve usage exclusively from active slot snapshots.
     ///
     /// If any active handle lacks a resolved account label, one unlabeled

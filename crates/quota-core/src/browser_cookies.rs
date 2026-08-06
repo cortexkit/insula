@@ -23,6 +23,22 @@
 //! browsers share the scheme but differ in path/keychain-service; add them when a
 //! provider needs them. Non-macOS returns `Unsupported` (callers degrade).
 
+/// The `source` a provider publishes when its credential is a browser session
+/// cookie.
+///
+/// `source` is observability only, and its job is to tell a reader how a figure
+/// was obtained so they know what to do when it stops arriving. The cohort
+/// previously published `api`, which names the wrong remedy: an API credential
+/// is fixed by supplying a key, while these are fixed only by logging into the
+/// site in Chrome on this machine. That distinction is the whole reason these
+/// providers behave differently from the rest -- they cannot work headless, and
+/// they break when a browser session expires rather than when a key is revoked.
+///
+/// It is also the one field that separates them once a fetch SUCCEEDS. A failure
+/// says "no matching cookie for domain" in its error text, but a healthy entry
+/// published `api` and was indistinguishable from a key-based provider.
+pub const SOURCE_LABEL: &str = "cookie";
+
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 

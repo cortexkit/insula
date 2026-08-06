@@ -488,8 +488,21 @@ change to the account, the credential, or anything a consumer did.
 It is observability only: read it to know how a figure was obtained, never as an
 identity or a state. Keying on it treats one account as two, and alerting on a
 change reports a lane fallback — which is the system working — as an incident.
-The values in use are `oauth`, `api` and `vault`; treat the set as open, since a
-new lane adds a value without warning.
+
+The values in use are:
+
+| value | how the credential was obtained | what fixes it when it stops working |
+| --- | --- | --- |
+| `vault` | served by the credential vault | re-authenticate that vault record |
+| `oauth` | an OAuth token or session found on this machine | log in with the tool that owns it |
+| `api` | an API key from the environment or a config file | supply or replace the key |
+| `cookie` | a browser session cookie read from the local Chrome store | log into the provider's site in Chrome, on this machine |
+
+Treat the set as open: a new lane adds a value without warning. The distinction
+worth acting on is that `cookie` providers cannot work headless and break when a
+**browser session** expires, which is a different remedy from every other value
+here — so a fleet that runs without a desktop browser should expect them absent
+rather than treat it as a fault.
 
 **Health counts providers; the array carries accounts.** A provider with several
 credentialed accounts contributes several entries to `usage.get` and exactly one

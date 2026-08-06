@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar},
+    browser_cookies::{self, CookieJar, SOURCE_LABEL},
     http::{Header, JsonRequest},
     model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -433,7 +433,7 @@ impl UsageProvider for FactoryProvider {
             Ok(ProviderUsage::healthy(
                 PROVIDER_NAME,
                 None,
-                "api",
+                SOURCE_LABEL,
                 usage,
             ))
         }

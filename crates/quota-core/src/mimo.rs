@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies,
+    browser_cookies::{self, SOURCE_LABEL},
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -281,7 +281,12 @@ impl UsageProvider for MimoProvider {
             let usage_json = String::from_utf8_lossy(usage_res.body_for_parsing()?);
 
             let usage = normalize(&detail_json, &usage_json)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

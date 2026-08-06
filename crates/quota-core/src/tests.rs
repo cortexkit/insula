@@ -470,6 +470,97 @@ fn every_api_provider_key_names_a_registered_provider() {
     );
 }
 
+/// Every cookie-cohort provider publishes the cookie source label.
+///
+/// `source` is observability only, but its job is to tell a reader how a figure
+/// was obtained so they know what to do when it stops arriving. These providers
+/// authenticate with a browser session cookie, which is fixed only by logging
+/// into the site in Chrome on this machine -- a different remedy from every
+/// other provider here, and the reason this cohort cannot work headless.
+///
+/// The label is the only field that separates them once a fetch SUCCEEDS. A
+/// failure names the cookie in its error text, but a healthy entry carries no
+/// other evidence of how it was authenticated.
+///
+/// Checked against `is_cookie_based`, which the registry already uses to size
+/// its stale-login metric, so the two cannot disagree about who is in the
+/// cohort. A provider added to one and not the other fails here.
+#[test]
+fn every_cookie_provider_publishes_the_cookie_source_label() {
+    // The cohort by behaviour, not by a list written here: taken from the same
+    // predicate the health metric counts.
+    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    let cookie_providers = registry.cookie_based_provider_names();
+
+    assert!(
+        cookie_providers.len() >= 5,
+        "found too few cookie providers ({}), the enumeration is broken rather \
+         than the cohort",
+        cookie_providers.len()
+    );
+
+    // Source names differ from wire names in two places, so map rather than
+    // assume: a mismatch would silently skip a provider.
+    let file_of = |provider: &str| -> String {
+        match provider {
+            "opencodego" => "opencodego".to_string(),
+            "qwen-cloud" => "qwen_cloud".to_string(),
+            other => other.replace('-', "_"),
+        }
+    };
+
+    let sources: std::collections::HashMap<&str, &str> = [
+        ("amp", include_str!("amp.rs")),
+        ("cursor", include_str!("cursor.rs")),
+        ("factory", include_str!("factory.rs")),
+        ("mimo", include_str!("mimo.rs")),
+        ("ollama", include_str!("ollama.rs")),
+        ("opencode", include_str!("opencode.rs")),
+        ("opencodego", include_str!("opencodego.rs")),
+        ("qoder", include_str!("qoder.rs")),
+        ("qwen_cloud", include_str!("qwen_cloud.rs")),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut wrong = Vec::new();
+    for provider in &cookie_providers {
+        let file = file_of(provider);
+        let Some(source) = sources.get(file.as_str()) else {
+            wrong.push(format!(
+                "{provider}: cookie-based but this test has no source for it"
+            ));
+            continue;
+        };
+        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // The healthy() constructor is where the label reaches the wire.
+        for line in runtime.lines().filter(|line| line.contains("healthy(")) {
+            if line.contains("SOURCE_LABEL") {
+                continue;
+            }
+            // The call may span lines; only a literal on the same line is
+            // decidable here, and that is the shape being guarded against.
+            if line.contains('"') {
+                wrong.push(format!("{provider}: {}", line.trim()));
+            }
+        }
+        if !runtime.contains("SOURCE_LABEL") {
+            wrong.push(format!(
+                "{provider}: publishes no SOURCE_LABEL, so its healthy entries \
+                 are indistinguishable from a key-based provider's"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "cookie providers must publish the shared cookie label: {wrong:#?}"
+    );
+
+    // Not vacuous: the constant must be the cookie label, so this cannot pass by
+    // every provider agreeing on the wrong string.
+    assert_eq!(crate::browser_cookies::SOURCE_LABEL, "cookie");
+}
+
 struct LabelProvider {
     labels: Arc<Mutex<HashMap<String, Option<String>>>>,
 }

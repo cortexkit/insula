@@ -14,6 +14,7 @@ use async_trait::async_trait;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
+    browser_cookies::SOURCE_LABEL,
     http::{Header, JsonRequest},
     model::ProviderUsage,
     opencode::{
@@ -91,7 +92,12 @@ impl UsageProvider for OpenCodeGoProvider {
             let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
             let now = chrono::Utc::now().timestamp();
             let usage = parse_windows(&text, now, true)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                usage,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

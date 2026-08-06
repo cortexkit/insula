@@ -54,7 +54,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self},
+    browser_cookies::{self, SOURCE_LABEL},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -481,7 +481,12 @@ impl UsageProvider for QwenCloudProvider {
                 enrich_with_counts(&mut enriched, &config_bytes, &sub_bytes);
             }
 
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", enriched))
+            Ok(ProviderUsage::healthy(
+                PROVIDER_NAME,
+                None,
+                SOURCE_LABEL,
+                enriched,
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
