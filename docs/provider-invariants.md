@@ -602,3 +602,19 @@ One more trap specific to this codebase. A module doc and a function doc in the
 same file have disagreed about the intended behaviour, and each looked
 authoritative alone. When they conflict, the conflict itself is the finding, and
 neither half is citable until the upstream contract settles it.
+
+### The mutation proof needs its own vacuity check
+
+Deleting a guard to watch a test go red is the strongest evidence in this
+document, and it has the same failure mode as everything it is used to check: it
+can pass while proving nothing. The mutation may land somewhere other than
+intended — a replacement anchored on a string that appears in several places
+edits the wrong one — and the target test stays green because the code under it
+never changed. That reads exactly like a defended guard.
+
+So the mutation must redden the test it was aimed at, by name. A mutation that
+reddens *something else*, or nothing, has told you about your edit rather than
+about your coverage. Confirm which test failed, not that the suite did — and
+after restoring, confirm the file is byte-identical to the original, because a
+partially reverted mutation is a silent behaviour change wearing a clean
+`git status`.
