@@ -54,6 +54,19 @@ impl<'a> AuthoritativeHandles<'a> {
 /// Refresher state protected by [`Registry`](crate::Registry)'s mutex.
 pub struct SlotStore {
     slots: HashMap<SlotKey, ProviderSlot>,
+    /// Providers whose most recent handle enumeration succeeded.
+    ///
+    /// Replaced wholesale each turn, so a provider that succeeded once and then
+    /// failed is removed rather than keeping a stale claim. Empty until the
+    /// first turn, which is what keeps a completeness claim unrepresentable
+    /// before the refresher has ever run.
+    ///
+    /// A failed enumeration is not the same as one returning nothing: the first
+    /// retains the provider's existing slots and can say nothing about which
+    /// accounts it has, while the second is an authoritative statement that it
+    /// has none. Both leave the provider with no fresh handle list, so without
+    /// recording the outcome the two are indistinguishable afterwards.
+    enumerated_ok: HashSet<String>,
     created_at: Instant,
     created_at_wall: DateTime<Utc>,
     last_tick_at: Option<Instant>,
@@ -65,12 +78,18 @@ impl SlotStore {
     pub fn new(now: Instant) -> Self {
         Self {
             slots: HashMap::new(),
+            enumerated_ok: HashSet::new(),
             created_at: now,
             created_at_wall: Utc::now(),
             last_tick_at: None,
             next_incarnation: 1,
             next_attempt_sequence: 1,
         }
+    }
+
+    /// Whether this provider's most recent handle enumeration succeeded.
+    pub fn enumeration_succeeded(&self, provider: &str) -> bool {
+        self.enumerated_ok.contains(provider)
     }
 
     /// Apply one authoritative, canonical handle snapshot for a provider.
@@ -89,6 +108,16 @@ impl SlotStore {
         authoritative: &AuthoritativeHandles<'_>,
         now: Instant,
     ) {
+        // Every provider is enumerated each turn and only the successes reach
+        // here, so the set of providers present IS the set that succeeded.
+        // Replaced rather than extended: a provider that succeeded last turn and
+        // failed this one must lose the claim, not keep it.
+        self.enumerated_ok = authoritative
+            .ordered
+            .iter()
+            .map(|(provider, _)| (*provider).to_string())
+            .collect();
+
         self.slots.retain(|key, _| {
             let Some(active) = authoritative.by_provider.get(key.provider.as_str()) else {
                 // An absent provider failed enumeration, so its last-known slots remain active.

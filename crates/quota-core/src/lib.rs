@@ -265,6 +265,39 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// One usage read: the entries, and which providers' account sets are complete.
+///
+/// A provider named in `complete_providers` has had its full account set
+/// published in `entries`, so a consumer holding stored accounts for it may
+/// replace that set -- including removing accounts the entries do not name.
+///
+/// A provider NOT named is **unknown, never empty**. Its entries are as usable
+/// as any other; the module is only declining to say that they are all of them.
+/// Treating absence as an empty account set is the destructive misreading this
+/// exists to prevent.
+///
+/// The survivor set is every LABELLED entry of that provider, including degraded
+/// ones. A degraded entry names an account that exists and is currently
+/// unusable, so usability governs which windows to store, never which accounts
+/// to keep -- deleting an account because it is unhealthy is the same data loss
+/// in a different costume.
+///
+/// Only a consumer performing a destructive action should consult this. A
+/// display-only consumer must not: gating what it shows on completeness would
+/// hide live data for exactly the providers whose identity is momentarily
+/// unsettled.
+#[derive(Debug, Clone, Default)]
+pub struct UsageSnapshot {
+    pub entries: Vec<ProviderUsage>,
+    /// Provider registry names, in registry order, matching `entries`.
+    ///
+    /// Registry names rather than the optional canonical `apiProvider` slug: a
+    /// provider without a counterpart has no slug at all, so keying on it would
+    /// silently exclude that provider from ever being complete -- the same
+    /// absence-as-answer failure this field exists to close.
+    pub complete_providers: Vec<String>,
+}
+
 /// Provider registry with a cache-only read path and one background refresher.
 pub struct Registry {
     providers: Vec<RegisteredProvider>,
@@ -394,7 +427,8 @@ impl Registry {
             .collect()
     }
 
-    /// Serve usage exclusively from active slot snapshots.
+    /// Serve usage exclusively from active slot snapshots, discarding the
+    /// completeness claim.
     ///
     /// If any active handle lacks a resolved account label, one unlabeled
     /// representative is selected by freshness and health, preferring local on a
@@ -402,12 +436,29 @@ impl Registry {
     /// are collapsed. A label transition without successful usage remains
     /// unavailable.
     pub async fn get_usage(&self, provider_filter: Option<&str>) -> Vec<ProviderUsage> {
-        let (mut snapshot, wall_time_anchor) = {
+        self.usage_snapshot(provider_filter).await.entries
+    }
+
+    /// Serve usage together with the providers whose account set is complete.
+    ///
+    /// The completeness claim is built by the SAME walk that emits the entries,
+    /// rather than computed separately from the same slots. A second predicate
+    /// over the same data is free to drift from the one that actually governs
+    /// emission, and a claim that disagrees with the entries beside it is worse
+    /// than no claim at all: it authorises a consumer to delete accounts the
+    /// array does not support.
+    pub async fn usage_snapshot(&self, provider_filter: Option<&str>) -> UsageSnapshot {
+        let (mut snapshot, wall_time_anchor, enumerated_ok) = {
             let store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (store.snapshot(), store.wall_time_anchor())
+            let enumerated_ok: Vec<bool> = self
+                .providers
+                .iter()
+                .map(|provider| store.enumeration_succeeded(provider.name.as_str()))
+                .collect();
+            (store.snapshot(), store.wall_time_anchor(), enumerated_ok)
         };
         for (_, slot) in &mut snapshot {
             if let Some(entry) = slot.entry.as_mut() {
@@ -441,16 +492,31 @@ impl Registry {
 
         let read_now = Instant::now();
         let mut out = Vec::new();
-        for provider in &self.providers {
+        let mut complete_providers = Vec::new();
+        for (index, provider) in self.providers.iter().enumerate() {
             let name = provider.name.as_str();
             if provider_filter.is_some_and(|filter| filter != name) {
                 continue;
             }
+            // A provider can only claim completeness on the strength of a
+            // handle enumeration that SUCCEEDED. A failed one keeps the previous
+            // slots, which may name accounts that no longer exist and cannot
+            // name any that were added, so it is silent about the account set
+            // rather than confirming it.
+            let enumeration_succeeded = enumerated_ok[index];
             let slots: Vec<_> = snapshot
                 .iter()
                 .filter(|(key, _)| key.provider == name)
                 .collect();
             if slots.is_empty() {
+                // A successful enumeration that returned no handles is a
+                // statement that this provider has no accounts, and it is the
+                // only way a consumer is ever authorised to clear one. Keying
+                // completeness on having at least one slot instead would make
+                // that unrepresentable -- the exact case the signal exists for.
+                if enumeration_succeeded {
+                    complete_providers.push(name.to_string());
+                }
                 continue;
             }
 
@@ -498,11 +564,18 @@ impl Registry {
             }
 
             let mut candidates: HashMap<String, (&SlotKey, &ProviderSlot)> = HashMap::new();
+            // Set by the emission walk itself. A slot that is skipped here is an
+            // account this response does not mention, and a consumer cannot tell
+            // that from the account having been removed -- so any skip forfeits
+            // the completeness claim.
+            let mut skipped_a_slot = false;
             for (key, slot) in slots {
                 if slot.label_in_flux || slot.entry.is_none() {
+                    skipped_a_slot = true;
                     continue;
                 }
                 let Some(account_id) = slot.account_id() else {
+                    skipped_a_slot = true;
                     continue;
                 };
                 // Prefer the better service status, then the more recent
@@ -545,6 +618,13 @@ impl Registry {
                     out.push(entry);
                 }
             }
+            // Every slot contributed its account, so the emitted accounts ARE
+            // the resolved inventory -- compared as a set, since two handles
+            // resolving one account are collapsed on purpose and a count would
+            // read that deliberate dedup as a missing account forever.
+            if enumeration_succeeded && !skipped_a_slot {
+                complete_providers.push(name.to_string());
+            }
         }
         // Applied once, to the assembled array, rather than at each of the
         // twenty-odd sites that compute a percent: a single missed guard there
@@ -554,7 +634,10 @@ impl Registry {
         // push the reply past the frame limit costs every provider's usage, not
         // just its own field.
         model::bound_wire_strings(&mut out);
-        out
+        UsageSnapshot {
+            entries: out,
+            complete_providers,
+        }
     }
 
     /// Run one bounded scheduler turn using the production fetch deadline.

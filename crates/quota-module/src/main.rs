@@ -544,7 +544,9 @@ async fn handle_usage_request(
         .await;
     }
 
-    let usage = registry.get_usage(request.params.provider.as_deref()).await;
+    let snapshot = registry
+        .usage_snapshot(request.params.provider.as_deref())
+        .await;
 
     // A reply that cannot be built must still be a reply. Both steps below can
     // fail on data rather than on programmer error -- the body is assembled from
@@ -554,7 +556,17 @@ async fn handle_usage_request(
     // wait out its own timeout with nothing saying why, which is the one
     // outcome this surface promises cannot happen: every poll either answers or
     // names its failure.
-    let body = match serde_json::to_vec(&json!({ "result": usage })) {
+    // `result` keeps its shape and meaning; `completeProviders` is a sibling key
+    // beside it. Every consumer reads this envelope as an untyped value and
+    // takes `result` out of it, so a new key is invisible until one chooses to
+    // read it -- which is why this is additive rather than a second operation.
+    // A second operation would have left the original serving path alive and
+    // correct-looking forever, and that path is exactly the one that cannot say
+    // whether an account is missing or gone.
+    let body = match serde_json::to_vec(&json!({
+        "result": snapshot.entries,
+        "completeProviders": snapshot.complete_providers,
+    })) {
         Ok(body) => body,
         Err(error) => {
             return send_route_error(

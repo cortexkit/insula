@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -735,6 +735,459 @@ async fn a_withheld_account_leaves_its_labeled_siblings_published() {
             .collect::<Vec<_>>(),
         vec![Some("A"), Some("B")],
         "the withheld account must come back on its own"
+    );
+}
+
+/// A provider whose handle set and per-handle accounts are both steerable, so a
+/// credential can be withdrawn or an enumeration made to fail mid-test.
+struct CompletenessProvider {
+    name: &'static str,
+    handles: Arc<Mutex<Result<Vec<CredentialHandle>, ()>>>,
+    labels: Arc<Mutex<HashMap<String, Option<String>>>>,
+    fail: Arc<Mutex<HashSet<String>>>,
+}
+
+impl CompletenessProvider {
+    fn new(handles: &[&str], labels: &[(&str, Option<&str>)]) -> Self {
+        Self::named("complete", handles, labels)
+    }
+
+    fn named(name: &'static str, handles: &[&str], labels: &[(&str, Option<&str>)]) -> Self {
+        Self {
+            name,
+            handles: Arc::new(Mutex::new(Ok(handles
+                .iter()
+                .map(|id| handle(id))
+                .collect()))),
+            labels: Arc::new(Mutex::new(
+                labels
+                    .iter()
+                    .map(|(id, account)| ((*id).to_string(), account.map(ToString::to_string)))
+                    .collect(),
+            )),
+            fail: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl UsageProvider for CompletenessProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.handles
+            .lock()
+            .unwrap()
+            .clone()
+            .map_err(|()| HandlesError::new("enumeration failed"))
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let id = handle.stable_id().to_string();
+        let account = self.labels.lock().unwrap().get(&id).cloned().flatten();
+        if self.fail.lock().unwrap().contains(&id) {
+            return FetchAttempt::failure(
+                observed(account.as_deref()),
+                Some("test".to_string()),
+                FetchError::Unauthorized("token rejected".to_string()),
+            );
+        }
+        FetchAttempt::success(observed(account.as_deref()), "test", Usage::default())
+    }
+}
+
+fn complete_set(snapshot: &crate::UsageSnapshot) -> Vec<&str> {
+    snapshot
+        .complete_providers
+        .iter()
+        .map(String::as_str)
+        .collect()
+}
+
+fn accounts_of(snapshot: &crate::UsageSnapshot) -> Vec<Option<&str>> {
+    snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.account.as_deref())
+        .collect()
+}
+
+/// Before the refresher's first turn, no provider is complete.
+///
+/// At that moment no provider has slots, so a rule keyed on "has no slots"
+/// would call every provider complete-with-zero-accounts and authorise a
+/// consumer to delete its entire store at every module start. Completeness is
+/// keyed on a handle enumeration having SUCCEEDED, which cannot have happened
+/// before the first turn.
+#[tokio::test]
+async fn no_provider_is_complete_before_the_first_turn() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1"],
+        &[("H1", Some("A"))],
+    ))]);
+
+    let cold = registry.usage_snapshot(None).await;
+    assert!(cold.entries.is_empty());
+    assert!(
+        cold.complete_providers.is_empty(),
+        "a cold registry must authorise no deletion: {:?}",
+        cold.complete_providers
+    );
+
+    // Not vacuous: one turn later the same provider IS complete, so the
+    // emptiness above is the pre-tick state rather than the mechanism never
+    // producing anything.
+    tick(&registry).await;
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["complete"]
+    );
+}
+
+/// A failed enumeration withdraws the completeness claim while entries remain.
+///
+/// The previous handle set is deliberately retained on a failed enumeration, so
+/// the entries keep serving. But a retained set may name accounts that no longer
+/// exist and cannot name any that were added, so it confirms nothing about the
+/// account set and must not authorise a replacement.
+#[tokio::test]
+async fn an_enumeration_failure_withdraws_completeness_but_keeps_the_entries() {
+    let provider = CompletenessProvider::new(&["H1"], &[("H1", Some("A"))]);
+    let handles = Arc::clone(&provider.handles);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["complete"]
+    );
+
+    *handles.lock().unwrap() = Err(());
+    tick(&registry).await;
+
+    let after = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&after),
+        vec![Some("A")],
+        "a failed enumeration must not disturb the entries"
+    );
+    assert!(
+        after.complete_providers.is_empty(),
+        "a retained handle set cannot confirm the account set: {:?}",
+        after.complete_providers
+    );
+}
+
+/// An account still waiting on its first fetch forfeits the claim.
+///
+/// The provider is already unlabeled in this state, because one unidentified
+/// handle collapses every account into a single unlabeled entry. Completeness
+/// must be withheld too: the array names no accounts at all, so authorising a
+/// replacement against it would delete every account the consumer holds.
+#[tokio::test]
+async fn a_pending_account_forfeits_the_claim() {
+    let provider = CompletenessProvider::new(&["H1"], &[("H1", Some("A"))]);
+    let handles = Arc::clone(&provider.handles);
+    let labels = Arc::clone(&provider.labels);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["complete"]
+    );
+
+    // A second credential appears and has not been fetched yet.
+    *handles.lock().unwrap() = Ok(vec![handle("H1"), handle("H2")]);
+    labels.lock().unwrap().insert("H2".into(), Some("B".into()));
+    {
+        let mut store = registry.store.lock().unwrap();
+        store.reconcile(
+            "complete",
+            &[handle("H1"), handle("H2")],
+            std::time::Instant::now(),
+        );
+    }
+
+    let mid = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&mid),
+        vec![None],
+        "an unidentified handle collapses the provider to one unlabeled entry"
+    );
+    assert!(
+        mid.complete_providers.is_empty(),
+        "an array naming no accounts must never authorise replacing them"
+    );
+}
+
+/// A withheld account forfeits the claim, even though its siblings look healthy.
+///
+/// This is the case no other signal covers: the siblings stay labeled, provider
+/// health still reports the provider serving, and the array is indistinguishable
+/// from the account having been removed. Completeness is the only thing standing
+/// between that array and a consumer deleting a live account.
+#[tokio::test]
+async fn a_withheld_account_forfeits_the_claim() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("B"))],
+    ))]);
+
+    tick(&registry).await;
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["complete"]
+    );
+
+    let key = SlotKey::new("complete", handle("H2"));
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut slot = store.get(&key).unwrap().clone();
+        slot.label_in_flux = true;
+        slot.entry = None;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+
+    let withheld = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&withheld),
+        vec![Some("A")],
+        "the withheld account vanishes while its sibling stays labeled"
+    );
+    assert!(
+        withheld.complete_providers.is_empty(),
+        "a withheld account must forfeit the claim: {:?}",
+        withheld.complete_providers
+    );
+}
+
+/// A provider whose upstream never reports an account is never complete.
+///
+/// Several providers publish a single unlabeled entry by contract, because their
+/// upstream exposes no account identity at all. They never enter an
+/// account-keyed store, so there is nothing to authorise and their permanent
+/// absence from the claim is correct rather than a fault.
+#[tokio::test]
+async fn an_identity_less_provider_is_never_complete() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1"],
+        &[("H1", None)],
+    ))]);
+
+    tick(&registry).await;
+    let snapshot = registry.usage_snapshot(None).await;
+
+    assert_eq!(accounts_of(&snapshot), vec![None]);
+    assert!(
+        snapshot.complete_providers.is_empty(),
+        "an identity-less provider cannot claim a complete account set"
+    );
+}
+
+/// Two handles resolving one account stay complete after the dedup.
+///
+/// A provider can reach one account through several credentials -- a local lane
+/// beside a vault lane, or two vault handles -- and those are collapsed to one
+/// entry deliberately. Comparing handle count against entry count would read
+/// that dedup as a missing account and suppress the claim forever, on exactly
+/// the providers this mechanism exists to serve.
+#[tokio::test]
+async fn duplicate_handles_resolving_one_account_stay_complete() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("A"))],
+    ))]);
+
+    tick(&registry).await;
+    let snapshot = registry.usage_snapshot(None).await;
+
+    assert_eq!(
+        accounts_of(&snapshot),
+        vec![Some("A")],
+        "two handles on one account publish one entry"
+    );
+    assert_eq!(
+        complete_set(&snapshot),
+        ["complete"],
+        "the dedup must not read as a missing account"
+    );
+}
+
+/// A successful enumeration returning no handles is complete with no entries.
+///
+/// This is the only way a consumer is ever authorised to clear a provider
+/// outright, and it is why completeness cannot be keyed on having at least one
+/// slot: the case the signal exists for is precisely the one with nothing left
+/// to point at.
+#[tokio::test]
+async fn a_provider_with_no_credentials_left_is_complete_with_no_entries() {
+    let provider = CompletenessProvider::new(&["H1"], &[("H1", Some("A"))]);
+    let handles = Arc::clone(&provider.handles);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    assert_eq!(
+        accounts_of(&registry.usage_snapshot(None).await),
+        vec![Some("A")]
+    );
+
+    *handles.lock().unwrap() = Ok(Vec::new());
+    tick(&registry).await;
+
+    let cleared = registry.usage_snapshot(None).await;
+    assert!(cleared.entries.is_empty(), "{:?}", accounts_of(&cleared));
+    assert_eq!(
+        complete_set(&cleared),
+        ["complete"],
+        "a provider with no credentials must be clearable, not merely silent"
+    );
+}
+
+/// An account whose credential is withdrawn is dropped under a complete claim.
+///
+/// The whole point of the mechanism: the array names only the surviving account
+/// AND says so authoritatively, which is the one situation where deleting the
+/// other one is right. Without this case an implementation that never claims
+/// completeness passes every other test here while doing nothing.
+#[tokio::test]
+async fn a_removed_account_leaves_a_complete_claim_naming_only_the_survivor() {
+    let provider =
+        CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    let handles = Arc::clone(&provider.handles);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    let before = registry.usage_snapshot(None).await;
+    assert_eq!(accounts_of(&before), vec![Some("A"), Some("B")]);
+    assert_eq!(complete_set(&before), ["complete"]);
+
+    // B's credential is withdrawn and the enumeration SUCCEEDS without it.
+    *handles.lock().unwrap() = Ok(vec![handle("H1")]);
+    tick(&registry).await;
+
+    let after = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&after),
+        vec![Some("A")],
+        "the withdrawn account must be gone from the entries"
+    );
+    assert_eq!(
+        complete_set(&after),
+        ["complete"],
+        "and the claim must stand, or the consumer can never remove it"
+    );
+}
+
+/// A degraded account is still named, and the provider is still complete.
+///
+/// A degraded entry names an account that exists and is currently unusable. If a
+/// consumer builds its survivor set from USABLE entries only, a complete claim
+/// authorises deleting an account whose token merely expired -- the original
+/// data loss wearing a different costume, and worse because the deletion now
+/// looks authorised.
+#[tokio::test]
+async fn a_degraded_account_is_named_and_keeps_the_provider_complete() {
+    let provider =
+        CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    let fail = Arc::clone(&provider.fail);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    fail.lock().unwrap().insert("H2".to_string());
+    tick(&registry).await;
+
+    let snapshot = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&snapshot),
+        vec![Some("A"), Some("B")],
+        "a degraded account must still be named on the wire"
+    );
+    let degraded = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.account.as_deref() == Some("B"))
+        .expect("B is present");
+    assert!(degraded.error.is_some(), "B is degraded, not healthy");
+    assert!(degraded.usage.is_none());
+    assert_eq!(
+        complete_set(&snapshot),
+        ["complete"],
+        "an unusable account does not make the account SET incomplete"
+    );
+}
+
+/// Either suppression alone is enough, and together they still suppress.
+///
+/// Pinned as a conjunction rather than inferred from the two single cases: an
+/// implementation that returns the claim when both conditions hold at once --
+/// a plausible way to get a boolean expression wrong -- passes both single-cause
+/// tests and fails only here.
+#[tokio::test]
+async fn an_enumeration_failure_and_a_withheld_account_together_still_suppress() {
+    let provider =
+        CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    let handles = Arc::clone(&provider.handles);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["complete"]
+    );
+
+    let key = SlotKey::new("complete", handle("H2"));
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut slot = store.get(&key).unwrap().clone();
+        slot.label_in_flux = true;
+        slot.entry = None;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+    *handles.lock().unwrap() = Err(());
+    tick(&registry).await;
+
+    let snapshot = registry.usage_snapshot(None).await;
+    assert!(
+        snapshot.complete_providers.is_empty(),
+        "two independent suppressions must not cancel: {:?}",
+        snapshot.complete_providers
+    );
+}
+
+/// The claim is scoped and ordered exactly like the entries.
+///
+/// A consumer reads the two together, so a claim listing a provider the entries
+/// do not cover would authorise a deletion against an array that never described
+/// it.
+#[tokio::test]
+async fn the_claim_follows_the_filter_and_the_registry_order() {
+    let registry = Registry::new(vec![
+        Box::new(CompletenessProvider::named(
+            "zeta",
+            &["H1"],
+            &[("H1", Some("A"))],
+        )),
+        Box::new(CompletenessProvider::new(&["H1"], &[("H1", Some("A"))])),
+    ]);
+    tick(&registry).await;
+
+    // Registry order, not alphabetical: `zeta` is registered first.
+    assert_eq!(
+        complete_set(&registry.usage_snapshot(None).await),
+        ["zeta", "complete"]
+    );
+
+    let filtered = registry.usage_snapshot(Some("complete")).await;
+    assert_eq!(
+        complete_set(&filtered),
+        ["complete"],
+        "a filtered read must not claim anything about providers it excluded"
     );
 }
 
