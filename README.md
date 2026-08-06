@@ -125,6 +125,10 @@ cargo run -p quota-core --example warmup-identity
 # per-turn admission cap leaves before the refresh interval degrades. Run it
 # when the provider set grows:
 cargo run -p quota-core --example sweep-probe
+
+# print reference usage.get envelopes for the completeness cases, for a consumer
+# pinning its account reconciliation against real producer output:
+cargo run -p quota-core --example completeness-envelopes
 ```
 
 ## Install as a supervised subc module

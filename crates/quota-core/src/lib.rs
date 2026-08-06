@@ -423,6 +423,22 @@ impl Registry {
         self.credential_source.is_some()
     }
 
+    /// The slot store, for diagnostics that must stage a specific slot state.
+    ///
+    /// A few states this module must answer for are reachable only through a
+    /// sequence of upstream conditions -- an account whose identity stopped
+    /// being confirmable, a credential replaced between two turns. Waiting for
+    /// them costs a refresh interval each, so a tool that renders reference
+    /// output for consumers stages them directly.
+    ///
+    /// Staging a slot bypasses the transitions that normally produce it, so a
+    /// state set here is only as faithful as the setter. Everything downstream
+    /// of the slot -- the emission gate, the completeness claim, the envelope --
+    /// is the shipping path.
+    pub fn slot_store(&self) -> &Mutex<SlotStore> {
+        &self.store
+    }
+
     /// Provider names registered, for discovery and observability.
     pub fn provider_names(&self) -> Vec<&str> {
         self.providers
