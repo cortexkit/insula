@@ -93,3 +93,18 @@ jobs:
       # real_daemon_e2e are #[ignore] and excluded here by design.
       - name: Test
         run: cargo test --workspace --all-targets
+
+      # `--all-targets` above COMPILES the examples but never RUNS them, so an
+      # example's own assertions are unexecuted by every other step here.
+      #
+      # This one carries a property a downstream consumer pins its reconciliation
+      # against: the withheld-account and genuine-removal envelopes must differ
+      # ONLY in `completeProviders`, so that a consumer proving "retain" versus
+      # "delete" is isolating that key and nothing else. It needs no credentials
+      # and no network -- it drives stub providers through the real registry.
+      #
+      # Without this step, breaking that property leaves this repository green
+      # and fails in the consumer's pipeline instead, where the cause is a
+      # producer change nobody there can see.
+      - name: Completeness envelope pair check
+        run: cargo run -p quota-core --example completeness-envelopes
