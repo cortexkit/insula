@@ -850,13 +850,22 @@ retention defect above was built.
 
 ## Why this file exists
 
-Every defect found at these seams was invisible from inside either codebase. A
-consumer stamping its own clock is locally correct and cannot be falsified
-without knowing this module's backoff semantics; this module's own summary of
-its degraded set was wrong about a function its author had read many times.
+A producer and a consumer can each be locally correct and still disagree about
+what a response means, because the meaning lives at the boundary and neither
+codebase contains it.
 
-**A contract between two correct modules is not derivable from either one.** It
-has to be written down and checked from both ends, or the seam accumulates
-exactly the defects neither codebase looks wrong for having. Silence from a
-consumer is not confirmation — every defect found this way had been live for
-weeks with nobody reporting it.
+A worked case: `fetchedAt` records the producer's last **successful** fetch, and
+a transient failure keeps serving the previous entry with that older timestamp
+unchanged. A consumer that stamps its own poll time instead is locally
+reasonable — nothing in its own code looks wrong — and the substitution resets
+the apparent age of data that is in fact getting older, on the consumer's poll
+cadence rather than the producer's failure duration. Polling more often makes it
+worse. That defect is not visible from either side alone: the consumer cannot
+falsify it without knowing the retention rule, and the producer never sees the
+consumer's clock.
+
+So the rules live here, where a change on either side can be reviewed against the
+same text. **Silence from a consumer is not confirmation.** A misreading produces
+no error on the producing side — no failed request, no exception, no support
+ticket — so the absence of complaints measures visibility rather than
+correctness.
