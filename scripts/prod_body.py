@@ -48,6 +48,27 @@ TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+tests\b")
 TEST_ONLY_ITEM = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*(?!mod\b)")
 
 
+def boundary_description() -> str:
+    """Describe the cut rule, derived from the pattern that performs it.
+
+    Read out of `TEST_MODULE` rather than written beside it. A hand-written
+    description is prose sitting next to a derived artifact: it agrees with the
+    code on the day it is written and silently stops agreeing when someone edits
+    the pattern, while still carrying the authority of an explicit statement.
+    Changing the anchor changes this line.
+    """
+    readable = (
+        TEST_MODULE.pattern.replace(r"\[", "[")
+        .replace(r"\]", "]")
+        .replace(r"\(", "(")
+        .replace(r"\)", ")")
+        .replace(r"\s*(?://[^\n]*\n\s*)*", " ")
+        .replace(r"\s+", " ")
+        .replace(r"\b", "")
+    )
+    return f'"production" is everything above `{readable}`'
+
+
 def production_body(source: str) -> tuple[str, float]:
     """Return the source up to the test module, and the fraction that is."""
     match = TEST_MODULE.search(source)
@@ -147,7 +168,7 @@ def main() -> int:
         # reasoning without re-deriving it, which is how the boundary's own
         # incompleteness was found.
         print(
-            'premise: "production" is everything above `#[cfg(test)] mod tests`\n'
+            f"premise: {boundary_description()}\n"
             f"examined: {len(args.files)} file(s)   matched: {len(hits)}",
             file=sys.stderr,
         )
