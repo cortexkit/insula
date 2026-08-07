@@ -650,6 +650,26 @@ It narrows the class rather than closing it: spellings that share a premise
 share its blind spot, and all three of those assume the target appears as a
 literal substring at the call site.
 
+And the same sweep has a **mirror failure that is quieter**. Cutting a file at
+its test module leaves behind `#[cfg(test)]` applied to individual items — a
+test-only constructor beside the real one, an injection hook, a helper accessor.
+Six of those live in this crate, across four files. A sweep asking whether every
+provider does X can then find X in a test-only helper and call the file fine.
+
+The two directions are not equally visible. Under-including reports something
+ABSENT that is present, which reads as a finding and gets investigated.
+Over-including reports something PRESENT that exists only under `cfg(test)`,
+which reads as a null and gets nothing. **A sweep hunting a missing call stops
+looking as soon as it finds one**, so this direction is never revisited.
+
+`scripts/prod_body.py` names the files carrying such items rather than trying to
+remove them, because removing them needs the span each one covers and a
+brace-matched span is a second guess stacked on the first. The warning narrows
+where to look; it does not answer. Re-checking a sweep against it flagged a call
+twenty-four lines below a test-only constructor, and reading the source showed
+the constructor had already closed — the call was production and the original
+result stood.
+
 **Print the positive count beside the negative.** "9 of 9 indexed" is checkable
 at a glance; "9 missing" is not, because the denominator is invisible and a
 broken detector reports the whole population. Then prove the detector can be
