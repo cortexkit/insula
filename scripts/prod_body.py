@@ -179,10 +179,19 @@ def main() -> int:
         # thirds and sees 5% knows the answer is about a different question,
         # without knowing anything about the pattern.
         share = round(100 * read_bytes / total_bytes) if total_bytes else 100
+        # The caveat counts appear on every run, including when they are zero.
+        # Reported only when non-zero, a caveat DISAPPEARS if the rule that
+        # detects it stops matching -- and every other number stays identical,
+        # because those rules describe the corpus rather than select from it. A
+        # reader cannot notice a line that is not there, so the failure of a
+        # caveat is invisible in exactly the way the caveat exists to prevent.
         print(
             f"premise: {boundary_description()}\n"
             f"examined: {len(args.files)} file(s), {share}% of their bytes   "
-            f"matched: {len(hits)}",
+            f"matched: {len(hits)}\n"
+            f"caveats: {len(misleading)} file(s) truncate under a "
+            f"first-attribute cut, {len(impure)} carry test-only items in the "
+            f"production body",
             file=sys.stderr,
         )
 
