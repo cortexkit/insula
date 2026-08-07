@@ -514,6 +514,31 @@ previous comment described only the mechanics, which reads as an invitation.
 Where the cost of the witness is bearable, prefer it: a sentence asks the next
 author to agree, a type does not.
 
+### And a third side: where does the reader stand
+
+The relaxation had three separate written explanations — the transform, the
+setter, and the section above — and all three are **mint-side**. The consumer
+contract, which is the file other teams actually read, did not contain the word
+"relax" at all, and named `rawUsedPercent` only in a table about field scope.
+
+That is the predictable direction. Mint-side documentation is written by the
+person who understands the mechanism at the moment they understand it best, so
+it feels complete while landing where no consumer looks. A published field needs
+its explanation **where someone stands when they need it**, which for anything on
+the wire is the contract rather than the code.
+
+The stakes are set by which misreading is natural. Here a consumer meeting an
+unexplained zero would reasonably treat `rawUsedPercent` as the truer figure and
+pace on that — routing away from an account whose credit is about to be spent,
+when the credit expires whether or not it is used. **The cautious-looking reading
+is the lossy one**, which is exactly the case where leaving the reader to infer
+is most expensive.
+
+And for any optional field, **say what absence means**. A consumer will infer
+something, and the inference that reads as unremarkable is usually the fail-open
+one. `rawUsedPercent` absent means the effective and reported figures agree — not
+that relaxation is switched off.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
