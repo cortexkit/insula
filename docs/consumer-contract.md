@@ -592,6 +592,27 @@ provider — discards capacity that still exists and is merely unmentioned. Key
 retention on `(provider, account)`, update the accounts a response names, and
 leave the rest alone to age on their own `fetchedAt`.
 
+### A provider can leave the array entirely, and that is not a fault
+
+An entry is emitted per credential handle. A provider that resolves **zero**
+handles emits nothing at all — not a degraded entry, not an empty one. So a
+provider disappearing from the array is a statement that no credential for it
+could be enumerated, which is a different condition from every credential having
+failed.
+
+The reachable case is a provider whose credentials come only from the credential
+store. One provider here works that way: when any stored handle exists for it,
+those handles **replace** the local-file lane entirely, because the local token
+carries no account identity and keeping it alongside labelled accounts would
+collapse them all into one unlabelled entry. If the store becomes unreachable,
+that provider resolves zero handles and vanishes — while providers that keep a
+local lane stay in the array showing their local lane's own failure.
+
+**Retain, do not prune.** This is the absent-means-unfinished rule with a
+concrete cause: the accounts are not gone and nothing about them has changed.
+Account removal is authorised only by `completeProviders`, and a provider that
+emitted nothing cannot appear there.
+
 ### `completeProviders` is how an account may be removed
 
 The reply carries a sibling key beside `result`:
