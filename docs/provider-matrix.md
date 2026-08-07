@@ -27,13 +27,13 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.47.0** (35 providers registered; verified
-2026-08-05). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.48.0** (35 providers registered; verified
+2026-08-07). CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. Read that release's content with `git show
 <tag>:<path>` or `git grep <tag>` — the checkout usually sits at an older tag, so
 plain `grep` silently reads a different version and reports a symbol added in the
 new release as absent. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.47.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.48.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and balance/credits
 providers (deferred to the Balance axis). When a diff touches a provider we serve,
@@ -116,6 +116,36 @@ but unverifiable from this host, which has no Doubao credential. The Claude
 changes are OAuth refresh coordination and probe plumbing, with no window-mapping
 change; Alibaba's are credential scoping; the ~100 remaining descriptor edits are
 a mechanical refactor of two to four lines each.
+
+At v0.48.0 one port landed, and it exposed a defect of ours rather than upstream
+drift. **kimi-for-coding**: the upstream began gating its subscription-stats call
+on a separate web session token, which made visible that the two surfaces take
+different credentials — the usage endpoint takes the coding API key, the web
+console takes a browser session. We had been sending the API key to the console,
+so every fetch made a request the console rejected, and the failure was swallowed
+as best-effort. The monthly and code-7d extras had therefore never reached the
+wire. Probing the console with a browser cookie returned exactly the shape the
+parser already expected, so nothing about the parsing was wrong; only the
+credential was. The enrichment is now skipped when no browser session exists
+rather than attempted with the wrong one.
+
+The general lesson is worth more than the fix: **a best-effort call that has
+never once succeeded is indistinguishable from one that succeeds and finds
+nothing.** Both publish no extra window and neither degrades the entry. The
+upstream diff is what surfaced it, which argues for reading parity rounds for
+credential and gating changes, not only for window-mapping drift.
+
+Declined at v0.48.0: the bulk of a 758-file release is a settings-storage
+refactor (`settings[providerConfig:field:]`) touching ~30 provider files by two
+to four lines each, plus a logging-category rename, neither with any wire
+counterpart. **Copilot** gained a `creditsUsed` counter that keeps an otherwise
+placeholder snapshot accessible — a credits axis, and upstream is explicit that
+it must never become a percentage window, which is exactly what our placeholder
+guard already refuses. **MiniMax** and several others gained detail sections for
+the upstream's own UI. **Sub2API** moved to a bundled plugin on JavaScriptCore
+platforms, leaving the Swift fetcher as a Linux fallback. **OpenCodeGo** gained a
+zen-balance join timeout (Balance axis) and no window change. **Claude** is
+refresh-coordination detail; **Doubao** is a struct-field cleanup.
 
 ---
 
