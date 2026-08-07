@@ -25,6 +25,13 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
 const CREDENTIALS_MODULE_ID: &str = "cortexkit-credentials";
+/// Bounds both the TCP connect and the HMAC handshake that follows it.
+///
+/// One constant covers two concerns because they share a budget: a peer that
+/// accepts the socket and then stalls mid-handshake is as unreachable as one
+/// that never accepts, and neither should hold a refresher tick. Named here
+/// because reusing a connect timeout for an authentication deadline is the kind
+/// of choice that looks like an oversight when it is read back.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const FAILED_CONNECT_COOLDOWN: Duration = Duration::from_secs(2);
