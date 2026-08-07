@@ -87,6 +87,18 @@ def main() -> int:
         else:
             sys.stdout.write(body)
 
+    # The denominator, printed whenever this is used as a search rather than as
+    # a filter. Without it a run that examined forty files and found nothing is
+    # indistinguishable from one that examined a single file, or from a pattern
+    # that could never match -- and this is a tool for hunting ABSENCE, where
+    # every bug produces more apparent absence. Its errors would otherwise be
+    # shaped exactly like its findings.
+    if args.grep_missing is not None or args.grep is not None:
+        print(
+            f"examined: {len(args.files)} file(s)   matched: {len(hits)}",
+            file=sys.stderr,
+        )
+
     if misleading:
         print(
             f"note: {len(misleading)} file(s) would truncate under a "
