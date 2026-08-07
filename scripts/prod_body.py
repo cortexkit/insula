@@ -131,10 +131,14 @@ def main() -> int:
     misleading: list[tuple[str, int]] = []
     impure: list[tuple[str, int]] = []
     hits: list[str] = []
+    read_bytes = 0
+    total_bytes = 0
 
     for path in args.files:
         source = path.read_text()
         body, fraction = production_body(source)
+        read_bytes += len(body)
+        total_bytes += len(source)
 
         naive = source.find("#[cfg(test)]")
         if naive >= 0 and naive < len(body) - 200:
@@ -167,9 +171,18 @@ def main() -> int:
         # look identical under any boundary. Stating it lets someone reject the
         # reasoning without re-deriving it, which is how the boundary's own
         # incompleteness was found.
+        # The share of the corpus the boundary rule actually kept. This is the
+        # rule's own output rather than a description of it, so it cannot agree
+        # with the code while the code does something else: an anchor that fails
+        # to match keeps whole files and drives this to 100%, and one that
+        # matches too early collapses it. A reader who expects roughly two
+        # thirds and sees 5% knows the answer is about a different question,
+        # without knowing anything about the pattern.
+        share = round(100 * read_bytes / total_bytes) if total_bytes else 100
         print(
             f"premise: {boundary_description()}\n"
-            f"examined: {len(args.files)} file(s)   matched: {len(hits)}",
+            f"examined: {len(args.files)} file(s), {share}% of their bytes   "
+            f"matched: {len(hits)}",
             file=sys.stderr,
         )
 
