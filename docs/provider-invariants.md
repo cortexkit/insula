@@ -340,6 +340,27 @@ It is **wrong** where the local lane is a genuinely different account, because
 then dropping it removes real usage from the wire rather than removing a
 duplicate. Establish which case a provider is in before changing its handles.
 
+## An asymmetric guard states its reason where the next caller looks
+
+Some guards are deliberately applied on one path and skipped on another. The
+empty-response rule is one: `send` and `send_full` refuse an empty 2xx body,
+`send_raw` does not, because a caller reading rate-limit headers off a `429`
+never looks at the body and would break if an empty one were refused.
+
+An omission like that reads as an oversight unless it says otherwise, and the
+cost of a reader believing it was one runs both ways. Applying a guard a path
+deliberately skips can reintroduce exactly the behaviour that path exists to
+avoid; skipping one a path needs reintroduces the defect it was written for —
+here, an empty 2xx becoming a decode failure, which is non-transient, so a
+flapping endpoint reads as dead. **The careful reader, doing what the code
+appears to ask, is the one who breaks it.**
+
+So the reason belongs at a definition rather than at the call sites, which are
+read by people who already know. And it belongs at **the definition the next
+caller opens first**: this rule's reasoning sat on `HttpResponse::body_for_parsing`,
+which a reader reaches only if they already suspect the rule exists, while
+`send_raw` — the door a new provider actually opens — said nothing at all.
+
 ## A grant needs a guard at every site that makes it
 
 Most checks in this codebase *refuse* something: a malformed payload, an
