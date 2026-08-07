@@ -601,6 +601,28 @@ a withheld slot that is never emitted, the other landed before both emits and so
 perturbed them equally. A green mutation run is more often a missed mutation than
 a weak guard.
 
+### Verify a change applied before reading the result it produced
+
+When the thing you changed lives **outside the file under test** — a
+`[patch.crates-io]` stanza, a lockfile, a mutation applied by a script, a
+heredoc — confirm it took effect before believing the run. The result cannot
+distinguish *applied and passed* from *never applied*, and the second is
+indistinguishable from success in every output either produces.
+
+A worked instance: patching this crate's dependency at a merged-but-unpublished
+version and running the suite gave a full green pass. The patch had **not**
+applied — cargo warns `patch ... was not used in the crate graph` and the lockfile
+still named the registry version, because a patch does not take effect until the
+lock is updated. The green run had tested the old dependency. The warning sat
+above the test output; `cargo metadata` settled it in one line.
+
+Four instances of this shape appeared in a single day, and none was visible in
+the result: two mutations that missed their target, a shell-escaping failure that
+left a file untouched, and this. **A change that silently fails to apply produces
+exactly the output of a change that applied and worked.** So check the mechanism,
+not the outcome — which is the same discipline as the mutation-proof rule above,
+pointed at the setup instead of the assertion.
+
 ### Merging a doc fix does not deliver it
 
 Documentation on a published type reaches a reader through a **release**, not
