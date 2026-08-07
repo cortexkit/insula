@@ -184,6 +184,18 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWi
 /// (the weekly all-models window), and the model-scoped weekly (`seven_day_opus`
 /// preferred, else `seven_day_sonnet`) → tertiary. Account-wide windows only;
 /// per-model routing is a later concern (the consumer's extractor handles that).
+///
+/// **This is where slot holes come from.** Each slot is filled from its own
+/// independent optional field, so an account with a model-scoped weekly limit and
+/// no all-models one emits `secondary: None` beside `tertiary: Some(..)`. The
+/// three slots are positions, not a ranking, and nothing here fills a gap or
+/// compacts the rest upward.
+///
+/// Anything walking these slots must therefore visit all three rather than stop
+/// at the first absent one — see [`crate::model::windows`], which exists to make
+/// that structural. A walk written as a search rather than a filter reads a
+/// sparse account as having less usage than it does, and a consumer that stops
+/// early reports the wrong constraint as binding.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let response: OAuthUsageResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
