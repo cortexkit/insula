@@ -347,6 +347,13 @@ weekly at 36.5%. A consumer reading only `primary` would have seen an idle
 provider that was in fact a third of the way through its week. This is not a
 rare alignment; it is the normal state of a short window.
 
+**An absent slot means that window was not reported, and the slots can have
+holes.** Each is filled from its own optional field on the upstream response, so
+`secondary` can be absent while `tertiary` is present — the account has a
+model-scoped weekly limit and no all-models one, say. Absent never means the
+window exists at zero, and it never means the slots below it are empty either.
+Walk all three and the extras rather than stopping at the first gap.
+
 So for "how much headroom does this account have", take the **maximum**
 `usedPercent` across every slot and every entry in `extraRateWindows`, or apply
 whatever policy you want deliberately. Do not let slot position stand in for a
@@ -437,6 +444,13 @@ normalised vocabulary, so it is not comparable across providers.
 grants. `availableCount` is how many are held, `soonestExpiresAt` when the next
 one lapses, and `credits` lists each with its own `expiresAt`. They are granted
 to **one account**, never to a provider — see the field-scope table below.
+
+Its absence means this account has no credit inventory to report — either the
+upstream does not grant them, or the lookup did not succeed on that fetch. It
+does **not** mean zero credits are held, and an entry can carry usage normally
+while omitting it, because the inventory lookup is separate from the usage fetch
+and is allowed to fail without degrading the entry. `soonestExpiresAt` is absent
+when no credit has a stated expiry, which is not the same as none expiring soon.
 
 ## Which field to key on
 
