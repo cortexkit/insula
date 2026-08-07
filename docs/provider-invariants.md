@@ -610,6 +610,32 @@ same file have disagreed about the intended behaviour, and each looked
 authoritative alone. When they conflict, the conflict itself is the finding, and
 neither half is citable until the upstream contract settles it.
 
+### A sweep for what is missing fails by finding more of it
+
+Several rules here were found by sweeping every provider for something that
+should be present. Those sweeps have a failure mode worth stating on its own:
+**every bug in a detector that hunts absence produces more apparent absence.** A
+pattern that is too narrow, an input that was truncated, a file extension left
+out of a list — each removes evidence rather than adding it, so the detector's
+errors are shaped exactly like its findings and cannot be told apart by reading
+the output.
+
+Three have happened here. One cut each file at the first `#[cfg(test)]`
+attribute and reported a provider as missing a call it makes twenty-four lines
+further down. One searched for filenames with an extension list that omitted
+`md`, and reported every document as unmentioned. One required a `docs/` prefix
+when the index it was checking lists bare filenames, and reported five of nine
+documents as unlinked when all nine are.
+
+A detector hunting absence has no failure mode in the opposite direction, so
+"it found something" carries no information about whether it works.
+
+**Print the positive count beside the negative.** "9 of 9 indexed" is checkable
+at a glance; "9 missing" is not, because the denominator is invisible and a
+broken detector reports the whole population. Then prove the detector can be
+satisfied at all: run it against an input where the thing genuinely is present,
+or against a commit from before the fix that introduced it.
+
 ### The mutation proof needs its own vacuity check
 
 Deleting a guard to watch a test go red is the strongest evidence in this
