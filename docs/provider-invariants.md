@@ -843,8 +843,22 @@ the assertion rather than before reaching it.** A mutation can break the setup
 instead of the behaviour — removing a guard so the input now parses cleanly makes
 `unwrap_err()` panic on an `Ok` value, and the test dies before the assertion is
 evaluated. That reddens without saying anything about the assertion's strength.
-The panic location answers it, allowing for the line shift a mutation inserted
-above the tests introduces.
+
+**Read the panic message, not the line number.** A stack trace from a mutated
+build is indexed against the mutant, so every line below an inserted or deleted
+block is displaced — and the displaced number lands on some other real statement,
+which may be the `unwrap_err()` that would suggest exactly the wrong conclusion.
+The message is unambiguous where the line is not: a panic from `unwrap_err()`
+reports an `Ok` value, while a failed assertion prints its own text.
+
+That only works if the assertion carries a message worth reading, so state the
+expectation in it rather than only the value:
+
+    expected the window guard, got: decode error: ... not decodable: missing used
+
+A bare mismatch says a test broke. Naming the rule that was expected, beside the
+one that answered instead, says *why* — which is the question a green mutation
+leaves open.
 
 When a sharpening cannot be shown to matter, keep it and label it **prophylactic
 rather than proven**. Those are different claims, and recording the weaker one is

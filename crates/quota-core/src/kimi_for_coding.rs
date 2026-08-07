@@ -729,7 +729,7 @@ mod tests {
         // leaving the test green while it exercises a different rule.
         assert!(
             matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
-            "{err}"
+            "expected the window guard, got: {err}"
         );
     }
 
@@ -739,7 +739,7 @@ mod tests {
         let err = normalize_usage(body).unwrap_err();
         assert!(
             matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
-            "{err}"
+            "expected the window guard, got: {err}"
         );
     }
 
@@ -749,7 +749,7 @@ mod tests {
         let err = normalize_usage(body).unwrap_err();
         assert!(
             matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
-            "{err}"
+            "expected the window guard, got: {err}"
         );
     }
 
@@ -761,7 +761,7 @@ mod tests {
         // window guard.
         assert!(
             matches!(&err, FetchError::Decode(m) if m.contains("not decodable")),
-            "{err}"
+            "expected the parse error, got: {err}"
         );
     }
 
