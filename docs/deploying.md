@@ -195,6 +195,39 @@ The stamp answers *is this build missing commits*. It cannot answer *does this
 build contain anything extra*, and a matching sha is not evidence that it does
 not.
 
+## Renaming the module id
+
+The subc module id is `ai-provider-quota`, and every other repository that calls
+this module names it by that id in a constant. Those are *target* references:
+they do not block a rename, they break when one lands. So callers ship **with**
+the change, and a caller missed is a dead quota route.
+
+Inside this repository the id has one definition, in
+`crates/quota-module/src/ids.rs`, which the integration tests include by path
+rather than restating. The local edit is a single line.
+
+What the suite can and cannot tell you about that line:
+
+- **The unit tests cannot verify the value.** Both sides read the same
+  definition, so any id passes — setting it to something else leaves the suite
+  green. They check that the pair moves together, which is a different property.
+- **`real_daemon_e2e` can.** It writes a `subc.jsonc` naming the id and has a
+  real `ck-subc` binary spawn and supervise this module from it, so the id must
+  round-trip through daemon config, process launch, and a routed `usage.get`.
+  It is `#[ignore]` because it builds the sibling daemon, so it needs running
+  explicitly:
+
+  ```sh
+  cargo test -p quota-module --test real_daemon_e2e -- --ignored
+  ```
+
+Rehearse by making the edit, running that test, and restoring the file. That
+confirms supervision works under the new id before any caller is touched.
+
+To enumerate the callers, run `scripts/module_id_callers.py`. It separates
+routes from trees that cannot receive an edit, and refuses to report a clean
+result when it finds no routes at all.
+
 ## When a deploy is not needed
 
 Commits touching only tests or documentation change no runtime behaviour, and
