@@ -197,3 +197,33 @@ like `git diff --name-only … | grep -v tests.rs` returns **grep's** exit statu
 and grep exits non-zero when nothing matches, so "no files changed" and "the
 command failed" are the same status. Any check whose exit code you intend to act
 on must not be read through a pipe.
+
+## Reading CI evidence for a specific commit
+
+This workflow sets `cancel-in-progress`, and pushes here often come in bursts, so
+a run being killed by the next push is routine — **30% of a recent 40-run sample
+was cancelled**. A cancelled run reports `status: completed` with
+`conclusion: cancelled`, which reads as closure to anything scanning for a
+terminal state.
+
+That matters when someone asks whether a particular change is verified, including
+a downstream consumer pinning evidence to a producer commit. Two rules:
+
+**Assert the step, not the run.** A run can be cancelled, and a run can conclude
+green with a step skipped by a conditional. The step list is the evidence and the
+run status is a summary of it:
+
+```
+gh run view <run-id> --json jobs \
+  | python3 -c "import json,sys; [print(s['conclusion'], s['name']) for j in json.load(sys.stdin)['jobs'] for s in j['steps']]"
+```
+
+**Ask for a run that contains the change, not the run at it.** Cancellation loses
+verification *at a commit*, never verification *of the content* — the next
+completed run covers everything beneath it. In that same sample, four cancelled
+runs carried production Rust and all four were ancestors of a later green run.
+So walk forward to the first completed run whose head contains the change:
+`git merge-base --is-ancestor <change> <run-head>`.
+
+The stricter reading — "the run at the commit that introduced it" — is the
+natural one and would report a third of this repository's history as unverified.
