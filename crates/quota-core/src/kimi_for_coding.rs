@@ -722,27 +722,47 @@ mod tests {
     fn missing_used_and_remaining_is_decode_error() {
         let body = br#"{ "usage": { "limit": "100", "resetTime": "2026-07-01T12:00:00Z" } }"#;
         let err = normalize_usage(body).unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        // Pinned to the window guard rather than to the variant. Both
+        // failure paths in this function report Decode, so a bare variant
+        // check is also satisfied by the body failing to parse at all --
+        // and a field becoming required is enough to move this input there,
+        // leaving the test green while it exercises a different rule.
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
+            "{err}"
+        );
     }
 
     #[test]
     fn zero_limit_is_decode_error_no_div_by_zero() {
         let body = br#"{ "usage": { "limit": "0", "used": "5" } }"#;
         let err = normalize_usage(body).unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
+            "{err}"
+        );
     }
 
     #[test]
     fn missing_limit_is_decode_error() {
         let body = br#"{ "usage": { "used": "5" } }"#;
         let err = normalize_usage(body).unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
+            "{err}"
+        );
     }
 
     #[test]
     fn garbage_body_is_decode_error() {
         let err = normalize_usage(b"not json").unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        // The neighbouring failure path, pinned for the same reason: this
+        // one must stay on the parse error and must not be satisfied by the
+        // window guard.
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.contains("not decodable")),
+            "{err}"
+        );
     }
 
     #[test]
