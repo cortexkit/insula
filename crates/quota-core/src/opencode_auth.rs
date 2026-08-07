@@ -35,6 +35,19 @@ pub enum OpencodeAuth {
 impl OpencodeAuth {
     /// True when an OAuth token's `expires` is in the past relative to `now_ms`.
     /// Always false for API keys (no expiry) or when no expiry is recorded.
+    ///
+    /// **This is for attributing a failure, not for skipping a fetch.** The
+    /// field records what the issuer said at grant time, and a token can outlive
+    /// it -- so refusing to try would break a lane that is still working, which
+    /// costs more than one wasted request. Attempt the fetch, and consult this
+    /// only when the response is too ambiguous to attribute on its own.
+    ///
+    /// That case is real rather than hypothetical: at least one upstream answers
+    /// an expired credential with an empty HTTP 200, byte-identical to what it
+    /// returns during an edge flap. An empty body is classified transient so a
+    /// flap does not discard a healthy window, so without this check a dead
+    /// credential retries forever and never reaches a verdict -- and nothing
+    /// ever tells the operator to sign in again.
     pub fn is_expired(&self, now_ms: i64) -> bool {
         match self {
             Self::Oauth {
@@ -43,6 +56,17 @@ impl OpencodeAuth {
             _ => false,
         }
     }
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before it.
+///
+/// Taken as an argument by [`OpencodeAuth::is_expired`] rather than read inside
+/// it, so tests can pin a time; this is the caller-side default.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Resolve the opencode auth.json path (`$XDG_DATA_HOME` or `~/.local/share`).

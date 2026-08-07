@@ -35,7 +35,7 @@ use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::{
     env,
-    http::{Header, JsonRequest},
+    http::{Header, JsonRequest, EMPTY_BODY_MARKER},
     model::{RateWindow, Usage},
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
@@ -452,6 +452,40 @@ impl GrokProvider {
     }
 }
 
+/// Re-attribute the one failure this endpoint cannot distinguish on its own.
+///
+/// An empty HTTP 200 arrives both when the edge is flapping and when the
+/// credential is dead, and it is classified transient so a flap keeps serving
+/// the last healthy window. That is right when the token is good and wrong when
+/// it is not: a dead credential retries forever and never reaches a verdict, so
+/// no consumer and no operator is ever told to sign in again.
+///
+/// The expiry recorded at grant time settles it. It is consulted only here,
+/// after the request has been made and only for this one ambiguous response, so
+/// a token still working past its stated expiry is unaffected -- every other
+/// outcome keeps the attribution the transport gave it.
+fn disambiguate_empty_response(attempt: FetchAttempt, expired: bool) -> FetchAttempt {
+    if !expired {
+        return attempt;
+    }
+    let is_empty_body = matches!(
+        &attempt.usage,
+        Err(FetchError::Upstream(message)) if message.contains(EMPTY_BODY_MARKER)
+    );
+    if !is_empty_body {
+        return attempt;
+    }
+    FetchAttempt::failure(
+        attempt.observed,
+        attempt.source,
+        FetchError::CredentialUnusable(
+            "xai token in opencode auth.json expired; the endpoint answers an expired \
+             credential with an empty response. Sign in again to refresh it."
+                .to_string(),
+        ),
+    )
+}
+
 impl Default for GrokProvider {
     fn default() -> Self {
         Self::new()
@@ -477,10 +511,9 @@ impl UsageProvider for GrokProvider {
             return self.fetch_vault(capability).await;
         }
 
-        let access =
+        let entry =
             match opencode_auth::read_provider(OPENCODE_PROVIDER).map_err(FetchError::NoSession) {
-                Ok(Some(OpencodeAuth::Oauth { access, .. })) => access,
-                Ok(Some(OpencodeAuth::Api { key })) => key,
+                Ok(Some(entry)) => entry,
                 Ok(None) => {
                     return FetchAttempt::failure(
                         None,
@@ -490,7 +523,14 @@ impl UsageProvider for GrokProvider {
                 }
                 Err(error) => return FetchAttempt::failure(None, None, error),
             };
-        self.fetch_local_bearer(&access).await
+        let expired = entry.is_expired(opencode_auth::now_ms());
+        let access = match &entry {
+            OpencodeAuth::Oauth { access, .. } => access.clone(),
+            OpencodeAuth::Api { key } => key.clone(),
+        };
+
+        let attempt = self.fetch_local_bearer(&access).await;
+        disambiguate_empty_response(attempt, expired)
     }
 }
 
@@ -1015,5 +1055,75 @@ mod tests {
         ];
         assert_eq!(body.len(), 8, "frame must be exactly 8 bytes");
         assert!(matches!(normalize_usage(&body), Err(FetchError::Decode(_))));
+    }
+
+    /// The whole point of the re-attribution: an expired credential must reach a
+    /// verdict rather than retrying behind a transient classification forever.
+    #[test]
+    fn expired_credential_turns_the_ambiguous_empty_body_into_a_verdict() {
+        let attempt = FetchAttempt::failure(
+            None,
+            None,
+            FetchError::Upstream("HTTP 200: empty response body".to_string()),
+        );
+        let out = disambiguate_empty_response(attempt, true);
+        assert!(
+            matches!(out.usage, Err(FetchError::CredentialUnusable(_))),
+            "an empty body from an expired credential must be attributed to the \
+             credential, not to the transport: {:?}",
+            out.usage
+        );
+    }
+
+    /// The guard's other side, and the one that keeps a working lane working: the
+    /// same response with a live credential is still a flap, and must keep serving
+    /// the last healthy window.
+    #[test]
+    fn live_credential_leaves_the_empty_body_transient() {
+        let attempt = FetchAttempt::failure(
+            None,
+            None,
+            FetchError::Upstream("HTTP 200: empty response body".to_string()),
+        );
+        let out = disambiguate_empty_response(attempt, false);
+        assert!(
+            matches!(out.usage, Err(FetchError::Upstream(_))),
+            "an empty body with a live credential is an edge flap and must stay \
+             transient: {:?}",
+            out.usage
+        );
+    }
+
+    /// Scoped to the one response that cannot be attributed on its own. An expired
+    /// credential does not license re-attributing every other transport failure --
+    /// a timeout is still a timeout, and degrading it would discard a healthy
+    /// window on a network blip.
+    #[test]
+    fn expiry_does_not_re_attribute_other_transport_failures() {
+        let attempt = FetchAttempt::failure(
+            None,
+            None,
+            FetchError::Upstream("connection timed out".to_string()),
+        );
+        let out = disambiguate_empty_response(attempt, true);
+        assert!(
+            matches!(&out.usage, Err(FetchError::Upstream(message)) if message.contains("timed out")),
+            "only the empty-body response is ambiguous; other transport errors keep \
+             their attribution: {:?}",
+            out.usage
+        );
+    }
+
+    /// A success is a success. If a token works past its stated expiry the fetch
+    /// stands -- the expiry is the issuer's claim at grant time, not proof.
+    #[test]
+    fn expiry_never_overrides_a_successful_fetch() {
+        let attempt = FetchAttempt::success(None, "oauth", Usage::default());
+        let out = disambiguate_empty_response(attempt, true);
+        assert!(
+            out.usage.is_ok(),
+            "a token working past its stated expiry must keep its result: {:?}",
+            out.usage
+        );
     }
 }

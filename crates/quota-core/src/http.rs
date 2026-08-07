@@ -158,13 +158,22 @@ impl HttpResponse {
     pub fn body_for_parsing(&self) -> Result<&[u8], FetchError> {
         if (200..300).contains(&self.status) && self.body.is_empty() {
             return Err(FetchError::Upstream(format!(
-                "HTTP {}: empty response body",
+                "HTTP {}: {EMPTY_BODY_MARKER}",
                 self.status
             )));
         }
         Ok(&self.body)
     }
 }
+
+/// The wording [`Response::body_for_parsing`] uses for an empty success body.
+///
+/// Shared so a provider that must tell this case apart from other transport
+/// failures can match on it rather than restating the phrase. One upstream
+/// answers a dead credential with an empty 200 and is otherwise unable to
+/// distinguish that from a flap, so it re-attributes this specific error when
+/// the credential is independently known to be expired.
+pub const EMPTY_BODY_MARKER: &str = "empty response body";
 
 impl Header {
     pub fn new(name: &'static str, value: impl Into<String>) -> Self {
