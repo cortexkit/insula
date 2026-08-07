@@ -811,6 +811,23 @@ into a neighbouring rule's domain. Replacing a `must be present` guard with a
 default that yields an empty collection hands the input to the next guard, which
 rejects empty — the suite stays green for a reason unrelated to coverage.
 
+And on the assertion side, which is where it hides in this crate: **several rules
+in one file report the same `FetchError` variant**, so a test asserting only the
+variant is satisfied by any of them. `kimi_for_coding` has two failure paths that
+both report `Decode` — the body not parsing, and the parsed body carrying no
+usable window — with four tests named for specific causes and none of them saying
+which path it expected.
+
+The refactor that exploits this is ordinary rather than contrived: making a usage
+field required moves a missing-value body from the window guard to the parse
+error. Every test stays green while three of them silently begin exercising a
+different rule. Pin the message, not the variant, wherever a file has more than
+one rule producing the same one.
+
+A fix to a test's quality needs its own fail-before, exactly like a fix to code:
+apply the mutation with the *old* assertion and confirm it passes. Otherwise
+there is no evidence the sharpening changed anything.
+
 ### The mutation proof needs its own vacuity check
 
 Deleting a guard to watch a test go red is the strongest evidence in this
