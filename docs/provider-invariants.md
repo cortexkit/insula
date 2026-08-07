@@ -785,6 +785,32 @@ broken detector reports the whole population. Then prove the detector can be
 satisfied at all: run it against an input where the thing genuinely is present,
 or against a commit from before the fix that introduced it.
 
+### A rule test needs three properties, not one
+
+A test for one rule of a multi-rule checker passes for the reason in its name
+only if all three hold:
+
+- **Detection** — it fires on input the rule should reject.
+- **Discrimination** — a paired test proves it stays silent on the neighbouring
+  case. Without it, a rule that rejects *everything* passes review: the
+  past-reset test would go green against a version reporting every reset at or
+  before now, and the used-count test against one reporting every window that
+  fills up.
+- **Isolation** — the fixture triggers no other rule, so the rule under test is
+  the only explanation for the finding.
+
+The third is the one that hides. A fixture whose used count exceeded its total
+by 20% also tripped the counts-versus-percent rule beside it, and the assertion
+searched the findings list — so the test would have passed on the neighbour
+alone. Overrunning by one instead, with the percent agreeing, leaves a single
+cause. Asserting the finding **count** rather than searching the list is what
+makes that isolation load-bearing rather than incidental.
+
+The same defect appears on the mutation side: a mutation must not move the input
+into a neighbouring rule's domain. Replacing a `must be present` guard with a
+default that yields an empty collection hands the input to the next guard, which
+rejects empty — the suite stays green for a reason unrelated to coverage.
+
 ### The mutation proof needs its own vacuity check
 
 Deleting a guard to watch a test go red is the strongest evidence in this
