@@ -333,6 +333,23 @@ pub enum FetchError {
     /// (no plan, or a plan that publishes no windows). Not a failure: there is
     /// nothing to fix and nothing to alert on.
     NoQuotaReported(String),
+    /// A local program this provider reads its usage from is not running.
+    ///
+    /// Distinct from [`Self::NoSession`] on the axis that matters to anything
+    /// keying on the class: NoSession is a stable fact about the host, and a
+    /// consumer may reasonably treat it as "this provider does not exist here"
+    /// and discard what it knows. This one changes when a person opens or
+    /// closes an application, so a provider reported that way would appear and
+    /// disappear on a cadence driven by desktop activity no consumer can see.
+    ///
+    /// Distinct from [`Self::Upstream`] because nothing upstream failed and
+    /// nothing was contacted. Reporting it that way would work -- both are
+    /// transient -- but it spends the meaning of a class someone relies on when
+    /// debugging a genuine network or endpoint failure.
+    ///
+    /// Transient by classification: the program may be running again at any
+    /// moment, and a cached window stays served meanwhile.
+    LocalSourceUnavailable(String),
     /// The session exists but is expired or rejected (401/403).
     Unauthorized(String),
     /// Numeric provider HTTP status retained for auth-failure reporting.
@@ -376,6 +393,7 @@ impl FetchError {
             Self::NoSession(_) => "credential_absent",
             Self::CredentialUnusable(_) => "credential_unusable",
             Self::NoQuotaReported(_) => "no_quota_reported",
+            Self::LocalSourceUnavailable(_) => "local_source_unavailable",
             Self::Unauthorized(_) | Self::ProviderStatus(401 | 403) => "credential_rejected",
             Self::ProviderStatus(_) | Self::Upstream(_) => "upstream_failed",
             Self::Decode(_) => "decode_failed",
@@ -450,6 +468,9 @@ impl std::fmt::Display for FetchError {
             Self::NoSession(m) => write!(f, "no session: {}", detail(m)),
             Self::CredentialUnusable(m) => write!(f, "credential unusable: {}", detail(m)),
             Self::NoQuotaReported(m) => write!(f, "no quota reported: {}", detail(m)),
+            // Says what is missing rather than that something failed, because
+            // nothing did: the program this reads from is simply not running.
+            Self::LocalSourceUnavailable(m) => write!(f, "local source unavailable: {}", detail(m)),
             Self::Unauthorized(m) => write!(f, "unauthorized: {}", detail(m)),
             Self::ProviderStatus(status) => write!(f, "provider returned HTTP {status}"),
             Self::Upstream(m) => write!(f, "upstream error: {}", detail(m)),
@@ -517,6 +538,7 @@ mod tests {
             FetchError::NoSession("x".into()),
             FetchError::CredentialUnusable("x".into()),
             FetchError::NoQuotaReported("x".into()),
+            FetchError::LocalSourceUnavailable("x".into()),
             FetchError::Internal("x".into()),
             FetchError::Unauthorized("x".into()),
             FetchError::ProviderStatus(401),
@@ -532,6 +554,7 @@ mod tests {
                 FetchError::NoSession(_) => "credential_absent",
                 FetchError::CredentialUnusable(_) => "credential_unusable",
                 FetchError::NoQuotaReported(_) => "no_quota_reported",
+                FetchError::LocalSourceUnavailable(_) => "local_source_unavailable",
                 FetchError::Unauthorized(_) | FetchError::ProviderStatus(401 | 403) => {
                     "credential_rejected"
                 }
@@ -546,7 +569,7 @@ mod tests {
         // cannot pass by mapping everything to one string.
         let distinct: std::collections::BTreeSet<_> =
             cases.iter().map(FetchError::error_class).collect();
-        assert_eq!(distinct.len(), 7);
+        assert_eq!(distinct.len(), 8);
 
         // The load-bearing split: an absent credential and a broken one must
         // never share a class, since only the second is worth acting on.
@@ -582,6 +605,9 @@ mod tests {
             "credential_unusable",
             "credential_rejected",
             "no_quota_reported",
+            // Judged as NOT a stale credential: the credential is untouched and
+            // the program that reads it is simply not running.
+            "local_source_unavailable",
             "upstream_failed",
             "decode_failed",
             "internal_error",
@@ -591,6 +617,7 @@ mod tests {
             FetchError::NoSession("x".into()),
             FetchError::CredentialUnusable("x".into()),
             FetchError::NoQuotaReported("x".into()),
+            FetchError::LocalSourceUnavailable("x".into()),
             FetchError::Unauthorized("x".into()),
             FetchError::ProviderStatus(401),
             FetchError::ProviderStatus(500),
@@ -606,6 +633,7 @@ mod tests {
                 FetchError::NoSession(_)
                 | FetchError::CredentialUnusable(_)
                 | FetchError::NoQuotaReported(_)
+                | FetchError::LocalSourceUnavailable(_)
                 | FetchError::Unauthorized(_)
                 | FetchError::ProviderStatus(_)
                 | FetchError::Upstream(_)

@@ -191,26 +191,41 @@ for health, never on this field's presence.
 | `credential_unusable` | a credential is present but cannot be used as one | no |
 | `credential_rejected` | the credential was sent and refused (401/403) | no — needs re-authentication |
 | `no_quota_reported` | the credential works; the account reports no quota | no, and nothing is wrong |
+| `local_source_unavailable` | a program on this machine that this provider reads usage from is not running | yes — when it runs again |
 | `upstream_failed` | the provider's endpoint failed (429, 5xx, network) | yes |
 | `decode_failed` | a response arrived in an unexpected shape | yes |
 | `internal_error` | a fault in this module, contained rather than crashing | sometimes |
 
 The self-recovery column is the one a user-facing surface should group on,
-because it decides between two sentences: **wait**, or **act**. The first three
-need an operator and will never clear on their own. The next needs nothing and
-nothing is wrong. The last three clear without anyone doing anything — with the
-caveat that `internal_error` clears only if the fault was in handling one
-particular response; a deterministic bug in this module repeats until it is
-fixed here.
+because it decides between two sentences: **wait**, or **act**. Read it off the
+column rather than from any summary here — a `no` means someone must do
+something, and `no_quota_reported` is the one row where `no` means nothing is
+wrong and nothing is needed.
+
+`internal_error` is marked *sometimes* because both of its causes carry that
+class and nothing on the wire separates them: a panic while handling one
+particular response clears on the next fetch, while a deterministic bug in this
+module repeats until it is fixed here. Promising recovery would be worse than
+saying nothing, since someone waiting on the second kind waits forever.
 
 `internal_error` also deserves its own sentence rather than sharing one with the
 other two. Those mean the provider is unwell; this one means the provider may be
 perfectly healthy and this module fell over reading it. Telling someone to check
 a service that is fine sends them somewhere with nothing to find.
 
-`upstream_failed` is rare on a degraded entry, because a transient failure with
-a prior healthy window serves that window stale instead of degrading. Seeing it
-means the slot never had a healthy window to fall back on.
+`upstream_failed` and `local_source_unavailable` are both rare on a degraded
+entry, because a transient failure with a prior healthy window serves that
+window stale instead of degrading. Seeing either means the slot never had a
+healthy window to fall back on.
+
+**`local_source_unavailable` exists to keep `credential_absent` meaning one
+thing.** A few providers read usage from a program running on this machine
+rather than from a stored credential, and that program's absence tracks whether
+someone has an application open. Reported as `credential_absent`, such a
+provider would appear and disappear on a cadence driven by desktop activity no
+consumer can see — while `credential_absent` is otherwise a stable fact about
+the host, which a consumer may reasonably act on by discarding what it knows
+about that provider. Keeping the two apart is what makes that reading safe.
 
 **The list will grow, and it is a string rather than an enum for that reason.**
 Render an unrecognised class as a degraded entry with an unknown reason: never

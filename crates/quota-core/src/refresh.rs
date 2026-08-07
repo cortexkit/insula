@@ -215,6 +215,10 @@ impl ProviderSlot {
 pub fn classify(err: &FetchError) -> FetchClass {
     match err {
         FetchError::Upstream(_) => FetchClass::Transient,
+        // The local program may be running again at any moment, so a cached
+        // window keeps being served rather than being replaced by a degraded
+        // entry every time someone closes an application.
+        FetchError::LocalSourceUnavailable(_) => FetchClass::Transient,
         FetchError::ProviderStatus(401 | 403)
         | FetchError::NoSession(_)
         | FetchError::CredentialUnusable(_)

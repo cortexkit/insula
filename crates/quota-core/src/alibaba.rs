@@ -355,10 +355,12 @@ fn should_retry_alternate_region(err: &FetchError) -> bool {
         FetchError::Decode(msg) => {
             msg.contains("missing coding plan quota data") || msg.contains("no quota windows found")
         }
-        // A local credential problem is not something another region can fix.
+        // A local credential problem is not something another region can fix,
+        // and neither is a local program that is not running.
         FetchError::NoSession(_)
         | FetchError::CredentialUnusable(_)
         | FetchError::NoQuotaReported(_)
+        | FetchError::LocalSourceUnavailable(_)
         // Not worth another region: a defect in this module reproduces there,
         // because every region runs the same code against the same input.
         | FetchError::Internal(_) => false,

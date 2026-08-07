@@ -895,13 +895,19 @@ impl UsageProvider for AntigravityProvider {
                 .await
                 .unwrap_or_else(|_join_error| Vec::new());
             if servers.is_empty() {
-                return Err(FetchError::NoSession(
+                // Not "no credential here": this lane reads usage from the
+                // running editor, so its absence tracks whether someone has the
+                // application open, not whether the provider is configured.
+                return Err(FetchError::LocalSourceUnavailable(
                     "no Antigravity language server or agy CLI process running".to_string(),
                 ));
             }
 
-            let mut last_err =
-                FetchError::NoSession("no Antigravity loopback port served quota".to_string());
+            // Processes were found but none answered -- one may be starting up
+            // or shutting down, which resolves on its own like the absent case.
+            let mut last_err = FetchError::LocalSourceUnavailable(
+                "no Antigravity loopback port served quota".to_string(),
+            );
             for server in &servers {
                 let pid = server.pid;
                 let ports = tokio::task::spawn_blocking(move || discover_ports(pid))

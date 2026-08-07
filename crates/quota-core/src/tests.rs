@@ -3614,6 +3614,103 @@ async fn fetched_at_is_stable_for_fresh_and_stale_slot_entries() {
     assert_eq!(stale[0].fetched_at.as_deref(), Some(fetched_at.as_str()));
 }
 
+/// A provider whose local source is not running keeps serving its last window.
+///
+/// Some providers read usage from a program on this machine rather than from a
+/// stored credential. That program's absence tracks whether someone has an
+/// application open, so it comes and goes on a cadence no consumer can see --
+/// unlike an absent credential, which is a stable fact about the host and which
+/// a consumer may reasonably read as "this provider does not exist here" and
+/// act on by discarding what it knows.
+///
+/// Classifying the two the same way makes such a provider appear and disappear
+/// as windows are opened and closed. Treating it as transient keeps the last
+/// known window in place across the gap, which is both more useful and more
+/// honest: the capacity did not change, only our ability to read it.
+/// Succeeds once, then fails with whatever the test asks for.
+struct SucceedsThenFailsProvider {
+    calls: Mutex<usize>,
+    then: fn() -> FetchError,
+}
+
+#[async_trait]
+impl UsageProvider for SucceedsThenFailsProvider {
+    fn name(&self) -> &str {
+        "local-lane"
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            FetchAttempt::success(None, "test", Usage::default())
+        } else {
+            FetchAttempt::failure(None, None, (self.then)())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_provider_whose_local_source_stops_running_keeps_serving_its_window() {
+    let registry = Registry::new(vec![Box::new(SucceedsThenFailsProvider {
+        calls: Mutex::new(0),
+        // The program goes away, as it does when someone closes the editor.
+        then: || {
+            FetchError::LocalSourceUnavailable(
+                "no Antigravity language server or agy CLI process running".to_string(),
+            )
+        },
+    })]);
+
+    tick(&registry).await;
+    assert!(
+        registry.get_usage(None).await[0].usage.is_some(),
+        "fixture must start healthy"
+    );
+
+    force_due(&registry, "local-lane");
+    tick(&registry).await;
+
+    let after = registry.get_usage(None).await;
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0].usage.is_some(),
+        "the cached window must survive: {:?}",
+        after[0].error
+    );
+    assert!(
+        after[0].error.is_none(),
+        "a transient failure with a prior healthy window serves it stale rather \
+         than replacing it with a degraded entry"
+    );
+}
+
+/// The same fixture with an absent CREDENTIAL degrades instead.
+///
+/// This is the behaviour the local-source class deliberately does not share,
+/// and asserting it here is what stops the test above from passing merely
+/// because this fixture never degrades at all.
+#[tokio::test]
+async fn a_provider_whose_credential_is_absent_loses_its_window() {
+    let registry = Registry::new(vec![Box::new(SucceedsThenFailsProvider {
+        calls: Mutex::new(0),
+        then: || FetchError::NoSession("no credential".to_string()),
+    })]);
+
+    tick(&registry).await;
+    force_due(&registry, "local-lane");
+    tick(&registry).await;
+
+    let degraded = registry.get_usage(None).await;
+    assert_eq!(
+        degraded[0].error_class.as_deref(),
+        Some("credential_absent"),
+        "{:?}",
+        degraded[0].error
+    );
+    assert!(degraded[0].usage.is_none());
+}
+
 /// A degraded entry carries the machine-readable class beside its prose.
 ///
 /// The message is prose with no stability promise, and consumers are told not
