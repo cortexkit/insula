@@ -637,6 +637,19 @@ extension list, a path prefix, an attribute where a module was meant — each is
 guess about how the target is written, and the guess is invisible in the output.
 When a sweep reports something missing, read that file before believing it.
 
+The cheap defence is to **run the sweep under two or three spellings a different
+author would plausibly have chosen, and treat any disagreement as the population
+the pattern was blind to.** A control written by the same person who wrote the
+pattern is drawn from the same vocabulary, so it passes for exactly the reason
+the pattern was wrong. Asking which files call a particular function here gives
+9, 8 or 10 depending on whether the needle is the bare name, the name with `fn`,
+or the trait that declares it — one number looks equally confident at any of
+those values, and the spread is the only thing that reveals the assumption.
+
+It narrows the class rather than closing it: spellings that share a premise
+share its blind spot, and all three of those assume the target appears as a
+literal substring at the call site.
+
 **Print the positive count beside the negative.** "9 of 9 indexed" is checkable
 at a glance; "9 missing" is not, because the denominator is invisible and a
 broken detector reports the whole population. Then prove the detector can be
