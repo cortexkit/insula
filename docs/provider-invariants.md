@@ -696,6 +696,24 @@ Same shape as an absence sweep reporting a count with no denominator: the output
 carries no trace of its own scope, so nothing about it invites the question.
 **Print what the narrowing removed, or carry the wide result forward.**
 
+### A review that answered about the wrong target is unaddressed, not wrong
+
+An automated review can examine something other than what was asked — a whole
+file rather than a diff, a neighbouring function, an older revision. Its findings
+are then neither right nor wrong about the intended target; they are **about
+something else**, and both obvious responses lose information.
+
+Discarding it because it disagrees with the change throws away a finding that may
+be correct where it landed. Accepting it as being about the change rewrites
+something that was fine. This happened here: a review of an uncommitted section
+returned specific, well-reasoned criticism of a passage forty lines away, which
+had been wrong for weeks. The critique was inapplicable to the change and
+accurate about its actual subject, so the finding was applied where it belonged.
+
+So before judging whether a review is right, establish **what it examined**. Same
+discipline as reading which test a mutation reddened rather than noting that
+something went red.
+
 ### A check that returns the same answer for every member of a set is answering a question about itself
 
 A uniform result across a population that cannot plausibly be uniform is an
