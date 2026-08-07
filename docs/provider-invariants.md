@@ -696,6 +696,26 @@ Same shape as an absence sweep reporting a count with no denominator: the output
 carries no trace of its own scope, so nothing about it invites the question.
 **Print what the narrowing removed, or carry the wide result forward.**
 
+### An explanation that fits one member may be its special case wearing the shape of the class
+
+When one member of a set behaves differently and a mechanism explains it, the
+mechanism is established for that member only. Letting it stand as the rule is
+the cheap step, and it survives because it is *true* — just not general.
+
+A worked case: during a credential-store outage, one provider vanished from the
+response entirely while others merely degraded. The explanation was real — that
+provider replaces its local credential lane with stored handles, so an
+unreachable store leaves it zero handles and it emits nothing. Reading the other
+five vault-aware providers showed **none of them share it**; each keeps an
+implicit local handle and extends it. The variation was in the providers, not in
+the outage, and the difference in symptom had been observed by two people without
+either connecting it.
+
+The check is one step and it is the step that gets skipped: **enumerate the other
+members before letting the explanation stand as the rule.** A mechanism that
+explains the case in front of you feels finished, which is precisely when it is
+least examined.
+
 ### A review that answered about the wrong target is unaddressed, not wrong
 
 An automated review can examine something other than what was asked — a whole
