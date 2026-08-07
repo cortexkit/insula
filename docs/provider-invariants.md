@@ -400,6 +400,24 @@ at the call site — a spawned task, no result, no test. What makes it safe is n
 visible from the code that discards it, which is the argument for asking the
 question per site rather than pattern-matching on the shape.
 
+**The noticer must not be downstream of the same break.** A backstop that fails
+whenever the thing it backstops fails is not one. The auth reports pass because
+the report and the wire entry both descend from a single 401 but travel
+independently: the report goes to the credential store, the entry goes to the
+next read, and neither is on the other's path.
+
+Answering "what would notice" is easier against a list of shapes than from
+scratch, and there are three here:
+
+| shape | the noticer | example |
+|---|---|---|
+| control flow | the fallback chain itself — failure funnels into a value the caller acts on | a reset that stays `None` and is omitted from the window |
+| independent signal | a second observation derived from the same event by another route | a 401 that lands as `credential_rejected` whether or not the report is delivered |
+| counter or reclaim | an explicit metric, or a path that cleans up regardless | not used here; the shape a teardown call needs, since nothing downstream reads its result |
+
+A site matching none of the three is where to look, and optional enrichment
+matches none by construction: the data it adds is the only evidence it ran.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
