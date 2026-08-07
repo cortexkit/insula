@@ -601,6 +601,26 @@ a withheld slot that is never emitted, the other landed before both emits and so
 perturbed them equally. A green mutation run is more often a missed mutation than
 a weak guard.
 
+### A comparison of two identical inputs says nothing about the transform
+
+The completeness harness emits a pair of envelopes whose `result` arrays are
+byte-identical, so that a consumer proving retain-versus-delete is isolating
+`completeProviders` and nothing else.
+
+It is tempting to extend that downstream: *decode both through your types and
+assert the decoded arrays are still equal, to prove the decode loses nothing.*
+**That check cannot fail.** The two inputs are already identical, so any
+deterministic function of them produces identical outputs — including one that
+drops every field. The assertion is satisfied by the inputs rather than by the
+property it appears to test.
+
+The general form: **a differential test over two equal inputs tests the equality
+of the inputs, not the behaviour of what is applied to them.** To show a decode
+preserves what matters, compare the decoded value against the *raw* payload field
+by field, and prove that check can fail by dropping a field and watching it
+redden. Keep that separate from the pair discrimination, or one assertion's
+vacuity hides inside the other's success.
+
 ### Record the consequence, not just the fact
 
 "`rawUsedPercent` is emitted only where the two figures diverge" is a fact, and a
