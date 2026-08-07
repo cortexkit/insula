@@ -340,6 +340,36 @@ It is **wrong** where the local lane is a genuinely different account, because
 then dropping it removes real usage from the wire rather than removing a
 duplicate. Establish which case a provider is in before changing its handles.
 
+## A best-effort call that has never succeeded looks like one that found nothing
+
+Several providers enrich a resolved usage snapshot from a second, optional
+endpoint. The pattern is deliberate: the windows are already in hand, so a
+console that is unreachable or logged out must not turn a good fetch into a
+degraded entry. `if let Ok(body) = second_call().await` is the shape.
+
+It has no failure signal at all. A call that is rejected on **every** fetch
+produces exactly what a call that succeeds and finds nothing produces: no extra
+window, no degraded entry, no failed test, and a provider that looks healthy
+because it is. `kimi-for-coding` sent its coding API key to a web console that
+authenticates with a browser session, so the enrichment had been rejected on
+every fetch since it was written and two windows had never once reached the wire.
+
+**The tell is that the two endpoints take different credentials.** One surface
+with one credential is fine; the moment a provider reaches a second host, or a
+second product surface on the same host, ask which credential that surface
+accepts rather than reusing the one already in hand. Reusing it is the natural
+thing to write, because it is right there and the call compiles.
+
+Sweeping for the shape is cheap — look for a discarded `Result` from an awaited
+request — but the sweep only lists candidates. Deciding each one means comparing
+the origin against the credential. Of the three sites in this crate, `kimi.rs`
+sends its web token to two paths on the same web host and is correct; the one
+that crossed a credential boundary was the defect.
+
+And the fix is not to make the call loud. It is to **skip it when its credential
+is absent**, so a host with no browser session makes no request at all, and a
+request that does go out is one that could have worked.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
