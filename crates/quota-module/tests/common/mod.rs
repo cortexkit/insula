@@ -24,7 +24,14 @@ use tokio::{
     time::{timeout, Instant},
 };
 
-pub const MODULE_ID: &str = "ai-provider-quota";
+// Included by path rather than restated: this is a binary crate, so a test
+// cannot `use` its constants. A second copy would drift the moment this module
+// is renamed, leaving the suite exercising an id nothing uses -- which passes.
+#[path = "../../src/ids.rs"]
+mod ids;
+#[allow(unused_imports)] // each consumer of this file uses a different subset
+pub use ids::CREDENTIALS_MODULE_ID as VAULT_MODULE_ID;
+pub use ids::DEFAULT_MODULE_ID as MODULE_ID;
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 

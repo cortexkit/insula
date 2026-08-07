@@ -1,9 +1,9 @@
-//! The credential vault's identity on the daemon, in one place.
+//! Daemon module ids, in one place.
 //!
 //! This lives in its own file so the integration tests can include it by path
 //! rather than restating it. The module is a binary crate, so a test cannot
-//! `use` anything from it — and when the id was written out twice, a rename of
-//! the vault left the client dialling the new name while the test stub still
+//! `use` anything from it — and when the vault's id was written out twice, a
+//! rename left the client dialling the new name while the test stub still
 //! registered under the old one. Nothing failed to compile; the test simply
 //! stopped exercising the vault and reported that two accounts never arrived.
 //!
@@ -28,3 +28,12 @@
 /// which is classified transient (a restarting module answers identically), so
 /// the refresher retries on its backoff forever and never reaches a verdict.
 pub const CREDENTIALS_MODULE_ID: &str = "claustrum";
+
+/// This module's own id on the daemon, used when the supervisor does not name
+/// one in the environment.
+///
+/// Kept here beside the vault's id for the same reason: the tests need it to
+/// register and address this module, and a second copy of it would drift the
+/// moment this module is renamed — leaving the suite exercising an id nothing
+/// uses, which passes.
+pub const DEFAULT_MODULE_ID: &str = "ai-provider-quota";

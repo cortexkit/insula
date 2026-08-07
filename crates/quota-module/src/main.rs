@@ -13,8 +13,10 @@
 //! (`~/.codex/auth.json`, ...) regardless of the relayed bind identity, so it
 //! declares an empty identity scope and ignores `project_root`.
 
+mod ids;
 mod vault_client;
-mod vault_ids;
+
+use ids::DEFAULT_MODULE_ID;
 
 use std::{error::Error, ffi::OsString, fmt, path::PathBuf, sync::Arc};
 
@@ -41,7 +43,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use vault_client::VaultClient;
 
-const DEFAULT_MODULE_ID: &str = "ai-provider-quota";
 const USAGE_GET_OP: &str = "usage.get";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
@@ -1141,7 +1142,7 @@ mod tests {
             "op": "route.bind",
             "route_channel": 7,
             "epoch": 1,
-            "target": { "kind": "management_surface", "module_id": MODULE_ID_FOR_TEST },
+            "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
             "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
         });
         let frame = Frame::build_with_version(
@@ -1162,6 +1163,4 @@ mod tests {
         let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
         assert!(matches!(body, ModuleControlResponse::RouteBindAck {}));
     }
-
-    const MODULE_ID_FOR_TEST: &str = "ai-provider-quota";
 }

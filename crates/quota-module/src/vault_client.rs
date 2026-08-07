@@ -24,7 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
-use crate::vault_ids::CREDENTIALS_MODULE_ID;
+use crate::ids::CREDENTIALS_MODULE_ID;
 /// Bounds both the TCP connect and the HMAC handshake that follows it.
 ///
 /// One constant covers two concerns because they share a budget: a peer that
