@@ -678,6 +678,20 @@ So when a subsystem reports healthy during an incident, ask **which operation th
 probe performs** before treating it as evidence. A probe that exercises one path
 is silent about every other, and its silence looks identical to a clean bill.
 
+The same question applies to this repository's own checkers, and the answer is
+uncomfortable. During that outage the module's health status, the conservation
+identity, the deployed-sanity checker, the `buildCommit` verification and the
+error-class distribution all passed — while seven credentialed accounts silently
+stopped being served. Every one of them measures **internal agreement**, and
+**a set that shrinks stays consistent**: the vanished providers moved from one
+bucket to another and the buckets still summed to the total.
+
+That is not an argument against those checks; the conservation identity caught a
+real bucket defect when it was written. It is an argument for knowing what each
+one is blind to. **A checker built to catch contradictions is silent about a
+silent subtraction** — so if the question is "did something stop working", none
+of them answers it, and their passing is not evidence either way.
+
 ### A narrowing step with no record of what it dropped produces a list that looks complete
 
 A sweep that finds the full population, followed by a second pass that narrows it,
