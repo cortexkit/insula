@@ -75,8 +75,18 @@ import sys
 from pathlib import Path
 
 DEFAULT_ID = "ai-provider-quota"
-# This module's own repository, whose single definition is not a caller.
-SELF_REPO = "insula"
+
+
+def self_repo() -> str:
+    """This repository's directory name, whose own hits are not caller hits.
+
+    Derived from this file's location rather than written down. A constant would
+    be a second place the repository's name lives, and it would go stale the next
+    time the directory is renamed -- silently, because a name that no longer
+    matches anything simply annotates nothing. The annotation would vanish and
+    this module's own definition would read as somebody else's caller.
+    """
+    return Path(__file__).resolve().parents[1].name
 
 # Extensions where the id can be a live reference. Deliberately wide: the cost of
 # examining a prose hit is one line of output, and the cost of excluding a real
@@ -226,6 +236,7 @@ def main() -> int:
         print(f"no git repositories under {root}", file=sys.stderr)
         return 2
 
+    mine = self_repo()
     copies = duplicates(all_repos)
     routes: list[str] = []
     docs = 0
@@ -250,7 +261,7 @@ def main() -> int:
             kind = role(path, text)
             if kind == "route":
                 rel = path.relative_to(root)
-                marker = "  (this module's own definition)" if path.parts and SELF_REPO in path.parts else ""
+                marker = "  (this module's own definition)" if mine in path.parts else ""
                 routes.append(f"{rel}:{num}{marker}")
             elif kind == "fixture":
                 fixtures += 1
