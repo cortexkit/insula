@@ -681,6 +681,28 @@ And the pattern must name the property rather than a word that happens to appear
 in it. A string can already be in use elsewhere for an unrelated reason, in which
 case the sweep is counting the string and not the thing.
 
+A corollary worth stating because it inverts the obvious: **a repository with no
+history of a defect has no control for it**, so its clean sweep is
+indistinguishable from a broken detector. The first time anything is swept for is
+when the answer can least be trusted, and a codebase that has already been wrong
+in some direction is better equipped to check itself along it than one that never
+has.
+
+### Print the premise beside the result
+
+Every sweep rests on a definition — what counts as production code, what counts
+as a call site, which files were even considered — and the numbers look identical
+under any of them. A reader who would disagree with the definition cannot tell it
+was used, so the assumption is the one part of the reasoning that never reaches
+the output.
+
+`scripts/prod_body.py` therefore names its boundary rule on every run, above the
+counts. This is not a debugging aid: it is what makes a result auditable by
+someone who did not write the tool, and that is the person most likely to catch
+it — not being the one who chose the pattern is the whole advantage. The
+incompleteness of this tool's own boundary was found exactly that way, by a
+reader who knew which anchor it used.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
