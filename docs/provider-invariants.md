@@ -650,6 +650,23 @@ It narrows the class rather than closing it: spellings that share a premise
 share its blind spot, and all three of those assume the target appears as a
 literal substring at the call site.
 
+And it helps least exactly where the stakes are highest. **When the expected
+answer is zero, a broken pattern returns the answer you wanted.** Every security
+sweep here has that shape — does any provider interpolate a credential path into
+a published error, does any lane send a bearer over plain http — and a detector
+that matches nothing because its pattern is wrong is indistinguishable from a
+clean result. The denominator is right, and several equally broken spellings
+agree with each other at zero.
+
+So a zero-expected sweep has to **borrow a non-zero answer from somewhere**, and
+the cheapest source is history: run the detector against the commit before the
+fix that removed the last instance. `ff845ec^` still interpolates three
+credential paths into wire errors; `d65444f^` still publishes an unstripped
+request URL. Both make the detector fire, which is what makes today's zero mean
+something. **Every defect ever fixed in this repository is a positive control
+lying around for free**, and one is worth more than three spellings when the
+expected answer is nothing at all.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
