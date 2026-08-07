@@ -14,6 +14,7 @@
 //! declares an empty identity scope and ignores `project_root`.
 
 mod vault_client;
+mod vault_ids;
 
 use std::{error::Error, ffi::OsString, fmt, path::PathBuf, sync::Arc};
 

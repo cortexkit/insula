@@ -114,7 +114,14 @@ async fn start_daemon() -> TestDaemon {
 
 // ---- credential and HTTP stubs --------------------------------------------
 
-const VAULT_MODULE_ID: &str = "cortexkit-credentials";
+// Included by path rather than restated: this is a binary crate, so a test
+// cannot `use` its constants. Restating the id let the two drift apart when the
+// vault was renamed -- the client dialled the new name while this stub still
+// registered under the old one, which compiles cleanly and silently stops
+// exercising the vault at all.
+#[path = "../src/vault_ids.rs"]
+mod vault_ids;
+use vault_ids::CREDENTIALS_MODULE_ID as VAULT_MODULE_ID;
 
 struct VaultStub {
     task: tokio::task::JoinHandle<()>,
