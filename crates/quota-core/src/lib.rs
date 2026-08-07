@@ -208,7 +208,24 @@ fn wall_time_from_anchor(
     created_at_wall.checked_add_signed(elapsed)
 }
 
-fn relax_usage_for_read(entry: &mut ProviderUsage) {
+/// Apply the banked-reset relaxation to an entry about to be published, if this
+/// slot has earned it.
+///
+/// The eligibility test lives here rather than at the call sites deliberately.
+/// This transform publishes a zero where the provider reported real usage, so a
+/// caller that applies it without the gate tells consumers an exhausted account
+/// is idle. With the check outside, that mistake is a missing `if` at a new call
+/// site and compiles cleanly; with it inside, the transform cannot be reached
+/// without the slot being consulted.
+///
+/// Both conditions matter. `relax_eligible` records that the fetch which
+/// produced this entry had banked credits and had not spent one; `is_fresh`
+/// bounds how long that finding is trusted, because a stale slot's eligibility
+/// describes an observation that may no longer hold.
+fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now: Instant) {
+    if !(slot.relax_eligible && slot.is_fresh(read_now)) {
+        return;
+    }
     let Some(usage) = entry.usage.as_mut() else {
         return;
     };
@@ -587,9 +604,7 @@ impl Registry {
                     if let Some(mut entry) = primary.entry.clone() {
                         entry.account = None;
                         entry.api_provider = api_provider_name(name).map(String::from);
-                        if primary.relax_eligible && primary.is_fresh(read_now) {
-                            relax_usage_for_read(&mut entry);
-                        }
+                        relax_usage_for_read(&mut entry, primary, read_now);
                         out.push(entry);
                     }
                 }
@@ -645,9 +660,7 @@ impl Registry {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
                     entry.api_provider = api_provider_name(name).map(String::from);
-                    if slot.relax_eligible && slot.is_fresh(read_now) {
-                        relax_usage_for_read(&mut entry);
-                    }
+                    relax_usage_for_read(&mut entry, slot, read_now);
                     out.push(entry);
                 }
             }
