@@ -666,19 +666,22 @@ mod tests {
     /// this is checked separately rather than inferred from the percent.
     #[test]
     fn a_used_count_above_the_total_is_reported() {
-        let mut w = window(50.0);
-        w.used_count = Some(12_000.0);
+        // The counts exceed the total by a hair, and the percent agrees with
+        // them. A larger overrun would also trip the counts-versus-percent rule
+        // beside this one, and the test would then pass whether or not this
+        // rule exists -- so the fixture is chosen to leave this rule as the only
+        // explanation for a finding.
+        let mut w = window(100.0);
+        w.used_count = Some(10_001.0);
         w.total_count = Some(10_000.0);
 
         let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
 
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.contains("usedCount 12000 exceeds totalCount 10000")),
-            "{:?}",
-            report.findings
+            report.findings[0].contains("usedCount 10001 exceeds totalCount 10000"),
+            "{}",
+            report.findings[0]
         );
     }
 
