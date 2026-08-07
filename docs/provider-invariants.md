@@ -703,6 +703,14 @@ it — not being the one who chose the pattern is the whole advantage. The
 incompleteness of this tool's own boundary was found exactly that way, by a
 reader who knew which anchor it used.
 
+**Derive the printed premise from the thing that enforces it.** Written by hand
+beside the pattern, it is prose next to a derived artifact and rots the same way:
+it agrees on the day it is written and stops agreeing when someone edits the
+pattern, while still carrying the authority of an explicit statement. A premise
+that can disagree with the code is worse than none. The check is one mutation —
+change the rule and confirm the printed line changes with it; here, anchoring on
+`mod checks` left the output still claiming `mod tests`.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
