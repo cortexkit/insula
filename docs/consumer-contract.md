@@ -452,6 +452,28 @@ while omitting it, because the inventory lookup is separate from the usage fetch
 and is allowed to fail without degrading the entry. `soonestExpiresAt` is absent
 when no credit has a stated expiry, which is not the same as none expiring soon.
 
+## Sibling keys on the envelope may be invisible to you
+
+`completeProviders` sits beside `result` on the `usage.get` envelope, and this
+module adds envelope-level keys rather than new operations so existing callers
+keep working. That reasoning holds for a consumer that reads the envelope. **Not
+every consumer does.**
+
+A shared request helper that unwraps `{"result": ...}` and hands the bare array
+onward makes sibling keys unreachable *by construction* — the code that would
+read them never sees the object they live on. That is a different situation from
+ignoring a key: adopting one later is a change to the transport helper, possibly
+in a shared library, rather than a change to the code that wants the data.
+
+It is harmless for a display-only consumer, and it is **not** harmless for anyone
+reconciling stored account sets, because `completeProviders` is the only thing
+that authorises deleting a stored account. If your helper unwraps the envelope
+and you prune accounts, you are pruning without the signal that makes pruning
+safe.
+
+Worth checking rather than assuming: the question is not "do I use
+`completeProviders`" but "could I, without touching my transport layer".
+
 ## Which field to key on
 
 Two fields name the provider and they are **different namespaces**:
