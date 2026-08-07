@@ -258,6 +258,10 @@ fn healthy_entry(
         saved_resets,
         usage: Some(usage),
         error: None,
+        // A healthy entry has no failure to classify. Absent rather than an
+        // "ok" sentinel: the field answers why an entry is degraded, and a
+        // healthy entry is not.
+        error_class: None,
     }
 }
 
@@ -405,7 +409,17 @@ fn next_slot_after_attempt_inner(
                     (retry_base.entry.clone(), SlotStatus::StaleTransient)
                 }
                 _ => (
-                    Some(ProviderUsage::degraded(provider_name, &error)),
+                    // The class travels with the entry, not just on the slot.
+                    // The message beside it is prose with no stability promise,
+                    // so without this a consumer separating "nobody configured
+                    // this provider" from "it is configured and broken" has only
+                    // the text to match on -- and that coupling breaks silently
+                    // whenever the wording is improved.
+                    Some(ProviderUsage::degraded_with_class(
+                        provider_name,
+                        &error,
+                        error.error_class(),
+                    )),
                     SlotStatus::Degraded,
                 ),
             };

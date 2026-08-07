@@ -3614,6 +3614,71 @@ async fn fetched_at_is_stable_for_fresh_and_stale_slot_entries() {
     assert_eq!(stale[0].fetched_at.as_deref(), Some(fetched_at.as_str()));
 }
 
+/// A degraded entry carries the machine-readable class beside its prose.
+///
+/// The message is prose with no stability promise, and consumers are told not
+/// to branch on it. Without the class travelling on the entry, a consumer that
+/// needs to separate "nobody configured this provider" from "it is configured
+/// and broken" has only the text to match on -- and that coupling breaks
+/// silently whenever the wording is improved, in a direction neither side can
+/// see: the producer experiences it as writing a clearer error, the consumer as
+/// a user being told the wrong remedy.
+///
+/// Asserted at the wire, not on the slot. The class has been correct on the
+/// slot for some time while never reaching a consumer, so "the value is
+/// computed" and "the value is published" are separate claims and only the
+/// second one matters here.
+#[tokio::test]
+async fn a_degraded_entry_publishes_its_error_class() {
+    // Fails with NoSession, the class a consumer most needs to tell apart: it
+    // means nobody logged in, not that anything broke.
+    let registry = registry(&[("unconfigured", false, false)]);
+    tick(&registry).await;
+
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].error.is_some(), "the fixture must be degraded");
+    assert_eq!(
+        entries[0].error_class.as_deref(),
+        Some("credential_absent"),
+        "a degraded entry must name its class, not only its prose"
+    );
+
+    // Also checks the wire spelling, which is camelCase and differs from the
+    // Rust field name. Serialization skips the field when it is None, so a
+    // class that failed to be set produces a response missing the key rather
+    // than one carrying null -- and a consumer reading an absent key cannot
+    // tell that from a producer too old to send it.
+    let json = serde_json::to_value(&entries[0]).unwrap();
+    assert_eq!(
+        json.get("errorClass").and_then(|v| v.as_str()),
+        Some("credential_absent"),
+        "published JSON: {json}"
+    );
+}
+
+/// A healthy entry publishes no class at all.
+///
+/// The field answers why an entry is degraded, so a healthy entry has nothing
+/// to say. Emitting an "ok" sentinel would make every consumer branch on a
+/// value that means "ignore me", and absence is already the honest statement.
+#[tokio::test]
+async fn a_healthy_entry_publishes_no_error_class() {
+    let registry = registry(&[("working", false, true)]);
+    tick(&registry).await;
+
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].error.is_none(), "the fixture must be healthy");
+    assert_eq!(entries[0].error_class, None);
+
+    let json = serde_json::to_value(&entries[0]).unwrap();
+    assert!(
+        json.get("errorClass").is_none(),
+        "a healthy entry must omit the field entirely: {json}"
+    );
+}
+
 #[tokio::test]
 async fn entries_for_a_never_successful_slot_have_no_fetched_at() {
     // Only covers a slot that has NEVER succeeded. A degraded entry whose slot
