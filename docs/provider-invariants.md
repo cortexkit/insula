@@ -603,6 +603,24 @@ test to apply is the usual one: replace the tolerant construct with the
 intolerant version and confirm the sparse fixture reddens and the dense ones do
 not.
 
+### `--lib --bins` is not the suite
+
+`cargo test --workspace --lib --bins` runs unit tests only. It does not run the
+integration targets under `tests/`, which is where every test that spawns a
+daemon, drives the wire, or exercises a stub lives — so the fast local gate is
+blind to exactly the tests that check how this module talks to anything else.
+
+That gap ran for four hours once: a constant restated in a `tests/` file drifted
+from the one the module dialled, CI failed on every push, and the local gate
+reported hundreds of passing tests throughout. **A high pass count from a
+restricted target set reads like coverage**, and the number climbs while the
+blind spot stays exactly as wide.
+
+So `--lib --bins` is a fast inner-loop check, not evidence a change is sound. The
+suite that answers that is `--all-targets`, and CI runs it. Reporting the
+restricted count as if it were the full one is the part to avoid: state which
+targets ran, or run all of them.
+
 ### An example's assertions do not run unless something runs the example
 
 `cargo test --workspace --all-targets` **compiles** examples and never executes
