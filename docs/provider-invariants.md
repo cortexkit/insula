@@ -418,6 +418,27 @@ scratch, and there are three here:
 A site matching none of the three is where to look, and optional enrichment
 matches none by construction: the data it adds is the only evidence it ran.
 
+**The claim that a noticer exists is itself a discarded result until someone
+reads it.** It is a statement about code that often lives somewhere else, and it
+feels settled the moment it is written down — a deferral with a reason attached
+reads as adjudicated whether or not the reason was checked.
+
+The auth reports are the worked example, and reading the other side changed the
+answer. For OAuth records the backstop is real and better than assumed: the
+credential store's refresh path marks a record as needing re-authentication when
+the provider rejects the refresh token, with no consumer involvement, so a dead
+record is retired whether or not any report is delivered. **For static API-key
+records there is no refresh adapter and therefore no refresh attempt**, so
+nothing produces that verdict and the report is the only thing that retires the
+record. One credential class is covered by an independent path and the other is
+not, from call sites that look identical here.
+
+The wire stays honest either way — the rejection is published as
+`credential_rejected` from a separate path — so the gap is in remediation rather
+than diagnosis. Which is the other half of the question: **notice what?** A
+backstop can cover one consequence of a failure and leave another uncovered, and
+"something would notice" is satisfied by covering either.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
