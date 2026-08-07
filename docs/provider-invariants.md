@@ -580,6 +580,29 @@ one they have already imagined. There is no self-check for this. What closes it
 is someone standing where the author is not — which is worth stating plainly
 rather than filing the class as solved.
 
+### A dense fixture cannot test tolerance of sparseness
+
+Every fixture here was built from a fully-populated response — all three window
+slots present, every optional field set — because that is what a healthy account
+looks like and it is what anyone writes by default. A fixture like that passes
+identically whether the code tolerates a missing slot or stops at the first one,
+so it cannot distinguish the two.
+
+The cost is visible only across consumers. The same gap appeared three times in
+one day from three positions: one decoder read `usage.primary` alone and shipped
+a status bar showing 25% for an account whose binding constraint was 36%; another
+happened to be correct because its loop was written as a filter rather than a
+search, with nothing in its code recording that holes were possible; and this
+repository had documented the shape without an instance. **None of the three
+would have found it alone** — one had the shape without a case, one had the case
+without the shape, and one had code that was right for a reason nobody had
+written down.
+
+So where a structure has optional members, one fixture must **omit** some. The
+test to apply is the usual one: replace the tolerant construct with the
+intolerant version and confirm the sparse fixture reddens and the dense ones do
+not.
+
 ### An example's assertions do not run unless something runs the example
 
 `cargo test --workspace --all-targets` **compiles** examples and never executes
@@ -622,6 +645,20 @@ left a file untouched, and this. **A change that silently fails to apply produce
 exactly the output of a change that applied and worked.** So check the mechanism,
 not the outcome — which is the same discipline as the mutation-proof rule above,
 pointed at the setup instead of the assertion.
+
+One remedy is weaker than it looks. Applying a mutation from a script and
+asserting *inside that script* that the anchor was found proves the anchor
+matched — not that the edit produced what was intended. Read the changed artefact
+itself: `git diff` the mutated file, or query the resolved state
+(`cargo metadata`) rather than the manifest you edited. **The check must consult
+something the failing step does not produce**, or it inherits that step's blind
+spot.
+
+The available tell, before any of that, is that the run **felt too smooth** — a
+suite passing against a dependency that was supposed to have changed, a perfect
+score from a freshly written detector. The anomaly is in the ease, not in the
+output, and it is worth acting on precisely when the result agrees with what you
+expected.
 
 ### Merging a doc fix does not deliver it
 
