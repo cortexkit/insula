@@ -630,6 +630,13 @@ documents as unlinked when all nine are.
 A detector hunting absence has no failure mode in the opposite direction, so
 "it found something" carries no information about whether it works.
 
+All three share a narrower cause worth naming separately, because a denominator
+does not fix it: **the detector encoded one spelling of the thing it was looking
+for, and a correct implementation written differently read as absence.** An
+extension list, a path prefix, an attribute where a module was meant — each is a
+guess about how the target is written, and the guess is invisible in the output.
+When a sweep reports something missing, read that file before believing it.
+
 **Print the positive count beside the negative.** "9 of 9 indexed" is checkable
 at a glance; "9 missing" is not, because the denominator is invisible and a
 broken detector reports the whole population. Then prove the detector can be
