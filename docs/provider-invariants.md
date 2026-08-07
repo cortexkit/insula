@@ -660,6 +660,55 @@ score from a freshly written detector. The anomaly is in the ease, not in the
 output, and it is worth acting on precisely when the result agrees with what you
 expected.
 
+### A health probe reports on the path it exercises, and nothing else
+
+During the outage above, the credential vault's own health read `ok` while it was
+fenced out of its own store by a competing writer. Not a broken probe — a true
+answer to a narrower question than anyone was asking, because the probe performed
+a read and reads were unfenced while writes were not.
+
+The same shape appeared on this side: every caller of that vault reported healthy
+throughout, because a health check that does not exercise a credential path
+cannot distinguish *working* from *not asked yet*. This module's own
+`health.check` is honest about its scope for exactly this reason — it reports
+refresher liveness and slot buckets, not whether any particular upstream would
+answer.
+
+So when a subsystem reports healthy during an incident, ask **which operation the
+probe performs** before treating it as evidence. A probe that exercises one path
+is silent about every other, and its silence looks identical to a clean bill.
+
+### A narrowing step with no record of what it dropped produces a list that looks complete
+
+A sweep that finds the full population, followed by a second pass that narrows it,
+yields a list indistinguishable from a complete one — unless the narrowing records
+what it removed. The evidence was correct and the summary was wrong, and the
+summary is what gets acted on.
+
+This reached here as an outage. A rename of the credential vault's daemon module
+id was staged across its callers; the sweep that found them included this module,
+a second pass over a subset of repositories was used to write the caller list,
+and every caller the narrow pass had not covered fell out silently. Five were
+told to stage and hold. This one was told nothing, and every vault-served
+provider lost its credential when the rename landed.
+
+Same shape as an absence sweep reporting a count with no denominator: the output
+carries no trace of its own scope, so nothing about it invites the question.
+**Print what the narrowing removed, or carry the wide result forward.**
+
+### A check that returns the same answer for every member of a set is answering a question about itself
+
+A uniform result across a population that cannot plausibly be uniform is an
+instrument reading, not a measurement. Two instances in one day: a
+documentation detector that scored every field as documented, including a field
+name that does not exist; and a case-mismatched grep that reported zero for every
+provider in a rendering, including the ones plainly present.
+
+The useful part is that **uniformity is the tell, and a partial result would have
+been worse.** One lucky match in either case yields a plausible partial answer
+that gets reported and believed. A broken instrument does not usually produce an
+obviously wrong answer — it produces a suspiciously tidy one.
+
 ### Merging a doc fix does not deliver it
 
 Documentation on a published type reaches a reader through a **release**, not
