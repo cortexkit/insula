@@ -41,6 +41,12 @@ from pathlib import Path
 # appears on production items.
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+tests\b")
 
+# `#[cfg(test)]` on something that is not a module: a test-only constructor
+# beside the real one, an injection hook, a helper accessor. These sit ABOVE the
+# test module, so cutting at the module leaves them inside what this calls the
+# production body.
+TEST_ONLY_ITEM = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*(?!mod\b)")
+
 
 def production_body(source: str) -> tuple[str, float]:
     """Return the source up to the test module, and the fraction that is."""
@@ -48,6 +54,23 @@ def production_body(source: str) -> tuple[str, float]:
     body = source[: match.start()] if match else source
     fraction = len(body) / len(source) if source else 1.0
     return body, fraction
+
+
+def test_only_items(body: str) -> list[int]:
+    """Line numbers of test-only items left inside a production body.
+
+    Cutting at the test module is right for the common case and wrong for
+    `#[cfg(test)]` applied to an individual item, which sits above that module
+    and stays in the body. A sweep asking "does every provider do X" will then
+    count a test-only helper as production code.
+
+    This is the mirror of the failure this tool was written to fix. That one
+    truncated a file and reported things ABSENT that were present; this one
+    over-includes and reports things PRESENT that exist only under `cfg(test)`.
+    The second is the quieter direction: a sweep looking for a missing call
+    finds the one in the test-only helper and concludes the file is fine.
+    """
+    return [body[: m.start()].count("\n") + 1 for m in TEST_ONLY_ITEM.finditer(body)]
 
 
 def main() -> int:
@@ -85,6 +108,7 @@ def main() -> int:
     # Files where the naive cut would have differed, so a reader can see whether
     # this sweep would have been wrong without it.
     misleading: list[tuple[str, int]] = []
+    impure: list[tuple[str, int]] = []
     hits: list[str] = []
 
     for path in args.files:
@@ -94,6 +118,10 @@ def main() -> int:
         naive = source.find("#[cfg(test)]")
         if naive >= 0 and naive < len(body) - 200:
             misleading.append((path.name, round(100 * naive / max(len(body), 1))))
+
+        leftover = test_only_items(body)
+        if leftover:
+            impure.append((path.name, len(leftover)))
 
         if args.grep_missing is not None:
             if args.grep_missing not in body:
@@ -121,6 +149,17 @@ def main() -> int:
             f"note: {len(misleading)} file(s) would truncate under a "
             f"first-attribute cut: "
             + ", ".join(f"{name} at {pct}%" for name, pct in sorted(misleading)),
+            file=sys.stderr,
+        )
+
+    # Reported rather than excised. Removing these items would need the spans
+    # they cover, and a brace-matched span is its own guessing game -- while
+    # naming them lets a reader check whether a result rests on one.
+    if impure:
+        print(
+            f"note: {len(impure)} file(s) carry test-only items inside the "
+            f"production body, so a match there may be test code: "
+            + ", ".join(f"{name} ({n})" for name, n in sorted(impure)),
             file=sys.stderr,
         )
 
