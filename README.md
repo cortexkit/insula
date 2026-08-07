@@ -98,12 +98,18 @@ warm the cache themselves, since reads are cache-only and a cold registry serves
 nothing:
 
 ```sh
+# ask whether every credential this host is configured for is actually being
+# served. Every other check here measures internal agreement -- and a set that
+# shrinks stays consistent, so a credential lane can go dark with all of them
+# green, which has happened. Reports how many lanes it checked, since providers
+# with a second non-vault lane cannot be covered this way:
+cargo run -p quota-module --example vault-lanes
+
 # check every live window on the DEPLOYED module for internal inconsistency (a
 # reset further out than the window is long, counts that disagree with the
 # percent, a percent out of range), plus cross-entry and health-identity checks.
-# Prefer this one: it reads the running module through the daemon, so it sees
-# vault-served accounts. Exits non-zero on a finding, and when it examined
-# nothing:
+# It reads the running module through the daemon, so it sees vault-served
+# accounts. Exits non-zero on a finding, and when it examined nothing:
 cargo run -p quota-module --example deployed-sanity
 
 # the same window rules against a registry built in-process. Needs no running
