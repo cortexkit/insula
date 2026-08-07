@@ -660,6 +660,22 @@ score from a freshly written detector. The anomaly is in the ease, not in the
 output, and it is worth acting on precisely when the result agrees with what you
 expected.
 
+### A timed-out send with an unknown outcome is cheap to make safe
+
+When a call to another process times out with no terminal response, the request
+may have executed and only the reply was lost. Both recoveries are wrong by
+default: retrying can duplicate an effect, and not retrying can drop a message
+the recipient never received.
+
+For anything without an idempotency key, **say in the retry that it may be a
+duplicate**. One sentence — "if this arrives twice, my first send timed out with
+an unknown outcome" — turns a confusing second copy into a labelled one, and the
+recipient can discard it without having to work out whether the two differ. It
+costs nothing when the first send was genuinely lost.
+
+And verify state before retrying rather than after: the timeout says the outcome
+is unknown, not that it failed, so the first question is what actually landed.
+
 ### A health probe reports on the path it exercises, and nothing else
 
 During the outage above, the credential vault's own health read `ok` while it was
