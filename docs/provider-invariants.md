@@ -826,7 +826,21 @@ one rule producing the same one.
 
 A fix to a test's quality needs its own fail-before, exactly like a fix to code:
 apply the mutation with the *old* assertion and confirm it passes. Otherwise
-there is no evidence the sharpening changed anything.
+there is no evidence the sharpening changed anything — and a sharpened assertion
+feels like an improvement by definition, so nobody asks for the proof that any
+code change would need.
+
+Run it per assertion, not per batch. A refactor that moves one test's input into
+a neighbouring rule's path leaves the other tests untouched, so one demonstration
+says nothing about its siblings. All four assertions in `kimi_for_coding` turned
+out to be genuinely load-bearing, but that took four separate refactors — a
+required field, a non-positive check hoisted ahead of the guard, and lenient
+parsing that lets an unparseable body reach the window guard instead of failing
+at the parse.
+
+When a sharpening cannot be shown to matter, keep it and label it **prophylactic
+rather than proven**. Those are different claims, and recording the weaker one is
+the difference between a documented margin and an imagined one.
 
 ### The mutation proof needs its own vacuity check
 
