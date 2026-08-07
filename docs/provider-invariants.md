@@ -838,6 +838,14 @@ required field, a non-positive check hoisted ahead of the guard, and lenient
 parsing that lets an unparseable body reach the window guard instead of failing
 at the parse.
 
+A red result is not the end of it either. **Check that the pinned run fails at
+the assertion rather than before reaching it.** A mutation can break the setup
+instead of the behaviour — removing a guard so the input now parses cleanly makes
+`unwrap_err()` panic on an `Ok` value, and the test dies before the assertion is
+evaluated. That reddens without saying anything about the assertion's strength.
+The panic location answers it, allowing for the line shift a mutation inserted
+above the tests introduces.
+
 When a sharpening cannot be shown to matter, keep it and label it **prophylactic
 rather than proven**. Those are different claims, and recording the weaker one is
 the difference between a documented margin and an imagined one.
