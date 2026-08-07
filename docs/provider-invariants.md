@@ -580,6 +580,27 @@ one they have already imagined. There is no self-check for this. What closes it
 is someone standing where the author is not — which is worth stating plainly
 rather than filing the class as solved.
 
+### An example's assertions do not run unless something runs the example
+
+`cargo test --workspace --all-targets` **compiles** examples and never executes
+them. An assertion inside one is checked by nothing until a step invokes it, so
+an example carrying a real invariant is a test that has never been run.
+
+That matters when a consumer pins against the example's output.
+`completeness-envelopes` asserts that the withheld-account and genuine-removal
+envelopes differ only in `completeProviders` — which is what lets a consumer
+prove its reconciliation reads the claim rather than something incidental.
+Unexecuted here, a break in that property leaves this repository green and
+surfaces in the consumer's pipeline, where the cause is a producer commit nobody
+there can see. **The failure lands where it cannot be diagnosed.**
+
+So any example whose assertions are load-bearing needs its own CI step, and the
+step needs proving: run the example under a mutation and confirm a non-zero exit.
+The first two attempts here exited 0 without reaching the property — one perturbed
+a withheld slot that is never emitted, the other landed before both emits and so
+perturbed them equally. A green mutation run is more often a missed mutation than
+a weak guard.
+
 ### Record the consequence, not just the fact
 
 "`rawUsedPercent` is emitted only where the two figures diverge" is a fact, and a
