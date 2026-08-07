@@ -48,12 +48,17 @@ jobs:
     timeout-minutes: 20
     defaults:
       run:
-        working-directory: ai-provider-quota
+        working-directory: insula
     steps:
-      - name: Checkout ai-provider-quota
+      # These are checkout DIRECTORY names on the runner, not repository
+      # references: `actions/checkout` with no `repository:` uses
+      # `github.repository`, which follows a repository rename on its own. They
+      # are named after this repository only so the sibling layout below reads
+      # the way it does on a developer's machine.
+      - name: Checkout insula
         uses: actions/checkout@v5
         with:
-          path: ai-provider-quota
+          path: insula
 
       # quota-module path-deps the private cortexkit/subconscious sibling
       # (subc-protocol/subc-transport, plus subc-core as a dev-dep). The default
@@ -70,7 +75,7 @@ jobs:
           repositories: subconscious
 
       # The path-dep layout is ../subconscious relative to the workspace, so check the
-      # sibling out next to ai-provider-quota.
+      # sibling out next to insula.
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
