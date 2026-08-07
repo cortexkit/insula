@@ -559,6 +559,27 @@ Neither setting is the answer. The sweep produces **candidates**; reading
 produces verdicts. What made the exercise work was the enumeration forcing a look
 at every field once, rather than at whichever field prompted the question.
 
+### A contract gap that looks theoretical here is often already live downstream
+
+The slot-holes finding above was written up as a shape a consumer *could* get
+wrong. Within hours a consumer reported the same defect one level shallower,
+already shipped: a status bar reading `usage.primary` alone had been showing 25%
+for an account whose binding constraint was a weekly window at 36%.
+
+That is the argument against deferring a documentation gap because nothing has
+gone wrong. **Nothing going wrong is what a producer observes either way.** A
+consumer misreading the wire produces no error here, no failing test, and no
+support request — the module is serving correct data and the misreading happens
+in someone else's process. The absence of a symptom is evidence about the
+producer's visibility, not about the consumer's behaviour.
+
+The same asymmetry explains why these gaps are found by consumers rather than
+found and then reported: a producer's sense of which readings are plausible is
+built from the consumers they can imagine, and every consumer they can imagine is
+one they have already imagined. There is no self-check for this. What closes it
+is someone standing where the author is not — which is worth stating plainly
+rather than filing the class as solved.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
