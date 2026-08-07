@@ -662,10 +662,24 @@ So a zero-expected sweep has to **borrow a non-zero answer from somewhere**, and
 the cheapest source is history: run the detector against the commit before the
 fix that removed the last instance. `ff845ec^` still interpolates three
 credential paths into wire errors; `d65444f^` still publishes an unstripped
-request URL. Both make the detector fire, which is what makes today's zero mean
-something. **Every defect ever fixed in this repository is a positive control
-lying around for free**, and one is worth more than three spellings when the
-expected answer is nothing at all.
+request URL. **Every defect ever fixed in this repository is a positive control
+lying around for free**, and the commit that fixed it is the pointer to its own
+control.
+
+The control has to be read as a **difference, not a presence**. A detector that
+fires before the fix has proved nothing if it also fires after — the pattern may
+be matching something incidental that the fix never touched, and a count that is
+the same on both sides looks like evidence while discriminating nothing. Compare
+the two counts:
+
+| control | pre-fix | post-fix | at HEAD |
+|---|---|---|---|
+| a credential path interpolated into a wire error | 3 | 0 | 0 |
+| a `reqwest` error stringified into a published message | 1 | 0 | 0 |
+
+And the pattern must name the property rather than a word that happens to appear
+in it. A string can already be in use elsewhere for an unrelated reason, in which
+case the sweep is counting the string and not the thing.
 
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
