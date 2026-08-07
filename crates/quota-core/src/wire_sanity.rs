@@ -616,6 +616,87 @@ mod tests {
         );
     }
 
+    /// A reset that has already passed means the producer stopped refreshing.
+    ///
+    /// Every window this module publishes is rebuilt from a fetch, so a reset
+    /// timestamp in the past cannot survive a successful one. Seeing it means
+    /// the entry is older than it looks and a consumer pacing against that
+    /// window believes it is about to be replenished when nothing is coming.
+    ///
+    /// A grace period covers ordinary clock skew between this host and the
+    /// provider, so only a reset well past its due time is reported.
+    #[test]
+    fn a_reset_already_in_the_past_is_reported() {
+        let mut w = window(50.0);
+        w.window_minutes = Some(300);
+        w.resets_at = Some("2026-07-28T08:00:00Z".into());
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("in the past"),
+            "{}",
+            report.findings[0]
+        );
+    }
+
+    /// Skew smaller than the grace period is not a finding.
+    ///
+    /// Without this the test above would pass against a rule that reports every
+    /// reset at or before the current instant, which would fire constantly on a
+    /// host whose clock runs slightly ahead of a provider's.
+    #[test]
+    fn a_reset_barely_in_the_past_is_tolerated_as_clock_skew() {
+        let mut w = window(50.0);
+        w.window_minutes = Some(300);
+        w.resets_at = Some("2026-07-28T09:59:00Z".into());
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// Spending more of an allowance than it holds is not a coherent reading.
+    ///
+    /// The two counts come from the same upstream payload, so one exceeding the
+    /// other means they were read from fields that do not describe the same
+    /// allowance -- a normalizer pairing a lifetime total with a windowed count,
+    /// say. The percent beside them can look entirely ordinary, which is why
+    /// this is checked separately rather than inferred from the percent.
+    #[test]
+    fn a_used_count_above_the_total_is_reported() {
+        let mut w = window(50.0);
+        w.used_count = Some(12_000.0);
+        w.total_count = Some(10_000.0);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("usedCount 12000 exceeds totalCount 10000")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Counts that fill the allowance exactly are not a finding.
+    ///
+    /// An exhausted window reports its used count equal to its total, and
+    /// reporting that would fire on every provider that runs out.
+    #[test]
+    fn a_used_count_equal_to_the_total_is_not_reported() {
+        let mut w = window(100.0);
+        w.used_count = Some(10_000.0);
+        w.total_count = Some(10_000.0);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
     #[test]
     fn an_out_of_range_percent_is_reported_at_both_ends() {
         for bad in [-1.0, 101.0, f64::NAN] {
