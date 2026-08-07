@@ -65,6 +65,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Refuse a sweep with nothing to sweep, rather than reporting it clean.
+    #
+    # Argument parsing already rejects an empty invocation, so this looks
+    # redundant -- but that protection is a side effect of `files` being
+    # positional, and it disappears the first time someone gives it a default or
+    # accepts a glob that matches nothing. A refusal that exists on purpose
+    # survives a change to how arguments are handled; one that exists by
+    # accident dies silently with it, and the failure it was preventing looks
+    # exactly like success.
+    if not args.files:
+        print(
+            "refusing: no files to examine, which would report clean without "
+            "having looked at anything",
+            file=sys.stderr,
+        )
+        return 2
+
     # Files where the naive cut would have differed, so a reader can see whether
     # this sweep would have been wrong without it.
     misleading: list[tuple[str, int]] = []
