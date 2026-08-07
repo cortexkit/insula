@@ -5,8 +5,16 @@ edition = "2021"
 publish = false
 description = "The ai-provider-quota subc module: registers a ManagementSurface, answers usage.get over the subc wire with ProviderUsage[]."
 
+# The binary name is the process name an operator sees in Activity Monitor, so
+# it tracks the module's own name rather than the crate's. Renaming it also
+# renames the CARGO_BIN_EXE_* env var the integration tests use to locate the
+# built binary, which is why those fail to compile if this changes alone.
+#
+# It does NOT move any of this module's on-disk paths: the redemption journal,
+# the quota config, and the vault handle file each come from their own hardcoded
+# literal spelled `ck-quota`. Those are load-bearing and deliberately unchanged.
 [[bin]]
-name = "ck-quota"
+name = "ck-insula"
 path = "src/main.rs"
 
 [dependencies]

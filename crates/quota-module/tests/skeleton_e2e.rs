@@ -382,7 +382,7 @@ impl Drop for ModuleProcess {
 }
 
 fn quota_module_command(subc_connection_file: &Path, test_temp_dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-quota"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-insula"));
     command
         .arg("--subc")
         .arg(subc_connection_file)
