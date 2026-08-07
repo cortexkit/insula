@@ -642,7 +642,29 @@ same file have disagreed about the intended behaviour, and each looked
 authoritative alone. When they conflict, the conflict itself is the finding, and
 neither half is citable until the upstream contract settles it.
 
-### A sweep for what is missing fails by finding more of it
+### A rule that finds nothing on first use is unexposed, not wrong
+
+Every rule above was written after a defect it would have caught. Applied
+somewhere new it will often find nothing, and that result is indistinguishable
+from the rule being unfounded — so the natural response is to stop applying it,
+which guarantees it never reaches the case it was written for. No bad judgement
+is needed anywhere in that chain.
+
+A null is only evidence if the code had the shape the rule needs. The
+twin-branch rule requires two independent producers of the same data; applied to
+one producer with two renderers it returns a clean null having tested nothing.
+**Report what the null covered, not just that it was clean** — an unqualified
+null is evidence for whatever the reader already believed.
+
+Rules also arrive blunt and are sharpened by their own easy cases. The
+asymmetric-guard rule was first written as "state the reason at the definition,
+not at the call sites", which caught a crude instance; catching it is what forced
+the sharper form — *the definition the next caller opens first* — and only that
+form could catch the near-miss where the reason sat on a real definition nobody
+opens cold. **The trivial first catch was not a lesser version of the good one;
+it was its precondition.**
+
+## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
 should be present. Those sweeps have a failure mode worth stating on its own:
