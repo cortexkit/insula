@@ -22,21 +22,34 @@ four roles and only one of them breaks:
   fixture     golden test vectors pinning a path format. Editing these breaks a
               golden comparison for no reason, and the failure then looks like
               the rename broke something real
-  stale       an abandoned checkout. Edits here produce NO ERROR AND NO EFFECT,
-              and someone who reached a real caller through such a checkout will
-              believe it is handled
+  copy        a second working tree of a repository already in the list. Edits
+              here produce NO ERROR AND NO EFFECT, and someone who reached a real
+              caller through such a tree will believe it is handled
 
-STALENESS IS JUDGED BY COMMIT RECENCY, NOT BY REMOTE CONFIGURATION, because the
-obvious proxies are wrong in both directions and this script got both wrong
-before they were checked. A repository with no remote can be under active
-development -- one here was committed to the same day -- so "no remote" reported
-as stale DROPS A LIVE CALLER, which is the dangerous direction. And a checkout on
-a branch with no upstream cannot be compared against origin at all: the
-comparison returns empty, which reads exactly like "up to date", so a tree three
-weeks behind was reported as live.
+A TREE IS DISCOUNTED FOR BEING A COPY, NOT FOR BEING QUIET. That distinction cost
+three wrong predicates to reach, each failing in a way the output did not show:
 
-Remote configuration answers "how would I publish a change here", which matters
-and is reported separately. It does not answer "is anyone working here".
+  "no remote"        A repository with no remote can be under active development.
+                     One here was committed to on the day this was written, and
+                     calling it abandoned DROPS A LIVE CALLER -- the direction
+                     that causes the outage this script exists to prevent.
+  "behind upstream"  A branch with no upstream cannot be compared against one.
+                     The comparison returns empty, which reads exactly like "up
+                     to date", so a tree weeks behind was reported as live.
+  "last commit age"  A repository is quiet when its module is not deployed yet.
+                     Quiet is not abandoned, and this misclassified a real
+                     repository in the same dangerous direction as the first.
+
+The property that actually matters is whether an edit can reach anyone, and a
+copy is the only case where it cannot. Two tells, both exact: a remote URL shared
+with another scanned tree, or -- for a tree with no remote at all -- a HEAD commit
+that already exists in another scanned tree's history.
+
+Remote configuration is still reported, separately, because it answers HOW a
+change would be published. A live repository with no remote still runs, still
+calls, and still breaks when the id changes; it just cannot be updated by opening
+a pull request, which is worth knowing before a rename window rather than when a
+pull request has nowhere to go.
 
 Run it before a rename window, and again during -- a caller added between the two
 is invisible to a list frozen in advance, which is the gap a hand-reconciled
@@ -52,7 +65,6 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 DEFAULT_ID = "ai-provider-quota"
@@ -64,10 +76,7 @@ SELF_REPO = "insula"
 # caller is a dead route.
 CODE_SUFFIXES = {".rs", ".toml", ".jsonc", ".json", ".yml", ".yaml", ".sh", ".ts", ".py"}
 
-# A checkout whose last commit is older than this is reported as abandoned rather
-# than as a caller. Chosen loose: the point is to catch trees nobody is working
-# in, not to police branch freshness.
-STALE_DAYS = 14
+
 
 
 def repos(root: Path) -> list[Path]:
@@ -87,28 +96,54 @@ def git(repo: Path, *args: str) -> str:
         return ""
 
 
-def days_since_commit(repo: Path) -> int | None:
-    epoch = git(repo, "log", "-1", "--format=%ct")
-    if not epoch.isdigit():
-        return None
-    return int((time.time() - int(epoch)) // 86400)
+def duplicates(all_repos: list[Path]) -> dict[Path, str]:
+    """Trees that are second copies of a repository already present.
 
-
-def staleness(repo: Path) -> str | None:
-    """Why nobody is working in this checkout, or None if it is live.
-
-    Judged on commit recency alone. See the module docstring for why the remote
-    is not consulted here: both obvious remote-based proxies misclassified real
-    repositories in this fleet, one of them in the direction that silently drops
-    a caller.
+    See the module docstring for why this replaced three activity-based
+    predicates. Both tells are exact rather than heuristic, so a tree is only
+    discounted when another tree in the same scan can receive the edit instead.
     """
-    age = days_since_commit(repo)
-    if age is None:
-        return "no commits"
-    if age > STALE_DAYS:
-        last = git(repo, "log", "-1", "--format=%cd", "--date=short")
-        return f"last commit {last} ({age} days ago)"
-    return None
+    by_url: dict[str, list[Path]] = {}
+    for repo in all_repos:
+        url = git(repo, "remote", "get-url", "origin")
+        if url:
+            by_url.setdefault(url, []).append(repo)
+
+    found: dict[Path, str] = {}
+    for url, group in by_url.items():
+        if len(group) < 2:
+            continue
+        # The tree whose directory matches the repository name is the canonical
+        # one; the rest are working copies of it.
+        name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        canonical = next((r for r in group if r.name == name), group[0])
+        for repo in group:
+            if repo is not canonical:
+                found[repo] = f"shares a remote with {canonical.name}"
+
+    # A tree with no remote is a copy only if its history is already contained in
+    # another scanned tree -- which is checkable, unlike its activity.
+    #
+    # Prefer a container that is not itself a copy: the point of naming one is to
+    # say where the edit should go instead, and pointing at another copy sends the
+    # reader one step further from the tree that can actually receive it.
+    for repo in all_repos:
+        if repo in found or git(repo, "remote"):
+            continue
+        head = git(repo, "rev-parse", "HEAD")
+        if not head:
+            continue
+        containers = [
+            other
+            for other in all_repos
+            if other is not repo and git(other, "cat-file", "-t", head) == "commit"
+        ]
+        canonical = next((c for c in containers if c not in found), None)
+        if canonical is not None:
+            found[repo] = f"history already present in {canonical.name}"
+        elif containers:
+            found[repo] = f"history already present in {containers[0].name}"
+    return found
 
 
 def publish_note(repo: Path) -> str | None:
@@ -171,6 +206,7 @@ def main() -> int:
         print(f"no git repositories under {root}", file=sys.stderr)
         return 2
 
+    copies = duplicates(all_repos)
     routes: list[str] = []
     docs = 0
     fixtures = 0
@@ -183,7 +219,7 @@ def main() -> int:
         if not found:
             continue
         files_with_hits += len({p for p, _, _ in found})
-        reason = staleness(repo)
+        reason = copies.get(repo)
         if reason:
             stale_repos.append(f"{repo.name}: {reason} ({len(found)} hit(s))")
             continue
@@ -208,7 +244,7 @@ def main() -> int:
     for r in routes:
         print(f"    {r}")
     print()
-    print(f"STALE CHECKOUTS -- edits here have no effect ({len(stale_repos)}):")
+    print(f"DUPLICATE TREES -- edits here have no effect ({len(stale_repos)}):")
     for s in stale_repos:
         print(f"    {s}")
     print()
