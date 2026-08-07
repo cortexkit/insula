@@ -443,6 +443,15 @@ API-key record never acquires a refresh intent, so it cannot reach any of them.
 **For that class the complete set of retirement mechanisms is the report or a
 human running an admin command.**
 
+The report is not a single shot, which softens the exposure without closing it.
+It is fired from inside the fetch path on every rejected fetch, and a rejected
+credential is a non-transient failure, so the slot retries on a fixed five-minute
+backoff and reports again each time. A transient delivery failure therefore
+heals on the next attempt. What does not heal is a report that fails for a
+*persistent* reason — the store unreachable for the life of the process, or a
+rejection it will give every time — because then every retry reproduces it, and
+the repetition is not evidence of anything.
+
 That paragraph describes another repository, read at `cortexkit-credentials`
 commit `f9f96c2` on 2026-08-07. It is a dependency with no compile-time edge:
 nothing here fails if that store changes how it retires records, so the citation
