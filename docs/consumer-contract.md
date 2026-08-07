@@ -334,6 +334,17 @@ A `usage` object carries up to three named slots — `primary`, `secondary`,
 does not fit three. It is tempting to read `primary` as *the* number for a
 provider. It is not.
 
+**No field on this wire identifies the binding limit. There is no slot, flag, or
+ordering that marks it, and the producer does not compute it.** If you need the
+constraint that actually applies to an account, you must rank the windows
+yourself — every slot and every `extraRateWindows` entry — by whatever policy
+suits you. Taking the maximum `usedPercent` is the usual one.
+
+That is stated positively because the alternative is every consumer inferring it
+from a field name, and a name is a promise people believe without checking. The
+failure is not weighing `primary` and choosing wrong; it is never noticing there
+was a choice.
+
 **`primary` is the provider's shortest window, not its most constrained one.**
 For most upstreams here the slots are filled in cadence order: the session or
 five-hour window lands in `primary`, the weekly in `secondary`. Nothing checks
@@ -459,20 +470,47 @@ module adds envelope-level keys rather than new operations so existing callers
 keep working. That reasoning holds for a consumer that reads the envelope. **Not
 every consumer does.**
 
-A shared request helper that unwraps `{"result": ...}` and hands the bare array
-onward makes sibling keys unreachable *by construction* — the code that would
-read them never sees the object they live on. That is a different situation from
-ignoring a key: adopting one later is a change to the transport helper, possibly
-in a shared library, rather than a change to the code that wants the data.
+Somewhere between the socket and the code that would use it, a consumer narrows
+the response to the array. **Wherever that happens, everything beside `result` is
+gone from that point on** — not ignored, but absent from the value being passed
+along. That is a different situation from ignoring a key: adopting one later
+means changing the layer that narrows, which is rarely the layer that wants the
+data.
 
-It is harmless for a display-only consumer, and it is **not** harmless for anyone
+The narrowing is not always in the transport, and looking only there gives a
+false all-clear. Two real shapes among current consumers:
+
+- A shared request helper unwraps `{"result": ...}` and hands the bare array
+  onward, so nothing downstream ever sees the envelope.
+- The transport decodes the whole body faithfully, and a **classify or mapping**
+  step then takes `envelope["result"]` and passes only the deserialized entries
+  inward. The envelope was reachable and stopped being so one layer in.
+
+Both are harmless for a display-only consumer. Neither is harmless for anyone
 reconciling stored account sets, because `completeProviders` is the only thing
-that authorises deleting a stored account. If your helper unwraps the envelope
-and you prune accounts, you are pruning without the signal that makes pruning
-safe.
+that authorises deleting a stored account — a provider missing from the array is
+otherwise indistinguishable from one whose accounts are temporarily withheld.
 
-Worth checking rather than assuming: the question is not "do I use
-`completeProviders`" but "could I, without touching my transport layer".
+So the check is **not** "do I use `completeProviders`", and not "does my
+transport read the envelope" either. It is: **trace one response from the socket
+to the code that would act on it, and find the first place the object becomes an
+array.** Everything past that point is working from a value that cannot answer
+the question, however faithfully the bytes were decoded upstream.
+
+The answer then sorts into three cases, and only the last is expensive:
+
+1. **Nothing narrows** — the envelope reaches the code that acts. Nothing to do.
+2. **Something you own narrows** — a private helper with callers you control.
+   Adopting a key is a local change in a file you already edit.
+3. **Something you do not own narrows** — a shared client or library. Adoption
+   means changing code other consumers depend on, and the moment you need it is
+   the moment you are about to prune stored accounts.
+
+Worth locating yourself precisely, because the second and third look identical
+from the inside — both answer "no, I cannot see it today" — and they differ by
+an order of magnitude in what adoption costs. A consumer in the second case
+reporting that they "cannot see envelope keys" can leave a genuinely third-case
+consumer believing their situation is equally cheap.
 
 ## Which field to key on
 
