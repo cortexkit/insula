@@ -193,11 +193,20 @@ for health, never on this field's presence.
 | `no_quota_reported` | the credential works; the account reports no quota | no, and nothing is wrong |
 | `upstream_failed` | the provider's endpoint failed (429, 5xx, network) | yes |
 | `decode_failed` | a response arrived in an unexpected shape | yes |
-| `internal_error` | a fault in this module, contained rather than crashing | yes |
+| `internal_error` | a fault in this module, contained rather than crashing | sometimes |
 
-Two of those need no action from anyone, three need an operator, and two clear
-themselves — which is the distinction that was previously only recoverable by
-matching prose.
+The self-recovery column is the one a user-facing surface should group on,
+because it decides between two sentences: **wait**, or **act**. The first three
+need an operator and will never clear on their own. The next needs nothing and
+nothing is wrong. The last three clear without anyone doing anything — with the
+caveat that `internal_error` clears only if the fault was in handling one
+particular response; a deterministic bug in this module repeats until it is
+fixed here.
+
+`internal_error` also deserves its own sentence rather than sharing one with the
+other two. Those mean the provider is unwell; this one means the provider may be
+perfectly healthy and this module fell over reading it. Telling someone to check
+a service that is fine sends them somewhere with nothing to find.
 
 `upstream_failed` is rare on a degraded entry, because a transient failure with
 a prior healthy window serves that window stale instead of degrading. Seeing it
