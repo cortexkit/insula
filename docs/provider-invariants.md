@@ -370,6 +370,36 @@ And the fix is not to make the call loud. It is to **skip it when its credential
 is absent**, so a host with no browser session makes no request at all, and a
 request that does go out is one that could have worked.
 
+### The general question, of which the credential boundary is one predictor
+
+A discarded result is safe exactly when **something else would notice its
+absence**. That is the question to ask at each site, and it is wider than the
+credential tell: a call can be permanently broken for reasons that have nothing
+to do with credentials, and the same silence follows.
+
+Applied across this crate, the discarded results fall into three groups and only
+the first was ever at risk:
+
+- **Optional enrichment** (`kimi_for_coding`, `kimi`) — nothing notices. The
+  windows it would add are the only evidence it ran, so permanent failure and
+  nothing-to-report are the same observation. This is where the defect was.
+- **Parse fallbacks** (~40 sites, `if let Ok(dt) = parse_rfc3339(..)`) — the
+  fallback chain notices. Each is followed by another attempt and ultimately by
+  a `None` that the caller acts on, so a permanently failing branch shows up as
+  an absent reset or an absent percent, which the wire already reports.
+- **Fire-and-forget reports** (`report_auth_failure`, six providers) — an
+  independent path notices. The report tells the credential store a login is
+  dead, and it is spawned with no return value, so a permanently failing report
+  is invisible at the call site. But the same 401 that triggers it also produces
+  a `credential_rejected` entry on the wire through a separate path, so the
+  operator-visible signal does not depend on the report landing. The report is
+  an optimisation on top of a signal that stands alone.
+
+The third group is the interesting one, because it looks exactly like the first
+at the call site — a spawned task, no result, no test. What makes it safe is not
+visible from the code that discards it, which is the argument for asking the
+question per site rather than pattern-matching on the shape.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
