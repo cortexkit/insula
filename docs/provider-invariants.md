@@ -741,6 +741,24 @@ The direction matters when choosing what to publish. A rule that SELECTS from
 the corpus moves the result when it breaks; a rule that DESCRIBES the corpus does
 not, so its failure is invisible unless its own output is printed.
 
+That makes the audit mechanical rather than a matter of noticing: **enumerate a
+tool's rules, classify each one, and confirm every describer has an
+unconditional number of its own.** `scripts/prod_body.py` has four, and each was
+checked by breaking it and reading the output:
+
+| rule | kind | what moves when it breaks |
+|---|---|---|
+| the test-module boundary | selector | byte share — 100% if the anchor never matches, 51% under a first-attribute cut |
+| which files match the needle | selector | the match count — 10 becomes 43 when inverted |
+| truncation detection | describer | its caveat count, 4 to 0 |
+| test-only items in the body | describer | its caveat count, 4 to 0 |
+
+And when only one number can be afforded, publish the count of what a rule
+**affected** rather than what it **considered**. A pattern rots by matching less
+rather than more, so the likelier failure of any filter is that it stops
+filtering — which leaves the considered-count untouched while the affected-count
+goes to zero.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
