@@ -174,21 +174,46 @@ those come apart sharply:
 - A provider whose credential is fine but whose account genuinely has no quota
   to report is a third thing again: not absent, not broken.
 
-On the host these docs are written from, that split is 24 / 3 / 1 — so an
-undifferentiated count of degraded entries is dominated by the case that can
-never mean anything, and a real breakage moves it by one.
+On the host these docs are written from, the great majority of degraded entries
+are the first case — providers nobody configured — and the genuinely broken ones
+number one or two. So an undifferentiated count of degraded entries is dominated
+by the case that can never mean anything, and a real breakage moves it by one.
+The exact figures drift as credentials come and go; the ratio is the point.
 
-`errorClass` is the machine-readable answer (`credential_absent`,
-`credential_unusable`, `credential_rejected`, `no_quota_reported`,
-`upstream_failed`, `decode_failed`). It is merged into
-`cortexkit-provider-usage` and **not yet on the wire** — this section describes
-where it will appear so that consumers stop deriving the distinction from prose
-in the meantime. When it arrives it is additive and absent on healthy entries,
-and an unrecognised class must render as a degraded entry with an unknown
-reason: never dropped, never folded into an existing bucket.
+`errorClass` is the machine-readable answer, and it is **on the wire** on every
+degraded entry. It is absent on healthy entries by design: the field says why an
+entry is degraded, and a healthy one has nothing to say — so branch on `error`
+for health, never on this field's presence.
 
-Until then, the distinction exists in the taxonomy but not on the wire. If you
-need it now, ask rather than parsing the message.
+| class | meaning | self-recovers? |
+| --- | --- | --- |
+| `credential_absent` | no credential is configured for this provider on this host | no — steady state |
+| `credential_unusable` | a credential is present but cannot be used as one | no |
+| `credential_rejected` | the credential was sent and refused (401/403) | no — needs re-authentication |
+| `no_quota_reported` | the credential works; the account reports no quota | no, and nothing is wrong |
+| `upstream_failed` | the provider's endpoint failed (429, 5xx, network) | yes |
+| `decode_failed` | a response arrived in an unexpected shape | yes |
+| `internal_error` | a fault in this module, contained rather than crashing | yes |
+
+Two of those need no action from anyone, three need an operator, and two clear
+themselves — which is the distinction that was previously only recoverable by
+matching prose.
+
+`upstream_failed` is rare on a degraded entry, because a transient failure with
+a prior healthy window serves that window stale instead of degrading. Seeing it
+means the slot never had a healthy window to fall back on.
+
+**The list will grow, and it is a string rather than an enum for that reason.**
+Render an unrecognised class as a degraded entry with an unknown reason: never
+drop the entry, never fold it into an existing bucket. Meeting an unknown value
+must not become a parse failure — the moment the list grows is the moment some
+provider's state changed, which is the worst possible time for an entry to
+vanish from a consumer's view.
+
+**No class authorises removing an account.** A degraded entry names an account
+that exists and is currently unusable, `credential_absent` included — that one
+means this host has no credential for the provider, never that an account is
+gone. Account removal is authorised only by `completeProviders`.
 
 The error string is prose, not a stable taxonomy. Use it for observability, and
 if you need to branch on the class, ask for a machine-readable field rather than
