@@ -601,6 +601,25 @@ a withheld slot that is never emitted, the other landed before both emits and so
 perturbed them equally. A green mutation run is more often a missed mutation than
 a weak guard.
 
+### Merging a doc fix does not deliver it
+
+Documentation on a published type reaches a reader through a **release**, not
+through a merge. Doc comments merged to a shared crate's default branch are seen
+by path-dependants immediately and by everyone else — registry consumers, docs.rs,
+anyone hovering the type in an editor — only when a new version is published.
+
+This was measured after exactly that merge: the published version carried sixteen
+optional fields with no doc comment while the branch carried none, at the **same
+version number**, differing by 83 lines. One consumer of four had the docs, and
+this module — which authored them and pins the crate from the registry — did not.
+
+So a doc change to a shared crate is not finished at merge. Either publish a
+patch release or record that the fix is pending one, because "merged" and
+"delivered" differ by exactly the audience the change was written for. And a
+published version that differs in content from the branch claiming the same
+number is its own hazard: it teaches readers to distrust the version rather than
+the content.
+
 ### A comparison of two identical inputs says nothing about the transform
 
 The completeness harness emits a pair of envelopes whose `result` arrays are
