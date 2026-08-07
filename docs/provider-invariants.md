@@ -443,6 +443,14 @@ API-key record never acquires a refresh intent, so it cannot reach any of them.
 **For that class the complete set of retirement mechanisms is the report or a
 human running an admin command.**
 
+That paragraph describes another repository, read at `cortexkit-credentials`
+commit `f9f96c2` on 2026-08-07. It is a dependency with no compile-time edge:
+nothing here fails if that store changes how it retires records, so the citation
+can go stale silently and from this side it looks exactly as authoritative as the
+day it was written. Recording where and when it was read does not prevent the
+drift, but it turns an assertion into something the next reader can re-check
+against a known starting point.
+
 The wire stays honest either way — the rejection is published as
 `credential_rejected` from a separate path — so the gap is in remediation rather
 than diagnosis. Which is the other half of the question: **notice what?** A
