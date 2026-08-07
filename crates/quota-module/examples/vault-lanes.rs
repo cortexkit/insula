@@ -87,16 +87,21 @@ const DUAL_LANE: &[(&str, &str)] = &[(
 /// family as `<base>:<label>` — `oauth:anthropic:ufuk2` alongside
 /// `oauth:anthropic`. Exact matching here would silently ignore every secondary
 /// account, which is the same defect this checker exists to catch.
+///
+/// The family list is the library's own, not a copy. A restated one would drift,
+/// and the drift is silent in the direction that matters: a family this checker
+/// lacked would be reported as "handles no provider here consumes", which reads
+/// like a stray credential rather than a gap in the checker, so the lane it
+/// should have examined goes unchecked and the run still ends in `findings:
+/// none`.
+///
+/// Sharing it does not weaken the check. What is compared is what this host is
+/// CONFIGURED for against what the wire is SERVING, and those two remain
+/// independent of each other — a family mapped to the wrong provider still
+/// leaves the right provider with no credential, so the lane goes dark and this
+/// fires anyway.
 fn provider_for_handle(key: &str) -> Option<&'static str> {
-    const FAMILIES: &[(&str, &str)] = &[
-        ("chatgpt:openai", "codex"),
-        ("oauth:anthropic", "claude"),
-        ("oauth:xai", "grok"),
-        ("antigravity:google", "antigravity"),
-        ("kimi-for-coding", "kimi-for-coding"),
-        ("oauth:google", "gemini"),
-    ];
-    FAMILIES
+    quota_core::vault_handles::CREDENTIAL_FAMILIES
         .iter()
         .find(|(prefix, _)| key == *prefix || key.starts_with(&format!("{prefix}:")))
         .map(|(_, provider)| *provider)
@@ -218,16 +223,28 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // An unmapped handle is a finding, not a note. This host holds a credential
+    // that no provider consumes, so it is being maintained and refreshed while
+    // reaching no upstream -- indistinguishable, from the wire, from a lane that
+    // was never configured. Printing it beside `findings: none` and exiting 0 is
+    // the exact shape this checker exists to refuse: the fact was on screen and
+    // the exit code said everything was fine.
     if !unmapped.is_empty() {
         println!(
-            "  handles no provider here consumes: {}",
-            unmapped.join(", ")
+            "  findings: {} handle(s) no provider here consumes",
+            unmapped.len()
         );
+        for key in &unmapped {
+            println!("    {key}: configured on this host and reaching no provider");
+        }
     }
 
     if dark.is_empty() {
-        println!("  findings: none");
-        return;
+        if unmapped.is_empty() {
+            println!("  findings: none");
+            return;
+        }
+        std::process::exit(1);
     }
 
     println!("  findings: {} lane(s) dark", dark.len());

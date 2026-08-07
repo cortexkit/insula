@@ -18,6 +18,31 @@ use crate::credential_source::VaultCapability;
 use crate::provider::{CredentialHandle, HandlesError};
 
 pub const HANDLES_PATH_ENV: &str = "CK_QUOTA_VAULT_HANDLES_PATH";
+
+/// Every credential family this module consumes, with the provider name each
+/// one feeds.
+///
+/// Published so the deployed-module checkers can ask "is every configured
+/// credential actually being served" without restating this list. A restated
+/// copy would drift, and the drift is silent in one direction: a family the copy
+/// lacks looks like a stray credential nobody consumes rather than a gap in the
+/// checker.
+///
+/// Sharing it costs nothing the checkers rely on. They compare what this host is
+/// CONFIGURED for against what the wire is SERVING, and those remain independent
+/// — a family mapped to the wrong provider still leaves the right provider with
+/// no credential, so the lane goes dark and the check fires either way.
+pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
+    ("chatgpt:openai", "codex"),
+    ("oauth:anthropic", "claude"),
+    ("oauth:xai", "grok"),
+    // Before the `oauth:google` entry: Antigravity's own Google credential is
+    // not a Gemini CLI one. Both reach the same Code Assist API and see
+    // different products.
+    ("antigravity:google", "antigravity"),
+    ("oauth:google", "gemini"),
+    ("kimi-for-coding", "kimi-for-coding"),
+];
 const DEFAULT_RELATIVE_PATH: &str = ".config/cortexkit/ck-quota/vault-handles.json";
 
 struct UniqueHandles(HashMap<String, String>);
@@ -392,31 +417,34 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
                 .is_some_and(|rest| rest.starts_with(':'))
     }
 
+    /// Resolve a handle id to the provider that consumes it.
+    ///
+    /// Walks [`CREDENTIAL_FAMILIES`] rather than a private chain of arms, so the
+    /// deployed-module checkers can ask the same question against the same list.
+    /// A second copy of it would drift, and a family missing from the copy reads
+    /// as a stray credential rather than as a gap in the checker.
+    ///
+    /// Matching stops at the first family whose prefix fits, so adding an entry
+    /// that is a prefix of an existing one would shadow it. No current pair has
+    /// that relationship — including the two Google families, whose ids are
+    /// disjoint despite looking similar.
     fn provider_for_id(id: &str) -> Option<ProviderKind> {
-        if prefixed_id(id, "chatgpt:openai") {
-            Some(ProviderKind::Codex)
-        } else if prefixed_id(id, "oauth:anthropic") {
-            Some(ProviderKind::Anthropic)
-        } else if prefixed_id(id, "oauth:xai") {
-            Some(ProviderKind::Grok)
-        } else if prefixed_id(id, "antigravity:google") {
-            // Antigravity's own Google credential, not a Gemini CLI one. Both
-            // reach the same Code Assist API, but they see different products:
-            // this one's quota response carries Antigravity's model pool
-            // (Claude and GPT alongside Gemini), which a Gemini CLI login has no
-            // access to. Serving it to the Gemini lane would publish another
-            // product's capacity under Gemini's name.
-            //
-            // Ordered before the `oauth:google` arm, which would otherwise not
-            // match this id anyway -- the two are kept adjacent so the
-            // distinction stays visible to whoever edits either.
-            Some(ProviderKind::Antigravity)
-        } else if prefixed_id(id, "oauth:google") {
-            Some(ProviderKind::Gemini)
-        } else if prefixed_id(id, "kimi-for-coding") {
-            Some(ProviderKind::KimiForCoding)
-        } else {
-            None
+        let name = CREDENTIAL_FAMILIES
+            .iter()
+            .find(|(prefix, _)| prefixed_id(id, prefix))
+            .map(|(_, provider)| *provider)?;
+        match name {
+            "codex" => Some(ProviderKind::Codex),
+            "claude" => Some(ProviderKind::Anthropic),
+            "grok" => Some(ProviderKind::Grok),
+            "antigravity" => Some(ProviderKind::Antigravity),
+            "gemini" => Some(ProviderKind::Gemini),
+            "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
+            // Unreachable while every family names a provider handled above.
+            // Returning None rather than panicking keeps a future entry from
+            // taking down the refresher: the credential is dropped with the
+            // stderr warning the unsupported path already emits.
+            _ => None,
         }
     }
 
