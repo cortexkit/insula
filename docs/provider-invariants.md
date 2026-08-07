@@ -466,6 +466,31 @@ than diagnosis. Which is the other half of the question: **notice what?** A
 backstop can cover one consequence of a failure and leave another uncovered, and
 "something would notice" is satisfied by covering either.
 
+## A guard's precondition belongs in its signature, not beside its call
+
+A check written next to a call holds only as long as nobody adds another caller.
+The code you read stays identical while the property stops being true, and
+nothing fails to compile. A check the function takes as a parameter cannot be
+skipped without changing the signature.
+
+The banked-reset relaxation is the case that matters here, because it is the one
+transform that publishes a number the provider did not report: it sets
+`usedPercent` to zero and moves the real figure to `rawUsedPercent`. Consumers
+pace on the zero, so an ungated application tells a router an exhausted account
+is idle. Its eligibility test used to sit at both call sites while the transform
+took only the entry — so the slot holding the evidence was not required to reach
+it, and a third call site could have applied it with no gate at all. It now takes
+the slot and decides for itself.
+
+**This class of finding has no symptom.** Both call sites were correct, every
+test passed, and the published wire was honest; the defect was reachable rather
+than present. An audit asking "is this correct" returns yes. The question that
+finds it is **could a future caller get this wrong without the compiler
+objecting**, and that question has to be asked deliberately, because nothing
+raises it. It also loses every prioritisation contest against a real defect,
+which is the argument for doing it while the file is already open rather than
+scheduling it.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
