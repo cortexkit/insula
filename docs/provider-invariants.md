@@ -369,6 +369,17 @@ Two habits follow, both of which this codebase needed:
   nothing about the other, and the temptation to guard once and call the class
   closed is strongest right after finding the first gap.
 
+The precondition is **two independent producers of the same data**, each doing
+its own work, so a guard genuinely has to be written twice. One producer feeding
+two renderers does not qualify: the value is computed once and then serialised or
+formatted, so there is only ever one place for the guard to live and the
+duplication this depends on is absent by construction. Applied to a render-fork
+the check returns a null that tests nothing — the same defect as a control scoped
+more narrowly than the query it guards, where the check ran, produced a value,
+and answered a different question. Stated because a null from the wrong shape
+invites two wrong conclusions: that the code is clean, or that the rule is
+unfounded.
+
 The read path has two emission branches — one for entries carrying an account
 label, one for entries without — so **every guard in it exists twice**. Both
 grants found so far were guarded at one branch and tested only there: the
