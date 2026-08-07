@@ -721,7 +721,20 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
 fn classify_error_frame(body: &[u8]) -> ClientFailure {
     let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
     match value.get("code").and_then(Value::as_str) {
-        Some("unknown_channel" | "unknown_module" | "module_reloading") => {
+        Some(code @ ("unknown_channel" | "unknown_module" | "module_reloading")) => {
+            // `unknown_module` is ambiguous in a way the retry cannot see: the
+            // daemon answers it both for a module that is restarting and for a
+            // name that has never been registered. Retrying is right for the
+            // first and futile for the second, and the vault lanes would simply
+            // stale-serve forever while every diagnostic looked healthy. Named
+            // here so a wrong module id is legible as a wrong id rather than as
+            // a vault outage.
+            if code == "unknown_module" {
+                eprintln!(
+                    "[ck-quota] warning: daemon does not recognise module id \
+                     {CREDENTIALS_MODULE_ID:?} -- restarting, or renamed?"
+                );
+            }
             return ClientFailure::RouteGone;
         }
         Some("target_unavailable" | "module_timeout" | "backend_error") => {
