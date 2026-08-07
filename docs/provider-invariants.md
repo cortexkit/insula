@@ -413,9 +413,16 @@ no test naming that site, that is the finding.
 | a healthy entry (`error` absent, `usage` present) | both | a fetch that returned windows | structural |
 | `apiProvider` (this usage is that upstream's, in a shared vocabulary consumers join spend and pricing on) | both | a mapping entry exists for this provider | key‑drift only |
 
-Two of these rows were added *after* deleting the condition and finding nothing
-reddened. The table is the defence: a warning asks you to feel differently, a
-list asks you to check something.
+The two **labeled emission** rows were added after deleting their conditions and
+finding nothing reddened — the guards existed, and the tests that appeared to
+cover them were named for the unlabeled branch. The table is the defence: a
+warning asks you to feel differently, a list asks you to check something.
+
+They are named rather than counted deliberately. A count here is unverifiable
+prose sitting beside a derived table — a reader cannot tell *which* two, and the
+sentence turns false the moment a third row is added, with nothing to catch it.
+Prose next to a correct table is the least-checked text in a document, because
+the table's correctness makes the paragraph beside it look checked too.
 
 The `fetchedAt` row is worded carefully because the natural reading is wrong.
 The timestamp survives the failure that degrades an entry, so a degraded entry
