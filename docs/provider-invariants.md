@@ -491,6 +491,29 @@ raises it. It also loses every prioritisation contest against a real defect,
 which is the argument for doing it while the file is already open rather than
 scheduling it.
 
+### A guard has two sides and they need separate audits
+
+Who may **act** on a privileged value, and who may **create** it. Fixing the
+first feels like closing the question, because the consumption side is where the
+consequence is visible and therefore where attention goes — but a value that can
+be minted without the check is not protected by a gate on its use.
+
+After moving the relaxation gate, the minting side was still a public setter
+taking a bare `bool`. One production caller passes a value computed from all five
+reset-tick conditions, so it is correct; but the check happens elsewhere and the
+boolean arrives stripped of its provenance, so any caller can pass `true` and it
+compiles. **Enforced and merely correct are different properties**, and a
+call-site audit cannot tell them apart, since both look like one correct caller.
+
+The strong remedy is a witness type: make the value constructible only by the
+function that performs the check, so it cannot exist without the check having
+run. That was not done here — the flag crosses three struct boundaries and each
+would have to thread the witness — and the weaker remedy was used instead, which
+is to say at the definition what entitles a caller to set it. The setter's
+previous comment described only the mechanics, which reads as an invitation.
+Where the cost of the witness is bearable, prefer it: a sentence asks the next
+author to agree, a type does not.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
