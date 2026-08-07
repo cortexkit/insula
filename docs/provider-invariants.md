@@ -580,6 +580,21 @@ one they have already imagined. There is no self-check for this. What closes it
 is someone standing where the author is not — which is worth stating plainly
 rather than filing the class as solved.
 
+### Record the consequence, not just the fact
+
+"`rawUsedPercent` is emitted only where the two figures diverge" is a fact, and a
+reader agrees with it. "So absence means they agree, and rendering a placeholder
+would be wrong on every unrelaxed window" is a consequence, and a reader
+remembers it while editing.
+
+The difference decides whether a correct behaviour survives a refactor. Code that
+is correct for an unstated reason is indistinguishable from code that is correct
+by accident, and the next author cannot tell which they are holding — so a
+simplification that looks like an improvement removes the property silently.
+
+A fact invites agreement; a consequence invites care. When documenting a field or
+a guard, write the sentence that names what breaks.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
