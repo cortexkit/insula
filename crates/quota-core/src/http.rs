@@ -353,6 +353,13 @@ impl JsonRequest {
     /// rare provider whose status semantics are bespoke — e.g. doubao must read
     /// rate-limit headers off BOTH 200 AND 429 — so it owns the status policy while
     /// still riding this shared transport instead of hand-rolling `reqwest`.
+    ///
+    /// The empty-body rule that [`send`](Self::send) applies is **deliberately
+    /// absent here**, because a caller reading rate-limit headers off a `429`
+    /// never looks at the body and would break if an empty one were refused. A
+    /// caller that does parse the body should ask for the check explicitly via
+    /// [`HttpResponse::body_for_parsing`], which carries the full reasoning.
+    /// Skipping it silently is how a flapping endpoint comes to read as dead.
     pub async fn send_raw(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
