@@ -3,17 +3,23 @@
 // Install: merge this `modules` entry into your real subc config at
 //   $XDG_CONFIG_HOME/cortexkit/subc.jsonc   (default: ~/.config/cortexkit/subc.jsonc)
 // and point `program` at your built binary (cargo build --release →
-// target/release/ck-quota). On its next start, the ck-subc daemon spawns +
+// target/release/ck-insula). On its next start, the ck-subc daemon spawns +
 // supervises it.
 //
 // The daemon appends `--subc <connection-file>` and injects the SUBC_MODULE_ID env
 // var itself — do NOT add those to args/env here. The map KEY ("ai-provider-quota")
 // is the module id the daemon registers it under.
+//
+// The key and the binary deliberately differ. The repository and its binary were
+// renamed to insula; the module id was not, because every other repository that
+// calls this module names it by that id, and such a reference does not block a
+// rename — it breaks when one lands. Changing the key here renames the module as
+// far as the daemon is concerned, and every caller loses its route.
 {
   "version": 1,
   "modules": {
     "ai-provider-quota": {
-      "program": "/abs/path/to/ai-provider-quota/target/release/ck-quota",
+      "program": "/abs/path/to/insula/target/release/ck-insula",
       "args": [],
       "env": {},
       "enabled": true

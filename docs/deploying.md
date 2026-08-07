@@ -16,8 +16,8 @@ rather than inferred.
 cargo build --release
 
 # 2. back up what is running, then replace it
-cp ~/.local/share/cortexkit/bin/ck-quota ~/.local/share/cortexkit/bin/ck-quota.bak
-cp target/release/ck-quota ~/.local/share/cortexkit/bin/ck-quota
+cp ~/.local/share/cortexkit/bin/ck-insula ~/.local/share/cortexkit/bin/ck-insula.bak
+cp target/release/ck-insula ~/.local/share/cortexkit/bin/ck-insula
 
 # 3. restart under supervision
 ck module restart ai-provider-quota
@@ -26,9 +26,24 @@ ck module restart ai-provider-quota
 ck module status ai-provider-quota --json    # health.metrics.buildCommit
 git rev-parse --short=12 HEAD                # must match
 
-# 5. check what it now publishes is internally coherent
+# 5. confirm every configured credential is actually being served
+cargo run -p quota-module --example vault-lanes
+
+# 6. check what it now publishes is internally coherent
 cargo run -p quota-module --example deployed-sanity
 ```
+
+The binary is `ck-insula` and the module id is `ai-provider-quota`. They differ
+because the repository was renamed and the module id was deliberately left
+alone: every other repository that calls this module names it by that id, and
+such a reference does not block a rename — it breaks when one lands. So the
+restart and status commands keep the old spelling while the artifact does not.
+
+Step 5 exists because steps 4 and 6 cannot see an absent lane. Both check that
+what is published is self-consistent, and a set that shrinks stays consistent —
+so a credential that stopped being served leaves them green. `vault-lanes`
+compares what this host is configured for against what the wire is serving,
+which is a relation neither side derives from the other.
 
 Step 5 answers a different question from step 4. The stamp says the right *code*
 is running; the sanity sweep says the *data* that code publishes does not
@@ -107,11 +122,11 @@ two commits can be built into byte-comparable binaries:
 git stash                       # or use a clean tree
 git checkout <deployed-commit>
 CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
-shasum -a 256 target/release/ck-quota
+shasum -a 256 target/release/ck-insula
 
 git checkout <head-commit>
 CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
-shasum -a 256 target/release/ck-quota
+shasum -a 256 target/release/ck-insula
 ```
 
 **Equal hashes mean no deploy is needed** — the commits produce the same binary.
