@@ -245,8 +245,23 @@ impl FetchAttempt {
         self
     }
 
-    /// Set read-time relaxation eligibility without changing other providers'
-    /// constructor call sites.
+    /// Record that a banked-reset tick found this account eligible for read-time
+    /// relaxation.
+    ///
+    /// **This is not a general-purpose flag, and a provider should not reach for
+    /// it.** Setting it true makes the read path publish `usedPercent: 0` for an
+    /// account whose real usage is higher, moving the reported figure to
+    /// `rawUsedPercent`. Consumers pace on the zero, so an unearned true tells a
+    /// router that an exhausted account is idle.
+    ///
+    /// The only thing entitled to set it is a reset tick that established every
+    /// condition in `codex_resets::reporting_eligible` — armed, below the wall,
+    /// no consume attempted this tick, nothing pending in the journal, and the
+    /// journal writable. Passing a bare `true` from anywhere else asserts all
+    /// five without having checked any.
+    ///
+    /// The type cannot enforce that, which is why it is said here: the value
+    /// arrives as a `bool` and every caller looks identical at this boundary.
     pub fn with_relax_eligible(mut self, relax_eligible: bool) -> Self {
         self.relax_eligible = relax_eligible;
         self
