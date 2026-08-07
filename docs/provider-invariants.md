@@ -728,6 +728,19 @@ cutting at the first `#[cfg(test)]` attribute rather than the module drops it to
 seeing 5% knows the result answers a different question, without knowing
 anything about the pattern.
 
+One number is not enough when a tool applies more than one rule. The byte share
+reports on the boundary; it says nothing about the separate rule that detects
+test-only items left inside the body. Disabling that one produced output
+identical to a clean run **minus a line** — same share, same counts, and a caveat
+that simply was not there. **A reader cannot notice a line that is absent**,
+which is the failure the caveat exists to prevent, pointed at the caveat itself.
+So every rule reports on every run, zeros included: a caveat count of `0` is a
+statement, an omitted caveat is nothing at all.
+
+The direction matters when choosing what to publish. A rule that SELECTS from
+the corpus moves the result when it breaks; a rule that DESCRIBES the corpus does
+not, so its failure is invisible unless its own output is printed.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
