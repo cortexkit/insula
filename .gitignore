@@ -1,7 +1,15 @@
 # Rust
 /target
 **/target
-Cargo.lock
+
+# Cargo.lock is deliberately TRACKED. This workspace produces a deployed binary,
+# and the module stamps its source commit into its health metrics so a running
+# process can be traced back to what built it. That identity is only complete if
+# the commit also fixes the dependency versions -- otherwise two builds of the
+# same commit can link different crates, and "same commit, different behaviour"
+# becomes unanswerable at exactly the moment someone is asking. Tracking it also
+# means CI tests the dependency set that ships, rather than resolving a fresh one
+# nobody has built against.
 
 # Node
 node_modules
