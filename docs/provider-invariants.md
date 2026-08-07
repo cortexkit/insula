@@ -539,6 +539,26 @@ something, and the inference that reads as unremarkable is usually the fail-open
 one. `rawUsedPercent` absent means the effective and reported figures agree — not
 that relaxation is switched off.
 
+That is a warning until someone lists the fields. Enumerate them from the wire
+type's `skip_serializing_if` attributes rather than from memory — there are 24 —
+and check each one against the contract. Doing that found two whose absence had
+never been defined: a window slot (the three can have holes, since each is filled
+from its own optional upstream field) and `savedResets` (absent covers the credit
+inventory lookup having failed, not zero credits held).
+
+**A keyword sweep over prose fails differently from one over code.** A code sweep
+fails loose when the pattern is too broad; a documentation sweep fails loose
+*because the document is about the thing being searched for*, so the vocabulary
+saturates and every mention matches by proximity. Searching this contract for
+absence-language scored every field as documented, including a field name that
+does not exist — the words appear every 213 characters. Tightening to
+same-sentence matches then reported two fields as gaps whose absence is spelled
+out in the neighbouring sentence.
+
+Neither setting is the answer. The sweep produces **candidates**; reading
+produces verdicts. What made the exercise work was the enumeration forcing a look
+at every field once, rather than at whichever field prompted the question.
+
 ## An asymmetric guard states its reason where the next caller looks
 
 Some guards are deliberately applied on one path and skipped on another. The
