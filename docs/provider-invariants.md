@@ -433,6 +433,16 @@ nothing produces that verdict and the report is the only thing that retires the
 record. One credential class is covered by an independent path and the other is
 not, from call sites that look identical here.
 
+Enumerating every writer rather than the one nearest to hand is what makes that
+checkable. Retirement is derived from record invalidation, and every automatic
+invalidation in that store sits on the refresh or rotation machinery: the
+invalid-grant verdict, the interrupted-rotation corruption guard (which reads the
+OAuth block and is skipped when there is none), and two crash-window
+reconciliation paths that take a refresh intent as their argument. A static
+API-key record never acquires a refresh intent, so it cannot reach any of them.
+**For that class the complete set of retirement mechanisms is the report or a
+human running an admin command.**
+
 The wire stays honest either way — the rejection is published as
 `credential_rejected` from a separate path — so the gap is in remediation rather
 than diagnosis. Which is the other half of the question: **notice what?** A
