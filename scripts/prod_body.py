@@ -139,7 +139,15 @@ def main() -> int:
     # every bug produces more apparent absence. Its errors would otherwise be
     # shaped exactly like its findings.
     if args.grep_missing is not None or args.grep is not None:
+        # The premise is printed beside the numbers because it is the thing a
+        # reader would otherwise have to reconstruct from the source. Every
+        # result here rests on one definition of "production", and a reader who
+        # disagrees with that definition cannot tell it was used -- the counts
+        # look identical under any boundary. Stating it lets someone reject the
+        # reasoning without re-deriving it, which is how the boundary's own
+        # incompleteness was found.
         print(
+            'premise: "production" is everything above `#[cfg(test)] mod tests`\n'
             f"examined: {len(args.files)} file(s)   matched: {len(hits)}",
             file=sys.stderr,
         )
