@@ -725,10 +725,15 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
             // `unknown_module` is ambiguous in a way the retry cannot see: the
             // daemon answers it both for a module that is restarting and for a
             // name that has never been registered. Retrying is right for the
-            // first and futile for the second, and the vault lanes would simply
-            // stale-serve forever while every diagnostic looked healthy. Named
-            // here so a wrong module id is legible as a wrong id rather than as
-            // a vault outage.
+            // first and futile for the second.
+            //
+            // The per-call retry is bounded, but the refresher's is not: a
+            // transient failure with a prior healthy window serves that window
+            // and tries again next tick, indefinitely. So a wrong id publishes a
+            // healthy-looking wire forever. This client hand-rolls its frame
+            // loop rather than using an SDK, and the SDKs are where the
+            // retry-budget-exhausted error that names the target lives -- so
+            // without this line the id is printed nowhere in this process.
             if code == "unknown_module" {
                 eprintln!(
                     "[ck-quota] warning: daemon does not recognise module id \
