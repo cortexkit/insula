@@ -43,7 +43,14 @@ three wrong predicates to reach, each failing in a way the output did not show:
 The property that actually matters is whether an edit can reach anyone, and a
 copy is the only case where it cannot. Two tells, both exact: a remote URL shared
 with another scanned tree, or -- for a tree with no remote at all -- a HEAD commit
-that already exists in another scanned tree's history.
+that is an ANCESTOR of another scanned tree's HEAD.
+
+Ancestry, not object existence. `git cat-file -e` answers yes for any commit the
+repository has ever fetched, including a branch that was pulled and never merged
+-- so a tree holding genuinely unmerged work would be discounted as a copy, which
+is the same caller-dropping direction as the three predicates above. That one is
+the subtlest of the four, because it is RIGHT ON EVERY TREE IN THIS FLEET TODAY
+and would only fail once someone has work in flight.
 
 Remote configuration is still reported, separately, because it answers HOW a
 change would be published. A live repository with no remote still runs, still
@@ -96,6 +103,21 @@ def git(repo: Path, *args: str) -> str:
         return ""
 
 
+def contains(repo: Path, commit: str) -> bool:
+    """Whether `commit` is an ancestor of this repository's HEAD.
+
+    Deliberately not `cat-file -e`, which reports on any object the repository
+    holds -- including a fetched branch nobody merged. See the module docstring:
+    that weaker check discounts a tree with unmerged work as a duplicate.
+    """
+    out = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return out.returncode == 0
+
+
 def duplicates(all_repos: list[Path]) -> dict[Path, str]:
     """Trees that are second copies of a repository already present.
 
@@ -134,9 +156,7 @@ def duplicates(all_repos: list[Path]) -> dict[Path, str]:
         if not head:
             continue
         containers = [
-            other
-            for other in all_repos
-            if other is not repo and git(other, "cat-file", "-t", head) == "commit"
+            other for other in all_repos if other is not repo and contains(other, head)
         ]
         canonical = next((c for c in containers if c not in found), None)
         if canonical is not None:
