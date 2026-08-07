@@ -711,6 +711,23 @@ that can disagree with the code is worse than none. The check is one mutation �
 change the rule and confirm the printed line changes with it; here, anchoring on
 `mod checks` left the output still claiming `mod tests`.
 
+Better still, publish a number the rule itself produces. There is an ordering:
+
+| form | can it disagree with the code? |
+|---|---|
+| implicit — the premise is only in the author's head | always |
+| transcribed — written by hand beside the rule | after any edit |
+| derived — read out of the rule | only if read from the wrong thing |
+| structural — an output of applying the rule | not without the result being wrong too |
+
+This tool prints the **share of bytes its boundary kept**, which was already
+being computed per file and discarded. It moves under both ways the boundary can
+fail: an anchor that never matches keeps whole files and drives it to 100%, and
+cutting at the first `#[cfg(test)]` attribute rather than the module drops it to
+51% and changes a sweep's answer. A reader expecting roughly two thirds and
+seeing 5% knows the result answers a different question, without knowing
+anything about the pattern.
+
 And the same sweep has a **mirror failure that is quieter**. Cutting a file at
 its test module leaves behind `#[cfg(test)]` applied to individual items — a
 test-only constructor beside the real one, an injection hook, a helper accessor.
