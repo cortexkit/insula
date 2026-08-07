@@ -266,6 +266,34 @@ consumed internally rather than published. Everywhere else, a 100% window is
 inferred from counts or percentages, so **no field on this wire states that a
 provider is currently refusing requests**. Do not read one into `usedPercent`.
 
+### `usedPercent` can be lower than what the provider reported
+
+One upstream grants banked quota-reset credits, and this module can spend one on
+your behalf when an account is about to hit its wall (see `savedResets` below).
+While an account holds an unspent credit that will be used before the window
+binds, its published `usedPercent` is **zero**, and the figure the provider
+actually reported moves to `rawUsedPercent` on the same window.
+
+The split is deliberate and the two fields answer different questions:
+
+- **`usedPercent` is the effective number** — how much headroom this account has
+  in practice, given a reset that is going to happen. Pace, route, and price on
+  this one.
+- **`rawUsedPercent` is what the upstream said** — present only when the two
+  diverge, so its absence means they agree. Show it in a human-facing view where
+  a zero beside real consumption would otherwise look like a bug.
+
+**Do not treat `rawUsedPercent` as the truer number and pace on it.** An account
+with a credit about to be spent genuinely has the headroom the zero claims, and
+routing away from it wastes the credit — which expires whether or not it is
+used.
+
+A consequence worth expecting: **an account can jump from 0% to a high number in
+one poll**, when the credits run out or the conditions for spending one stop
+holding. That is the module reporting honestly again, not a fault. A consumer
+that treats a large single-poll jump as implausible will reject the one reading
+that matters.
+
 ### An exhausted window may carry no reset at all
 
 `resetsAt` is optional and is never fabricated. The percent is the load-bearing
