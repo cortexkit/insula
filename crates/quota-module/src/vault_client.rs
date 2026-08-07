@@ -24,7 +24,18 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
-const CREDENTIALS_MODULE_ID: &str = "cortexkit-credentials";
+/// The daemon module id of the credential vault.
+///
+/// This is a TARGET reference: the id dialled to reach the vault, not a name
+/// anyone checks against us. So it does not gate a rename on that side — it
+/// breaks the moment one lands, and every vault-served provider loses its
+/// credential while local-credential providers carry on unaffected.
+///
+/// The failure is quiet by construction. A wrong id answers `unknown_module`,
+/// which is classified transient (a restarting module answers identically), so
+/// the refresher retries on its backoff forever and never reaches a verdict.
+/// The warning below exists because nothing else in the process names the id.
+const CREDENTIALS_MODULE_ID: &str = "claustrum";
 /// Bounds both the TCP connect and the HMAC handshake that follows it.
 ///
 /// One constant covers two concerns because they share a budget: a peer that
