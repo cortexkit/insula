@@ -44,6 +44,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::browser_cookies;
 use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::env;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
@@ -59,6 +60,9 @@ const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const SUBSCRIPTION_STATS_URL: &str =
     "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats";
 const ENV_API_KEY: &str = "KIMI_CODE_API_KEY";
+/// The browser host carrying the web console session, which is a different
+/// credential from the coding API key above.
+const WEB_COOKIE_DOMAIN: &str = "kimi.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEEKLY_MINUTES: i64 = 7 * 24 * 60;
 const FIVE_HOUR_MINUTES: i64 = 5 * 60;
@@ -349,15 +353,54 @@ fn usage_request(url: &str, bearer: &str) -> JsonRequest {
         .header(Header::new("Accept", "application/json"))
 }
 
-fn subscription_stats_request(bearer: &str) -> JsonRequest {
+fn subscription_stats_request(web_token: &str) -> JsonRequest {
     JsonRequest::post_json(SUBSCRIPTION_STATS_URL, b"{}".to_vec())
         .timeout(REQUEST_TIMEOUT)
-        .bearer(bearer)
+        .bearer(web_token)
         .header(Header::new("Content-Type", "application/json"))
         .header(Header::new("Accept", "application/json"))
-        .header(Header::new("Cookie", format!("kimi-auth={bearer}")))
+        .header(Header::new("Cookie", format!("kimi-auth={web_token}")))
         .header(Header::new("Origin", "https://www.kimi.com"))
         .header(Header::new("Referer", "https://www.kimi.com/code/console"))
+}
+
+/// The web console session token, when this host has one.
+///
+/// The subscription extras come from the web console, which authenticates with
+/// a browser session rather than with the coding API key that serves the usage
+/// endpoint. They are two separate credentials for two separate surfaces, and
+/// the key is not accepted by the console -- so sending it there produces a
+/// rejection on every fetch, and the extras it was meant to collect never
+/// arrive.
+///
+/// Returning `None` when no browser session exists is what keeps the failure
+/// legible: the enrichment is skipped rather than attempted and swallowed, so a
+/// host without a Kimi browser login does no console request at all.
+async fn web_enrichment_token() -> Option<String> {
+    let jar = browser_cookies::chrome_cookies_for_async(WEB_COOKIE_DOMAIN)
+        .await
+        .ok()?;
+    jar.header()
+        .split("; ")
+        .find_map(|pair| pair.strip_prefix("kimi-auth="))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// Fetch the optional subscription extras and fold them in.
+///
+/// Best-effort by design: the usage windows are already resolved by the time
+/// this runs, and a console that is unreachable, logged out, or slow must not
+/// turn a good fetch into a degraded entry. The cost of skipping is two extra
+/// windows a consumer treats as optional; the cost of failing would be the
+/// provider's whole capacity signal.
+async fn merge_subscription_extras(http: &reqwest::Client, usage: &mut Usage) {
+    let Some(web_token) = web_enrichment_token().await else {
+        return;
+    };
+    if let Ok(stats_body) = subscription_stats_request(&web_token).send(http).await {
+        merge_extras(usage, parse_subscription_extras(&stats_body));
+    }
 }
 
 /// The kimi-for-coding usage provider.
@@ -414,10 +457,7 @@ impl KimiForCodingProvider {
             .and_then(|body| normalize_usage(&body));
         match result {
             Ok(mut usage) => {
-                // Best-effort subscription stats for monthly + code-7d extras.
-                if let Ok(stats_body) = subscription_stats_request(bearer).send(&self.http).await {
-                    merge_extras(&mut usage, parse_subscription_extras(&stats_body));
-                }
+                merge_subscription_extras(&self.http, &mut usage).await;
                 FetchAttempt::success(Some(AccountObservation::new(None, None)), "api", usage)
             }
             Err(error) => FetchAttempt::failure(None, None, error),
@@ -467,10 +507,7 @@ impl KimiForCodingProvider {
         }
         match result {
             Ok(mut usage) => {
-                // Best-effort subscription stats for monthly + code-7d extras.
-                if let Ok(stats_body) = subscription_stats_request(&bearer).send(&self.http).await {
-                    merge_extras(&mut usage, parse_subscription_extras(&stats_body));
-                }
+                merge_subscription_extras(&self.http, &mut usage).await;
                 FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
@@ -751,6 +788,61 @@ mod tests {
             matches!(&err, FetchError::Decode(m) if m.contains("missing valid weekly window")),
             "expected the window guard, got: {err}"
         );
+    }
+
+    /// A live console payload, captured from this host's browser session on
+    /// 2026-08-07. LIVE-OBSERVED, not hand-written: the field spellings, the
+    /// ratio scale (a fraction, not a percent) and the nanosecond-precision
+    /// timestamps are all as the server sent them.
+    const LIVE_SUBSCRIPTION_STATS: &[u8] = br#"{"ratelimitCode5h":{"ratio":0.11,"enabled":true,"resetTime":"2026-08-07T13:08:27.604046432Z"},"ratelimitCode7d":{"ratio":0.1621,"enabled":true,"resetTime":"2026-08-13T18:08:27.604046432Z"},"subscriptionBalance":{"id":"19f902a6-04c2-8306-8000-0000ff64c68f","feature":"FEATURE_OMNI","type":"SUBSCRIPTION","unit":"UNIT_CREDIT","amountUsedRatio":0.1915,"kimiCodeUsedRatio":0.1915,"expireTime":"2026-08-23T18:08:35Z","domain":"DOMAIN_NEXUS"}}"#;
+
+    /// The console's own response yields both extras.
+    ///
+    /// Pinned against a live capture because the parser was written from the
+    /// upstream reference and had never seen a real response: the extras were
+    /// requested with the wrong credential, so every attempt was rejected and
+    /// silently discarded, and this code path had never once produced a window
+    /// in production.
+    #[test]
+    fn live_console_payload_yields_both_extras() {
+        let extras = parse_subscription_extras(LIVE_SUBSCRIPTION_STATS);
+
+        let ids: Vec<_> = extras.iter().filter_map(|e| e.id.as_deref()).collect();
+        assert_eq!(ids, vec!["kimi-monthly", "kimi-code-7d"], "{extras:?}");
+
+        // Ratios are fractions on the wire and percents on ours.
+        let monthly = extras[0].window.as_ref().expect("monthly window");
+        assert_eq!(monthly.used_percent, 19.15);
+        assert_eq!(monthly.resets_at.as_deref(), Some("2026-08-23T18:08:35Z"));
+
+        let code_7d = extras[1].window.as_ref().expect("7d window");
+        assert_eq!(code_7d.used_percent, 16.21);
+        assert_eq!(code_7d.window_minutes, Some(WEEKLY_MINUTES));
+        assert!(code_7d.resets_at.is_some());
+    }
+
+    /// A disabled rate limit contributes no window.
+    ///
+    /// Without this the extras test above would pass against a parser that
+    /// ignored `enabled` entirely, which would publish a window for a limit the
+    /// account is not subject to.
+    #[test]
+    fn a_disabled_rate_limit_is_not_published() {
+        let body = br#"{"ratelimitCode7d":{"ratio":0.5,"enabled":false}}"#;
+        let extras = parse_subscription_extras(body);
+        assert!(extras.is_empty(), "{extras:?}");
+    }
+
+    /// A non-subscription balance contributes no monthly window.
+    ///
+    /// The console returns other balance kinds against the same field, and
+    /// treating one as the subscription would report an unrelated allowance as
+    /// this account's monthly usage.
+    #[test]
+    fn a_non_subscription_balance_is_not_published_as_monthly() {
+        let body = br#"{"subscriptionBalance":{"feature":"FEATURE_OMNI","type":"WALLET","amountUsedRatio":0.9}}"#;
+        let extras = parse_subscription_extras(body);
+        assert!(extras.is_empty(), "{extras:?}");
     }
 
     #[test]
