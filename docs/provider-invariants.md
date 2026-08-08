@@ -923,6 +923,29 @@ reading either branch, diff it against its twin rather than reading it alone —
 any condition present in one and absent in the other is either a deliberate
 difference worth a comment or a gap.
 
+### The asymmetry has a second, worse form
+
+Both cases above were *one* producer of a claim, split into two emission
+branches. There is a harder shape: two producers that are not peers at all,
+where one **acts** on the answer and the other only **reports** it.
+
+Run outside this codebase, the rule found exactly that: a value computed once by
+the component that takes an action on it, and again by an inline scan that fills
+a diagnostic field on an error. The acting producer scoped its scan correctly and
+held five tests including one for that scoping. The reporting producer omitted
+the scope and carried a single assertion, for the trivial case where the answer
+is empty.
+
+The prediction holds and sharpens: the simpler path is not merely easier to test,
+it is the one whose output **nobody acts on**, so nothing fails when it is wrong.
+A diagnostic that names a recovery time the caller cannot actually have is a
+lying instrument, and it lies most convincingly precisely because the acting path
+beside it is correct and well tested.
+
+So when diffing twins, note which one has **consequences**. A guard missing from
+the consequential path is a defect that surfaces; a guard missing from the
+reporting path produces a plausible number that is never contradicted.
+
 The cheap way to check either: delete the condition and see which tests redden.
 If the only failures are in tests named for something else, the condition is
 defended by accident and one refactor from being unguarded.
