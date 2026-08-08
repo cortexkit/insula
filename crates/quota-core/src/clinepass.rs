@@ -67,6 +67,18 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let mut tertiary = None;
 
     for limit in response.data.limits {
+        // A limit type this module does not know is DISCARDED, and the cost is
+        // that an upstream can add a window and we publish an account as less
+        // constrained than it is -- silently, since the entry still looks like a
+        // complete reading. The alternative would be to publish it as an extra
+        // window with an unknown cadence, which states a limit nobody can act on
+        // and is the wrong direction under the cost-asymmetry fence.
+        //
+        // What keeps the discard honest is the guard after this loop: if the
+        // known types match NOTHING, the fetch fails rather than reporting an
+        // empty success. So the invisible case is a response mixing known and
+        // unknown types, which is worth re-checking whenever this provider's
+        // upstream changes shape.
         let window_minutes = match limit.limit_type.as_str() {
             "five_hour" => 5 * 60,
             "weekly" => 7 * 24 * 60,
@@ -296,6 +308,37 @@ mod tests {
 
         let result = normalize_usage(body);
         assert!(matches!(result, Err(FetchError::Decode(_))));
+    }
+
+    /// A response mixing a known limit with an unknown one is a SUCCESS whose
+    /// unknown window is silently gone.
+    ///
+    /// This is the case the all-skipped guard cannot catch, and it is the shape
+    /// an upstream produces the day it adds a window type: the entry looks like
+    /// a complete reading, and an account is published as less constrained than
+    /// it is. Pinned so the behaviour is a recorded decision rather than an
+    /// accident — if this provider should ever fail, or mark, on an unknown
+    /// type, this test is where that argument gets made.
+    #[test]
+    fn a_known_limit_beside_an_unknown_one_publishes_only_the_known_window() {
+        let body = br#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "weekly", "percentUsed": 40.0 },
+                    { "type": "quarterly", "percentUsed": 95.0 }
+                ]
+            }
+        }"#;
+
+        let usage = normalize_usage(body).expect("a known limit makes this a usable response");
+
+        assert_eq!(usage.secondary.expect("weekly window").used_percent, 40.0);
+        // The unknown limit reached no slot and no extra window: nothing on the
+        // wire says a 95%-used limit was seen and dropped.
+        assert!(usage.primary.is_none());
+        assert!(usage.tertiary.is_none());
+        assert!(usage.extra_rate_windows.is_none());
     }
 
     #[test]
