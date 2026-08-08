@@ -8,6 +8,12 @@ implementation is a loopback probe with no OAuth request path to reuse).
 Banked resets knob stays GLOBAL — every armed-eligible codex account
 auto-consumes its own credits.
 
+> **This is a record of a decision, not a description of the system.** The
+> antigravity deferral above has since been reversed and built — see the note in
+> the per-provider section. Where this document and the source disagree, the
+> source is right; the value here is the reasoning, which the source does not
+> carry.
+
 MERGE PHASING (Oracle-sized): merge 1 = vault client + core seam + machinery
 fixes + codex two-account (the priority pair, everything below unless marked
 later). Merge 2 = anthropic + grok (thin bearer-swap lanes). Merge 3 = gemini
@@ -247,8 +253,12 @@ snapshot per mapped entry. Prefix table: `chatgpt:openai*` → codex;
   populates the local token cache, never refreshes locally (vault owns
   refresh). Note: two valid tokens for one Google account share server-side
   rate limits — correlated 429s are expected and classified transient.
-- antigravity OAuth fallback: DEFERRED (no existing OAuth request path; the
-  local probe remains the only antigravity lane).
+- antigravity OAuth fallback: DEFERRED at the time of writing, for want of an
+  OAuth request path. **This has since shipped** — `antigravity.rs` now has a
+  cloud lane calling `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
+  with a vault-served Google credential, used when no local editor process is
+  running. The local probe wins when both are healthy. Read that file rather than
+  this line for the current shape.
 
 ## What this deliberately does NOT change
 

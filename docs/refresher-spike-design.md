@@ -181,6 +181,15 @@ Retry-After is implemented it MUST be CLAMPED — `min(retry_after,
 MAX_TRANSIENT_BACKOFF)` — never honored raw, so an upstream cannot dictate an
 unbounded refresh-suppression window.
 
+Re-derived against the shipped code: **the stated blocker is gone, and the
+feature is still not wanted.** `FetchError` gained `ProviderStatus(u16)`, so 429
+is distinguishable from a generic 5xx today and the "cannot tell them apart"
+reason no longer holds. What has not changed is the value: class-based backoff
+already caps transient retries at 15 minutes, no provider here has been observed
+sending a `Retry-After` this module would obey differently, and honouring one
+could only lengthen a wait that is already bounded. The clamp requirement above
+remains the condition on any future implementation.
+
 ## Freshness
 
 `fresh = last_success_at.map(|t| now - t <= FRESH_HORIZON).unwrap_or(false)`,
