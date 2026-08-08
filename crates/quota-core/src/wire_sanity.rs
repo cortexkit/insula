@@ -786,6 +786,49 @@ mod tests {
         }
     }
 
+    /// A reset timestamp that will not parse is a finding.
+    ///
+    /// Around a dozen providers carry the upstream's own reset string through
+    /// rather than formatting one from an epoch, so this is the field most
+    /// exposed to an upstream changing shape. A consumer parses it to decide
+    /// when capacity returns; one that cannot be parsed is either dropped or
+    /// treated as absent, and both readings are wrong in the same direction as
+    /// a missing window.
+    ///
+    /// This rule sits in a `match` arm rather than behind an `if`, which is why
+    /// it wants an explicit test: a mechanical sweep that mutates conditions
+    /// skips it, and a skipped rule reads exactly like a covered one in the
+    /// sweep's output.
+    #[test]
+    fn an_unparseable_reset_is_reported() {
+        let mut w = window(40.0);
+        w.resets_at = Some("not-a-timestamp".to_string());
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(
+            report.findings,
+            vec!["codex/acct/primary: resetsAt is unparseable: not-a-timestamp".to_string()]
+        );
+    }
+
+    /// The paired silent case: a well-formed reset must stay quiet.
+    ///
+    /// Without it, a version reporting every reset as unparseable passes, since
+    /// the neighbouring rules on this field only run once parsing has succeeded.
+    #[test]
+    fn a_parseable_reset_is_not_reported() {
+        let mut w = window(40.0);
+        w.resets_at = Some("2026-07-28T12:00:00Z".to_string());
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        // Not vacuous: the window was examined, so the silence is the rule
+        // declining to fire rather than the sweep skipping it.
+        assert_eq!(report.windows_checked, 1);
+    }
+
     /// The paired silent case, carrying a HEALTHY `rawUsedPercent`.
     ///
     /// Without a healthy instance of the field the rule inspects, an over-wide
