@@ -1382,6 +1382,14 @@ only if all three hold:
   past-reset test would go green against a version reporting every reset at or
   before now, and the used-count test against one reporting every window that
   fills up.
+
+  **The silent case must contain a healthy instance of the shape the rule
+  inspects** — not a healthy entry, not a healthy neighbour. A rule checking
+  extra windows was paired with a control holding only slots, so the over-wide
+  version, firing on every extra window rather than only an empty one, passed
+  the whole suite. The control was scoped narrower than the rule and proved the
+  rule stays silent on data it never examines, which is no evidence at all. Same
+  defect as a detector's blind spot, one layer up.
 - **Isolation** — the fixture triggers no other rule, so the rule under test is
   the only explanation for the finding.
 
