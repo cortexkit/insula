@@ -73,6 +73,35 @@ first half and relies on the daemon choosing to do the second.
 is missing entirely, the daemon has not read the config that declares it — `ck
 module rescan` re-reads `subc.jsonc`.
 
+## Running the ignored tests
+
+Several tests are `#[ignore]` because they need something the machine may not
+have: real credentials, an IDE's configuration on disk, or the sibling daemon
+binary. They are the only checks that exercise a live credential end to end, so
+nothing else can tell you a lane has stopped working.
+
+```sh
+cargo test --workspace --all-targets --no-fail-fast -- --ignored
+```
+
+**`--no-fail-fast` is load-bearing.** Without it the run stops at the first
+failing test binary and every later one is skipped, reported only as a count you
+have to notice is short. A first failure hides the rest, which is how two
+unrelated failures here were found one at a time rather than together.
+
+Expect some of these to fail for reasons that are not defects: a machine with no
+JetBrains subscription, a credential deliberately not configured. Read the
+failure before treating it as one. Two things do make them worth running
+regularly:
+
+- **A live credential can die without any other check noticing**, particularly
+  where the upstream answers a dead credential ambiguously. Nothing in the unit
+  suite or the deployed checkers contacts an upstream with a real token.
+- **An ignored test does not fail when the code around it changes**, so it drifts
+  silently and the drift surfaces only when someone runs it. One here asserted a
+  set of error classes that a later refactor had replaced, and it had been red
+  from the moment of that commit.
+
 ## Verifying the deploy
 
 `health.metrics.buildCommit` is stamped at compile time from the git HEAD of the
