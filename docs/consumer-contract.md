@@ -82,6 +82,32 @@ That window is short and self-inflicted, but during it the producer looks health
 from every angle and the consumer sees a feed that has silently stopped
 answering.
 
+### Render it differently from an empty result
+
+On a typical host most providers are unconfigured, so a UI that hides providers
+without credentials is doing the right thing — and that is exactly what makes
+this dangerous. **Hiding an empty result and hiding a dead route produce the same
+observable**, so a display with no rows is indistinguishable from a display that
+cannot reach this module at all. Nothing else reports it: the module is healthy,
+its logs are quiet, and the failure lives entirely in the caller's constant.
+
+So a refused call needs its own rendering — "limits unavailable" rather than
+nothing. This is the one failure of the six where **silence is the default
+presentation and also the wrong one.**
+
+### The module id is the contract, and `insula` is the durable one
+
+The subc module id is `insula`. It was `ai-provider-quota` until 2026-08-08; the
+repository, the binary and the module id are now all the same word, which is the
+end state rather than a step toward another.
+
+There is no capability-based resolution to prefer instead. The daemon's
+`catalog.list` does return each module's declared roles, so a consumer *could*
+select the module providing a `ManagementSurface` with a `usage.get` operation
+— but that describes a shape, not an identity, and it silently picks the wrong
+module the day a second one declares the same operation. Pin the id, and treat a
+failure to open the route as the visible, distinct condition described above.
+
 ## An empty array is not "nothing configured"
 
 Degraded entries *are* entries, so a host with zero usable credentials returns a
