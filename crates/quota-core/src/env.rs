@@ -134,7 +134,7 @@ mod tests {
     /// account's home directory.
     #[test]
     fn a_failed_credential_read_names_the_file_and_not_its_path() {
-        let path = std::path::Path::new("/nonexistent-home-dir/alice/.gemini/oauth_creds.json");
+        let path = std::path::Path::new("nonexistent-home-dir/alice/.gemini/oauth_creds.json");
         let error = read_credential_file(path, "gemini oauth_creds.json")
             .expect_err("a path that cannot exist must fail to read");
 
@@ -146,6 +146,15 @@ mod tests {
         // Not vacuous: the message must still identify the file and carry the
         // reason, so this cannot pass by returning something empty or generic.
         assert!(published.contains("gemini oauth_creds.json"), "{published}");
-        assert!(published.contains("No such file"), "{published}");
+
+        // The reason is compared against what this platform actually says rather
+        // than against a fixed string. Every operating system words a missing
+        // file differently, so asserting one wording tests the host it was
+        // written on and fails everywhere else -- while asserting nothing about
+        // the reason would let an empty or generic message pass.
+        let os_wording = std::fs::read_to_string(path)
+            .expect_err("the same read must fail the same way")
+            .to_string();
+        assert!(published.contains(&os_wording), "{published}");
     }
 }
