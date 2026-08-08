@@ -28,10 +28,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Linux-only. Unlike llm-runner there is no cfg(windows) code to exercise: the only
-  # platform-specific paths are the macOS cookie/antigravity probes, which carry
-  # cfg(not(target_os = "macos")) stubs — so the Linux leg compiles and covers the
-  # non-macOS path. macOS stays the development platform (local cargo test + clippy).
+  # Linux and Windows. macOS stays the development platform (local cargo test +
+  # clippy) and is not a CI leg, so the macOS-only code paths — the Chrome cookie
+  # store and the antigravity local probe — are covered by their
+  # cfg(not(target_os = "macos")) stubs here rather than executed.
+  #
+  # The Windows leg exists because this module discovers credentials by building
+  # paths on the machine it runs on, and that is the class of code which compiles
+  # everywhere and is silently wrong per platform: a path built for the wrong
+  # convention finds nothing and reports healthy. Cross-compiling does not
+  # substitute for it — from macOS it fails in a dependency's C build for want of
+  # MSVC headers, and even where it links it exercises no filesystem or OS-API
+  # behaviour.
   #
   # The #[ignore] tests split into two groups for two different reasons, and only
   # one of them is a CI limit. The live provider proofs need real credentials and
@@ -45,8 +53,19 @@ jobs:
   # GitHub's included minutes. Revert `runner` to GitHub-hosted `ubuntu-latest` if the
   # repo becomes public (public-repo Actions minutes are free).
   test:
-    name: Test (ubuntu)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Both legs run to completion. A Windows failure and a Linux failure have
+      # different causes here, and cancelling one on the other's failure hides
+      # whichever finished second.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - os: windows
+            runner: blacksmith-4vcpu-windows-2025
     # A wedged test must surface as a fast red run, not burn the runner for
     # the 6-hour Actions default. Healthy runs finish well under 15 minutes.
     timeout-minutes: 20
@@ -123,7 +142,13 @@ jobs:
       # default to paths under HOME and the test shells out to cargo itself to
       # build the sibling daemon. Without them the toolchain disappears along with
       # the credentials.
+      # Ubuntu only, and not because it could not work on Windows: the property
+      # under test is that this module's subc id round-trips through daemon
+      # config, process launch and a routed call, which is platform-independent.
+      # The script below is also POSIX shell, where the Windows runner defaults
+      # to PowerShell.
       - name: Real daemon supervision
+        if: matrix.os == 'ubuntu'
         run: |
           rig="$(mktemp -d)"
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
