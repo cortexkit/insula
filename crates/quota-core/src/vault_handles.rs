@@ -43,6 +43,13 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("oauth:google", "gemini"),
     ("kimi-for-coding", "kimi-for-coding"),
 ];
+/// The `ck-quota` segment is a literal and is deliberately not derived from the
+/// binary or module name, both of which have since been renamed. Beside a binary
+/// called `ck-insula` it reads like a leftover; it is the file an operator mints
+/// vault handles into, and renaming the segment silently reverts every
+/// vault-served provider to its local credential lane — which still fetches, so
+/// the loss shows up as accounts quietly losing their labels rather than as a
+/// failure. If it ever moves, move the file first.
 const DEFAULT_RELATIVE_PATH: &str = ".config/cortexkit/ck-quota/vault-handles.json";
 
 struct UniqueHandles(HashMap<String, String>);

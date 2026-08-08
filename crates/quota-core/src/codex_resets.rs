@@ -615,6 +615,22 @@ fn prune_records(
     Ok(before - records.len())
 }
 
+/// Where the redemption journal lives.
+///
+/// THE `ck-quota` SEGMENT IS DELIBERATE AND MUST NOT BE TIDIED. It is a literal,
+/// not a value derived from the binary or the module id, and both of those have
+/// since been renamed — so beside a binary called `ck-insula` this path reads
+/// like a leftover from an old name. It is not. It is where every redemption
+/// this host has ever reserved is recorded.
+///
+/// Renaming the segment does not fail. The old file is simply not found, an
+/// empty journal is created in its place, and an empty journal is
+/// indistinguishable from a correctly migrated one — while every pending
+/// redemption it used to fence is now unfenced, free to be spent a second time.
+/// The cost is money and there is no symptom.
+///
+/// If this ever has to move, it is a migration with its own window: move the
+/// file first, then verify by its CONTENTS rather than its existence.
 pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
     if let Some(path) = std::env::var_os("CK_QUOTA_STATE_DIR").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path).join("redemptions.json"));

@@ -46,6 +46,18 @@ use vault_client::VaultClient;
 const USAGE_GET_OP: &str = "usage.get";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
+/// The `ck-quota` name is a literal, deliberately not derived from the binary or
+/// module name — both of which have since been renamed, so beside a binary called
+/// `ck-insula` this reads like a leftover. It is the live config file.
+///
+/// It is read ONCE, at startup. Renaming it, or any restart that cannot find it,
+/// leaves the codex banked-resets feature OFF while the module comes up entirely
+/// healthy: nothing on the wire, in health metrics, or in the supervisor view
+/// records that a config was expected. The only way to tell the feature is armed
+/// is from its effect on the wire: while it is armed, a codex entry's windows
+/// carry `usedPercent` 0 with the provider's actual figure moved into
+/// `rawUsedPercent`. An unarmed module publishes the real figure in
+/// `usedPercent` and omits `rawUsedPercent` entirely.
 const QUOTA_CONFIG_RELATIVE_PATH: &str = "cortexkit/ck-quota.jsonc";
 
 #[tokio::main]
