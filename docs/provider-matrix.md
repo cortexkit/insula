@@ -135,6 +135,16 @@ nothing.** Both publish no extra window and neither degrades the entry. The
 upstream diff is what surfaced it, which argues for reading parity rounds for
 credential and gating changes, not only for window-mapping drift.
 
+At v0.48.1 nothing was portable, and the round is recorded because a null is
+only worth anything when the search behind it is stated. The release is a CLI
+dashboard and web-UI feature — serve command, HTML, snapshot payloads, and their
+tests. Two files under `CodexBarCore` are touched, both replacing `Bundle.module`
+with a resource lookup that also resolves inside an `.app`, so plugin JavaScript
+loads when the CLI runs from the app bundle. No provider fetcher, no credential
+handling, no window mapping, and no gating changed: reading the whole delta for
+credential and gating drift, rather than window mapping alone, returned those two
+resource lines and nothing else.
+
 Declined at v0.48.0: the bulk of a 758-file release is a settings-storage
 refactor (`settings[providerConfig:field:]`) touching ~30 provider files by two
 to four lines each, plus a logging-category rename, neither with any wire
