@@ -1492,17 +1492,27 @@ after restoring, confirm the file is byte-identical to the original, because a
 partially reverted mutation is a silent behaviour change wearing a clean
 `git status`.
 
-**Restore from the index, not from a copy.** `git checkout -- <path>` cannot be
-stale; a snapshot taken into a scratch directory can, and restoring from one
-taken before an earlier round of work silently reverts everything since —
-including committed work, leaving a clean tree, a green suite, and a file an hour
-behind. This is a live hazard rather than a hypothetical: of the snapshots left
-over from one day's mutation rounds here, several had been overtaken by later
-commits to the same file, and restoring any of them would have reverted between
-four and ninety lines. The byte-identical check above catches a *partial* revert
-against the snapshot; it cannot catch a *complete* revert to the wrong version,
-because the file then matches its snapshot exactly. Only the index knows what
-the file is supposed to be.
+**Stage or commit before mutating, then restore from the index.** The reference
+copy has to be made authoritative *before* the edit, and both ways of skipping
+that step fail silently in opposite directions.
+
+A snapshot taken into a scratch directory goes **stale**: restoring one taken
+before an earlier round reverts everything since, including committed work,
+leaving a clean tree and a green suite. Of the snapshots left over from one day's
+mutation rounds here, several had been overtaken by later commits to the same
+file, and restoring any of them would have reverted between four and ninety
+lines. The byte-identical check above catches a *partial* revert against the
+snapshot and cannot catch a *complete* revert to the wrong version, because the
+file then matches its snapshot exactly.
+
+Restoring from the index instead is stale-proof and discards **uncommitted
+work**: mutating a rule to prove a test you have just written, then running
+`git checkout -- <path>`, deletes that test, because the index holds the version
+from before it existed. The suite goes green again and looks like a successful
+restore.
+
+Staging first closes both. The index then holds exactly the state the restore
+should return, rather than a copy that is merely old or merely clean.
 
 The same doubt applies to a **control that has never fired**. The live checkers
 in `examples/` have reported `findings: none` on every run they have ever made,
