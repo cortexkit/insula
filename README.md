@@ -27,6 +27,7 @@ Current, and kept true against the code:
 | `deploying.md` | how to replace a running build, and how to verify which one is live |
 | `provider-matrix.md` | per-provider auth archetype, endpoint, and verification status |
 | `codex-banked-resets-design.md` | how the one mutating feature is fenced against double-spend |
+| `cross-platform-design.md` | what Windows and Linux parity requires, and where it is not achievable |
 
 Written before the code and kept for the reasoning, **not** as descriptions of
 what is there — each carries a list of the details that shipped differently:
