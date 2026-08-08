@@ -1,4 +1,4 @@
-# ai-provider-quota
+# insula
 
 A subc-supervised module that knows every AI provider's usage limits and reset
 windows — the headless engine that replaces the external **CodexBar** dependency.
@@ -148,7 +148,7 @@ entry pointing `program` at the built binary — see `examples/subc.jsonc`:
 {
   "version": 1,
   "modules": {
-    "ai-provider-quota": {
+    "insula": {
       "program": "/abs/path/to/target/release/ck-insula"
     }
   }

@@ -74,7 +74,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_ID = "ai-provider-quota"
+# The id this module is currently served under. It is only the default for the
+# --id flag: the script's job is finding who names a given string, so pointing it
+# at a superseded id is a legitimate use -- that is how you find callers left
+# behind by a rename.
+DEFAULT_ID = "insula"
 
 
 def self_repo() -> str:

@@ -20,10 +20,10 @@ cp ~/.local/share/cortexkit/bin/ck-insula ~/.local/share/cortexkit/bin/ck-insula
 cp target/release/ck-insula ~/.local/share/cortexkit/bin/ck-insula
 
 # 3. restart under supervision
-ck module restart ai-provider-quota
+ck module restart insula
 
 # 4. verify the running build is the one you just installed
-ck module status ai-provider-quota --json    # health.metrics.buildCommit
+ck module status insula --json    # health.metrics.buildCommit
 git rev-parse --short=12 HEAD                # must match
 
 # 5. confirm every configured credential is actually being served
@@ -33,11 +33,12 @@ cargo run -p quota-module --example vault-lanes
 cargo run -p quota-module --example deployed-sanity
 ```
 
-The binary is `ck-insula` and the module id is `ai-provider-quota`. They differ
-because the repository was renamed and the module id was deliberately left
-alone: every other repository that calls this module names it by that id, and
-such a reference does not block a rename — it breaks when one lands. So the
-restart and status commands keep the old spelling while the artifact does not.
+The binary, the module id and this repository are all `insula` — but three paths
+on disk are still named `ck-quota` and are **not** leftovers: the redemption
+journal, the quota config, and the vault handle file. Each comes from its own
+hardcoded literal, none is derived from the binary or the module id, and each is
+load-bearing. Renaming any of them is a migration, not a tidy: see the note in
+`crates/quota-module/Cargo.toml` for what the journal one costs.
 
 Step 5 exists because steps 4 and 6 cannot see an absent lane. Both check that
 what is published is self-consistent, and a set that shrinks stays consistent —
@@ -69,7 +70,7 @@ like a supervised module restarting, it stayed down unnoticed. The daemon's
 drain-restart path stops and starts it as a unit; killing it only performs the
 first half and relies on the daemon choosing to do the second.
 
-`ck module status ai-provider-quota` shows the supervision state. If the entry
+`ck module status insula` shows the supervision state. If the entry
 is missing entirely, the daemon has not read the config that declares it — `ck
 module rescan` re-reads `subc.jsonc`.
 
@@ -125,7 +126,7 @@ second pointless deploy.
 The reply dates itself, so this is checkable rather than a matter of waiting:
 
 ```sh
-ck module status ai-provider-quota --json    # module.last_probe_ms, epoch ms
+ck module status insula --json    # module.last_probe_ms, epoch ms
 ```
 
 If that timestamp predates the restart, the health block beside it describes the
@@ -226,14 +227,45 @@ not.
 
 ## Renaming the module id
 
-The subc module id is `ai-provider-quota`, and every other repository that calls
-this module names it by that id in a constant. Those are *target* references:
-they do not block a rename, they break when one lands. So callers ship **with**
-the change, and a caller missed is a dead quota route.
+The subc module id is `insula`, and every other repository that calls this module
+names it by that id in a constant. Those are *target* references: they do not
+block a rename, they break when one lands. So callers ship **with** the change,
+and a caller missed is a dead quota route.
 
 Inside this repository the id has one definition, in
 `crates/quota-module/src/ids.rs`, which the integration tests include by path
 rather than restating. The local edit is a single line.
+
+**The running process does not read that constant.** The daemon injects
+`SUBC_MODULE_ID` when it spawns a module and that wins, so the id a supervised
+process announces comes from the daemon's config, not from this binary. Two
+consequences, and the second is the one that bites:
+
+- A daemon-side rename needs **no rebuild and no new binary**. Verify which id a
+  live process is actually using with `ps eww <pid> | grep SUBC_MODULE_ID`
+  rather than reading it out of the source.
+- The constant should **follow** that flip, never lead it, so the fallback cannot
+  disagree with a live config if the flip is delayed.
+
+And the flip is a **restart**, even though it needs no rebuild: the daemon
+respawns the module rather than editing a running process's environment. Compare
+the pid before and after to see it. That matters because the banked-resets config
+is read once at startup (see `Registry::with_defaults`), so a restart is exactly
+when it can silently stop being read — an unreadable config leaves the feature
+off and the module healthy. Check it from the wire afterwards, per the step-5
+note above.
+
+### The checkers go dark during the window
+
+`vault-lanes` and `deployed-sanity` dial this same constant to reach the daemon,
+so between a daemon-side flip and this constant catching up, both fail with
+`module <old id> did not appear in catalog` and exit 101. They are not only
+defined by this id, they are *addressed* by it.
+
+That is the acceptance check going down with the thing it checks. Survivable
+because `ck module status <id>` and the daemon's own catalog answer the same
+questions by an independent route — use those during the window, and treat the
+examples as available again only once the constant matches.
 
 What the suite can and cannot tell you about that line:
 

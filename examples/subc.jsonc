@@ -1,4 +1,4 @@
-// Example subc daemon config entry for the ai-provider-quota module.
+// Example subc daemon config entry for the insula module.
 //
 // Install: merge this `modules` entry into your real subc config at
 //   $XDG_CONFIG_HOME/cortexkit/subc.jsonc   (default: ~/.config/cortexkit/subc.jsonc)
@@ -7,7 +7,7 @@
 // supervises it.
 //
 // The daemon appends `--subc <connection-file>` and injects the SUBC_MODULE_ID env
-// var itself — do NOT add those to args/env here. The map KEY ("ai-provider-quota")
+// var itself — do NOT add those to args/env here. The map KEY ("insula")
 // is the module id the daemon registers it under.
 //
 // The key and the binary deliberately differ. The repository and its binary were
@@ -18,7 +18,7 @@
 {
   "version": 1,
   "modules": {
-    "ai-provider-quota": {
+    "insula": {
       "program": "/abs/path/to/insula/target/release/ck-insula",
       "args": [],
       "env": {},

@@ -78,7 +78,7 @@ and parallelizable — once the pattern is proven for one provider, the rest fan
 
 ## Multi-repo coordination (3 repos, you drive the quota one)
 
-- **this repo (`ai-provider-quota`)** — the Rust subc module + the per-provider usage fetchers. YOU own it.
+- **this repo (`insula`)** — the Rust subc module + the per-provider usage fetchers. YOU own it.
 - **`subconscious`** (Alfonso @ subc) — provides `@cortexkit/subc-client` (TS). Coordinate the
   client API + the module's subc contract (route op, request/response shape) with your driver.
 - **`alfonso`** (Alfonso @ alf) — repoints `codexbar-quota-source.ts` from HTTP to the subc-client.
