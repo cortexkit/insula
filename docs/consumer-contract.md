@@ -17,7 +17,7 @@ Response assembly is `crates/quota-module/src/main.rs`, array construction is
 `Registry::get_usage` in `crates/quota-core/src/lib.rs`, and the entry type
 comes from the published `cortexkit-provider-usage` crate.
 
-## The five response shapes
+## The six response shapes
 
 | shape | meaning | consumer action |
 |---|---|---|
@@ -25,7 +25,8 @@ comes from the published `cortexkit-provider-usage` crate.
 | entries, all degraded | reached every credential path, none usable | price as known-bad, not as no-signal |
 | empty array | no capacity information at all | see below — this is *not* "nothing configured" |
 | malformed body | not producible on the success path | transport corruption; report it |
-| error frame | the only unavailable-poll case | retry per your own policy |
+| error frame | this module answered and refused | retry per your own policy |
+| no answer at all | the daemon refused before reaching this module | see below — carries **no** information about capacity |
 
 Results publish incrementally as each provider completes, so a partial array is
 normal rather than a symptom. A provider missing from one poll and present in
@@ -49,6 +50,37 @@ is exactly the data worth waiting for.
 `pending` is the signal that resolves it: it held at 4 for the whole plateau and
 dropped to 0 as the last entries landed. Read it before concluding an array is
 complete, and never infer completeness from the count being stable across polls.
+
+## A refused call is not a poll at all
+
+A call can fail before this module sees it. If the daemon has no module
+registered under the id being dialled, `route.open` fails with `unknown_module`
+and nothing is ever delivered here.
+
+This is a third thing, distinct from both entries and error frames, and the
+distinction is load-bearing:
+
+- a **degraded entry** is a verdict — this module reached a credential path and
+  concluded it was unusable,
+- an **absent entry** is unfinished — the sweep has not got there yet,
+- a **refused call** is neither. No verdict was reached and no work is pending,
+  because the request did not arrive. Nothing appears in this module's wire
+  output, its health metrics, or its logs, and `health.check` reads perfectly
+  normal throughout: the module is running and serving, just under a name the
+  caller is not using.
+
+**It carries no information about capacity.** Retain what you last knew and
+retry; do not age, degrade, or prune anything on the strength of it. In
+particular it authorises nothing about account sets — `completeProviders` cannot
+arrive on a call that was refused, so a consumer that prunes accounts absent from
+a response must not run that path here. Handle it at transport level, before any
+body-shaped interpretation.
+
+The realistic cause is a name that changed on one side only — a module rename
+lands in the daemon while a consumer's target constant still says the old id.
+That window is short and self-inflicted, but during it the producer looks healthy
+from every angle and the consumer sees a feed that has silently stopped
+answering.
 
 ## An empty array is not "nothing configured"
 
