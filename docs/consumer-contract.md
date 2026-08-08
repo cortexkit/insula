@@ -428,6 +428,35 @@ So for "how much headroom does this account have", take the **maximum**
 whatever policy you want deliberately. Do not let slot position stand in for a
 judgement about which limit binds.
 
+### A maximum over an incomplete set is biased downward
+
+That reduction has a property worth stating, because it is the direction that
+costs you: **a window missing from the set can only lower the answer.** Taking a
+maximum over what arrived reports more headroom than the account has, and the
+result looks exactly like a genuine reading — there is no ragged edge, no null,
+nothing to notice.
+
+So the question that matters is what an absent window *means*, and there are two
+kinds:
+
+- **Not reported by the upstream.** Ordinary, described above: the account has no
+  such limit, or the provider does not expose it. Nothing is lost.
+- **Reported but unusable.** A window whose percent cannot be represented is
+  dropped by this module rather than published, because a non-finite number
+  serializes as `null` and would fail a typed decode of the whole array.
+
+Those are indistinguishable on the wire, and the second is the one that biases
+your reading. It is unreachable today — it requires an unguarded division
+upstream of the drop — which is why no field marks it rather than the case being
+impossible.
+
+The same reasoning applies to your own decoder, and is the more likely source:
+if it discards a window it cannot parse, it has converted *unreadable* into
+*absent* and will report a smaller number with full confidence. Prefer marking a
+reading as assembled from an incomplete set over silently narrowing it — the
+figures shown stay true, and the marker is what keeps a partial answer honest
+rather than merely lower.
+
 The slots are also not stable across providers. One provider's `primary` may be
 a five-hour window and another's a monthly one, so `primary` is not comparable
 between providers. Read `windowMinutes` — the window's length — when the cadence

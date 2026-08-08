@@ -66,6 +66,20 @@ pub fn windows(usage: &Usage) -> impl Iterator<Item = &RateWindow> {
 /// correct decision per site and this is one decision for all of them, and
 /// because the cost of a single missed guard is not a wrong number but a
 /// response no typed consumer can read.
+///
+/// KNOWN CONSEQUENCE, and the reason this is not simply free: a dropped window
+/// is indistinguishable on the wire from a window that never existed. Consumers
+/// commonly reduce an account to its *most constrained* window, so a silently
+/// dropped one biases that reading DOWNWARD -- an account is reported as having
+/// more headroom than it has, which is the expensive direction.
+///
+/// Nothing here can currently reach that state, since a non-finite percent needs
+/// a missed denominator guard upstream. The alternative -- an additional wire
+/// field marking the entry as assembled from an incomplete window set -- is a
+/// change to a published shared type with several consumers, and adding a field
+/// that no provider can populate today would be a signal that is almost always
+/// absent. Documented for consumers in `docs/consumer-contract.md` instead, and
+/// worth building the moment this path becomes reachable.
 pub fn drop_uncomputable_windows(entries: &mut [ProviderUsage]) {
     for entry in entries {
         let Some(usage) = entry.usage.as_mut() else {
