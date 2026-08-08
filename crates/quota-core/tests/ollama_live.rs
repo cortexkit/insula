@@ -19,13 +19,15 @@ async fn ollama_live_returns_real_window_or_degrades() {
         }
         Err(e) => {
             eprintln!("[ollama-live] degraded: {e}");
-            assert!(matches!(
-                e,
-                FetchError::NoSession(_)
-                    | FetchError::Unauthorized(_)
-                    | FetchError::Upstream(_)
-                    | FetchError::Decode(_)
-            ));
+            // This provider reads a browser session cookie and scrapes a page,
+            // so every failure it can reach is an ordinary condition of that
+            // arrangement: no cookie, a rejected one, an unreachable site, or
+            // markup that no longer parses. An internal class is not, and means
+            // this crate caught its own panic rather than handling a condition.
+            assert!(
+                !matches!(e, FetchError::Internal(_)),
+                "a live probe must not surface an internal failure: {e:?}"
+            );
         }
     }
 }

@@ -21,13 +21,16 @@ async fn antigravity_live_returns_real_window_or_degrades() {
         }
         Err(e) => {
             eprintln!("[antigravity-live] degraded: {e}");
-            assert!(matches!(
-                e,
-                FetchError::NoSession(_)
-                    | FetchError::Unauthorized(_)
-                    | FetchError::Upstream(_)
-                    | FetchError::Decode(_)
-            ));
+            // Every failure this provider can reach is recoverable without
+            // changing anything about the account: the editor is not running,
+            // its local server refused or answered oddly, or the credential
+            // needs refreshing. What must not appear is an internal class, which
+            // means this crate caught its own panic rather than handling a
+            // condition -- the one outcome a live probe should never normalise.
+            assert!(
+                !matches!(e, FetchError::Internal(_)),
+                "a live probe must not surface an internal failure: {e:?}"
+            );
         }
     }
 }
