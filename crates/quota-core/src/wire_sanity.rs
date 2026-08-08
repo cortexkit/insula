@@ -758,6 +758,56 @@ mod tests {
         }
     }
 
+    /// `rawUsedPercent` needs its own bound, and its own test.
+    ///
+    /// It is a separate field with a separate source: where `usedPercent` can be
+    /// zeroed by the read-time relaxation, this carries the figure the provider
+    /// actually reported, so a consumer showing a user their real standing reads
+    /// this one. A rule guarding the neighbouring field says nothing about it.
+    ///
+    /// The bad value is paired with an in-range `usedPercent` so the finding has
+    /// exactly one cause: a fixture with both out of range would pass while this
+    /// rule did nothing.
+    #[test]
+    fn an_out_of_range_raw_percent_is_reported_at_both_ends() {
+        for bad in [-1.0, 101.0, f64::NAN] {
+            let mut w = window(40.0);
+            w.raw_used_percent = Some(bad);
+
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+            assert_eq!(
+                report.findings,
+                vec![format!(
+                    "codex/acct/primary: rawUsedPercent out of range: {bad}"
+                )],
+                "{bad} accepted"
+            );
+        }
+    }
+
+    /// The paired silent case, carrying a HEALTHY `rawUsedPercent`.
+    ///
+    /// Without a healthy instance of the field the rule inspects, an over-wide
+    /// version -- one firing whenever the field is present at all -- passes
+    /// every other test in this file, since no other fixture sets it.
+    ///
+    /// The value is deliberately not equal to `usedPercent`: this field exists
+    /// precisely because the two differ when a relaxation is in effect, and a
+    /// fixture where they agree would also pass a rule that compared them.
+    #[test]
+    fn a_raw_percent_inside_the_range_is_not_reported() {
+        let mut w = window(0.0);
+        w.raw_used_percent = Some(58.0);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        // Not vacuous: the window really was examined, so the silence is the
+        // rule declining to fire rather than the sweep skipping it.
+        assert_eq!(report.windows_checked, 1);
+    }
+
     #[test]
     fn counts_disagreeing_with_the_percent_are_reported() {
         let mut w = window(40.0);

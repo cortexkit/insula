@@ -1371,6 +1371,24 @@ broken detector reports the whole population. Then prove the detector can be
 satisfied at all: run it against an input where the thing genuinely is present,
 or against a commit from before the fix that introduced it.
 
+### Why a check ends up narrower than what it checks
+
+The failures below are all one shape: **a verification scoped to the example
+rather than to the rule**. It runs, produces a value, and answers a question
+adjacent to the one asked — which is why it reads as evidence.
+
+The cause is worth stating because it defeats care. A check is written by
+whoever best understands the thing being checked, at the moment of understanding
+it, immediately after solving the specific case in front of them. So its scope
+inherits the shape of that case. Being careful produces the narrow version,
+because the narrow version is exactly what the example makes salient.
+
+That is why the audit has to be a **separate pass, later**, asking one question
+of each check: *what shape does this inspect, and does its control contain a
+healthy instance of that shape?* Doing it in the moment does not work, and
+passing the audit is the only way to distinguish a control that holds by design
+from one that holds by luck — both look identical until something mutates them.
+
 ### A rule test needs three properties, not one
 
 A test for one rule of a multi-rule checker passes for the reason in its name
