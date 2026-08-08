@@ -36,4 +36,15 @@ pub const CREDENTIALS_MODULE_ID: &str = "claustrum";
 /// register and address this module, and a second copy of it would drift the
 /// moment this module is renamed — leaving the suite exercising an id nothing
 /// uses, which passes.
-pub const DEFAULT_MODULE_ID: &str = "ai-provider-quota";
+///
+/// IT IS A FALLBACK, NOT THE IDENTITY. The daemon injects `SUBC_MODULE_ID` when
+/// it spawns this module, and that wins (see `ModuleConfig::from_env`), so under
+/// supervision the daemon's config decides the name and this value is never
+/// read. It is what the module announces when something spawns it directly — a
+/// developer run, or a supervisor that does not set the variable.
+///
+/// The consequence worth knowing before a rename: the daemon's config can be
+/// renamed without rebuilding this binary, because the running process takes its
+/// id from the environment. This constant should follow that flip rather than
+/// lead it, so the fallback never disagrees with a live config.
+pub const DEFAULT_MODULE_ID: &str = "insula";
