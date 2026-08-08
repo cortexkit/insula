@@ -129,6 +129,15 @@ const MAX_WIRE_STRING_BYTES: usize = 512;
 /// Truncation is announced rather than silent, for the same reason the error
 /// text is: a value cut without saying so reads as a complete one, and an
 /// identifier that quietly loses its tail can collide with a sibling.
+///
+/// Announcing the cut is only sufficient because every field bounded here is
+/// PROSE OR AN IDENTIFIER. A truncated number would still be a valid number --
+/// `36` cut to `3` is a plausible reading, not a visibly damaged one -- so a
+/// marker elsewhere in the string would not protect it. The numeric fields on
+/// this wire are typed rather than stringly, so they cannot reach this function
+/// at all; that is what closes the hazard, not this bound. A future field
+/// carrying a number as text would reopen it, and would need dropping whole
+/// rather than truncating.
 pub fn bound_wire_strings(entries: &mut [ProviderUsage]) {
     fn bound(value: &mut Option<String>) {
         if let Some(text) = value {
