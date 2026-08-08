@@ -35,6 +35,7 @@ lines = original.splitlines(keepends=True)
 # for every findings.push by walking back to the nearest enclosing `if`.
 push_lines = [i for i, l in enumerate(lines) if "findings.push" in l]
 guards = []
+unmatched = []
 for p in push_lines:
     for j in range(p, max(p - 12, -1), -1):
         stripped = lines[j].strip()
@@ -42,8 +43,17 @@ for p in push_lines:
             if j not in guards:
                 guards.append(j)
             break
+    else:
+        # No single-line `if` above this finding: the rule is in a match arm, or
+        # behind a guard whose condition spans several lines. Reported rather
+        # than dropped -- a finding this sweep cannot reach is the one most
+        # likely to be untested, since the same irregular shape defeats casual
+        # reading too.
+        unmatched.append(p + 1)
 
 print(f"  rules with a mutable guard: {len(guards)} (of {len(push_lines)} findings sites)")
+if unmatched:
+    print(f"  NOT REACHABLE by this sweep, check by hand: lines {unmatched}")
 print()
 
 undefended = []
@@ -61,13 +71,23 @@ for idx in guards:
         text=True,
     )
     failed = re.findall(r"^test (\S+) \.\.\. FAILED", run.stdout, re.M)
-    compiled = "error[E" not in run.stderr
+    # "Did the suite run at all" is the unambiguous question, and it has to be
+    # asked FIRST. Asking "did it compile" first means matching on error text,
+    # and cargo prints `error: test failed` for a test that built and correctly
+    # failed -- so every genuinely defended rule would be misreported as skipped.
+    # A summary line is printed only when the binary ran.
+    compiled = re.search(r"^test result:", run.stdout, re.M) is not None
 
     subprocess.run(["git", "checkout", "--", REL], cwd=REPO, check=True)
 
     label = guard.strip()[:64]
     if not compiled:
-        print(f"  line {idx + 1}: SKIPPED (mutation did not compile) {label}")
+        # The guard binds something its body uses (`if let Some(x) = …`), so
+        # replacing it with `if false` leaves that name unbound. The rule is
+        # NOT REACHED by this sweep and has to be mutated by hand -- and it is
+        # the likeliest place for a gap, since the same irregular shape that
+        # defeats this rewrite also defeats casual reading.
+        print(f"  line {idx + 1}: NOT REACHED, mutate by hand: {label}")
     elif failed:
         print(f"  line {idx + 1}: defended by {len(failed)} test(s) -> {failed[0]}")
     else:
