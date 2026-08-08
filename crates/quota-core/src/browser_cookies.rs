@@ -540,6 +540,11 @@ mod tests {
 
     /// The reuse bound has to hold in both directions, so both are asserted with
     /// violating inputs rather than only the expiry side.
+    ///
+    /// Gated with the code it covers: the snapshot cache exists only where a
+    /// cookie store can be read, so off that platform these names do not resolve
+    /// and the crate fails to compile for its own test target.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_snapshot_is_reused_until_the_bound_and_replaced_after_it() {
         let ttl = Duration::from_secs(45);
@@ -563,6 +568,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_missing_snapshot_is_stale_so_the_first_caller_takes_one() {
         assert!(snapshot_is_stale(None, Instant::now(), SNAPSHOT_TTL));
@@ -573,6 +579,7 @@ mod tests {
     /// panic in debug and, if it silently wrapped, would produce a gigantic
     /// elapsed time -- reading as PERMANENTLY fresh and pinning one stale copy
     /// forever. That failure is silent and unbounded, so it is fenced.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_apparently_backwards_clock_does_not_pin_a_stale_snapshot() {
         let now = Instant::now();
@@ -587,6 +594,7 @@ mod tests {
     /// The bound is only correct relative to the refresher's cadence: below the
     /// 60s base interval so every tick reads the store at least once, and far
     /// enough above zero to actually be shared within one tick.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_reuse_bound_stays_inside_the_refresher_base_interval() {
         assert!(
