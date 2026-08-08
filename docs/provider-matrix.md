@@ -320,7 +320,26 @@ headless USAGE FETCH endpoint (live value) → builds like any live provider; (2
 cache grows a per-key write-timestamp → staleness becomes measurable; (3) we add a
 staleness/confidence field to `ProviderUsage` that the router discounts on (ALF's-
 call model+consumer change, same shape as the balance seam) → the reset-guarded
-design above becomes shippable as-is. Note for a future build: SET
+design above becomes shippable as-is.
+
+**Condition (3) is now PARTLY met, and the gap is smaller than this section
+assumes.** `ProviderUsage` gained `fetchedAt` — a producer-stamped per-entry
+timestamp of that slot's last successful fetch — and consumers were told to age
+entries on it. So the wire can already say *when a value was true*, which is the
+half this section says is missing.
+
+What is still missing is narrower: `fetchedAt` records when **this module** read
+the source, and for a cache-backed provider that is not when the value became
+true. Reading a three-hour-old cache entry stamps a fresh `fetchedAt`, so the
+field would assert freshness this module cannot support — the deferral's own
+objection, one layer in.
+
+That makes the remaining ask concrete rather than open-ended: either the entry
+carries a second timestamp meaning *when the underlying source last updated*, or
+`fetchedAt` is documented as read-time and a separate field carries value-time.
+Worth re-deriving from the published crate before acting on this paragraph — the
+wire has gained fields twice since the deferral was written, and a deferral that
+is not re-read against the current wire outlives its reason. Note for a future build: SET
 windowMinutes=daily 1440/weekly 10080 (derivable-and-correct from the field names,
 and the consumer needs the burn-rate denominator) — confirmed not a faithfulness
 violation.
