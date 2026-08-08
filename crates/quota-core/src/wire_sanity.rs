@@ -152,6 +152,23 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
         findings.push(format!("{where_}: entry carries neither usage nor error"));
     }
 
+    // A usage object with no window in it is the same defect one level in: it
+    // reads as a successful capacity reading and carries no capacity. It is what
+    // an entry becomes when every window it had was dropped for carrying a
+    // percent that could not be published, and the result is worse than an
+    // absent entry, because a consumer reducing an account to its most
+    // constrained window silently gets a smaller answer from the accounts that
+    // survived -- or, if this was the only account, another account's standing
+    // reported as this one's.
+    //
+    // Checked here rather than trusted to the emission path: the drop and the
+    // shape rule are far apart, and the wire is where the two have to agree.
+    if entry.usage.is_some() && windows_of(entry).is_empty() {
+        findings.push(format!(
+            "{where_}: carries a usage object with no window, which reads as a reading and states nothing"
+        ));
+    }
+
     // Consumers are told to age every entry on `fetchedAt` and never on their own
     // poll time, so usage without it leaves them no honest way to decide how old
     // the reading is. Both available answers are wrong: treat it as current and a
@@ -758,6 +775,63 @@ mod tests {
         assert_eq!(report.findings, Vec::<String>::new());
         // The cross-entry checks do not need a window, so they still ran.
         assert_eq!(report.providers_compared, 1);
+    }
+
+    /// An entry can lose every window it had and still look like a reading.
+    ///
+    /// The percent is the load-bearing field, so a window carrying one that
+    /// cannot be published is dropped. Drop them all and what remains is a
+    /// `usage` object with nothing in it: not a failure, not an absence, and
+    /// indistinguishable from a successful fetch of an account with no limits.
+    ///
+    /// It has to be caught here because it is worse than an absent entry. A
+    /// consumer reducing an account to its most constrained window gets a
+    /// smaller answer from whichever accounts survived -- and if this was the
+    /// only account of its provider, another account's standing is reported as
+    /// this one's.
+    #[test]
+    fn a_usage_object_with_no_window_is_a_finding() {
+        let mut entry =
+            ProviderUsage::healthy("claude", Some("acct-A".into()), "vault", Usage::default());
+        entry.fetched_at = Some(stamped_at());
+
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(
+            report.findings,
+            vec![
+                "claude/acct-A: carries a usage object with no window, which reads as a reading and states nothing"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The paired must-not-fire case: the two shapes that legitimately carry no
+    /// window must stay silent, or the rule above becomes noise and is ignored.
+    ///
+    /// A degraded entry has no `usage` at all -- it states a failure instead --
+    /// and an entry with a real window is the ordinary case.
+    #[test]
+    fn an_entry_that_states_a_failure_or_carries_a_window_is_not_a_finding() {
+        let degraded = ProviderUsage::degraded("codex", "no session: not configured");
+
+        let mut healthy = ProviderUsage::healthy(
+            "claude",
+            Some("acct-B".into()),
+            "vault",
+            Usage {
+                primary: Some(window(10.0)),
+                ..Usage::default()
+            },
+        );
+        healthy.fetched_at = Some(stamped_at());
+
+        let report = check_entries(&[degraded, healthy], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        // Not vacuous: the healthy entry really was examined, so the silence is
+        // the rule declining to fire rather than the sweep skipping the array.
+        assert_eq!(report.windows_checked, 1);
     }
 
     fn labelled(provider: &str, account: &str) -> ProviderUsage {
