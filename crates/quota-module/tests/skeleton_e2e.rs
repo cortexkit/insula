@@ -414,17 +414,33 @@ fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
         .get_envs()
         .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
         .collect();
+
+    // Expectations are built with the same path joining the code under test
+    // uses, rather than written as literal strings. The property being checked
+    // is that each variable points inside the rig -- a real credential must not
+    // be reachable from a test process -- and the separator it is spelled with
+    // is the platform's business. A literal picks one platform's separator and
+    // fails everywhere else for a reason unrelated to isolation.
+    let expect = |name: &str| {
+        temp_dir
+            .join(name)
+            .to_str()
+            .expect("the rig path is valid UTF-8")
+            .to_owned()
+    };
+
     assert_eq!(
-        env.get("XDG_CONFIG_HOME"),
-        Some(&"/isolated-test-rig/quota-config")
+        env.get("XDG_CONFIG_HOME").map(|value| value.to_string()),
+        Some(expect("quota-config"))
     );
     assert_eq!(
-        env.get("CK_QUOTA_STATE_DIR"),
-        Some(&"/isolated-test-rig/quota-state")
+        env.get("CK_QUOTA_STATE_DIR").map(|value| value.to_string()),
+        Some(expect("quota-state"))
     );
     assert_eq!(
-        env.get("CK_QUOTA_VAULT_HANDLES_PATH"),
-        Some(&"/isolated-test-rig/absent-vault-handles.json")
+        env.get("CK_QUOTA_VAULT_HANDLES_PATH")
+            .map(|value| value.to_string()),
+        Some(expect("absent-vault-handles.json"))
     );
 }
 
