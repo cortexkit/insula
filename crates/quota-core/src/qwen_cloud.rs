@@ -536,6 +536,75 @@ mod tests {
         assert_eq!(secondary.window_minutes, Some(10_080));
     }
 
+    /// Captured from the live endpoint on 2026-08-08, after an upstream change:
+    /// the five-hour window stopped being reported and only the weekly one
+    /// remains, while the envelope `code` arrives as the string "200" rather
+    /// than a number.
+    ///
+    /// Both halves must stay non-fatal. A window this API stops reporting is not
+    /// an error — the account still has a real weekly figure, and refusing the
+    /// whole payload would take a live provider dark over a window that no longer
+    /// exists. And the absent window must be absent, never a zero: a consumer
+    /// cannot distinguish a fabricated 0% from genuinely unused capacity, so it
+    /// would read a silently-dropped window as full headroom.
+    const DRIFTED_WEEKLY_ONLY_RESPONSE: &str = r#"{
+      "code": "200",
+      "data": {
+        "DataV2": {
+          "ret": ["SUCCESS::接口调用成功"],
+          "data": {
+            "msg": "Success.",
+            "code": "SUCCESS",
+            "data": { "per1WeekPercentage": 0.3 },
+            "requestId": "test-fixture-request-id",
+            "success": true
+          }
+        },
+        "success": true,
+        "httpStatus": 200,
+        "errorCode": "",
+        "api": "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+        "errorMsg": ""
+      },
+      "httpStatusCode": "200",
+      "requestId": "test-fixture-request-id",
+      "successResponse": true
+    }"#;
+
+    #[test]
+    fn weekly_only_response_keeps_the_window_it_still_reports() {
+        let usage = normalize_usage(DRIFTED_WEEKLY_ONLY_RESPONSE.as_bytes())
+            .expect("a payload reporting one window is a usable answer, not an error");
+
+        let secondary = usage
+            .secondary
+            .expect("the weekly window is still reported");
+        assert_eq!(secondary.used_percent, 30.0);
+        assert_eq!(secondary.window_minutes, Some(10_080));
+        assert_eq!(secondary.resets_at, None);
+
+        assert!(
+            usage.primary.is_none(),
+            "an unreported window must be absent, never a fabricated zero: a \
+             consumer reads 0% as full headroom"
+        );
+    }
+
+    #[test]
+    fn a_payload_reporting_no_window_at_all_is_an_error() {
+        // The boundary beside the test above. One window missing is a narrower
+        // answer; every window missing means nothing usable was delivered, and
+        // publishing that as an empty success would read as an account with no
+        // limits rather than as a failure to learn anything.
+        let mut body: serde_json::Value =
+            serde_json::from_str(DRIFTED_WEEKLY_ONLY_RESPONSE).unwrap();
+        body["data"]["DataV2"]["data"]["data"] = serde_json::json!({});
+        assert!(matches!(
+            normalize_usage(body.to_string().as_bytes()),
+            Err(FetchError::Decode(_))
+        ));
+    }
+
     #[test]
     fn epoch_milliseconds_convert_to_utc() {
         assert_eq!(
