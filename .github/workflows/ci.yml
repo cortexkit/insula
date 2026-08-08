@@ -31,9 +31,13 @@ jobs:
   # Linux-only. Unlike llm-runner there is no cfg(windows) code to exercise: the only
   # platform-specific paths are the macOS cookie/antigravity probes, which carry
   # cfg(not(target_os = "macos")) stubs — so the Linux leg compiles and covers the
-  # non-macOS path. macOS stays the development platform (local cargo test + clippy);
-  # the live + real-daemon tests are #[ignore] (need real creds, the macOS desktop
-  # state, or the sibling subc-core daemon) and are intentionally not CI-run.
+  # non-macOS path. macOS stays the development platform (local cargo test + clippy).
+  #
+  # The #[ignore] tests split into two groups for two different reasons, and only
+  # one of them is a CI limit. The live provider proofs need real credentials and
+  # macOS desktop state, so they cannot run here. real_daemon_e2e needs only the
+  # sibling daemon, which this job already checks out and already compiles since
+  # subc-core is a dev-dep, so it runs in its own step below.
   #
   # Runners are Blacksmith, not GitHub-hosted: these repos are owned by a free-plan
   # organization where GitHub bills private-repo Actions minutes and blocks jobs once
@@ -93,11 +97,32 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Runs the 153 quota-core unit tests + the in-process skeleton_e2e CI test
-      # (skeleton_round_trips_usage_get_over_the_wire). The live real-window proofs and
-      # real_daemon_e2e are #[ignore] and excluded here by design.
+      # Runs the quota-core unit tests + the in-process skeleton_e2e CI test
+      # (skeleton_round_trips_usage_get_over_the_wire). The #[ignore] tests do not
+      # run in this step; the daemon one runs in its own step below.
       - name: Test
         run: cargo test --workspace --all-targets
+
+      # The only test where the subc module id must round-trip through daemon
+      # config, process launch and a routed call: a real ck-subc binary reads a
+      # generated subc.jsonc, spawns this module from it, and serves usage.get
+      # back over the route channel.
+      #
+      # Nothing else covers that. The unit tests read the module id from the same
+      # definition on both sides, so they pass for any value of it, including a
+      # wrong one. Supervision is what a rename breaks, and it breaks silently: a
+      # module registered under an id nobody dials is not an error, it is a module
+      # nobody calls.
+      #
+      # It needs no credentials. HOME is redirected to an empty directory so the
+      # result cannot depend on what this runner happens to have: the assertion is
+      # that supervision and routing work, and a registry of degraded entries
+      # proves that as well as a healthy one would.
+      - name: Real daemon supervision
+        run: |
+          rig="$(mktemp -d)"
+          HOME="$rig" XDG_CONFIG_HOME="$rig/config" CK_QUOTA_STATE_DIR="$rig/state" \
+            cargo test -p quota-module --test real_daemon_e2e -- --ignored
 
       # `--all-targets` above COMPILES the examples but never RUNS them, so an
       # example's own assertions are unexecuted by every other step here.
