@@ -169,6 +169,36 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
         ));
     }
 
+    // The same defect one level further in, and it survives the check above
+    // whenever a sibling window remains. An extra window is a NAMED pool, and
+    // dropping only its percent leaves the name published with nothing behind
+    // it -- a consumer keying on that id finds an entry and no capacity, which
+    // reads as a pool that exists and is unmeasured rather than one whose figure
+    // could not be published.
+    //
+    // It matters most where the extras ARE the account's real limits: some
+    // providers publish pooled windows there and leave the slots for a headline,
+    // so an emptied extra is a whole pool silently absent from anything summing
+    // them.
+    for extra in entry
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.extra_rate_windows.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        if extra.window.is_none() {
+            let named = extra
+                .id
+                .as_deref()
+                .or(extra.title.as_deref())
+                .unwrap_or("unnamed");
+            findings.push(format!(
+                "{where_}: extra window {named:?} is published with no window behind it"
+            ));
+        }
+    }
+
     // Consumers are told to age every entry on `fetchedAt` and never on their own
     // poll time, so usage without it leaves them no honest way to decide how old
     // the reading is. Both available answers are wrong: treat it as current and a
@@ -806,6 +836,47 @@ mod tests {
         );
     }
 
+    /// An extra window whose percent was dropped leaves its NAME published with
+    /// nothing behind it.
+    ///
+    /// This survives the empty-usage rule whenever a sibling window remains, so
+    /// it needs its own check. The consequence is worse than a missing entry: a
+    /// consumer keying on that id finds a pool that exists and is unmeasured,
+    /// rather than one whose figure could not be published — and for the
+    /// providers whose real limits live in extras rather than slots, it is a
+    /// whole pool silently absent from anything summing them.
+    #[test]
+    fn an_extra_window_with_nothing_behind_it_is_a_finding() {
+        let mut entry = ProviderUsage::healthy(
+            "antigravity",
+            Some("acct-A".into()),
+            "vault",
+            Usage {
+                primary: Some(window(10.0)),
+                extra_rate_windows: Some(vec![ExtraWindow {
+                    id: Some("claude-and-gpt-weekly".into()),
+                    title: Some("Claude and GPT models".into()),
+                    window: None,
+                }]),
+                ..Usage::default()
+            },
+        );
+        entry.fetched_at = Some(stamped_at());
+
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(
+            report.findings,
+            vec![
+                "antigravity/acct-A: extra window \"claude-and-gpt-weekly\" is published with no window behind it"
+                    .to_string()
+            ]
+        );
+        // Not vacuous: the sibling slot really is intact, so the entry passed the
+        // empty-usage rule and this finding came from the extras check alone.
+        assert_eq!(report.windows_checked, 1);
+    }
+
     /// The paired must-not-fire case: the two shapes that legitimately carry no
     /// window must stay silent, or the rule above becomes noise and is ignored.
     ///
@@ -821,6 +892,16 @@ mod tests {
             "vault",
             Usage {
                 primary: Some(window(10.0)),
+                // An intact extra window, because the extras rule is the one
+                // most easily written too wide: a version firing on every extra
+                // rather than only on an empty one passes every test that has no
+                // healthy extra in it, and is caught by nothing until it floods
+                // a live run.
+                extra_rate_windows: Some(vec![ExtraWindow {
+                    id: Some("gemini-weekly".into()),
+                    title: Some("Gemini Models".into()),
+                    window: Some(window(22.0)),
+                }]),
                 ..Usage::default()
             },
         );
@@ -829,9 +910,10 @@ mod tests {
         let report = check_entries(&[degraded, healthy], at("2026-07-28T10:00:00Z"));
 
         assert_eq!(report.findings, Vec::<String>::new());
-        // Not vacuous: the healthy entry really was examined, so the silence is
-        // the rule declining to fire rather than the sweep skipping the array.
-        assert_eq!(report.windows_checked, 1);
+        // Not vacuous: both the slot and the extra were really examined, so the
+        // silence is the rules declining to fire rather than the sweep skipping
+        // the array.
+        assert_eq!(report.windows_checked, 2);
     }
 
     fn labelled(provider: &str, account: &str) -> ProviderUsage {
