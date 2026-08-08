@@ -16,12 +16,13 @@ part fails when it cannot work.
 | path-resolution sites in `quota-core` + `quota-module` | 19 |
 | of those with any Windows branch | 0 |
 | providers compiled out off macOS | 9 (the cookie cohort) |
-| `quota-core` builds for `x86_64-pc-windows-msvc` | no — see below |
+| `quota-core` has ever been compiled for Windows | no |
 
-The build failure today is in a dependency's C build (`ring`) rather than in our
-own code, which means **no part of this crate has ever been compiled for
-Windows**. The first deliverable is a Windows build at all; every other item
-here is unverifiable until that exists.
+Nothing here has been compiled for Windows, so the first deliverable is a build
+at all — every other item is unverifiable until one exists. It has to be a
+*native* build: cross-compiling from macOS fails in a dependency's C build for
+lack of MSVC headers, while a sibling repository pinning the same dependency
+version builds it cleanly on a native Windows runner.
 
 ## The rule that decides every path question
 
@@ -218,11 +219,15 @@ to every platform's decrypt path.
 ## Ordering: what blocks what
 
 Two items gate everything else and are scheduled first rather than discovered
-later.
+later. Neither is hard; both are silent if skipped.
 
-1. **The `ring` C-build failure on `x86_64-pc-windows-msvc`.** No Windows
-   artifact exists at all until this is resolved, so every Windows item below is
-   blocked on it. Resolve or replace the dependency before anything else.
+1. **A Windows build.** Cross-compiling to `x86_64-pc-windows-msvc` from macOS
+   fails in a dependency's C build (`ring`, missing `assert.h` — no MSVC
+   headers on a Mac). That is a property of *cross*-compiling, not of the
+   dependency: a sibling repository in this fleet pins the same `ring` version
+   and its native Windows CI leg is green. So the answer is to build natively in
+   CI rather than to change the dependency, and "no local Windows check" is a
+   constraint on the developer loop rather than a blocker on the work.
 2. **`$HOME` is normally unset on Windows.** All 19 existing sites read it. If
    the helper does not resolve `%USERPROFILE%` (with `HOMEDRIVE`/`HOMEPATH` as
    fallback), every third-party resolver returns `None` and the module reports
