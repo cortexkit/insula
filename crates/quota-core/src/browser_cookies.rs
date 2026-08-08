@@ -41,6 +41,10 @@ pub const SOURCE_LABEL: &str = "cookie";
 
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 /// Why cookie extraction could not produce a session cookie. All variants are
 /// "no usable cookie" outcomes the caller folds into a degraded entry.
@@ -148,12 +152,101 @@ pub fn chrome_cookies_for(_domain_suffix: &str) -> Result<CookieJar, CookieError
     Err(CookieError::Unsupported)
 }
 
+/// How long one copy of the cookie store may be reused across providers.
+///
+/// Nine providers in this cohort each need a cookie out of the SAME store, and
+/// every fetch used to copy the whole database and re-read the keychain for
+/// itself. Measured on a live machine that came to 0.55 GB of disk reads per
+/// hour: roughly 7 MB per fetch to obtain a few hundred bytes of cookie.
+///
+/// The bound is taken from the refresher's own cadence and is load-bearing in
+/// BOTH directions. It has to exceed the time one refresh tick takes to fan out
+/// across the cohort, or providers within a single tick stop sharing and the
+/// amplification returns. It has to stay BELOW the refresher's 60s base
+/// interval, so every tick still reads the store at least once: a snapshot that
+/// outlived a tick would let a provider stamp `fetchedAt` for a fetch whose
+/// underlying data was read during an earlier one, overstating freshness on the
+/// wire.
+#[cfg(target_os = "macos")]
+const SNAPSHOT_TTL: Duration = Duration::from_secs(45);
+
+/// A copy of the cookie store, plus the key that decrypts what is inside it.
+///
+/// The key is held with the snapshot rather than separately because the two are
+/// acquired together and are useless apart. Deriving it means another `security`
+/// subprocess, which was also being paid once per provider per tick.
+#[cfg(target_os = "macos")]
+struct Snapshot {
+    path: PathBuf,
+    key: Vec<u8>,
+    taken_at: Instant,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // Best-effort: a leftover copy is a stale temp file, not a correctness
+        // problem, and there is nothing useful to do if removal fails.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+/// Whether a snapshot taken at `taken_at` must be replaced before serving `now`.
+///
+/// Separated from the extraction path so the decision can be tested without a
+/// cookie store, a keychain, or control over the clock.
+#[cfg(target_os = "macos")]
+fn snapshot_is_stale(taken_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    match taken_at {
+        // Nothing cached yet: the first caller after start always pays for one.
+        None => true,
+        // Saturating rather than subtracting: a clock that appears to move
+        // backwards must not read as an arbitrarily FRESH snapshot, which would
+        // pin one stale copy in place indefinitely.
+        Some(taken_at) => now.saturating_duration_since(taken_at) >= ttl,
+    }
+}
+
 /// Extract + decrypt all Chrome cookies whose `host_key` ends with `domain_suffix`.
 #[cfg(target_os = "macos")]
 pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError> {
-    let store = locate_chrome_cookie_store().ok_or(CookieError::NoStore)?;
-    let key = safe_storage_key()?;
-    let rows = read_encrypted_cookies(&store, domain_suffix)?;
+    // The lock is held across the copy so that a cohort fanning out together
+    // takes ONE snapshot rather than racing to take nine identical ones. These
+    // callers already run on blocking threads, and the work serialised here is
+    // the work being eliminated.
+    let mut guard = SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if snapshot_is_stale(
+        guard.as_ref().map(|s| s.taken_at),
+        Instant::now(),
+        SNAPSHOT_TTL,
+    ) {
+        // Dropped before the replacement is built so the old copy is removed
+        // even if taking the new one fails.
+        *guard = None;
+
+        let store = locate_chrome_cookie_store().ok_or(CookieError::NoStore)?;
+        let key = safe_storage_key()?;
+        let path = copy_cookie_store(&store)?;
+        *guard = Some(Snapshot {
+            path,
+            key,
+            taken_at: Instant::now(),
+        });
+    }
+
+    let snapshot = guard
+        .as_ref()
+        .expect("a snapshot was just taken or was already fresh");
+    let key = snapshot.key.clone();
+    let rows = read_encrypted_cookies(&snapshot.path, domain_suffix)?;
+    drop(guard);
+
     let mut cookies = Vec::new();
     for (host_key, name, encrypted) in rows {
         // A cookie we can't decrypt is skipped, not fatal — a partial jar that
@@ -236,26 +329,35 @@ fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
     Ok(key.to_vec())
 }
 
-/// Copy the (possibly locked) cookie DB to a temp path and read the encrypted
-/// cookies whose host_key ends with `domain_suffix`.
+/// Copy the (possibly locked) cookie DB to a temp path.
+///
+/// Chrome keeps the database open, so this reads a consistent snapshot without
+/// contending on its lock. The caller owns the returned path and is responsible
+/// for removing it.
 #[cfg(target_os = "macos")]
-fn read_encrypted_cookies(
-    store: &std::path::Path,
-    domain_suffix: &str,
-) -> Result<Vec<(String, String, Vec<u8>)>, CookieError> {
-    // Chrome keeps the DB open; copy it so we read a consistent snapshot without
-    // contending on its lock.
+fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
     let tmp = std::env::temp_dir().join(format!(
         "quota-chrome-cookies-{}-{}.db",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
     std::fs::copy(store, &tmp).map_err(|e| CookieError::Extract(format!("copy store: {e}")))?;
+    Ok(tmp)
+}
 
+/// Read the encrypted cookies whose host_key ends with `domain_suffix` from a
+/// snapshot taken by [`copy_cookie_store`].
+#[cfg(target_os = "macos")]
+fn read_encrypted_cookies(
+    snapshot: &std::path::Path,
+    domain_suffix: &str,
+) -> Result<Vec<(String, String, Vec<u8>)>, CookieError> {
     let result = (|| {
-        let conn =
-            rusqlite::Connection::open_with_flags(&tmp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
+        let conn = rusqlite::Connection::open_with_flags(
+            snapshot,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
         // Deliberately unfiltered on expiry. An expired cookie is sent, the
         // upstream rejects it, and that arrives as a rejected credential --
         // which is the honest reading: the login is no longer usable.
@@ -284,7 +386,6 @@ fn read_encrypted_cookies(
         Ok::<_, CookieError>(rows)
     })();
 
-    let _ = std::fs::remove_file(&tmp);
     result
 }
 
@@ -435,6 +536,64 @@ mod tests {
         let key = [7u8; 16];
         assert!(decrypt_v10(b"v11garbage", "ollama.com", &key).is_none());
         assert!(decrypt_v10(b"", "ollama.com", &key).is_none());
+    }
+
+    /// The reuse bound has to hold in both directions, so both are asserted with
+    /// violating inputs rather than only the expiry side.
+    #[test]
+    fn a_snapshot_is_reused_until_the_bound_and_replaced_after_it() {
+        let ttl = Duration::from_secs(45);
+        let taken = Instant::now();
+
+        // Within the bound: the whole point of the cache. If this ever reports
+        // stale, every provider in a tick copies the store again.
+        assert!(!snapshot_is_stale(
+            Some(taken),
+            taken + Duration::from_secs(44),
+            ttl
+        ));
+
+        // At and past the bound: a snapshot must not outlive it, or a provider
+        // stamps a fresh fetch time onto data read during an earlier tick.
+        assert!(snapshot_is_stale(Some(taken), taken + ttl, ttl));
+        assert!(snapshot_is_stale(
+            Some(taken),
+            taken + Duration::from_secs(120),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn a_missing_snapshot_is_stale_so_the_first_caller_takes_one() {
+        assert!(snapshot_is_stale(None, Instant::now(), SNAPSHOT_TTL));
+    }
+
+    /// `Instant` is monotonic per the standard library, but the arithmetic here
+    /// still has to be saturating: a plain subtraction of a later instant would
+    /// panic in debug and, if it silently wrapped, would produce a gigantic
+    /// elapsed time -- reading as PERMANENTLY fresh and pinning one stale copy
+    /// forever. That failure is silent and unbounded, so it is fenced.
+    #[test]
+    fn an_apparently_backwards_clock_does_not_pin_a_stale_snapshot() {
+        let now = Instant::now();
+        let taken_in_the_future = now + Duration::from_secs(600);
+        assert!(!snapshot_is_stale(
+            Some(taken_in_the_future),
+            now,
+            SNAPSHOT_TTL
+        ));
+    }
+
+    /// The bound is only correct relative to the refresher's cadence: below the
+    /// 60s base interval so every tick reads the store at least once, and far
+    /// enough above zero to actually be shared within one tick.
+    #[test]
+    fn the_reuse_bound_stays_inside_the_refresher_base_interval() {
+        assert!(
+            SNAPSHOT_TTL < crate::refresh::BASE_INTERVAL,
+            "a snapshot outliving a tick would overstate fetchedAt freshness"
+        );
+        assert!(SNAPSHOT_TTL >= Duration::from_secs(10));
     }
 
     #[test]
