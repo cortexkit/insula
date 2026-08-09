@@ -401,7 +401,19 @@ mod tests {
         assert!(message.contains("first | second | third"));
         assert!(!message.contains("fourth"));
 
-        let long_message = "é".repeat(MAX_GRAPHQL_ERROR_SUMMARY_BYTES);
+        // Sized by a literal rather than from the constant under test. Deriving
+        // the fixture from `MAX_GRAPHQL_ERROR_SUMMARY_BYTES` scales the input
+        // with the cap, so the pressure is established no matter what the cap
+        // says -- the test then proves truncation happens somewhere and cannot
+        // notice a cap raised to a size that no longer bounds the wire. The
+        // literal also keeps the allocation small: at a cap of one billion the
+        // derived fixture built a two-gigabyte string.
+        //
+        // Multibyte on purpose, and an odd byte count: 4001 two-byte chars
+        // means the budget lands mid-character, so a truncation that ignores
+        // char boundaries panics here rather than in front of a user with a
+        // non-ASCII upstream error.
+        let long_message = "é".repeat(4001);
         let oversized = serde_json::to_vec(&json!({
             "errors": [{"message": long_message}],
             "data": null
@@ -410,7 +422,13 @@ mod tests {
         let FetchError::Decode(message) = normalize_usage(&oversized).unwrap_err() else {
             panic!("expected Decode");
         };
-        assert!(message.len() <= MAX_GRAPHQL_ERROR_SUMMARY_BYTES + 40);
+        // An absolute bound, for the same reason: compared against the constant,
+        // this assertion is satisfied by any cap at all.
+        assert!(
+            message.len() <= 600,
+            "a {} byte summary reached the wire",
+            message.len()
+        );
         assert!(message.ends_with('…'));
     }
 }
