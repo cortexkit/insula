@@ -74,17 +74,41 @@ fn clean(raw: &str) -> Option<String> {
 
 /// Env key first, then the manicode credentials file (`default.authToken` then
 /// top-level `authToken`).
-fn resolve_token() -> Option<String> {
+///
+/// `Ok(None)` means no credential is configured here, which is the ordinary
+/// state on a machine where this tool was never installed. An `Err` means the
+/// file exists and could not be used -- no permission, a directory in its place,
+/// an I/O error, or contents that are not JSON.
+///
+/// The distinction reaches the wire as a different error class, and consumers
+/// act on it: `credential_absent` authorises discarding stored state for the
+/// account, while `credential_unusable` says the account is configured and
+/// something on this host needs fixing. Collapsing both into "absent" files a
+/// fixable problem under "nothing to fix", where nobody looks.
+fn resolve_token() -> Result<Option<String>, FetchError> {
     if let Some(key) = env::first_env(API_KEY_ENV).and_then(|v| clean(&v)) {
-        return Some(key);
+        return Ok(Some(key));
     }
-    let path = credentials_path()?;
-    let data = std::fs::read(&path).ok()?;
-    let file: CredentialsFile = serde_json::from_slice(&data).ok()?;
-    file.default
+    let Some(path) = credentials_path() else {
+        return Ok(None);
+    };
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(FetchError::CredentialUnusable(format!(
+                "reading the codebuff credentials file: {error}"
+            )))
+        }
+    };
+    let file: CredentialsFile = serde_json::from_slice(&data).map_err(|error| {
+        FetchError::CredentialUnusable(format!("parsing the codebuff credentials file: {error}"))
+    })?;
+    Ok(file
+        .default
         .and_then(|p| p.auth_token)
         .or(file.auth_token)
-        .and_then(|t| clean(&t))
+        .and_then(|t| clean(&t)))
 }
 
 // ---- response parsing (pure) ------------------------------------------------
@@ -207,7 +231,7 @@ impl UsageProvider for CodebuffProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let token = resolve_token().ok_or_else(|| {
+            let token = resolve_token()?.ok_or_else(|| {
                 FetchError::NoSession(
                     "no CODEBUFF_API_KEY or ~/.config/manicode/credentials.json".to_string(),
                 )

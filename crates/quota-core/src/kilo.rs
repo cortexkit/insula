@@ -459,23 +459,59 @@ fn kilo_auth_file_path() -> Option<PathBuf> {
     crate::env::home_dir().map(|home| home.join(".local/share/kilo/auth.json"))
 }
 
-fn read_auth_file_token() -> Option<String> {
-    let path = kilo_auth_file_path()?;
-    let data = std::fs::read(&path).ok()?;
-    let root: Value = serde_json::from_slice(&data).ok()?;
-    let access = root.get("kilo")?.get("access")?.as_str()?.trim();
-    if access.is_empty() {
-        None
-    } else {
-        Some(access.to_string())
-    }
+/// Read the token from the editor's auth file, distinguishing absent from
+/// unreadable.
+///
+/// `Ok(None)` means the file is genuinely not there, which is the ordinary state
+/// on a machine where this tool was never installed. An `Err` means the file
+/// exists and could not be used -- no permission, a directory in its place, an
+/// I/O error, or contents that are not the shape this expects.
+///
+/// The distinction reaches the wire as a different error class, and consumers
+/// act on it: `credential_absent` authorises discarding stored state for the
+/// account, while `credential_unusable` says the account is configured and
+/// something on this host needs fixing. Collapsing both into "absent" files a
+/// fixable problem under "nothing to fix", where nobody looks.
+fn read_auth_file_token() -> Result<Option<String>, FetchError> {
+    let Some(path) = kilo_auth_file_path() else {
+        return Ok(None);
+    };
+    read_auth_file_token_at(&path)
+}
+
+/// The read and classification, over an arbitrary path.
+///
+/// Split from [`read_auth_file_token`] so the unreadable and malformed cases can
+/// be constructed in a test: the caller resolves a fixed location under the home
+/// directory, and a rule that can only be exercised by arranging the developer's
+/// own home directory is one nobody exercises.
+fn read_auth_file_token_at(path: &std::path::Path) -> Result<Option<String>, FetchError> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(FetchError::CredentialUnusable(format!(
+                "reading the kilo auth file: {error}"
+            )))
+        }
+    };
+    let root: Value = serde_json::from_slice(&data).map_err(|error| {
+        FetchError::CredentialUnusable(format!("parsing the kilo auth file: {error}"))
+    })?;
+    let access = root
+        .get("kilo")
+        .and_then(|kilo| kilo.get("access"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|access| !access.is_empty());
+    Ok(access.map(ToString::to_string))
 }
 
 fn resolve_api_key() -> Result<String, FetchError> {
     if let Some(key) = env::first_env(API_KEY_ENV) {
         return Ok(key);
     }
-    read_auth_file_token().ok_or_else(|| {
+    read_auth_file_token()?.ok_or_else(|| {
         FetchError::NoSession(format!(
             "none of {API_KEY_ENV:?} is set and no ~/.local/share/kilo/auth.json token"
         ))
@@ -530,6 +566,68 @@ impl UsageProvider for KiloProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// An absent file and an unreadable one must not report the same thing.
+    ///
+    /// A missing file is the ordinary state where this tool was never
+    /// installed. A file that exists and cannot be read is a configured account
+    /// with something broken on this host -- and the two reach consumers as
+    /// different error classes, one of which authorises discarding stored state
+    /// for the account.
+    #[test]
+    fn an_absent_auth_file_and_an_unreadable_one_report_differently() {
+        let dir = std::env::temp_dir().join(format!("insula-kilo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("absent.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            matches!(read_auth_file_token_at(&missing), Ok(None)),
+            "a missing file must read as no credential configured"
+        );
+
+        // A directory where a file belongs: present, and unusable. Chosen over a
+        // permission bit because it behaves the same for root, who would
+        // otherwise read a sealed file and see the absent case instead.
+        let occupied = dir.join("occupied.json");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let error = read_auth_file_token_at(&occupied)
+            .expect_err("a path that cannot be read must not report as absent");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "expected CredentialUnusable, got {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Contents that are not the expected shape are unusable, not absent.
+    ///
+    /// A truncated or rewritten auth file is a configured account whose
+    /// credential cannot be extracted -- reporting it as absent would tell a
+    /// consumer the account is gone.
+    #[test]
+    fn a_malformed_auth_file_is_unusable_rather_than_absent() {
+        let dir = std::env::temp_dir().join(format!("insula-kilo-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let error = read_auth_file_token_at(&path)
+            .expect_err("unparseable contents must not report as absent");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "expected CredentialUnusable, got {error:?}"
+        );
+
+        // A well-formed file without the key is a real absence, not a failure:
+        // the file belongs to a tool that has one and this account does not.
+        std::fs::write(&path, br#"{"kilo":{}}"#).unwrap();
+        assert!(matches!(read_auth_file_token_at(&path), Ok(None)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]
