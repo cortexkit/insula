@@ -291,18 +291,22 @@ async fn only_a_failed_cookie_counts_as_a_stale_login() {
     tick(&registry).await;
 
     let health = registry.health();
-    // Every one is degraded: none is serving a window.
+    // No provider in this fixture is serving a window, and they split by whether
+    // somebody can act on the failure. Asserted as whole lists rather than by
+    // membership, so a class moving between the two fails here instead of
+    // passing unnoticed.
     assert_eq!(
         health.degraded,
         vec![
-            "not-logged-in",
             "login-expired",
             "site-erroring",
-            "no-plan",
             "our-bug",
             "page-unparseable"
         ]
     );
+    // Never logged in, and a working credential with no plan to report: both are
+    // correct states rather than faults.
+    assert_eq!(health.unconfigured, vec!["not-logged-in", "no-plan"]);
     // Only the two that mean a stored login stopped working. Asserted as the
     // whole list rather than by membership, so a class wrongly joining the count
     // fails here instead of passing unnoticed.
@@ -327,13 +331,70 @@ async fn health_reflects_provider_outcomes() {
 
     let health = registry.health();
     assert_eq!(health.fresh, 2);
-    assert_eq!(health.degraded, vec!["cursor", "elevenlabs"]);
-    // Both failures here are absent credentials, so neither is a stale-login
-    // signal: a cookie provider nobody has logged into is behaving correctly.
-    // The cohort count is exercised with a real failure in
-    // `only_a_failed_cookie_counts_as_a_stale_login`.
+    // Both failures here are absent credentials, which is the expected state on
+    // a host that does not use those services -- so they are reported as
+    // unconfigured rather than as something to act on. `degraded` staying empty
+    // is the point: it is what an operator watches, and a host where nothing is
+    // wrong must leave it empty however many adapters are unconfigured.
+    assert!(
+        health.degraded.is_empty(),
+        "absent credentials must not raise the operator signal, got {:?}",
+        health.degraded
+    );
+    assert_eq!(health.unconfigured, vec!["cursor", "elevenlabs"]);
+    // Neither is a stale-login signal either: a cookie provider nobody has
+    // logged into is behaving correctly. The cohort count is exercised with a
+    // real failure in `only_a_failed_cookie_counts_as_a_stale_login`.
     assert!(health.cookie_logins_stale.is_empty());
     assert!(health.last_tick_age.is_some());
+}
+
+/// One broken account beside one that was never configured is a provider
+/// somebody should look at.
+///
+/// The unconfigured bucket exists so the degraded count stays an operator
+/// trigger, and it requires EVERY account to be an expected absence. Asking
+/// whether ANY account is absent would move this provider out of the count --
+/// which is worse than not having split at all, because the failure disappears
+/// from the number an operator watches instead of merely being diluted in it.
+#[tokio::test]
+async fn a_broken_account_beside_an_unconfigured_one_stays_actionable() {
+    struct MixedProvider;
+
+    #[async_trait]
+    impl UsageProvider for MixedProvider {
+        fn name(&self) -> &str {
+            "mixed"
+        }
+
+        fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+            Ok(vec![handle("never-configured"), handle("broken")])
+        }
+
+        async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+            let error = if handle.stable_id() == "broken" {
+                FetchError::CredentialUnusable("token file is a directory".into())
+            } else {
+                FetchError::NoSession("no credential configured".into())
+            };
+            FetchAttempt::failure(None, None, error)
+        }
+    }
+
+    let registry = Registry::new(vec![Box::new(MixedProvider) as Box<dyn UsageProvider>]);
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert_eq!(
+        health.degraded,
+        vec!["mixed"],
+        "a provider with one unusable credential must stay in the operator count"
+    );
+    assert!(
+        health.unconfigured.is_empty(),
+        "unconfigured must require every account to be an expected absence, got {:?}",
+        health.unconfigured
+    );
 }
 
 #[tokio::test]
@@ -2217,9 +2278,10 @@ impl UsageProvider for CursorProvider {
 /// whose first fetch has not run yet.
 ///
 /// Consumers are told to assert `fresh + stale + pending + degraded +
-/// withoutHandles == providersTotal` and alert on an imbalance, so a state that
-/// breaks it without anything being wrong is worse than no invariant at all: it
-/// fires after every restart and trains the reader to ignore the alert.
+/// unconfigured + withoutHandles == providersTotal` and alert on an imbalance,
+/// so a state that breaks it without anything being wrong is worse than no
+/// invariant at all: it fires after every restart and trains the reader to
+/// ignore the alert.
 ///
 /// The unbucketed state is ordinary rather than exotic. The refresher admits a
 /// bounded number of fetch units per turn, so any registry with more units than
@@ -2269,13 +2331,15 @@ async fn every_provider_lands_in_exactly_one_health_bucket() {
             + health.stale
             + health.pending
             + health.degraded.len()
+            + health.unconfigured.len()
             + health.without_handles.len(),
         health.providers_total,
-        "buckets: fresh {} stale {} pending {} degraded {:?} withoutHandles {:?} total {}",
+        "buckets: fresh {} stale {} pending {} degraded {:?} unconfigured {:?} withoutHandles {:?} total {}",
         health.fresh,
         health.stale,
         health.pending,
         health.degraded,
+        health.unconfigured,
         health.without_handles,
         health.providers_total
     );
@@ -2290,6 +2354,7 @@ async fn every_provider_lands_in_exactly_one_health_bucket() {
             + health.stale
             + health.pending
             + health.degraded.len()
+            + health.unconfigured.len()
             + health.without_handles.len(),
         health.providers_total
     );

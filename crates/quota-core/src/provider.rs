@@ -442,6 +442,45 @@ const MAX_ERROR_DETAIL_BYTES: usize = 1024;
 /// that *should* count is
 /// `every_error_class_is_classified_for_credential_staleness`, which fails when
 /// a new class appears here unjudged.
+/// Whether a failure class means "nothing is configured here" rather than
+/// "something is wrong here".
+///
+/// The distinction is what an operator should do: nothing, or investigate. On a
+/// typical host most providers have no credential at all -- a machine that uses
+/// four services still has adapters for thirty-five -- so folding those in with
+/// real failures makes any count of them a permanent alarm, where one genuine
+/// failure moves the number by one against a baseline nobody reads.
+///
+/// Asked as "which classes are expected" rather than "which are problems", so a
+/// class added to the taxonomy later is treated as actionable until someone
+/// decides otherwise. The exhaustive test over the taxonomy makes that decision
+/// explicit rather than defaulted.
+pub fn class_is_expected_absence(class: &str) -> bool {
+    match class {
+        // No credential was ever found. The correct and permanent state on a
+        // host that does not use the service.
+        "credential_absent" => true,
+        // The credential worked and the account has no quota to report -- a
+        // plan without metered windows, say. Nothing to fix.
+        "no_quota_reported" => true,
+        // A credential exists and something about this host stops it working.
+        "credential_unusable" => false,
+        // The upstream saw the credential and refused it.
+        "credential_rejected" => false,
+        // The upstream could not be reached or errored.
+        "upstream_failed" => false,
+        // The response arrived and could not be read.
+        "decode_failed" => false,
+        // A local program this provider reads from is not running. Expected in
+        // the moment, but it is a state the operator can change, and the entry
+        // is served stale rather than degraded while it lasts.
+        "local_source_unavailable" => false,
+        // Our own defect.
+        "internal_error" => false,
+        _ => false,
+    }
+}
+
 pub fn class_means_credential_stopped_working(class: &str) -> bool {
     match class {
         // The upstream saw the credential and refused it.
@@ -675,6 +714,91 @@ mod tests {
         assert!(!class_means_credential_stopped_working(
             "a_class_from_a_newer_build"
         ));
+    }
+
+    /// Every class must be judged explicitly for whether it means "nothing is
+    /// configured here" rather than "something is wrong here".
+    ///
+    /// Same shape as the staleness judgement above and for the same reason:
+    /// `class_is_expected_absence` ends in a catch-all, which is the right
+    /// default for a value arriving from a newer build but would silently
+    /// swallow a class added here. A new failure kind defaulting to "actionable"
+    /// is the safe direction -- it shows up in a count somebody reads -- but it
+    /// should be a decision rather than an accident.
+    #[test]
+    fn every_error_class_is_judged_for_expected_absence() {
+        // Maintained by hand, deliberately: an author adding a class has to
+        // decide which side it falls on and record it here.
+        let judged = [
+            // Expected: nothing is set up, and nothing is broken.
+            "credential_absent",
+            "no_quota_reported",
+            // Actionable: a credential exists, or the upstream or this module
+            // misbehaved.
+            "credential_unusable",
+            "credential_rejected",
+            "local_source_unavailable",
+            "upstream_failed",
+            "decode_failed",
+            "internal_error",
+        ];
+
+        let all = [
+            FetchError::NoSession("x".into()),
+            FetchError::CredentialUnusable("x".into()),
+            FetchError::NoQuotaReported("x".into()),
+            FetchError::LocalSourceUnavailable("x".into()),
+            FetchError::Unauthorized("x".into()),
+            FetchError::ProviderStatus(401),
+            FetchError::ProviderStatus(500),
+            FetchError::Upstream("x".into()),
+            FetchError::Decode("x".into()),
+            FetchError::Internal("x".into()),
+        ];
+
+        for case in &all {
+            // Fails to compile when a variant is added, so the list above cannot
+            // fall behind the enum without someone noticing.
+            match case {
+                FetchError::NoSession(_)
+                | FetchError::CredentialUnusable(_)
+                | FetchError::NoQuotaReported(_)
+                | FetchError::LocalSourceUnavailable(_)
+                | FetchError::Unauthorized(_)
+                | FetchError::ProviderStatus(_)
+                | FetchError::Upstream(_)
+                | FetchError::Decode(_)
+                | FetchError::Internal(_) => {}
+            }
+
+            let class = case.error_class();
+            assert!(
+                judged.contains(&class),
+                "{class:?} reaches the wire but no one decided whether it means \
+                 nothing is configured; it would default to 'actionable'"
+            );
+        }
+
+        // The two that mean nothing needs doing.
+        assert!(class_is_expected_absence("credential_absent"));
+        assert!(class_is_expected_absence("no_quota_reported"));
+
+        // And the one most easily confused with absence: a credential that
+        // exists and cannot be used is a host somebody must fix, not a host
+        // where nobody signed in. Getting this wrong hides exactly the failure
+        // the split was built to surface.
+        assert!(
+            !class_is_expected_absence("credential_unusable"),
+            "a broken credential must stay in the count an operator watches"
+        );
+        assert!(!class_is_expected_absence("credential_rejected"));
+        assert!(!class_is_expected_absence("upstream_failed"));
+        assert!(!class_is_expected_absence("decode_failed"));
+        assert!(!class_is_expected_absence("internal_error"));
+        assert!(!class_is_expected_absence("local_source_unavailable"));
+
+        // An unknown class from a newer build is treated as actionable.
+        assert!(!class_is_expected_absence("a_class_from_a_newer_build"));
     }
 
     /// Each vault outcome reaches the wire as its own statement.

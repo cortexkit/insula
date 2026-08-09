@@ -124,7 +124,7 @@ async fn main() {
 /// Check the health conservation identity against the deployed module.
 ///
 /// Consumers are told to assert `fresh + stale + pending + degraded +
-/// withoutHandles == providersTotal` and alert on an imbalance, so the producer
+/// unconfigured + withoutHandles == providersTotal` and alert on an imbalance, so the producer
 /// should be checking it too -- a bucket that classifies a provider into nothing
 /// under-sums silently, and the first person to notice would otherwise be a
 /// consumer whose alert fires for a reason they cannot diagnose.
@@ -194,6 +194,7 @@ async fn check_health_identity(stream: &mut tokio::net::TcpStream) -> Vec<String
         ("stale", number("stale")),
         ("pending", number("pending")),
         ("degraded", list_len("degraded")),
+        ("unconfigured", list_len("unconfigured")),
         ("withoutHandles", list_len("withoutHandles")),
         ("providersTotal", number("providersTotal")),
     ];
@@ -229,16 +230,19 @@ async fn check_health_identity(stream: &mut tokio::net::TcpStream) -> Vec<String
         + value("stale")
         + value("pending")
         + value("degraded")
+        + value("unconfigured")
         + value("withoutHandles");
     let total = value("providersTotal");
     if sum != total {
         return vec![format!(
             "health buckets do not account for every provider: fresh {} + stale {} + pending {} \
-             + degraded {} + withoutHandles {} = {sum}, but providersTotal is {total}",
+             + degraded {} + unconfigured {} + withoutHandles {} = {sum}, but providersTotal is \
+             {total}",
             value("fresh"),
             value("stale"),
             value("pending"),
             value("degraded"),
+            value("unconfigured"),
             value("withoutHandles"),
         )];
     }

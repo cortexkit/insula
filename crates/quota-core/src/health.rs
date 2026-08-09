@@ -42,9 +42,23 @@ pub struct HealthSnapshot {
     /// Not a fault, and distinct from `without_handles`: this provider resolved
     /// its credentials and is queued, rather than failing to enumerate any.
     pub pending: usize,
-    /// Names of providers in a degraded state (non-transient failure: no creds,
-    /// expired session, bad shape) — they serve an error entry, not a window.
+    /// Names of providers failing in a way somebody can act on: a credential
+    /// exists and does not work, the upstream refused it, or the response could
+    /// not be read. They serve an error entry, not a window.
+    ///
+    /// Deliberately excludes providers with no credential on this host, which
+    /// are reported in `unconfigured`. Folding the two together made this a
+    /// permanent alarm — on a machine using four services, thirty-one adapters
+    /// have nothing configured, so a real failure moved the number from 31 to 32
+    /// and nobody could see it.
     pub degraded: Vec<String>,
+    /// Names of providers with no credential source on this host.
+    ///
+    /// The expected state for most adapters on most machines, and not a fault:
+    /// the module ships thirty-five providers and no one uses all of them. Kept
+    /// as a separate bucket rather than dropped so the conservation identity
+    /// still accounts for every provider.
+    pub unconfigured: Vec<String>,
     /// Registered providers that resolved no credential handle at all, so they
     /// hold no slots and appear in none of the counts above.
     ///
@@ -55,8 +69,9 @@ pub struct HealthSnapshot {
     /// that every provider legitimately has no slots yet.
     ///
     /// The conservation identity this exists to preserve is
-    /// `fresh + stale + pending + degraded.len() + without_handles.len() ==
-    /// providers_total`, and it holds only once `last_tick_age` is `Some`.
+    /// `fresh + stale + pending + degraded.len() + unconfigured.len() +
+    /// without_handles.len() == providers_total`, and it holds only once
+    /// `last_tick_age` is `Some`.
     /// Consumers are told to assert it, so every branch that classifies a
     /// provider must increment exactly one bucket.
     pub without_handles: Vec<String>,
@@ -100,6 +115,7 @@ impl HealthSnapshot {
             // being set, and this snapshot leaves it `None`.
             pending: 0,
             degraded: Vec::new(),
+            unconfigured: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total,
             cookie_logins_stale: Vec::new(),

@@ -1,6 +1,6 @@
 //! Check the health conservation identity across a real warm-up.
 //!
-//! The identity is `fresh + stale + pending + degraded + withoutHandles ==
+//! The identity is `fresh + stale + pending + degraded + unconfigured + withoutHandles ==
 //! providersTotal`, and consumers are told to assert it and alert on an
 //! imbalance. Its most stressed moment is the first seconds after a start: the
 //! refresher admits a bounded number of fetch units per turn, so with the full
@@ -58,6 +58,7 @@ async fn main() {
             + health.stale
             + health.pending
             + health.degraded.len()
+            + health.unconfigured.len()
             + health.without_handles.len();
 
         // Gated on the refresher having ticked, exactly as consumers are told to
@@ -66,13 +67,14 @@ async fn main() {
         // start.
         if health.last_tick_age.is_some() && sum != health.providers_total {
             imbalances.push(format!(
-                "{:.2}s: fresh {} + stale {} + pending {} + degraded {} + withoutHandles {} \
-                 = {sum}, but providersTotal is {}",
+                "{:.2}s: fresh {} + stale {} + pending {} + degraded {} + unconfigured {} \
+                 + withoutHandles {} = {sum}, but providersTotal is {}",
                 started.elapsed().as_secs_f64(),
                 health.fresh,
                 health.stale,
                 health.pending,
                 health.degraded.len(),
+                health.unconfigured.len(),
                 health.without_handles.len(),
                 health.providers_total,
             ));

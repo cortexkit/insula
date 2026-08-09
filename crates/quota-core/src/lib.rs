@@ -895,6 +895,7 @@ impl Registry {
         let mut stale = 0;
         let mut pending = 0;
         let mut degraded = Vec::new();
+        let mut unconfigured = Vec::new();
         let mut without_handles = Vec::new();
         let mut cookie_logins_stale = Vec::new();
 
@@ -944,6 +945,21 @@ impl Registry {
                 // a consumer asserting that identity sees an imbalance that means
                 // nothing is wrong.
                 pending += 1;
+            } else if slots.iter().all(|slot| {
+                slot.error_class
+                    .is_some_and(provider::class_is_expected_absence)
+            }) {
+                // Every account of this provider failed for a reason that means
+                // nothing is configured here. Separated from `degraded` so that
+                // count stays an operator trigger: most adapters have no
+                // credential on any given host, and folding them in makes a real
+                // failure move the number by one against a baseline in the
+                // twenties.
+                //
+                // Requires ALL slots to agree. One account with a broken
+                // credential beside one that was never configured is a provider
+                // somebody should look at.
+                unconfigured.push(name.to_string());
             } else {
                 degraded.push(name.to_string());
                 // Only a stored login that stopped working counts. A cookie that
@@ -976,6 +992,7 @@ impl Registry {
             stale,
             pending,
             degraded,
+            unconfigured,
             without_handles,
             cookie_cohort_total,
             cookie_logins_stale,

@@ -238,6 +238,13 @@ number one or two. So an undifferentiated count of degraded entries is dominated
 by the case that can never mean anything, and a real breakage moves it by one.
 The exact figures drift as credentials come and go; the ratio is the point.
 
+The health check applies this split for you at the provider level: `degraded`
+there counts only the second and third cases, and providers whose every account
+is an expected absence are reported separately as `unconfigured`. The `usage.get`
+array is not split — it carries one entry per account with its own `errorClass`,
+so a surface rendering accounts should group on the class itself using the table
+below.
+
 `errorClass` is the machine-readable answer, and it is **on the wire** on every
 degraded entry. It is absent on healthy entries by design: the field says why an
 entry is degraded, and a healthy one has nothing to say — so branch on `error`
@@ -860,16 +867,34 @@ every account under it is healthy.
 The metrics carry a conservation identity that must balance:
 
 ```
-fresh + stale + pending + len(degraded) + len(withoutHandles) == providersTotal
+fresh + stale + pending + len(degraded) + len(unconfigured) + len(withoutHandles)
+  == providersTotal
 ```
 
-**The four terms are not the same type on the wire.** `fresh` and `stale` are
-numbers; `degraded` and `withoutHandles` are arrays of provider names, because
-knowing *which* providers are degraded is worth more than knowing how many.
-Take their lengths. A language that coerces rather than complaining will happily
-evaluate the wrong expression here — in JavaScript, `7 + 0 + [..28 names..] +
-[]` is a string, and the comparison is simply false forever, which reads as a
-standing imbalance rather than as a bug in the assertion.
+**The terms are not the same type on the wire.** `fresh`, `stale` and `pending`
+are numbers; `degraded`, `unconfigured` and `withoutHandles` are arrays of
+provider names, because knowing *which* providers are in a bucket is worth more
+than knowing how many. Take their lengths. A language that coerces rather than
+complaining will happily evaluate the wrong expression here — in JavaScript,
+`7 + 0 + [..28 names..] + []` is a string, and the comparison is simply false
+forever, which reads as a standing imbalance rather than as a bug in the
+assertion.
+
+**`degraded` is the operator signal; `unconfigured` is not.** A provider whose
+accounts all failed because no credential exists on the host is reported as
+`unconfigured` — the expected state for most adapters on most machines, since
+this module ships 35 and nobody uses all of them. `degraded` is narrower: a
+credential exists and something is wrong with it, or the upstream refused it, or
+the response could not be read. Alert on `degraded` being non-empty; do not
+alert on `unconfigured`.
+
+The split matters because the combined count is a permanent alarm. On the host
+these docs are written from, 27 providers failed and 23 of those had no
+credential at all — so a genuine new failure moved the old number from 27 to 28,
+which no operator would notice. A provider needs *every* account to be an
+expected absence to count as unconfigured; one broken credential beside one that
+was never set up is a provider somebody should look at, and it is reported as
+degraded.
 
 Assert it and alert on imbalance. It cannot be tuned into silence and cannot
 pass by sampling healthy members. It is **not** a liveness signal, though: it

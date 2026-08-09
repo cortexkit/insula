@@ -443,19 +443,21 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
             Some(age) => format!("refresher stalled: last tick {}s ago", age.as_secs()),
             None => "refresher never ticked since startup".to_string(),
         })
-    } else if !snapshot.degraded.is_empty() {
-        // The two counts measure different things, so they are not rendered in
-        // parallel: `degraded` counts every provider that failed for any reason,
-        // while the cookie count is narrower -- only browser logins that went
-        // stale, excluding the far more common case of never having logged in.
-        // Phrasing them as "N/35 degraded (M of 9 cookie-cohort)" reads as M of
-        // the 9 cookie providers being degraded, which is a different and much
-        // larger number.
+    } else if !snapshot.degraded.is_empty() || snapshot.serving() < snapshot.providers_total {
+        // Serving first, then the number an operator should act on, then the
+        // ones that are merely not set up here. Leading with degraded made the
+        // line read as an alarm on every host, because most adapters have no
+        // credential on any given machine.
+        //
+        // The cookie count is narrower still -- only browser logins that went
+        // stale, excluding never having logged in -- so it keeps its own clause
+        // rather than being rendered in parallel with the others.
         Some(format!(
-            "{}/{} providers degraded, {} serving; {} of {} cookie logins stale",
-            snapshot.degraded.len(),
-            snapshot.providers_total,
+            "{} serving, {} degraded, {} unconfigured of {}; {} of {} cookie logins stale",
             snapshot.serving(),
+            snapshot.degraded.len(),
+            snapshot.unconfigured.len(),
+            snapshot.providers_total,
             snapshot.cookie_logins_stale.len(),
             snapshot.cookie_cohort_total,
         ))
@@ -479,7 +481,14 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         // an identity that is briefly false after every restart trains its reader
         // to ignore the imbalance that matters.
         "pending": snapshot.pending,
+        // Providers somebody can act on: a credential exists and is failing.
+        // Kept apart from `unconfigured` so a consumer can alert on this being
+        // non-empty, which is not possible when the two are one number.
         "degraded": snapshot.degraded,
+        // Providers with no credential source on this host -- the expected state
+        // for most adapters on most machines. Published by name rather than
+        // omitted so the conservation identity still accounts for them.
+        "unconfigured": snapshot.unconfigured,
         // Registered providers that resolved no credential handle, so they appear
         // in none of the counts above. Reported by name so the buckets can be
         // reconciled against providersTotal rather than silently under-summing.
@@ -753,6 +762,7 @@ mod tests {
             stale: 0,
             pending: 0,
             degraded: Vec::new(),
+            unconfigured: Vec::new(),
             without_handles: Vec::new(),
             cookie_cohort_total: 0,
             cookie_logins_stale: Vec::new(),
@@ -779,13 +789,15 @@ mod tests {
     /// as "N/M degraded (K of C cookie-cohort)" invites reading K as the cookie
     /// providers that are degraded, which is a different and larger number.
     #[test]
-    fn the_health_detail_does_not_conflate_its_two_counts() {
-        // Modelled on this host: most providers have no credentials, most cookie
-        // providers were never logged into, and two live logins went stale.
+    fn the_health_detail_does_not_conflate_its_three_counts() {
+        // Modelled on this host: most providers have no credential at all, a few
+        // are genuinely failing, most cookie providers were never logged into,
+        // and two live logins went stale.
         let snapshot = quota_core::health::HealthSnapshot {
             providers_total: 35,
             fresh: 7,
-            degraded: (0..28).map(|index| format!("provider-{index}")).collect(),
+            degraded: (0..4).map(|index| format!("broken-{index}")).collect(),
+            unconfigured: (0..24).map(|index| format!("unused-{index}")).collect(),
             cookie_cohort_total: 9,
             cookie_logins_stale: vec!["opencodego".into(), "qoder".into()],
             ..healthy_snapshot()
@@ -797,23 +809,27 @@ mod tests {
         let detail = detail.expect("a degraded provider produces a detail line");
 
         // Each count is attached to what it measures.
-        assert!(
-            detail.contains("28/35 providers degraded"),
-            "detail: {detail}"
-        );
+        assert!(detail.contains("7 serving"), "detail: {detail}");
+        assert!(detail.contains("4 degraded"), "detail: {detail}");
+        assert!(detail.contains("24 unconfigured of 35"), "detail: {detail}");
         assert!(
             detail.contains("2 of 9 cookie logins stale"),
             "detail: {detail}"
         );
 
-        // Not vacuous: the phrasing that invited reading the cookie count as a
-        // degraded count must not come back. The two are independent -- on this
-        // host 8 of the 9 cookie providers are degraded while only 2 of them are
-        // stale logins -- so a reader who conflates them sees a quarter of the
-        // real number.
+        // Not vacuous in two directions. The phrasing that invited reading the
+        // cookie count as a degraded count must not come back -- the two are
+        // independent, and a reader who conflates them sees a quarter of the real
+        // number. And the operator count must not silently absorb the
+        // unconfigured providers again, which is what made this line a permanent
+        // alarm: 28 of 35 on a host where four things were actually wrong.
         assert!(
             !detail.contains("cookie-cohort"),
             "the cohort count is being rendered as a degraded count: {detail}"
+        );
+        assert!(
+            !detail.contains("28 degraded") && !detail.contains("28/35"),
+            "unconfigured providers are being counted as degraded: {detail}"
         );
     }
 
@@ -1121,6 +1137,7 @@ mod tests {
             "stale",
             "pending",
             "degraded",
+            "unconfigured",
             "withoutHandles",
             "cookieCohortTotal",
             "cookieLoginsStale",
