@@ -532,6 +532,70 @@ fn every_api_provider_key_names_a_registered_provider() {
 /// Checked against `is_cookie_based`, which the registry already uses to size
 /// its stale-login metric, so the two cannot disagree about who is in the
 /// cohort. A provider added to one and not the other fails here.
+/// Every shipped provider must enumerate the same handles twice in a row.
+///
+/// The scheduler calls `handles()` on all providers at the start of every turn
+/// and treats the answer as authoritative: handles it does not name are reaped,
+/// handles it names for the first time are created due-now. A provider whose
+/// answer varies between identical calls therefore destroys and recreates its
+/// own slot each turn -- which resets the incarnation, discards any cached
+/// window, restarts backoff, and means a slow provider can never finish a fetch
+/// before its slot is replaced.
+///
+/// Nothing else would report that. The module stays healthy and the provider
+/// simply never produces a reading, which is indistinguishable from an account
+/// with no credentials.
+///
+/// Every other test of this machinery uses purpose-built stubs, so the
+/// obligation is proven about the stubs rather than about the implementations
+/// that ship. This drives the real ones.
+///
+/// It compares consecutive calls rather than asserting a specific set: what a
+/// provider finds depends on the machine, and on a host with no credentials most
+/// return the same empty answer twice, which is agreement rather than vacuity.
+/// `handles()` reads config and credential files only -- no network -- so calling
+/// it twice is cheap.
+#[test]
+fn every_provider_enumerates_the_same_handles_twice() {
+    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    let total = registry.provider_names().len();
+
+    let mut compared = 0;
+    for provider in &registry.providers {
+        let name = provider.name.as_str();
+        let (Ok(first), Ok(second)) = (provider.fetcher.handles(), provider.fetcher.handles())
+        else {
+            // An enumeration error is a legitimate answer -- an unreadable config
+            // is retained rather than treated as authoritative-empty -- and says
+            // nothing about determinism.
+            continue;
+        };
+        let ids = |handles: Vec<CredentialHandle>| {
+            let mut ids: Vec<String> = handles
+                .iter()
+                .map(|handle| handle.stable_id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ids(first),
+            ids(second),
+            "{name} enumerated different handles on two consecutive calls, so the \
+             scheduler would reap and recreate its slot every turn"
+        );
+        compared += 1;
+    }
+
+    // Without this the test passes on a machine where every provider errors, and
+    // a clean result would cover nothing at all.
+    assert_eq!(
+        compared, total,
+        "only {compared} of {total} providers were compared, so this covers less \
+         than it appears to"
+    );
+}
+
 #[test]
 fn every_cookie_provider_publishes_the_cookie_source_label() {
     // The cohort by behaviour, not by a list written here: taken from the same
