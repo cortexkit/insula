@@ -69,6 +69,10 @@ def main(argv):
     path.write_text(source.replace(old, new, 1))
     print(f"  mutated {rel}")
 
+    # The restore runs in `finally` so that an interrupt cannot leave the tree
+    # mutated. Without it, Ctrl-C during a slow suite exits with the mutation
+    # still applied and nothing saying so -- and the next thing anyone runs
+    # reports on code they did not write.
     try:
         result = run(["cargo", "test", *test_args], timeout=TIMEOUT_SECS)
         ran = "\ntest result:" in result.stdout or result.stdout.startswith("test result:")
@@ -80,14 +84,17 @@ def main(argv):
         outcome = "ran" if ran else "did-not-build"
     except subprocess.TimeoutExpired:
         ran, failed, outcome = False, [], "hung"
-
-    restored = run(["git", "checkout", "--", rel])
-    if restored.returncode != 0 or path.read_text() != source:
-        # Louder than a failed proof: the tree is now wrong, and every later
-        # result in this session would describe mutated code.
-        print(f"  !! RESTORE FAILED for {rel} -- fix the tree before continuing", file=sys.stderr)
-        return 2
-    print("  restored")
+    finally:
+        restored = run(["git", "checkout", "--", rel])
+        if restored.returncode != 0 or path.read_text() != source:
+            # Louder than a failed proof: the tree is now wrong, and every later
+            # result in this session would describe mutated code.
+            print(
+                f"  !! RESTORE FAILED for {rel} -- fix the tree before continuing",
+                file=sys.stderr,
+            )
+            return 2
+        print("  restored")
 
     if outcome == "hung":
         # A third outcome, distinct from red and green: removing the thing under
