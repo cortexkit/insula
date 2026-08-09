@@ -44,15 +44,28 @@ status = subprocess.run(
     capture_output=True,
     text=True,
     check=True,
-).stdout.strip()
+# NOT .strip(): porcelain marks staged-versus-unstaged in the first TWO columns,
+# and the unstaged case is a LEADING SPACE. Stripping it makes the two states
+# identical -- which would leave this guard unable to tell apart the very
+# distinction its message turns on.
+).stdout.rstrip("\n")
 if status:
-    print(
-        f"  REFUSING TO RUN: {REL} is not clean against the index ({status!r}). "
-        f"Commit or stage it first -- this sweep restores from the index after "
-        f"every mutation, so uncommitted work is lost and anything staged while "
-        f"mutated becomes the version restored.",
-        file=sys.stderr,
+    # The remedy differs by which kind of dirt this is, and telling the reader
+    # to "stage it" is actively wrong for the staged case -- staging is what put
+    # them here. Unstaged work would be destroyed by the first restore; staged
+    # work becomes the version every restore returns to, so a mutation staged
+    # mid-run is audited forever while the tree looks clean.
+    staged = status[:1] not in (" ", "?")
+    remedy = (
+        "Commit it, or reset the staged copy if it is a mutation from an "
+        "interrupted run -- staging is what makes the index the reference, so "
+        "anything staged while mutated is the version every restore returns to."
+        if staged
+        else "Commit or stage it first -- this sweep restores from the index "
+        "after every mutation, so uncommitted work is destroyed by the first "
+        "round."
     )
+    print(f"  REFUSING TO RUN: {REL} is not clean ({status!r}). {remedy}", file=sys.stderr)
     sys.exit(2)
 
 original = TARGET.read_text()
