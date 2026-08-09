@@ -31,6 +31,38 @@ REL = "crates/quota-core/src/wire_sanity.rs"
 original = TARGET.read_text()
 lines = original.splitlines(keepends=True)
 
+# Cross-check the population against an independent count before doing anything
+# with it. This sweep enumerates by matching `findings.push`, and a rule that
+# reaches the report another way -- pushed onto a differently-named binding, or
+# extended from a helper -- is invisible to that match. The sweep would then
+# audit a subset and report it as the whole, which is the exact failure it
+# exists to detect, committed by the detector.
+#
+# The independent signal is the number of finding message formats, since every
+# rule that can fire must have text to fire with. Counting a different artefact
+# is the point: a miscount shared by both would defeat this.
+#
+# The message pattern accepts more than one leading placeholder because a
+# cross-entry rule names the provider and account separately rather than through
+# the single prefix an entry-level rule uses. Matching only the common form made
+# the counts disagree by one and stopped the sweep -- which is the refusal
+# working, on the sweep's own pattern rather than on the file.
+PUSH_PATTERN = re.compile(r"findings\.push")
+MESSAGE_PATTERN = re.compile(r'"(?:\{[a-z_]+\}[:/])+')
+
+pushes = len(PUSH_PATTERN.findall(original))
+message_sites = len(MESSAGE_PATTERN.findall(original))
+
+if message_sites != pushes:
+    print(
+        f"  REFUSING TO RUN: {pushes} findings.push sites but {message_sites} "
+        f"finding messages. The enumeration is incomplete, so a clean result "
+        f"would describe a subset. Fix the sweep, not the count.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+print(f"  population agrees: {pushes} rules by two independent counts")
+
 # Each rule is an `if <cond> {` whose body pushes a finding. Find the guard line
 # for every findings.push by walking back to the nearest enclosing `if`.
 push_lines = [i for i, l in enumerate(lines) if "findings.push" in l]
