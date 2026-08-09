@@ -441,24 +441,32 @@ async fn probe_model(
         .send_raw(client)
         .await?;
 
-    if response.status == 401 {
-        return Err(FetchError::Unauthorized(format!(
-            "HTTP {}",
-            response.status
-        )));
-    }
-    if response.status != 200 && response.status != 429 {
-        let excerpt: String = String::from_utf8_lossy(&response.body)
-            .chars()
-            .take(200)
-            .collect();
-        return Err(FetchError::Upstream(format!(
-            "HTTP {}: {excerpt}",
-            response.status
-        )));
-    }
-
+    classify_probe_status(response.status, &response.body)?;
     Ok(response)
+}
+
+/// Decide whether a probe response is one whose headers should be read.
+///
+/// Split out from the request so the decision can be tested: the request itself
+/// needs a live endpoint, and this is the part with the provider-specific rule
+/// in it.
+///
+/// 429 is accepted deliberately, and it is the reason this provider uses a raw
+/// send rather than the shared status handling. The quota figures live in
+/// `x-ratelimit-*` response headers that are present on a refusal as well as a
+/// success -- an exhausted account answers 429 and that response still states
+/// the limit and its reset. Rejecting it would make a provider disappear from
+/// the wire exactly when it is most constrained, which reads to a consumer as
+/// capacity that was never measured.
+fn classify_probe_status(status: u16, body: &[u8]) -> Result<(), FetchError> {
+    if status == 401 {
+        return Err(FetchError::Unauthorized(format!("HTTP {status}")));
+    }
+    if status != 200 && status != 429 {
+        let excerpt: String = String::from_utf8_lossy(body).chars().take(200).collect();
+        return Err(FetchError::Upstream(format!("HTTP {status}: {excerpt}")));
+    }
+    Ok(())
 }
 
 fn headers_to_snapshot(response: &HttpResponse) -> DoubaoHeaderSnapshot {
@@ -560,6 +568,47 @@ impl UsageProvider for DoubaoProvider {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// A refusal still carries the quota figures, so it must not be rejected.
+    ///
+    /// This provider reads its windows from `x-ratelimit-*` response headers,
+    /// which are present on a 429 as well as a 200. An exhausted account answers
+    /// 429 and that response states both the limit and its reset -- so treating
+    /// it as an upstream error would drop the provider from the wire at exactly
+    /// the moment it is most constrained, and a missing window reads as capacity
+    /// that was never measured rather than as capacity that is gone.
+    #[test]
+    fn a_rate_limited_probe_is_accepted_so_its_headers_can_be_read() {
+        assert!(classify_probe_status(429, b"").is_ok());
+    }
+
+    /// The paired case: 200 is accepted for the ordinary reason.
+    #[test]
+    fn a_successful_probe_is_accepted() {
+        assert!(classify_probe_status(200, b"").is_ok());
+    }
+
+    /// Every other status is refused, and the two refusals are distinguished.
+    ///
+    /// 401 is non-transient -- a dead key keeps failing, and serving a stale
+    /// window under it would hide that. Other statuses are transient, so the
+    /// last healthy window keeps being served through a flap instead of being
+    /// replaced by a degraded entry.
+    #[test]
+    fn other_statuses_are_refused_with_the_class_that_matches_them() {
+        assert!(matches!(
+            classify_probe_status(401, b""),
+            Err(FetchError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            classify_probe_status(500, b"upstream exploded"),
+            Err(FetchError::Upstream(_))
+        ));
+        assert!(matches!(
+            classify_probe_status(404, b""),
+            Err(FetchError::Upstream(_))
+        ));
+    }
 
     #[test]
     fn coding_plan_payload_maps_all_three_windows() {
