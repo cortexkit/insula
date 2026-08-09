@@ -230,7 +230,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
         // even if taking the new one fails.
         *guard = None;
 
-        let store = locate_chrome_cookie_store().ok_or(CookieError::NoStore)?;
+        let store = locate_chrome_cookie_store()?.ok_or(CookieError::NoStore)?;
         let key = safe_storage_key()?;
         let path = copy_cookie_store(&store)?;
         *guard = Some(Snapshot {
@@ -267,23 +267,53 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
 
 /// Candidate Chrome cookie-store paths (Default + numbered profiles).
 #[cfg(target_os = "macos")]
-fn locate_chrome_cookie_store() -> Option<PathBuf> {
-    let home = crate::env::home_dir()?;
-    let base = home.join("Library/Application Support/Google/Chrome");
+/// Find the most recently written Chrome cookie database.
+///
+/// `Ok(None)` means Chrome is not installed for this user, which is an ordinary
+/// and permanent state. `Err` means the profile directory is there and could not
+/// be listed -- a permission change, a stale mount, an I/O error -- which is a
+/// different fact about the host and one somebody can act on.
+///
+/// The distinction reaches the wire: absence becomes `credential_absent`, which
+/// tells a consumer no browser session exists here, while an unreadable store
+/// is reported as a condition of the moment and keeps serving the last healthy
+/// window rather than replacing it. Collapsing them would take the whole cookie
+/// cohort dark and report it as nobody having logged in.
+fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
+    let Some(home) = crate::env::home_dir() else {
+        return Ok(None);
+    };
+    locate_under(&home.join("Library/Application Support/Google/Chrome"))
+}
+
+/// Search and classify an arbitrary profile directory.
+///
+/// Separate from [`locate_chrome_cookie_store`], which resolves one fixed
+/// location under the home directory, so a test can pass a deliberately
+/// unlistable path instead of altering the real Chrome installation to reach
+/// that branch.
+fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> {
     // Chrome stores the cookie DB under each profile's "Network" dir (newer) or
     // directly in the profile dir (older). Prefer the most-recently-modified.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_dir() {
-                continue;
-            }
-            candidates.push(p.join("Network/Cookies"));
-            candidates.push(p.join("Cookies"));
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CookieError::Extract(format!(
+                "listing the Chrome profile directory: {error}"
+            )))
         }
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        candidates.push(p.join("Network/Cookies"));
+        candidates.push(p.join("Cookies"));
     }
-    candidates
+    Ok(candidates
         .into_iter()
         .filter(|p| p.is_file())
         .filter_map(|p| {
@@ -291,7 +321,7 @@ fn locate_chrome_cookie_store() -> Option<PathBuf> {
             Some((mtime, p))
         })
         .max_by_key(|(mtime, _)| *mtime)
-        .map(|(_, p)| p)
+        .map(|(_, p)| p))
 }
 
 /// Read the "Chrome Safe Storage" generic password from the login keychain via the
@@ -432,6 +462,52 @@ fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A Chrome directory that cannot be listed must not read as Chrome absent.
+    ///
+    /// The two states reach consumers differently: absence is a permanent fact
+    /// about the host and reports the account as never configured, while an
+    /// unreadable store is a condition of the moment and keeps the last healthy
+    /// window being served. Collapsing them takes all nine cookie-backed
+    /// providers dark at once and reports it as nobody having logged in.
+    ///
+    /// The unreadable directory is one whose contents cannot be listed. A
+    /// permission bit would not stop root, so on a root run the fixture would
+    /// quietly exercise the absent case while appearing to exercise this one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unlistable_profile_directory_is_not_reported_as_no_chrome() {
+        let root = std::env::temp_dir().join(format!("insula-cookies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Absent: the ordinary state where Chrome was never installed.
+        let missing = root.join("no-such-chrome");
+        assert!(
+            matches!(locate_under(&missing), Ok(None)),
+            "a missing profile directory must read as no Chrome installed"
+        );
+
+        // Present and unlistable: a file where the directory belongs, which is
+        // unreadable-as-a-directory for every user including root.
+        let occupied = root.join("occupied");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        let error = locate_under(&occupied)
+            .expect_err("an unlistable profile directory must not report as absent");
+        assert!(
+            matches!(error, CookieError::Extract(_)),
+            "expected Extract, got {error:?}"
+        );
+
+        // And an empty but readable directory is a real absence: Chrome is
+        // installed and holds no profile with a cookie store.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(locate_under(&empty), Ok(None)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     use super::*;
     use crate::provider::FetchError;
     use crate::refresh::{classify, FetchClass};
