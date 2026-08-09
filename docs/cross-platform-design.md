@@ -165,9 +165,20 @@ wrong-remedy reporting this design exists to avoid.
 Per-browser, and both the current and historical layouts must be probed:
 
 ```
-Linux    ~/.config/google-chrome/<Profile>/Network/Cookies
-         ~/.config/chromium/<Profile>/Network/Cookies
-         ~/.config/BraveSoftware/Brave-Browser/<Profile>/Network/Cookies
+Linux    ~/.config/google-chrome/<Profile>/{Network/,}Cookies
+         ~/.config/chromium/<Profile>/{Network/,}Cookies
+         ~/.config/BraveSoftware/Brave-Browser/<Profile>/{Network/,}Cookies
+
+         Both spellings, and NOT because one is legacy. Measured on Chrome
+         151 for linux arm64: a freshly created profile puts the database at
+         <Profile>/Cookies with no Network directory at all, including after
+         real network traffic. Documentation and secondary sources describe
+         the Network/ layout, so trusting either alone would have produced a
+         resolver that finds nothing on a current Chrome -- which is
+         indistinguishable from a host where nobody logged in.
+
+         Search both, prefer the most recently written, exactly as the macOS
+         path already does.
          (also the flatpak roots under ~/.var/app/…)
 
 Windows  %LOCALAPPDATA%\Google\Chrome\User Data\<Profile>\Network\Cookies
