@@ -88,8 +88,13 @@ if unmatched:
     print(f"  NOT REACHABLE by this sweep, check by hand: lines {unmatched}")
 print()
 
-undefended = []
-for idx in guards:
+def neutralise_and_run(idx):
+    """Disable the guard at `idx`, run the suite, restore, and report.
+
+    Returns (compiled, failed_test_names). Restoring comes from the index, which
+    is only correct when the tree is staged or committed -- see the module
+    docstring.
+    """
     guard = lines[idx]
     indent = guard[: len(guard) - len(guard.lstrip())]
     mutated = lines[:]
@@ -111,8 +116,44 @@ for idx in guards:
     compiled = re.search(r"^test result:", run.stdout, re.M) is not None
 
     subprocess.run(["git", "checkout", "--", REL], cwd=REPO, check=True)
+    return compiled, failed
 
-    label = guard.strip()[:64]
+
+# POSITIVE CONTROL, before any verdict below is trusted.
+#
+# "Every rule defended" is produced by a sweep that works AND by a sweep that has
+# lost the ability to detect -- a rewrite that stops applying, a verdict pattern
+# that stops matching after a refactor. One observable, two states, which is the
+# fault this script hunts, arriving in the script.
+#
+# So neutralise a rule whose defence is known and require the run to notice. If
+# it does not, the instrument cannot detect and every result below is
+# meaningless, so it refuses rather than reports.
+#
+# It terminates the regress rather than adding another layer needing its own
+# audit, because it FAILS CLOSED: a broken self-test does not pass its own check,
+# and the script exits.
+if not guards:
+    print("  REFUSING TO RUN: no mutable guard found at all", file=sys.stderr)
+    sys.exit(2)
+
+probe = guards[0]
+probe_compiled, probe_failed = neutralise_and_run(probe)
+if not (probe_compiled and probe_failed):
+    print(
+        f"  REFUSING TO RUN: neutralising the rule at line {probe + 1} did not "
+        f"redden any test. The sweep cannot detect, so a clean result below "
+        f"would mean nothing.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+print(f"  instrument proven live: neutralising line {probe + 1} reddened {probe_failed[0]}")
+print()
+
+undefended = []
+for idx in guards:
+    compiled, failed = neutralise_and_run(idx)
+    label = lines[idx].strip()[:64]
     if not compiled:
         # The guard binds something its body uses (`if let Some(x) = …`), so
         # replacing it with `if false` leaves that name unbound. The rule is
