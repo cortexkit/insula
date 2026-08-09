@@ -39,11 +39,11 @@
 /// published `api` and was indistinguishable from a key-based provider.
 pub const SOURCE_LABEL: &str = "cookie";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::Mutex;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 /// Why cookie extraction could not produce a session cookie. All variants are
@@ -84,7 +84,7 @@ pub enum CookieError {
 /// platform this would be dead code and the build denies warnings. The gate
 /// includes `test` so the classification stays exercised on any host -- it is
 /// pure, and it is the part a Linux port will reuse unchanged.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scheme {
     /// AES-128-CBC. On macOS the key comes from the keychain; on Linux, from a
@@ -103,7 +103,7 @@ pub(crate) enum Scheme {
     Unknown,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl Scheme {
     /// Classify by the value's own prefix.
     pub(crate) fn of(value: &[u8]) -> Self {
@@ -230,7 +230,7 @@ pub async fn chrome_cookies_for_async(domain_suffix: &str) -> Result<CookieJar, 
 
 /// Extract + decrypt all Chrome cookies whose `host_key` ends with `domain_suffix`
 /// (e.g. `"ollama.com"` matches `ollama.com` and `signin.ollama.com`).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn chrome_cookies_for(_domain_suffix: &str) -> Result<CookieJar, CookieError> {
     Err(CookieError::Unsupported)
 }
@@ -250,7 +250,7 @@ pub fn chrome_cookies_for(_domain_suffix: &str) -> Result<CookieJar, CookieError
 /// outlived a tick would let a provider stamp `fetchedAt` for a fetch whose
 /// underlying data was read during an earlier one, overstating freshness on the
 /// wire.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SNAPSHOT_TTL: Duration = Duration::from_secs(45);
 
 /// A copy of the cookie store, plus the key that decrypts what is inside it.
@@ -258,14 +258,14 @@ const SNAPSHOT_TTL: Duration = Duration::from_secs(45);
 /// The key is held with the snapshot rather than separately because the two are
 /// acquired together and are useless apart. Deriving it means another `security`
 /// subprocess, which was also being paid once per provider per tick.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Snapshot {
     path: PathBuf,
     key: Vec<u8>,
     taken_at: Instant,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for Snapshot {
     fn drop(&mut self) {
         // Best-effort: a leftover copy is a stale temp file, not a correctness
@@ -274,14 +274,14 @@ impl Drop for Snapshot {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 
 /// Whether a snapshot taken at `taken_at` must be replaced before serving `now`.
 ///
 /// Separated from the extraction path so the decision can be tested without a
 /// cookie store, a keychain, or control over the clock.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn snapshot_is_stale(taken_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
     match taken_at {
         // Nothing cached yet: the first caller after start always pays for one.
@@ -294,7 +294,7 @@ fn snapshot_is_stale(taken_at: Option<Instant>, now: Instant, ttl: Duration) -> 
 }
 
 /// Extract + decrypt all Chrome cookies whose `host_key` ends with `domain_suffix`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError> {
     // The lock is held across the copy so that a cohort fanning out together
     // takes ONE snapshot rather than racing to take nine identical ones. These
@@ -364,7 +364,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
 /// as absent, which is the conservative direction: naming a scheme is a claim
 /// that the scheme is the reason, and that claim is only safe when every refused
 /// row agrees on it.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn unreadable_or_absent(refused: &[Scheme]) -> CookieError {
     let sealed = |scheme: &Scheme| matches!(scheme, Scheme::V12 | Scheme::V20);
     match refused.first() {
@@ -393,13 +393,23 @@ fn unreadable_or_absent(refused: &[Scheme]) -> CookieError {
 /// way. The gate has to be repeated on every item that uses the gated imports
 /// above -- an item left ungated still compiles here, because on this platform
 /// the import it needs exists.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
     let Some(home) = crate::env::home_dir() else {
         return Ok(None);
     };
-    locate_under(&home.join("Library/Application Support/Google/Chrome"))
+    locate_under(&home.join(CHROME_DATA_SUBPATH))
 }
+
+/// Where Chrome keeps its user data, relative to the home directory.
+///
+/// This follows CHROME's behaviour rather than the host's convention for
+/// application data, because the directory belongs to Chrome. On Linux that is
+/// `~/.config/google-chrome` even though the same tree also holds XDG config.
+#[cfg(target_os = "macos")]
+const CHROME_DATA_SUBPATH: &str = "Library/Application Support/Google/Chrome";
+#[cfg(target_os = "linux")]
+const CHROME_DATA_SUBPATH: &str = ".config/google-chrome";
 
 /// Search and classify an arbitrary profile directory.
 ///
@@ -407,7 +417,7 @@ fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
 /// location under the home directory, so a test can pass a deliberately
 /// unlistable path instead of altering the real Chrome installation to reach
 /// that branch.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> {
     // Chrome stores the cookie DB under each profile's "Network" dir (newer) or
     // directly in the profile dir (older). Prefer the most-recently-modified.
@@ -420,6 +430,12 @@ fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> 
             )))
         }
     };
+    // Both spellings, and not because one is legacy: which one a profile uses
+    // depends on the Chrome that created it. Measured on Chrome 151 for Linux,
+    // a fresh profile has no `Network` directory at all and keeps the database
+    // directly in the profile, while the documented layout puts it under
+    // `Network/`. Searching only one finds nothing on the other, and finding
+    // nothing here is reported as a host where nobody logged in.
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let p = entry.path();
@@ -468,6 +484,34 @@ fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
     derive_key(&password, MACOS_PBKDF2_ROUNDS)
 }
 
+/// Derive the key for a `v10` cookie on Linux.
+///
+/// `v10` on Linux is the fallback Chrome uses when no keyring is available, and
+/// its password is a literal constant compiled into Chromium rather than a
+/// secret -- so this needs no keyring, no D-Bus, and cannot fail.
+///
+/// It is also more common than the `--password-store` flag suggests. Measured
+/// on a host whose Secret Service was running but whose collection was LOCKED:
+/// Chrome was told to use the keyring, silently fell back, and wrote `v10`.
+/// Any host whose keyring is locked when the browser starts behaves this way.
+///
+/// `v11` -- the keyring-backed scheme -- is recognised and refused rather than
+/// read: obtaining its password means a Secret Service conversation over D-Bus,
+/// and an untested key derivation here would not fail, it would produce
+/// plausible garbage. See [`Scheme`].
+#[cfg(target_os = "linux")]
+fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
+    derive_key(LINUX_FALLBACK_PASSWORD, LINUX_PBKDF2_ROUNDS)
+}
+
+/// The constant password Chromium uses for `v10` on Linux.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_FALLBACK_PASSWORD: &str = "peanuts";
+
+/// PBKDF2 rounds Chrome uses on Linux.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_PBKDF2_ROUNDS: u32 = 1;
+
 /// PBKDF2 rounds Chrome uses on macOS.
 ///
 /// Platform-specific and not interchangeable: Chrome on Linux derives the same
@@ -491,7 +535,7 @@ const MACOS_PBKDF2_ROUNDS: u32 = 1003;
 /// credential. So a test asserting merely that decryption "did not fail" passes
 /// with the wrong constant, and only a known-plaintext vector per scheme can
 /// tell the difference.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
     use hmac::Hmac;
     use sha1::Sha1;
@@ -507,7 +551,7 @@ fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
 /// Chrome keeps the database open, so this reads a consistent snapshot without
 /// contending on its lock. The caller owns the returned path and is responsible
 /// for removing it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
     let tmp = std::env::temp_dir().join(format!(
         "quota-chrome-cookies-{}-{}.db",
@@ -520,7 +564,7 @@ fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
 
 /// Read the encrypted cookies whose host_key ends with `domain_suffix` from a
 /// snapshot taken by [`copy_cookie_store`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_encrypted_cookies(
     snapshot: &std::path::Path,
     domain_suffix: &str,
@@ -564,14 +608,14 @@ fn read_encrypted_cookies(
 
 /// Decrypt one `v10` cookie value. Returns None if it isn't a `v10` blob or fails
 /// to decrypt (caller skips it). Pure given the key — unit-testable.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn decrypt_value(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
     decrypt_v10(encrypted, host_key, key)
 }
 
 /// The `v10` decryption, factored out so tests can exercise it with a synthetic
 /// blob encrypted under a known key (no real keychain needed).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
     use sha2::{Digest, Sha256};
@@ -781,9 +825,10 @@ mod tests {
             "the macOS key derivation changed"
         );
 
-        // The Linux constant, pinned now so a port cannot quietly reuse the
-        // macOS one: same password, same salt, one round, entirely different key.
-        let linux = derive_key("peanuts", 1).expect("derives");
+        // The Linux constants, named rather than repeated: this pins what the
+        // Linux key path actually uses, so changing either constant fails here
+        // instead of only changing behaviour on a platform this host cannot run.
+        let linux = derive_key(LINUX_FALLBACK_PASSWORD, LINUX_PBKDF2_ROUNDS).expect("derives");
         assert_eq!(
             linux,
             [
