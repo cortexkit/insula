@@ -338,6 +338,50 @@ mod tests {
         assert!(store.publish_if_current(&key, incarnation, new_sequence, new));
     }
 
+    /// The incarnation half of the publish fence has to be load-bearing on its
+    /// own, independently of the attempt sequence beside it.
+    ///
+    /// A handle removed and re-added gets a fresh incarnation, and an attempt
+    /// admitted before the removal may still be in flight. Its sequence can be
+    /// the newest one the re-added slot has issued -- nothing resets the
+    /// sequence counter across a reconcile -- so the sequence check alone lets
+    /// that attempt publish into a slot it never belonged to. The published
+    /// usage would then describe whatever credential the handle pointed at
+    /// before it was replaced, under the identity of the one that replaced it.
+    ///
+    /// The neighbouring test covers a re-added key whose in-flight attempt was
+    /// admitted under the OLD incarnation and never re-admitted, which the
+    /// sequence check happens to reject as well. This one constructs the case
+    /// where only the incarnation differs, so it fails if that conjunct is
+    /// dropped.
+    #[test]
+    fn an_attempt_from_a_previous_incarnation_cannot_publish_into_a_readded_slot() {
+        let now = Instant::now();
+        let handle = CredentialHandle::new("H");
+        let key = SlotKey::new("mock", handle.clone());
+        let mut store = SlotStore::new(now);
+
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let old_incarnation = store.get(&key).unwrap().incarnation;
+        let (in_flight, _) = store.admit(&key, old_incarnation).unwrap();
+
+        // The handle goes away and comes back: a new incarnation, and the slot
+        // is fresh.
+        store.reconcile("mock", &[], now);
+        store.reconcile("mock", std::slice::from_ref(&handle), now);
+        let new_incarnation = store.get(&key).unwrap().incarnation;
+        assert_ne!(new_incarnation, old_incarnation);
+
+        // Publish with the sequence the re-added slot currently holds, so the
+        // sequence check passes and the incarnation check is the only thing
+        // left to reject it. Without that check, this stale attempt publishes.
+        let current_sequence = store.get(&key).unwrap().attempt_sequence;
+        assert!(
+            !store.publish_if_current(&key, old_incarnation, current_sequence, in_flight),
+            "an attempt from a previous incarnation published into the re-added slot"
+        );
+    }
+
     #[test]
     fn incarnation_counter_wraps_without_panicking() {
         let now = Instant::now();
