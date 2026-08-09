@@ -84,30 +84,65 @@ lines = original.splitlines(keepends=True)
 # audit a subset and report it as the whole, which is the exact failure it
 # exists to detect, committed by the detector.
 #
-# The independent signal is the number of finding message formats, since every
-# rule that can fire must have text to fire with. Counting a different artefact
-# is the point: a miscount shared by both would defeat this.
+# The independent signal is the finding message formats, since every rule that
+# can fire must have text to fire with. Counting a different artefact is the
+# point: a miscount shared by both would defeat this.
 #
 # The message pattern accepts more than one leading placeholder because a
 # cross-entry rule names the provider and account separately rather than through
 # the single prefix an entry-level rule uses. Matching only the common form made
 # the counts disagree by one and stopped the sweep -- which is the refusal
 # working, on the sweep's own pattern rather than on the file.
+#
+# COMPARED BY LINE, NOT BY COUNT. Equal totals imply the same set only while
+# every rule has exactly one message and no other string carries the prefix --
+# a property of today's file, not of the check. A rule rewritten to push a bare
+# string while some unrelated literal gains a placeholder keeps both totals
+# identical and silently removes a rule from the population, which is the exact
+# failure this guard exists to catch.
 PUSH_PATTERN = re.compile(r"findings\.push")
 MESSAGE_PATTERN = re.compile(r'"(?:\{[a-z_]+\}[:/])+')
 
-pushes = len(PUSH_PATTERN.findall(original))
-message_sites = len(MESSAGE_PATTERN.findall(original))
+# Paired inside each push's OWN statement, not merely on a nearby line. A line
+# can hold a bare push and an unrelated placeholder string, which pairs by
+# proximity while the rule itself has become unenumerable.
+def push_statements(text):
+    """Yield (line number, source) for each `findings.push(...)` statement."""
+    for match in PUSH_PATTERN.finditer(text):
+        depth, end = 0, None
+        for i, ch in enumerate(text[match.start():], start=match.start()):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            end = len(text)
+        yield text[: match.start()].count("\n") + 1, text[match.start():end]
 
-if message_sites != pushes:
+
+statements = list(push_statements(original))
+silent_pushes = sorted(line for line, body in statements if not MESSAGE_PATTERN.search(body))
+
+# The reverse direction: a placeholder-shaped string that belongs to no push is
+# either a rule reaching the report another way, or a decoy the sweep would
+# miscount.
+claimed = "".join(body for _, body in statements)
+stray_messages = len(MESSAGE_PATTERN.findall(original)) - len(MESSAGE_PATTERN.findall(claimed))
+
+if silent_pushes or stray_messages:
     print(
-        f"  REFUSING TO RUN: {pushes} findings.push sites but {message_sites} "
-        f"finding messages. The enumeration is incomplete, so a clean result "
-        f"would describe a subset. Fix the sweep, not the count.",
+        f"  REFUSING TO RUN: the two enumerations disagree. "
+        f"findings.push carrying no finding message at lines {silent_pushes}; "
+        f"{stray_messages} finding-shaped message(s) belonging to no push. "
+        f"A rule this sweep cannot see would be reported as absent rather than "
+        f"unchecked -- fix the patterns, not the file.",
         file=sys.stderr,
     )
     sys.exit(2)
-print(f"  population agrees: {pushes} rules by two independent counts")
+print(f"  population agrees: {len(statements)} rules, each carrying its own message")
 
 # Each rule is an `if <cond> {` whose body pushes a finding. Find the guard line
 # for every findings.push by walking back to the nearest enclosing `if`.
