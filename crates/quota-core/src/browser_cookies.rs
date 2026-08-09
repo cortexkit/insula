@@ -334,9 +334,6 @@ fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> 
 /// `security` CLI (zero-dependency, and the path proven against the real keychain).
 #[cfg(target_os = "macos")]
 fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
-    use hmac::Hmac;
-    use sha1::Sha1;
-
     let output = std::process::Command::new("security")
         .args([
             "find-generic-password",
@@ -358,9 +355,39 @@ fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
         return Err(CookieError::NoKeychainKey("empty password".to_string()));
     }
 
-    // PBKDF2-HMAC-SHA1(password, "saltysalt", 1003) -> 16-byte AES key.
+    derive_key(&password, MACOS_PBKDF2_ROUNDS)
+}
+
+/// PBKDF2 rounds Chrome uses on macOS.
+///
+/// Platform-specific and not interchangeable: Chrome on Linux derives the same
+/// way with ONE round. Deriving with the wrong count is the quiet failure this
+/// scheme invites -- see [`derive_key`].
+#[cfg(any(target_os = "macos", test))]
+const MACOS_PBKDF2_ROUNDS: u32 = 1003;
+
+/// Derive Chrome's AES key from its storage password.
+///
+/// `PBKDF2-HMAC-SHA1(password, "saltysalt", rounds)` to 16 bytes. The round
+/// count is the caller's because it is the one part of this that varies by
+/// platform, and the password's source varies with it: a keychain item on macOS,
+/// the Secret Service or a fixed constant on Linux.
+///
+/// **A wrong round count does not fail.** It produces a different 16-byte key,
+/// which then decrypts every cookie into plausible-looking bytes -- AES-CBC has
+/// no integrity check here, so the only signal is that the plaintext is
+/// nonsense. Nothing raises, and the cookie jar comes back full of garbage that
+/// gets sent to the provider, which answers 401 and is published as a rejected
+/// credential. So a test asserting merely that decryption "did not fail" passes
+/// with the wrong constant, and only a known-plaintext vector per scheme can
+/// tell the difference.
+#[cfg(any(target_os = "macos", test))]
+fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
+    use hmac::Hmac;
+    use sha1::Sha1;
+
     let mut key = [0u8; 16];
-    pbkdf2::pbkdf2::<Hmac<Sha1>>(password.as_bytes(), b"saltysalt", 1003, &mut key)
+    pbkdf2::pbkdf2::<Hmac<Sha1>>(password.as_bytes(), b"saltysalt", rounds, &mut key)
         .map_err(|e| CookieError::Extract(format!("pbkdf2: {e}")))?;
     Ok(key.to_vec())
 }
@@ -468,6 +495,55 @@ fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The derived key is pinned to a known vector, per platform round count.
+    ///
+    /// This is the one property in the cookie path that cannot be checked by
+    /// observing a failure, because a wrong round count does not produce one. It
+    /// yields a valid 16-byte key that decrypts every cookie into nonsense, and
+    /// AES-CBC carries no integrity check to notice -- the jar comes back full,
+    /// the values are garbage, the provider answers 401, and it publishes as a
+    /// credential the upstream rejected rather than as anything about this code.
+    ///
+    /// So the assertion is on the KEY BYTES against an independently computed
+    /// vector, not on decryption succeeding. Chrome derives identically on Linux
+    /// with a single round, which is why the count is pinned here rather than
+    /// only used: the two schemes differ in nothing else, so a Linux port that
+    /// reuses the macOS constant would be a one-word error with no symptom.
+    #[test]
+    fn the_derived_key_is_pinned_per_platform_round_count() {
+        // PBKDF2-HMAC-SHA1("peanuts", "saltysalt", 1003, dkLen=16), computed with
+        // Python's hashlib rather than by running this code, so the vector is not
+        // whatever the implementation happens to produce.
+        let macos = derive_key("peanuts", MACOS_PBKDF2_ROUNDS).expect("derives");
+        assert_eq!(
+            macos,
+            [
+                0xd9, 0xa0, 0x9d, 0x49, 0x9b, 0x4e, 0x1b, 0x74, 0x61, 0xf2, 0x8e, 0x67, 0x97, 0x2c,
+                0x6d, 0xbd
+            ],
+            "the macOS key derivation changed"
+        );
+
+        // The Linux constant, pinned now so a port cannot quietly reuse the
+        // macOS one: same password, same salt, one round, entirely different key.
+        let linux = derive_key("peanuts", 1).expect("derives");
+        assert_eq!(
+            linux,
+            [
+                0xfd, 0x62, 0x1f, 0xe5, 0xa2, 0xb4, 0x02, 0x53, 0x9d, 0xfa, 0x14, 0x7c, 0xa9, 0x27,
+                0x27, 0x78
+            ],
+            "the single-round derivation changed"
+        );
+
+        // The point of the whole test: the round count is load-bearing and the
+        // two are not interchangeable.
+        assert_ne!(
+            macos, linux,
+            "round counts must not produce the same key, or neither vector proves anything"
+        );
+    }
 
     /// A Chrome directory that cannot be listed must not read as Chrome absent.
     ///
