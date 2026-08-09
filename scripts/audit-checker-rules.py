@@ -44,6 +44,20 @@ REL = "crates/quota-core/src/wire_sanity.rs"
 # mutation from an interrupted run that every restore would reinstate. Both are
 # silent -- the file looks restored, the tree looks clean, and the sweep reports
 # on code that is not the code.
+# Checked before anything else, because every guard below silently agrees that a
+# missing file is fine: `git status` reports nothing for a path that does not
+# exist, so the cleanliness check passes, and the read then raises a bare
+# FileNotFoundError with no cause and no remedy. The sweep does stop, which is
+# the right outcome reached by the wrong route -- it reads as the script being
+# broken rather than as its target having moved.
+if not TARGET.exists():
+    print(
+        f"  REFUSING TO RUN: {REL} does not exist. This sweep audits the rules in "
+        f"that one file; if it moved, point TARGET and REL at its new location.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 status = subprocess.run(
     ["git", "status", "--porcelain", "--", REL],
     cwd=REPO,
@@ -243,7 +257,15 @@ def neutralise_and_run(idx):
 # audit, because it FAILS CLOSED: a broken self-test does not pass its own check,
 # and the script exits.
 if not guards:
-    print("  REFUSING TO RUN: no mutable guard found at all", file=sys.stderr)
+    # Distinct from the empty-population refusal above: rules WERE found, and
+    # none of them is shaped so this sweep can neutralise it. The remedy is the
+    # rewrite pattern, not the enumeration.
+    print(
+        f"  REFUSING TO RUN: {len(statements)} rules found, but none has a guard "
+        f"this sweep can neutralise -- every one is a shape the `if <cond> {{` "
+        f"rewrite cannot reach, so there is no liveness probe to run.",
+        file=sys.stderr,
+    )
     sys.exit(2)
 
 probe = guards[0]
