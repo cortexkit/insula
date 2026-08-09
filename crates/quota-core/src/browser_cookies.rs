@@ -56,10 +56,80 @@ pub enum CookieError {
     NoKeychainKey(String),
     /// No cookie matching the requested domain in the store.
     NoCookie,
+    /// Cookies for the domain exist, but every one is encrypted with a scheme
+    /// this cannot read. Carries the scheme's own prefix.
+    ///
+    /// Distinct from [`Self::NoCookie`] because the two are opposite facts about
+    /// the host: no cookie means nobody logged in, while this means somebody
+    /// did and the values are sealed. Chrome's App-Bound Encryption (`v20`)
+    /// holds its key in a service that validates the calling executable, so
+    /// this is a permanent and correct outcome on such a profile rather than a
+    /// fault -- but reporting it as an absent session would send someone to log
+    /// in again, which cannot help.
+    UnreadableScheme(&'static str),
     /// Reading the store or decrypting failed.
     Extract(String),
     /// This platform is not supported (not macOS).
     Unsupported,
+}
+
+/// Which encryption scheme a stored cookie value uses.
+///
+/// Chromium tags every encrypted value with a version prefix and the tag decides
+/// the key source and cipher. Dispatch is per VALUE rather than per platform,
+/// because one profile can legitimately hold several: a machine that gains a
+/// keyring re-encrypts new cookies while old ones keep their old prefix.
+///
+/// Gated because the only caller is the macOS extraction path; on another
+/// platform this would be dead code and the build denies warnings. The gate
+/// includes `test` so the classification stays exercised on any host -- it is
+/// pure, and it is the part a Linux port will reuse unchanged.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scheme {
+    /// AES-128-CBC. On macOS the key comes from the keychain; on Linux, from a
+    /// fixed constant password when no keyring is available.
+    V10,
+    /// As `v10`, but the password comes from the Secret Service or KWallet.
+    V11,
+    /// The xdg Secret Portal scheme, AES-256-GCM. Recognised, not read.
+    V12,
+    /// Chrome's App-Bound Encryption. The key lives in an elevation service
+    /// that validates the calling executable, so no other process can obtain
+    /// it. Recognised, not read.
+    V20,
+    /// No recognised prefix. Either an unencrypted value from a very old
+    /// profile or a scheme newer than this code.
+    Unknown,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Scheme {
+    /// Classify by the value's own prefix.
+    pub(crate) fn of(value: &[u8]) -> Self {
+        if value.starts_with(b"v10") {
+            Self::V10
+        } else if value.starts_with(b"v11") {
+            Self::V11
+        } else if value.starts_with(b"v12") {
+            Self::V12
+        } else if value.starts_with(b"v20") {
+            Self::V20
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// The prefix, for reporting which scheme was refused.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::V10 => "v10",
+            Self::V11 => "v11",
+            Self::V12 => "v12",
+            Self::V20 => "v20",
+            Self::Unknown => "unrecognised",
+        }
+    }
 }
 
 impl From<CookieError> for crate::provider::FetchError {
@@ -83,6 +153,14 @@ impl From<CookieError> for crate::provider::FetchError {
             CookieError::NoStore | CookieError::NoCookie | CookieError::Unsupported => {
                 crate::provider::FetchError::NoSession(detail)
             }
+            // Not NoSession: a session exists and is sealed. That class routes
+            // the provider into the health bucket meaning "nothing configured
+            // here", which would hide a host where somebody did log in and this
+            // simply cannot read it. Not transient either -- retrying an
+            // App-Bound-Encrypted profile never starts working.
+            CookieError::UnreadableScheme(_) => {
+                crate::provider::FetchError::CredentialUnusable(detail)
+            }
             CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
                 crate::provider::FetchError::Upstream(detail)
             }
@@ -98,6 +176,11 @@ impl std::fmt::Display for CookieError {
                 write!(f, "Chrome Safe Storage keychain key unavailable: {m}")
             }
             Self::NoCookie => write!(f, "no matching cookie for domain"),
+            Self::UnreadableScheme(scheme) => write!(
+                f,
+                "the browser session for this domain is encrypted with {scheme}, \
+                 which only the browser itself can decrypt"
+            ),
             Self::Extract(m) => write!(f, "cookie extraction failed: {m}"),
             Self::Unsupported => write!(f, "browser-cookie extraction is macOS+Chrome only"),
         }
@@ -248,6 +331,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
     drop(guard);
 
     let mut cookies = Vec::new();
+    let mut refused = Vec::new();
     for (host_key, name, encrypted) in rows {
         // A cookie we can't decrypt is skipped, not fatal — a partial jar that
         // still carries the session cookie is usable.
@@ -257,12 +341,38 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
                 value,
                 host_key,
             });
+        } else {
+            refused.push(Scheme::of(&encrypted));
         }
     }
     if cookies.is_empty() {
-        return Err(CookieError::NoCookie);
+        return Err(unreadable_or_absent(&refused));
     }
     Ok(CookieJar { cookies })
+}
+
+/// Decide what an empty jar means, given the schemes that were refused.
+///
+/// Reached only when nothing decrypted, and the two outcomes are opposite facts
+/// about the host: no rows at all means nobody logged in, while rows that all
+/// carry a scheme this cannot read mean somebody did and the values are sealed.
+/// Collapsing the second into the first sends a reader to log in again, which
+/// cannot help -- App-Bound Encryption will seal the new session exactly as it
+/// sealed the old one.
+///
+/// A row that failed for any other reason (a corrupt blob, a wrong key) reports
+/// as absent, which is the conservative direction: naming a scheme is a claim
+/// that the scheme is the reason, and that claim is only safe when every refused
+/// row agrees on it.
+#[cfg(any(target_os = "macos", test))]
+fn unreadable_or_absent(refused: &[Scheme]) -> CookieError {
+    let sealed = |scheme: &Scheme| matches!(scheme, Scheme::V12 | Scheme::V20);
+    match refused.first() {
+        Some(first) if sealed(first) && refused.iter().all(|s| s == first) => {
+            CookieError::UnreadableScheme(first.label())
+        }
+        _ => CookieError::NoCookie,
+    }
 }
 
 /// Find the most recently written Chrome cookie database.
@@ -495,6 +605,152 @@ fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every cookie failure is judged for which wire class it becomes.
+    ///
+    /// The class decides what a consumer does, and the three outcomes are not
+    /// interchangeable: `credential_absent` says nobody logged in, and the
+    /// health check keeps such providers out of its `degraded` list so that
+    /// list stays a set of things somebody can act on; `credential_unusable`
+    /// says somebody did log in and the credential cannot be used here, which
+    /// does appear there; and a transient class leaves a window already being
+    /// served in place rather than replacing it with a failure.
+    ///
+    /// Enumerated with an exhaustive match so a new variant stops compiling
+    /// here instead of taking whichever arm it happens to fall into.
+    #[test]
+    fn every_cookie_failure_maps_to_the_class_a_consumer_acts_on() {
+        use crate::provider::FetchError;
+
+        let all = [
+            CookieError::NoStore,
+            CookieError::NoCookie,
+            CookieError::Unsupported,
+            CookieError::UnreadableScheme("v20"),
+            CookieError::NoKeychainKey("locked".into()),
+            CookieError::Extract("mid-write".into()),
+        ];
+
+        for case in &all {
+            match case {
+                CookieError::NoStore
+                | CookieError::NoCookie
+                | CookieError::Unsupported
+                | CookieError::UnreadableScheme(_)
+                | CookieError::NoKeychainKey(_)
+                | CookieError::Extract(_) => {}
+            }
+        }
+
+        // Nothing is configured on this host.
+        for absent in [
+            CookieError::NoStore,
+            CookieError::NoCookie,
+            CookieError::Unsupported,
+        ] {
+            let label = absent.to_string();
+            assert!(
+                matches!(FetchError::from(absent), FetchError::NoSession(_)),
+                "{label} must report as an absent session"
+            );
+        }
+
+        // A session exists and cannot be read. Not absent, and not transient:
+        // retrying an App-Bound-Encrypted profile never starts working.
+        let sealed = FetchError::from(CookieError::UnreadableScheme("v20"));
+        assert!(
+            matches!(sealed, FetchError::CredentialUnusable(_)),
+            "a sealed session must not report as an absent one, got {sealed:?}"
+        );
+
+        // Conditions of the moment: a locked keychain or a store mid-write.
+        for transient in [
+            CookieError::NoKeychainKey("locked".into()),
+            CookieError::Extract("mid-write".into()),
+        ] {
+            let label = transient.to_string();
+            assert!(
+                matches!(FetchError::from(transient), FetchError::Upstream(_)),
+                "{label} must stay transient so a served window survives it"
+            );
+        }
+    }
+
+    /// A sealed session is not an absent one.
+    ///
+    /// Chrome's App-Bound Encryption keeps its key in a service that checks
+    /// which executable is asking, so those cookies cannot be read by this
+    /// process -- ever, on that profile. Reporting it as "no cookie" makes the
+    /// provider read as an account nobody logged into, which after the health
+    /// split lands it in the bucket operators are told not to watch, and points
+    /// whoever does look at logging in again. Logging in again produces another
+    /// sealed cookie.
+    ///
+    /// Asserted through the classifier rather than around it, so the mapping
+    /// from prefix to outcome is what is under test.
+    #[test]
+    fn a_sealed_session_is_reported_differently_from_an_absent_one() {
+        // Nothing was refused because nothing was there.
+        assert!(matches!(unreadable_or_absent(&[]), CookieError::NoCookie));
+
+        // Every row sealed by the same scheme: nameable, and named.
+        let sealed = unreadable_or_absent(&[Scheme::V20, Scheme::V20]);
+        assert!(
+            matches!(sealed, CookieError::UnreadableScheme("v20")),
+            "expected a named v20 refusal, got {sealed:?}"
+        );
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::V12]),
+            CookieError::UnreadableScheme("v12")
+        ));
+
+        // A scheme we CAN normally read failing is not a sealing claim: the key
+        // may simply be wrong, and blaming the scheme would send the reader
+        // somewhere there is nothing to find.
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::V10]),
+            CookieError::NoCookie
+        ));
+
+        // Mixed rows: one sealed, one failed for its own reason. Naming a
+        // scheme claims it is THE reason, which is only true when they agree.
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::V20, Scheme::V10]),
+            CookieError::NoCookie
+        ));
+    }
+
+    /// The scheme is read from the value, never assumed from the platform.
+    ///
+    /// One profile can hold several at once -- a machine that gains a keyring
+    /// re-encrypts new cookies while old ones keep their old prefix -- so a
+    /// per-platform assumption would misread the older half of a live profile.
+    #[test]
+    fn the_scheme_comes_from_the_value_prefix() {
+        assert_eq!(Scheme::of(b"v10somecipher"), Scheme::V10);
+        assert_eq!(Scheme::of(b"v11somecipher"), Scheme::V11);
+        assert_eq!(Scheme::of(b"v12somecipher"), Scheme::V12);
+        assert_eq!(Scheme::of(b"v20somecipher"), Scheme::V20);
+
+        // An old profile can hold values with no prefix at all, and a future
+        // Chrome can add one this does not know. Both are Unknown, and neither
+        // is claimed as a sealed session.
+        assert_eq!(Scheme::of(b"plaintextvalue"), Scheme::Unknown);
+        assert_eq!(Scheme::of(b"v99future"), Scheme::Unknown);
+        assert_eq!(Scheme::of(b""), Scheme::Unknown);
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::Unknown]),
+            CookieError::NoCookie
+        ));
+
+        // Not vacuous: the labels are distinct, so a classifier collapsing two
+        // schemes fails here rather than passing with a plausible name.
+        let labels = [Scheme::V10, Scheme::V11, Scheme::V12, Scheme::V20].map(Scheme::label);
+        let mut unique = labels.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "two schemes share a label");
+    }
 
     /// The derived key is pinned to a known vector, per platform round count.
     ///
