@@ -28,6 +28,33 @@ REPO = Path("/Users/ufukaltinok/Work/Projects/CortexKit/insula")
 TARGET = REPO / "crates/quota-core/src/wire_sanity.rs"
 REL = "crates/quota-core/src/wire_sanity.rs"
 
+# The restore below is `git checkout -- <path>`, which returns the file to what
+# the INDEX holds. That is the state wanted only if the index was made
+# authoritative BEFORE any mutation: staging a mutated file makes the mutation
+# the reference, and every restore afterwards faithfully restores the break.
+#
+# So refuse to start unless the target is clean against the index. A dirty target
+# means either uncommitted work the first restore would delete, or a staged
+# mutation from an interrupted run that every restore would reinstate. Both are
+# silent -- the file looks restored, the tree looks clean, and the sweep reports
+# on code that is not the code.
+status = subprocess.run(
+    ["git", "status", "--porcelain", "--", REL],
+    cwd=REPO,
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+if status:
+    print(
+        f"  REFUSING TO RUN: {REL} is not clean against the index ({status!r}). "
+        f"Commit or stage it first -- this sweep restores from the index after "
+        f"every mutation, so uncommitted work is lost and anything staged while "
+        f"mutated becomes the version restored.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 original = TARGET.read_text()
 lines = original.splitlines(keepends=True)
 
