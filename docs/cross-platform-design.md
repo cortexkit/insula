@@ -80,9 +80,25 @@ constant, and a wrong choice fails as garbage plaintext rather than an error.
 
 A profile can hold both prefixes at once, which is why dispatch is per value.
 
-`v12` (an xdg-portal scheme using HKDF-SHA256 and AES-256-GCM) exists for
-sandboxed installs. Out of scope initially; it must be *recognised* and refused
-by name rather than falling into the "not a cookie we understand" bucket.
+Which backend a profile actually used is decided by Chrome's `--password-store=`
+flag, and it is worth knowing the exact values because they are how a test host
+is made to produce each scheme deliberately rather than by hoping:
+
+| value | backend | scheme produced |
+| --- | --- | --- |
+| `basic` | constant fallback password | `v10` |
+| `gnome-libsecret` | Secret Service (`org.freedesktop.secrets`) | `v11` |
+| `kwallet`, `kwallet5`, `kwallet6` | KWallet over D-Bus | `v11` |
+| absent, or anything else | desktop-environment detection | either |
+
+Note there is no `detect` or `gnome` value: unrecognised strings fall through to
+detection rather than being rejected, so a typo silently becomes "detect" and the
+resulting profile proves nothing about the scheme you meant to test. On KDE
+Plasma 6 detection selects KWallet 6.
+
+`v12` (an xdg-portal Secret Portal scheme using AES-256-GCM) exists for sandboxed
+installs. Out of scope initially; it must be *recognised* and refused by name
+rather than falling into the "not a cookie we understand" bucket.
 
 **Windows.** Two schemes, and one of them is closed to us:
 
