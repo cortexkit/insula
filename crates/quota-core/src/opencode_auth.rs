@@ -74,7 +74,7 @@ pub fn auth_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("opencode/auth.json"));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/opencode/auth.json"))
+    crate::env::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
 }
 
 /// Read one provider's credential entry from opencode's auth.json. Returns

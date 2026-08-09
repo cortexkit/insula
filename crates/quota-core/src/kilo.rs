@@ -456,7 +456,7 @@ fn epoch_to_rfc3339(value: f64) -> Option<String> {
 }
 
 fn kilo_auth_file_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/kilo/auth.json"))
+    crate::env::home_dir().map(|home| home.join(".local/share/kilo/auth.json"))
 }
 
 fn read_auth_file_token() -> Option<String> {

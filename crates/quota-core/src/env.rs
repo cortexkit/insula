@@ -6,6 +6,57 @@
 //! the RFC 3339 / ISO 8601 UTC string the consumer's `Date.parse` expects.
 
 use chrono::{TimeZone, Utc};
+use std::path::PathBuf;
+
+/// The current user's home directory.
+///
+/// Every provider that reads a credential from disk starts here, so this is the
+/// one place the platform difference is expressed. Unix publishes `$HOME`;
+/// Windows normally does not, and a bare `HOME` read there returns `None` for
+/// every provider at once -- which this module reports as a host where nothing
+/// is configured. That failure is silent and looks exactly like the truth on a
+/// machine where the user has genuinely logged into nothing, so it is worth
+/// resolving centrally rather than at nine call sites.
+///
+/// `HOME` is still consulted first on every platform: a Unix-shaped environment
+/// is authoritative where it exists, and Windows shells that set it (MSYS, Git
+/// Bash, WSL interop) mean what they say. `USERPROFILE` is the native Windows
+/// answer, and `HOMEDRIVE` + `HOMEPATH` is the fallback for the domain-joined
+/// case where a profile lives on a mapped drive.
+///
+/// Note this resolves OUR home directory, not where another tool keeps its
+/// files. Several third-party CLIs this module reads from are Node programs
+/// that build POSIX-shaped paths under the home directory on every platform, so
+/// their locations are `home_dir().join(".config/...")` even on Windows --
+/// following the host convention there instead would look correct and find
+/// nothing.
+pub fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = non_empty("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let Some(profile) = non_empty("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    // Both halves are required: a drive with no path, or a path with no drive,
+    // does not name a directory, and joining one to a relative credential path
+    // would produce a location that happens to resolve against the process's
+    // current directory.
+    match (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+        (Some(mut drive), Some(path)) => {
+            drive.push(path);
+            Some(PathBuf::from(drive))
+        }
+        _ => None,
+    }
+}
+
+/// Read an environment variable, treating an empty value as absent.
+///
+/// An empty `HOME` is not a home directory, and letting it through would build
+/// paths relative to the process's current directory rather than failing.
+fn non_empty(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
 
 /// Return the value of the first non-empty env var in `names`, trimmed.
 pub fn first_env(names: &[&str]) -> Option<String> {

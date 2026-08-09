@@ -389,7 +389,7 @@ fn codex_home() -> Option<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::env::home_dir()
 }
 
 /// Resolve the API base, honoring a `chatgpt_base_url` override in config.toml.

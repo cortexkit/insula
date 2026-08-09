@@ -268,7 +268,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
 /// Candidate Chrome cookie-store paths (Default + numbered profiles).
 #[cfg(target_os = "macos")]
 fn locate_chrome_cookie_store() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = crate::env::home_dir()?;
     let base = home.join("Library/Application Support/Google/Chrome");
     // Chrome stores the cookie DB under each profile's "Network" dir (newer) or
     // directly in the profile dir (older). Prefer the most-recently-modified.

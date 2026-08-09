@@ -40,8 +40,7 @@ pub const PROVIDER_NAME: &str = "jetbrains";
 /// JetBrains config base dirs to scan for installed IDEs (macOS + Linux/XDG).
 fn config_base_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = crate::env::home_dir() {
         dirs.push(home.join("Library/Application Support/JetBrains")); // macOS
         dirs.push(home.join(".config/JetBrains")); // Linux
     }

@@ -296,10 +296,7 @@ pub fn vault_handles_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(HANDLES_PATH_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_RELATIVE_PATH))
+    crate::env::home_dir().map(|home| home.join(DEFAULT_RELATIVE_PATH))
 }
 
 enum LoadResult {

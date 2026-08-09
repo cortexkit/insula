@@ -51,7 +51,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 // ---- credential resolution --------------------------------------------------
 
 fn credentials_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/manicode/credentials.json"))
+    crate::env::home_dir().map(|h| h.join(".config/manicode/credentials.json"))
 }
 
 #[derive(Debug, Deserialize)]

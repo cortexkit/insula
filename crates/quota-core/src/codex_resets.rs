@@ -640,9 +640,7 @@ pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
             .join("cortexkit/ck-quota")
             .join("redemptions.json"));
     }
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    crate::env::home_dir()
         .map(|home| {
             home.join(".local/state/cortexkit/ck-quota")
                 .join("redemptions.json")

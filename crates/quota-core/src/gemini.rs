@@ -128,7 +128,7 @@ impl std::fmt::Debug for OauthCreds {
 }
 
 fn creds_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".gemini/oauth_creds.json"))
+    crate::env::home_dir().map(|home| home.join(".gemini/oauth_creds.json"))
 }
 
 fn read_creds() -> Result<OauthCreds, FetchError> {
