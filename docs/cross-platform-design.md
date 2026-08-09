@@ -87,9 +87,21 @@ is made to produce each scheme deliberately rather than by hoping:
 | value | backend | scheme produced |
 | --- | --- | --- |
 | `basic` | constant fallback password | `v10` |
-| `gnome-libsecret` | Secret Service (`org.freedesktop.secrets`) | `v11` |
-| `kwallet`, `kwallet5`, `kwallet6` | KWallet over D-Bus | `v11` |
+| `gnome-libsecret` | Secret Service (`org.freedesktop.secrets`) | `v11`, *if unlocked* |
+| `kwallet`, `kwallet5`, `kwallet6` | KWallet over D-Bus | `v11`, *if unlocked* |
 | absent, or anything else | desktop-environment detection | either |
+
+The flag requests a backend; it does not guarantee one. Measured on a host
+whose Secret Service was running but whose `login` collection was **locked**:
+Chrome asked for `gnome-libsecret` and wrote `v10` anyway, with no error and no
+indication in the profile that the request had not been honoured.
+
+Two consequences. Testing a `v11` reader needs the keyring genuinely unlocked,
+which in practice means a real desktop login rather than a headless run — a
+headless box will keep producing `v10` and appear to confirm a code path it
+never exercised. And `v10` is more common in the field than a reading of the
+flag suggests, since any host whose keyring is locked at browser start degrades
+to it silently.
 
 Note there is no `detect` or `gnome` value: unrecognised strings fall through to
 detection rather than being rejected, so a typo silently becomes "detect" and the
