@@ -31,17 +31,27 @@ use std::path::PathBuf;
 /// following the host convention there instead would look correct and find
 /// nothing.
 pub fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = non_empty("HOME") {
+    home_dir_from(non_empty)
+}
+
+/// The resolution order, over an arbitrary environment.
+///
+/// Split from [`home_dir`] so the Windows branches can be exercised anywhere.
+/// Reading the process environment directly would leave them testable only on
+/// the platform they exist for -- and a rule that cannot be tested where it is
+/// written is one nobody checks until a user reports that nothing resolves.
+fn home_dir_from(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(home) = lookup("HOME") {
         return Some(PathBuf::from(home));
     }
-    if let Some(profile) = non_empty("USERPROFILE") {
+    if let Some(profile) = lookup("USERPROFILE") {
         return Some(PathBuf::from(profile));
     }
     // Both halves are required: a drive with no path, or a path with no drive,
     // does not name a directory, and joining one to a relative credential path
     // would produce a location that happens to resolve against the process's
     // current directory.
-    match (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+    match (lookup("HOMEDRIVE"), lookup("HOMEPATH")) {
         (Some(mut drive), Some(path)) => {
             drive.push(path);
             Some(PathBuf::from(drive))
@@ -169,6 +179,90 @@ mod tests {
         assert!(unusable.to_string().contains("test creds"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fake environment, so the Windows branches run on every platform.
+    fn env_of<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, value)| *key == name && !value.is_empty())
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        }
+    }
+
+    /// `HOME` wins wherever it is set, including on Windows.
+    ///
+    /// Windows shells that publish it (MSYS, Git Bash, WSL interop) mean what
+    /// they say, and several third-party CLIs this module reads from are Node
+    /// programs that build POSIX-shaped paths under it on every platform. A
+    /// resolver preferring the native variable would send those reads to a
+    /// directory the tool never writes -- which resolves, finds nothing, and
+    /// reports as an account that was never configured.
+    #[test]
+    fn home_wins_over_the_windows_variables() {
+        let resolved = home_dir_from(env_of(&[
+            ("HOME", "/Users/someone"),
+            ("USERPROFILE", r"C:\Users\someone"),
+            ("HOMEDRIVE", "C:"),
+            ("HOMEPATH", r"\Users\someone"),
+        ]));
+        assert_eq!(resolved, Some(PathBuf::from("/Users/someone")));
+    }
+
+    /// The ordinary Windows case: no `HOME`, so `USERPROFILE` answers.
+    ///
+    /// Without this branch every credential path on Windows resolves to `None`
+    /// at once, and the module reports a host where nothing is configured --
+    /// indistinguishable from the truth on a machine nobody has logged in on.
+    #[test]
+    fn userprofile_answers_when_home_is_absent() {
+        let resolved = home_dir_from(env_of(&[
+            ("USERPROFILE", r"C:\Users\someone"),
+            ("HOMEDRIVE", "C:"),
+            ("HOMEPATH", r"\Users\other"),
+        ]));
+        assert_eq!(resolved, Some(PathBuf::from(r"C:\Users\someone")));
+    }
+
+    /// The domain-joined fallback, and it needs BOTH halves.
+    ///
+    /// A drive with no path, or a path with no drive, does not name a directory:
+    /// joining a relative credential path to either produces a location that
+    /// resolves against the process's current directory instead of failing.
+    #[test]
+    fn homedrive_and_homepath_answer_only_together() {
+        assert_eq!(
+            home_dir_from(env_of(&[
+                ("HOMEDRIVE", "C:"),
+                ("HOMEPATH", r"\Users\someone")
+            ])),
+            Some(PathBuf::from(r"C:\Users\someone"))
+        );
+        assert_eq!(home_dir_from(env_of(&[("HOMEDRIVE", "C:")])), None);
+        assert_eq!(
+            home_dir_from(env_of(&[("HOMEPATH", r"\Users\someone")])),
+            None
+        );
+    }
+
+    /// An empty value is not a home directory.
+    ///
+    /// A variable set to the empty string reads as present, and joining a
+    /// relative credential path to it produces a path resolved against the
+    /// process's working directory instead of a failure -- so a read would land
+    /// wherever the process happened to start.
+    #[test]
+    fn an_empty_value_is_treated_as_absent() {
+        let resolved = home_dir_from(env_of(&[
+            ("HOME", ""),
+            ("USERPROFILE", r"C:\Users\someone"),
+        ]));
+        assert_eq!(resolved, Some(PathBuf::from(r"C:\Users\someone")));
+
+        assert_eq!(home_dir_from(env_of(&[("HOME", "")])), None);
     }
 
     #[test]
