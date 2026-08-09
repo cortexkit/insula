@@ -644,8 +644,8 @@ mod tests {
     use chrono::TimeZone as _;
     use std::io::Write as _;
     use std::sync::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     use crate::credential_source::{VaultCredential, VaultGetError};
     use crate::provider::CredentialResolution;
@@ -745,35 +745,6 @@ mod tests {
         }
     }
 
-    async fn read_request(stream: &mut TcpStream) -> String {
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 2048];
-        loop {
-            let read = stream.read(&mut buffer).await.unwrap();
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            if bytes.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&bytes).to_string()
-    }
-
     async fn serve_sequence(
         responses: Vec<(u16, Vec<u8>)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -785,7 +756,7 @@ mod tests {
             let mut requests = Vec::new();
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut stream).await);
+                requests.push(crate::loopback::read_request(&mut stream).await);
                 let reason = if status == 200 {
                     "OK"
                 } else if status == 429 {
