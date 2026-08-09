@@ -1,4 +1,5 @@
-//! Synthetic usage fetcher — credential from an environment variable.
+//! Synthetic usage fetcher — credential from an environment variable, or from
+//! the shared opencode auth store.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! SYNTHETIC_API_KEY available. Endpoint, headers, and response shape ported from
@@ -12,11 +13,14 @@ use crate::{
     env,
     http::JsonRequest,
     model::{ProviderUsage, RateWindow, Usage},
+    opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "synthetic";
 const API_KEY_ENV: &[&str] = &["SYNTHETIC_API_KEY"];
+/// This provider's key in opencode's auth store.
+const OPENCODE_PROVIDER: &str = "synthetic";
 const BASE_URL_ENV: &[&str] = &["SYNTHETIC_API_URL"];
 const DEFAULT_BASE: &str = "https://api.synthetic.new/v2/quotas";
 
@@ -508,6 +512,62 @@ impl Default for SyntheticProvider {
     }
 }
 
+/// The API key, from the environment or the shared opencode auth store.
+///
+/// The environment wins so an operator can point this at another account
+/// without touching a file another tool owns. The store is the fallback because
+/// this key already lives there on any machine where opencode is configured for
+/// this provider, and several providers here read it for exactly that reason --
+/// requiring an environment variable as well would report an account that is
+/// configured on the host as one that is not.
+fn resolve_api_key() -> Result<String, FetchError> {
+    resolve_api_key_from(env::first_env(API_KEY_ENV), || {
+        opencode_auth::read_provider(OPENCODE_PROVIDER)
+    })
+}
+
+/// The precedence, over a supplied environment value and store lookup.
+///
+/// Split from [`resolve_api_key`] so both halves of the rule can be tested: that
+/// the environment wins when set, and that the store is consulted when it is
+/// not. Testing only the classification below would leave the fallback
+/// unreached by any test -- the wiring is the part that was missing before, and
+/// removing it is invisible to a suite that only exercises the classifier.
+///
+/// The lookup is taken lazily so an environment hit does not read a file.
+fn resolve_api_key_from(
+    from_env: Option<String>,
+    lookup: impl FnOnce() -> Result<Option<OpencodeAuth>, FetchError>,
+) -> Result<String, FetchError> {
+    if let Some(key) = from_env {
+        return Ok(key);
+    }
+    key_from_store(lookup()?)
+}
+
+/// Turn a store lookup into a key or a reason there is none.
+///
+/// Split from [`resolve_api_key`] so each outcome can be tested: the caller
+/// reads the real store at a fixed path, and the three cases differ in which
+/// error class they publish rather than in anything observable from a live run
+/// on a host that has only one of them.
+fn key_from_store(entry: Option<OpencodeAuth>) -> Result<String, FetchError> {
+    match entry {
+        Some(OpencodeAuth::Api { key }) => Ok(key),
+        // An OAuth entry would be this provider changing its credential shape
+        // rather than a key to send: the bearer belongs to a different grant, so
+        // sending it would draw a 401 and be published as a credential the
+        // upstream refused. Reported as unusable instead, which names what is
+        // actually on the host.
+        Some(OpencodeAuth::Oauth { .. }) => Err(FetchError::CredentialUnusable(
+            "the opencode synthetic entry holds an OAuth token, not an API key".to_string(),
+        )),
+        None => Err(FetchError::NoSession(format!(
+            "none of {API_KEY_ENV:?} is set and no synthetic entry in the opencode auth store"
+        ))),
+    }
+}
+
 #[async_trait]
 impl UsageProvider for SyntheticProvider {
     fn name(&self) -> &str {
@@ -516,8 +576,7 @@ impl UsageProvider for SyntheticProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let api_key = env::first_env(API_KEY_ENV)
-                .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
+            let api_key = resolve_api_key()?;
             let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
 
             let body = JsonRequest::get(base)
@@ -535,6 +594,80 @@ impl UsageProvider for SyntheticProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The environment wins, and the store is consulted when it is silent.
+    ///
+    /// Both halves matter. Without the first, an operator cannot point this at
+    /// another account without editing a file another tool owns. Without the
+    /// second, a host where opencode holds this credential reports the provider
+    /// as never configured -- which is the state that made this provider dark
+    /// on machines that had a working key all along.
+    #[test]
+    fn the_environment_wins_and_the_store_is_the_fallback() {
+        let unread = || panic!("the store must not be read when the environment answers");
+        let key = resolve_api_key_from(Some("from-env".to_string()), unread)
+            .expect("an environment key is used as-is");
+        assert_eq!(key, "from-env");
+
+        // Not vacuous: with no environment value the store is reached, so
+        // deleting the fallback fails here rather than passing quietly.
+        let key = resolve_api_key_from(None, || {
+            Ok(Some(OpencodeAuth::Api {
+                key: "from-store".to_string(),
+            }))
+        })
+        .expect("the store answers when the environment does not");
+        assert_eq!(key, "from-store");
+
+        // And a store that cannot be read is not a store with nothing in it.
+        let error = resolve_api_key_from(None, || {
+            Err(FetchError::CredentialUnusable("unreadable".to_string()))
+        })
+        .expect_err("a failed store read must not read as no credential");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "expected CredentialUnusable, got {error:?}"
+        );
+    }
+
+    /// The store lookup publishes a different reason for each outcome.
+    ///
+    /// All three reach a consumer as "no usage", and they mean different things
+    /// to whoever reads the output: a missing entry is a host where this
+    /// provider was never configured, while an entry of the wrong shape is a
+    /// host somebody must look at. The classes are treated differently as far
+    /// out as the health buckets, where absence is deliberately left out of the
+    /// count an operator watches.
+    #[test]
+    fn each_store_outcome_publishes_its_own_reason() {
+        let key = key_from_store(Some(OpencodeAuth::Api {
+            key: "sk-test".to_string(),
+        }))
+        .expect("an api entry yields its key");
+        assert_eq!(key, "sk-test");
+
+        // The provider is configured in opencode but with a credential this
+        // endpoint cannot use. Not an absence: something is there.
+        let error = key_from_store(Some(OpencodeAuth::Oauth {
+            access: "token".to_string(),
+            refresh: None,
+            expires: None,
+        }))
+        .expect_err("an oauth entry is not an api key");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "expected CredentialUnusable, got {error:?}"
+        );
+
+        // No entry at all is the ordinary state on a host that does not use
+        // this provider.
+        let error = key_from_store(None).expect_err("no entry means no credential");
+        assert!(
+            matches!(error, FetchError::NoSession(_)),
+            "expected NoSession, got {error:?}"
+        );
+    }
+
     use super::*;
 
     #[test]
