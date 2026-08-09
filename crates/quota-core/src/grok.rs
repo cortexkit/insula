@@ -538,8 +538,6 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::sync::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     use crate::credential_source::{VaultCredential, VaultGetError};
     use crate::provider::CredentialResolution;
@@ -630,26 +628,15 @@ mod tests {
         }
     }
 
+    /// Serve one request and hand back what was sent, at this provider's path.
+    ///
+    /// Wraps the shared helper so the URL keeps the shape this provider
+    /// builds against. The shared reader is used because a single socket read
+    /// returns one TCP segment rather than the whole request, which makes any
+    /// assertion about what was NOT sent pass without reading it.
     async fn serve_once(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            let read = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]).to_string();
-            let reason = if status == 200 { "OK" } else { "Unauthorized" };
-            let headers = format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(headers.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-            request
-        });
-        (format!("http://{address}/usage"), task)
+        let (base, task) = crate::loopback::serve_once(status, body).await;
+        (format!("{base}/usage"), task)
     }
 
     fn write_handles(body: &str) -> std::path::PathBuf {

@@ -32,6 +32,8 @@ pub mod kilo;
 pub mod kimi;
 pub mod kimi_for_coding;
 pub mod llmproxy;
+#[cfg(test)]
+pub mod loopback;
 pub mod manus;
 pub mod mimo;
 pub mod minimax;
