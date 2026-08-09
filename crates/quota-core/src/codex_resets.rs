@@ -568,7 +568,31 @@ fn sync_parent_directory(parent: &Path) -> Result<(), JournalError> {
 
 #[cfg(windows)]
 fn sync_parent_directory(_parent: &Path) -> Result<(), JournalError> {
-    // Windows does not support opening directories for fsync through std::fs.
+    // Nothing to do here, but NOT because the guarantee is unnecessary -- this
+    // is a gap, and it is recorded rather than papered over.
+    //
+    // Windows has no documented equivalent of fsync on a directory. A directory
+    // handle can be opened with FILE_FLAG_BACKUP_SEMANTICS, but FlushFileBuffers
+    // is specified in terms of a file's data and does not promise directory-entry
+    // durability, so calling it here would look like a fix while guaranteeing
+    // nothing.
+    //
+    // The durable sequence on Windows puts the guarantee in the RENAME instead:
+    // MoveFileExW with MOVEFILE_WRITE_THROUGH does not return until the move is
+    // on disk. Rust's fs::rename does not pass that flag, so the rename above is
+    // not crash-durable on Windows as written -- a crash in the window after it
+    // returns can lose the rename while both the old and new contents survive.
+    //
+    // What that costs: this journal fences a banked reset credit against being
+    // spent twice. Losing a rename can lose the record of a redemption that
+    // already happened. The upstream consume endpoint is idempotent on the
+    // request id, which is the outer fence, so the failure is bounded -- but the
+    // local half of a two-part fence is weaker here than on Unix, and that is
+    // worth knowing before anyone relies on it.
+    //
+    // Not yet fixed because the feature is off unless `auto_use_resets` is
+    // configured, and no Windows host has configured it. Fixing it means calling
+    // MoveFileExW directly rather than fs::rename.
     Ok(())
 }
 
