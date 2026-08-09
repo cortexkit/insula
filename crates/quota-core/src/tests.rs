@@ -379,8 +379,55 @@ async fn read_never_blocks_on_an_inflight_fetch() {
     running.await.unwrap();
 }
 
+/// The canonical slug must actually reach the wire, not merely exist in a table.
+///
+/// The neighbouring test parses the mapping out of the source text, so it stays
+/// green even if nothing ever consults the map. That leaves the lookup itself
+/// unproven: replacing it with one that returns nothing for every provider
+/// passes, because absent is a LEGAL value here -- fourteen of this module's
+/// providers have no counterpart and correctly publish no slug at all.
+///
+/// So a consumer joining capacity to spend on `apiProvider` would find the field
+/// simply missing everywhere, which is indistinguishable from the honest case
+/// and reads as "this producer has no canonical name for anything".
+#[tokio::test]
+async fn a_mapped_provider_publishes_its_canonical_slug() {
+    // `codex` is in the map; `mock` deliberately is not, and its absence is the
+    // control -- without it, a lookup returning a constant slug for everything
+    // would also pass.
+    let registry = registry(&[("codex", false, true), ("mock", false, true)]);
+    tick(&registry).await;
+
+    let entries = registry.get_usage(None).await;
+    let slug = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.provider == name)
+            .unwrap_or_else(|| panic!("{name} must be served"))
+            .api_provider
+            .clone()
+    };
+
+    assert_eq!(
+        slug("codex").as_deref(),
+        Some("openai"),
+        "a mapped provider must publish its canonical slug on the wire"
+    );
+    assert_eq!(
+        slug("mock"),
+        None,
+        "a provider with no counterpart must publish no slug"
+    );
+}
+
 #[test]
 fn every_api_provider_key_names_a_registered_provider() {
+    // Read this as a check on the MAP, not on the lookup: it verifies the table is
+    // well-formed by parsing the source text, which stays true even if nothing
+    // ever calls the function. `a_mapped_provider_publishes_its_canonical_slug`
+    // covers the other half -- that the map is actually reached and its value
+    // reaches the wire.
+    //
     // `apiProvider` is a claim about identity, not a label: consumers join
     // pricing and spend data on it. The mapping is keyed by this module's own
     // provider name, so renaming a provider silently strips the canonical slug
