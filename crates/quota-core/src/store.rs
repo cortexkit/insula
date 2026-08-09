@@ -94,6 +94,20 @@ impl SlotStore {
 
     /// Apply one authoritative, canonical handle snapshot for a provider.
     /// Missing handles are reaped and new handles become immediately due.
+    ///
+    /// **Test-only.** Production reconciles every provider in one pass through
+    /// [`Self::reconcile_batch`], because a per-provider `retain` walks the whole
+    /// map once per provider. This exists so a test can set up one provider
+    /// without building a whole authoritative snapshot.
+    ///
+    /// It is therefore a SECOND implementation of the slot lifetime rule -- a
+    /// slot exists exactly while its handle is enumerated -- and the two share
+    /// only the birth half (`insert_missing`). The reaping halves are separate
+    /// expressions, so this one can drift from the shipped one while every test
+    /// built on it still passes. `batch_matches_per_provider_reconciliation`
+    /// pins them together; without it, tests here would describe behaviour the
+    /// module does not have.
+    #[cfg(test)]
     pub fn reconcile(&mut self, provider: &str, handles: &[CredentialHandle], now: Instant) {
         let active: HashSet<&CredentialHandle> = handles.iter().collect();
         self.slots
@@ -217,6 +231,59 @@ impl SlotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The test-only per-provider reconcile must agree with the shipped batch one.
+    ///
+    /// Seventeen tests in this file set up their world through `reconcile`, which
+    /// production never calls -- so if its reaping rule drifts from
+    /// `reconcile_batch`, those tests keep passing while describing a module that
+    /// does not exist. The two share the birth half and implement the death half
+    /// separately, which is exactly where a divergence would live.
+    ///
+    /// Driven with a case where reaping is the whole point: a handle is removed
+    /// from one provider while another provider keeps both of its own.
+    #[test]
+    fn batch_matches_per_provider_reconciliation() {
+        let now = Instant::now();
+        let kept = CredentialHandle::new("kept");
+        let removed = CredentialHandle::new("removed");
+        let other = [CredentialHandle::new("o1"), CredentialHandle::new("o2")];
+
+        let mut per_provider = SlotStore::new(now);
+        per_provider.reconcile("a", &[kept.clone(), removed.clone()], now);
+        per_provider.reconcile("b", &other, now);
+        per_provider.reconcile("a", std::slice::from_ref(&kept), now);
+
+        let mut batched = SlotStore::new(now);
+        let a_both = [kept.clone(), removed.clone()];
+        let a_kept = [kept.clone()];
+        batched.reconcile_batch(
+            &AuthoritativeHandles::new([("a", a_both.as_slice()), ("b", other.as_slice())]),
+            now,
+        );
+        batched.reconcile_batch(
+            &AuthoritativeHandles::new([("a", a_kept.as_slice()), ("b", other.as_slice())]),
+            now,
+        );
+
+        let keys = |store: &SlotStore| {
+            let mut keys: Vec<String> = store
+                .slots
+                .keys()
+                .map(|key| format!("{}/{}", key.provider, key.handle.stable_id()))
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&per_provider),
+            keys(&batched),
+            "the test-only reconcile disagrees with the shipped batch path"
+        );
+        // Not vacuous: reaping actually happened, so agreeing on "everything
+        // survived" is not what this proves.
+        assert!(!keys(&batched).contains(&"a/removed".to_string()));
+    }
 
     #[test]
     fn batch_reconciliation_preserves_slots_for_failed_providers() {
