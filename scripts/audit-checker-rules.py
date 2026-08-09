@@ -142,6 +142,20 @@ if silent_pushes or stray_messages:
         file=sys.stderr,
     )
     sys.exit(2)
+
+# Agreement is not enough on its own, because two derivations can be emptied
+# together by a change upstream of both -- renaming the vector rules push onto,
+# say -- and they then agree perfectly at zero. That is the most reassuring
+# possible way to report having checked nothing, so an empty population is
+# refused outright rather than swept.
+if not statements:
+    print(
+        "  REFUSING TO RUN: no rules found at all. Both readings agree, and they "
+        "agree about nothing -- something upstream of both patterns changed, so "
+        "a clean sweep below would describe an empty population.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 print(f"  population agrees: {len(statements)} rules, each carrying its own message")
 
 # Each rule is an `if <cond> {` whose body pushes a finding. Find the guard line
