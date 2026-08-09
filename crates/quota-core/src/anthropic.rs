@@ -375,9 +375,7 @@ impl UsageProvider for AnthropicProvider {
             return self.fetch_vault(handle.stable_id(), capability).await;
         }
 
-        let access = match opencode_auth::read_provider(OPENCODE_PROVIDER)
-            .map_err(FetchError::NoSession)
-        {
+        let access = match opencode_auth::read_provider(OPENCODE_PROVIDER) {
             Ok(Some(OpencodeAuth::Oauth { access, .. })) => access,
             Ok(Some(OpencodeAuth::Api { key })) => key,
             Ok(None) => {

@@ -511,18 +511,17 @@ impl UsageProvider for GrokProvider {
             return self.fetch_vault(capability).await;
         }
 
-        let entry =
-            match opencode_auth::read_provider(OPENCODE_PROVIDER).map_err(FetchError::NoSession) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => {
-                    return FetchAttempt::failure(
-                        None,
-                        None,
-                        FetchError::NoSession("no xai entry in opencode auth.json".to_string()),
-                    );
-                }
-                Err(error) => return FetchAttempt::failure(None, None, error),
-            };
+        let entry = match opencode_auth::read_provider(OPENCODE_PROVIDER) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                return FetchAttempt::failure(
+                    None,
+                    None,
+                    FetchError::NoSession("no xai entry in opencode auth.json".to_string()),
+                );
+            }
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
         let expired = entry.is_expired(opencode_auth::now_ms());
         let access = match &entry {
             OpencodeAuth::Oauth { access, .. } => access.clone(),

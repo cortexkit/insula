@@ -15,6 +15,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::provider::FetchError;
+
 /// One provider's credential entry in opencode's auth.json.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -77,19 +79,47 @@ pub fn auth_path() -> Option<PathBuf> {
     crate::env::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
 }
 
-/// Read one provider's credential entry from opencode's auth.json. Returns
-/// `Ok(None)` when the file or the provider entry is absent (a normal "no
-/// session" condition the caller folds into silent-degrade).
-pub fn read_provider(provider: &str) -> Result<Option<OpencodeAuth>, String> {
+/// Read one provider's credential entry from opencode's auth.json.
+///
+/// `Ok(None)` means nothing is configured: no auth file, or no entry for this
+/// provider. `Err` means the file is there and could not be used -- no
+/// permission, a directory in its place, an I/O error, or contents that will not
+/// parse.
+///
+/// The error type is [`FetchError`] rather than a string because the callers
+/// were each choosing a class for it, and both chose `NoSession` -- so an
+/// unreadable auth file reached the wire as `credential_absent`, the class that
+/// tells a consumer the account was never configured and lets an operator
+/// surface leave it out of the count it watches. Classifying here means a new
+/// caller cannot make that choice again.
+pub fn read_provider(provider: &str) -> Result<Option<OpencodeAuth>, FetchError> {
     let Some(path) = auth_path() else {
         return Ok(None);
     };
-    let data = match std::fs::read(&path) {
+    read_provider_at(&path, provider)
+}
+
+/// The read and its classification, over an arbitrary path.
+///
+/// Separate from [`read_provider`], which resolves one fixed location, so a test
+/// can point at a deliberately unreadable file instead of altering the real auth
+/// store to reach that branch.
+fn read_provider_at(
+    path: &std::path::Path,
+    provider: &str,
+) -> Result<Option<OpencodeAuth>, FetchError> {
+    let data = match std::fs::read(path) {
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+        // The path is deliberately not interpolated: this error string reaches
+        // the wire, and it would carry the operating-system username.
+        Err(e) => {
+            return Err(FetchError::CredentialUnusable(format!(
+                "reading the opencode auth store: {e}"
+            )))
+        }
     };
-    parse_provider(&data, provider)
+    parse_provider(&data, provider).map_err(FetchError::CredentialUnusable)
 }
 
 /// Parse one provider's entry from raw auth.json bytes. Pure — unit-testable.
@@ -131,6 +161,55 @@ mod tests {
         let raw = br#"{ "openai": { "type": "api", "key": "sk-xyz" } }"#;
         let auth = parse_provider(raw, "openai").unwrap().unwrap();
         assert!(matches!(auth, OpencodeAuth::Api { key } if key == "sk-xyz"));
+    }
+
+    /// An auth store that cannot be read must not report as one that is absent.
+    ///
+    /// Both reach a caller as "no credential", but they mean opposite things to
+    /// whoever is looking at the output: an absent store is the ordinary state
+    /// on a host that never configured these providers, while an unreadable one
+    /// is a host somebody must fix. The classes they map to are treated
+    /// differently all the way out to the health buckets, where absence is
+    /// deliberately excluded from the count an operator watches.
+    #[test]
+    fn an_unreadable_auth_store_is_not_reported_as_an_absent_one() {
+        let dir = std::env::temp_dir().join(format!("insula-oc-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent: no auth file at all.
+        let missing = dir.join("no-such-auth.json");
+        assert!(matches!(read_provider_at(&missing, "anthropic"), Ok(None)));
+
+        // Present and unreadable. A directory where the file belongs, rather
+        // than a permission bit, because a mode of 000 does not stop root -- so
+        // on a root run a permission fixture would quietly exercise the absent
+        // case while appearing to exercise this one.
+        let occupied = dir.join("occupied.json");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let error = read_provider_at(&occupied, "anthropic")
+            .expect_err("an unreadable auth store must not report as absent");
+        assert!(
+            matches!(error, FetchError::CredentialUnusable(_)),
+            "expected CredentialUnusable, got {error:?}"
+        );
+
+        // Unparseable contents are equally a host to fix, not a host with
+        // nothing configured.
+        let malformed = dir.join("malformed.json");
+        std::fs::write(&malformed, b"{ not json").unwrap();
+        let error = read_provider_at(&malformed, "anthropic")
+            .expect_err("unparseable contents must not report as absent");
+        assert!(matches!(error, FetchError::CredentialUnusable(_)));
+
+        // And a well-formed store simply lacking this provider is a real
+        // absence: the file belongs to a tool that holds many providers and this
+        // one was never signed into.
+        let without = dir.join("without.json");
+        std::fs::write(&without, br#"{"openai":{"type":"api","key":"k"}}"#).unwrap();
+        assert!(matches!(read_provider_at(&without, "anthropic"), Ok(None)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -265,8 +265,6 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
     Ok(CookieJar { cookies })
 }
 
-/// Candidate Chrome cookie-store paths (Default + numbered profiles).
-#[cfg(target_os = "macos")]
 /// Find the most recently written Chrome cookie database.
 ///
 /// `Ok(None)` means Chrome is not installed for this user, which is an ordinary
@@ -279,6 +277,13 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
 /// is reported as a condition of the moment and keeps serving the last healthy
 /// window rather than replacing it. Collapsing them would take the whole cookie
 /// cohort dark and report it as nobody having logged in.
+///
+/// macOS-only, like the rest of the extraction path: the store location and its
+/// encryption scheme are platform-specific, and the caller is gated the same
+/// way. The gate has to be repeated on every item that uses the gated imports
+/// above -- an item left ungated still compiles here, because on this platform
+/// the import it needs exists.
+#[cfg(target_os = "macos")]
 fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
     let Some(home) = crate::env::home_dir() else {
         return Ok(None);
@@ -292,6 +297,7 @@ fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
 /// location under the home directory, so a test can pass a deliberately
 /// unlistable path instead of altering the real Chrome installation to reach
 /// that branch.
+#[cfg(target_os = "macos")]
 fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> {
     // Chrome stores the cookie DB under each profile's "Network" dir (newer) or
     // directly in the profile dir (older). Prefer the most-recently-modified.
