@@ -123,12 +123,30 @@ def contains(repo: Path, commit: str) -> bool:
     Deliberately not `cat-file -e`, which reports on any object the repository
     holds -- including a fetched branch nobody merged. See the module docstring:
     that weaker check discounts a tree with unmerged work as a duplicate.
+
+    This command answers with THREE exit codes, not two: 0 means yes, 1 means no,
+    and 128 means it could not tell -- an unknown commit, an unborn HEAD, a
+    directory that is not a repository. Only 0 is a yes. Reading "not 1" as yes,
+    or "not 0" as no, would turn "I could not look" into a confident answer, and
+    the caller uses this to decide whether a tree is a discardable copy of
+    another.
     """
     out = subprocess.run(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, "HEAD"],
         capture_output=True,
         text=True,
     )
+    if out.returncode not in (0, 1):
+        # Not silently false: a tree this scan cannot read is not a tree whose
+        # history demonstrably excludes the commit, and treating it as one would
+        # quietly widen the set of repositories reported as live callers.
+        print(
+            f"  cannot determine ancestry in {repo}: git exited {out.returncode} "
+            f"-- treated as NOT containing, so this tree may be reported as a "
+            f"separate caller rather than a copy",
+            file=sys.stderr,
+        )
+        return False
     return out.returncode == 0
 
 
