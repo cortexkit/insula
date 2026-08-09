@@ -19,12 +19,18 @@ reports "16 of 17 defended" without naming the seventeenth invites the reader to
 round up.
 """
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path("/Users/ufukaltinok/Work/Projects/CortexKit/insula")
+
+# Seconds a single mutated run may take before it is treated as a hang. Sized
+# well above a healthy run of this suite (about two seconds) so a slow machine
+# is not misread as a hang; override to a small value to exercise the hang path.
+MUTATION_TIMEOUT = int(os.environ.get("MUTATION_TIMEOUT", "120"))
 TARGET = REPO / "crates/quota-core/src/wire_sanity.rs"
 REL = "crates/quota-core/src/wire_sanity.rs"
 
@@ -141,12 +147,26 @@ def neutralise_and_run(idx):
     mutated[idx] = f"{indent}if false {{\n"
     TARGET.write_text("".join(mutated))
 
-    run = subprocess.run(
-        ["cargo", "test", "-p", "quota-core", "--lib", "wire_sanity"],
-        cwd=REPO,
-        capture_output=True,
-        text=True,
-    )
+    # A mutated run has THREE outcomes, not two. Beyond red and green, a
+    # mutation can make the suite HANG -- a guard whose removal turns a bounded
+    # retry into an unbounded one produces no verdict at all. Without a cap the
+    # sweep blocks forever, reports nothing about any site after this one, and
+    # leaves the file mutated if it is killed by hand.
+    #
+    # A timeout gets its own verdict rather than being folded into not-reached,
+    # because the two mean opposite things: a hang says the condition changes
+    # control flow, a compile failure says the rewrite was malformed.
+    try:
+        run = subprocess.run(
+            ["cargo", "test", "-p", "quota-core", "--lib", "wire_sanity"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=MUTATION_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        subprocess.run(["git", "checkout", "--", REL], cwd=REPO, check=True)
+        return None, []
     failed = re.findall(r"^test (\S+) \.\.\. FAILED", run.stdout, re.M)
     # "Did the suite run at all" is the unambiguous question, and it has to be
     # asked FIRST. Asking "did it compile" first means matching on error text,
@@ -179,6 +199,14 @@ if not guards:
 
 probe = guards[0]
 probe_compiled, probe_failed = neutralise_and_run(probe)
+if probe_compiled is None:
+    print(
+        f"  REFUSING TO RUN: neutralising the rule at line {probe + 1} made the "
+        f"suite hang. A sweep that cannot tell a hang from a verdict cannot be "
+        f"trusted, and every result below would be one of the two.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 if not (probe_compiled and probe_failed):
     print(
         f"  REFUSING TO RUN: neutralising the rule at line {probe + 1} did not "
@@ -191,10 +219,20 @@ print(f"  instrument proven live: neutralising line {probe + 1} reddened {probe_
 print()
 
 undefended = []
+hung = []
 for idx in guards:
     compiled, failed = neutralise_and_run(idx)
     label = lines[idx].strip()[:64]
-    if not compiled:
+
+    if compiled is None:
+        # A fourth outcome, distinct from defended, undefended, and NOT
+        # REACHED. Removing this guard changed control flow enough that the
+        # suite never finished -- so the guard is load-bearing -- but no test
+        # ever reported on it, which leaves open whether anything asserts what
+        # it does.
+        print(f"  line {idx + 1}: HUNG, inspect by hand: {label}")
+        hung.append(idx + 1)
+    elif not compiled:
         # The guard binds something its body uses (`if let Some(x) = …`), so
         # replacing it with `if false` leaves that name unbound. The rule is
         # NOT REACHED by this sweep and has to be mutated by hand -- and it is
@@ -211,4 +249,6 @@ print()
 if TARGET.read_text() != original:
     print("  !! file not restored cleanly", file=sys.stderr)
     sys.exit(2)
+if hung:
+    print(f"  rules whose removal hung the suite: {hung}")
 print(f"  restored byte-identical; undefended rules: {undefended or 'none'}")
