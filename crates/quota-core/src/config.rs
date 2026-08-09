@@ -73,17 +73,26 @@ mod tests {
                 .auto_use_resets,
             0
         );
+        // Compared against a literal rather than against the constant. Asserting
+        // the clamped value equals `MAX_AUTO_USE_RESETS_SECS` is satisfied by
+        // any ceiling at all -- both sides move together, so the test proves
+        // clamping happens and never that it happens at a useful size. A ceiling
+        // raised past a credit's 30-day lifetime would arm the feature
+        // permanently: every credit is always "about to expire", so one is spent
+        // on the first tick that finds any.
         assert_eq!(
             parse(r#"{"codex":{"auto_use_resets":999999999}}"#)
                 .codex
                 .auto_use_resets,
-            MAX_AUTO_USE_RESETS_SECS
+            2_592_000,
+            "a config value above the ceiling must clamp to 30 days"
         );
         assert_eq!(
             parse(r#"{"codex":{"auto_use_resets":1e30}}"#)
                 .codex
                 .auto_use_resets,
-            MAX_AUTO_USE_RESETS_SECS
+            2_592_000,
+            "a float beyond u64 range must clamp to 30 days, not wrap"
         );
     }
 
