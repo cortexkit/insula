@@ -18,6 +18,10 @@ part fails when it cannot work.
 | providers compiled out off macOS | 9 (the cookie cohort) |
 | `quota-core` has ever been compiled for Windows | no |
 
+This table is the state *before* the work started, kept as the baseline the
+design was written against. The Status section below records what has since
+changed.
+
 Nothing here has been compiled for Windows, so the first deliverable is a build
 at all — every other item is unverifiable until one exists. It has to be a
 *native* build: cross-compiling from macOS fails in a dependency's C build for
@@ -255,6 +259,25 @@ One existing behaviour to preserve deliberately: current Chromium prepends a
 and later, which we already strip on macOS. It is not macOS-specific and applies
 to every platform's decrypt path.
 
+## Status
+
+What has shipped since this was written, so the sections below are read as
+design rather than as outstanding work:
+
+| item | state |
+|---|---|
+| Windows CI leg | **done** — both legs green on every commit |
+| `$HOME` resolution with `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` | **done**, tests run on every platform |
+| Cookie scheme classified per value (`v10`/`v11`/`v12`/`v20`) | **done** |
+| Linux `v10` cookie reading | **done**, proven against a real Chrome profile |
+| Linux `v11` (keyring) | refused by name, pending a host with an unlocked keyring |
+| Windows cookies | not started; `v20` closed by construction, `v10` reachable |
+| Windows journal rename durability | **gap, recorded** — see `sync_parent_directory` in `codex_resets.rs` |
+
+The two gating items below are both done. They are kept because the reasoning
+still explains why the work was ordered this way, and because the second one
+describes a failure mode that recurs whenever a new path is added.
+
 ## Ordering: what blocks what
 
 Two items gate everything else and are scheduled first rather than discovered
@@ -290,6 +313,13 @@ coverage.
    only "did not fail" would pass with the macOS iteration count on Linux.
    Fixtures include the `SHA256(host_key)` plaintext prefix, which is a
    database-version property rather than a macOS one.
+
+   Both round counts are now pinned to vectors computed outside this code, and
+   the prefix was confirmed present on Linux against a live profile. That prefix
+   is worth more than a fixture: because it is a plaintext this code can derive
+   independently, a decryption can be checked for correctness rather than merely
+   for not erroring — the only self-checking signal in a scheme with no
+   integrity check.
 3. **The refusal paths tested through the whole chain**, not on the variant
    alone. A consumer sees `CookieError` → `FetchError` → `error_class` →
    `classify`, and the hazard lives at the end of that chain: a terminal
