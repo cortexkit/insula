@@ -178,7 +178,7 @@ Pool {
   funding:   "granted" | "purchased" | "subscription" | "unknown"
   remaining: Option<Amount>
   total:     Option<Amount>
-  basis:     "reported" | "derived"   // how `remaining` was obtained
+  basis:     "reported" | "derived" | "unstated"  // how `remaining` was obtained
   spendable: Option<bool>             // provider says this may be drawn on
 }
 
@@ -209,6 +209,23 @@ knows which.
 denominated in currency; Manus is denominated in points that convert to nothing.
 An enum would force points into a currency slot or drop them.
 
+**Both enums tolerate a value they do not recognise**, and this is the one
+correction the shape needed after review. The payload crosses a repository
+boundary, so producer and consumer versions move independently — and a closed
+enum makes the first new variant fail deserialization of the *whole entry*, not
+one field. Measured before fixing: an entry with a healthy 42% window and one
+pool of an unrecognised funding loses everything, so a new credit-pool kind
+would delete an account's quota signal and read as the provider being
+unavailable.
+
+`funding` falls back to `unknown`, where the fallback and the meaning already
+agree — a kind this consumer cannot name is one it must not spend from. `basis`
+falls back to a distinct `unstated` rather than to `derived`, because both are
+read conservatively but `derived` is a *claim about how a number was obtained*,
+and answering "I do not know" with it would assert a computation nobody
+performed. Keeping `unstated` separate also leaves the existence of a new basis
+visible instead of absorbed into a real one.
+
 **`spendable` is tri-state and comes from the provider**, not from
 `remaining > 0`. Anthropic publishes `is_enabled`, `user_disabled` and
 `can_purchase_credits` directly, so a pool can be non-empty and closed. Inferring
@@ -217,6 +234,37 @@ it from the amount would report a disabled pool as available headroom.
 What it deliberately does not carry: a percentage, a reset, a window length, or
 any field a pace calculation reads. A pool with a period is a `RateWindow` and
 belongs in `usage`.
+
+## What a consumer does when the provider says nothing
+
+Three fields can be absent or unrecognised, and each has a direction that is
+safe. All three are consumer policy rather than wire facts, so they belong in
+`consumer-contract.md` once pools ship; they are recorded here because deciding
+them late means every consumer has already defaulted them silently.
+
+**`spendable` absent** — the provider does not say whether this pool may be
+drawn on. The safe reading differs by what the reader is about to do, and both
+readings are correct at once:
+
+| reader | treat absent as | why |
+|---|---|---|
+| a router about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
+| a UI showing the account | **unknown** | hiding a real pool misleads a person who could act on it |
+
+The asymmetry is the whole argument: a display that omits a live pool is a
+smaller harm than a router that spends from a closed one. A single global
+default would have to pick one and be wrong for the other reader.
+
+**`funding` is `unknown`** — either the provider named a pool without defining
+it, or the producer used a kind this consumer predates. Do not spend from it
+under a policy that names a specific funding. "Only granted credits" must mean
+*only pools stated as granted*, never *everything not stated as purchased*.
+
+**`basis` is `unstated`** — treat `remaining` as a ceiling. Never as an exact
+figure, and never as a reason to drop the pool.
+
+The shape of all three: **absence is not a value**, and the correct reading of
+absence depends on what the reader is about to do with it.
 
 ## Where the policy lives
 
