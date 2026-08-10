@@ -838,6 +838,12 @@ mod tests {
 
         // The one actually compiled in agrees with the table above, so this
         // cannot pass while the constant the code uses says something else.
+        //
+        // Gated because the constant exists only where extraction is supported,
+        // while this test compiles everywhere. On a platform with no cookie
+        // path the table above is still worth asserting -- it is the check that
+        // survives someone editing a value they cannot compile.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert_eq!(
             CHROME_DATA_SUBPATH,
             chrome_data_subpath(std::env::consts::OS)
