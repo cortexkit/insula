@@ -164,6 +164,60 @@ credits" policy is exactly expressible. Kilo reports grants per pool and
 consumption against their sum, so the same policy is only a ceiling. One field
 tells a consumer which of the two it is holding.
 
+## The shape
+
+Derived from the six payloads examined rather than from first principles, and
+checked back against each one.
+
+```
+spend: [ Pool ]          // per entry, alongside `usage`; absent when unknown
+
+Pool {
+  id:        String      // the provider's own name for it, never ours
+  label:     String      // display text
+  funding:   "granted" | "purchased" | "subscription" | "unknown"
+  remaining: Option<Amount>
+  total:     Option<Amount>
+  basis:     "reported" | "derived"   // how `remaining` was obtained
+  spendable: Option<bool>             // provider says this may be drawn on
+}
+
+Amount {
+  minor:    i64          // integer minor units, never a float
+  exponent: u8           // 2 for cents; 0 for whole credits or points
+  unit:     String       // "USD", "CNY", or a provider's credit label
+}
+```
+
+Five decisions in there are load-bearing, and each was forced by a payload:
+
+**`id` is the provider's own name.** MiniMax's wallet separates
+`voucher_balance`, `cash_balance` and `credit_balance` without publicly defining
+which is a gift. Publishing `voucher` and letting a consumer decide is honest;
+publishing `granted` is us inventing the label a spend policy keys on.
+
+**`funding` therefore admits `"unknown"`, and it is not a failure value.** It is
+the correct answer for every MiniMax pool today. A three-value enum would push
+callers to guess.
+
+**`basis` distinguishes reported from derived**, because DeepSeek reports
+`granted_balance` as a live remainder while kilo's is a grant with consumption
+tracked against the sum. Same field, different meaning, and only the producer
+knows which.
+
+**`unit` is a free string, not a currency enum.** DeepSeek and Anthropic are
+denominated in currency; Manus is denominated in points that convert to nothing.
+An enum would force points into a currency slot or drop them.
+
+**`spendable` is tri-state and comes from the provider**, not from
+`remaining > 0`. Anthropic publishes `is_enabled`, `user_disabled` and
+`can_purchase_credits` directly, so a pool can be non-empty and closed. Inferring
+it from the amount would report a disabled pool as available headroom.
+
+What it deliberately does not carry: a percentage, a reset, a window length, or
+any field a pace calculation reads. A pool with a period is a `RateWindow` and
+belongs in `usage`.
+
 ## Where the policy lives
 
 Publishing a balance is not spending one. The decision of *when* money may be
