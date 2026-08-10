@@ -129,6 +129,27 @@ cookies are likely `v20` and unreadable by us. Some profiles remain `v10` (per-
 user installs, custom data directories, policy-disabled ABE), and mixed profiles
 are normal.
 
+**A second obstacle sits in front of the encryption, and it was measured rather
+than anticipated.** While Chrome is running on Windows it holds the cookie
+database under an exclusive lock that refuses a copy *and* refuses an open with
+`FileShare.ReadWrite` — verified against a live profile:
+
+```
+Copy-Item …\Network\Cookies      → "being used by another process"
+[IO.File]::Open(…,'Open','Read','ReadWrite') → "being used by another process"
+```
+
+That is stricter than macOS, where Chrome also holds the file open but a copy
+succeeds — which is what the existing extraction relies on. So a Windows reader
+cannot reuse the snapshot approach: it would need a Volume Shadow Copy, or to
+read only while Chrome is not running, and the second is not a real option for a
+background poller on a desktop.
+
+This matters for sequencing. The cost of Windows cookie support is the shadow-copy
+machinery *plus* whatever fraction of profiles are still `v10`, and the first
+half is paid even when the second turns out to be zero. Establish the `v10`/`v20`
+split on a real profile before building either.
+
 This is not a gap to engineer around. Reading `v20` would mean impersonating
 Chrome to its own elevation service, which is precisely what the mechanism
 exists to prevent.
@@ -271,7 +292,7 @@ design rather than as outstanding work:
 | Cookie scheme classified per value (`v10`/`v11`/`v12`/`v20`) | **done** |
 | Linux `v10` cookie reading | **done**, proven against a real Chrome profile |
 | Linux `v11` (keyring) | refused by name, pending a host with an unlocked keyring |
-| Windows cookies | not started; `v20` closed by construction, `v10` reachable |
+| Windows cookies | not started; `v20` closed by construction, `v10` reachable, and the running-Chrome file lock is a second obstacle in front of both |
 | Windows journal rename durability | **gap, recorded** — see `sync_parent_directory` in `codex_resets.rs` |
 
 The two gating items below are both done. They are kept because the reasoning
