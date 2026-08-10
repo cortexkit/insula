@@ -182,7 +182,10 @@ impl std::fmt::Display for CookieError {
                  which only the browser itself can decrypt"
             ),
             Self::Extract(m) => write!(f, "cookie extraction failed: {m}"),
-            Self::Unsupported => write!(f, "browser-cookie extraction is macOS+Chrome only"),
+            Self::Unsupported => write!(
+                f,
+                "browser-cookie extraction is not supported on this platform"
+            ),
         }
     }
 }
@@ -388,11 +391,10 @@ fn unreadable_or_absent(refused: &[Scheme]) -> CookieError {
 /// window rather than replacing it. Collapsing them would take the whole cookie
 /// cohort dark and report it as nobody having logged in.
 ///
-/// macOS-only, like the rest of the extraction path: the store location and its
-/// encryption scheme are platform-specific, and the caller is gated the same
-/// way. The gate has to be repeated on every item that uses the gated imports
-/// above -- an item left ungated still compiles here, because on this platform
-/// the import it needs exists.
+/// Gated to the platforms whose store layout and key source this understands,
+/// like the rest of the extraction path. The gate has to be repeated on every
+/// item using the gated imports above -- an item left ungated still compiles on
+/// a platform where the import it needs exists, and fails only on the others.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
     let Some(home) = crate::env::home_dir() else {
