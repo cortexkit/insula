@@ -150,6 +150,31 @@ machinery *plus* whatever fraction of profiles are still `v10`, and the first
 half is paid even when the second turns out to be zero. Establish the `v10`/`v20`
 split on a real profile before building either.
 
+**Measured, and it settles the lane.** The cookie database is locked, but
+`Local State` is not, and it answers the question directly — it carries the key
+blobs, each tagged with the scheme that owns it. On a current default install
+(Chrome 152, Windows 11, per-user install, non-administrator account):
+
+```
+os_crypt.app_bound_encrypted_key  → prefix "APPB",  644 bytes
+os_crypt.encrypted_key            → prefix "DPAPI", 293 bytes
+```
+
+The `APPB` blob is present, so App-Bound Encryption is active and new cookies
+are written as `v20` — sealed to Chrome's own executable. The legacy `DPAPI` key
+remains beside it for cookies written before ABE, which is why profiles are
+mixed rather than one or the other.
+
+So Windows cookie support would cost shadow-copy machinery to reach a database
+whose *current* entries are unreadable by construction, in exchange for whatever
+stale `v10` remnants a profile still holds. **The lane is closed on evidence**,
+not on documentation. Reopening it needs a change in what Chrome does, not a
+change in effort here.
+
+Worth keeping as method: the locked file was not the only witness. The question
+was "which scheme does this profile use", and an unlocked file answered it —
+waiting for the browser to quit would have produced the same answer more slowly.
+
 This is not a gap to engineer around. Reading `v20` would mean impersonating
 Chrome to its own elevation service, which is precisely what the mechanism
 exists to prevent.
@@ -292,7 +317,7 @@ design rather than as outstanding work:
 | Cookie scheme classified per value (`v10`/`v11`/`v12`/`v20`) | **done** |
 | Linux `v10` cookie reading | **done**, proven against a real Chrome profile |
 | Linux `v11` (keyring) | refused by name, pending a host with an unlocked keyring |
-| Windows cookies | not started; `v20` closed by construction, `v10` reachable, and the running-Chrome file lock is a second obstacle in front of both |
+| Windows cookies | **closed on evidence** — a live profile carries an active `APPB` app-bound key, so current cookies are sealed to Chrome, and the file lock would have to be defeated first to reach the stale remainder |
 | Windows journal rename durability | **gap, recorded** — see `sync_parent_directory` in `codex_resets.rs` |
 
 The two gating items below are both done. They are kept because the reasoning
