@@ -827,6 +827,41 @@ percent beside another's `rawUsedPercent`, or a `savedResets` count belonging to
 a third. Nothing on the wire marks the difference, which is why it is stated
 here.
 
+### Folding several accounts into one answer
+
+Selecting a whole entry is the rule; *which* entry depends on the question, and
+the two common questions have different answers.
+
+**"Can I use this provider right now?"** takes the account with the most
+headroom — the minimum `usedPercent` across entries whose `usage` is present.
+A provider is unusable only when every account is exhausted, and treating it as
+unusable because the *first* account is exhausted abandons capacity that exists.
+
+**"How pressured is this account?"** takes that account's own entry and nothing
+else. This is the one that must not be folded: pacing decisions belong to the
+account that will actually serve the request.
+
+Three rules make either safe:
+
+1. **Never average.** Two accounts at 50% are not one account at 50%; they are
+   two accounts either of which can serve. Averaging invents a figure that
+   describes nothing, and it moves in the wrong direction when an account is
+   added.
+2. **Degraded is not zero and not full.** An entry with an `error` and no
+   `usage` carries no capacity reading at all. Fold it as *unknown*, not as
+   exhausted (which hides a working account) and not as idle (which routes work
+   at an account that cannot serve it).
+3. **Fold only entries you would act on.** `savedResets`, `accountInfo` and
+   `rawUsedPercent` describe one account each; carry them from the entry you
+   selected or drop them, never combine them.
+
+**What this producer will not do for you.** A provider-level rollup entry is not
+published, and the reason is structural rather than a missing feature: every
+field except `provider` and `apiProvider` is account-scoped, so a synthesised
+provider entry would either omit most of the record or state one account's
+figures under a provider's name. Both are worse than the fold above, because the
+consumer can see which account it selected and a rollup cannot say.
+
 **`source` is narrower than account scope, and it moves.** A provider can read
 one account through more than one lane — a local file or process, and a
 credential from the vault. Both describe the same account, and which one answers
