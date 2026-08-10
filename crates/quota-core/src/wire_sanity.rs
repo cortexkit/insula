@@ -148,7 +148,10 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
     // nothing at all while still occupying a row, so a consumer counting
     // published providers counts it and a consumer reading capacity finds none:
     // the two disagree about the same entry.
-    if entry.usage.is_none() && entry.error.is_none() {
+    // Pools count as something stated. A provider can sell credit and publish no
+    // rate limits at all, and such an entry has no usage and no error while
+    // being entirely healthy -- its whole answer is the balance.
+    if entry.usage.is_none() && entry.error.is_none() && !states_a_pool(entry) {
         findings.push(format!("{where_}: entry carries neither usage nor error"));
     }
 
@@ -161,9 +164,13 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
     // survived -- or, if this was the only account, another account's standing
     // reported as this one's.
     //
+    // Unless the entry also publishes a non-empty pool list, which is a capacity
+    // statement of a different kind: a provider selling credit with no rate
+    // limits has nothing to put in a window and its whole answer is the balance.
+    //
     // Checked here rather than trusted to the emission path: the drop and the
     // shape rule are far apart, and the wire is where the two have to agree.
-    if entry.usage.is_some() && windows_of(entry).is_empty() {
+    if entry.usage.is_some() && windows_of(entry).is_empty() && !states_a_pool(entry) {
         findings.push(format!(
             "{where_}: carries a usage object with no window, which reads as a reading and states nothing"
         ));
@@ -313,6 +320,25 @@ fn check_across_entries(entries: &[ProviderUsage], report: &mut SanityReport) {
     }
 }
 
+/// Whether an entry publishes at least one prepaid balance or credit pool.
+///
+/// Used by the shape rules above, which exist to catch an entry that occupies a
+/// row and states nothing. A non-empty `spend` list is a statement about the
+/// account's prepaid pools, and that is the whole answer for a provider selling
+/// credit with no rate limits to report.
+///
+/// Presence is all this asks. Whether a pool's `remaining` is known, or whether
+/// it may currently be drawn on, are separate questions with their own fields --
+/// a pool whose balance the provider will not state still tells a consumer the
+/// pool exists, which is more than an empty entry says.
+///
+/// An EMPTY pool list is deliberately not a statement. `spend: []` says the
+/// producer looked and found no pools, which leaves the same hole as no usage at
+/// all, so an entry carrying only an empty list still fails those rules.
+fn states_a_pool(entry: &ProviderUsage) -> bool {
+    entry.spend.as_ref().is_some_and(|pools| !pools.is_empty())
+}
+
 /// Every window an entry publishes.
 ///
 /// Built by destructuring `Usage` rather than by naming slots, so a slot added to
@@ -453,7 +479,7 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_provider_usage::{ExtraWindow, Usage};
+    use cortexkit_provider_usage::{Amount, ExtraWindow, Pool, PoolBasis, PoolFunding, Usage};
 
     fn window(percent: f64) -> RateWindow {
         RateWindow {
@@ -464,6 +490,70 @@ mod tests {
             used_count: None,
             total_count: None,
         }
+    }
+
+    /// A provider selling only credit publishes no window, and that is healthy.
+    ///
+    /// The shape rules above exist to catch an entry that occupies a row and
+    /// states nothing. A pool is a statement -- it says what the account can
+    /// still spend -- so an entry whose whole answer is a balance must pass,
+    /// even though it has no usage and no error.
+    ///
+    /// Without this the first balance-only provider would be reported as
+    /// malformed by our own checker on every run, which is how a real signal
+    /// gets trained away.
+    #[test]
+    fn an_entry_whose_only_answer_is_a_pool_is_not_a_finding() {
+        let mut entry = ProviderUsage::degraded("deepseek", "placeholder");
+        entry.error = None;
+        entry.error_class = None;
+        entry.spend = Some(vec![Pool {
+            id: "granted_balance".to_string(),
+            label: "Granted".to_string(),
+            funding: PoolFunding::Granted,
+            remaining: Some(Amount {
+                minor: 1000,
+                exponent: 2,
+                unit: "CNY".to_string(),
+            }),
+            total: None,
+            basis: PoolBasis::Reported,
+            spendable: None,
+        }]);
+
+        entry.fetched_at = Some(stamped_at());
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report.findings.is_empty(),
+            "a balance-only entry must not be a finding: {:?}",
+            report.findings
+        );
+    }
+
+    /// An EMPTY pool list states nothing, and must still be a finding.
+    ///
+    /// The distinction is the same one this wire draws everywhere else: absent
+    /// means the producer has nothing to say, empty means it looked and found
+    /// none. An entry carrying neither usage, nor error, nor any actual pool
+    /// leaves exactly the hole the rule exists to catch -- so tolerating pools
+    /// must not become tolerating the field.
+    #[test]
+    fn an_empty_pool_list_does_not_rescue_an_empty_entry() {
+        let mut entry = ProviderUsage::degraded("deepseek", "placeholder");
+        entry.error = None;
+        entry.error_class = None;
+        entry.spend = Some(Vec::new());
+
+        entry.fetched_at = Some(stamped_at());
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("neither usage nor error")),
+            "an empty pool list must not count as a statement: {:?}",
+            report.findings
+        );
     }
 
     /// The checker's walk must reach every window the decision paths reach.
