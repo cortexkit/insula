@@ -261,6 +261,10 @@ fn healthy_entry(
         fetched_at: None,
         saved_resets,
         usage: Some(usage),
+        // No provider publishes pools yet. Absent is the honest value: it says
+        // this producer has nothing to report, which is not the same as an
+        // account having no credit.
+        spend: None,
         error: None,
         // A healthy entry has no failure to classify. Absent rather than an
         // "ok" sentinel: the field answers why an entry is degraded, and a
