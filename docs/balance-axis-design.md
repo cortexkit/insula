@@ -79,6 +79,28 @@ reset and a remaining balance. Every field was null on the account inspected, so
 its semantics are unknown and nothing here is built on it. But a design assuming
 "windows are percentages, balances are money" will meet a hybrid.
 
+## Money is not an `f64`
+
+The removed seam declared `remaining: f64`. Every real payload examined since
+says that is wrong, and they disagree with it in three different ways:
+
+| provider | how an amount arrives |
+| --- | --- |
+| DeepSeek | `"110.00"` — a decimal **string** |
+| MiniMax | `"98.00"` — a decimal **string** |
+| Anthropic | `{amount_minor: 0, currency: "USD", exponent: 2}` — integer minor units |
+
+Two of the three deliberately avoid a binary float, and the third is the
+standard representation for money precisely because floats cannot hold it: the
+nearest `f64` to `0.1` is not `0.1`, so sums drift and a threshold comparison
+near zero can go either way. A balance is compared against zero on every routing
+decision that reads it.
+
+So amounts are carried as **integer minor units plus an exponent**, matching
+Anthropic's shape, and a provider's decimal string is parsed once at the edge
+where its own precision is still known. Parsing `"110.00"` into a float and
+re-rendering it is the same defect with an extra step.
+
 ## Pools are plural
 
 A single `{remaining, total, unit}` cannot express "$9.50 granted and $40
@@ -127,6 +149,21 @@ is **known** or **derived from a combined total**, so a consumer can tell
 "granted 9.5, remaining unknown" from "granted 9.5, remaining 4.5" instead of
 assuming the second.
 
+That flag is not defensive bookkeeping for one provider's quirk — the two
+providers this ships with answer it differently. DeepSeek reports a **remaining
+balance per kind**:
+
+```json
+{ "is_available": true,
+  "balance_infos": [ { "currency": "CNY", "total_balance": "110.00",
+                       "granted_balance": "10.00", "topped_up_balance": "100.00" } ] }
+```
+
+There, `granted` and `topped_up` are live remainders and a "spend only granted
+credits" policy is exactly expressible. Kilo reports grants per pool and
+consumption against their sum, so the same policy is only a ceiling. One field
+tells a consumer which of the two it is holding.
+
 ## Where the policy lives
 
 Publishing a balance is not spending one. The decision of *when* money may be
@@ -163,6 +200,25 @@ Land the shape with two providers rather than seventeen:
   with a user waiting. Note its rate-limit endpoint carries no pool at all, so
   this is a fetch to add rather than a parse to fix.
 - **DeepSeek** — the pure case: no windows exist, the balance is the signal.
+  `GET /user/balance`, documented, and the only examined provider that reports
+  granted and purchased remainders separately.
+
+**A caveat that belongs with MiniMax specifically, because the motivating user
+wants free credits.** Its wallet lives at `GET /account/query_balance` and is
+**not in the public documentation** — it is used by MiniMax's own CLI, which is
+where the shape below comes from:
+
+```json
+{ "available_amount": "98.00", "cash_balance": "0.00",
+  "voucher_balance": "98.00", "credit_balance": "0.00", "owed_amount": "0.00" }
+```
+
+`voucher_balance` is the plausible home for granted credits, and MiniMax does
+not publicly define it that way. So reading "voucher means free" is an
+inference, and acting on it spends real money if it is wrong. Publish the pools
+MiniMax names, rather than relabelling one of them `granted` on a guess — the
+naming is the part we would be inventing, and it is the part a spend policy
+would key on.
 
 Those two cover both structural shapes. If the shape is wrong, it is discovered
 with two fetchers written instead of seventeen. Roughly a dozen other providers
