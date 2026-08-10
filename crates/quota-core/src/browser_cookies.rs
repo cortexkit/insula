@@ -408,10 +408,28 @@ fn locate_chrome_cookie_store() -> Result<Option<PathBuf>, CookieError> {
 /// This follows CHROME's behaviour rather than the host's convention for
 /// application data, because the directory belongs to Chrome. On Linux that is
 /// `~/.config/google-chrome` even though the same tree also holds XDG config.
-#[cfg(target_os = "macos")]
-const CHROME_DATA_SUBPATH: &str = "Library/Application Support/Google/Chrome";
-#[cfg(target_os = "linux")]
-const CHROME_DATA_SUBPATH: &str = ".config/google-chrome";
+///
+/// Defined per platform through [`chrome_data_subpath`] rather than as a bare
+/// `cfg` constant, so every value is visible to a test on every host. A path
+/// only compiled on one platform is a path only checkable there, and a wrong
+/// one does not fail: it finds no store, which this module publishes as a host
+/// where nobody logged in.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CHROME_DATA_SUBPATH: &str = chrome_data_subpath(std::env::consts::OS);
+
+/// The Chrome user-data directory for a given `std::env::consts::OS` value.
+///
+/// `const` so the caller above stays a compile-time constant, and takes the OS
+/// as an argument so a test can ask for a platform it is not running on.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const fn chrome_data_subpath(os: &str) -> &'static str {
+    // `match` on a &str is not const, so compare bytes.
+    if matches!(os.as_bytes(), b"macos") {
+        "Library/Application Support/Google/Chrome"
+    } else {
+        ".config/google-chrome"
+    }
+}
 
 /// Search and classify an arbitrary profile directory.
 ///
@@ -796,6 +814,38 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), labels.len(), "two schemes share a label");
+    }
+
+    /// Every platform's Chrome directory is pinned, including ones not running.
+    ///
+    /// These paths follow Chrome's own behaviour rather than the host's
+    /// convention for application data, so neither can be derived from the
+    /// other and both have to be stated. A wrong one produces no error: the
+    /// search finds no store, and this module publishes that as a host where
+    /// nobody logged in -- so the mistake reads as a true fact about the user.
+    ///
+    /// Asserted for both platforms from either, because a value behind a `cfg`
+    /// is only checkable on the platform that compiles it, and that is the
+    /// platform where someone is least likely to be looking when they change
+    /// the other one.
+    #[test]
+    fn the_chrome_directory_is_pinned_for_every_platform() {
+        assert_eq!(
+            chrome_data_subpath("macos"),
+            "Library/Application Support/Google/Chrome"
+        );
+        assert_eq!(chrome_data_subpath("linux"), ".config/google-chrome");
+
+        // The one actually compiled in agrees with the table above, so this
+        // cannot pass while the constant the code uses says something else.
+        assert_eq!(
+            CHROME_DATA_SUBPATH,
+            chrome_data_subpath(std::env::consts::OS)
+        );
+
+        // Not vacuous: the two differ, so a function collapsing to one answer
+        // fails here rather than passing with a plausible-looking path.
+        assert_ne!(chrome_data_subpath("macos"), chrome_data_subpath("linux"));
     }
 
     /// The derived key is pinned to a known vector, per platform round count.
