@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 use crate::credential_source::{VaultCapability, VaultGetError};
-use crate::model::{AccountInfo, ProviderUsage, SavedResets, Usage};
+use crate::model::{AccountInfo, Pool, ProviderUsage, SavedResets, Usage};
 
 /// Stable identity for one credential fetch unit.
 ///
@@ -153,6 +153,20 @@ pub struct FetchAttempt {
     pub account_info: Option<AccountInfo>,
     /// Optional read-only reset inventory attached to a successful usage fetch.
     pub saved_resets: Option<SavedResets>,
+    /// Prepaid balances and credit pools observed on this account, if the
+    /// provider reports any.
+    ///
+    /// Kept beside `usage` rather than inside it because the two are different
+    /// facts: a window is a share of a period, a pool is an amount with no
+    /// period, and over-spending them fails in opposite directions -- one
+    /// throttles and recovers by waiting, the other bills and recovers by
+    /// paying.
+    ///
+    /// `None` means this provider has nothing to say about pools, which differs
+    /// from an empty list. An empty list is a finding on the wire, since it says
+    /// the provider was asked and reports none while the entry states nothing
+    /// else.
+    pub pools: Option<Vec<Pool>>,
     /// The slot may relax raw percentages only while this success remains fresh.
     pub relax_eligible: bool,
     pub credential_resolution: CredentialResolution,
@@ -170,6 +184,7 @@ impl FetchAttempt {
             usage: Ok(usage),
             account_info: None,
             saved_resets: None,
+            pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }
@@ -186,6 +201,7 @@ impl FetchAttempt {
             usage: Err(error),
             account_info: None,
             saved_resets: None,
+            pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }
@@ -228,6 +244,7 @@ impl FetchAttempt {
             usage: Err(fetch_error),
             account_info: None,
             saved_resets: None,
+            pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Unverified,
         }
@@ -289,6 +306,7 @@ impl FetchAttempt {
                     usage,
                     account_info,
                     saved_resets,
+                    pools: entry.spend,
                     relax_eligible: false,
                     credential_resolution: CredentialResolution::Verified,
                 }

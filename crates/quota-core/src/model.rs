@@ -15,7 +15,8 @@
 //! additively, when the balance axis is actually designed.
 
 pub use cortexkit_provider_usage::{
-    AccountInfo, CreditExpiry, ExtraWindow, ProviderUsage, RateWindow, SavedResets, Usage,
+    AccountInfo, Amount, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding, ProviderUsage,
+    RateWindow, SavedResets, Usage,
 };
 
 /// Every rate window a `Usage` carries, in slot order then extras.

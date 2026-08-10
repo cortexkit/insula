@@ -251,6 +251,7 @@ fn healthy_entry(
     usage: crate::model::Usage,
     account_info: Option<AccountInfo>,
     saved_resets: Option<SavedResets>,
+    pools: Option<Vec<crate::model::Pool>>,
 ) -> ProviderUsage {
     ProviderUsage {
         provider: provider_name.to_string(),
@@ -261,10 +262,10 @@ fn healthy_entry(
         fetched_at: None,
         saved_resets,
         usage: Some(usage),
-        // No provider publishes pools yet. Absent is the honest value: it says
-        // this producer has nothing to report, which is not the same as an
-        // account having no credit.
-        spend: None,
+        // Absent says this producer has nothing to report about pools, which is
+        // not the same as an account having no credit. A provider that fetches
+        // pools and finds none sends an empty list instead.
+        spend: pools,
         error: None,
         // A healthy entry has no failure to classify. Absent rather than an
         // "ok" sentinel: the field answers why an entry is degraded, and a
@@ -390,6 +391,7 @@ fn next_slot_after_attempt_inner(
                 usage,
                 attempt.account_info,
                 attempt.saved_resets,
+                attempt.pools,
             )),
             observation,
             label_in_flux: false,
@@ -477,6 +479,7 @@ mod tests {
             usage,
             account_info: None,
             saved_resets: None,
+            pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
         }
