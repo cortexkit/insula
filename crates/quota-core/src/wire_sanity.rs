@@ -137,6 +137,90 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 }
 
 /// Check one entry against the promise that it says something.
+/// Check the prepaid pools on one entry.
+///
+/// Every window field on this wire has a range rule; money had none until these,
+/// which is backwards. A percent that is wrong by a factor of a hundred is a
+/// misrouted request, and a BALANCE wrong by a factor of a hundred is a spend
+/// decision made against a figure nobody can reconcile.
+///
+/// These check internal consistency only, exactly like the window rules: nothing
+/// here knows what any provider's credit is worth, and no rule fires on a value
+/// merely because it is large.
+fn check_pools(entry: &ProviderUsage, where_: &str, findings: &mut Vec<String>) {
+    let Some(pools) = entry.spend.as_ref() else {
+        return;
+    };
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for pool in pools {
+        // A consumer selecting "only granted credit" keys on the id. Two pools
+        // sharing one leaves that selection ambiguous, and the ambiguity is
+        // silent: whichever the consumer happens to reach first decides how much
+        // money it believes is available.
+        if !seen.insert(pool.id.as_str()) {
+            findings.push(format!(
+                "{where_}: publishes two pools with id '{}', so a policy naming it selects arbitrarily",
+                pool.id
+            ));
+        }
+
+        // An empty id cannot be keyed on at all, which makes the pool
+        // unselectable while still contributing to any total a consumer sums.
+        if pool.id.trim().is_empty() {
+            findings.push(format!("{where_}: publishes a pool with an empty id"));
+        }
+
+        for (field, amount) in [("remaining", &pool.remaining), ("total", &pool.total)] {
+            let Some(amount) = amount else { continue };
+
+            // An amount with no denomination states a quantity of nothing, and a
+            // consumer rendering it will invent a unit for it.
+            if amount.unit.trim().is_empty() {
+                findings.push(format!(
+                    "{where_}: pool '{}' states a {field} with no unit",
+                    pool.id
+                ));
+            }
+
+            // The exponent scales the figure by a power of ten, so an implausible
+            // one is not a cosmetic error: at exponent 9 a balance of 24.02 would
+            // have been published as 24020000000 minor units, and a consumer
+            // dividing correctly still gets the right answer while one that
+            // ignores the exponent is off by a billion. Nine decimal places is
+            // past any real money or credit precision.
+            if amount.exponent > 9 {
+                findings.push(format!(
+                    "{where_}: pool '{}' states a {field} with exponent {}, which no currency or credit uses",
+                    pool.id, amount.exponent
+                ));
+            }
+        }
+
+        // A pool whose total is smaller than what remains in it describes an
+        // account holding more than its own ceiling. One of the two figures is
+        // wrong and this cannot say which, which is why it reports rather than
+        // picks.
+        if let (Some(remaining), Some(total)) = (&pool.remaining, &pool.total) {
+            if remaining.unit == total.unit && remaining.exponent == total.exponent {
+                if remaining.minor > total.minor {
+                    findings.push(format!(
+                        "{where_}: pool '{}' has more remaining ({}) than its total ({})",
+                        pool.id, remaining.minor, total.minor
+                    ));
+                }
+            } else {
+                // Comparing across units or scales would require converting one
+                // to the other, and inventing a rate is worse than declining.
+                findings.push(format!(
+                    "{where_}: pool '{}' states remaining and total in different terms ({} e-{} vs {} e-{}), so neither bounds the other",
+                    pool.id, remaining.unit, remaining.exponent, total.unit, total.exponent
+                ));
+            }
+        }
+    }
+}
+
 fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut Vec<String>) {
     let where_ = format!(
         "{}/{}",
@@ -151,6 +235,8 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
     // Pools count as something stated. A provider can sell credit and publish no
     // rate limits at all, and such an entry has no usage and no error while
     // being entirely healthy -- its whole answer is the balance.
+    check_pools(entry, &where_, findings);
+
     if entry.usage.is_none() && entry.error.is_none() && !states_a_pool(entry) {
         findings.push(format!("{where_}: entry carries neither usage nor error"));
     }
@@ -490,6 +576,138 @@ mod tests {
             used_count: None,
             total_count: None,
         }
+    }
+
+    fn pool(id: &str, remaining: Option<(i64, u8, &str)>, total: Option<(i64, u8, &str)>) -> Pool {
+        Pool {
+            id: id.to_string(),
+            label: id.to_string(),
+            funding: PoolFunding::Unknown,
+            remaining: remaining.map(|(minor, exponent, unit)| Amount {
+                minor,
+                exponent,
+                unit: unit.to_string(),
+            }),
+            total: total.map(|(minor, exponent, unit)| Amount {
+                minor,
+                exponent,
+                unit: unit.to_string(),
+            }),
+            basis: PoolBasis::Reported,
+            spendable: None,
+        }
+    }
+
+    fn entry_with_pools(pools: Vec<Pool>) -> ProviderUsage {
+        let mut entry =
+            ProviderUsage::healthy("deepseek", Some("acct-A".into()), "api", Usage::default());
+        entry.fetched_at = Some(stamped_at());
+        entry.spend = Some(pools);
+        entry
+    }
+
+    /// Two pools sharing an id make a spend policy that names it select
+    /// arbitrarily, and the arbitrariness is silent.
+    #[test]
+    fn duplicate_pool_ids_are_a_finding() {
+        let entry = entry_with_pools(vec![
+            pool("granted", Some((100, 2, "USD")), None),
+            pool("granted", Some((250, 2, "USD")), None),
+        ]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("two pools with id 'granted'")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A pool holding more than its own ceiling has one wrong figure, and the
+    /// checker reports rather than picking which.
+    #[test]
+    fn remaining_above_total_is_a_finding() {
+        let entry = entry_with_pools(vec![pool(
+            "credits",
+            Some((5_000, 2, "USD")),
+            Some((1_000, 2, "USD")),
+        )]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report.findings.iter().any(|f| f.contains("more remaining")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Remaining and total in different units do not bound each other, and
+    /// converting between them would mean inventing a rate.
+    #[test]
+    fn a_total_in_other_terms_is_a_finding() {
+        let entry = entry_with_pools(vec![pool(
+            "credits",
+            Some((100, 2, "USD")),
+            Some((100, 2, "CNY")),
+        )]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("different terms")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// An exponent past any real precision scales the figure by a power of ten,
+    /// so a consumer ignoring it is wrong by that factor.
+    #[test]
+    fn an_implausible_exponent_is_a_finding() {
+        let entry = entry_with_pools(vec![pool("credits", Some((1, 12, "USD")), None)]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report.findings.iter().any(|f| f.contains("exponent 12")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// An amount with no denomination states a quantity of nothing.
+    #[test]
+    fn an_amount_without_a_unit_is_a_finding() {
+        let entry = entry_with_pools(vec![pool("credits", Some((100, 2, "  ")), None)]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report.findings.iter().any(|f| f.contains("no unit")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The control: a well-formed pool set must fire NONE of the rules above.
+    ///
+    /// Holds a healthy instance of every shape they inspect -- two distinct ids,
+    /// a remaining below its total in matching terms, an ordinary exponent, and
+    /// a stated unit -- so an over-wide rule cannot pass by examining nothing.
+    #[test]
+    fn a_well_formed_pool_set_is_silent() {
+        let entry = entry_with_pools(vec![
+            pool(
+                "granted_balance",
+                Some((0, 2, "CNY")),
+                Some((1_000, 2, "CNY")),
+            ),
+            pool("topped_up_balance", Some((2_402, 2, "CNY")), None),
+        ]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report.findings.is_empty(),
+            "a well-formed pool set must be silent: {:?}",
+            report.findings
+        );
     }
 
     /// A provider selling only credit publishes no window, and that is healthy.
