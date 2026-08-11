@@ -107,6 +107,28 @@ never exercised. And `v10` is more common in the field than a reading of the
 flag suggests, since any host whose keyring is locked at browser start degrades
 to it silently.
 
+**What the shipped Linux verification does and does not establish.** The `v10`
+path was proven against a real Chrome profile: cookies decrypted, and
+`qwen-cloud` served a live weekly window matching the macOS reading exactly. But
+that VM's Chrome had **no desktop identity in its own environment** —
+`XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE` and `DESKTOP_SESSION` are all unset in
+`/proc/<pid>/environ` — so detection could only land on the basic store. The
+profile was 96 cookies, every one `v10`.
+
+That is a correct proof of the `v10` reader and **no evidence at all about how
+often a desktop Linux user is on `v11`**. A GNOME or KDE session with an
+unlocked keyring is the case that produces `v11`, and it is precisely the case a
+headless VM cannot produce. So the honest statement of Linux coverage is: the
+scheme we read is proven; the share of users it covers is unmeasured, and this
+host cannot measure it.
+
+Reaching `v11` requires the Secret Service API over D-Bus (`org.freedesktop.
+secrets`) to fetch the `Chrome Safe Storage` password, then the same PBKDF2 at
+one iteration. The obstacle is not the crypto — it is identical to `v10` bar the
+password source — but that a locked or absent keyring must degrade to reporting
+no cookies rather than to a wrong answer, and that failure mode cannot be
+exercised on a box where the keyring is never unlocked in the first place.
+
 Note there is no `detect` or `gnome` value: unrecognised strings fall through to
 detection rather than being rejected, so a typo silently becomes "detect" and the
 resulting profile proves nothing about the scheme you meant to test. On KDE
