@@ -104,7 +104,22 @@ today.
 
 A tiny durable state file: `$XDG_STATE_HOME/cortexkit/ck-quota/redemptions.json`
 (default `~/.local/state/cortexkit/ck-quota/redemptions.json`), written
-atomically (temp + rename). One record per logical redemption:
+atomically (temp + rename).
+
+**`CK_QUOTA_STATE_DIR` overrides that directory outright**, ahead of both
+`XDG_STATE_HOME` and the default. Recorded here because the journal is what
+stops a credit being spent twice, and moving it is indistinguishable from having
+none: the module finds an empty directory, writes a fresh journal, and every
+pending record from the previous location is unfenced. Nothing on the wire or in
+health reports says the file moved.
+
+The variable exists for test isolation — the end-to-end harnesses set it so a
+test run cannot spend a real credit — and for a deployment that keeps state off
+the default path. Both are legitimate; the hazard is setting it once and
+forgetting, or setting it for the module and not for a tool that reads the same
+journal.
+
+One record per logical redemption:
 
 ```json
 { "account_id": "...", "redeem_request_id": "<uuid4>",
