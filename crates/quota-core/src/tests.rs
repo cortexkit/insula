@@ -1713,7 +1713,20 @@ async fn round_robin_admission_and_turn_heartbeat_prevent_large_provider_starvat
         .await
         .expect("the later provider was starved behind slow handles");
     assert_eq!(quick_calls.load(Ordering::SeqCst), 1);
-    assert!(slow_calls.load(Ordering::SeqCst) < refresh::CONCURRENCY_CAP);
+    // Bound against a LITERAL, not against the constant under test. Comparing
+    // to `CONCURRENCY_CAP` scales the assertion with the value it is meant to
+    // bound: widening the cap to 1000 admits every one of this provider's 12
+    // handles and the comparison still holds, so the test passes at any cap and
+    // proves only that the number is finite.
+    //
+    // 8 is the shipped cap and the reason it is the right literal: this
+    // provider offers 12 handles, so a cap that admits all of them starves the
+    // second provider entirely -- which is the behaviour this test exists to
+    // catch, and it is invisible to a self-referential bound.
+    assert!(
+        slow_calls.load(Ordering::SeqCst) < 8,
+        "one provider's handles must not fill the whole turn"
+    );
     assert!(!registry.health().refresher_stalled);
 
     gate.add_permits(refresh::CONCURRENCY_CAP);
