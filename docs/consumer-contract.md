@@ -390,6 +390,26 @@ say, and the safe reading depends on what you are about to do:
 | about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
 | rendering to a person | **unknown** | hiding a live pool misleads someone who could act on it |
 
+### Finding out what your build cannot decode
+
+The wire types live in the `cortexkit-provider-usage` crate, and every release
+is tagged in `cortexkit/commons`. To see what this producer added since the
+version you decode against:
+
+```
+git diff cortexkit-provider-usage-v<yours>..cortexkit-provider-usage-v<latest> \
+  -- crates/cortexkit-provider-usage/src/lib.rs
+```
+
+Deliberately a command rather than a list of fields kept here. A hand-written
+"added since" table is a curated artifact: nothing breaks when it falls behind,
+so it decays into a confident wrong answer. The diff is derived from the
+released artifact, so it cannot disagree with what shipped.
+
+Consumers that decode this wire with their own structs rather than the crate
+have no version to check — the fields they parse are the fields they wrote. Both
+kinds of consumer exist today.
+
 ### Decode `funding` and `basis` permissively
 
 Both are closed sets today and **both will gain values**. Decode them as
