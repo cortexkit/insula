@@ -149,7 +149,11 @@ two commits can be built into byte-comparable binaries:
 
 ```sh
 # From the SAME directory, so embedded absolute paths match.
-git stash                       # or use a clean tree
+# Do NOT reach for `git stash` on a clean tree: it stashes nothing, and the
+# `git stash pop` afterwards then restores whatever unrelated entry was already
+# on the stack -- which on a tree that has been worked in for days can be a
+# months-old reversal of code that has since shipped. Verify the tree is clean
+# with `git status --porcelain` and skip the stash entirely.
 git checkout <deployed-commit>
 CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
 shasum -a 256 target/release/ck-insula
@@ -168,7 +172,10 @@ difference, read the diff.
 
 Two conditions are easy to get wrong. Both builds must run from the same
 directory, because absolute paths are embedded and a worktree elsewhere yields
-different bytes for identical source. And both commits must contain the override
+different bytes for identical source. That is not a small effect and it is
+silent: the same commit built in a sibling worktree and in the repository
+produced two different hashes here, which reads exactly like a real difference
+and would send someone to deploy a binary identical to the running one. And both commits must contain the override
 support, since an older `build.rs` ignores the variable and stamps its own sha —
 making the stamp itself the difference being measured. Overlay the current
 `build.rs` onto the older commit if needed.
