@@ -76,10 +76,18 @@ fn connection_file() -> PathBuf {
 /// stops being read — which costs more than the coverage it buys, because the
 /// failure this exists to catch takes down *every* stored lane at once and the
 /// remaining providers still prove it.
-const DUAL_LANE: &[(&str, &str)] = &[(
-    "antigravity",
-    "a local editor process is probed first and wins when both are healthy",
-)];
+const DUAL_LANE: &[(&str, &str)] = &[
+    (
+        "antigravity",
+        "a local editor process is probed first and wins when both are healthy",
+    ),
+    (
+        "grok",
+        "a local opencode oauth token reaches the same account, and grok resolves \
+no account identity, so both lanes dedup into one entry whose source names \
+whichever won",
+    ),
+];
 
 /// Maps a credential handle key to the provider that consumes it.
 ///
