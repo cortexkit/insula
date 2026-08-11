@@ -35,6 +35,7 @@ use crate::codex_resets::{
 };
 use crate::config::CodexConfig;
 use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential};
+use crate::model::{Amount, Pool, PoolBasis, PoolFunding};
 use crate::provider::AccountObservation;
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
@@ -308,6 +309,45 @@ struct UsageResponse {
     #[serde(default)]
     plan_type: Option<String>,
     rate_limit: Option<RateLimit>,
+    #[serde(default)]
+    credits: Option<CreditDetails>,
+}
+
+/// The prepaid credit balance carried in the same `/wham/usage` body.
+///
+/// Separate from `rate_limit`: this is money on the account rather than a share
+/// of a period, and it is what keeps serving once the plan windows are spent.
+#[derive(Debug, Deserialize)]
+struct CreditDetails {
+    /// The account's own statement that a credit pool exists at all.
+    ///
+    /// Load-bearing rather than decorative: an account with no pool reports
+    /// `balance: "0"` here too, so the balance alone cannot distinguish "no
+    /// credit left" from "no credit product". Publishing the first as a
+    /// zero-balance pool would state an exhausted pool that does not exist.
+    #[serde(default)]
+    has_credits: Option<bool>,
+    /// Upstream sends a decimal string; a number is accepted because the
+    /// reference implementation accepts both and we have only observed one.
+    #[serde(default)]
+    balance: Option<serde_json::Value>,
+    /// The plan carries no credit cap.
+    ///
+    /// Parsed and deliberately not acted on. The pool shape already states this
+    /// correctly: an absent `total` means no stated ceiling, which is what an
+    /// uncapped pool has, so branching on the flag would change nothing that
+    /// reaches a consumer.
+    ///
+    /// Kept in the struct so the observed payload shape stays visible here, and
+    /// so its absence from the output reads as a decision. No account on this
+    /// host reports it true, so any behaviour keyed on it would ship untested.
+    #[allow(dead_code)]
+    #[serde(default)]
+    unlimited: Option<bool>,
+    /// The account has spent past its overage allowance -- an enforcement
+    /// statement, unlike a balance, which is only a quantity.
+    #[serde(default)]
+    overage_limit_reached: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,12 +387,90 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
     })
 }
 
+/// Build the credit pool this account holds, when it holds one.
+///
+/// Returns an EMPTY vector rather than a zero-balance pool when the account has
+/// no credit product. Both cases report `balance: "0"`, and the difference
+/// matters to a consumer deciding where to route: an exhausted pool may refill,
+/// while a pool that does not exist never will.
+///
+/// The pool is published only when `has_credits` is explicitly true. Absent is
+/// not treated as true, because inventing a pool is the direction that puts a
+/// figure in front of a router that might spend against it.
+fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
+    let Some(details) = credits else {
+        return Vec::new();
+    };
+    if details.has_credits != Some(true) {
+        return Vec::new();
+    }
+
+    // `unlimited` means the plan carries no credit cap. A pool with no ceiling
+    // is not a quantity, and publishing one with an absent remaining would read
+    // as "we could not determine it" rather than "there is no limit" -- so the
+    // pool is emitted with its balance and the spendable flag, and the absence
+    // of a total is the only honest statement about the ceiling.
+    let remaining = details
+        .balance
+        .as_ref()
+        .and_then(amount_from_json)
+        .map(|(minor, exponent)| Amount {
+            minor,
+            exponent,
+            unit: CREDIT_UNIT.to_string(),
+        });
+
+    vec![Pool {
+        id: "credits".to_string(),
+        label: "Prepaid credits".to_string(),
+        // Upstream states a balance without saying how it was funded: a
+        // promotional grant and a purchased top-up land in the same field.
+        funding: PoolFunding::Unknown,
+        remaining,
+        total: None,
+        // The balance is stated directly rather than derived from a total.
+        basis: PoolBasis::Reported,
+        // `overage_limit_reached` is the account's own enforcement statement.
+        // Only the blocking direction is propagated: true means no further
+        // spend is accepted, while false says the overage allowance is intact
+        // and is not a claim that this pool itself may be drawn on.
+        spendable: match details.overage_limit_reached {
+            Some(true) => Some(false),
+            _ => None,
+        },
+    }]
+}
+
+/// Codex states no currency on this balance, and the account's billing currency
+/// is not determinable from this payload. A currency code guessed from the plan
+/// would look authoritative and be a guess about somebody's money.
+const CREDIT_UNIT: &str = "credit";
+
+/// Read a balance that upstream may send as a decimal string or as a number.
+///
+/// Strings go through the shared strict parser. A JSON number is accepted
+/// because the reference implementation accepts both shapes, and is converted
+/// through its own decimal rendering rather than by scaling a float -- the
+/// scaling is what introduces the representation error the minor-unit
+/// representation exists to avoid.
+fn amount_from_json(value: &serde_json::Value) -> Option<(i64, u8)> {
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => return None,
+    };
+    crate::money::parse_amount(&text, CREDIT_UNIT).map(|amount| (amount.minor, amount.exponent))
+}
+
 /// Raw usage plus the server's explicit wall indicator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexUsageSnapshot {
     pub usage: Usage,
     pub limit_reached: Option<bool>,
     pub plan_type: Option<String>,
+    /// Prepaid credit on this account. Empty when the account has no credit
+    /// product, which is not the same as a spent one.
+    pub pools: Vec<Pool>,
 }
 
 /// Normalize a full `/wham/usage` JSON body without relaxing any percentages.
@@ -377,6 +495,7 @@ pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, Fetch
             extra_rate_windows: None,
         },
         limit_reached: rate_limit.limit_reached,
+        pools: credit_pools(response.credits.as_ref()),
     })
 }
 
@@ -478,7 +597,28 @@ pub(crate) fn unarmed_usage_attempt(
     source: &str,
     snapshot: CodexUsageSnapshot,
 ) -> FetchAttempt {
-    FetchAttempt::success(observed, source, snapshot.usage)
+    usage_attempt(observed, source, snapshot)
+}
+
+/// Build a successful attempt from a usage snapshot, carrying its credit pools.
+///
+/// Every success path goes through here rather than calling
+/// `FetchAttempt::success` directly. The armed path returns from six places
+/// depending on how far the reset coordinator gets, and attaching pools at each
+/// one would make the field appear and disappear by code path -- a consumer
+/// would read that as an account gaining and losing its credit product between
+/// polls, which is the one thing a balance must never do.
+pub(crate) fn usage_attempt(
+    observed: Option<AccountObservation>,
+    source: &str,
+    snapshot: CodexUsageSnapshot,
+) -> FetchAttempt {
+    let mut attempt = FetchAttempt::success(observed, source, snapshot.usage);
+    // Always Some, never None: this provider asks about credit on every fetch,
+    // so an empty list is the honest answer for an account with no credit
+    // product. None would say the question was not asked.
+    attempt.pools = Some(snapshot.pools);
+    attempt
 }
 
 pub(crate) fn reset_trigger_expiry(
@@ -717,15 +857,16 @@ impl CodexProvider {
                     "[ck-quota] warning: codex credits GET failed account_id={account_id}: {error}; usage metadata unavailable"
                 );
                 log_reset_tick(Some(&facts), None, None, false, false);
-                return FetchAttempt::success(observed, source, usage_snapshot.usage)
-                    .with_account_info(context.account_info(usage_snapshot.plan_type));
+                let account_info = context.account_info(usage_snapshot.plan_type.clone());
+                return usage_attempt(observed, source, usage_snapshot)
+                    .with_account_info(account_info);
             }
         };
         let saved_resets = Some(credits.saved_resets());
-        let account_info = context.account_info(usage_snapshot.plan_type);
+        let account_info = context.account_info(usage_snapshot.plan_type.clone());
         let Some(earliest_expiry) = reset_trigger_expiry(&credits, now) else {
             log_reset_tick(Some(&facts), Some(&credits), None, false, false);
-            return FetchAttempt::success(observed, source, usage_snapshot.usage)
+            return usage_attempt(observed, source, usage_snapshot)
                 .with_account_info(account_info)
                 .with_saved_resets(saved_resets);
         };
@@ -738,7 +879,7 @@ impl CodexProvider {
                 false,
                 false,
             );
-            return FetchAttempt::success(observed, source, usage_snapshot.usage)
+            return usage_attempt(observed, source, usage_snapshot)
                 .with_account_info(account_info)
                 .with_saved_resets(saved_resets);
         }
@@ -756,7 +897,7 @@ impl CodexProvider {
                     false,
                     false,
                 );
-                return FetchAttempt::success(observed, source, usage_snapshot.usage)
+                return usage_attempt(observed, source, usage_snapshot)
                     .with_account_info(account_info)
                     .with_saved_resets(saved_resets);
             }
@@ -783,7 +924,7 @@ impl CodexProvider {
             result.armed,
             result.relax_eligible,
         );
-        FetchAttempt::success(observed, source, usage_snapshot.usage)
+        usage_attempt(observed, source, usage_snapshot)
             .with_account_info(account_info)
             .with_saved_resets(saved_resets)
             .with_relax_eligible(result.relax_eligible)
@@ -1619,5 +1760,135 @@ mod tests {
             )),
             "https://proxy.local/backend-api/wham/usage"
         );
+    }
+}
+
+#[cfg(test)]
+mod credit_pool_tests {
+    use super::*;
+
+    /// Live-captured from this host's `/wham/usage`, an individual Pro account
+    /// with no credit product. The `balance: "0"` beside `has_credits: false`
+    /// is the shape the emission rule turns on.
+    const NO_CREDIT_PRODUCT: &[u8] = br#"{
+        "plan_type": "pro",
+        "rate_limit": { "primary_window": { "used_percent": 0, "limit_window_seconds": 604800 } },
+        "credits": { "has_credits": false, "unlimited": false,
+                     "overage_limit_reached": false, "balance": "0" }
+    }"#;
+
+    /// Same shape with credit present. Synthetic: no account on this host holds
+    /// codex credit, so the populated branch cannot be captured here.
+    const WITH_CREDIT: &[u8] = br#"{
+        "plan_type": "pro",
+        "rate_limit": { "primary_window": { "used_percent": 12.5, "limit_window_seconds": 604800 } },
+        "credits": { "has_credits": true, "unlimited": false,
+                     "overage_limit_reached": false, "balance": "24.02" }
+    }"#;
+
+    /// An account with no credit product publishes NO pool, not a zero one.
+    ///
+    /// Both cases report `balance: "0"`, so the balance alone cannot separate
+    /// "spent it all" from "never had one". A zero-balance pool would state an
+    /// exhausted pool that does not exist -- and an exhausted pool implies a
+    /// refill that will never come.
+    #[test]
+    fn an_account_without_a_credit_product_publishes_no_pool() {
+        let snapshot = normalize_usage_snapshot(NO_CREDIT_PRODUCT).expect("live shape must parse");
+        assert!(
+            snapshot.pools.is_empty(),
+            "has_credits false must publish no pool: {:?}",
+            snapshot.pools
+        );
+        // The windows must be unaffected -- this is the same payload.
+        assert!(snapshot.usage.primary.is_some(), "windows must still parse");
+    }
+
+    /// A funded account publishes its balance in minor units.
+    #[test]
+    fn a_funded_account_publishes_its_balance() {
+        let snapshot = normalize_usage_snapshot(WITH_CREDIT).expect("parses");
+        assert_eq!(snapshot.pools.len(), 1, "{:?}", snapshot.pools);
+        let pool = &snapshot.pools[0];
+        assert_eq!(pool.id, "credits");
+        assert_eq!(
+            pool.remaining,
+            Some(Amount {
+                minor: 2402,
+                exponent: 2,
+                unit: "credit".to_string()
+            })
+        );
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        // Upstream states a balance without saying how it was funded.
+        assert_eq!(pool.funding, PoolFunding::Unknown);
+    }
+
+    /// Absent `has_credits` is not treated as true.
+    ///
+    /// Inventing a pool is the direction that puts a figure in front of a
+    /// router that might spend against it, so silence must not create one.
+    #[test]
+    fn an_absent_has_credits_publishes_no_pool() {
+        let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 1 } },
+                         "credits": { "balance": "50.00" } }"#;
+        let snapshot = normalize_usage_snapshot(body).expect("parses");
+        assert!(
+            snapshot.pools.is_empty(),
+            "an unstated has_credits must not publish a pool: {:?}",
+            snapshot.pools
+        );
+    }
+
+    /// Only the blocking direction of the overage flag reaches the pool.
+    ///
+    /// `overage_limit_reached: true` means no further spend is accepted, which
+    /// is true of the pool. False says the overage allowance is intact and is
+    /// not a claim that this pool may be drawn on, so it states nothing.
+    #[test]
+    fn only_a_reached_overage_limit_marks_the_pool_unspendable() {
+        let blocked = br#"{ "rate_limit": { "primary_window": { "used_percent": 1 } },
+            "credits": { "has_credits": true, "balance": "5.00",
+                         "overage_limit_reached": true } }"#;
+        let snapshot = normalize_usage_snapshot(blocked).expect("parses");
+        assert_eq!(snapshot.pools[0].spendable, Some(false));
+
+        let open = normalize_usage_snapshot(WITH_CREDIT).expect("parses");
+        assert_eq!(
+            open.pools[0].spendable, None,
+            "an intact overage allowance is not a per-pool spendability claim"
+        );
+    }
+
+    /// A balance sent as a JSON number is read without going through a float.
+    ///
+    /// The reference implementation accepts both shapes. Scaling a float by a
+    /// power of ten is what introduces the representation error that minor
+    /// units exist to avoid, so the number is rendered and parsed as text.
+    #[test]
+    fn a_numeric_balance_is_read_without_scaling_a_float() {
+        let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 1 } },
+            "credits": { "has_credits": true, "balance": 24.02 } }"#;
+        let snapshot = normalize_usage_snapshot(body).expect("parses");
+        assert_eq!(
+            snapshot.pools[0].remaining,
+            Some(Amount {
+                minor: 2402,
+                exponent: 2,
+                unit: "credit".to_string()
+            })
+        );
+    }
+
+    /// An unreadable balance leaves the pool published with no remaining rather
+    /// than dropping it: the account HAS credit, and saying so with an unknown
+    /// amount is more honest than reporting no credit product at all.
+    #[test]
+    fn an_unreadable_balance_keeps_the_pool_without_an_amount() {
+        let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 1 } },
+            "credits": { "has_credits": true, "balance": "1,024.00" } }"#;
+        let snapshot = normalize_usage_snapshot(body).expect("parses");
+        assert_eq!(snapshot.pools.len(), 1);
+        assert_eq!(snapshot.pools[0].remaining, None);
     }
 }
