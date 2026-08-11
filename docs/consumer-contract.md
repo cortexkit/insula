@@ -313,6 +313,96 @@ failures that once read `no session: …` now read `credential unusable: …` or
 these strings will see a discontinuity at that release, and anything matching on
 them was relying on a promise this contract never made.
 
+## `spend` is money, and it fails in the opposite direction from a window
+
+Some providers sell credit alongside a plan, or instead of one. That credit is
+an **amount with no period** — no percentage, no reset, no window length — so it
+cannot be a `RateWindow`, and it is published separately as `spend`:
+
+```json
+"spend": [
+  { "id": "granted_balance",   "label": "Granted credit",
+    "funding": "granted",   "basis": "reported",
+    "remaining": { "minor": 0,    "exponent": 2, "unit": "CNY" } },
+  { "id": "topped_up_balance", "label": "Purchased credit",
+    "funding": "purchased", "basis": "reported",
+    "remaining": { "minor": 2402, "exponent": 2, "unit": "CNY" } }
+]
+```
+
+**Why it is a separate key rather than another window.** Over-consuming a window
+gets you throttled and recovers by waiting. Over-consuming a balance gets you
+**billed**, and no routing decision can undo that. A consumer that found a
+balance where it expected headroom would pace into a bill, so nothing here is a
+percentage and nothing carries a reset.
+
+### Amounts are integer minor units
+
+`{ minor: 2402, exponent: 2, unit: "CNY" }` is 24.02 CNY. Reconstruct with
+`minor / 10^exponent`, and prefer comparing in minor units directly: a balance is
+compared against zero on every routing decision that reads it, and binary floats
+cannot hold decimal amounts exactly.
+
+`unit` is a free string. It is a currency code where the provider states one,
+and otherwise a provider's own word for its credits — some pools are points that
+convert to no currency. **Never assume two pools are comparable because both
+carry an amount.**
+
+### `funding` says what a pool costs to spend
+
+| value | meaning |
+| --- | --- |
+| `granted` | given by the provider; spending it costs nothing |
+| `purchased` | bought; spending it costs money |
+| `subscription` | included in a plan already paid for |
+| `unknown` | the provider separates this pool but does not say what funds it |
+
+`unknown` is a **correct answer, not a failure**. Several providers name their
+pools and define none of them, and this producer will not invent the label a
+spend policy keys on. It is also what an unrecognised value from a newer producer
+decodes to, and the two meanings agree: a funding you cannot name is one you must
+not spend from.
+
+Consequently, **"spend only free credit" must mean *only pools stated as
+`granted`*, never *everything not stated as `purchased`***.
+
+### `basis` says whether `remaining` is exact
+
+| value | meaning |
+| --- | --- |
+| `reported` | the provider states this pool's remainder directly — exact |
+| `derived` | computed against a consumption figure covering several pools — a **ceiling** |
+| `unstated` | not stated, or a value this consumer does not recognise — treat as a **ceiling** |
+
+The difference is not cosmetic. Providers commonly report grants per pool but
+consumption against their **sum**, which makes a per-pool remainder
+underivable — so a policy naming one pool is exact against a `reported` pool and
+only an upper bound against the other two.
+
+### `spendable`, and what absence means
+
+`spendable` is read from the provider, never inferred from `remaining > 0`: a
+pool can be non-empty and closed. When it is **absent**, the provider did not
+say, and the safe reading depends on what you are about to do:
+
+| reader | treat absent as | why |
+| --- | --- | --- |
+| about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
+| rendering to a person | **unknown** | hiding a live pool misleads someone who could act on it |
+
+### Absent, empty, and present
+
+`spend` absent means this producer has nothing to report about pools — most
+providers, and any provider whose pool fetch failed. `spend: []` means it asked
+and the provider reports none. They are not interchangeable: an absent list is
+silence, an empty one is a statement.
+
+**An entry may carry pools and no windows at all.** A provider that sells only
+credit publishes `usage: {}` beside a non-empty `spend`, and that entry is
+healthy — its whole answer is the balance. Consumers that reduce an account to
+its most constrained window must not treat such an entry as capacity-less or
+malformed.
+
 ## 100% used does not mean requests are being refused
 
 `usedPercent` is a **capacity reading**, not an enforcement state. A window at
@@ -851,9 +941,11 @@ Three rules make either safe:
    `usage` carries no capacity reading at all. Fold it as *unknown*, not as
    exhausted (which hides a working account) and not as idle (which routes work
    at an account that cannot serve it).
-3. **Fold only entries you would act on.** `savedResets`, `accountInfo` and
-   `rawUsedPercent` describe one account each; carry them from the entry you
-   selected or drop them, never combine them.
+3. **Fold only entries you would act on.** `savedResets`, `accountInfo`,
+   `rawUsedPercent` and `spend` describe one account each; carry them from the
+   entry you selected or drop them, never combine them. Credit is bought per
+   account: summing `spend` across sibling entries states a total no single
+   credential can draw on.
 
 **What this producer will not do for you.** A provider-level rollup entry is not
 published, and the reason is structural rather than a missing feature: every

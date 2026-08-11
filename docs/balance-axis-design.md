@@ -11,8 +11,13 @@ reports a credit pool. There is no window, no reset, and no percentage — only 
 quantity that shrinks when spent and grows when paid for.
 
 This document records what was decided about publishing those, and the findings
-that decided it. It is a record of a DECISION, not a description of shipped
-behaviour: nothing here is implemented yet.
+that decided it.
+
+It is a record of REASONING, not the current contract. The shape shipped in
+`cortexkit-provider-usage` 0.5.0 and is served by `deepseek` and `minimax`;
+`docs/consumer-contract.md` describes what is actually on the wire and wins
+wherever the two disagree. What is kept here is why the shape is what it is,
+which the source and the contract do not carry.
 
 ## Why it was deferred, and why that changed
 
