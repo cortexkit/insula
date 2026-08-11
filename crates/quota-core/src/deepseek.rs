@@ -1,0 +1,510 @@
+//! DeepSeek — a prepaid balance and nothing else.
+//!
+//! This endpoint reports no rate-window fields at all, so there is no window to
+//! normalize and the account's whole standing is whatever credit remains.
+//!
+//! DeepSeek states granted and purchased credit as separate live remainders,
+//! rather than as grants with consumption tracked against their sum. A consumer
+//! policy naming one pool -- "spend only granted credit" -- is therefore exact
+//! here rather than a ceiling, which is why these pools carry
+//! `PoolBasis::Reported`.
+//!
+//! - Endpoint: `GET https://api.deepseek.com/user/balance`, bearer API key.
+//! - Documented at <https://api-docs.deepseek.com/api/get-user-balance>.
+
+use async_trait::async_trait;
+use serde::Deserialize;
+
+use crate::env;
+use crate::http::JsonRequest;
+use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
+use crate::provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider};
+
+const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
+const ENV_KEYS: &[&str] = &["DEEPSEEK_API_KEY", "DEEPSEEK_TOKEN"];
+const OPENCODE_PROVIDER: &str = "deepseek";
+
+/// The documented response shape.
+///
+/// Every amount arrives as a **string**, which is deliberate on DeepSeek's part
+/// and preserved here: see [`parse_amount`].
+#[derive(Debug, Deserialize)]
+struct BalanceResponse {
+    is_available: Option<bool>,
+    balance_infos: Option<Vec<BalanceInfo>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceInfo {
+    currency: Option<String>,
+    /// Present in the payload and deliberately unpublished: it is the sum of the
+    /// two pools below, and emitting it as a third pool would have a consumer
+    /// adding up its own money twice.
+    ///
+    /// Kept in the struct so the documented shape stays visible here, and so a
+    /// future reader sees that its absence from the output is a decision.
+    #[allow(dead_code)]
+    total_balance: Option<String>,
+    granted_balance: Option<String>,
+    topped_up_balance: Option<String>,
+}
+
+/// Parse a provider's decimal string into integer minor units.
+///
+/// The provider's own precision is preserved rather than normalised: `"110.00"`
+/// becomes 11000 at exponent 2, `"0.5"` becomes 5 at exponent 1, and `"10"`
+/// becomes 10 at exponent 0. Rounding to a fixed two places would invent
+/// precision for a provider that reports less and silently truncate one that
+/// reports more.
+///
+/// Anything not exactly a decimal number is refused rather than salvaged, and
+/// that matters more than it looks. A grouped figure like `"1,000.00"` parses to
+/// `1` under a lenient reader — a thousandfold understatement that reads as a
+/// perfectly ordinary balance, with no error anywhere. Refusing leaves the pool
+/// unpublished, which a consumer treats as unknown; guessing produces a number
+/// it would spend against.
+fn parse_amount(raw: &str, unit: &str) -> Option<Amount> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, text.strip_prefix('+').unwrap_or(text)),
+    };
+
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (digits, ""),
+    };
+
+    // Both halves must be digits only. This is what rejects grouped thousands,
+    // currency symbols, exponent notation, and a second decimal point.
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // A cap on stated precision, not a limit of the arithmetic. Nine decimal
+    // places is far past what any money or credit figure carries, so a longer
+    // fraction means the field is not the decimal number it appears to be, and
+    // publishing it would give a consumer a figure whose scale nobody intended.
+    // The digits themselves are concatenated and parsed, so an over-long value
+    // would fail the `i64` parse below anyway -- this refuses it by its shape
+    // rather than by whether it happens to fit.
+    let exponent = u8::try_from(fraction.len()).ok()?;
+    if exponent > 9 {
+        return None;
+    }
+
+    let combined = format!("{whole}{fraction}");
+    let magnitude: i64 = combined.parse().ok()?;
+
+    Some(Amount {
+        minor: sign * magnitude,
+        exponent,
+        unit: unit.to_string(),
+    })
+}
+
+/// Build the pools DeepSeek reports for one currency.
+///
+/// `granted` and `topped_up` are published as separate pools because DeepSeek
+/// states each as its own live remainder. `total_balance` is deliberately not
+/// published as a third pool: it is the sum of the other two, and a consumer
+/// adding up pools would count the money twice.
+fn pools_from(info: &BalanceInfo) -> Vec<Pool> {
+    let unit = info.currency.as_deref().unwrap_or("").trim();
+    if unit.is_empty() {
+        // Without a denomination an amount states a quantity of nothing. Better
+        // to publish no pool than a number a consumer cannot interpret.
+        return Vec::new();
+    }
+
+    let mut pools = Vec::new();
+    let mut push = |raw: &Option<String>, id: &str, label: &str, funding: PoolFunding| {
+        let Some(text) = raw.as_deref() else {
+            return;
+        };
+        let Some(amount) = parse_amount(text, unit) else {
+            return;
+        };
+        pools.push(Pool {
+            id: id.to_string(),
+            label: label.to_string(),
+            funding,
+            remaining: Some(amount),
+            total: None,
+            // DeepSeek states each remainder directly, so a policy keyed on one
+            // pool is exact here rather than a ceiling.
+            basis: PoolBasis::Reported,
+            // DeepSeek publishes no per-pool enable flag. Absent, not guessed:
+            // `is_available` is an account-level statement and saying it applies
+            // to each pool would be this module's inference, not DeepSeek's.
+            spendable: None,
+        });
+    };
+
+    push(
+        &info.granted_balance,
+        "granted_balance",
+        "Granted credit",
+        PoolFunding::Granted,
+    );
+    push(
+        &info.topped_up_balance,
+        "topped_up_balance",
+        "Purchased credit",
+        PoolFunding::Purchased,
+    );
+    pools
+}
+
+/// Turn a response body into the pools to publish.
+pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
+    let response: BalanceResponse = serde_json::from_slice(body)
+        .map_err(|error| FetchError::Decode(format!("deepseek: {error}")))?;
+
+    let Some(infos) = response.balance_infos else {
+        return Err(FetchError::Decode(
+            "deepseek: response carries no balance_infos".to_string(),
+        ));
+    };
+
+    let pools: Vec<Pool> = infos.iter().flat_map(pools_from).collect();
+
+    // Nothing publishable came out of the payload: no currency block at all, or
+    // every amount in them unreadable. That is a decode failure rather than an
+    // account with no money, and the two call for opposite responses --
+    // publishing it as "no pools" would report a parse problem as a financial
+    // fact, and a consumer would stop routing here rather than retrying.
+    if pools.is_empty() {
+        return Err(FetchError::Decode(
+            "deepseek: no readable balance in any currency".to_string(),
+        ));
+    }
+
+    Ok(pools)
+}
+
+/// Whether DeepSeek reports the balance as insufficient to serve API calls.
+///
+/// The upstream field is `is_available`, documented as "whether the user's
+/// balance is sufficient for API calls" -- a statement about spending capacity,
+/// not about whether the account exists or is enabled. The threshold is not
+/// documented.
+///
+/// Only the negative is propagated onto pools. `false` means no call will be
+/// served, which is true of every pool at once and is therefore safe to state
+/// about each. `true` says the account can serve calls overall, which is not a
+/// claim about any individual pool, so marking pools spendable from it would
+/// publish this module's inference as DeepSeek's word.
+fn balance_insufficient(body: &[u8]) -> bool {
+    serde_json::from_slice::<BalanceResponse>(body)
+        .ok()
+        .and_then(|response| response.is_available)
+        .is_some_and(|available| !available)
+}
+
+pub struct DeepSeekProvider {
+    url: String,
+    http: reqwest::Client,
+}
+
+impl Default for DeepSeekProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeepSeekProvider {
+    pub fn new() -> Self {
+        Self {
+            url: BALANCE_URL.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// The API key, from the environment or the shared auth store.
+    ///
+    /// Both are checked because a host may have either: the environment is the
+    /// documented way to configure this provider, and the auth store is where a
+    /// user who signed in through another tool already has the same key.
+    fn api_key() -> Option<String> {
+        if let Some(key) = env::first_env(ENV_KEYS) {
+            return Some(key);
+        }
+        match crate::opencode_auth::read_provider(OPENCODE_PROVIDER) {
+            Ok(Some(crate::opencode_auth::OpencodeAuth::Api { key })) => Some(key),
+            // An OAuth entry under this name is not this provider's credential:
+            // the balance endpoint takes an API key, and sending an access token
+            // would produce a 401 recorded as a rejected credential.
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl UsageProvider for DeepSeekProvider {
+    fn name(&self) -> &'static str {
+        "deepseek"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![CredentialHandle::implicit()])
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let Some(key) = Self::api_key() else {
+            return FetchAttempt::failure(
+                None,
+                None,
+                FetchError::NoSession(
+                    "no DEEPSEEK_API_KEY and no deepseek entry in the opencode auth store"
+                        .to_string(),
+                ),
+            );
+        };
+
+        let body = match JsonRequest::get(&self.url)
+            .bearer(&key)
+            .send(&self.http)
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+
+        let mut pools = match normalize_pools(&body) {
+            Ok(pools) => pools,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+
+        // Insufficient overall means no pool can currently fund a call, which is
+        // a per-pool fact worth stating. Sufficient overall is not.
+        if balance_insufficient(&body) {
+            for pool in &mut pools {
+                pool.spendable = Some(false);
+            }
+        }
+
+        // No windows: this endpoint reports no rate-window fields, so an empty
+        // `Usage` beside a non-empty pool list is the honest shape. The wire
+        // checker accepts that combination for exactly this case.
+        let mut attempt = FetchAttempt::success(None, "api", Usage::default());
+        attempt.pools = Some(pools);
+        attempt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live-shape fixture from the published documentation, values as sent.
+    ///
+    /// Synthetic in the sense that it was transcribed from DeepSeek's own
+    /// example rather than captured from an account, but the SHAPE is the
+    /// documented one: amounts as strings, currency alongside.
+    const DOC_FIXTURE: &[u8] = br#"{
+        "is_available": true,
+        "balance_infos": [
+          { "currency": "CNY",
+            "total_balance": "110.00",
+            "granted_balance": "10.00",
+            "topped_up_balance": "100.00" }
+        ]
+    }"#;
+
+    #[test]
+    fn the_documented_payload_yields_a_granted_and_a_purchased_pool() {
+        let pools = normalize_pools(DOC_FIXTURE).expect("documented shape must parse");
+
+        assert_eq!(pools.len(), 2, "one pool per stated remainder: {pools:?}");
+        assert_eq!(pools[0].id, "granted_balance");
+        assert_eq!(pools[0].funding, PoolFunding::Granted);
+        assert_eq!(
+            pools[0].remaining,
+            Some(Amount {
+                minor: 1000,
+                exponent: 2,
+                unit: "CNY".to_string()
+            })
+        );
+        assert_eq!(pools[1].id, "topped_up_balance");
+        assert_eq!(pools[1].funding, PoolFunding::Purchased);
+        assert_eq!(
+            pools[1].remaining,
+            Some(Amount {
+                minor: 10_000,
+                exponent: 2,
+                unit: "CNY".to_string()
+            })
+        );
+    }
+
+    /// The total is not published as a pool.
+    ///
+    /// It is the sum of the other two, so a consumer adding pools to find what
+    /// an account holds would count every unit twice and route as though it had
+    /// double the credit.
+    #[test]
+    fn the_total_is_not_published_as_a_third_pool() {
+        let pools = normalize_pools(DOC_FIXTURE).expect("parses");
+        assert!(
+            !pools.iter().any(|pool| pool.id.contains("total")),
+            "total must not be a pool: {pools:?}"
+        );
+        let summed: i64 = pools
+            .iter()
+            .filter_map(|pool| pool.remaining.as_ref().map(|amount| amount.minor))
+            .sum();
+        assert_eq!(summed, 11_000, "the pools must sum to the stated total");
+    }
+
+    /// Amounts keep the precision the provider stated, in integer minor units.
+    #[test]
+    fn amounts_parse_to_minor_units_at_the_stated_precision() {
+        assert_eq!(
+            parse_amount("110.00", "USD"),
+            Some(Amount {
+                minor: 11_000,
+                exponent: 2,
+                unit: "USD".to_string()
+            })
+        );
+        // Fewer decimals is not padded: reporting exponent 2 here would claim a
+        // precision the provider did not state.
+        assert_eq!(
+            parse_amount("0.5", "USD"),
+            Some(Amount {
+                minor: 5,
+                exponent: 1,
+                unit: "USD".to_string()
+            })
+        );
+        assert_eq!(
+            parse_amount("10", "credits"),
+            Some(Amount {
+                minor: 10,
+                exponent: 0,
+                unit: "credits".to_string()
+            })
+        );
+        // A negative balance is a real state (an account in arrears) and must
+        // survive as one rather than being clamped to zero, which would read as
+        // an account that simply has nothing left.
+        assert_eq!(
+            parse_amount("-1.50", "USD"),
+            Some(Amount {
+                minor: -150,
+                exponent: 2,
+                unit: "USD".to_string()
+            })
+        );
+    }
+
+    /// A number this cannot read is refused, never salvaged.
+    ///
+    /// The grouped case is the one that matters and the reason the parse is
+    /// strict rather than tolerant: `"1,000.00"` under a lenient reader becomes
+    /// 1, a thousandfold understatement that looks like an ordinary balance and
+    /// raises nothing. Refusing leaves the pool unpublished, which a consumer
+    /// treats as unknown; salvaging produces a figure it would spend against.
+    #[test]
+    fn an_unreadable_amount_is_refused_rather_than_guessed() {
+        for bad in [
+            "1,000.00", // grouped thousands
+            "$10.00",   // currency symbol
+            "1e3",      // exponent notation
+            "1.2.3",    // two decimal points
+            "",         // empty
+            "   ",      // whitespace only
+            "abc",      // not a number
+            ".",        // a point and no digits
+        ] {
+            assert_eq!(
+                parse_amount(bad, "USD"),
+                None,
+                "{bad:?} must not parse to a spendable figure"
+            );
+        }
+    }
+
+    /// A body whose amounts are all unreadable is a decode failure, not an
+    /// account with no money.
+    ///
+    /// Publishing it as "no pools" would report a parsing problem as a financial
+    /// fact, and the two call for opposite responses: one is retried and fixed,
+    /// the other is a reason to stop routing here.
+    #[test]
+    fn a_body_with_no_readable_amount_is_a_decode_error() {
+        let body = br#"{ "is_available": true,
+            "balance_infos": [ { "currency": "USD", "granted_balance": "1,000.00" } ] }"#;
+        assert!(matches!(normalize_pools(body), Err(FetchError::Decode(_))));
+    }
+
+    /// An amount with no currency states a quantity of nothing.
+    #[test]
+    fn an_amount_without_a_currency_is_not_published() {
+        let body = br#"{ "is_available": true,
+            "balance_infos": [ { "granted_balance": "10.00" } ] }"#;
+        assert!(matches!(normalize_pools(body), Err(FetchError::Decode(_))));
+    }
+
+    /// An insufficient balance marks every pool unspendable; a sufficient one
+    /// says nothing about any single pool.
+    ///
+    /// `is_available` is documented as whether the balance suffices for API
+    /// calls. False applies to every pool at once, so stating it per pool is
+    /// faithful. True is an account-wide statement that establishes nothing
+    /// about an individual pool, and propagating it would publish an inference
+    /// of ours as the provider's word.
+    #[test]
+    fn an_insufficient_balance_marks_pools_unspendable_and_a_sufficient_one_says_nothing() {
+        let insufficient = br#"{ "is_available": false,
+            "balance_infos": [ { "currency": "USD", "granted_balance": "1.00" } ] }"#;
+        assert!(
+            balance_insufficient(insufficient),
+            "false must read as insufficient"
+        );
+
+        // Sufficient, and unstated, are both "no statement about this pool".
+        assert!(!balance_insufficient(DOC_FIXTURE));
+        let unstated =
+            br#"{ "balance_infos": [ { "currency": "USD", "granted_balance": "1.00" } ] }"#;
+        assert!(!balance_insufficient(unstated));
+
+        let pools = normalize_pools(DOC_FIXTURE).expect("parses");
+        assert!(
+            pools.iter().all(|pool| pool.spendable.is_none()),
+            "a sufficient balance must not claim per-pool spendability: {pools:?}"
+        );
+    }
+
+    /// Every pool is reported rather than derived, because DeepSeek states each
+    /// remainder directly. A policy naming one pool is exact here.
+    #[test]
+    fn deepseek_pools_are_reported_not_derived() {
+        let pools = normalize_pools(DOC_FIXTURE).expect("parses");
+        assert!(
+            pools.iter().all(|pool| pool.basis == PoolBasis::Reported),
+            "{pools:?}"
+        );
+    }
+
+    /// Malformed JSON is a decode failure naming this provider.
+    #[test]
+    fn a_garbage_body_is_a_decode_error() {
+        assert!(matches!(
+            normalize_pools(b"not json"),
+            Err(FetchError::Decode(_))
+        ));
+    }
+}

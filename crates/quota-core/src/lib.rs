@@ -1,4 +1,9 @@
-//! quota-core — provider usage fetchers + RateWindow normalization + TTL cache.
+//! quota-core — provider fetchers, normalization, and the background refresher.
+//!
+//! Fetches each provider's own reporting and normalizes it into two kinds of
+//! statement: `RateWindow`s, a share of a period with a reset, and prepaid
+//! pools, an amount with no period at all. A provider may publish either or
+//! both.
 //!
 //! Wire-agnostic: this crate knows nothing about subc. It exposes a [`Registry`]
 //! that fetches per-provider usage (reusing each provider's own session) and
@@ -18,6 +23,7 @@ pub mod config;
 pub mod copilot;
 pub mod credential_source;
 pub mod cursor;
+pub mod deepseek;
 pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
@@ -265,6 +271,7 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         "gemini" => Some("google"),
         "grok" => Some("xai"),
         "copilot" => Some("github-copilot"),
+        "deepseek" => Some("deepseek"),
         "kimi-for-coding" => Some("kimi-for-coding"),
         "kilo" => Some("kilo"),
         "minimax" => Some("minimax"),
@@ -393,6 +400,7 @@ impl Registry {
             Box::new(codebuff::CodebuffProvider::new()),
             Box::new(copilot::CopilotProvider::new()),
             Box::new(cursor::CursorProvider::new()),
+            Box::new(deepseek::DeepSeekProvider::new()),
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
             Box::new(factory::FactoryProvider::new()),
