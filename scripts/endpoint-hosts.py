@@ -95,6 +95,30 @@ EXPECTED: dict[str, dict[str, str]] = {
 
 CONST = re.compile(r'const ([A-Z_]*(?:URL|BASE)[A-Z_]*): &str = "(https://[^"]+)"')
 
+# Cut at the test MODULE, never at the first `#[cfg(test)]`.
+#
+# That attribute also sits on production items in this crate -- a test-only
+# constructor beside the real one, a `pub mod` used only by tests -- and four
+# provider modules have one BEFORE their test module today. Splitting on the
+# first occurrence would silently stop reading those files partway, so an
+# endpoint constant declared after that point would never be checked and the
+# run would still report success.
+#
+# The mirror failure is over-inclusion: reading the whole file pulls in fixture
+# URLs from the test module, which no credential ever reaches, and pins them as
+# though they were real endpoints. Both directions report a clean, plausible
+# number, which is why the boundary is stated here rather than left to a split.
+#
+# Same rule as scripts/prod_body.py, whose docstring records what a truncated
+# scan costs.
+TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+tests\b")
+
+
+def production_body(source: str) -> str:
+    """Return the source up to the test module."""
+    match = TEST_MODULE.search(source)
+    return source[: match.start()] if match else source
+
 
 def main() -> int:
     if not SRC.is_dir():
@@ -109,7 +133,7 @@ def main() -> int:
         source = path.read_text(encoding="utf-8", errors="replace")
         # Production only: a fixture URL in a test module is not a request this
         # ever makes, and pinning one would fail on every harness change.
-        body = source.split("#[cfg(test)]")[0]
+        body = production_body(source)
         found = CONST.findall(body)
         if not found:
             continue
