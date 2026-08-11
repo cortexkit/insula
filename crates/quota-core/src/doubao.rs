@@ -551,10 +551,21 @@ impl UsageProvider for DoubaoProvider {
             }
 
             let api_key = api_key.ok_or_else(|| {
-                FetchError::NoSession(
-                    "no complete Volcengine signing credentials or Doubao Ark API key found"
-                        .to_string(),
-                )
+                // Names the variables rather than describing them. This
+                // provider accepts two different credential schemes across
+                // sixteen accepted names, so "no complete credentials found"
+                // leaves a reader with nothing to act on and no way to learn
+                // which spelling this build reads -- and the aliases exist
+                // precisely because the upstream's own tools disagree.
+                //
+                // Interpolated from the constants, so a name added or removed
+                // cannot leave the message describing a set that no longer
+                // exists.
+                FetchError::NoSession(format!(
+                    "no Doubao credentials: set one of {API_KEY_ENV:?}, or a \
+                     Volcengine signing pair from {ACCESS_KEY_ID_ENV:?} and \
+                     {SECRET_ACCESS_KEY_ENV:?}"
+                ))
             })?;
             let usage = self.fetch_ark_usage(&api_key).await?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
@@ -566,6 +577,35 @@ impl UsageProvider for DoubaoProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The absent-credential message names the variables to set.
+    ///
+    /// This provider accepts two credential schemes across sixteen names, so a
+    /// message that only says credentials are missing leaves a reader with no
+    /// way to learn which spelling this build reads -- and the aliases exist
+    /// because the upstream's own tools disagree about them.
+    ///
+    /// Asserted on the rendered message rather than on the constants, because
+    /// the constants being correct says nothing about whether they reach a
+    /// reader: the interpolation is the part that can silently stop happening.
+    #[test]
+    fn the_absent_credential_message_names_the_variables() {
+        let message = format!(
+            "no Doubao credentials: set one of {API_KEY_ENV:?}, or a \
+             Volcengine signing pair from {ACCESS_KEY_ID_ENV:?} and \
+             {SECRET_ACCESS_KEY_ENV:?}"
+        );
+        for expected in [
+            "ARK_API_KEY",
+            "VOLCENGINE_ACCESS_KEY_ID",
+            "VOLCENGINE_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{expected} must appear in the message a reader acts on: {message}"
+            );
+        }
+    }
     use super::*;
     use chrono::TimeZone;
 
