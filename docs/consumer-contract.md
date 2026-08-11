@@ -1021,6 +1021,18 @@ worth acting on is that `cookie` providers cannot work headless and break when a
 here — so a fleet that runs without a desktop browser should expect them absent
 rather than treat it as a fault.
 
+**Two health metrics describe this module's own client, not any provider.**
+`vaultUnmatchedDrops` and `vaultStaleGenerationDrops` count frames this module
+read from the credential vault and discarded: one whose caller had already gone,
+and one arriving for a caller from a previous connection. Both drops are
+correct — the point of publishing them is that a silently discarded reply and a
+peer that never answered look identical from outside, and those two states send
+an investigation to opposite components.
+
+Small numbers around a daemon restart are ordinary. A rising unmatched count
+while nothing is restarting is the one worth asking about. Neither says anything
+about a provider's capacity, so they belong to operators rather than to routing.
+
 **Health counts providers; the array carries accounts.** A provider with several
 credentialed accounts contributes several entries to `usage.get` and exactly one
 to these buckets, so the array is normally longer than `providersTotal` and the

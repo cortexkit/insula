@@ -152,6 +152,9 @@ struct ClientState {
     pending: Mutex<HashMap<(u32, u64), Pending>>,
     next_connection_generation: AtomicU64,
     next_route_generation: AtomicU64,
+    /// Frames the reader loop discarded, by class. See [`Self::dispatch`].
+    unmatched_terminal_drops: AtomicU64,
+    stale_generation_drops: AtomicU64,
     next_corr: AtomicU64,
     request_timeout: Duration,
 }
@@ -169,6 +172,8 @@ impl ClientState {
             pending: Mutex::new(HashMap::new()),
             next_connection_generation: AtomicU64::new(1),
             next_route_generation: AtomicU64::new(1),
+            unmatched_terminal_drops: AtomicU64::new(0),
+            stale_generation_drops: AtomicU64::new(0),
             next_corr: AtomicU64::new(1),
             request_timeout,
         }
@@ -309,25 +314,60 @@ impl ClientState {
         Ok(connection)
     }
 
+    /// Deliver one frame to its waiting caller, or count the drop.
+    ///
+    /// Two classes of frame are correctly discarded here: one whose
+    /// (epoch, corr) matches no pending entry, and one that matches an entry
+    /// belonging to an older connection. Both are right -- a reply to a request
+    /// whose caller has gone, and a reply arriving after a reconnect that
+    /// already failed the call.
+    ///
+    /// The DROPPING is correct; the invisibility is the defect. A silently
+    /// discarded reply and a peer that sent nothing produce the same observable
+    /// -- a call that waits and then times out -- and those two states have
+    /// opposite investigations. Counting separates them without changing any
+    /// behaviour: a non-zero count says the frames arrived and this client threw
+    /// them away.
+    ///
+    /// The counters are cumulative for the process and deliberately not reset by
+    /// a reconnect, since a reconnect is exactly when a burst is expected and
+    /// clearing them would erase the evidence of the event that caused it.
     fn dispatch(&self, generation: u64, frame: Frame) {
         let key = (frame.header.epoch, frame.header.corr);
-        let pending = {
+        let (pending, stale_generation) = {
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending
-                .get(&key)
-                .is_some_and(|entry| entry.connection_generation == generation)
-            {
-                pending.remove(&key)
-            } else {
-                None
+            match pending.get(&key) {
+                Some(entry) if entry.connection_generation == generation => {
+                    (pending.remove(&key), false)
+                }
+                // Matched a caller, but one from a previous connection.
+                Some(_) => (None, true),
+                None => (None, false),
             }
         };
         if let Some(pending) = pending {
             let _ = pending.sender.send(Ok(frame));
+            return;
         }
+        if stale_generation {
+            self.stale_generation_drops.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.unmatched_terminal_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Frames discarded because no caller was waiting for them.
+    pub fn unmatched_terminal_drops(&self) -> u64 {
+        self.unmatched_terminal_drops.load(Ordering::Relaxed)
+    }
+
+    /// Frames discarded because their caller belonged to an older connection.
+    pub fn stale_generation_drops(&self) -> u64 {
+        self.stale_generation_drops.load(Ordering::Relaxed)
     }
 
     async fn invalidate_connection(&self, failed_generation: u64) {
@@ -613,6 +653,19 @@ pub struct VaultClient {
 }
 
 impl VaultClient {
+    /// Frames the reader loop discarded because no caller was waiting.
+    ///
+    /// See [`ClientState::dispatch`] for why both drop classes are counted
+    /// rather than merely being correct.
+    pub fn unmatched_terminal_drops(&self) -> u64 {
+        self.state.unmatched_terminal_drops()
+    }
+
+    /// Frames discarded because their caller belonged to an older connection.
+    pub fn stale_generation_drops(&self) -> u64 {
+        self.state.stale_generation_drops()
+    }
+
     pub fn new(connection_file_path: impl Into<PathBuf>) -> Self {
         Self {
             state: Arc::new(ClientState::new(connection_file_path.into())),
@@ -1569,5 +1622,104 @@ mod tests {
     fn connection_path_is_not_formatted_with_capability_data() {
         let client = VaultClient::new(std::path::Path::new("/tmp/subc-connection.json"));
         assert!(!format!("{client:?}").contains("subc-connection.json"));
+    }
+}
+
+#[cfg(test)]
+mod drop_counter_tests {
+    use super::*;
+
+    fn state() -> ClientState {
+        ClientState::new(PathBuf::from("/nonexistent/connection.json"))
+    }
+
+    fn frame(epoch: u32, corr: u64) -> Frame {
+        Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            epoch,
+            corr,
+            Vec::new(),
+        )
+        .expect("frame")
+    }
+
+    /// A reply nobody is waiting for is counted, not silently discarded.
+    ///
+    /// The drop itself is correct. What it must not be is invisible: a
+    /// discarded reply and a peer that sent nothing both present as a call that
+    /// waits and then times out, and those two states send an investigation to
+    /// opposite components. A non-zero count says the frame did arrive here.
+    #[test]
+    fn an_unmatched_terminal_frame_is_counted() {
+        let state = state();
+        assert_eq!(state.unmatched_terminal_drops(), 0);
+
+        state.dispatch(1, frame(7, 42));
+
+        assert_eq!(
+            state.unmatched_terminal_drops(),
+            1,
+            "a frame with no waiting caller must be counted"
+        );
+        assert_eq!(
+            state.stale_generation_drops(),
+            0,
+            "and must not be attributed to the other class"
+        );
+    }
+
+    /// A reply for a caller from a previous connection counts separately.
+    ///
+    /// Kept apart from the unmatched class because they mean different things:
+    /// this one says a reconnect raced a reply in flight, which is expected
+    /// during a daemon restart, while an unmatched terminal in a quiet period is
+    /// not expected at all. One combined number would let a burst of the
+    /// ordinary kind hide the other.
+    #[test]
+    fn a_frame_for_an_older_connection_is_counted_as_stale() {
+        let state = state();
+        let (sender, _receiver) = oneshot::channel();
+        state.pending.lock().unwrap().insert(
+            (7, 42),
+            Pending {
+                connection_generation: 1,
+                sender,
+            },
+        );
+
+        // Same key, but the reader loop is now on a newer connection.
+        state.dispatch(2, frame(7, 42));
+
+        assert_eq!(state.stale_generation_drops(), 1);
+        assert_eq!(state.unmatched_terminal_drops(), 0);
+        assert!(
+            state.pending.lock().unwrap().contains_key(&(7, 42)),
+            "a stale frame must not consume the current caller's entry"
+        );
+    }
+
+    /// A matched frame is delivered and counts nothing.
+    ///
+    /// The control: without it, a dispatch that counted every frame as a drop
+    /// would satisfy both tests above.
+    #[test]
+    fn a_matched_frame_is_delivered_and_not_counted() {
+        let state = state();
+        let (sender, receiver) = oneshot::channel();
+        state.pending.lock().unwrap().insert(
+            (7, 42),
+            Pending {
+                connection_generation: 1,
+                sender,
+            },
+        );
+
+        state.dispatch(1, frame(7, 42));
+
+        assert!(receiver.blocking_recv().is_ok(), "caller must receive it");
+        assert_eq!(state.unmatched_terminal_drops(), 0);
+        assert_eq!(state.stale_generation_drops(), 0);
     }
 }

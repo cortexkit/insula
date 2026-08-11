@@ -139,8 +139,12 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
-    let credential_source: Arc<dyn CredentialSource> =
-        Arc::new(VaultClient::new(config.connection_file_path.clone()));
+    // Held concretely as well as behind the trait: the health path reads this
+    // client's own frame-drop counters, which the CredentialSource trait does
+    // not expose because they are a property of THIS transport rather than of
+    // credential lookup.
+    let vault = Arc::new(VaultClient::new(config.connection_file_path.clone()));
+    let credential_source: Arc<dyn CredentialSource> = vault.clone();
     let registry = Arc::new(Registry::with_defaults(
         quota_config,
         Some(credential_source),
@@ -156,7 +160,14 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
         tokio::spawn(async move { registry.refresh_loop(cancel).await })
     };
 
-    let loop_result = module_loop(&mut read_half, tx.clone(), &config, Arc::clone(&registry)).await;
+    let loop_result = module_loop(
+        &mut read_half,
+        tx.clone(),
+        &config,
+        Arc::clone(&registry),
+        Arc::clone(&vault),
+    )
+    .await;
     drop(tx);
 
     // Stop the refresher and reap it before returning.
@@ -196,6 +207,7 @@ async fn module_loop<R>(
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
     registry: Arc<Registry>,
+    vault: Arc<VaultClient>,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -210,7 +222,7 @@ where
         else {
             return Ok(()); // clean EOF: subc closed the connection.
         };
-        if !handle_frame(frame, &writer, &registry).await? {
+        if !handle_frame(frame, &writer, &registry, &vault).await? {
             return Ok(());
         }
     }
@@ -295,6 +307,7 @@ async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
+    vault: &Arc<VaultClient>,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -314,7 +327,7 @@ async fn handle_frame(
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => Ok(true), // route goodbye: nothing to tear down (no per-route state).
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, registry).await?;
+            handle_control_request(frame, writer, registry, vault).await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -335,6 +348,7 @@ async fn handle_control_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
+    vault: &VaultClient,
 ) -> Result<(), ModuleError> {
     // A body this module cannot decode is answered, not escalated. Returning an
     // error here propagates to the frame loop, which treats it as fatal and ends
@@ -371,7 +385,7 @@ async fn handle_control_request(
             // a poisoned serving cache (a panicked serving task) is `failing`;
             // otherwise `ok`, because a provider degrading on a box without its
             // creds is this prober's normal state, carried as detail not status.
-            health_report(&registry.health())
+            health_report(&registry.health(), vault)
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -428,7 +442,10 @@ const BUILD_COMMIT: &str = env!("CK_QUOTA_BUILD_COMMIT");
 /// last-known windows still serve, only freshness decays); otherwise `ok` with
 /// per-provider staleness carried as opaque `detail`/`metrics`, because a
 /// provider lacking local creds is this prober's normal resting state.
-fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControlResponse {
+fn health_report(
+    snapshot: &quota_core::health::HealthSnapshot,
+    vault: &VaultClient,
+) -> ModuleControlResponse {
     let status = if snapshot.is_failing() {
         HealthStatus::Failing
     } else if snapshot.is_degraded() {
@@ -493,6 +510,21 @@ fn health_report(snapshot: &quota_core::health::HealthSnapshot) -> ModuleControl
         // in none of the counts above. Reported by name so the buckets can be
         // reconciled against providersTotal rather than silently under-summing.
         "withoutHandles": snapshot.without_handles,
+        // Frames this module's own vault client read off the wire and discarded.
+        //
+        // Both classes are correct to drop -- a reply whose caller has gone, and
+        // one arriving for a caller from a previous connection -- but a silent
+        // drop and a peer that never answered produce the same observable, a
+        // call that waits and times out. Those two have opposite
+        // investigations, so the counts are published rather than logged: a
+        // non-zero value says the frames reached this process.
+        //
+        // Ordinary in small numbers around a daemon restart. A rising
+        // `vaultUnmatchedDrops` while nothing is restarting is the one worth
+        // asking about, because it means replies are arriving that no caller is
+        // waiting for.
+        "vaultUnmatchedDrops": vault.unmatched_terminal_drops(),
+        "vaultStaleGenerationDrops": vault.stale_generation_drops(),
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieLoginsStale": snapshot.cookie_logins_stale,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
@@ -753,6 +785,15 @@ mod tests {
 
     static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
+    /// A vault client that never connects.
+    ///
+    /// The health path reads only this client's frame-drop counters, which start
+    /// at zero and need no connection to be read -- so a client pointed at a
+    /// path that does not exist is the right fixture rather than a mock.
+    fn test_vault() -> VaultClient {
+        VaultClient::new(std::path::PathBuf::from("/nonexistent/connection.json"))
+    }
+
     /// A snapshot of a module serving normally, to be perturbed one field at a
     /// time by the tests that care about a single fault.
     fn healthy_snapshot() -> quota_core::health::HealthSnapshot {
@@ -773,7 +814,9 @@ mod tests {
     }
 
     fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
-        let ModuleControlResponse::HealthCheck { status, .. } = health_report(snapshot) else {
+        let ModuleControlResponse::HealthCheck { status, .. } =
+            health_report(snapshot, &test_vault())
+        else {
             panic!("health_report must produce a HealthCheck response");
         };
         status
@@ -803,7 +846,9 @@ mod tests {
             ..healthy_snapshot()
         };
 
-        let ModuleControlResponse::HealthCheck { detail, .. } = health_report(&snapshot) else {
+        let ModuleControlResponse::HealthCheck { detail, .. } =
+            health_report(&snapshot, &test_vault())
+        else {
             panic!("health_report must produce a HealthCheck response");
         };
         let detail = detail.expect("a degraded provider produces a detail line");
@@ -1040,7 +1085,8 @@ mod tests {
             .unwrap();
 
             let registry = Arc::new(quota_core::Registry::new(Vec::new()));
-            let result = handle_control_request(frame, &tx, &registry).await;
+            let vault = VaultClient::new(std::path::PathBuf::from("/nonexistent"));
+            let result = handle_control_request(frame, &tx, &registry, &vault).await;
 
             // The handler must not signal failure upward: that is what the frame
             // loop treats as fatal.
@@ -1106,7 +1152,9 @@ mod tests {
         )
         .unwrap();
 
-        handle_control_request(frame, &tx, &registry).await.unwrap();
+        handle_control_request(frame, &tx, &registry, &test_vault())
+            .await
+            .unwrap();
 
         let response = rx.try_recv().expect("a response frame was sent");
         assert_eq!(response.header.ty, FrameType::Response);
@@ -1143,6 +1191,8 @@ mod tests {
             "cookieLoginsStale",
             "lastTickAgeSecs",
             "refresherStalled",
+            "vaultUnmatchedDrops",
+            "vaultStaleGenerationDrops",
         ];
         let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
         published.sort_unstable();
@@ -1185,7 +1235,9 @@ mod tests {
         )
         .unwrap();
 
-        handle_control_request(frame, &tx, &registry).await.unwrap();
+        handle_control_request(frame, &tx, &registry, &test_vault())
+            .await
+            .unwrap();
 
         let response = rx.try_recv().expect("a response frame was sent");
         assert_eq!(response.header.ty, FrameType::Response);
