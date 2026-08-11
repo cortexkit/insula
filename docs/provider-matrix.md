@@ -27,16 +27,24 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.48.0** (35 providers registered; verified
-2026-08-07). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.49.2** (37 providers registered; verified
+2026-08-11). CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. Read that release's content with `git show
 <tag>:<path>` or `git grep <tag>` — the checkout usually sits at an older tag, so
 plain `grep` silently reads a different version and reports a symbol added in the
 new release as absent. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.48.0..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.49.2..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
-silent degradation), new window-bearing providers to port, and balance/credits
-providers (deferred to the Balance axis). When a diff touches a provider we serve,
+silent degradation), new window-bearing providers to port, and credit-pool
+sources (now portable: the Balance axis ships, so a prepaid balance is publishable
+rather than deferred — see docs/balance-axis-design.md).
+
+Read the diff for CREDENTIAL AND GATING changes as well as mapping drift. The one
+real port of the v0.48.0 round came from upstream adding a gate, which made
+visible that WE were sending the wrong credential to a second endpoint — a
+best-effort enrichment that has never once succeeded looks exactly like one that
+succeeds and finds nothing, since both publish no extra window and neither
+degrades the entry. Any provider with a second optional endpoint has that shape. When a diff touches a provider we serve,
 confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
 `/api/oauth/usage`, not CodexBar's CLI/web fetcher) and that the field actually
 changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
@@ -134,6 +142,43 @@ never once succeeded is indistinguishable from one that succeeds and finds
 nothing.** Both publish no extra window and neither degrades the entry. The
 upstream diff is what surfaced it, which argues for reading parity rounds for
 credential and gating changes, not only for window-mapping drift.
+
+At v0.49.0 through v0.49.2 nothing was portable, and what was SEARCHED matters
+more than the verdict. 129 provider-core files changed across the three
+releases; the sweep read them for credential and gating changes as well as
+window-mapping drift, since the previous round's one real port came from a
+gating change rather than a mapping one.
+
+Three findings, none of them ports:
+
+- **Codex gained a third credit-limit source.** `spend_control.individual_limit`,
+  for team and enterprise workspaces that report a monthly credit pool there
+  instead of at the response root, behind an established precedence of root then
+  `rate_limit` then `spend_control`. Verified against our own live `wham/usage`
+  payload: `spend_control` is present and its `individual_limit` is null on an
+  individual Pro account, which is the expected shape for a non-team plan. Not
+  ported because we consume no codex credit limit at all today — the field would
+  land on the Balance axis, and porting a precedence chain we cannot exercise on
+  any account here would ship an untested selection rule.
+
+  Recorded as the concrete next step for codex on that axis: the same payload
+  also carries `credits` (`has_credits`, `balance`, `unlimited`,
+  `overage_limit_reached`), which is a pool this module already fetches and
+  discards.
+
+- **A binding-quota projection**, capping a session row's displayed percentage
+  and reset by any exhausted longer lane. It is a display-layer transform in
+  their menu card, and the equivalent decision on our side is already made in the
+  opposite direction and documented: this producer publishes every window
+  untransformed and states that no field identifies the binding limit, because
+  the ranking policy belongs to whoever acts on it. Nothing to port; the
+  divergence is deliberate and already written down.
+
+- **ClinePass moved to a TypeScript plugin** (-223 lines), which is a delivery
+  change on their side with no effect on the endpoint or the mapping.
+
+The Claude fetcher change in range is an error-construction refactor, and the
+remaining volume is settings storage, plugin engine, and menu presentation.
 
 At v0.48.1 nothing was portable, and the round is recorded because a null is
 only worth anything when the search behind it is stated. The release is a CLI
