@@ -148,6 +148,12 @@ examined nothing — a sweep that finds nothing because it looked at nothing is
 indistinguishable from a real pass, and that failure is silent.
 
 ```sh
+# every provider endpoint against the host it is supposed to reach. Each one
+# receives a credential, and the OAuth token endpoints receive a live refresh
+# token in the request body -- so a host that drifts does not fail, it receives
+# a working credential:
+python3 scripts/endpoint-hosts.py
+
 # providers reporting an absent credential while a key they could read sits in
 # the shared opencode auth store. That combination reads to an operator as
 # "never configured", so nobody investigates it:

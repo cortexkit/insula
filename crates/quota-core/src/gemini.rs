@@ -641,6 +641,22 @@ impl UsageProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
 
+    /// The token endpoint is pinned to Google's own host.
+    ///
+    /// This is the URL a live REFRESH TOKEN is posted to, in the request body,
+    /// so a wrong host does not merely fail -- it receives a working
+    /// credential. The symptom afterwards is indistinguishable from an expired
+    /// login: the exchange returns an error, the account reads as dead, and an
+    /// operator re-authenticating does not fix it because the credential was
+    /// never the problem.
+    ///
+    /// Asserted against a literal read off the constant rather than compared to
+    /// the constant itself, which would hold at any value.
+    #[test]
+    fn the_token_endpoint_is_googles_own_host() {
+        assert_eq!(TOKEN_URL, "https://oauth2.googleapis.com/token");
+    }
+
     /// The masked OAuth constants unmask to Google's real public client.
     ///
     /// Pinned against literals rather than against a round trip through
