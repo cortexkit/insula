@@ -139,6 +139,42 @@ cargo run -p quota-core --example sweep-probe
 cargo run -p quota-core --example completeness-envelopes
 ```
 
+### Repository sweeps
+
+Python tools under `scripts/`, for questions the Rust checkers cannot answer
+because they are about the source, the host, or the fleet rather than the wire.
+Each exits non-zero on a finding and refuses to report a clean result when it
+examined nothing — a sweep that finds nothing because it looked at nothing is
+indistinguishable from a real pass, and that failure is silent.
+
+```sh
+# providers reporting an absent credential while a key they could read sits in
+# the shared opencode auth store. That combination reads to an operator as
+# "never configured", so nobody investigates it:
+python3 scripts/unread-credentials.py
+
+# read the production half of a Rust file, with the test module cut off. Any
+# sweep asking "does every provider do X" needs this, or assertions inside
+# tests count as production code:
+python3 scripts/prod_body.py crates/quota-core/src/*.rs
+
+# apply a mutation, run the tests, and restore the file whatever happens.
+# Reports whether the mutation reddened a test, was never reached, or hung:
+python3 scripts/probe.py <file> <before> <after>
+
+# check that every rule in the wire checkers has a test that fails when the
+# rule is deleted, and a control that does not fire when it should not:
+python3 scripts/audit-checker-rules.py
+
+# find every caller of this module's id across the fleet, so a rename can be
+# sequenced rather than discovered:
+python3 scripts/module_id_callers.py
+
+# measure this process's real disk reads and writes, with a control write to
+# prove the counter moves before reporting anything:
+python3 scripts/measure-disk-io.py
+```
+
 ## Install as a supervised subc module
 
 The subc daemon binary (`ck-subc`, built from the `subc-core` crate) spawns and
