@@ -100,16 +100,42 @@ def absent_providers() -> set[str] | None:
     }
 
 
-def env_only_providers() -> list[str]:
-    """Providers that read an env var for a key and never consult the store."""
-    out = []
+def code_only(source: str) -> str:
+    """Strip line comments, so a MENTION is not mistaken for a call.
+
+    Both halves of the detection below are substring tests, and a comment
+    naming either one moves a provider between sets without anything saying so.
+    The over-inclusion direction is caught later by the live filter; this
+    direction is not caught by anything -- a provider drops out of the examined
+    population and the run reports a smaller number that still reads as clean.
+
+    Verified rather than assumed: adding the line "this does not read
+    opencode_auth" to a provider that genuinely reads only its environment
+    removed it from the crossable set, silently.
+    """
+    return "\n".join(line.split("//")[0] for line in source.splitlines())
+
+
+def env_only_providers() -> tuple[list[str], list[str]]:
+    """Providers reading an env var for a key and never consulting the store.
+
+    Returns the set and the providers excluded for having a store fallback, so
+    the run can report the exclusion rather than only its result. A population
+    that shrinks silently is the failure this whole check exists to avoid one
+    layer down.
+    """
+    out, has_fallback = [], []
     for f in sorted(SRC.glob("*.rs")):
         if f.stem in NOT_PROVIDERS:
             continue
-        text = f.read_text(encoding="utf-8", errors="replace")
-        if "first_env" in text and "opencode_auth" not in text:
+        text = code_only(f.read_text(encoding="utf-8", errors="replace"))
+        if "first_env" not in text:
+            continue
+        if "opencode_auth" in text:
+            has_fallback.append(f.stem)
+        else:
             out.append(f.stem)
-    return out
+    return out, has_fallback
 
 
 def slug_map() -> dict[str, str]:
@@ -135,7 +161,7 @@ def main() -> int:
         print(f"refusing: auth store unreadable ({exc})")
         return 2
 
-    env_only = env_only_providers()
+    env_only, has_fallback = env_only_providers()
     slugs = slug_map()
 
     if not env_only:
@@ -162,6 +188,10 @@ def main() -> int:
     else:
         print(f"  live filter: {len(absent)} providers currently report credential_absent")
     print(f"  env-only providers: {len(env_only)}  of which mapped to a slug: {len(crossable)}")
+    print(
+        f"  already read the store, so nothing to cross: {len(has_fallback)}"
+        + (f" ({', '.join(has_fallback)})" if has_fallback else "")
+    )
     print()
     print("  PROVIDER              SLUG                       KEY ON THIS HOST")
     for provider, slug in crossable:
