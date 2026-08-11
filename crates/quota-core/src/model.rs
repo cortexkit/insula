@@ -157,9 +157,13 @@ const MAX_WIRE_STRING_BYTES: usize = 512;
 pub fn bound_wire_strings(entries: &mut [ProviderUsage]) {
     fn bound(value: &mut Option<String>) {
         if let Some(text) = value {
-            if text.len() > MAX_WIRE_STRING_BYTES {
-                *text = crate::text::truncate_for_wire(text, MAX_WIRE_STRING_BYTES);
-            }
+            bound_text(text);
+        }
+    }
+
+    fn bound_text(text: &mut String) {
+        if text.len() > MAX_WIRE_STRING_BYTES {
+            *text = crate::text::truncate_for_wire(text, MAX_WIRE_STRING_BYTES);
         }
     }
 
@@ -186,11 +190,84 @@ pub fn bound_wire_strings(entries: &mut [ProviderUsage]) {
                 bound(&mut window.resets_at);
             }
         }
+        // Pools carry three upstream strings. `unit` is the sharpest: deepseek
+        // reads it straight from the payload's `currency` field, so an upstream
+        // that returns a long value puts it on the wire unchanged.
+        if let Some(pools) = entry.spend.as_mut() {
+            for pool in pools.iter_mut() {
+                bound_text(&mut pool.id);
+                bound_text(&mut pool.label);
+                for amount in [pool.remaining.as_mut(), pool.total.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    bound_text(&mut amount.unit);
+                }
+            }
+        }
         // `provider` and `api_provider` are this module's own names and
         // `fetched_at` is formatted here, so neither can carry an upstream's
         // length. `savedResets` timestamps are formatted from parsed values
         // too. `error` is bounded already, at the single point where a failure
         // becomes wire text.
+    }
+}
+
+#[cfg(test)]
+mod pool_bound_tests {
+    use super::*;
+
+    /// Every string a pool carries is bounded, including the unit.
+    ///
+    /// `unit` is the one that matters most and looks least like a risk: it
+    /// reads as a currency code, but at least one provider takes it straight
+    /// from the payload's `currency` field, so its length is the upstream's
+    /// choice rather than ours.
+    ///
+    /// The cost of missing one is not local. The frame codec refuses a body
+    /// over its maximum, so a single oversized string loses EVERY provider's
+    /// usage in that reply, not just the field carrying it.
+    #[test]
+    fn a_pools_strings_are_all_bounded() {
+        let long = "x".repeat(MAX_WIRE_STRING_BYTES * 2);
+        let mut entry =
+            ProviderUsage::healthy("deepseek", Some("acct".into()), "api", Usage::default());
+        entry.spend = Some(vec![Pool {
+            id: long.clone(),
+            label: long.clone(),
+            funding: PoolFunding::Unknown,
+            remaining: Some(Amount {
+                minor: 1,
+                exponent: 2,
+                unit: long.clone(),
+            }),
+            total: Some(Amount {
+                minor: 2,
+                exponent: 2,
+                unit: long.clone(),
+            }),
+            basis: PoolBasis::Reported,
+            spendable: None,
+        }]);
+
+        let mut entries = [entry];
+        bound_wire_strings(&mut entries);
+
+        let pool = &entries[0].spend.as_ref().unwrap()[0];
+        // Cut AND announced, matching every other bounded field here: a value
+        // trimmed silently reads as a complete one, and an id that quietly
+        // loses its tail can collide with a sibling pool.
+        for (name, value) in [
+            ("id", &pool.id),
+            ("label", &pool.label),
+            ("remaining unit", &pool.remaining.as_ref().unwrap().unit),
+            // A separate field from `remaining`: bounding only the first would
+            // leave this one through, and the entry would still be oversized.
+            ("total unit", &pool.total.as_ref().unwrap().unit),
+        ] {
+            assert!(value.len() < long.len(), "{name} was not bounded at all");
+            assert!(value.contains("more bytes]"), "{name} was cut silently");
+        }
     }
 }
 
