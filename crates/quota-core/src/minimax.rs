@@ -35,7 +35,8 @@ use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
+    money::parse_amount,
     provider::{FetchError, UsageProvider},
 };
 
@@ -45,8 +46,40 @@ const API_KEY_ENV: &[&str] = &["MINIMAX_CODING_API_KEY", "MINIMAX_API_KEY"];
 const REGION_ENV: &[&str] = &["MINIMAX_API_REGION"];
 
 const REMAINS_PATH: &str = "/v1/api/openplatform/coding_plan/remains";
+/// The account wallet, which reports prepaid balances rather than rate windows.
+///
+/// NOT in MiniMax's public documentation. The path and response shape come from
+/// MiniMax's own CLI, so this is a reasonable source but not a promised
+/// contract: it can change without a deprecation notice, and a failure here must
+/// never take the rate windows down with it.
+const BALANCE_PATH: &str = "/account/query_balance";
 const GLOBAL_API_BASE: &str = "https://api.minimax.io";
 const CHINA_API_BASE: &str = "https://api.minimaxi.com";
+
+/// The wallet response.
+///
+/// Amounts arrive as decimal strings, e.g. `"98.00"`.
+///
+/// MiniMax separates these balances and publicly defines none of them.
+/// `voucher_balance` is the plausible home for granted credit and MiniMax does
+/// not say so, which is why every pool below is published under MiniMax's own
+/// field name with `PoolFunding::Unknown`. Naming one of them "granted" would
+/// invent exactly the label a spend policy keys on, and being wrong there spends
+/// real money.
+#[derive(Debug, Clone, Deserialize)]
+struct WalletResponse {
+    /// Present in the payload and deliberately unpublished: it reads as the
+    /// spendable total across the balances below, so emitting it as a fourth
+    /// pool would have a consumer counting the same money twice.
+    ///
+    /// Kept in the struct so the observed shape stays visible here, and so its
+    /// absence from the output reads as a decision rather than an oversight.
+    #[allow(dead_code)]
+    available_amount: Option<String>,
+    cash_balance: Option<String>,
+    voucher_balance: Option<String>,
+    credit_balance: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct BaseResp {
@@ -429,6 +462,92 @@ fn normalize_usage_at(body: &[u8], now_secs: i64) -> Result<Usage, FetchError> {
     })
 }
 
+/// Build the pools MiniMax's wallet reports.
+///
+/// Every pool is published under MiniMax's own field name and with
+/// `PoolFunding::Unknown`, because MiniMax separates these balances without
+/// publicly defining any of them. `voucher_balance` is where granted credit
+/// plausibly lives, and "plausibly" is not a basis for a label a consumer will
+/// key a spend policy on.
+///
+/// `available_amount` is deliberately not a pool. It reads as the spendable
+/// total across the others -- the CLI's own figures add up that way -- so
+/// publishing it beside them would have a consumer counting the same money
+/// twice. Nothing here reads it.
+fn wallet_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
+    let wallet: WalletResponse = serde_json::from_slice(body)
+        .map_err(|error| FetchError::Decode(format!("minimax wallet: {error}")))?;
+
+    // MiniMax states no currency on this endpoint, and the account's billing
+    // currency is not determinable from it. "credit" is therefore a generic
+    // placeholder chosen here, not a denomination MiniMax reports -- a currency
+    // code inferred from the region setting would look authoritative and be a
+    // guess about somebody's money.
+    const UNIT: &str = "credit";
+
+    let mut pools = Vec::new();
+    let mut push = |raw: &Option<String>, id: &str, label: &str| {
+        let Some(text) = raw.as_deref() else {
+            return;
+        };
+        let Some(amount) = parse_amount(text, UNIT) else {
+            return;
+        };
+        pools.push(Pool {
+            id: id.to_string(),
+            label: label.to_string(),
+            // Not a guess. MiniMax documents none of these three.
+            funding: PoolFunding::Unknown,
+            remaining: Some(amount),
+            total: None,
+            // Each balance is stated directly rather than derived from a total
+            // and a consumption figure, so a policy naming one is exact.
+            basis: PoolBasis::Reported,
+            // No per-pool enable flag on this endpoint.
+            spendable: None,
+        });
+    };
+
+    push(&wallet.cash_balance, "cash_balance", "Cash balance");
+    push(
+        &wallet.voucher_balance,
+        "voucher_balance",
+        "Voucher balance",
+    );
+    push(&wallet.credit_balance, "credit_balance", "Credit balance");
+
+    if pools.is_empty() {
+        return Err(FetchError::Decode(
+            "minimax wallet: no readable balance".to_string(),
+        ));
+    }
+    Ok(pools)
+}
+
+fn balance_url(base: &str) -> String {
+    format!("{}{}", base.trim_end_matches('/'), BALANCE_PATH)
+}
+
+/// Fetch the wallet, returning None on any failure.
+///
+/// Deliberately swallows its error. The caller has already published rate
+/// windows by this point, and this endpoint is undocumented -- an outage or a
+/// shape change here must cost the money signal only, never the capacity one.
+///
+/// Nothing is logged and no error reaches the wire, so a wallet outage is
+/// invisible as a failure: it shows only as an entry that carries no pools,
+/// which is indistinguishable from a provider that reports none. That is the
+/// price of never letting this endpoint cost the capacity signal, and it is
+/// worth knowing before trusting an absence here.
+async fn fetch_wallet(client: &reqwest::Client, api_key: &str, base: &str) -> Option<Vec<Pool>> {
+    let body = JsonRequest::get(balance_url(base))
+        .bearer(api_key)
+        .send(client)
+        .await
+        .ok()?;
+    wallet_pools(&body).ok()
+}
+
 fn api_base_url() -> String {
     let region = env::first_env(REGION_ENV)
         .map(|v| v.trim().to_lowercase())
@@ -484,24 +603,54 @@ impl UsageProvider for MinimaxProvider {
     }
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
-        let result: Result<ProviderUsage, FetchError> = async {
+        let result: Result<(ProviderUsage, String, String), FetchError> = async {
             let api_key = env::first_env(API_KEY_ENV)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-            let base = api_base_url();
-            let body = match fetch_remains_once(&self.http, &api_key, &base).await {
-                Ok(body) => body,
-                Err(FetchError::Unauthorized(_)) if base == GLOBAL_API_BASE => {
-                    fetch_remains_once(&self.http, &api_key, CHINA_API_BASE).await?
-                }
+            let configured = api_base_url();
+            // Which host actually answered, not which one was tried first. A key
+            // minted in one region is rejected by the other, so a later request
+            // on this account has to go to the host that accepted this one --
+            // sending it elsewhere earns a 401 for a credential that is fine.
+            let (body, base) = match fetch_remains_once(&self.http, &api_key, &configured).await {
+                Ok(body) => (body, configured),
+                Err(FetchError::Unauthorized(_)) if configured == GLOBAL_API_BASE => (
+                    fetch_remains_once(&self.http, &api_key, CHINA_API_BASE).await?,
+                    CHINA_API_BASE.to_string(),
+                ),
                 Err(e) => return Err(e),
             };
 
             let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            Ok((
+                ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage),
+                api_key,
+                base,
+            ))
         }
         .await;
-        FetchAttempt::from_provider_usage(result)
+
+        let (entry, api_key, base) = match result {
+            Ok(value) => value,
+            Err(error) => return FetchAttempt::from_provider_usage(Err(error)),
+        };
+
+        // The wallet is fetched only after the windows are in the successful
+        // usage entry, and its failure is discarded rather than propagated.
+        //
+        // Two reasons, and the second is the load-bearing one. The endpoint is
+        // undocumented, so it can change or disappear without notice. And the
+        // windows are what a router paces on: letting a wallet failure degrade
+        // this entry would trade a working capacity signal for a missing money
+        // one, which is strictly worse than not asking at all.
+        //
+        // A wallet that fails leaves `pools` as None -- nothing to report --
+        // rather than an empty list, which would claim MiniMax holds no credit.
+        let pools = fetch_wallet(&self.http, &api_key, &base).await;
+
+        let mut attempt = FetchAttempt::from_provider_usage(Ok(entry));
+        attempt.pools = pools;
+        attempt
     }
 }
 
@@ -898,5 +1047,104 @@ mod tests {
             make_interval_window(model, now).is_none(),
             "the unavailable-lane shape must still be suppressed"
         );
+    }
+}
+
+#[cfg(test)]
+mod wallet_tests {
+    use super::*;
+
+    /// CLI-observed shape: taken from MiniMax's own CLI, which is the only
+    /// source for this endpoint. Not a documented contract.
+    const WALLET: &[u8] = br#"{
+        "available_amount": "98.00",
+        "cash_balance": "0.00",
+        "voucher_balance": "98.00",
+        "credit_balance": "0.00",
+        "owed_amount": "0.00",
+        "base_resp": { "status_code": 0, "status_msg": "success" }
+    }"#;
+
+    /// Pools keep MiniMax's own names and claim no funding.
+    ///
+    /// The temptation is to publish `voucher_balance` as granted credit, since
+    /// that is plausibly what it is and it is what a "spend only free credit"
+    /// policy wants. MiniMax documents none of these three, so that label would
+    /// be ours, and a consumer keying a spend policy on it would be spending
+    /// real money on our guess.
+    #[test]
+    fn wallet_pools_carry_minimax_names_and_unknown_funding() {
+        let pools = wallet_pools(WALLET).expect("the CLI-observed shape must parse");
+
+        let ids: Vec<&str> = pools.iter().map(|pool| pool.id.as_str()).collect();
+        assert_eq!(ids, ["cash_balance", "voucher_balance", "credit_balance"]);
+        assert!(
+            pools
+                .iter()
+                .all(|pool| pool.funding == PoolFunding::Unknown),
+            "no pool may claim a funding MiniMax does not state: {pools:?}"
+        );
+        assert!(
+            !pools
+                .iter()
+                .any(|pool| pool.id.contains("granted")
+                    || pool.label.to_lowercase().contains("granted")),
+            "a granted label would be ours, not MiniMax's: {pools:?}"
+        );
+    }
+
+    /// The spendable total is not published beside its own parts.
+    #[test]
+    fn the_available_total_is_not_a_pool() {
+        let pools = wallet_pools(WALLET).expect("parses");
+        assert!(
+            !pools.iter().any(|pool| pool.id.contains("available")),
+            "available_amount is the sum of the parts: {pools:?}"
+        );
+        let summed: i64 = pools
+            .iter()
+            .filter_map(|pool| pool.remaining.as_ref().map(|amount| amount.minor))
+            .sum();
+        assert_eq!(summed, 9_800, "the pools must sum to the stated total");
+    }
+
+    /// The wallet must be asked on the host that accepted the credential.
+    ///
+    /// A key minted in one region is rejected by the other, and the rate-window
+    /// request already falls back from global to China on a 401. If the wallet
+    /// then used the originally configured host, an account that only works in
+    /// China would have its windows fetched from China and its wallet asked in
+    /// the wrong place -- earning a 401 for a credential that is perfectly good.
+    ///
+    /// Worse, the failure would be invisible: wallet errors are deliberately
+    /// discarded, so this would present as "MiniMax reports no pools" forever
+    /// rather than as anything anyone could debug.
+    #[test]
+    fn the_wallet_url_follows_the_host_that_answered() {
+        assert_eq!(
+            balance_url(CHINA_API_BASE),
+            format!("{CHINA_API_BASE}{BALANCE_PATH}")
+        );
+        assert_eq!(
+            balance_url(GLOBAL_API_BASE),
+            format!("{GLOBAL_API_BASE}{BALANCE_PATH}")
+        );
+        // The two must differ, or the assertion above proves nothing about
+        // which host a fallback ends up using.
+        assert_ne!(balance_url(CHINA_API_BASE), balance_url(GLOBAL_API_BASE));
+    }
+
+    /// A wallet body that states nothing readable is an error, not an empty
+    /// wallet: the two are opposite facts about an account's money.
+    #[test]
+    fn an_unreadable_wallet_is_an_error_rather_than_no_credit() {
+        assert!(matches!(
+            wallet_pools(b"not json"),
+            Err(FetchError::Decode(_))
+        ));
+        assert!(matches!(
+            wallet_pools(br#"{ "base_resp": { "status_code": 0 } }"#),
+            Err(FetchError::Decode(_))
+        ));
     }
 }
