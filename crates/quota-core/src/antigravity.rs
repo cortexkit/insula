@@ -1120,23 +1120,43 @@ impl UsageProvider for AntigravityProvider {
     /// lane is offered whenever a vault credential exists, and is what keeps this
     /// provider reporting with nothing open.
     ///
-    /// Unlike the vault-served providers, the local lane is NOT replaced when a
-    /// vault handle appears. Both describe the same account, so there is no
-    /// identity ambiguity to avoid, and keeping both means a cloud outage or a
-    /// dead credential still leaves the local answer.
+    /// A credentialed lane REPLACES the local probe rather than joining it.
+    ///
+    /// The local probe can never resolve an account identity -- it asks a
+    /// running editor what its quota is, and the answer names no account. The
+    /// read path emits labeled entries only when EVERY handle resolves one, so
+    /// keeping the probe beside identity-bearing lanes collapses the whole
+    /// provider to a single unlabeled entry and discards the identity the other
+    /// lanes did resolve.
+    ///
+    /// That is not theoretical here: it shipped that way, and the wire showed
+    /// `account: null` for an account whose email the plugin lane had read
+    /// correctly. Multiple logged-in accounts make it worse rather than
+    /// differently wrong -- four accounts would publish as one unlabeled entry
+    /// describing whichever the editor happened to be using.
+    ///
+    /// The probe remains the whole answer when nothing else is configured,
+    /// which is the case it was built for. What is given up when a credential
+    /// exists is its richer per-model detail and its offline reach; the
+    /// refresher already serves the last healthy window through a cloud outage,
+    /// so the exposure is a stale window rather than a blank provider.
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
+        let mut credentialed = Vec::new();
         if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.antigravity_handles()?);
+            credentialed.extend(self.handle_loader.antigravity_handles()?);
         }
         // One handle per account the plugin has logged in. This is the lane an
         // ordinary install has, and the only one that can see more than one
         // account: the local probe reports whichever account the running editor
         // happens to be using, and a vault credential is minted per fleet host.
         for (index, account) in stored_accounts().iter().enumerate() {
-            handles.push(CredentialHandle::new(account_handle_name(account, index)));
+            credentialed.push(CredentialHandle::new(account_handle_name(account, index)));
         }
-        Ok(handles)
+
+        if credentialed.is_empty() {
+            return Ok(vec![CredentialHandle::implicit()]);
+        }
+        Ok(credentialed)
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -1673,6 +1693,54 @@ mod plugin_lane_tests {
             .filter_map(|a| a.email)
             .collect();
         assert_eq!(kept, ["live@example.test", "default@example.test"]);
+    }
+
+    /// With no credential anywhere, the local probe is the whole provider.
+    ///
+    /// The case the probe was built for: no plugin, no vault, an editor running.
+    /// Dropping it here would take the provider dark for the only users who
+    /// have nothing else.
+    #[test]
+    fn the_local_probe_stands_alone_when_nothing_else_is_configured() {
+        let provider = AntigravityProvider::new();
+        let handles = provider.handles().expect("handles");
+        // This host has plugin accounts, so assert the RULE rather than the
+        // count: whenever no credentialed lane exists, the probe is offered.
+        let credentialed = handles
+            .iter()
+            .filter(|handle| !matches!(handle, CredentialHandle::ImplicitLocal))
+            .count();
+        if credentialed == 0 {
+            assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        } else {
+            assert!(
+                !handles.contains(&CredentialHandle::implicit()),
+                "a credentialed lane must replace the probe, not join it: {handles:?}"
+            );
+        }
+    }
+
+    /// A credentialed lane replaces the probe rather than joining it.
+    ///
+    /// The probe resolves no account identity, and the read path emits labeled
+    /// entries only when EVERY handle resolves one -- so keeping it beside a
+    /// lane that DOES resolve identity discards that identity for the whole
+    /// provider. This shipped wrong once: the wire showed `account: null` for an
+    /// account whose email the plugin lane had read correctly.
+    #[test]
+    fn a_credentialed_lane_replaces_the_local_probe() {
+        let provider = AntigravityProvider::new();
+        let handles = provider.handles().expect("handles");
+        let named = handles
+            .iter()
+            .filter(|handle| matches!(handle, CredentialHandle::Named(_)))
+            .count();
+        if named > 0 {
+            assert!(
+                !handles.contains(&CredentialHandle::implicit()),
+                "the probe must not survive beside identity-bearing lanes: {handles:?}"
+            );
+        }
     }
 
     /// The masked OAuth constants unmask to the plugin's real client.
