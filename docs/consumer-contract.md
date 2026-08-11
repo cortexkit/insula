@@ -390,6 +390,27 @@ say, and the safe reading depends on what you are about to do:
 | about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
 | rendering to a person | **unknown** | hiding a live pool misleads someone who could act on it |
 
+### Decode `funding` and `basis` permissively
+
+Both are closed sets today and **both will gain values**. Decode them as
+strings, or as an enum with a catch-all — never as a closed enum that fails on
+an unrecognised value.
+
+The failure this prevents is not local. A strict decode of one pool's `funding`
+fails the whole entry, taking the account's **rate windows** down with it — data
+that has nothing to do with pools and was perfectly readable. That is a pool
+field deleting a capacity signal.
+
+The safe landing is already the correct one: an unrecognised `funding` means the
+same as `unknown` (a funding you cannot name is one you must not spend from),
+and an unrecognised `basis` means the same as `unstated` (treat `remaining` as a
+ceiling). Both fall to the conservative side without special handling.
+
+The same applies to the envelope as a whole: this producer adds fields
+additively and without warning, so a decoder that rejects unknown fields
+(`serde(deny_unknown_fields)` and equivalents) turns every future addition into
+an outage on the consumer's side.
+
 ### Absent, empty, and present
 
 `spend` absent means this producer has nothing to report about pools — most
