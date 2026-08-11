@@ -1,8 +1,15 @@
 //! Sub2API usage fetcher — group API key and self-hosted endpoint from env.
 //!
-//! Every accepted `rate_limits[]` entry becomes a named extra window. USD quota,
-//! subscription, and balance fields are deliberately omitted: they measure money
-//! rather than a rate-limit period, and the balance output seam is not wired yet.
+//! Every accepted `rate_limits[]` entry becomes a named extra window. The USD
+//! quota, subscription and balance fields are still omitted -- they measure money
+//! rather than a rate-limit period, so they belong on `ProviderUsage::spend` as
+//! `Pool`s and never as windows.
+//!
+//! NOT YET PUBLISHED, and the reason is verification rather than plumbing: the
+//! pool shape ships and three providers use it, but no credential for this
+//! provider exists on any host here, so a normalizer written for these fields
+//! could not be run against a real payload. Publishing money parsed only from a
+//! fixture is the wrong direction to be wrong in.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! `SUB2API_API_KEY` / `SUB2API_BASE_URL` pair was available. Endpoint selection,

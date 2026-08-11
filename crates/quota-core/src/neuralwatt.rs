@@ -1,6 +1,8 @@
 //! NeuralWatt usage provider.
 //!
-//! The prepaid balance (providerCost) is BALANCE-AXIS: skip, note in doc-comment.
+//! The prepaid balance (`credits_remaining_usd`) is parsed and not published.
+//! Balances have a home now -- `Pool`s on `ProviderUsage::spend` -- so what is
+//! missing is a credential to verify against, not somewhere to put it.
 //!
 //! VERIFICATION:
 //! This port is fixture-verified against CodexBar source.

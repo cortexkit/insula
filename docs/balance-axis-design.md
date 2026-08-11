@@ -310,6 +310,25 @@ Land the shape with two providers rather than seventeen:
   `GET /user/balance`, documented, and the only examined provider that reports
   granted and purchased remainders separately.
 
+**What actually shipped, and what stopped at two-plus-one.** Both providers
+above landed, and **Codex** followed immediately: its `/wham/usage` response
+already carried a `credits` object that was being parsed and discarded, so
+publishing it needed no new endpoint, credential, or request. That is the
+cheapest possible third case and it exercised a distinction the first two did
+not — an account with **no credit product** reports the same `balance: "0"` as a
+spent one, so `has_credits` decides between publishing nothing and publishing an
+exhausted pool.
+
+**Everything else stopped for one reason, and it is not the wire.** NeuralWatt,
+ZenMux, Sub2API, Kilo, StepFun and Manus all report a balance, and several parse
+it already. None of them has a credential on any host here — every one reports
+`credential_absent`. A normalizer for them could be written from a fixture and
+could not be run against a real payload, and money parsed only from a fixture is
+the wrong direction to be wrong in: a misread balance is not a missing row, it
+is a figure a router may spend against. The obstacle is a credential, not a
+design decision, and their source comments say so at the point where the fields
+are skipped.
+
 **A caveat that belongs with MiniMax specifically, because the motivating user
 wants free credits.** Its wallet lives at `GET /account/query_balance` and is
 **not in the public documentation** — it is used by MiniMax's own CLI, which is

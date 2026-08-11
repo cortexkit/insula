@@ -7,8 +7,11 @@
 //! - `Sources/CodexBarCore/Providers/ZenMux/ZenMuxUsageFetcher.swift:121-205`
 //! - `Sources/CodexBarCore/Providers/ZenMux/ZenMuxSettingsReader.swift:4-23`
 //!
-//! Note: The PAYG balance USD call (`payg/balance`) is BALANCE-AXIS and is skipped
-//! entirely (not fetched), as instructed.
+//! Note: the PAYG balance call (`payg/balance`) is not fetched. Prepaid balances
+//! are publishable now -- they travel as `Pool`s on `ProviderUsage::spend` -- so
+//! the remaining obstacle is verification, not the wire: no credential for this
+//! provider exists on any host here, so neither the request nor the response
+//! shape could be exercised against anything real.
 
 use std::time::Duration;
 

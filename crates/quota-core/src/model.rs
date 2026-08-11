@@ -9,10 +9,11 @@
 //! `used_percent` and populates `raw_used_percent` — lives in this crate's
 //! registry (`lib.rs`), NOT in the types: the shared crate is shape, not policy.
 //!
-//! NOTE: the reserved prepaid-`Balance` seam was removed when the types moved to
-//! the shared crate (it was never populated by any provider and is wire-neutral:
-//! the field was always `None` and skipped). It returns to the shared crate,
-//! additively, when the balance axis is actually designed.
+//! Prepaid balances travel as `Pool`s on `ProviderUsage::spend`, beside `usage`
+//! rather than inside it. A window is a share of a period; a pool is an amount
+//! with no period, and over-spending them fails in opposite directions -- one
+//! throttles and recovers by waiting, the other bills and recovers by paying.
+//! See `docs/balance-axis-design.md` for why the shape is what it is.
 
 pub use cortexkit_provider_usage::{
     AccountInfo, Amount, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding, ProviderUsage,
