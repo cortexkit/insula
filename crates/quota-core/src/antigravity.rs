@@ -1503,6 +1503,70 @@ mod tests {
     }
 
     #[test]
+    /// The CLI arm accepts a shell command that merely names the binary.
+    ///
+    /// Recorded as a KNOWN LIMIT rather than fixed, because the fix is worse
+    /// than the fault. `ps` shows argv and nothing in it distinguishes "is this
+    /// process the CLI" from "does this process mention the CLI" -- the kernel
+    /// knows, through the executable path, but reading that per candidate costs
+    /// a syscall per process on every refresh for a provider that is usually
+    /// absent.
+    ///
+    /// The consequence is bounded: a wrongly-matched pid gets its ports probed,
+    /// answers nothing, and the provider reports its local source unavailable.
+    /// That is the same outcome as no editor running, which is the common case,
+    /// so the cost is a wasted probe rather than a wrong reading. Nothing is
+    /// published from a mismatched process, because the probe requires a
+    /// response the wrong process cannot give.
+    #[test]
+    fn the_cli_arm_matches_a_shell_that_only_names_the_binary() {
+        assert_eq!(
+            classify_command("/bin/bash -c ls ~/bin/agy"),
+            Some(String::new()),
+            "documenting the limit: a command ending in /agy classifies as the CLI"
+        );
+        // What keeps it bounded: the port probe against such a pid finds
+        // nothing, so the lane degrades rather than publishing a wrong figure.
+    }
+
+    /// A shell whose own command line mentions the words is not a server.
+    ///
+    /// `ps -ax -o command=` shows a process's whole argv, so any shell running a
+    /// grep, an editor, or a build over this file carries both "antigravity" and
+    /// "language_server" in its own line. The classifier is a substring match
+    /// over that text, and the language-server arm is only closed because it
+    /// also demands a `--csrf_token` -- which a shell command discussing the
+    /// server does not have, unless the text it carries happens to contain one.
+    ///
+    /// The CLI arm has no such second condition, so it is the exposed one: it
+    /// accepts any command line containing `/agy ` or ending in `/agy`. A probe
+    /// against a wrongly-matched pid asks a loopback port that answers nothing
+    /// useful, and the provider reports the local source unavailable -- honest,
+    /// but attributed to a missing editor rather than a bad match.
+    #[test]
+    fn a_shell_mentioning_the_words_is_not_classified_as_a_server() {
+        // The real shape: a shell running a search over this very file.
+        let shell = "/bin/bash -c grep -n 'antigravity language_server' \
+                     crates/quota-core/src/antigravity.rs";
+        assert_eq!(
+            classify_command(shell),
+            None,
+            "a shell command naming the server must not be probed as one"
+        );
+
+        // An editor holding the file open is the same hazard, different tool.
+        assert_eq!(
+            classify_command("vim crates/quota-core/src/antigravity.rs"),
+            None
+        );
+
+        // The real server still classifies, so the guard above is not just
+        // rejecting everything.
+        let real = "/Applications/Antigravity.app/Contents/Resources/bin/\
+                    language_server --csrf_token=abc123";
+        assert_eq!(classify_command(real), Some("abc123".to_string()));
+    }
+
     fn parses_process_list_keeps_only_antigravity_servers() {
         let ps = "  123 /Applications/Antigravity.app/Contents/MacOS/agy\n\
             456 /Applications/Antigravity.app/language_server --csrf_token=tok antigravity\n\
