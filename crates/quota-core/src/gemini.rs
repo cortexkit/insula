@@ -640,6 +640,31 @@ impl UsageProvider for GeminiProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The masked OAuth constants unmask to Google's real public client.
+    ///
+    /// Pinned against literals rather than against a round trip through
+    /// `unmask`, because a round-trip assertion holds for ANY mask and any
+    /// bytes: it proves the function is reversible, not that these bytes are
+    /// the client Google will accept.
+    ///
+    /// The failure mode is what makes this worth an explicit test. A wrong
+    /// client is not a decode error -- a refresh token is bound to the client
+    /// that minted it, so the exchange returns 401 and the account reads as a
+    /// dead login. Nothing distinguishes that from a genuinely expired
+    /// credential, so the remedy an operator reaches for (log in again) does
+    /// not fix it and the real cause is invisible.
+    #[test]
+    fn the_masked_oauth_client_unmasks_to_googles_public_pair() {
+        assert_eq!(
+            unmask(CLIENT_ID_MASKED),
+            "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+        );
+        assert_eq!(
+            unmask(CLIENT_SECRET_MASKED),
+            "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"
+        );
+    }
     use super::*;
     use chrono::TimeZone as _;
     use std::io::Write as _;
