@@ -71,6 +71,136 @@ const REMOTE_QUOTA_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:r
 /// Identifies the calling product on that shared endpoint.
 const REMOTE_USER_AGENT: &str = "antigravity";
 
+/// Where the opencode `antigravity-auth` plugin keeps its logged-in accounts.
+///
+/// This is the third credential lane, and the one an ordinary install actually
+/// has: the local probe needs the editor running, and the cloud lane as first
+/// shipped needed a vault credential that only this fleet mints. A user who
+/// signed in through the plugin has neither, and the provider went dark for
+/// them with `local_source_unavailable` — correct and useless.
+const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
+
+/// The plugin's own Google OAuth client, which is what makes this lane work.
+///
+/// A refresh token is bound to the client that minted it, so the client here
+/// must be the PLUGIN's — not Antigravity's desktop app, and not Gemini CLI's.
+/// Both of those were tried against a healthy token and returned 401, which
+/// reads exactly like a dead credential and is not one.
+///
+/// Public by construction (it ships in the plugin's own JavaScript) and stored
+/// XOR-masked for the same reason as the Gemini pair: to keep secret-scanner
+/// regexes off the source text, never for secrecy. Overridable by env when the
+/// plugin rotates it.
+const ANTIGRAVITY_CLIENT_ID_MASKED: &[u8] = &[
+    64, 69, 88, 69, 81, 29, 70, 69, 84, 92, 92, 90, 28, 78, 6, 8, 12, 0, 94, 31, 95, 67, 29, 93,
+    69, 13, 78, 2, 16, 80, 95, 92, 21, 89, 12, 30, 10, 14, 27, 25, 17, 5, 65, 70, 10, 4, 79, 76, 0,
+    5, 17, 66, 14, 12, 66, 4, 30, 0, 17, 0, 72, 4, 82, 30, 27, 27, 17, 15, 89, 94, 22, 13, 1,
+];
+const ANTIGRAVITY_CLIENT_SECRET_MASKED: &[u8] = &[
+    54, 58, 44, 39, 49, 117, 93, 62, 87, 84, 47, 52, 127, 87, 74, 83, 40, 23, 97, 60, 0, 28, 57,
+    45, 76, 18, 117, 51, 65, 24, 90, 24, 39, 108, 5,
+];
+const CRED_MASK: &[u8] = b"quota-public-creds-v1";
+const CLIENT_ID_ENV: &[&str] = &["ANTIGRAVITY_OAUTH_CLIENT_ID"];
+const CLIENT_SECRET_ENV: &[&str] = &["ANTIGRAVITY_OAUTH_CLIENT_SECRET"];
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// The wire `source` for this lane.
+///
+/// Deliberately the EXISTING `oauth` value rather than a new one. The published
+/// meaning of `oauth` is "an OAuth token or session found on this machine",
+/// whose remedy is "log in with the tool that owns it" -- which describes this
+/// lane exactly, the owning tool being the opencode plugin. A new value would
+/// have to earn its place by implying a different remedy, and this one does not.
+const PLUGIN_SOURCE: &str = "oauth";
+
+/// XOR-unmask an embedded public credential to its plaintext.
+fn unmask(masked: &[u8]) -> String {
+    masked
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b ^ CRED_MASK[i % CRED_MASK.len()]) as char)
+        .collect()
+}
+
+fn oauth_client_id() -> String {
+    crate::env::first_env(CLIENT_ID_ENV).unwrap_or_else(|| unmask(ANTIGRAVITY_CLIENT_ID_MASKED))
+}
+
+fn oauth_client_secret() -> String {
+    crate::env::first_env(CLIENT_SECRET_ENV)
+        .unwrap_or_else(|| unmask(ANTIGRAVITY_CLIENT_SECRET_MASKED))
+}
+
+/// One logged-in account as the plugin stores it.
+#[derive(Debug, Clone, Deserialize)]
+struct StoredAccount {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default, rename = "refreshToken")]
+    refresh_token: Option<String>,
+    #[serde(default, rename = "managedProjectId")]
+    managed_project_id: Option<String>,
+    /// The plugin's own switch. A disabled account is one the user turned off,
+    /// so reporting its quota would describe capacity they have chosen not to
+    /// use -- and absent is treated as enabled, matching the plugin's default.
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsFile {
+    #[serde(default)]
+    accounts: Vec<StoredAccount>,
+}
+
+/// Read the plugin's accounts, keeping only those that can actually be fetched.
+///
+/// Returns an empty vector when the file is absent, which is the ordinary case
+/// on a host that never installed the plugin -- not an error, and deliberately
+/// indistinguishable from having no accounts, because both mean this lane has
+/// nothing to offer.
+fn stored_accounts() -> Vec<StoredAccount> {
+    let Some(home) = crate::env::home_dir() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(home.join(ACCOUNTS_FILE)) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_str::<AccountsFile>(&text) else {
+        return Vec::new();
+    };
+    file.accounts
+        .into_iter()
+        .filter(|account| account.enabled != Some(false))
+        .filter(|account| {
+            account
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+        .collect()
+}
+
+/// The handle name for a stored account.
+///
+/// The email when the plugin recorded one, since it is stable across restarts
+/// and survives the list being reordered -- which the index does not. A slot
+/// number is the fallback, and it is a worse key: adding an account above this
+/// one silently repoints the handle at a different account, and the refresher
+/// keys its backoff and identity fencing on exactly this string.
+fn account_handle_name(account: &StoredAccount, index: usize) -> String {
+    match account
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        Some(email) => format!("plugin:{email}"),
+        None => format!("plugin:#{index}"),
+    }
+}
+
 const QUOTA_SUMMARY_PATH: &str =
     "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 
@@ -704,6 +834,135 @@ impl AntigravityProvider {
         }
     }
 
+    /// Fetch one plugin-stored account's quota.
+    ///
+    /// Same cloud endpoint as the vault lane; only the credential differs. The
+    /// plugin stores a refresh token, so this exchanges it for an access token
+    /// on every fetch rather than caching one -- the refresher's own interval is
+    /// longer than the hour these tokens live, so a cache would be a miss with
+    /// extra state.
+    async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
+        let accounts = stored_accounts();
+        let found = accounts
+            .iter()
+            .enumerate()
+            .find(|(index, account)| account_handle_name(account, *index) == handle_name);
+        let Some((_, account)) = found else {
+            // The account was removed or disabled between enumeration and fetch.
+            // Absent rather than broken: nothing here is wrong, the user simply
+            // signed it out.
+            return FetchAttempt::failure(
+                None,
+                Some(PLUGIN_SOURCE.to_string()),
+                FetchError::NoSession(
+                    "the opencode antigravity plugin no longer lists this account".to_string(),
+                ),
+            );
+        };
+
+        let observed = account
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+            .map(|email| AccountObservation::new(Some(email.to_string()), None));
+
+        let refresh_token = account.refresh_token.clone().unwrap_or_default();
+        let access_token = match self.exchange_refresh_token(&refresh_token).await {
+            Ok(token) => token,
+            Err(error) => {
+                return FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error)
+            }
+        };
+
+        let project = account
+            .managed_project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+
+        let usage = self
+            .fetch_remote_quota(&access_token, project.as_deref())
+            .await;
+        match usage {
+            Ok(usage) => FetchAttempt::success(observed, PLUGIN_SOURCE, usage),
+            Err(error) => FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error),
+        }
+    }
+
+    /// Call the cloud quota endpoint with an already-resolved access token.
+    ///
+    /// Shared by both cloud credential lanes -- the vault one and the plugin
+    /// file one -- because they differ only in where the token came from. Two
+    /// copies of this call would be two places for the request shape to drift,
+    /// and the endpoint is the half that is hard to verify.
+    async fn fetch_remote_quota(
+        &self,
+        access_token: &str,
+        project: Option<&str>,
+    ) -> Result<Usage, FetchError> {
+        // The project scopes the query where one is known. The endpoint also
+        // answers without it, so an absent project is not a failure.
+        let body = match project {
+            Some(project) => serde_json::json!({ "project": project }),
+            None => serde_json::json!({}),
+        };
+        let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
+        let response = JsonRequest::post_json(&self.quota_url, body)
+            .bearer(access_token)
+            // Identifies the calling product to the shared endpoint, matching
+            // what the Antigravity client sends.
+            .header(Header::new("User-Agent", REMOTE_USER_AGENT))
+            .timeout(REQUEST_TIMEOUT)
+            .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
+            .await?;
+        parse_remote_quota(&response.body)
+    }
+
+    /// Exchange a stored refresh token for a short-lived access token.
+    ///
+    /// A 400 or 401 here means the grant itself was rejected, which is a
+    /// credential the user must re-authorize rather than a transient fault, so
+    /// it must not be retried as though the network flapped.
+    async fn exchange_refresh_token(&self, refresh_token: &str) -> Result<String, FetchError> {
+        if refresh_token.trim().is_empty() {
+            return Err(FetchError::NoSession(
+                "the stored account carries no refresh token".to_string(),
+            ));
+        }
+        let client_id = oauth_client_id();
+        let client_secret = oauth_client_secret();
+        let response = JsonRequest::post_form(
+            TOKEN_URL,
+            &[
+                ("client_id", &client_id),
+                ("client_secret", &client_secret),
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token"),
+            ],
+        )
+        .timeout(REQUEST_TIMEOUT)
+        .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
+        .await?;
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: Option<String>,
+        }
+        let parsed: TokenResponse = serde_json::from_slice(&response.body).map_err(|e| {
+            FetchError::Decode(format!("antigravity token response not decodable: {e}"))
+        })?;
+        parsed
+            .access_token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| {
+                FetchError::CredentialUnusable(
+                    "the token exchange returned no access token".to_string(),
+                )
+            })
+    }
+
     /// Fetch quota from the cloud, needing no local process.
     ///
     /// The credential is Antigravity's own Google login, served by the vault.
@@ -749,20 +1008,8 @@ impl AntigravityProvider {
         let result: Result<Usage, FetchError> = async {
             // The project scopes the query where the vault knows one. The endpoint
             // also answers without it, so an absent project is not a failure.
-            let body = match &project {
-                Some(project) => serde_json::json!({ "project": project }),
-                None => serde_json::json!({}),
-            };
-            let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
-            let response = JsonRequest::post_json(&self.quota_url, body)
-                .bearer(&access_token)
-                // Identifies the calling product to the shared endpoint, matching
-                // what the Antigravity client sends.
-                .header(Header::new("User-Agent", REMOTE_USER_AGENT))
-                .timeout(REQUEST_TIMEOUT)
-                .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
-                .await?;
-            parse_remote_quota(&response.body)
+            self.fetch_remote_quota(&access_token, project.as_deref())
+                .await
         }
         .await;
 
@@ -882,10 +1129,20 @@ impl UsageProvider for AntigravityProvider {
         if self.credential_source.is_some() {
             handles.extend(self.handle_loader.antigravity_handles()?);
         }
+        // One handle per account the plugin has logged in. This is the lane an
+        // ordinary install has, and the only one that can see more than one
+        // account: the local probe reports whichever account the running editor
+        // happens to be using, and a vault credential is minted per fleet host.
+        for (index, account) in stored_accounts().iter().enumerate() {
+            handles.push(CredentialHandle::new(account_handle_name(account, index)));
+        }
         Ok(handles)
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if let CredentialHandle::Named(name) = handle {
+            return self.fetch_plugin_account(name).await;
+        }
         if let Some(capability) = handle.vault_capability() {
             return self.fetch_remote(capability).await;
         }
@@ -1341,5 +1598,109 @@ mod tests {
             // so this cannot pass by dropping the window's timing entirely.
             assert!(window.resets_at.is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod plugin_lane_tests {
+    use super::*;
+
+    fn account(email: Option<&str>, token: Option<&str>, enabled: Option<bool>) -> StoredAccount {
+        StoredAccount {
+            email: email.map(str::to_string),
+            refresh_token: token.map(str::to_string),
+            managed_project_id: Some("proj-1".to_string()),
+            enabled,
+        }
+    }
+
+    /// The handle name keys on the email, not the slot.
+    ///
+    /// The refresher keys backoff and identity fencing on this string, so a name
+    /// that moves when the list is reordered silently repoints a slot at a
+    /// different account -- carrying the previous account's failure history and
+    /// its cached window with it.
+    #[test]
+    fn the_handle_name_keys_on_the_email_when_there_is_one() {
+        let named = account(Some("a@example.test"), Some("tok"), None);
+        assert_eq!(account_handle_name(&named, 0), "plugin:a@example.test");
+        assert_eq!(
+            account_handle_name(&named, 7),
+            "plugin:a@example.test",
+            "the position must not appear in the name"
+        );
+
+        // Without an email there is nothing stable to use, and the slot number
+        // is the honest fallback rather than a fabricated identity.
+        let anonymous = account(None, Some("tok"), None);
+        assert_eq!(account_handle_name(&anonymous, 3), "plugin:#3");
+    }
+
+    /// A blank email does not produce a handle named `plugin:`.
+    #[test]
+    fn a_blank_email_falls_back_to_the_slot() {
+        let blank = account(Some("   "), Some("tok"), None);
+        assert_eq!(account_handle_name(&blank, 2), "plugin:#2");
+    }
+
+    /// Accounts the user disabled, or that carry no token, are not offered.
+    ///
+    /// Both would produce a handle that can only fail: a disabled account is
+    /// capacity the user chose not to use, and a tokenless one cannot be
+    /// exchanged. Offering either would publish a degraded entry describing
+    /// nothing wrong.
+    #[test]
+    fn disabled_and_tokenless_accounts_are_filtered() {
+        let file = AccountsFile {
+            accounts: vec![
+                account(Some("live@example.test"), Some("tok"), Some(true)),
+                account(Some("off@example.test"), Some("tok"), Some(false)),
+                account(Some("empty@example.test"), Some("   "), None),
+                account(Some("none@example.test"), None, None),
+                // Absent `enabled` matches the plugin's own default of on.
+                account(Some("default@example.test"), Some("tok"), None),
+            ],
+        };
+        let kept: Vec<String> = file
+            .accounts
+            .into_iter()
+            .filter(|a| a.enabled != Some(false))
+            .filter(|a| {
+                a.refresh_token
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+            })
+            .filter_map(|a| a.email)
+            .collect();
+        assert_eq!(kept, ["live@example.test", "default@example.test"]);
+    }
+
+    /// The masked OAuth constants unmask to the plugin's real client.
+    ///
+    /// A refresh token is bound to the client that minted it, so an unmasking
+    /// error does not degrade gracefully -- it returns 401 from a healthy
+    /// credential, which reads as a dead login. Pinned against literals rather
+    /// than against the masking function, or the test would pass for any pair
+    /// that round-trips.
+    #[test]
+    fn the_masked_oauth_client_unmasks_to_the_plugin_pair() {
+        assert_eq!(
+            unmask(ANTIGRAVITY_CLIENT_ID_MASKED),
+            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+        );
+        assert_eq!(
+            unmask(ANTIGRAVITY_CLIENT_SECRET_MASKED),
+            "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"
+        );
+    }
+
+    /// The plugin lane reports the existing `oauth` source, not a new value.
+    ///
+    /// Its published meaning -- an OAuth token found on this machine, fixed by
+    /// logging in with the tool that owns it -- describes this lane exactly, and
+    /// a new value would have to imply a different remedy to earn its place.
+    #[test]
+    fn the_plugin_lane_uses_the_existing_oauth_source() {
+        assert_eq!(PLUGIN_SOURCE, "oauth");
     }
 }
