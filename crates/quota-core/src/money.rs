@@ -121,6 +121,35 @@ mod tests {
         );
     }
 
+    /// Precision past any real money is refused, not published rescaled.
+    ///
+    /// The exponent scales the figure by a power of ten, so it is not cosmetic:
+    /// a consumer that divides correctly still gets the right answer, while one
+    /// that ignores the exponent is wrong by that factor. Nine decimal places is
+    /// past any currency or credit precision, so a longer fraction means the
+    /// field is not the decimal number it appears to be.
+    ///
+    /// The boundary is asserted from both sides. Only the reject side existed
+    /// implicitly before, and it was defended by nothing: raising the ceiling to
+    /// 99 left every test green, because no fixture carried a fraction longer
+    /// than two digits.
+    #[test]
+    fn a_fraction_longer_than_any_real_precision_is_refused() {
+        // Nine decimals is accepted: at the boundary, not past it.
+        assert_eq!(
+            parse_amount("1.234567890", "USD"),
+            Some(Amount {
+                minor: 1_234_567_890,
+                exponent: 9,
+                unit: "USD".to_string()
+            })
+        );
+
+        // Ten is not, and the digits are all valid -- so only the length rule
+        // can be what rejects this.
+        assert_eq!(parse_amount("1.2345678901", "USD"), None);
+    }
+
     /// A number this cannot read is refused, never salvaged.
     ///
     /// The grouped case is the one that matters and the reason the parse is
