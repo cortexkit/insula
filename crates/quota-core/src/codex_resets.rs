@@ -364,8 +364,30 @@ impl RedemptionJournal {
         self.load()
     }
 
+    /// Prove at startup that this journal can be written, and say where it is.
+    ///
+    /// The path is announced because a relocated journal is otherwise
+    /// indistinguishable from a fresh one: a missing file reads as an empty
+    /// history, so the module starts clean and looks healthy while every
+    /// pending record at the previous location is unfenced. `CK_QUOTA_STATE_DIR`
+    /// moves this directory ahead of both XDG_STATE_HOME and the default, so
+    /// the difference between "no redemptions yet" and "the history is
+    /// somewhere else" is invisible in every other surface -- the wire, health,
+    /// and the journal's own contents all look identical.
+    ///
+    /// One line at startup rather than a check, because there is nothing to
+    /// check against: a first run on a new host is legitimately empty, and no
+    /// stored marker can distinguish it from a moved directory without becoming
+    /// the state it is trying to verify. Printing the resolved path lets an
+    /// operator compare it against the one they expect, which is the only
+    /// comparison that can be made from outside.
     fn probe_atomic_write(&self) -> Result<(), JournalError> {
         let records = self.load()?;
+        eprintln!(
+            "[ck-quota] codex reset journal: {} ({} record(s))",
+            self.path.display(),
+            records.len()
+        );
         self.save(&records)
     }
 

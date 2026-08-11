@@ -119,6 +119,14 @@ the default path. Both are legitimate; the hazard is setting it once and
 forgetting, or setting it for the module and not for a tool that reads the same
 journal.
 
+**The resolved path is printed at startup** (`[ck-quota] codex reset journal:
+<path> (N record(s))`), which is the only signal that distinguishes a relocated
+journal from a genuinely new one. It is announced rather than checked because
+there is nothing to check against: a first run on a new host is legitimately
+empty, and any stored marker proving otherwise would itself live in the
+directory whose location is in question. An operator comparing the printed path
+against the one they expect is the only comparison available from outside.
+
 One record per logical redemption:
 
 ```json
