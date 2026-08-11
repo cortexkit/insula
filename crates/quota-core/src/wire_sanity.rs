@@ -625,6 +625,28 @@ mod tests {
         );
     }
 
+    /// A pool with no id cannot be selected, only summed.
+    ///
+    /// The worse half of the pair: a duplicate id makes a spend policy pick
+    /// arbitrarily between two real pools, while an empty one leaves a pool that
+    /// no policy can name at all -- excluded from every selection while still
+    /// contributing to any total a consumer adds up. An account then appears to
+    /// hold money that "only granted credit" and "only purchased credit" both
+    /// decline to touch.
+    #[test]
+    fn an_empty_pool_id_is_a_finding() {
+        let entry = entry_with_pools(vec![pool("   ", Some((100, 2, "USD")), None)]);
+        let report = check_entries(&[entry], at("2026-07-28T10:00:00Z"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("pool with an empty id")),
+            "{:?}",
+            report.findings
+        );
+    }
+
     /// A pool holding more than its own ceiling has one wrong figure, and the
     /// checker reports rather than picking which.
     #[test]
