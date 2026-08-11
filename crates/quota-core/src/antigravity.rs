@@ -80,6 +80,24 @@ const REMOTE_USER_AGENT: &str = "antigravity";
 /// them with `local_source_unavailable` — correct and useless.
 const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 
+/// Why reading another tool's refresh token is safe HERE and not in general.
+///
+/// Google does not rotate: a refresh exchange returns an access token and no
+/// new refresh token, so the value in the plugin's file stays valid and two
+/// readers can each refresh independently without disturbing the other.
+/// Verified against the live endpoint rather than assumed.
+///
+/// THAT IS A PROPERTY OF GOOGLE, NOT A PATTERN TO COPY. Anthropic's OAuth
+/// rotates -- its token response carries a replacement refresh token and the
+/// old one stops working -- so a lane reading the anthropic plugin's store the
+/// way this one reads antigravity's would invalidate the credential that plugin
+/// depends on, breaking the user's actual sign-in to collect a usage figure. A
+/// reader that is not the owner of a rotating credential must not spend it.
+///
+/// Before adding a file-backed lane for any provider, establish which kind its
+/// refresh is. The failure is silent on this side and expensive on the other.
+const _ROTATION_NOTE: () = ();
+
 /// The plugin's own Google OAuth client, which is what makes this lane work.
 ///
 /// A refresh token is bound to the client that minted it, so the client here
