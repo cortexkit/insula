@@ -1502,7 +1502,6 @@ mod tests {
         assert_eq!(ports, vec![51234, 51235]);
     }
 
-    #[test]
     /// The CLI arm accepts a shell command that merely names the binary.
     ///
     /// Recorded as a KNOWN LIMIT rather than fixed, because the fix is worse
@@ -1567,6 +1566,7 @@ mod tests {
         assert_eq!(classify_command(real), Some("abc123".to_string()));
     }
 
+    #[test]
     fn parses_process_list_keeps_only_antigravity_servers() {
         let ps = "  123 /Applications/Antigravity.app/Contents/MacOS/agy\n\
             456 /Applications/Antigravity.app/language_server --csrf_token=tok antigravity\n\
