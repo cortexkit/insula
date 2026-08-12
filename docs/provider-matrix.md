@@ -27,13 +27,16 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.49.2** (37 providers registered; verified
-2026-08-11). CodexBar is a moving upstream; parity is re-checked whenever it
+**Current parity: CodexBar v0.49.3** (37 providers registered; verified
+2026-08-12). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
+`max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
+excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
 publishes a newer GitHub release. Read that release's content with `git show
 <tag>:<path>` or `git grep <tag>` — the checkout usually sits at an older tag, so
 plain `grep` silently reads a different version and reports a symbol added in the
 new release as absent. On a new release, diff `git -C ~/Work/OSS/CodexBar
-diff v0.49.2..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
+diff v0.49.3..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and credit-pool
 sources (now portable: the Balance axis ships, so a prepaid balance is publishable
