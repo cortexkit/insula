@@ -1251,6 +1251,40 @@ comes from the registry rather than from summing the buckets, which is the whole
 reason the identity can fail — a total derived from its own parts always
 balances and proves nothing.
 
+**And an identity cannot see a state that reports in the WRONG place.** It
+proves nothing reports nowhere; a state landing in a bucket it does not belong
+in keeps the sum whole. The shape that produces this is bucketing on BOOLEANS
+derived from a state rather than matching on the state itself: the health
+buckets here ask `has_fresh`, `has_stale`, `all_degraded`, so a new `SlotStatus`
+variant fails every test, falls into the last arm, and is counted as pending
+while the identity stays balanced.
+
+The companion instrument is an **exhaustiveness fence** — an `every()`
+enumerator plus a match in a test, so a new variant fails to compile and its
+bucket is named rather than inherited. Where the state is a `&str` the compiler
+cannot help directly, and the fence goes at the ONE PRODUCER instead: walk every
+variant of the enum that generates the string, and assert each generated value
+appears in a hand-maintained judged list. That is what makes the `_ => false`
+arms in `class_is_expected_absence` safe — not the wildcard, but that no
+unjudged class can reach it.
+
+That reasoning holds only while the string has a producer you own. A state read
+from a database or another process is bounded by nothing your tests can reach: a
+migration or a manual write can produce a value no code path ever emitted. There
+the only available instrument is a validating boundary that REFUSES an
+unrecognised value, and it must be structural rather than positional — a guard
+that works because validation happens to run first stops working when someone
+adds a second entry point.
+
+**Check where the fence actually bites, not that one exists.** Adding a variant
+to `SlotStatus` already broke this build before the fence was added — at
+`service_rank`, which decides which of two duplicate slots wins and asks nothing
+about health. "The compiler catches it" was true and irrelevant. The general
+form is worth more than the instance: a check that fires is evidence only about
+the property it fires ABOUT, and accepting a real check as evidence for a claim
+it was never making is harder to notice than having no check at all, because
+something genuinely does go red.
+
 So: **an unfalsifiable check is a reason to find a check that bites, not a
 limitation to document.** Where you cannot verify the property you wanted,
 verify a different one that the same defect would violate. And treat the note
