@@ -152,14 +152,31 @@ Creating a default collection over the Secret Service API blocks on a GUI prompt
 (`PromptDismissedException` when unattended, and a hung call when attempted
 against a live session), so it cannot be scripted.
 
-The remaining step is therefore one GUI action on the VM: open **Passwords and
-Keys**, create a keyring named `Default keyring` with an **empty** password, and
-accept the "store unencrypted" warning. After that the keyring auto-unlocks under
-autologin and Chrome will write `v11`. Until someone performs it, the `v11`
-reader stays unverifiable here — and shipping decryption code that has never
-decrypted real ciphertext is exactly the failure the wrong-iteration-count trap
-above describes: it produces garbage plaintext rather than an error, so a test
-asserting "did not fail" passes with the wrong constant.
+**`v11` was then produced and decrypted on that VM, with no GUI action.** The
+way through is `org.freedesktop.Secret.Service.SetAlias`, a plain D-Bus method
+that takes no prompt: point the `default` alias at the session collection, which
+an autologin session already has unlocked. Chrome then finds a default
+collection, stores `Chrome Safe Storage` in it, and writes `v11` cookies.
+
+Measured end to end rather than reasoned about:
+
+| step | observation |
+| --- | --- |
+| `SetAlias('default', …/collection/session)` | returns `method_return`, no prompt |
+| Chrome relaunched with `--password-store=gnome-libsecret` | writes item `Chrome Safe Storage`, 24-byte secret |
+| cookie jar after new cookies are set | `{v10: 89, v11: 3}` — mixed, as expected |
+| `PBKDF2-HMAC-SHA1(secret, "saltysalt", 1)` → AES-128-CBC, space IV | plaintext's first 32 bytes equal `SHA256(host_key)` |
+
+That last row is the part that matters. The `SHA256(host_key)` prefix is a real
+integrity check, so a matching prefix proves the key is right — which is exactly
+the evidence the wrong-round-count trap cannot be argued into. One round is
+confirmed for Linux `v11`, against the same 1003 that macOS uses.
+
+Two caveats on the rig. The session collection is in-memory, so the key does not
+survive a reboot and the `v11` cookies written under it become undecryptable
+afterwards — fine for verifying a reader, useless as a persistent fixture. And
+`SetAlias` is a test-rig manoeuvre, not something to imitate in the product: it
+repoints a user's default keyring.
 
 Reaching `v11` requires the Secret Service API over D-Bus (`org.freedesktop.
 secrets`) to fetch the `Chrome Safe Storage` password, then the same PBKDF2 at
