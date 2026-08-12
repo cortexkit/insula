@@ -719,7 +719,11 @@ fn read_encrypted_cookies(
 /// readable still serves. Pure given the keys — unit-testable.
 ///
 /// Dispatch is per VALUE and not per host, because one profile holds a mixture.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+///
+/// The gate includes `test` so the dispatch stays exercised on every host: it is
+/// pure given its keys, and a platform that compiles it out would report a green
+/// suite while the choice between schemes went unchecked.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn decrypt_value(
     encrypted: &[u8],
     host_key: &str,
