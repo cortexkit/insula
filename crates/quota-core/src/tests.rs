@@ -17,7 +17,7 @@ use crate::codex_resets::{
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
 use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential, VaultGetError};
-use crate::model::{ExtraWindow, RateWindow, Usage};
+use crate::model::{AccountInfo, ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, FetchError, HandlesError};
 use crate::refresh::{BASE_INTERVAL, FRESH_HORIZON};
 use crate::vault_handles::VaultHandleLoader;
@@ -749,11 +749,19 @@ impl UsageProvider for LabelProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let account = self.labels.lock().unwrap()[handle.stable_id()].clone();
+        // Descriptive text always accompanies the payload, whether or not an
+        // identity resolved -- which is the real upstream shape and the reason
+        // the two fields are asserted independently below.
         FetchAttempt::success(
             Some(AccountObservation::new(account, None)),
             "test",
             Usage::default(),
         )
+        .with_account_info(Some(AccountInfo {
+            email: Some(format!("{}@example.test", handle.stable_id())),
+            org_name: None,
+            plan_type: None,
+        }))
     }
 }
 
@@ -771,6 +779,20 @@ async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_dedupli
     let unresolved = registry.get_usage(None).await;
     assert_eq!(unresolved.len(), 1);
     assert_eq!(unresolved[0].account, None);
+    // The two fields are gated independently: `account` is the identity this
+    // module verified and is withheld while any handle is unresolved, while
+    // `accountInfo` is unverified descriptive text that rides along with the
+    // payload. A consumer must not reconstruct the withheld identity from it,
+    // so the wire has to keep offering the case where one is present without
+    // the other rather than quietly suppressing it.
+    assert_eq!(
+        unresolved[0]
+            .account_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref()),
+        Some("H1@example.test"),
+        "descriptive account text must survive an unlabeled emission"
+    );
 
     *labels.lock().unwrap() = HashMap::from([
         ("H1".to_string(), Some("A".to_string())),
