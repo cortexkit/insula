@@ -26,3 +26,12 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
 libc = "0.2"
+
+# Linux only: reading a `v11` cookie needs Chrome's storage password, which
+# lives in the Secret Service and is reachable only over D-Bus. Gated to Linux
+# so no other platform pays for the zbus stack, and pinned to the pure-Rust
+# crypto feature to avoid dragging in a C OpenSSL build.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.1", default-features = false, features = [
+    "rt-tokio-crypto-rust",
+] }

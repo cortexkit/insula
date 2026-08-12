@@ -264,8 +264,30 @@ const SNAPSHOT_TTL: Duration = Duration::from_secs(45);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Snapshot {
     path: PathBuf,
-    key: Vec<u8>,
+    keys: CookieKeys,
     taken_at: Instant,
+}
+
+/// The keys a single profile needs, one per scheme it may contain.
+///
+/// Two rather than one because a profile legitimately holds a MIXTURE: a host
+/// that gains a working keyring re-encrypts new cookies as `v11` while every
+/// older value keeps its `v10` prefix. Measured on the Linux test VM, whose jar
+/// read 89 `v10` beside 3 `v11` after the store was switched. Keying the whole
+/// snapshot on one scheme would silently drop whichever half lost.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct CookieKeys {
+    /// Decrypts `v10` values. Always derivable: on macOS from the keychain
+    /// password, on Linux from a constant compiled into Chromium.
+    v10: Vec<u8>,
+    /// Decrypts `v11` values, when this host has the keyring password.
+    ///
+    /// `None` is the ordinary case rather than a fault: macOS has no `v11` at
+    /// all, and on Linux the Secret Service may be absent, locked, or hold no
+    /// Chrome entry. A `None` here refuses `v11` values exactly as before this
+    /// key existed, which keeps a keyring problem from costing the `v10` half
+    /// of the same jar.
+    v11: Option<Vec<u8>>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -317,11 +339,11 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
         *guard = None;
 
         let store = locate_chrome_cookie_store()?.ok_or(CookieError::NoStore)?;
-        let key = safe_storage_key()?;
+        let keys = cookie_keys()?;
         let path = copy_cookie_store(&store)?;
         *guard = Some(Snapshot {
             path,
-            key,
+            keys,
             taken_at: Instant::now(),
         });
     }
@@ -329,7 +351,8 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
     let snapshot = guard
         .as_ref()
         .expect("a snapshot was just taken or was already fresh");
-    let key = snapshot.key.clone();
+    let v10_key = snapshot.keys.v10.clone();
+    let v11_key = snapshot.keys.v11.clone();
     let rows = read_encrypted_cookies(&snapshot.path, domain_suffix)?;
     drop(guard);
 
@@ -338,7 +361,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
     for (host_key, name, encrypted) in rows {
         // A cookie we can't decrypt is skipped, not fatal — a partial jar that
         // still carries the session cookie is usable.
-        if let Some(value) = decrypt_value(&encrypted, &host_key, &key) {
+        if let Some(value) = decrypt_value(&encrypted, &host_key, &v10_key, v11_key.as_deref()) {
             cookies.push(Cookie {
                 name,
                 value,
@@ -524,6 +547,69 @@ fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
     derive_key(LINUX_FALLBACK_PASSWORD, LINUX_PBKDF2_ROUNDS)
 }
 
+/// The attributes Chrome stores its `v11` password under in the Secret Service.
+///
+/// Matched on rather than the item's LABEL, which is display text: it is
+/// localised, and both Chrome and Chromium have shipped several ("Chrome Safe
+/// Storage", "Chromium Safe Storage"). Observed verbatim on the Linux test VM.
+#[cfg(target_os = "linux")]
+const CHROME_SECRET_ATTRIBUTES: [(&str, &str); 2] = [
+    ("application", "chrome"),
+    ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+];
+
+/// Fetch Chrome's `v11` storage password from the Secret Service and derive its
+/// key. `Ok(None)` means this host simply has no `v11` key to offer.
+///
+/// Every failure here is `Ok(None)` rather than an error, and that is the whole
+/// design: a keyring that is absent, locked, or holds no Chrome entry is the
+/// ORDINARY state of a Linux host, and the same jar's `v10` cookies stay
+/// perfectly readable. Propagating a D-Bus failure would take a working cookie
+/// cohort dark over a scheme the profile may not even contain.
+///
+/// Only unlocked items are considered. A locked item would raise a GUI unlock
+/// prompt on the user's desktop — from a background daemon they did not
+/// knowingly start, which is not a thing this module may do.
+#[cfg(target_os = "linux")]
+fn secret_service_key() -> Option<Vec<u8>> {
+    use secret_service::blocking::SecretService;
+    use secret_service::EncryptionType;
+
+    let service = SecretService::connect(EncryptionType::Dh).ok()?;
+    let attributes = std::collections::HashMap::from(CHROME_SECRET_ATTRIBUTES);
+    let found = service.search_items(attributes).ok()?;
+    let item = found.unlocked.first()?;
+    let password = item.get_secret().ok()?;
+    if password.is_empty() {
+        return None;
+    }
+    // The stored secret is arbitrary bytes; Chrome derives over them directly.
+    let password = String::from_utf8_lossy(&password).into_owned();
+    derive_key(&password, LINUX_PBKDF2_ROUNDS).ok()
+}
+
+/// Assemble the keys for this host's profile.
+#[cfg(target_os = "linux")]
+fn cookie_keys() -> Result<CookieKeys, CookieError> {
+    Ok(CookieKeys {
+        v10: safe_storage_key()?,
+        v11: secret_service_key(),
+    })
+}
+
+/// Assemble the keys for this host's profile.
+///
+/// macOS has no `v11`: the scheme exists for the Secret Service and KWallet,
+/// which this platform does not have, so the key is `None` by construction
+/// rather than by a failed lookup.
+#[cfg(target_os = "macos")]
+fn cookie_keys() -> Result<CookieKeys, CookieError> {
+    Ok(CookieKeys {
+        v10: safe_storage_key()?,
+        v11: None,
+    })
+}
+
 /// The constant password Chromium uses for `v10` on Linux.
 #[cfg(any(target_os = "linux", test))]
 const LINUX_FALLBACK_PASSWORD: &str = "peanuts";
@@ -626,23 +712,48 @@ fn read_encrypted_cookies(
     result
 }
 
-/// Decrypt one `v10` cookie value. Returns None if it isn't a `v10` blob or fails
-/// to decrypt (caller skips it). Pure given the key — unit-testable.
+/// Decrypt one cookie value, choosing the key by the value's own prefix.
+///
+/// Returns `None` when the value's scheme is unreadable here or decryption
+/// fails; the caller skips it and records the scheme, so a jar that is half
+/// readable still serves. Pure given the keys — unit-testable.
+///
+/// Dispatch is per VALUE and not per host, because one profile holds a mixture.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn decrypt_value(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
-    decrypt_v10(encrypted, host_key, key)
+fn decrypt_value(
+    encrypted: &[u8],
+    host_key: &str,
+    v10_key: &[u8],
+    v11_key: Option<&[u8]>,
+) -> Option<String> {
+    match Scheme::of(encrypted) {
+        Scheme::V10 => decrypt_cbc(encrypted, b"v10", host_key, v10_key),
+        Scheme::V11 => decrypt_cbc(encrypted, b"v11", host_key, v11_key?),
+        _ => None,
+    }
 }
 
-/// The `v10` decryption, factored out so tests can exercise it with a synthetic
-/// blob encrypted under a known key (no real keychain needed).
+/// The shared AES-128-CBC body behind `v10` and `v11`.
+///
+/// The two schemes are the SAME cipher, IV, padding and host-hash prefix; they
+/// differ only in where the password came from — a constant or the keychain for
+/// `v10`, the Secret Service for `v11`. Writing it once means a fix to the
+/// padding or the prefix cannot land on one scheme and miss the other.
+///
+/// `prefix` is passed rather than inferred so the caller's choice of key and the
+/// blob actually decrypted cannot disagree: decrypting a `v11` value with the
+/// `v10` key produces garbage rather than an error (see [`derive_key`]).
+///
+/// Factored out so tests can exercise it with a blob encrypted under a known
+/// key, with no keychain and no D-Bus.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn decrypt_v10(encrypted: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
+fn decrypt_cbc(encrypted: &[u8], prefix: &[u8], host_key: &str, key: &[u8]) -> Option<String> {
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
     use sha2::{Digest, Sha256};
 
     type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
-    let ciphertext = encrypted.strip_prefix(b"v10")?;
+    let ciphertext = encrypted.strip_prefix(prefix)?;
     if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return None;
     }
@@ -1001,6 +1112,17 @@ mod tests {
     /// Encrypt a value the way Chrome does, to test the decrypt path with a known
     /// key. `with_prefix` prepends the SHA256(host_key) domain hash (newer Chrome).
     fn encrypt_v10(value: &str, host_key: &str, key: &[u8], with_prefix: bool) -> Vec<u8> {
+        encrypt_as(b"v10", value, host_key, key, with_prefix)
+    }
+
+    /// Encrypt a value the way Chrome does, under a chosen scheme prefix.
+    fn encrypt_as(
+        prefix: &[u8],
+        value: &str,
+        host_key: &str,
+        key: &[u8],
+        with_prefix: bool,
+    ) -> Vec<u8> {
         let mut plaintext = Vec::new();
         if with_prefix {
             plaintext.extend_from_slice(&Sha256::digest(host_key.as_bytes()));
@@ -1009,9 +1131,57 @@ mod tests {
         let iv = [b' '; 16];
         let ct =
             Aes128CbcEnc::new(key.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
-        let mut out = b"v10".to_vec();
+        let mut out = prefix.to_vec();
         out.extend_from_slice(&ct);
         out
+    }
+
+    /// `decrypt_value` must pick the key by the value's own prefix.
+    ///
+    /// The two keys are deliberately different, so a dispatch that sent `v11`
+    /// values at the `v10` key would fail to recover the plaintext. Both
+    /// directions are asserted from ONE jar, because the defect being fenced is
+    /// a mixed profile — the state a host lands in the moment its keyring
+    /// starts working — where keying everything one way silently drops half.
+    #[test]
+    fn each_scheme_is_decrypted_with_its_own_key() {
+        let v10_key = [3u8; 16];
+        let v11_key = [9u8; 16];
+        let host = "ollama.com";
+
+        let older = encrypt_as(b"v10", "from-the-constant", host, &v10_key, true);
+        let newer = encrypt_as(b"v11", "from-the-keyring", host, &v11_key, true);
+
+        assert_eq!(
+            decrypt_value(&older, host, &v10_key, Some(&v11_key)).as_deref(),
+            Some("from-the-constant")
+        );
+        assert_eq!(
+            decrypt_value(&newer, host, &v10_key, Some(&v11_key)).as_deref(),
+            Some("from-the-keyring")
+        );
+    }
+
+    /// A host with no keyring key still reads the `v10` half of its jar.
+    ///
+    /// This is the ordinary Linux state, not an edge case: no Secret Service, a
+    /// locked collection, or no Chrome entry in it. The `v11` values are refused
+    /// — never decrypted under the `v10` key, which would yield garbage that
+    /// reads as a real cookie value and gets sent to a provider.
+    #[test]
+    fn without_a_keyring_key_v10_still_reads_and_v11_is_refused() {
+        let v10_key = [3u8; 16];
+        let v11_key = [9u8; 16];
+        let host = "ollama.com";
+
+        let older = encrypt_as(b"v10", "still-readable", host, &v10_key, true);
+        let newer = encrypt_as(b"v11", "needs-the-keyring", host, &v11_key, true);
+
+        assert_eq!(
+            decrypt_value(&older, host, &v10_key, None).as_deref(),
+            Some("still-readable")
+        );
+        assert_eq!(decrypt_value(&newer, host, &v10_key, None), None);
     }
 
     #[test]
@@ -1019,7 +1189,7 @@ mod tests {
         let key = [7u8; 16];
         let enc = encrypt_v10("session-abc-123", "ollama.com", &key, true);
         assert_eq!(
-            decrypt_v10(&enc, "ollama.com", &key).as_deref(),
+            decrypt_cbc(&enc, b"v10", "ollama.com", &key).as_deref(),
             Some("session-abc-123")
         );
     }
@@ -1029,7 +1199,7 @@ mod tests {
         let key = [7u8; 16];
         let enc = encrypt_v10("plain-value", "ollama.com", &key, false);
         assert_eq!(
-            decrypt_v10(&enc, "ollama.com", &key).as_deref(),
+            decrypt_cbc(&enc, b"v10", "ollama.com", &key).as_deref(),
             Some("plain-value")
         );
     }
@@ -1043,16 +1213,114 @@ mod tests {
         // Decrypt claiming a different host: the leading bytes won't match
         // SHA256("other.com"), so nothing is stripped.
         assert_eq!(
-            decrypt_v10(&enc, "other.com", &key).as_deref(),
+            decrypt_cbc(&enc, b"v10", "other.com", &key).as_deref(),
             Some("no-prefix-here")
         );
     }
 
+    /// A blob whose prefix is not the one being decrypted must be refused
+    /// rather than decrypted under the wrong key.
+    ///
+    /// This is the check that keeps the shared cipher body honest now that two
+    /// schemes use it: `v10` and `v11` differ ONLY in key source, so a
+    /// mis-dispatched blob decrypts into plausible garbage instead of failing.
     #[test]
-    fn non_v10_blob_returns_none() {
+    fn a_blob_of_another_scheme_returns_none() {
         let key = [7u8; 16];
-        assert!(decrypt_v10(b"v11garbage", "ollama.com", &key).is_none());
-        assert!(decrypt_v10(b"", "ollama.com", &key).is_none());
+        assert!(decrypt_cbc(b"v11garbage", b"v10", "ollama.com", &key).is_none());
+        assert!(decrypt_cbc(b"v10garbage", b"v11", "ollama.com", &key).is_none());
+        assert!(decrypt_cbc(b"", b"v10", "ollama.com", &key).is_none());
+    }
+
+    /// Decrypt a REAL `v11` cookie captured from Chrome on Linux.
+    ///
+    /// LIVE CAPTURE, not synthetic. Taken from Google Chrome 151 on Ubuntu
+    /// 24.04 (ARM64) running with `--password-store=gnome-libsecret` against an
+    /// unlocked Secret Service collection: the cookie is `SIDCC` for
+    /// `.google.com`, and the password is the 24-byte secret Chrome itself
+    /// stored under the item `Chrome Safe Storage`.
+    ///
+    /// This is the only test here that can tell a right PBKDF2 round count from
+    /// a wrong one. A synthetic fixture is encrypted with whatever key the test
+    /// derives, so it round-trips under ANY constant and proves nothing about
+    /// the constant; this ciphertext was produced by Chrome, so only the real
+    /// value decrypts it. The assertion rests on the 32-byte `SHA256(host_key)`
+    /// prefix Chrome prepends — an integrity check that is astronomically
+    /// unlikely to match under a wrong key, where "decryption did not error"
+    /// would pass with any key at all, since AES-CBC has no integrity check and
+    /// PKCS#7 unpadding succeeds on garbage about one time in 256.
+    ///
+    /// The password is a throwaway test VM's and decrypts nothing else; the
+    /// cookie value is an expired session token from that VM's own browser.
+    #[test]
+    fn a_real_linux_v11_cookie_from_chrome_decrypts() {
+        // Base64 of the raw secret bytes, exactly as read back from the
+        // Secret Service item.
+        let password = String::from_utf8(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                "VGYrSnpaWWlBM09icTQ3QzBEcG1KZz09",
+            )
+            .expect("valid base64"),
+        )
+        .expect("the stored secret is ASCII");
+
+        let key = derive_key(&password, LINUX_PBKDF2_ROUNDS).expect("derives");
+        assert_eq!(
+            hex(&key),
+            "c61b2c9cdf89e77e930c9b104b77432b",
+            "the Linux v11 key derivation drifted from the value Chrome uses"
+        );
+
+        let ciphertext = unhex(
+            "7631319ef839f9d6d8e3fc98f79fbbb46af37245e80ca83d16045818d132f6f0             0ece908b3d517cc04f227c1a2f17bf54eb11c781a4848546b388c24764acf377             cdb4b8c59a0e187e583e1f5ac3f67b72904a2725c1fdd9f10c3fc67fca105943             43e4309886c9ffb8180724754e2a964d41b187",
+        );
+
+        let value = decrypt_cbc(&ciphertext, b"v11", ".google.com", &key)
+            .expect("the captured v11 cookie decrypts under the derived key");
+        assert!(
+            value.starts_with("AKEyXzWfwKTCz8OicAgdJLoc"),
+            "decrypted to unexpected plaintext: {value:?}"
+        );
+    }
+
+    /// The macOS round count must NOT decrypt a Linux `v11` cookie.
+    ///
+    /// The paired negative for the test above, and the one that would catch the
+    /// constants being swapped. Without it, a `derive_key` that ignored its
+    /// `rounds` argument entirely would still pass the positive case.
+    #[test]
+    fn the_macos_round_count_does_not_decrypt_a_linux_cookie() {
+        let password = "Tf+JzZYiA3Obq47C0DpmJg==";
+        let wrong = derive_key(password, MACOS_PBKDF2_ROUNDS).expect("derives");
+        assert_ne!(
+            hex(&wrong),
+            "c61b2c9cdf89e77e930c9b104b77432b",
+            "1003 rounds must not produce the 1-round key"
+        );
+
+        let ciphertext = unhex(
+            "7631319ef839f9d6d8e3fc98f79fbbb46af37245e80ca83d16045818d132f6f0             0ece908b3d517cc04f227c1a2f17bf54eb11c781a4848546b388c24764acf377             cdb4b8c59a0e187e583e1f5ac3f67b72904a2725c1fdd9f10c3fc67fca105943             43e4309886c9ffb8180724754e2a964d41b187",
+        );
+
+        // May unpad by chance, but must never yield the true plaintext.
+        let decoded = decrypt_cbc(&ciphertext, b"v11", ".google.com", &wrong);
+        assert!(
+            !decoded.is_some_and(|v| v.starts_with("AKEyXzWfwKTCz8OicAgdJLoc")),
+            "the wrong round count recovered the real value"
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("valid hex"))
+            .collect()
     }
 
     /// The reuse bound has to hold in both directions, so both are asserted with
