@@ -964,6 +964,21 @@ claim in the module to get wrong. Rarity in production and consequence on the
 wire are not correlated, and where they are inverted the natural amount of
 testing is backwards.
 
+**A competing predictor was proposed and falsified, which is why this one is
+stated rather than the obvious alternative.** After the first two cases the
+divergences sat in read paths, so read-versus-write looked like the
+discriminator — equally checkable from outside, and a tidier story. The third
+case is a write pair that diverges: one producer guards against a negative
+generation, its twin takes three signed coordinates and checks none. So across
+three pairs the split is one read, one write, and one genuine null where both
+producers are live.
+
+Distance-from-the-exercised-path predicted all three; read-versus-write would
+have been wrong once. Recorded because a rule that has beaten a plausible rival
+on a case that separated them is worth more than one that merely fits its own
+examples, and the losing candidate is the thing a future reader is most likely
+to propose again.
+
 The read path has two emission branches — one for entries carrying an account
 label, one for entries without — so **every guard in it exists twice**. Both
 grants found so far were guarded at one branch and tested only there: the
