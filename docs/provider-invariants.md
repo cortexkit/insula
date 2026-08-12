@@ -1492,6 +1492,33 @@ after restoring, confirm the file is byte-identical to the original, because a
 partially reverted mutation is a silent behaviour change wearing a clean
 `git status`.
 
+**The edit landing is not the same as the state being reached.** The paragraph
+above catches a mutation that edited the wrong text. There is a second cause of
+a green result that survives it: an edit that lands exactly where intended, on
+the line you meant, and still fails to produce the forbidden state — so the code
+never behaves differently and the suite is right to stay green.
+
+Found here gating a descriptive field on the *observation* existing, to prove
+that field independent of the verified identity. The mutation applied cleanly to
+the correct line. But an unresolved handle still HAS an observation — the null is
+the `account_id` inside it — so the gate was already satisfied and nothing
+changed. Gating on the identity itself reddened the test immediately. The first
+result was a verdict on the mutation, not on the coverage, and it is
+indistinguishable by exit code from a genuine gap.
+
+So a mutation carries two obligations, and only the second makes the first
+meaningful:
+
+1. does the target test go red when the guard is removed, and
+2. does this mutation actually produce the state the guard forbids?
+
+Question 2 is answered by constructing the forbidden state directly and checking
+the mutated code reaches it — usually by reading what the mutated expression
+evaluates to for the fixture at hand, rather than trusting that a plausible edit
+implies a changed behaviour. The trap is sharpest where a value is nested inside
+an `Option` that is itself always present: the outer layer reads as the thing
+being tested while the inner one carries the meaning.
+
 **Stage or commit before mutating, then restore from the index.** The reference
 copy has to be made authoritative *before* the edit, and both ways of skipping
 that step fail silently in opposite directions.
