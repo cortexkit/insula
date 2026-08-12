@@ -32,6 +32,18 @@ mod ids;
 #[allow(unused_imports)] // each consumer of this file uses a different subset
 pub use ids::CREDENTIALS_MODULE_ID as VAULT_MODULE_ID;
 pub use ids::DEFAULT_MODULE_ID as MODULE_ID;
+/// How long a spawned module has to register before a test gives up.
+///
+/// Generous because the first test to run pays for a cold `cargo` link of the
+/// module binary, and because these tests spawn real daemons and real modules
+/// rather than stubs. Observed to expire on this host when three e2e tests
+/// spawned concurrently under a loaded machine; the identical command passed
+/// immediately afterwards.
+///
+/// A registration timeout is therefore weak evidence of a defect on its own.
+/// Re-run before investigating: a genuine failure reproduces, and a scheduling
+/// one does not. What distinguishes them is not the message, which is identical
+/// either way.
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 

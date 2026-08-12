@@ -823,6 +823,21 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
         .unwrap_or(ClientFailure::Protocol)
 }
 
+/// Decode a `credential.get` reply.
+///
+/// **The field names here are not proven by any test in this crate.** The
+/// loopback fixtures construct the reply themselves, so they speak whatever
+/// spelling this function reads and would pass with any of them: a rename on
+/// either side leaves the suite green and breaks production. What actually
+/// proves them is the `vault-lanes` example, which dials the live vault and
+/// reports how many handles each provider is serving — a lane that decodes
+/// nothing reports zero and the example exits non-zero.
+///
+/// The general shape, worth recognising elsewhere: a test that builds both ends
+/// of a contract certifies the contract against itself. It is a real test of
+/// this function's LOGIC — which branches it takes, what it does with an empty
+/// payload — and no evidence at all about the NAMES, because the names are the
+/// half the fixture supplies rather than checks.
 fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
     let result = response
