@@ -838,6 +838,15 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
 /// this function's LOGIC — which branches it takes, what it does with an empty
 /// payload — and no evidence at all about the NAMES, because the names are the
 /// half the fixture supplies rather than checks.
+///
+/// **`vault-lanes` proves these names only for the DEPLOYED binary.** It dials
+/// the running daemon through its connection file, so it exercises whatever was
+/// last installed, not the working tree. Renaming a wire field here and running
+/// it reports `findings: none` — verified by doing exactly that — because the
+/// edit is not in the process being asked. That does not weaken the check, it
+/// names its subject: the names are proven for the deployment, and a
+/// working-tree change is covered only once deployed, which makes
+/// deploy-then-check the order that carries evidence.
 fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
     let result = response
