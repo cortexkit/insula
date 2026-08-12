@@ -939,6 +939,25 @@ impl CredentialSource for VaultClient {
         decode_get_response(&frame.body)
     }
 
+    /// Tell the vault a served credential was refused upstream.
+    ///
+    /// **The least-proven shape this module emits.** Every other emitted shape
+    /// has a receiver that accepts or refuses it continuously: the `usage.get`
+    /// reply is decoded by consumers on every poll, the `credential.get` request
+    /// is honoured by the vault whenever a lane serves, and the health report is
+    /// rendered by the daemon. Those are proven by use.
+    ///
+    /// This one is sent only when an upstream returns 401 or 403, which on a
+    /// healthy host is never. So a rename or a shape change here is not caught
+    /// by anything running today — it surfaces on the first real auth failure,
+    /// which is the worst moment to discover the report does not arrive, since
+    /// that report is what invalidates a static API key that has no refresh
+    /// adapter to notice for itself.
+    ///
+    /// It is not testable by sending one: a synthetic report would mutate the
+    /// vault's record state. The bounded gap is stated here rather than closed,
+    /// and the acceptance evidence is the absence of the warning below during a
+    /// genuine failure.
     async fn report_auth_failure(
         &self,
         capability: &VaultCapability,
