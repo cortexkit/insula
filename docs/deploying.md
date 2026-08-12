@@ -170,6 +170,21 @@ file and line, so adding a comment above a function in a runtime file shifts
 every line below it and changes the binary without changing behaviour. On a
 difference, read the diff.
 
+**Record the finding with what would falsify it, not the conclusion alone.** The
+result of this comparison is almost always reported to someone who cannot re-run
+it — a summary, a commit message, a peer. "Byte-identical" and "no deploy
+needed" carry nothing a reader can check, and the second is an inference rather
+than a measurement. Write what was observed and why it is consistent with no
+behaviour change: *same size, differing hash, diff is test-only*. That form
+carries its own refutation — a differing SIZE, or a diff touching a runtime
+line, contradicts it on sight.
+
+The reason to insist on it is that the measurement is usually right and the
+report is what drifts. This exact comparison was run correctly here and then
+summarised an hour later as "byte-identical to HEAD's", which was the opposite
+of the recorded numbers. Nothing in that sentence looked uncertain, and the
+next reader's cost is skipping a check on the strength of it.
+
 Two conditions are easy to get wrong. Both builds must run from the same
 directory, because absolute paths are embedded and a worktree elsewhere yields
 different bytes for identical source. That is not a small effect and it is
