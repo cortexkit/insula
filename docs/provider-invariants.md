@@ -910,6 +910,35 @@ and answered a different question. Stated because a null from the wrong shape
 invites two wrong conclusions: that the code is clean, or that the rule is
 unfounded.
 
+**Externally confirmed, which every rule here should be and most are not.** Until
+2026-08-12 every instance of this was in this repository, which makes it an
+observation about one codebase rather than a rule. Run against a repository
+written by someone else, it found a live divergence on the first surface it was
+pointed at: two independent spend-report producers, one querying SQLite directly
+and one reading an in-memory projection, sharing five guards — invalid window,
+live-fact filtering, non-null timestamps, half-open window, subject/project/scope
+filters — and diverging on the sixth. The projection scopes corrections to the
+facts that survived filtering; the direct path applies no subject, project or
+scope predicate to corrections at all. Unfiltered requests agree, so the
+divergence appears only on a filtered one.
+
+Two details from the confirmation are worth more than the hit itself.
+
+The direct producer turned out to be production-dead, reached only from tests,
+so the divergence is a WRONG ORACLE rather than a wrong report — which is the
+worse outcome: it will either mask a real defect in the production path or
+manufacture a phantom one, on exactly the queries an operator filters. A rule
+that finds divergence between two producers should ask which one is on the wire
+before scoring the severity, and the answer can invert it.
+
+And the predicted untested twin was untested for two independent reasons, not
+one. No test in that file inserts a correction at all, and no test passes a
+non-null filter — every request built there sets subject, scope and project to
+`None`. Two guards, two blind spots, intersecting exactly where the divergence
+lives. The rule pointed at the right cell of a table whose rows and columns were
+both empty, which is the case where reading either producer alone reveals
+nothing.
+
 The read path has two emission branches — one for entries carrying an account
 label, one for entries without — so **every guard in it exists twice**. Both
 grants found so far were guarded at one branch and tested only there: the
