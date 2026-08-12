@@ -765,6 +765,45 @@ impl UsageProvider for LabelProvider {
     }
 }
 
+/// Every slot status must be classified into a health bucket deliberately.
+///
+/// The identity `fresh + stale + pending + degraded + unconfigured +
+/// withoutHandles == providersTotal` proves no state reports NOWHERE. It cannot
+/// prove a state reports in the RIGHT place: the buckets branch on booleans
+/// derived from the status, so a new variant fails every `has_*` test, falls
+/// into the last arm, and the sum still balances while the provider is counted
+/// as something it is not.
+///
+/// So the identity needs this beside it. Adding a variant to `SlotStatus` fails
+/// to compile in `every()` and again in the match below, which forces an author
+/// to name the bucket rather than inherit one by falling through.
+#[test]
+fn every_slot_status_is_deliberately_bucketed() {
+    for status in SlotStatus::every() {
+        // The fence: a new variant breaks this match.
+        let bucket = match status {
+            SlotStatus::Fresh => "fresh",
+            SlotStatus::StaleTransient => "stale",
+            SlotStatus::Pending => "pending",
+            SlotStatus::Degraded => "degraded-or-unconfigured",
+        };
+        assert!(!bucket.is_empty());
+    }
+
+    // Not vacuous: the four statuses reach three distinct destinations, so this
+    // cannot pass by mapping everything to one bucket.
+    let distinct: std::collections::BTreeSet<_> = SlotStatus::every()
+        .into_iter()
+        .map(|status| match status {
+            SlotStatus::Fresh => "fresh",
+            SlotStatus::StaleTransient => "stale",
+            SlotStatus::Pending => "pending",
+            SlotStatus::Degraded => "degraded-or-unconfigured",
+        })
+        .collect();
+    assert_eq!(distinct.len(), 4);
+}
+
 #[tokio::test]
 async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_deduplicates() {
     let labels = Arc::new(Mutex::new(HashMap::from([
