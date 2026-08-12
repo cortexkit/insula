@@ -686,6 +686,23 @@ display- and grouping-only: nothing in this module derives behaviour from them,
 and `planType` in particular is the upstream's own label rather than a
 normalised vocabulary, so it is not comparable across providers.
 
+**`accountInfo` can be present while `account` is absent, and the pair must not
+be used as one another's proxy.** They are gated differently on purpose:
+`account` is the identity this module VERIFIED for the fetch unit, and it is
+withheld the moment any handle of that provider fails to resolve one, because a
+consumer cannot tell two unlabeled entries from two accounts. `accountInfo` is
+descriptive text the upstream happened to return with the payload, and it rides
+along unverified.
+
+So an unlabeled entry can carry an email — that is reachable today, not
+theoretical. Do NOT key on it, join on it, or use it to reconstruct the identity
+the `account` field is withholding: the entry is one representative of several
+handles selected by freshness, so its email names the account whose numbers are
+published while the other handles' accounts are not represented at all. Reading
+it as the identity would attribute one account's windows to a set of accounts
+this response is deliberately declining to enumerate. Render it; never resolve
+with it.
+
 `savedResets` describes banked quota-reset credits, which exactly one upstream
 grants. `availableCount` is how many are held, `soonestExpiresAt` when the next
 one lapses, and `credits` lists each with its own `expiresAt`. They are granted
