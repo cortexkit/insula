@@ -939,6 +939,31 @@ lives. The rule pointed at the right cell of a table whose rows and columns were
 both empty, which is the case where reading either producer alone reveals
 nothing.
 
+**Which producer holds the gap is predictable, and the predictor is checkable
+from outside.** The original form of this said the tested branch is the SIMPLER
+one, because it is easier to test. That is a judgement about code, and it
+requires reading both branches and forming an opinion about which is simpler.
+
+The sharper predictor, from three cases across two repositories: **the gap is on
+the producer FURTHEST FROM THE EXERCISED PATH.** A SQL report producer no
+production caller reaches, an emitter nothing has ever sent, and — in this
+module — the labeled emission branch, which serves 2 entries where the unlabeled
+branch serves 35 on this host. In every case the guard that exists is the one on
+the producer something actually runs.
+
+That is better than "simpler" in two ways. It requires no judgement: rank the
+producers by whether a production caller or a live receiver exercises them, which
+is a search rather than an opinion. And it connects to the receiver-acceptance
+criterion above — a shape no receiver has accepted is a shape whose correctness
+is an opinion, and a producer nothing exercises is where its guards go missing.
+The two rules are the same observation from different ends.
+
+The uncomfortable corollary for this module: the labeled branch is the rare one
+here, and it is also the one carrying the account identity — the most expensive
+claim in the module to get wrong. Rarity in production and consequence on the
+wire are not correlated, and where they are inverted the natural amount of
+testing is backwards.
+
 The read path has two emission branches — one for entries carrying an account
 label, one for entries without — so **every guard in it exists twice**. Both
 grants found so far were guarded at one branch and tested only there: the
