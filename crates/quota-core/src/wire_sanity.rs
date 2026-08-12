@@ -536,11 +536,35 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
         }
     }
 
-    // Note on what the count agreement check can and cannot see: where a
-    // provider recovers `used_count` from the percentage and the cap, this
-    // comparison returns the reported percentage by construction and cannot
-    // fire. It still holds for any provider that publishes an absolute count
-    // the upstream measured, and it catches a producer that computed one of the
+    // A count is a quantity of things -- requests, messages, tokens -- so a
+    // fractional one is not a rounding blemish, it is evidence the number was
+    // COMPUTED rather than measured. The wire type is f64 for range, not to
+    // permit fractions, and a consumer storing counts as integers rejects the
+    // whole response over one such value.
+    //
+    // This rule exists because the note that used to stand here observed that
+    // the agreement check below cannot fire on a derived count, and stopped
+    // there. That was the wrong conclusion: an unfalsifiable check is a reason
+    // to find a check that DOES bite, not a limitation to document. A live
+    // fractional count then reached a consumer and cost it every provider's
+    // capacity on the response.
+    for (field, value) in [
+        ("usedCount", window.used_count),
+        ("totalCount", window.total_count),
+    ] {
+        if let Some(value) = value {
+            if value.is_finite() && value.fract() != 0.0 {
+                findings.push(format!(
+                    "{where_}: {field} {value} is not a whole number, so it was                      derived rather than reported"
+                ));
+            }
+        }
+    }
+
+    // Where a provider recovers `used_count` from the percentage and the cap,
+    // this comparison returns the reported percentage by construction and
+    // cannot fire. It holds for any provider that publishes an absolute count
+    // the upstream measured, and catches a producer that computed one of the
     // three from the other two incorrectly.
     if let (Some(used), Some(total)) = (window.used_count, window.total_count) {
         if used > total {
@@ -1059,6 +1083,74 @@ mod tests {
             report.findings[0].contains("usedCount 10001 exceeds totalCount 10000"),
             "{}",
             report.findings[0]
+        );
+    }
+
+    /// A fractional count is reported, because it proves the number was derived.
+    ///
+    /// The fixture is the live value that caused this rule to exist: qwen-cloud
+    /// published 45.052361473854994% against a 40000 cap and multiplied the two,
+    /// and a consumer storing counts as integers rejected the entire response --
+    /// every provider's capacity, over one provider's arithmetic.
+    #[test]
+    fn a_count_that_is_not_a_whole_number_is_reported() {
+        let mut w = window(45.052_361_473_854_994);
+        w.used_count = Some(18_020.944_589_542);
+        w.total_count = Some(40_000.0);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("usedCount")
+                && report.findings[0].contains("not a whole number"),
+            "{}",
+            report.findings[0]
+        );
+    }
+
+    /// A fractional TOTAL is reported too, not only the used half.
+    ///
+    /// The paired direction: a cap is as much a count as the consumption is, and
+    /// a rule written for one field is exactly how the other goes unchecked.
+    #[test]
+    fn a_fractional_total_is_reported() {
+        let mut w = window(10.0);
+        w.used_count = Some(100.0);
+        w.total_count = Some(1_000.5);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("totalCount") && f.contains("not a whole number")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Whole-number counts are silent.
+    ///
+    /// The must-not-fire control, carrying a healthy instance of the exact shape
+    /// the rule inspects: both count fields present and integral, with a
+    /// percentage that agrees with them.
+    #[test]
+    fn whole_number_counts_are_not_reported() {
+        let mut w = window(45.0);
+        w.used_count = Some(18_000.0);
+        w.total_count = Some(40_000.0);
+
+        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.contains("not a whole number")),
+            "{:?}",
+            report.findings
         );
     }
 

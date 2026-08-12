@@ -204,16 +204,29 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
         Some(t) => t,
         None => return,
     };
+    // The cap is published; the consumed count is NOT reconstructed from it.
+    //
+    // `usedCount` is a count of things, so it is integral by contract, and
+    // `percentage * cap` is fractional for almost every input. Rounding would be
+    // worse than omitting: it would present an estimate in a field whose type
+    // claims an exact measurement the console never reported.
+    //
+    // The estimate is also not merely un-rounded, it is measured against a
+    // denominator that does not match. Live check on 2026-08-12: the console
+    // returned 45.052361473854994% where this cap is 40000, and no integer count
+    // over 40000 produces that percentage -- 18021/40000 is 45.0525%, off by
+    // 1.4e-6, which is eleven orders of magnitude above f64 noise. So the
+    // console divides by something other than the cap this endpoint reports,
+    // exactly the entitled-versus-enforced gap described at the top of this
+    // file. A derived count would carry that disagreement as if it were data.
     if let Some(ref mut primary) = usage.primary {
         if let Some(cap) = tier.five_hour {
             primary.total_count = Some(cap);
-            primary.used_count = Some(primary.used_percent / 100.0 * cap);
         }
     }
     if let Some(ref mut secondary) = usage.secondary {
         if let Some(cap) = tier.weekly {
             secondary.total_count = Some(cap);
-            secondary.used_count = Some(secondary.used_percent / 100.0 * cap);
         }
     }
 }
@@ -726,10 +739,35 @@ mod tests {
 
         let primary = usage.primary.expect("the window survives enrichment");
         assert_eq!(primary.total_count, Some(4000.0), "cap of the wrong plan");
-        assert_eq!(primary.used_count, Some(1112.0));
         let secondary = usage.secondary.expect("the window survives enrichment");
         assert_eq!(secondary.total_count, Some(40000.0));
-        assert_eq!(secondary.used_count, Some(4000.0));
+    }
+
+    /// The consumed count is never reconstructed from the percentage.
+    ///
+    /// `usedCount` is a count of things and is integral by contract, while
+    /// `percentage * cap` is fractional for almost every input — this fixture's
+    /// 27.8% over 4000 is one of the rare percentages that divides cleanly,
+    /// which is why the arithmetic looked sound for as long as it did. A
+    /// consumer that validates integrality rejects the whole response over one
+    /// such value, so the check uses a percentage of the ordinary kind.
+    #[test]
+    fn a_consumed_count_is_never_derived_from_the_percentage() {
+        let mut usage = usage_at(45.052_361_473_854_994, 10.0);
+        let caps = gateway(r#"{"success":true,"data":{"pro":{"five_hour":4000,"weekly":40000}}}"#);
+
+        enrich_with_counts(&mut usage, &caps, &subscription_body("pro"));
+
+        let primary = usage.primary.expect("the window survives enrichment");
+        assert_eq!(
+            primary.used_count, None,
+            "a count derived from a percentage is an estimate, not a measurement"
+        );
+        assert_eq!(
+            primary.total_count,
+            Some(4000.0),
+            "the cap is reported by the provider and stays"
+        );
     }
 
     /// Enrichment is additive: when no cap can be resolved the percentage stands
