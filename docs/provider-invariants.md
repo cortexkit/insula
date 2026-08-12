@@ -1320,6 +1320,52 @@ whole property distinguishing a control from an anecdote. Every note either side
 wrote, and every blind spot either side documented, failed on days when we were
 paying attention. That asymmetry is the argument for rules over vigilance.
 
+## The claims that rot are the ones no test could have failed
+
+A day spent auditing this module and a peer's alongside it produced nine
+defects, and the pattern in them is narrow enough to act on. None were found by
+looking where either of us suspected. Every one was in reviewed, believed code,
+and the check that found it was going and verifying something expected to be
+fine.
+
+But "check what you are confident about" is too broad to be a practice, and the
+sharper version comes from what the nine had in common. Four were claims about
+BEHAVIOUR and those were all well covered — the strongest claim here, that the
+refresher cannot lose a healthy window to a transient failure, turns out to be
+defended by six tests approaching it from different directions. Confidence and
+coverage are not reliably inverse.
+
+The ones that had rotted were claims about SCOPE:
+
+- what a check covers (`vault-lanes` proves the deployed binary, not the working
+  tree — and reported `findings: none` on a renamed wire field),
+- what a note implies (a comment explaining why a rule cannot fire, standing in
+  for the rule that would),
+- what a measurement showed (a correct hash comparison summarised an hour later
+  as its own opposite),
+- which direction a shape belongs to (a peer's design document quoting the
+  acknowledgment struct where the request struct belongs).
+
+Behaviour gets tests because that is what tests are for. **A scope claim lives in
+prose, and prose has no runner** — nothing goes red when it drifts, and it is
+usually written by the person best placed to be wrong about it, at the moment
+they are most confident.
+
+So the practice: pick the strongest claim you would defend THAT NO TEST COULD
+HAVE FAILED, and check that one. Every item above is a sentence rather than a
+code path.
+
+Two corollaries, both paid for:
+
+**A verified fact does not stay verified by being repeated.** "Deployed at X and
+serving" was checked once and restated in eight messages over several hours as
+present tense. It held — but repetition is what made it feel checked, which is
+the same freshness error this module warns consumers about on the wire.
+
+**Report the nulls.** A practice that only ever produces hits stops being
+believed, and a rule that has never returned clean has been exercised rather
+than tested.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
