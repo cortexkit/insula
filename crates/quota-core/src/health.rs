@@ -90,6 +90,26 @@ pub struct HealthSnapshot {
     /// Read alongside `cookie_cohort_total` as "N of C logins stale", never as a
     /// share of `degraded` — the two answer different questions and a host can
     /// easily have eight degraded cookie providers and two stale logins.
+    ///
+    /// **The proxy is "a cookie was found", which is weaker than "a login
+    /// exists", and the gap is visible on this host.** Some adapters here check
+    /// for a recognised session-cookie name before fetching (`is_session_cookie`
+    /// in `cursor`, `ollama`, `amp`, `factory`, `opencode`), so a rejection from
+    /// them really does mean a known login stopped working. The rest send every
+    /// cookie the domain has, and a domain can hold cookies without anyone ever
+    /// having signed in: `qoder`'s jar contains exactly one, `tfstk`, which is
+    /// Alibaba's tracking cookie. That is sent, refused with a 401, and counted
+    /// here as a stale login on a host where nobody ever logged in.
+    ///
+    /// The classification itself is not wrong and matches the upstream this was
+    /// ported from, which also maps 401 to invalid credentials and reserves
+    /// "missing" for an empty cookie header. What is missing is a session-cookie
+    /// predicate for those adapters, and it is deliberately NOT guessed: naming
+    /// the wrong cookie makes a working provider report as never configured,
+    /// which is far more expensive than one over-counted entry in a metric.
+    /// Closing it needs one observation this host cannot supply — a jar from a
+    /// browser actually signed in to that service, showing which cookie carries
+    /// the session.
     pub cookie_logins_stale: Vec<String>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,
