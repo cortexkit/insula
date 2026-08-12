@@ -1216,12 +1216,40 @@ measured. That rule would have caught a live fractional count before it reached
 a consumer, where instead it cost that consumer every provider's capacity on the
 response until it was fixed.
 
-The peer half of this pair is worth recording because it is the same shape one
-level worse. Their health check consulted only one freshness source, so a
+**A harder class sits next to this one, and this rule does not catch it.** The
+peer case that arrived with this exchange looked at first like the same shape
+one level worse: a health check consulting only one freshness source, so a
 configured axis with no successful poll was not represented at all and its
-absence read as healthy — the instrument could not express the state, which also
-suppressed the alarm that would have found it. Four days dark, surfaced by
-someone inspecting a table by hand after an unrelated deploy.
+absence read as healthy. Four days dark, surfaced by someone inspecting a table
+by hand after an unrelated deploy.
+
+But that failure had NO NOTE. Nobody had reasoned about the gap and stopped —
+the state simply was not in the enumeration, and nothing in the file drew
+attention to its absence. A sweep for cannot-fire annotations would never have
+found it, on any day, however carefully run. Filing it as an instance of the
+rule above would credit that rule with a catch it cannot make.
+
+So the two are different problems. This section's rule finds the gap someone
+DOCUMENTED. The harder one is that an instrument's coverage of the state space
+is not visible from the instrument's own source: absence of a state from the
+enumeration reads as absence of a problem, and there is no text to grep for.
+
+The mechanical form that does catch it is a **conservation identity** over the
+partition — assert that the buckets SUM to the population, rather than that each
+bucket looks right. An unrepresented state then cannot hide, because the sum
+stops balancing, and no one has to have thought of the missing state in advance.
+That is not theory here: `fresh + stale + pending + len(degraded) +
+len(unconfigured) + len(withoutHandles) == providersTotal` is published for
+exactly this reason, and it earned itself. Providers awaiting a first fetch
+answered none of the bucket arms and landed nowhere while still counting in the
+total; the identity broke, which is how the `pending` bucket came to exist. No
+inspection of the health code would have raised the question, because every
+bucket in it was individually correct.
+
+The precondition is that the population be independently known. `providersTotal`
+comes from the registry rather than from summing the buckets, which is the whole
+reason the identity can fail — a total derived from its own parts always
+balances and proves nothing.
 
 So: **an unfalsifiable check is a reason to find a check that bites, not a
 limitation to document.** Where you cannot verify the property you wanted,
