@@ -1196,6 +1196,47 @@ form could catch the near-miss where the reason sat on a real definition nobody
 opens cold. **The trivial first catch was not a lesser version of the good one;
 it was its precondition.**
 
+## A note explaining why a check cannot fire is a defect report
+
+When a check cannot detect the thing it was written for, the honest instinct is
+to write that down beside it. That instinct is right about the fact and wrong
+about what to do next: the note documents a gap where a working check should
+be, and it reads as diligence, so nobody returns to it. The interval between
+writing the note and the incident is time the defect was known and shipped
+anyway.
+
+Concretely here. `wire_sanity` compares `usedCount` against `totalCount`, and a
+comment beside it observed that where a provider *derives* the count from the
+percentage and the cap, the comparison returns the reported percentage by
+construction and cannot fire. True, carefully reasoned, and the end of the
+thought. What it should have prompted is the question of which OTHER property
+of a derived count is checkable — and one was, four lines long: a count is a
+quantity of things, so a fractional value proves it was computed rather than
+measured. That rule would have caught a live fractional count before it reached
+a consumer, where instead it cost that consumer every provider's capacity on the
+response until it was fixed.
+
+The peer half of this pair is worth recording because it is the same shape one
+level worse. Their health check consulted only one freshness source, so a
+configured axis with no successful poll was not represented at all and its
+absence read as healthy — the instrument could not express the state, which also
+suppressed the alarm that would have found it. Four days dark, surfaced by
+someone inspecting a table by hand after an unrelated deploy.
+
+So: **an unfalsifiable check is a reason to find a check that bites, not a
+limitation to document.** Where you cannot verify the property you wanted,
+verify a different one that the same defect would violate. And treat the note
+itself as the alert — a comment saying a check cannot fire is a defect report
+that has been filed and never triaged.
+
+The corollary about who found what: neither of these was caught by a control.
+One was found by chance, the other bounded by a peer's strictness at their own
+boundary. The only mechanism that functioned as designed was a rule written to
+refuse a shape, which worked on a day when nobody was watching — and that is the
+whole property distinguishing a control from an anecdote. Every note either side
+wrote, and every blind spot either side documented, failed on days when we were
+paying attention. That asymmetry is the argument for rules over vigilance.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
