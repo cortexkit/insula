@@ -1276,6 +1276,27 @@ unrecognised value, and it must be structural rather than positional — a guard
 that works because validation happens to run first stops working when someone
 adds a second entry point.
 
+**A dropped value is only detectable against an independently-known population.**
+The third disposition for a wildcard — after fencing at the producer and failing
+closed on foreign input — is dropping the value, which is right for parsing and
+mapping where the alternative is refusing a payload over one unreadable member.
+Its risk is different from mis-bucketing: the value is simply absent from the
+output, and absence reads as nothing-to-report.
+
+That is not fixed at the match site, and auditing wildcards forever is the wrong
+response. `vault_handles` returns `None` for a credential family that maps to no
+provider and drops it with a stderr warning; what makes that safe is elsewhere.
+`vault-lanes` enumerates configured handles from the handle FILE — a population
+known independently of what the mapper produced — collects every handle that
+reached no provider, and exits non-zero. A warning printed beside `findings:
+none` and an exit code of 0 is the shape that checker exists to refuse: the fact
+was on screen and the summary said everything was fine.
+
+So the test for a dropping wildcard is not what the arm returns. It is whether
+anything downstream knows how many values SHOULD have arrived. Where the output
+is built by iterating whatever a query returned, no such number exists and the
+omission is undetectable however careful the arm is.
+
 **Check where the fence actually bites, not that one exists.** Adding a variant
 to `SlotStatus` already broke this build before the fence was added — at
 `service_rank`, which decides which of two duplicate slots wins and asks nothing
