@@ -178,6 +178,24 @@ afterwards — fine for verifying a reader, useless as a persistent fixture. And
 `SetAlias` is a test-rig manoeuvre, not something to imitate in the product: it
 repoints a user's default keyring.
 
+**The reader then shipped and was verified against that rig** (`b004623`). It
+reads the password from the Secret Service by ATTRIBUTES — `application=chrome`,
+`xdg:schema=chrome_libsecret_os_crypt_password_v2` — rather than by the item's
+label, which is display text that has differed between Chrome and Chromium.
+
+Three results from the VM, the third being the one worth keeping:
+
+| run | outcome |
+| --- | --- |
+| unit vector, on macOS and Linux | the captured `v11` ciphertext decrypts; the 1003-round key does not |
+| live jar, keyring entry present | 23 cookies, including all three real `v11` values |
+| live jar, keyring entry deleted | 20 cookies — the `v11` values drop out, the `v10` half still serves |
+
+That last row is the design property, not a nicety. A missing keyring key is
+`Ok(None)` rather than an error precisely so a host whose Secret Service is
+absent, locked, or Chrome-less keeps every cookie it could already read. The
+failure it prevents is a keyring problem taking the whole cookie cohort dark.
+
 Reaching `v11` requires the Secret Service API over D-Bus (`org.freedesktop.
 secrets`) to fetch the `Chrome Safe Storage` password, then the same PBKDF2 at
 one iteration. The obstacle is not the crypto — it is identical to `v10` bar the
