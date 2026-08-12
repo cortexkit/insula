@@ -69,6 +69,30 @@ def boundary_description() -> str:
     return f'"production" is everything above `{readable}`'
 
 
+def whole_file_is_test_only(path: pathlib.Path) -> str | None:
+    """Return the declaring file when this whole file is a `#[cfg(test)]` module.
+
+    A module can be gated where it is DECLARED rather than inside itself:
+    `#[cfg(test)] mod tests;` in lib.rs makes every line of tests.rs test-only,
+    and nothing in tests.rs says so. Cutting at an in-file marker then keeps the
+    entire file as production code and reports its contents as findings.
+
+    That is not hypothetical -- sweeping for aborting constructs returned 16
+    hits, every one of them in such a file, and the correct answer was zero.
+    The failure is quiet in the dangerous direction: the sweep produced a
+    plausible non-zero count with real line numbers, so the natural reaction is
+    to start triaging rather than to doubt the population.
+    """
+    stem = path.stem
+    for sibling in path.parent.glob("*.rs"):
+        if sibling == path:
+            continue
+        text = sibling.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+" + re.escape(stem) + r"\s*;", text):
+            return sibling.name
+    return None
+
+
 def production_body(source: str) -> tuple[str, float]:
     """Return the source up to the test module, and the fraction that is."""
     match = TEST_MODULE.search(source)
@@ -131,11 +155,20 @@ def main() -> int:
     misleading: list[tuple[str, int]] = []
     impure: list[tuple[str, int]] = []
     hits: list[str] = []
+    externally_gated: list[tuple[str, str]] = []
     read_bytes = 0
     total_bytes = 0
 
     for path in args.files:
         source = path.read_text()
+        declared_by = whole_file_is_test_only(path)
+        if declared_by is not None:
+            # Every line is test-only, gated where the module is declared. Skip
+            # it entirely rather than cut it: there is nothing to cut at, and
+            # keeping it would report its whole contents as production findings.
+            externally_gated.append((path.name, declared_by))
+            total_bytes += len(source)
+            continue
         body, fraction = production_body(source)
         read_bytes += len(body)
         total_bytes += len(source)
@@ -214,6 +247,15 @@ def main() -> int:
     # Reported rather than excised. Removing these items would need the spans
     # they cover, and a brace-matched span is its own guessing game -- while
     # naming them lets a reader check whether a result rests on one.
+    if externally_gated:
+        for name, declared_by in externally_gated:
+            print(
+                f"  skipped {name}: every line is test-only, gated at "
+                f"`#[cfg(test)] mod` in {declared_by}"
+            )
+    else:
+        print("  files gated at their declaration: 0")
+
     if impure:
         print(
             f"note: {len(impure)} file(s) carry test-only items inside the "
