@@ -5,6 +5,25 @@
 //! prefer the OAuth token: the usage endpoint is account-scoped via the
 //! `ChatGPT-Account-Id` header, which an API key alone does not carry, and the
 //! OAuth `tokens.access_token` is the credential CodexBar's own usage path uses.
+//!
+//! READ-ONLY BY DESIGN: this reads the access token the Codex CLI already
+//! obtained and never performs a refresh of its own. That is not an omission to
+//! fill in later. OpenAI's refresh grant ROTATES -- its token response carries a
+//! replacement refresh token and the previous one stops working, which the CLI
+//! persists -- so a refresh performed here would invalidate the credential the
+//! user's own `codex` install depends on, to collect a usage figure. The CLI
+//! could not distinguish that from an expired session.
+//!
+//! The cost of staying read-only is bounded and visible: when the stored access
+//! token expires before the CLI renews it, the fetch returns 401 and the
+//! provider degrades with `credential_rejected` until the user next runs Codex.
+//! An unreadable window is recoverable; a broken sign-in is not.
+//!
+//! The same asymmetry decides which credential stores are safe to read for other
+//! providers. Google does not rotate, so `antigravity` reads the opencode
+//! plugin's refresh token and exchanges it freely. Anthropic and OpenAI both
+//! rotate, so their plugin stores are read-only sources of an ALREADY-VALID
+//! access token or nothing at all.
 //! When only an API key is present we fall back to it (no account header).
 //!
 //! Fetch: `GET {base}/wham/usage` with `Authorization: Bearer <token>`,
