@@ -614,17 +614,27 @@ cap changed from one whose usage did. Do not compute one from the other and the
 percent: the percent can be reported directly by the upstream against a cap that
 differs from the one you would divide by.
 
-**The two are not equally independent, and the difference matters if you plan to
-cross-check them.** `totalCount` is the plan's cap, which the upstream states
-directly. `usedCount` may be *recovered* from the percentage and that cap where
-the upstream publishes no absolute figure of its own — a faithful recovery of
-the number the upstream divided, to the precision at which it transmitted the
-percentage, but not an independent measurement. So `usedCount / totalCount`
-returns the reported percentage by construction: agreement between them confirms
-nothing, and disagreement would indicate a producer defect rather than anything
-about the account. The independent signal is `totalCount` alone: watching it
-change is how a cap change becomes visible, which is what these fields were
-added for.
+**Both are whole numbers, always.** They count things — requests, messages,
+tokens — so a fractional value is not a rounding blemish but evidence the number
+was computed rather than measured. The wire type is `f64` for range, not to
+permit fractions. Storing them as integers is correct, and rejecting a
+non-integral one is a reasonable thing for a consumer to do.
+
+**`usedCount` is emitted only where the upstream REPORTS a count.** It is never
+reconstructed from the percentage and the cap. This rule was learned the
+expensive way: this document previously said a recovered count was "a faithful
+recovery of the number the upstream divided", and that was false. Measured on
+the live wire, one upstream returned `45.052361473854994%` against a cap of
+`40000`, and no integer count over that cap produces that percentage — the
+nearest, `18021`, gives `45.0525%`, off by `1.4e-6` where `f64` noise is `1e-17`.
+The console divides by something other than the cap its own endpoint reports. A
+recovered count would therefore have carried a disagreement between two upstream
+endpoints while presenting it as a measurement.
+
+So where you see `totalCount` with no `usedCount`, the cap is known and the
+consumed figure is not; the percentage is the whole signal for consumption. The
+independent signal is `totalCount` alone: watching it change is how a cap change
+becomes visible, which is what these fields were added for.
 
 Each entry in `extraRateWindows` carries an `id` (a stable identifier), a `title`
 (human-facing text), and a `window` — all three optional. Match on `id`; render
