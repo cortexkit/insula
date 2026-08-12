@@ -117,10 +117,26 @@ profile was 96 cookies, every one `v10`.
 
 That is a correct proof of the `v10` reader and **no evidence at all about how
 often a desktop Linux user is on `v11`**. A GNOME or KDE session with an
-unlocked keyring is the case that produces `v11`, and it is precisely the case a
-headless VM cannot produce. So the honest statement of Linux coverage is: the
-scheme we read is proven; the share of users it covers is unmeasured, and this
-host cannot measure it.
+unlocked keyring is the case that produces `v11`. So the honest statement of
+Linux coverage is: the scheme we read is proven; the share of users it covers is
+unmeasured.
+
+**A later attempt to produce `v11` on that VM failed, and the reason narrows the
+ask.** The VM does have a real desktop login — `loginctl` reports an active
+Wayland session on seat0, not the headless shape assumed above — so the earlier
+explanation was wrong about the machine. What blocks it is the keyring itself:
+the `Login` collection stays locked, and it cannot be unlocked without the
+password it was created with. Piping the account password to `gnome-keyring-
+daemon --unlock` leaves it locked, because this VM's keyring was created by a
+different install and its password is not the current account password. There is
+also no default collection, so a Secret Service client gets
+`PromptDismissedException` where a desktop user would get a dialog.
+
+So producing `v11` needs a keyring whose password is known at creation time —
+either a fresh desktop user logged in through the display manager, or a keyring
+deliberately recreated with a known password. Both are available on a desktop
+box; neither is reachable through `prlctl exec` on this one. The blocker is a
+credential, not the absence of a desktop.
 
 Reaching `v11` requires the Secret Service API over D-Bus (`org.freedesktop.
 secrets`) to fetch the `Chrome Safe Storage` password, then the same PBKDF2 at
