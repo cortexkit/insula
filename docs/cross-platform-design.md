@@ -134,9 +134,32 @@ also no default collection, so a Secret Service client gets
 
 So producing `v11` needs a keyring whose password is known at creation time —
 either a fresh desktop user logged in through the display manager, or a keyring
-deliberately recreated with a known password. Both are available on a desktop
-box; neither is reachable through `prlctl exec` on this one. The blocker is a
-credential, not the absence of a desktop.
+deliberately recreated with a known password.
+
+**A second attempt narrowed it further, and found the tension worth recording.**
+The VM was set up to run unattended: GDM autologin, screen lock off, idle
+suspend off, `loginctl enable-linger`. That works — it reboots straight into an
+active Wayland session on seat0 with no password typed. But *the same property
+that makes it unattended is what keeps `v11` out of reach*: PAM unlocks the
+login keyring using the password the user types at login, so an autologin
+session types nothing and no login keyring is created at all. The only unlocked
+collection is the in-memory session keyring, which does not persist.
+
+Chrome with `--password-store=gnome-libsecret` then finds no default collection,
+fails to store its `Chrome Safe Storage` secret, and falls back to the basic
+store — which is why the profile still reads 94 `v10` cookies after the switch.
+Creating a default collection over the Secret Service API blocks on a GUI prompt
+(`PromptDismissedException` when unattended, and a hung call when attempted
+against a live session), so it cannot be scripted.
+
+The remaining step is therefore one GUI action on the VM: open **Passwords and
+Keys**, create a keyring named `Default keyring` with an **empty** password, and
+accept the "store unencrypted" warning. After that the keyring auto-unlocks under
+autologin and Chrome will write `v11`. Until someone performs it, the `v11`
+reader stays unverifiable here — and shipping decryption code that has never
+decrypted real ciphertext is exactly the failure the wrong-iteration-count trap
+above describes: it produces garbage plaintext rather than an error, so a test
+asserting "did not fail" passes with the wrong constant.
 
 Reaching `v11` requires the Secret Service API over D-Bus (`org.freedesktop.
 secrets`) to fetch the `Chrome Safe Storage` password, then the same PBKDF2 at
