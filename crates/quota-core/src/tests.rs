@@ -5459,3 +5459,66 @@ fn a_wire_timestamp_has_one_spelling_per_instant() {
         assert_eq!(parsed.with_timezone(&chrono::Utc), timestamp);
     }
 }
+
+/// A slot on backoff is not fetched until its deadline, and is fetched after it.
+///
+/// The ladder's values are asserted elsewhere, and that is only half the
+/// property: every backoff duration could be correct while the scheduler
+/// ignored `next_due_at` entirely, and the value assertions would all still
+/// pass. What makes a deadline load-bearing is that it SUPPRESSES work before
+/// it arrives, which no assertion about a stored number can show.
+///
+/// The pair matters as much as the negative. Proving only that nothing is
+/// fetched before the deadline is satisfied by a scheduler that fetches
+/// nothing at all, so the same slot must be shown to run once its deadline
+/// passes.
+#[tokio::test]
+async fn a_slot_on_backoff_is_skipped_until_its_deadline() {
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UsageProvider for CountingProvider {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Transient, so the slot lands on the exponential ladder rather than
+            // the fixed non-transient interval.
+            FetchAttempt::failure(None, None, FetchError::Upstream("HTTP 503".into()))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let registry = Registry::new(vec![Box::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    })]);
+
+    // First failure: puts the slot on a 60-second backoff.
+    tick(&registry).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the first fetch runs");
+
+    // Ticking again immediately must NOT fetch. This is the assertion the value
+    // tests cannot make: without it, a scheduler that ignored the deadline would
+    // pass every other test in this suite.
+    for _ in 0..3 {
+        tick(&registry).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a slot inside its backoff window must not be fetched again"
+    );
+
+    // And once the deadline passes it runs, or the negative above would be
+    // satisfied by a scheduler that never fetches anything.
+    force_due(&registry, "counting");
+    tick(&registry).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a slot past its deadline must be fetched"
+    );
+}

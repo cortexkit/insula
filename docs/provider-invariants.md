@@ -1123,6 +1123,34 @@ point and confirm it describes what still follows it. To find existing cases,
 look for a doc block naming something other than what it is attached to, or one
 whose paragraphs open two different subjects.
 
+## A stored deadline is not a working deadline
+
+A retry ladder has two properties and they are tested very differently. That the
+durations are right is a question about a pure function, and it is the one that
+gets asserted, because it is easy: call `backoff(class, n)` and compare. That the
+scheduler HONOURS them is a question about behaviour, and it is the one that
+matters, because a deadline nothing consults is decoration.
+
+The values passing tells you nothing about the second. Every duration in this
+crate's ladder is asserted, and making the scheduler ignore `next_due_at`
+entirely — treating every slot as due on every tick — reddened exactly one test,
+named for enumeration errors and handle admission. Defended by accident, by a
+test about something else. A refresher hammering every provider on every tick
+would have shipped with the whole backoff suite green.
+
+**The proof is a negative and a positive, and neither alone is worth anything.**
+Fetch once to arm the ladder, tick several more times and assert the call count
+did NOT move — that is what shows the deadline suppresses work. Then advance
+past it and assert the count DID move, because a suppression test alone is
+satisfied by a scheduler that fetches nothing at all.
+
+That second half is not hypothetical caution. Mutating the scheduler to fetch
+nothing did not redden a test here: it HUNG, and the suite reported a timeout
+rather than a failure. A permanently idle refresher is caught by the clock
+rather than by an assertion, which is the weakest form of catching something —
+so the positive half has to be proven by a mutation that suppresses only the
+retry, not by one that suppresses everything.
+
 ## A fixture records whether its values were observed or invented
 
 Parser tests need input, and the fastest way to get it is to write some. That is
