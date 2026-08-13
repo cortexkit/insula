@@ -1,6 +1,16 @@
 # Codex banked resets: auto-consume + relaxed reporting
 
-Status: DESIGN v2 — adversarial Oracle pass folded (8 findings, 4 critical).
+Status: SHIPPED and live in production since 2026-07-15, including real credit
+redemptions against live accounts. The line below describes the state this note
+was written in, not the state of the system.
+
+> **This is a record of a decision, not a description of what exists.** Where it
+> and the source disagree, the source is right; the value here is the reasoning,
+> which the code does not carry. `crates/quota-core/src/codex_resets.rs` and the
+> relaxation transform in `lib.rs` are authoritative for behaviour, and
+> `docs/consumer-contract.md` for what reaches the wire.
+
+Original status: DESIGN v2 — adversarial Oracle pass folded (8 findings, 4 critical).
 Date: 2026-07-14. Ufuk-approved shape (one knob, module-local, no ALF change;
 exhaustion backstop confirmed). v1 of this note was ruled UNSAFE by the Oracle
 pass; every mechanism below that differs from v1 exists to close a named
