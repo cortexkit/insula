@@ -97,11 +97,13 @@ async fn main() {
     // with "findings: none", and only one of them saw the vault.
     println!("lane: deployed module through the daemon (vault lane included)");
     println!(
-        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   pools checked: {}   providers compared: {}",
+        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   pools checked: {} ({} amounts, {} bound comparisons)   providers compared: {}",
         report.entries,
         report.degraded,
         report.windows_checked,
         report.pools_checked,
+        report.pool_amounts_checked,
+        report.pool_comparisons,
         report.providers_compared
     );
 

@@ -82,6 +82,21 @@ pub struct SanityReport {
     pub entries: usize,
     pub degraded: usize,
     pub windows_checked: usize,
+    /// Pool amounts examined by the unit and exponent rules.
+    ///
+    /// A pool may state a remaining balance, a total, both, or neither, and the
+    /// amount rules only run where one is present — so `pools_checked` is an
+    /// honest denominator for the rules with no precondition (duplicate and
+    /// empty ids) and an overstatement for these.
+    pub pool_amounts_checked: usize,
+    /// Remaining-against-total comparisons the bound rule actually made.
+    ///
+    /// The narrowest population here and the easiest to assume: it needs BOTH
+    /// amounts on one pool, and a provider publishing only a remaining balance
+    /// never reaches it. Reported separately because this is the rule that
+    /// catches a balance stated wrongly against its own cap, so a zero here is
+    /// worth seeing rather than inferring from the pool count.
+    pub pool_comparisons: usize,
     /// Spend pools examined by the pool rules.
     ///
     /// Counted separately from windows because the two populations are
@@ -120,14 +135,14 @@ impl SanityReport {
 pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityReport {
     // Accumulated outside the report because the entry walk borrows
     // `report.findings` mutably for the duration.
-    let mut pools_checked = 0usize;
+    let mut tally = PoolTally::default();
     let mut report = SanityReport {
         entries: entries.len(),
         ..SanityReport::default()
     };
 
     for entry in entries {
-        check_entry_shape(entry, now, &mut report.findings, &mut pools_checked);
+        check_entry_shape(entry, now, &mut report.findings, &mut tally);
         if entry.error.is_some() {
             report.degraded += 1;
             continue;
@@ -145,7 +160,9 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 
     check_across_entries(entries, &mut report);
 
-    report.pools_checked = pools_checked;
+    report.pools_checked = tally.pools;
+    report.pool_amounts_checked = tally.amounts;
+    report.pool_comparisons = tally.comparisons;
     report
 }
 
@@ -160,16 +177,25 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 /// These check internal consistency only, exactly like the window rules: nothing
 /// here knows what any provider's credit is worth, and no rule fires on a value
 /// merely because it is large.
+/// What the pool rules actually examined, so a zero is visible rather than
+/// inferred from a neighbouring count.
+#[derive(Debug, Default)]
+struct PoolTally {
+    pools: usize,
+    amounts: usize,
+    comparisons: usize,
+}
+
 fn check_pools(
     entry: &ProviderUsage,
     where_: &str,
     findings: &mut Vec<String>,
-    pools_checked: &mut usize,
+    tally: &mut PoolTally,
 ) {
     let Some(pools) = entry.spend.as_ref() else {
         return;
     };
-    *pools_checked += pools.len();
+    tally.pools += pools.len();
 
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for pool in pools {
@@ -192,6 +218,7 @@ fn check_pools(
 
         for (field, amount) in [("remaining", &pool.remaining), ("total", &pool.total)] {
             let Some(amount) = amount else { continue };
+            tally.amounts += 1;
 
             // An amount with no denomination states a quantity of nothing, and a
             // consumer rendering it will invent a unit for it.
@@ -221,6 +248,7 @@ fn check_pools(
         // wrong and this cannot say which, which is why it reports rather than
         // picks.
         if let (Some(remaining), Some(total)) = (&pool.remaining, &pool.total) {
+            tally.comparisons += 1;
             if remaining.unit == total.unit && remaining.exponent == total.exponent {
                 if remaining.minor > total.minor {
                     findings.push(format!(
@@ -244,7 +272,7 @@ fn check_entry_shape(
     entry: &ProviderUsage,
     now: DateTime<Utc>,
     findings: &mut Vec<String>,
-    pools_checked: &mut usize,
+    tally: &mut PoolTally,
 ) {
     let where_ = format!(
         "{}/{}",
@@ -259,7 +287,7 @@ fn check_entry_shape(
     // Pools count as something stated. A provider can sell credit and publish no
     // rate limits at all, and such an entry has no usage and no error while
     // being entirely healthy -- its whole answer is the balance.
-    check_pools(entry, &where_, findings, pools_checked);
+    check_pools(entry, &where_, findings, tally);
 
     if entry.usage.is_none() && entry.error.is_none() && !states_a_pool(entry) {
         findings.push(format!("{where_}: entry carries neither usage nor error"));
@@ -1116,6 +1144,55 @@ mod tests {
     /// published 45.052361473854994% against a 40000 cap and multiplied the two,
     /// and a consumer storing counts as integers rejected the entire response --
     /// every provider's capacity, over one provider's arithmetic.
+    /// Each pool rule reports the population it actually examined.
+    ///
+    /// A pool count is an honest denominator only for the rules with no
+    /// precondition — duplicate and empty ids run on every pool. The amount
+    /// rules need an amount present, and the bound rule needs BOTH a remaining
+    /// and a total on one pool, so a provider publishing only a balance walks
+    /// past it entirely.
+    ///
+    /// That is the live state rather than a hypothetical: the only provider
+    /// here publishing pools states a remaining balance and no total, so the
+    /// bound rule has never evaluated on real data while the pool count read as
+    /// coverage for all six rules.
+    #[test]
+    fn each_pool_rule_reports_the_population_it_examined() {
+        let mut balance_only = entry(window(10.0));
+        balance_only.spend = Some(vec![pool("granted", Some((500, 2, "USD")), None)]);
+
+        let report = check_entries(&[balance_only], at(FIXTURE_NOW));
+        assert_eq!(report.pools_checked, 1);
+        assert_eq!(
+            report.pool_amounts_checked, 1,
+            "the remaining amount is checked"
+        );
+        assert_eq!(
+            report.pool_comparisons, 0,
+            "a pool with no total cannot reach the bound rule, and must say so"
+        );
+
+        // A pool carrying both reaches it, or the zero above would be
+        // indistinguishable from a counter that never increments.
+        let mut bounded = entry(window(10.0));
+        bounded.spend = Some(vec![pool(
+            "granted",
+            Some((500, 2, "USD")),
+            Some((1000, 2, "USD")),
+        )]);
+
+        let bounded_report = check_entries(&[bounded], at(FIXTURE_NOW));
+        assert_eq!(
+            bounded_report.pool_amounts_checked, 2,
+            "remaining and total"
+        );
+        assert_eq!(
+            bounded_report.pool_comparisons, 1,
+            "both amounts present means the bound rule ran"
+        );
+        assert!(bounded_report.findings.is_empty());
+    }
+
     /// The pool rules report their own denominator.
     ///
     /// Windows and pools are independent populations: most providers publish
