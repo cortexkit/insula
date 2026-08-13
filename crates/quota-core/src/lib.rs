@@ -955,11 +955,11 @@ impl Registry {
 
         for provider in &self.providers {
             let name = provider.name.as_str();
-            let slots: Vec<_> = snapshot
+            let keyed: Vec<_> = snapshot
                 .iter()
                 .filter(|(key, _)| key.provider == name)
-                .map(|(_, slot)| slot)
                 .collect();
+            let slots: Vec<&ProviderSlot> = keyed.iter().map(|(_, slot)| slot).collect();
             if slots.is_empty() {
                 // Registered but holding no slots, so it contributes to no count
                 // below. Report it by name rather than skipping it: otherwise the
@@ -999,11 +999,22 @@ impl Registry {
             // so the conservation identity is untouched: a provider counted here
             // is still counted in exactly one bucket.
             if (has_fresh || has_stale)
-                && slots.iter().any(|slot| {
-                    slot.observation
-                        .as_ref()
-                        .and_then(|observation| observation.account_id.as_deref())
-                        .is_none()
+                && keyed.iter().any(|(key, slot)| {
+                    // Vault handles only. One exists because somebody minted it,
+                    // so a failing one is a credential that was configured and
+                    // stopped working. Most providers also keep an implicit local
+                    // lane -- an environment variable or a file path -- that
+                    // exists whether or not anyone uses it, and on a host that
+                    // does not, it fails with an absent credential and no
+                    // identity while the vault lane beside it serves perfectly.
+                    // Counting those named a provider whose only fault was
+                    // shipping a lane nobody configured.
+                    !key.handle.is_local()
+                        && slot
+                            .observation
+                            .as_ref()
+                            .and_then(|observation| observation.account_id.as_deref())
+                            .is_none()
                         && slot
                             .entry
                             .as_ref()

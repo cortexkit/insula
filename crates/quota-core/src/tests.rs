@@ -5153,8 +5153,21 @@ fn the_documented_provider_count_matches_the_registry() {
 /// changes on its own.
 #[tokio::test]
 async fn a_credential_reaching_no_account_is_named_in_health() {
+    // Vault handles: the metric is about a credential somebody minted, so a
+    // fixture built from implicit local lanes would exercise the wrong shape and
+    // pass for the wrong reason.
     let provider =
         CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    *provider.handles.lock().unwrap() = Ok(vec![
+        CredentialHandle::vault(
+            "H1",
+            crate::credential_source::VaultCapability::new("ckh_h1"),
+        ),
+        CredentialHandle::vault(
+            "H2",
+            crate::credential_source::VaultCapability::new("ckh_h2"),
+        ),
+    ]);
     let fail = Arc::clone(&provider.fail);
     let labels = Arc::clone(&provider.labels);
     let registry = Registry::new(vec![Box::new(provider)]);
@@ -5192,6 +5205,33 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
     assert!(
         healthy.health().handles_without_account.is_empty(),
         "a provider whose credentials all resolve must not be named"
+    );
+
+    // Silent for an implicit local lane that resolves nothing. Most providers
+    // ship one -- an environment variable or a file path -- and it exists
+    // whether or not anyone uses it, so on a host that does not, it fails with
+    // an absent credential and no identity while a minted handle beside it
+    // serves. Naming that reports a provider whose only fault is offering a lane
+    // nobody configured.
+    let mixed = CompletenessProvider::new(&["V1", "L1"], &[("V1", Some("A")), ("L1", None)]);
+    *mixed.handles.lock().unwrap() = Ok(vec![
+        CredentialHandle::vault(
+            "V1",
+            crate::credential_source::VaultCapability::new("ckh_v1"),
+        ),
+        handle("L1"),
+    ]);
+    mixed.fail.lock().unwrap().insert("L1".to_string());
+    let with_local = Registry::new(vec![Box::new(mixed)]);
+    tick(&with_local).await;
+    let local_health = with_local.health();
+    assert!(
+        local_health.handles_without_account.is_empty(),
+        "an unconfigured local lane beside a serving vault handle must not be named"
+    );
+    assert_eq!(
+        local_health.fresh, 1,
+        "and the provider is serving, so the control is not vacuous"
     );
 
     // Silent for a provider that serves usage while resolving no identity. Many
