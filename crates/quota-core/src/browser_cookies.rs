@@ -317,6 +317,7 @@ static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 /// the property the reuse exists for: nine cookie providers fanning out in one
 /// refresh tick share a single snapshot instead of copying the same database
 /// nine times.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refresh_snapshot_if_stale<F>(
     guard: &mut Option<Snapshot>,
     now: Instant,
@@ -335,6 +336,7 @@ where
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn snapshot_is_stale(taken_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
     match taken_at {
         // Nothing cached yet: the first caller after start always pays for one.
