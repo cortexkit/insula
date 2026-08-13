@@ -1438,6 +1438,31 @@ the same freshness error this module warns consumers about on the wire.
 believed, and a rule that has never returned clean has been exercised rather
 than tested.
 
+## Registering a provider has a step that fails the build
+
+Adding an adapter means: the module under `crates/quota-core/src/`, the
+`UsageProvider` impl, the registration in `Registry::with_defaults` — and then
+the provider count stated in `docs/provider-matrix.md`, which a unit test
+compares against the registry. That last one is a build step, not housekeeping:
+the suite goes red until the sentence matches.
+
+It is enforced because it had already drifted. The matrix said 37 while the
+registry built 36, and the number came from counting `Box::new` occurrences in
+the registry source — one of which wraps a fetch outcome and registers nothing.
+A cheap proxy answering a nearby question, in a sentence ending "verified".
+
+The canonical slug map (`api_provider_name`) is the deliberate opposite. A new
+provider does NOT have to appear there, and no test requires it, because many
+providers have no models.dev counterpart — a required entry would invite a
+guessed slug, and consumers join pricing data on that field. What IS enforced is
+the other direction: every key in the map must name a registered provider, so a
+rename cannot silently strip the slug from a provider's entries.
+
+**Note where this is written.** `STRUCTURE.md` carries an add-a-provider
+procedure and is the obvious place for it — but that file is gitignored AND
+regenerated, so an edit there reaches nobody and is overwritten by the next
+doc-gen run. A procedure has to live somewhere tracked to be a procedure at all.
+
 ## An enumeration with no escape clause is a closed-world claim
 
 A comment listing the cases a value can take is the most authoritative shape a
