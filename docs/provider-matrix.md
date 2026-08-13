@@ -72,7 +72,16 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All four matched CodexBar v0.47.0 and none changed in that release.
+All four matched CodexBar v0.49.3, re-verified 2026-08-12 by locating each value
+in the tagged tree (`git grep <value> v0.49.3 -- Sources/`) rather than in the
+checkout, which usually sits at an older tag.
+
+The re-check was overdue by five releases: this line read v0.47.0 while v0.48.0,
+v0.48.1, v0.49.0, v0.49.2 and v0.49.3 had all shipped. The values had not
+drifted, so nothing was broken — but the SENTENCE had, and it is the only thing
+here that says when a reader last looked. A currency claim goes stale silently
+while the thing it describes stays correct, which is why this note carries the
+tag it was checked against and not a bare "verified".
 
 A mismatch is not automatically a port: confirm the value changed **within** the
 diff range rather than always having differed, and that we call the same endpoint
