@@ -219,6 +219,17 @@ def neutralise_and_run(idx):
     # A timeout gets its own verdict rather than being folded into not-reached,
     # because the two mean opposite things: a hang says the condition changes
     # control flow, a compile failure says the rewrite was malformed.
+    #
+    # But HUNG is not purely a control-flow signal, and reading it as one
+    # overstates what happened. The budget covers a rebuild as well as the run,
+    # so a mutation landing on a cold cache can exhaust it while the suite would
+    # have finished. Raise MUTATION_TIMEOUT and re-run before concluding a rule
+    # changes control flow: a verdict that moves when only the budget moved was
+    # never about the code.
+    #
+    # Do NOT kill this script mid-sweep. It restores after each mutation, so an
+    # interrupted run leaves the file rewritten -- recoverable, because the next
+    # run refuses a dirty tree, but only if the next run happens.
     try:
         run = subprocess.run(
             ["cargo", "test", "-p", "quota-core", "--lib", "wire_sanity"],
