@@ -1146,6 +1146,25 @@ captured from a live response, copied from a reference implementation, or
 invented for the case. "Live-verified" on the test *function* does not answer it,
 because a test can drive a real code path with made-up input.
 
+**And provenance is not correctness.** A capture proves what the wire said, not
+that what it said was intended — which is the opposite of how a captured fixture
+is usually argued for. The two are indistinguishable from inside the fixture: a
+value that is wrong and a value that is right look identical once they are string
+literals, and the capture's authority attaches to both.
+
+This is not theoretical here. A test built from a real captured payload asserted
+`"2026-07-14T13:00:01+00:00"` for a credit expiry, and that assertion was pinning
+a **defect** — the formatter dropped the fractional part because the instant
+happened to land on a whole second, so one instant had several spellings on the
+wire. The test was green, the value was genuine, and its realness was the reason
+nobody questioned it. Fixing the producer reddened it.
+
+The distinction to hold: a capture is authoritative about the SHAPE the upstream
+sends and about what THIS module emitted at that moment. It is not authoritative
+about whether emitting that was right. When a captured expectation blocks a fix,
+the question is which side the defect is on — and "it came from real data" argues
+for neither answer.
+
 The same distinction governs what a producer can promise a consumer about a
 published string. Values this module composes are stable because it controls
 them, and a change can be announced before it ships. Values passed through from
