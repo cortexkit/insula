@@ -92,11 +92,43 @@ impl ModuleConfig {
 }
 
 fn quota_config_path() -> Option<PathBuf> {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
-    {
+    quota_config_path_from(|key| std::env::var_os(key))
+}
+
+/// Resolve the config path over an arbitrary environment.
+///
+/// The order matches the subc daemon's own `default_config_path`, deliberately:
+/// this is a file WE own, and an operator configuring the fleet should find
+/// every module's config where the daemon's already is. Third-party credential
+/// files are the opposite case and follow the tool that writes them.
+///
+/// **`HOME` alone is not enough.** It is normally unset for a native Windows
+/// process, so reading it directly returns no path there and the config is never
+/// loaded. That failure is silent in the worst way available here: an absent
+/// config is a legitimate state meaning "no overrides", so banked-reset
+/// auto-consume simply stays off while the module reports healthy and the wire
+/// carries no field saying the feature was configured and not read.
+///
+/// The lookup is injected so the Windows arms are exercisable on any host. A
+/// branch testable only where it runs is one nobody checks until someone reports
+/// that a setting has no effect -- and the report would be about the feature,
+/// not about the path.
+fn quota_config_path_from(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(config_home) = lookup("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(config_home).join(QUOTA_CONFIG_RELATIVE_PATH));
     }
-    std::env::var_os("HOME")
+    if let Some(app_data) = lookup("APPDATA").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(app_data).join(QUOTA_CONFIG_RELATIVE_PATH));
+    }
+    if let Some(profile) = lookup("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join(QUOTA_CONFIG_RELATIVE_PATH),
+        );
+    }
+    lookup("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".config").join(QUOTA_CONFIG_RELATIVE_PATH))
@@ -780,6 +812,90 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// The config path follows the daemon's own resolution order.
+    ///
+    /// Each arm is asserted separately because they are tried in sequence, and a
+    /// test that only ever supplies one variable cannot tell a correct order
+    /// from an accidental one.
+    #[test]
+    fn the_config_path_resolves_like_the_daemon() {
+        let os = std::ffi::OsString::from;
+
+        // XDG wins wherever it is set, on every platform.
+        let xdg = quota_config_path_from(|key| match key {
+            "XDG_CONFIG_HOME" => Some(os("/tmp/xdg")),
+            "APPDATA" => Some(os(r"C:\roaming")),
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        });
+        assert_eq!(
+            xdg,
+            Some(PathBuf::from("/tmp/xdg/cortexkit/ck-quota.jsonc"))
+        );
+
+        // Windows without XDG: the roaming directory, not HOME.
+        let roaming = quota_config_path_from(|key| match key {
+            "APPDATA" => Some(os(r"C:\roaming")),
+            _ => None,
+        })
+        .expect("APPDATA must resolve a path");
+        assert!(
+            roaming
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("roaming/cortexkit/ck-quota.jsonc"),
+            "{roaming:?}"
+        );
+
+        // Stripped Windows environment: reconstruct what APPDATA would hold.
+        let profile = quota_config_path_from(|key| match key {
+            "USERPROFILE" => Some(os(r"C:\Users\qta")),
+            _ => None,
+        })
+        .expect("USERPROFILE must resolve a path");
+        assert!(
+            profile
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("Users/qta/AppData/Roaming/cortexkit/ck-quota.jsonc"),
+            "{profile:?}"
+        );
+
+        // Unix stays exactly as it was.
+        let unix = quota_config_path_from(|key| match key {
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        });
+        assert_eq!(
+            unix,
+            Some(PathBuf::from("/home/qta/.config/cortexkit/ck-quota.jsonc"))
+        );
+
+        // Nothing set at all: no path rather than a relative one, which would
+        // resolve against the working directory of whoever spawned the module.
+        assert_eq!(quota_config_path_from(|_| None), None);
+    }
+
+    /// A Windows environment must not fall through to the Unix arm.
+    ///
+    /// The regression this pins is the original defect: reading `HOME` alone,
+    /// which is normally unset on Windows, so the config is never found and
+    /// banked-reset auto-consume stays off with nothing reporting why.
+    #[test]
+    fn a_windows_environment_never_returns_a_unix_path() {
+        let path = quota_config_path_from(|key| match key {
+            "APPDATA" => Some(std::ffi::OsString::from(r"C:\roaming")),
+            _ => None,
+        })
+        .expect("a windows environment must resolve a path");
+
+        assert!(
+            !path.to_string_lossy().contains("/.config/"),
+            "resolved a Unix path on a Windows environment: {path:?}"
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
