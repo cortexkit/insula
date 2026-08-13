@@ -288,6 +288,20 @@ column rather than from any summary here — a `no` means someone must do
 something, and `no_quota_reported` is the one row where `no` means nothing is
 wrong and nothing is needed.
 
+**This list grows, so decode it as an open vocabulary.** Two of the eight rows
+above were added after consumers were already reading the field, because a
+failure that had been folded into a neighbouring class turned out to need its
+own remedy. A decoder that treats the set as closed — an enum that fails, a
+match that panics, a filter that drops what it does not recognise — breaks on an
+addition that is additive by construction and breaks in the direction that hides
+it, since an unrecognised class becomes silence rather than an error.
+
+Keep an unknown class as a readable string and let it reach whatever surface
+displays the known ones. The strings are chosen to be legible for exactly this
+reason: a consumer that cannot classify a new one can still show it, and a
+person reading `credential_rejected` needs no table. Branch on the classes you
+know and pass the rest through.
+
 `internal_error` is marked *sometimes* because both of its causes carry that
 class and nothing on the wire separates them: a panic while handling one
 particular response clears on the next fetch, while a deterministic bug in this
