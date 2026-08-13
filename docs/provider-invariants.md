@@ -1151,6 +1151,22 @@ rather than by an assertion, which is the weakest form of catching something —
 so the positive half has to be proven by a mutation that suppresses only the
 retry, not by one that suppresses everything.
 
+**An assertion that nothing extra happened never shows anything would happen
+again**, and that generalises past retry ladders. The refresher's idle sleep is
+capped so that discovery keeps running: handles are enumerated at the top of a
+tick, so the longest the loop may sleep is the longest a newly added credential
+stays invisible. Replacing that cap with its opposite — sleeping the full
+backoff instead of the bound — reddened nothing, and a user adding an account
+while their providers were failing would have waited a quarter of an hour.
+
+The liveness check could not catch it either, for a reason worth generalising:
+`STALL_HORIZON` is DERIVED from `MAX_TICK_SLEEP`, so raising the sleep raises
+what counts as stalled, and the heartbeat keeps reporting healthy because the
+refresher is doing exactly what its own constants now permit. **A guard computed
+from the thing it guards cannot fail while the two move together** — which is
+why a bound like this needs a test naming the behaviour it protects, not merely
+a documented relationship between the constants.
+
 ## A fixture records whether its values were observed or invented
 
 Parser tests need input, and the fastest way to get it is to write some. That is
