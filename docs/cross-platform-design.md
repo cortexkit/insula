@@ -54,7 +54,7 @@ The concrete case, verified in the tools' own sources:
 | OpenCode | `%USERPROFILE%\.local\share\opencode\auth.json` | no |
 | Kilo | `%USERPROFILE%\.local\share\kilo\auth.json` | no |
 | Codebuff | `%USERPROFILE%\.config\manicode\credentials.json` | no |
-| JetBrains | `%APPDATA%\JetBrains\<Product>\options\…` | **yes** |
+| JetBrains | `%APPDATA%\JetBrains\<Product>\options\…` | **yes** — branch SHIPPED, `jetbrains.rs` |
 
 Five of six keep their POSIX-shaped path on Windows because they are Node CLIs
 built on `os.homedir()`. JetBrains is a native application and does not. A

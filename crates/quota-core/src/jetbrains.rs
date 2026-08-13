@@ -37,15 +37,56 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "jetbrains";
 
-/// JetBrains config base dirs to scan for installed IDEs (macOS + Linux/XDG).
+/// JetBrains config base dirs to scan for installed IDEs.
+///
+/// JetBrains is the one third-party source here that DOES follow host
+/// convention, so it is the one that needs a Windows branch. The others read by
+/// this module -- Codex, Gemini, OpenCode, Kilo, Codebuff -- are Node CLIs built
+/// on `os.homedir()` and keep their POSIX-shaped paths on Windows, so mapping
+/// their `~/.config` to `%APPDATA%` would break five sources to fix one. This is
+/// a native application and stores under `%APPDATA%\JetBrains` there.
+///
+/// Every candidate is probed rather than selected by `cfg`: a path that does not
+/// exist costs one failed `read_dir`, and probing all of them means a host with
+/// an unusual layout is still found. The failure this avoids is the quiet one --
+/// on Windows, scanning only the two Unix paths finds nothing, reports no active
+/// quota, and is indistinguishable from an IDE that is genuinely not installed.
 fn config_base_dirs() -> Vec<PathBuf> {
+    config_base_dirs_from(crate::env::home_dir(), |key| std::env::var_os(key))
+}
+
+/// The candidate list, over an arbitrary environment.
+///
+/// Split from [`config_base_dirs`] for the same reason `env::home_dir_from`
+/// exists: reading the process environment inside the function leaves the
+/// Windows branch exercisable only on Windows, and a branch that can only be
+/// tested where it runs is one nobody checks until a user reports that nothing
+/// resolves. Here that report would never come -- the provider degrades as "no
+/// active quota", which is the same thing it says on a host with no IDE.
+fn config_base_dirs_from(
+    home: Option<PathBuf>,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::env::home_dir() {
+    if let Some(home) = home {
         dirs.push(home.join("Library/Application Support/JetBrains")); // macOS
         dirs.push(home.join(".config/JetBrains")); // Linux
     }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+    if let Some(xdg) = lookup("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         dirs.push(PathBuf::from(xdg).join("JetBrains"));
+    }
+    // Windows: the roaming application-data directory. `APPDATA` is set by the
+    // OS; the `USERPROFILE` fallback covers a stripped environment, where the
+    // literal `AppData\Roaming` is the value `APPDATA` would have held.
+    if let Some(appdata) = lookup("APPDATA").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(appdata).join("JetBrains"));
+    } else if let Some(profile) = lookup("USERPROFILE").filter(|v| !v.is_empty()) {
+        dirs.push(
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("JetBrains"),
+        );
     }
     dirs
 }
@@ -207,6 +248,98 @@ impl UsageProvider for JetBrainsProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The Windows roaming directory is a candidate, and only there.
+    ///
+    /// JetBrains is the one third-party source here that follows host
+    /// convention, so this branch is the difference between finding a live
+    /// quota file on Windows and reporting "no active quota" -- which is what a
+    /// host with no IDE installed also reports, so the failure carries no
+    /// signal of its own.
+    #[test]
+    fn the_windows_roaming_directory_is_searched() {
+        let env = |key: &str| match key {
+            "APPDATA" => Some(std::ffi::OsString::from(r"C:\Users\qta\AppData\Roaming")),
+            _ => None,
+        };
+        let dirs = config_base_dirs_from(Some(PathBuf::from(r"C:\Users\qta")), env);
+
+        assert!(
+            dirs.iter()
+                .any(|d| d.ends_with("JetBrains") && d.to_string_lossy().contains("AppData")),
+            "no roaming candidate in {dirs:?}"
+        );
+    }
+
+    /// A stripped environment still reaches the roaming directory.
+    ///
+    /// `APPDATA` is normally set by the OS, so the fallback exists for a
+    /// service-style environment where it is not. It reconstructs the literal
+    /// value `APPDATA` would have held rather than guessing a different layout.
+    #[test]
+    fn a_missing_appdata_falls_back_to_the_profile() {
+        let env = |key: &str| match key {
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\qta")),
+            _ => None,
+        };
+        let dirs = config_base_dirs_from(None, env);
+
+        let found = dirs.iter().find(|d| d.ends_with("JetBrains"));
+        let found = found.expect("no candidate built from USERPROFILE");
+        let shown = found.to_string_lossy().replace('\\', "/");
+        assert!(
+            shown.ends_with("AppData/Roaming/JetBrains"),
+            "fallback built the wrong shape: {shown}"
+        );
+    }
+
+    /// `APPDATA` wins when both are present, rather than both being added.
+    ///
+    /// The two describe the same directory, so emitting both would search it
+    /// twice -- harmless but misleading to anyone reading the candidate list to
+    /// understand where this looks.
+    #[test]
+    fn appdata_is_preferred_over_the_profile_fallback() {
+        let env = |key: &str| match key {
+            "APPDATA" => Some(std::ffi::OsString::from(r"D:\roaming")),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\qta")),
+            _ => None,
+        };
+        let dirs = config_base_dirs_from(None, env);
+
+        let windows: Vec<_> = dirs.iter().filter(|d| d.ends_with("JetBrains")).collect();
+        assert_eq!(windows.len(), 1, "expected one windows candidate: {dirs:?}");
+        assert!(
+            windows[0].to_string_lossy().starts_with("D:"),
+            "{windows:?}"
+        );
+    }
+
+    /// The Unix candidates survive the Windows branch being added.
+    ///
+    /// The regression this pins is a Windows fix written as a `cfg` swap rather
+    /// than an addition, which would take macOS and Linux dark to light up a
+    /// platform nobody here runs.
+    #[test]
+    fn the_unix_candidates_are_still_searched() {
+        let dirs = config_base_dirs_from(Some(PathBuf::from("/home/qta")), |_| None);
+        let shown: Vec<_> = dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            shown
+                .iter()
+                .any(|d| d.contains("Library/Application Support/JetBrains")),
+            "macOS candidate missing: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|d| d.ends_with(".config/JetBrains")),
+            "Linux candidate missing: {shown:?}"
+        );
+    }
+
     use super::*;
 
     /// CodexBar-shaped active quota: numbers are STRINGS, JSON is HTML-entity
