@@ -820,6 +820,32 @@ signal working, not the threshold being wrong, and
 [the freshness section](#freshness-comes-from-the-producer-never-from-the-poll)
 covers what to do with it.
 
+**Prefer the disclosure to the threshold where you have it.** An entry preserved
+through an ongoing failure now says so directly, which answers the question a
+wall-clock threshold can only approximate:
+
+```json
+"fetchedAt": "2026-08-13T10:00:00Z",
+"stale": { "since": "2026-08-13T10:02:00Z", "class": "upstream_failed" }
+```
+
+`fetchedAt` is when the served reading was obtained. `since` is when the producer
+first failed to refresh it. **The gap between them is how long the producer has
+been unable to look**, which is the quantity a staleness policy actually wants —
+an entry can be minutes old with the producer perfectly healthy, or seconds old
+with the producer failing since just after the read. A threshold on age alone
+cannot separate those, so it has to deny fresh-enough data in order to catch
+stale data.
+
+`since` is always later than `fetchedAt`; a negative difference means something
+is wrong upstream of you. `class` uses the `errorClass` vocabulary and is
+optional, since a producer that cannot classify a failure should still disclose
+the state — render "stale, cause unstated" rather than suppressing it.
+
+Absent means this entry is a fresh success. It is **not a fault signal**:
+preserving a reading through a brief upstream failure is correct behaviour, and
+this field reports that it is happening rather than that something is broken.
+
 ## An absent account is never a statement that the account is gone
 
 The rule above applies per **entry**, and an entry is per account — so a
