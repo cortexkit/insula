@@ -355,6 +355,29 @@ and grep exits non-zero when nothing matches, so "no files changed" and "the
 command failed" are the same status. Any check whose exit code you intend to act
 on must not be read through a pipe.
 
+## A pinned-hash comparison needs its own control
+
+Building two commits with the stamp overridden and comparing hashes answers "did
+the code change", but only if the build is reproducible — and nothing about the
+comparison tells you whether it is. Build the SAME commit twice, with a forced
+recompile between, before reading anything into a difference. Without that
+control a nondeterministic build reports every pair as different and the
+conclusion is "always redeploy", which is indistinguishable from a correct
+answer.
+
+**And a differing hash is not by itself a code change.** Two commits here
+differed only by two `cfg` attributes that both evaluate TRUE on the building
+platform, so the compiled behaviour provably could not differ — and the binaries
+had identical SIZE, each reproducible, with different hashes. Source structure
+reaches the output through symbol mangling and metadata without reaching
+behaviour.
+
+So read the pair together: identical size with a differing hash and no
+behavioural delta in the diff is a metadata difference. A real code change moves
+the size. When the diff is small enough to read, read it — it settles the
+question faster than the hash does, and the hash cannot distinguish these two
+cases at all.
+
 ## Reading CI evidence for a specific commit
 
 This workflow sets `cancel-in-progress`, and pushes here often come in bursts, so
