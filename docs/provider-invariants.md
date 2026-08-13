@@ -1435,6 +1435,40 @@ the same freshness error this module warns consumers about on the wire.
 believed, and a rule that has never returned clean has been exercised rather
 than tested.
 
+## An enumeration with no escape clause is a closed-world claim
+
+A comment listing the cases a value can take is the most authoritative shape a
+comment has, and the most expensive one to get wrong. It does not mislead by
+being vague — it misleads by being COMPLETE, because a reader who accepts the
+list has no reason to look for a case outside it.
+
+The instance: a match arm here carried "the vault holds a record for this handle
+in both cases — it was minted deliberately — so neither is an absent
+credential." True of both arms it described. False of the case that was missing,
+which was a handle naming a credential that had been REMOVED — no record, no
+login that fixes it. A reader hitting that bug would have been talked out of the
+right answer by a comment that sounded settled.
+
+Two properties made it durable, and both look like good writing:
+
+- It enumerated, so the space appeared closed.
+- It gave a RATIONALE ("it was minted deliberately"), so questioning it meant
+  defeating an argument rather than noticing an omission.
+
+The repair is one clause: "…unless the record itself is gone." Not a hedge — a
+named case, which is the difference between inviting a check and foreclosing it.
+
+**When a comment enumerates cases, the load-bearing sentence is the one naming
+what would ADD a case, not the one listing the cases.** A comment that says what
+it cannot see keeps a future reader looking; one that says what cannot happen
+stops them. In a codebase with other authors and an upstream that changes, a
+closed-world claim is a bet you are not positioned to cover.
+
+The generalisation is not "hedge everything", which produces comments that
+assert nothing. It is that an enumeration should state its own boundary
+condition — what would make it incomplete — so the next reader can check that
+condition instead of trusting the list.
+
 ## A record and a currency claim look identical and age oppositely
 
 Both are a sentence with a date in it. One says something HAPPENED then — a
