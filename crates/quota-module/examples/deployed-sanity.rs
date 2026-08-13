@@ -93,6 +93,9 @@ async fn main() {
         .filter(|entry| entry.source.as_deref() == Some("vault"))
         .count();
 
+    // Names the lane for the same reason the local checker does: both finish
+    // with "findings: none", and only one of them saw the vault.
+    println!("lane: deployed module through the daemon (vault lane included)");
     println!(
         "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   providers compared: {}",
         report.entries, report.degraded, report.windows_checked, report.providers_compared

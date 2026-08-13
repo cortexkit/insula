@@ -42,6 +42,12 @@ fn main() {
     }
 
     let report = wire_sanity::check_entries(&entries, Utc::now());
+    // Name the lane in the OUTPUT, not only in the file header. Both checkers
+    // finish with "findings: none", and a clean run of this one is easily
+    // mistaken for a clean run of the deployed one -- which examines strictly
+    // more, because the vault lane exists only there. A reader who cannot tell
+    // the two apart from the transcript has a pass for a check that never ran.
+    println!("lane: local credentials only (vault lane NOT examined; see deployed-sanity)");
     println!(
         "entries: {} ({} degraded)   windows checked: {}   providers compared: {}   warm-up {:.0}s",
         report.entries,
