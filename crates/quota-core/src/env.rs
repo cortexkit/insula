@@ -120,6 +120,16 @@ pub fn read_credential_file(
     })
 }
 
+/// Render an epoch second as an RFC 3339 string for the wire.
+///
+/// Uses an explicit format rather than `to_rfc3339`, and that is the reason it
+/// is safe to key on: `to_rfc3339` chooses precision from the VALUE, so a whole
+/// second prints with no fractional part, nanoseconds ending in three zeros
+/// print six digits, and everything else prints nine. One instant then has
+/// several valid spellings and string equality stops meaning instant equality.
+///
+/// An explicit format cannot vary that way. Anything formatting a timestamp for
+/// the wire should use either this or `rfc3339_canonical`, never the default.
 pub fn epoch_to_iso8601(epoch_secs: i64) -> Option<String> {
     match Utc.timestamp_opt(epoch_secs, 0) {
         chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
