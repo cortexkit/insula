@@ -1200,12 +1200,32 @@ async fn a_failing_identity_less_handle_does_not_unlabel_its_siblings() {
 
     // Exactly one unlabeled entry, never one per failing handle: two unlabeled
     // entries for a provider are indistinguishable from two accounts.
-    let unlabeled = snapshot
+    let unlabeled: Vec<_> = snapshot
         .entries
         .iter()
         .filter(|entry| entry.account.is_none())
-        .count();
-    assert_eq!(unlabeled, 1, "the failure stays visible, exactly once");
+        .collect();
+    assert_eq!(
+        unlabeled.len(),
+        1,
+        "the failure stays visible, exactly once"
+    );
+
+    // And it carries NO usage. This is what makes the mixed shape safe for a
+    // consumer summing a provider's capacity: the unlabeled entry may be the
+    // same account as one of the labeled ones reached by a second credential,
+    // so if it ever published usage the total would count that account twice.
+    // The narrower collapse rule above is only sound while this holds -- a
+    // handle serving usage without an identity still collapses the provider.
+    assert!(
+        unlabeled[0].usage.is_none(),
+        "the unlabeled representative must publish no capacity: {:?}",
+        unlabeled[0].usage
+    );
+    assert!(
+        unlabeled[0].error.is_some(),
+        "and it must say why it resolved no account"
+    );
 
     // The claim is still withheld: an account is missing from the array, so
     // authorising a replacement against it would delete one that exists.
