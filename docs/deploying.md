@@ -375,6 +375,20 @@ gh run view <run-id> --json jobs \
   | python3 -c "import json,sys; [print(s['conclusion'], s['name']) for j in json.load(sys.stdin)['jobs'] for s in j['steps']]"
 ```
 
+**A cancellation between two failures is not evidence of anything, and it is
+where this reading goes wrong.** The guidance above trains the eye to treat
+`cancelled` as noise, which is correct in isolation and dangerous in a column: a
+list reading failure, cancelled, cancelled, failure looks like one bad run
+surrounded by churn, and is actually a red that has never gone green. Cancelled
+means the run was killed before it could answer, so it removes evidence rather
+than supplying it — it can never be the reason a neighbouring failure is stale.
+
+This is not hypothetical. A Windows compile break here survived three commits
+because the failures were separated by cancellations and the whole column read
+as burst noise. **Read the most recent CONCLUSIVE run, and treat every
+cancellation as a gap rather than a data point.** A single failure with no later
+success beneath it is a red branch however many cancellations sit between.
+
 **Ask for a run that contains the change, not the run at it.** Cancellation loses
 verification *at a commit*, never verification *of the content* — the next
 completed run covers everything beneath it. In that same sample, four cancelled
