@@ -27,7 +27,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.49.3** (37 providers registered; verified
+**Current parity: CodexBar v0.49.3** (36 providers registered; verified
 2026-08-12). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is

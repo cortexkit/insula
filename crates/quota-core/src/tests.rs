@@ -5080,3 +5080,42 @@ async fn the_local_lane_wins_when_both_lanes_of_a_provider_are_healthy() {
         "the remote lane won a tie against local"
     );
 }
+
+/// The provider count stated in the matrix is the count the registry builds.
+///
+/// A number restated in prose drifts silently: the registry gains a provider,
+/// the sentence does not, and nothing disagrees. This one was already wrong by
+/// one -- written by counting `Box::new` lines in the registry source, which
+/// also matches a `Box::new` that wraps a fetch outcome and registers nothing.
+///
+/// Checked here rather than noted, because a claim about another file is a
+/// comment pretending to be a guarantee until something compares the two. The
+/// assertion names both sides so a failure says which to change: adding a
+/// provider should update the sentence, not this test.
+#[test]
+fn the_documented_provider_count_matches_the_registry() {
+    let registered = Registry::with_defaults(crate::config::QuotaConfig::default(), None)
+        .provider_names()
+        .len();
+
+    let matrix = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/provider-matrix.md"),
+    )
+    .expect("provider-matrix.md must be readable from the crate directory");
+
+    let stated: usize = matrix
+        .split_once(" providers registered")
+        .and_then(|(before, _)| {
+            before
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .find(|token| !token.is_empty())
+                .and_then(|token| token.parse().ok())
+        })
+        .expect("the matrix must state a provider count as `<N> providers registered`");
+
+    assert_eq!(
+        stated, registered,
+        "docs/provider-matrix.md states {stated} providers and the registry builds \
+         {registered}; update the matrix sentence when adding or removing a provider"
+    );
+}
