@@ -1115,10 +1115,12 @@ async fn an_enumeration_failure_withdraws_completeness_but_keeps_the_entries() {
 
 /// An account still waiting on its first fetch forfeits the claim.
 ///
-/// The provider is already unlabeled in this state, because one unidentified
-/// handle collapses every account into a single unlabeled entry. Completeness
-/// must be withheld too: the array names no accounts at all, so authorising a
-/// replacement against it would delete every account the consumer holds.
+/// Its resolved sibling stays LABELED: a handle with no entry publishes no
+/// capacity, so it cannot be the same account as a labeled sibling and there is
+/// nothing to double-count by keeping the label. Completeness is withheld all
+/// the same, and that is the property protecting the consumer here — the array
+/// is missing an account, so authorising a replacement against it would delete
+/// one that exists.
 #[tokio::test]
 async fn a_pending_account_forfeits_the_claim() {
     let provider = CompletenessProvider::new(&["H1"], &[("H1", Some("A"))]);
@@ -1147,12 +1149,69 @@ async fn a_pending_account_forfeits_the_claim() {
     let mid = registry.usage_snapshot(None).await;
     assert_eq!(
         accounts_of(&mid),
-        vec![None],
-        "an unidentified handle collapses the provider to one unlabeled entry"
+        vec![Some("A")],
+        "a handle awaiting its first fetch must not cost its sibling the label"
     );
     assert!(
         mid.complete_providers.is_empty(),
-        "an array naming no accounts must never authorise replacing them"
+        "an array missing an account must never authorise replacing them"
+    );
+}
+
+/// A handle that resolves no account and serves no usage keeps its siblings labeled.
+///
+/// This is the state a handle reaches when the credential behind it is removed
+/// and the handle is left configured: it can never resolve again, and nothing
+/// about it changes on its own. Collapsing the provider for it used to cost
+/// every healthy account its identity permanently and silently — the wire
+/// showed one unlabeled row, every health reading said serving, and only the
+/// completeness claim recorded that anything was wrong.
+///
+/// The label is safe to keep because the failing handle publishes no capacity:
+/// a degraded entry carries an error and no usage, so it cannot be the same
+/// account as a labeled sibling in the way an identity-less handle SERVING
+/// usage can. That distinction is the whole rule, and its other half is pinned
+/// by `one_identity_less_handle_suppresses_the_labels_of_every_other_handle`.
+#[tokio::test]
+async fn a_failing_identity_less_handle_does_not_unlabel_its_siblings() {
+    let provider =
+        CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    let fail = Arc::clone(&provider.fail);
+    let labels = Arc::clone(&provider.labels);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    // H2's credential is removed: it resolves no identity and its fetch fails.
+    fail.lock().unwrap().insert("H2".to_string());
+    labels.lock().unwrap().insert("H2".into(), None);
+
+    tick(&registry).await;
+    let snapshot = registry.usage_snapshot(None).await;
+
+    let labeled: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter_map(|entry| entry.account.as_deref())
+        .collect();
+    assert_eq!(
+        labeled,
+        vec!["A"],
+        "a dead handle must not cost its healthy sibling the account label"
+    );
+
+    // Exactly one unlabeled entry, never one per failing handle: two unlabeled
+    // entries for a provider are indistinguishable from two accounts.
+    let unlabeled = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.account.is_none())
+        .count();
+    assert_eq!(unlabeled, 1, "the failure stays visible, exactly once");
+
+    // The claim is still withheld: an account is missing from the array, so
+    // authorising a replacement against it would delete one that exists.
+    assert!(
+        snapshot.complete_providers.is_empty(),
+        "a provider missing an account must not authorise replacing its set"
     );
 }
 

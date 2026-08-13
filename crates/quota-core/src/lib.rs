@@ -581,8 +581,28 @@ impl Registry {
                 continue;
             }
 
-            let all_resolved = slots.iter().all(|(_, slot)| slot.account_id().is_some());
-            if !all_resolved {
+            // An unresolved handle only has to suppress its siblings when it
+            // could BE one of them. A handle serving usage without an identity
+            // may be the same account as a labeled sibling -- a local lane
+            // beside a vault lane commonly is -- and publishing both would count
+            // one account's capacity twice, which is worse than publishing it
+            // once without a label.
+            //
+            // A handle carrying only an error has no capacity to double-count,
+            // by construction: a degraded entry has no usage. So it cannot
+            // create that ambiguity, and collapsing the provider for it costs
+            // every healthy sibling its identity to guard against nothing. That
+            // is the state a handle reaches when the credential behind it is
+            // removed and the handle is left configured -- permanent, silent,
+            // and previously enough to blind an entire provider.
+            let ambiguous_capacity = slots.iter().any(|(_, slot)| {
+                slot.account_id().is_none()
+                    && slot
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.usage.is_some())
+            });
+            if ambiguous_capacity {
                 let primary = slots
                     .iter()
                     .filter(|(_, slot)| !slot.label_in_flux)
@@ -628,12 +648,19 @@ impl Registry {
             // that from the account having been removed -- so any skip forfeits
             // the completeness claim.
             let mut skipped_a_slot = false;
+            let mut unidentified: Vec<(&SlotKey, &ProviderSlot)> = Vec::new();
             for (key, slot) in slots {
                 if slot.label_in_flux || slot.entry.is_none() {
                     skipped_a_slot = true;
                     continue;
                 }
                 let Some(account_id) = slot.account_id() else {
+                    // Identity-less and carrying no usage, or this branch would
+                    // not have been taken. Held back for a single unlabeled
+                    // representative below rather than emitted per handle: two
+                    // unlabeled entries for one provider are indistinguishable
+                    // from two accounts to a consumer.
+                    unidentified.push((key, slot));
                     skipped_a_slot = true;
                     continue;
                 };
@@ -672,6 +699,21 @@ impl Registry {
                     entry.account = Some(account_id);
                     entry.api_provider = api_provider_name(name).map(String::from);
                     relax_usage_for_read(&mut entry, slot, read_now);
+                    out.push(entry);
+                }
+            }
+            // One entry for every handle that resolved nothing, so the failure
+            // stays visible without asserting how many handles are behind it.
+            // Emitting it keeps a dead handle reportable to an operator; the
+            // alternative is a provider that renders perfectly while quietly
+            // holding a credential that can never resolve again.
+            if let Some((_, slot)) = unidentified
+                .into_iter()
+                .min_by(|(left, _), (right, _)| left.handle.sort_cmp(&right.handle))
+            {
+                if let Some(mut entry) = slot.entry.clone() {
+                    entry.account = None;
+                    entry.api_provider = api_provider_name(name).map(String::from);
                     out.push(entry);
                 }
             }
