@@ -179,6 +179,19 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 /// merely because it is large.
 /// What the pool rules actually examined, so a zero is visible rather than
 /// inferred from a neighbouring count.
+///
+/// **A NEW RULE WITH A PRECONDITION NEEDS A NEW FIELD HERE.** Three populations
+/// exist because the rules divide into three: every pool reaches the id rules,
+/// only pools stating an amount reach the unit and exponent rules, and only
+/// pools stating BOTH a remaining and a total reach the bound rule. A fourth
+/// precondition without a fourth count is invisible in exactly the way this
+/// struct exists to prevent — the neighbouring numbers keep reporting, and the
+/// new rule is indistinguishable from one that never fires.
+///
+/// The live figures make the case: `pools checked: 2 (2 amounts, 0 bound
+/// comparisons)`. The bound rule has never evaluated on real data, because the
+/// only provider publishing pools states a balance and no total. Before these
+/// fields, `pools checked: 2` read as coverage for all six rules.
 #[derive(Debug, Default)]
 struct PoolTally {
     pools: usize,
