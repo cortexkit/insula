@@ -212,15 +212,28 @@ impl FetchAttempt {
             VaultGetError::Transient => {
                 FetchError::Upstream("credential vault temporarily unavailable".to_string())
             }
-            // The vault holds a record for this handle in both cases -- it was
-            // minted deliberately -- so neither is an absent credential. One
-            // needs a login, the other cannot be served at all.
+            // A record exists for this handle in both cases -- it was minted
+            // deliberately -- so neither is an absent credential. One needs a
+            // login, the other cannot be served at all. The case where NO
+            // record exists is `NotFound` below, and it was carved out of
+            // `Permanent` for exactly that reason: this comment used to cover
+            // it and was wrong about it.
             VaultGetError::AuthRequired => {
                 FetchError::CredentialUnusable("credential requires authentication".to_string())
             }
             VaultGetError::Permanent => {
                 FetchError::CredentialUnusable("vault credential is unavailable".to_string())
             }
+            // The handle names nothing: no credential exists for it, which is
+            // what a handle becomes when its credential is removed and the
+            // handle is left configured. Reported as ABSENT rather than
+            // unusable, because there is nothing here to fix -- no login
+            // restores an account that was deleted, and calling it unusable
+            // sends an operator looking for a broken credential that no longer
+            // exists.
+            VaultGetError::NotFound => FetchError::NoSession(
+                "no credential exists for this handle; it names a removed record".to_string(),
+            ),
             // A credential that exists and is empty. Reported as unusable
             // rather than as a malformed reply, because the reply was not
             // malformed -- the record is. It names its own cause, since an
@@ -841,6 +854,7 @@ mod tests {
             VaultGetError::Transient,
             VaultGetError::AuthRequired,
             VaultGetError::Permanent,
+            VaultGetError::NotFound,
             VaultGetError::EmptyPayload,
             VaultGetError::Corrupt,
             VaultGetError::FailClosed,
@@ -853,6 +867,7 @@ mod tests {
                 VaultGetError::Transient
                 | VaultGetError::AuthRequired
                 | VaultGetError::Permanent
+                | VaultGetError::NotFound
                 | VaultGetError::EmptyPayload
                 | VaultGetError::Corrupt
                 | VaultGetError::FailClosed => {}

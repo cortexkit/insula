@@ -769,6 +769,23 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
         return VaultGetError::Corrupt;
     }
 
+    // No credential exists for this handle. Distinguished from the general
+    // permanent answer because the remedies are opposite: a corrupt or
+    // unavailable record is something an operator repairs, while this one means
+    // the handle names a credential that is gone, and the only fix is to stop
+    // configuring it.
+    //
+    // BRANCHING ON THE CLASS IS LOAD-BEARING, not defensive. The vault produces
+    // this code only on a clean zero-row lookup -- a store it cannot read maps
+    // to a transient class, and a vault that is down returns no body at all --
+    // so the pair cannot occur during an outage. Matching the CODE alone would
+    // drop that guarantee the moment any producer arm hands out the same code
+    // in a transient context, and callers may act on this answer rather than
+    // merely report it.
+    if class == "permanent" && code == Some("not_found") {
+        return VaultGetError::NotFound;
+    }
+
     match class {
         "transient" => VaultGetError::Transient,
         "auth_required" => VaultGetError::AuthRequired,
@@ -1114,6 +1131,27 @@ mod tests {
     /// absent credential is created by logging in, while a corrupt one already
     /// exists and something damaged it. The vault sends a finer-grained code
     /// beside the class, and reading only the class discards exactly that.
+    /// A transient class keeps its class whatever code rides with it.
+    ///
+    /// `not_found` is the one code a caller may ACT on rather than merely
+    /// report -- a handle naming a removed credential is a handle to stop
+    /// configuring. That is safe only because the vault emits it on a clean
+    /// zero-row lookup, while a store it cannot read maps to a transient class
+    /// instead. Matching the code alone would discard that guarantee and let a
+    /// future producer arm turn an outage into a reap.
+    #[test]
+    fn a_transient_class_is_never_read_as_a_missing_credential() {
+        assert_eq!(
+            read_error_to_outcome("transient", Some("not_found")),
+            VaultGetError::Transient,
+            "a transient answer must not be read as a permanently missing credential"
+        );
+        assert_eq!(
+            read_error_to_outcome("auth_required", Some("not_found")),
+            VaultGetError::AuthRequired
+        );
+    }
+
     #[test]
     fn a_quarantined_record_is_not_reported_as_an_absent_one() {
         assert_eq!(
@@ -1122,12 +1160,12 @@ mod tests {
         );
         assert_eq!(
             read_error_to_outcome("permanent", Some("not_found")),
-            VaultGetError::Permanent
+            VaultGetError::NotFound
         );
 
         // Retry behaviour is unchanged: the code refines the description only,
         // and both remain non-transient.
-        for outcome in [VaultGetError::Corrupt, VaultGetError::Permanent] {
+        for outcome in [VaultGetError::Corrupt, VaultGetError::NotFound] {
             assert_eq!(
                 quota_core::refresh::classify(
                     &quota_core::provider::FetchAttempt::unverified_vault_failure(outcome)

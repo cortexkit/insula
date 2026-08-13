@@ -86,6 +86,19 @@ pub enum VaultGetError {
     Transient,
     AuthRequired,
     Permanent,
+    /// No credential exists for this handle at all.
+    ///
+    /// Distinct from [`Self::Permanent`], which is the general "no retry will
+    /// help" answer, because this one says something sharper: the handle names
+    /// nothing. It is what a handle becomes when the credential behind it is
+    /// removed and the handle is left configured -- a state no login fixes,
+    /// because there is no account to log in to.
+    ///
+    /// The vault produces it only on a clean zero-row lookup; any FAILURE to
+    /// read the store maps to a transient class instead, and a vault that is
+    /// down answers nothing at all. So this cannot appear during an outage,
+    /// which is what makes it safe to act on rather than merely report.
+    NotFound,
     /// The lookup succeeded and carried no credential bytes.
     ///
     /// Separate from [`Self::Permanent`], which means no record exists, and from
@@ -114,6 +127,7 @@ impl std::fmt::Debug for VaultGetError {
             Self::Transient => "Transient",
             Self::AuthRequired => "AuthRequired",
             Self::Permanent => "Permanent",
+            Self::NotFound => "NotFound",
             Self::EmptyPayload => "EmptyPayload",
             Self::Corrupt => "Corrupt",
             Self::FailClosed => "FailClosed",
@@ -127,6 +141,7 @@ impl std::fmt::Display for VaultGetError {
             Self::Transient => "credential vault temporarily unavailable",
             Self::AuthRequired => "credential requires authentication",
             Self::Permanent => "credential is unavailable",
+            Self::NotFound => "no credential exists for this handle",
             Self::EmptyPayload => "credential vault served an empty credential",
             Self::Corrupt => "credential vault holds a corrupt or quarantined record",
             Self::FailClosed => "credential vault rejected the request",
