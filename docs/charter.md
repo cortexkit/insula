@@ -104,7 +104,10 @@ and parallelizable — once the pattern is proven for one provider, the rest fan
 Same as the llm-runner build: your driver (Alfonso @ subc) sets direction, reviews each milestone,
 and owns cross-repo coordination (the TS client + the subc contract). You build, verify against real
 state, and ask when a decision is genuinely open. You hold local commit authority; push/publish/release
-gate on the human. Prompts/specs for any workers you spawn go in `.alfonso/prompts/`.
+gate on the human. Prompts/specs for any workers you spawn go in `.cortexkit/alfonso/prompts/`,
+which is machine-local: a prompt written there is invisible to every other
+checkout, so anything worth keeping belongs in a commit message or `docs/`
+rather than being cited by path.
 
 ## Reference paths
 - CodexBar (Swift, the thing to replicate): `/Users/ufukaltinok/Work/OSS/CodexBar`
