@@ -82,6 +82,15 @@ pub struct SanityReport {
     pub entries: usize,
     pub degraded: usize,
     pub windows_checked: usize,
+    /// Spend pools examined by the pool rules.
+    ///
+    /// Counted separately from windows because the two populations are
+    /// independent: most providers publish windows and no pools, so a sweep can
+    /// check dozens of windows while every pool rule sits idle. Without its own
+    /// denominator a run that examined no pool reports the same `findings: none`
+    /// as one that examined hundreds, and the six pool rules are indistinguishable
+    /// from rules that never fire.
+    pub pools_checked: usize,
     /// How many providers had their sibling entries compared against each other.
     ///
     /// Separate from `windows_checked` because the two can diverge sharply: an
@@ -109,13 +118,16 @@ impl SanityReport {
 /// Check every window of every healthy entry, optionally filtered to one
 /// provider.
 pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityReport {
+    // Accumulated outside the report because the entry walk borrows
+    // `report.findings` mutably for the duration.
+    let mut pools_checked = 0usize;
     let mut report = SanityReport {
         entries: entries.len(),
         ..SanityReport::default()
     };
 
     for entry in entries {
-        check_entry_shape(entry, now, &mut report.findings);
+        check_entry_shape(entry, now, &mut report.findings, &mut pools_checked);
         if entry.error.is_some() {
             report.degraded += 1;
             continue;
@@ -133,6 +145,7 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 
     check_across_entries(entries, &mut report);
 
+    report.pools_checked = pools_checked;
     report
 }
 
@@ -147,10 +160,16 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 /// These check internal consistency only, exactly like the window rules: nothing
 /// here knows what any provider's credit is worth, and no rule fires on a value
 /// merely because it is large.
-fn check_pools(entry: &ProviderUsage, where_: &str, findings: &mut Vec<String>) {
+fn check_pools(
+    entry: &ProviderUsage,
+    where_: &str,
+    findings: &mut Vec<String>,
+    pools_checked: &mut usize,
+) {
     let Some(pools) = entry.spend.as_ref() else {
         return;
     };
+    *pools_checked += pools.len();
 
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for pool in pools {
@@ -221,7 +240,12 @@ fn check_pools(entry: &ProviderUsage, where_: &str, findings: &mut Vec<String>) 
     }
 }
 
-fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut Vec<String>) {
+fn check_entry_shape(
+    entry: &ProviderUsage,
+    now: DateTime<Utc>,
+    findings: &mut Vec<String>,
+    pools_checked: &mut usize,
+) {
     let where_ = format!(
         "{}/{}",
         entry.provider,
@@ -235,7 +259,7 @@ fn check_entry_shape(entry: &ProviderUsage, now: DateTime<Utc>, findings: &mut V
     // Pools count as something stated. A provider can sell credit and publish no
     // rate limits at all, and such an entry has no usage and no error while
     // being entirely healthy -- its whole answer is the balance.
-    check_pools(entry, &where_, findings);
+    check_pools(entry, &where_, findings, pools_checked);
 
     if entry.usage.is_none() && entry.error.is_none() && !states_a_pool(entry) {
         findings.push(format!("{where_}: entry carries neither usage nor error"));
@@ -1092,6 +1116,38 @@ mod tests {
     /// published 45.052361473854994% against a 40000 cap and multiplied the two,
     /// and a consumer storing counts as integers rejected the entire response --
     /// every provider's capacity, over one provider's arithmetic.
+    /// The pool rules report their own denominator.
+    ///
+    /// Windows and pools are independent populations: most providers publish
+    /// windows and no pools at all, so a sweep can check dozens of windows while
+    /// every pool rule sits idle. Reported separately because a run that
+    /// examined no pool otherwise looks identical to one that examined
+    /// hundreds — both say `findings: none`, and the six pool rules are then
+    /// indistinguishable from rules that never fire.
+    #[test]
+    fn the_pool_rules_report_how_many_pools_they_examined() {
+        let mut with_pools = entry(window(10.0));
+        with_pools.spend = Some(vec![
+            pool("granted", Some((500, 2, "USD")), None),
+            pool("purchased", Some((250, 2, "USD")), None),
+        ]);
+
+        let report = check_entries(&[with_pools, entry(window(10.0))], at(FIXTURE_NOW));
+        assert_eq!(
+            report.pools_checked, 2,
+            "both pools of the one entry that has them must be counted"
+        );
+
+        // Zero is reported rather than hidden, which is the whole point: an
+        // entry set with no pools must be visibly different from one with them.
+        let none = check_entries(&[entry(window(10.0))], at(FIXTURE_NOW));
+        assert_eq!(none.pools_checked, 0);
+        assert!(
+            none.findings.is_empty(),
+            "and a run examining no pool is still a clean run, not a finding"
+        );
+    }
+
     #[test]
     fn a_count_that_is_not_a_whole_number_is_reported() {
         let mut w = window(45.052_361_473_854_994);

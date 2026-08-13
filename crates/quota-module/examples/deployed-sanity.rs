@@ -97,8 +97,12 @@ async fn main() {
     // with "findings: none", and only one of them saw the vault.
     println!("lane: deployed module through the daemon (vault lane included)");
     println!(
-        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   providers compared: {}",
-        report.entries, report.degraded, report.windows_checked, report.providers_compared
+        "entries: {} ({} degraded, {labelled} labelled, {vault} vault-served)   windows checked: {}   pools checked: {}   providers compared: {}",
+        report.entries,
+        report.degraded,
+        report.windows_checked,
+        report.pools_checked,
+        report.providers_compared
     );
 
     // Findings are reported before the no-windows exit. The cross-entry checks
