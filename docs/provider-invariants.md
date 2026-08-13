@@ -1167,6 +1167,36 @@ from the thing it guards cannot fail while the two move together** — which is
 why a bound like this needs a test naming the behaviour it protects, not merely
 a documented relationship between the constants.
 
+## Proven not-reached is worse than never-proven-reached
+
+A rule nobody has measured MIGHT be running. A rule measured at zero has
+definitively never run — and the only way to reach the worse state is to
+measure, which is why the comfortable reading survives so long.
+
+Both states look identical from outside: the checker reports `findings: none`
+either way. The difference is entirely in whether a denominator exists, so the
+work is not finding a defect but converting an unknown into a known bad.
+
+The instance here: six spend-pool rules, one of which needs a pool to state BOTH
+a remaining balance and a total. The only provider publishing pools states a
+balance and no total, so that rule — the one catching a balance stated wrongly
+against its own cap — has never evaluated on live data in its entire life. The
+sweep said `findings: none` throughout, honestly.
+
+**Count the population each RULE examined, not the population the container
+walked.** A conditional guard inside a loop creates a narrower population than
+the loop's, and the loop's count silently vouches for it. `pools checked: 2` was
+an honest denominator for the two rules with no precondition and an overstatement
+for the other four.
+
+Where this stops is worth stating, because it is a real limit rather than a gap:
+requiring a count per conditional rule cannot be ENFORCED without the checker
+knowing which of its own branches are preconditions — and whatever decided that
+would be a rule with no denominator, needing a count of the branches it examined.
+So the requirement lives as a note at the tally each rule increments, beside the
+live figures, because a zero sitting where the next author reads argues better
+than a rule telling them to count.
+
 ## Drawing a seam and testing behind it are two different jobs
 
 A decision fused to the I/O it depends on cannot be driven in a test, and the

@@ -188,6 +188,13 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 /// struct exists to prevent — the neighbouring numbers keep reporting, and the
 /// new rule is indistinguishable from one that never fires.
 ///
+/// **This is a note and nothing enforces it, and that is not a shortcut.** A
+/// check would need the checker to know which of its own branches are
+/// preconditions — and whatever decided that would itself be a rule with no
+/// denominator, needing a count of the branches it examined. The regress is
+/// real, so the requirement stops here on purpose rather than for want of
+/// effort.
+///
 /// The live figures make the case: `pools checked: 2 (2 amounts, 0 bound
 /// comparisons)`. The bound rule has never evaluated on real data, because the
 /// only provider publishing pools states a balance and no total. Before these
