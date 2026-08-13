@@ -1745,6 +1745,19 @@ writing rather than noticed while reading. In this repo `ARCHITECTURE.md` and
 `STRUCTURE.md` are generated; the only marker is a comment in `.gitignore`, which
 nobody editing them will see.
 
+The general constraint, which is why `.gitignore` is the right home rather than a
+compromise: **a property of an artifact that is destroyed by the process
+producing that artifact cannot be recorded inside it.** The marker has to live in
+the thing that does the destroying, or in something that outlives it. That covers
+generated docs, and equally anything a migration rewrites, a formatter
+normalises, or a codegen step owns.
+
+Enumerating this repo's untracked paths turns up one more with the same hazard:
+`.cortexkit`, `.alfonso` and `.opencode` are machine-local agent state, and a
+long-running audit ledger lived under `.cortexkit` once — reachable, never
+destroyed, and invisible to every other checkout for its whole life. Both markers
+now sit in `.gitignore` beside the entries.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that

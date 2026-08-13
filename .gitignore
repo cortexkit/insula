@@ -16,7 +16,12 @@ node_modules
 package-lock.json
 bun.lockb
 
-# Agent tooling
+# Agent tooling.
+#
+# Machine-local and untracked: notes, ledgers and plans written here reach this
+# machine only. A long-running audit ledger lived under .cortexkit once and was
+# invisible to every other checkout for its whole life. Durable findings belong
+# in docs/ -- see docs/provider-invariants.md for where a rule goes and why.
 .alfonso
 .opencode
 .cortexkit
