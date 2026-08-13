@@ -5522,3 +5522,54 @@ async fn a_slot_on_backoff_is_skipped_until_its_deadline() {
         "a slot past its deadline must be fetched"
     );
 }
+
+/// The idle sleep is capped even when every handle is far from due.
+///
+/// The cap is what keeps discovery running: newly minted credentials are found
+/// by the enumeration at the top of a tick, so the longest the loop may sleep is
+/// also the longest a new account can go unnoticed. With every handle on a
+/// fifteen-minute transient backoff, an uncapped sleep would wait the full
+/// fifteen minutes before looking again.
+///
+/// Nothing else catches it. The stall horizon is derived from this bound, so
+/// raising one silently raises the other and the heartbeat still looks healthy;
+/// a refresher that had gone quiet for a quarter of an hour would report as
+/// fine, because it is doing exactly what its own constants now permit.
+#[tokio::test]
+async fn the_idle_sleep_is_capped_so_discovery_keeps_running() {
+    fn set_due_in(registry: &Registry, delay: Duration) {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            slot.next_due_at = Instant::now() + delay;
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+    }
+
+    let registry = Registry::new(vec![Box::new(StubProvider {
+        name: "stub",
+        cookie: false,
+        ok: true,
+    })]);
+    tick(&registry).await;
+
+    // Push the only slot far into the future, the state reached when a provider
+    // has been failing long enough to earn the maximum backoff.
+    set_due_in(&registry, Duration::from_secs(15 * 60));
+
+    let sleep_for = registry.sleep_until_next_due(Instant::now());
+    assert!(
+        sleep_for <= refresh::MAX_TICK_SLEEP,
+        "the loop must wake within the cap even when nothing is due: slept {sleep_for:?}"
+    );
+
+    // Not vacuous: a slot due sooner than the cap must shorten the sleep rather
+    // than always returning the cap.
+    set_due_in(&registry, Duration::from_secs(1));
+    let shorter = registry.sleep_until_next_due(Instant::now());
+    assert!(
+        shorter < refresh::MAX_TICK_SLEEP,
+        "a slot due before the cap must shorten the sleep: slept {shorter:?}"
+    );
+}
