@@ -380,6 +380,50 @@ fn check_entry_shape(
             ahead.num_seconds()
         ));
     }
+
+    check_staleness_disclosure(entry, &where_, fetched_at.with_timezone(&Utc), findings);
+}
+
+/// A staleness disclosure must be orderable against the reading it describes.
+///
+/// `since` says when this module first failed to refresh the entry, and
+/// `fetchedAt` says when the served reading was obtained, so the failure
+/// necessarily begins AFTER the read. A `since` at or before `fetchedAt` claims
+/// the refresh failed before the value it is refreshing existed, which no clock
+/// can support -- and the gap between the two is the blind duration consumers
+/// compute, so an inverted pair yields a negative or zero one.
+///
+/// Checked here because this module is the only place that can catch it before
+/// it ships. A consumer can refuse the row, and one does, but by then the
+/// impossible pair is already on the wire and every other consumer has decided
+/// independently what to do with it.
+fn check_staleness_disclosure(
+    entry: &ProviderUsage,
+    where_: &str,
+    fetched_at: DateTime<Utc>,
+    findings: &mut Vec<String>,
+) {
+    let Some(stale) = entry.stale.as_ref() else {
+        return;
+    };
+    let Ok(since) = DateTime::parse_from_rfc3339(&stale.since) else {
+        findings.push(format!(
+            "{where_}: stale.since is unparseable: {}",
+            stale.since
+        ));
+        return;
+    };
+    // Equal instants are refused rather than tolerated: the reading completed
+    // and the next attempt failed, which are different moments however coarse
+    // the clock, and admitting equality publishes a zero blind duration that
+    // reads as "failing for no time at all".
+    if since.with_timezone(&Utc) <= fetched_at {
+        findings.push(format!(
+            "{where_}: stale.since ({}) is not after fetchedAt ({}), so the blind duration is not positive",
+            stale.since,
+            fetched_at.to_rfc3339()
+        ));
+    }
 }
 
 /// Check the invariants that hold between sibling entries of one provider.
@@ -1144,6 +1188,59 @@ mod tests {
     /// published 45.052361473854994% against a 40000 cap and multiplied the two,
     /// and a consumer storing counts as integers rejected the entire response --
     /// every provider's capacity, over one provider's arithmetic.
+    /// An inverted or equal staleness pair is reported.
+    ///
+    /// `since` is when the refresh started failing and `fetchedAt` is when the
+    /// served reading was obtained, so the failure begins after the read. The
+    /// gap between them is the blind duration a consumer computes, and an
+    /// inverted pair yields a negative one while an equal pair yields zero --
+    /// which reads as "failing for no time at all" rather than as a fault.
+    #[test]
+    fn a_staleness_disclosure_that_precedes_its_reading_is_reported() {
+        let stale_at = |since: &str| {
+            let mut e = entry(window(10.0));
+            e.fetched_at = Some(stamped_at());
+            e.stale = Some(cortexkit_provider_usage::Stale {
+                since: since.to_string(),
+                class: Some("upstream_failed".into()),
+            });
+            e
+        };
+
+        let fetched = DateTime::parse_from_rfc3339(&stamped_at())
+            .expect("the fixture stamp parses")
+            .with_timezone(&Utc);
+
+        let before = stale_at(&(fetched - chrono::Duration::seconds(30)).to_rfc3339());
+        let report = check_entries(&[before], at(FIXTURE_NOW));
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(report.findings[0].contains("not after fetchedAt"));
+
+        // Equal is refused too: the read completed and the next attempt failed,
+        // which are different moments however coarse the clock.
+        let same = stale_at(&fetched.to_rfc3339());
+        assert_eq!(
+            check_entries(&[same], at(FIXTURE_NOW)).findings.len(),
+            1,
+            "an equal pair publishes a zero blind duration"
+        );
+
+        // Must not fire on the ordinary shape, or every preserved reading on the
+        // wire becomes a finding.
+        let after = stale_at(&(fetched + chrono::Duration::seconds(60)).to_rfc3339());
+        assert!(
+            check_entries(&[after], at(FIXTURE_NOW)).findings.is_empty(),
+            "a disclosure after its reading is the normal case"
+        );
+
+        // And an unparseable since is reported rather than skipped: a
+        // comparison with nothing to compare against must not pass by default.
+        let unparseable = stale_at("not-a-timestamp");
+        let bad = check_entries(&[unparseable], at(FIXTURE_NOW));
+        assert_eq!(bad.findings.len(), 1);
+        assert!(bad.findings[0].contains("unparseable"));
+    }
+
     /// Each pool rule reports the population it actually examined.
     ///
     /// A pool count is an honest denominator only for the rules with no
