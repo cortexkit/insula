@@ -126,6 +126,24 @@ pub struct HealthSnapshot {
     /// browser actually signed in to that service, showing which cookie carries
     /// the session.
     pub cookie_logins_stale: Vec<String>,
+    /// Providers holding a credential that reaches no account while their other
+    /// accounts serve normally.
+    ///
+    /// The state a handle enters when the credential behind it is deleted and
+    /// the handle is left configured: it can never resolve again, and nothing
+    /// about it changes on its own. The provider is genuinely serving, so it
+    /// lands in `fresh` and every other count here reads normal — which is why
+    /// this needs its own line rather than a bucket. Without it the only
+    /// evidence is the provider's absence from `completeProviders` on
+    /// `usage.get`, which is a signal you have to know to look for.
+    ///
+    /// Requires a serving sibling on purpose. A provider whose accounts are ALL
+    /// unresolved is already named by `unconfigured` or `degraded`, and
+    /// repeating it here would bury the case nothing else reports.
+    ///
+    /// Does not participate in the conservation identity: a provider named here
+    /// is still counted in exactly one bucket.
+    pub handles_without_account: Vec<String>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,
     /// The refresher loop is wedged/dead: its heartbeat is older than the stall
@@ -154,6 +172,7 @@ impl HealthSnapshot {
             without_handles: Vec::new(),
             cookie_cohort_total,
             cookie_logins_stale: Vec::new(),
+            handles_without_account: Vec::new(),
             last_tick_age: None,
             refresher_stalled: false,
             cache_poisoned: true,

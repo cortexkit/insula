@@ -559,6 +559,13 @@ fn health_report(
         "vaultStaleGenerationDrops": vault.stale_generation_drops(),
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieLoginsStale": snapshot.cookie_logins_stale,
+        // Providers holding a credential that reaches no account while their
+        // other accounts serve. Published because nothing else on this surface
+        // can express it: the provider is genuinely healthy, so it counts as
+        // fresh and every other number here reads normal. It is the state a
+        // handle enters when its credential is deleted and the handle is left
+        // configured, and it does not clear on its own.
+        "handlesWithoutAccount": snapshot.handles_without_account,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
     });
@@ -923,6 +930,7 @@ mod tests {
             without_handles: Vec::new(),
             cookie_cohort_total: 0,
             cookie_logins_stale: Vec::new(),
+            handles_without_account: Vec::new(),
             last_tick_age: Some(std::time::Duration::from_secs(5)),
             refresher_stalled: false,
             cache_poisoned: false,
@@ -1305,6 +1313,7 @@ mod tests {
             "withoutHandles",
             "cookieCohortTotal",
             "cookieLoginsStale",
+            "handlesWithoutAccount",
             "lastTickAgeSecs",
             "refresherStalled",
             "vaultUnmatchedDrops",

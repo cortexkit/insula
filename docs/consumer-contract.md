@@ -859,15 +859,23 @@ There is never more than one unlabeled entry per provider, so a consumer can
 rely on the count of unlabeled entries being zero or one — but not on it
 naming how many credentials are behind it.
 
-**Health will not tell you about this, and that is deliberate.** A provider with
-three working accounts and one broken credential counts as `fresh` on
-`supervisor.health`, because it is serving and alarming on it would be wrong.
-The broken credential is reported on the usage array instead: the provider is
-omitted from `completeProviders`, and the credential appears as its own entry
-with an `errorClass`. Health answers "is this provider serving"; the array
-answers "did every credential resolve". A monitor that wants the second question
-must read the array — the health buckets cannot answer it without alarming on
-providers that work.
+**Health names this on its own line rather than in a bucket.** A provider with
+three working accounts and one broken credential counts as `fresh`, because it
+is serving and alarming on it would be wrong — so the buckets cannot express it.
+`handlesWithoutAccount` lists such providers beside the buckets, and does not
+participate in the conservation identity: a provider named there is still
+counted in exactly one bucket.
+
+It is deliberately silent in two neighbouring states. A provider whose accounts
+ALL fail is already named by `degraded` or `unconfigured`. A provider that serves
+usage while resolving no account id is healthy and permanently unlabeled, which
+is ordinary for upstreams that return no account identity. The line means a
+credential that FAILED to reach an account while its siblings serve.
+
+The same fact reaches the usage array as the provider's absence from
+`completeProviders` plus one unlabeled entry carrying an `errorClass`. Health
+answers "is this provider serving"; the array answers "did every credential
+resolve".
 
 Neither is a fault, both clear on their own within a refresh cycle, and neither
 is distinguishable from the account having been removed by looking at the array.

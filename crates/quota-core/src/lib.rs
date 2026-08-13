@@ -951,6 +951,7 @@ impl Registry {
         let mut unconfigured = Vec::new();
         let mut without_handles = Vec::new();
         let mut cookie_logins_stale = Vec::new();
+        let mut handles_without_account = Vec::new();
 
         for provider in &self.providers {
             let name = provider.name.as_str();
@@ -982,6 +983,35 @@ impl Registry {
                     || (slot.status == SlotStatus::Fresh && !slot.is_fresh(now))
             });
             let all_degraded = slots.iter().all(|slot| slot.status == SlotStatus::Degraded);
+
+            // A credential that reaches no account while its siblings serve. The
+            // provider is genuinely healthy, so it lands in `fresh` or `stale`
+            // and every count on this snapshot reads normal -- which is the
+            // whole problem: this is the state a handle enters when the
+            // credential behind it is deleted and the handle is left
+            // configured, and it never clears on its own.
+            //
+            // Requires a serving sibling. A provider whose accounts are ALL
+            // unresolved is already reported by `unconfigured` or `degraded`;
+            // repeating it here would bury the case that nothing else names.
+            //
+            // Reported separately from the buckets rather than as one of them,
+            // so the conservation identity is untouched: a provider counted here
+            // is still counted in exactly one bucket.
+            if (has_fresh || has_stale)
+                && slots.iter().any(|slot| {
+                    slot.observation
+                        .as_ref()
+                        .and_then(|observation| observation.account_id.as_deref())
+                        .is_none()
+                        && slot
+                            .entry
+                            .as_ref()
+                            .is_some_and(|entry| entry.error.is_some())
+                })
+            {
+                handles_without_account.push(name.to_string());
+            }
 
             if has_fresh {
                 fresh += 1;
@@ -1049,6 +1079,7 @@ impl Registry {
             without_handles,
             cookie_cohort_total,
             cookie_logins_stale,
+            handles_without_account,
             last_tick_age,
             refresher_stalled,
             cache_poisoned: false,

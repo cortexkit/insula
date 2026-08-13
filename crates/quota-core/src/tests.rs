@@ -5139,3 +5139,99 @@ fn the_documented_provider_count_matches_the_registry() {
          {registered}; update the matrix sentence when adding or removing a provider"
     );
 }
+
+/// A credential reaching no account is named in health, not just in the array.
+///
+/// The provider serves normally, so it lands in `fresh` and every count on the
+/// snapshot reads healthy. The only other evidence is its absence from
+/// `completeProviders` on `usage.get` — a signal a reader has to know to look
+/// for, on a different call. This is the surface an operator sees without
+/// asking for anything.
+///
+/// The state is the one a handle enters when its credential is deleted while
+/// the handle stays configured: it can never resolve again and nothing about it
+/// changes on its own.
+#[tokio::test]
+async fn a_credential_reaching_no_account_is_named_in_health() {
+    let provider =
+        CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
+    let fail = Arc::clone(&provider.fail);
+    let labels = Arc::clone(&provider.labels);
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    fail.lock().unwrap().insert("H2".to_string());
+    labels.lock().unwrap().insert("H2".into(), None);
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert_eq!(
+        health.handles_without_account,
+        vec!["complete".to_string()],
+        "a credential reaching no account must be named"
+    );
+    // Still counted exactly once in the buckets: this line sits beside the
+    // conservation identity rather than inside it.
+    assert_eq!(
+        health.fresh, 1,
+        "the provider is serving and counts as fresh"
+    );
+    assert!(health.degraded.is_empty(), "and is not a fault");
+
+    // Silent when every handle resolves, or the line would name every
+    // multi-account provider and stop being a signal.
+    //
+    // A second registry rather than repairing this one: a non-transient failure
+    // puts the slot on a fixed multi-minute backoff, so another tick here would
+    // not re-fetch it and the control would be testing the backoff instead of
+    // the metric.
+    let healthy = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("B"))],
+    ))]);
+    tick(&healthy).await;
+    assert!(
+        healthy.health().handles_without_account.is_empty(),
+        "a provider whose credentials all resolve must not be named"
+    );
+
+    // Silent for a provider that serves usage while resolving no identity. Many
+    // upstreams return no account id at all, so their entries are healthy and
+    // permanently unlabeled — naming those would put most of the registry on
+    // this line on every host and make it noise. The line is about a credential
+    // that FAILED to reach an account, not one whose upstream has no account to
+    // name.
+    let anonymous = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1"],
+        &[("H1", None)],
+    ))]);
+    tick(&anonymous).await;
+    let anonymous_health = anonymous.health();
+    assert!(
+        anonymous_health.handles_without_account.is_empty(),
+        "a healthy provider that reports no account id must not be named"
+    );
+    assert_eq!(
+        anonymous_health.fresh, 1,
+        "and it is serving, so the control is not vacuous"
+    );
+
+    // Silent when NO account resolves, which is a different fault with its own
+    // line. Without this the metric would repeat every provider already named
+    // by `unconfigured` or `degraded` — on a host where most adapters have no
+    // credential that is most of the registry, and the case nothing else
+    // reports would be buried in a list nobody reads.
+    let all_failing = CompletenessProvider::new(&["H1", "H2"], &[("H1", None), ("H2", None)]);
+    all_failing.fail.lock().unwrap().insert("H1".to_string());
+    all_failing.fail.lock().unwrap().insert("H2".to_string());
+    let dark = Registry::new(vec![Box::new(all_failing)]);
+    tick(&dark).await;
+    let dark_health = dark.health();
+    assert!(
+        dark_health.handles_without_account.is_empty(),
+        "a provider with no serving account is reported elsewhere, not here"
+    );
+    assert!(
+        !dark_health.degraded.is_empty() || !dark_health.unconfigured.is_empty(),
+        "and it must be reported by one of those lines, or it vanishes entirely"
+    );
+}
