@@ -1047,6 +1047,59 @@ mod tests {
     /// window being served. Collapsing them takes all nine cookie-backed
     /// providers dark at once and reports it as nobody having logged in.
     ///
+    /// The most recently written cookie database wins across profiles.
+    ///
+    /// Chrome keeps one database per profile, and a person who has ever created
+    /// a second profile has several. Only one holds the session they are
+    /// actually signed in with, and the others hold whatever was there when they
+    /// stopped using them — so picking by anything other than recency reads a
+    /// profile that may have no login at all, and this module publishes that as
+    /// a host where nobody signed in.
+    ///
+    /// Both spellings are searched because which one a profile uses depends on
+    /// the Chrome that created it, so the fixture places them in different
+    /// profiles: an older `Network/Cookies` beside a newer bare `Cookies`. That
+    /// also stops a rule preferring one layout over the other from passing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_most_recently_written_profile_database_wins() {
+        let root = std::env::temp_dir().join(format!("insula-newest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let stale = root.join("Profile 1").join("Network");
+        std::fs::create_dir_all(&stale).unwrap();
+        let stale_db = stale.join("Cookies");
+        std::fs::write(&stale_db, b"old").unwrap();
+
+        let live = root.join("Profile 2");
+        std::fs::create_dir_all(&live).unwrap();
+        let live_db = live.join("Cookies");
+        std::fs::write(&live_db, b"new").unwrap();
+
+        // Rewritten after a real pause so its mtime is genuinely later. Write
+        // order alone is not enough: both files can land in the same filesystem
+        // timestamp tick, and a fixture whose two mtimes are equal cannot
+        // distinguish newest from oldest — it would pass under either rule.
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&live_db, b"newer").unwrap();
+        let stale_at = std::fs::metadata(&stale_db).unwrap().modified().unwrap();
+        let live_at = std::fs::metadata(&live_db).unwrap().modified().unwrap();
+        assert!(
+            live_at > stale_at,
+            "the fixture must actually separate the two mtimes, or it proves nothing"
+        );
+
+        let found = locate_under(&root)
+            .expect("a listable directory must not error")
+            .expect("a profile holding a database must be found");
+        assert_eq!(
+            found, live_db,
+            "the newest database must win, not the first found"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The unreadable directory is one whose contents cannot be listed. A
     /// permission bit would not stop root, so on a root run the fixture would
     /// quietly exercise the absent case while appearing to exercise this one.
