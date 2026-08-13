@@ -1167,6 +1167,34 @@ from the thing it guards cannot fail while the two move together** — which is
 why a bound like this needs a test naming the behaviour it protects, not merely
 a documented relationship between the constants.
 
+## Drawing a seam and testing behind it are two different jobs
+
+A decision fused to the I/O it depends on cannot be driven in a test, and the
+usual repair is to take the I/O as an argument: `refresh_snapshot_if_stale`
+receives its acquirer, `locate_under` receives a base directory. That separates
+"when should we do this" from "how do we do it", and only the first is a
+decision.
+
+**The seam is not the test, and this repo has an example of each half arriving
+without the other.** `locate_under` was extracted precisely so a test could
+supply a directory rather than alter a real Chrome installation, with a comment
+saying so — and the decision behind it, which cookie database to pick when a user
+has several profiles, was untested. Switching "newest wins" to "oldest wins"
+reddened nothing. Someone did the harder part, wrote down why, and then covered
+only the branch they had in mind at the time.
+
+So when a seam already exists, do not read it as coverage. It is an invitation
+that may never have been accepted, and the reason it looks like coverage is that
+the effort visible in the diff went into making the test possible.
+
+A fixture note that generalises past this case: the test writes two cookie
+databases and asserts the newest is chosen, which only means something if the
+two mtimes actually differ. Files written back to back can land in the same
+filesystem timestamp tick, and a fixture whose two values are EQUAL passes under
+either rule. It therefore separates them deliberately and asserts the separation
+before asserting the outcome — better to fail on the setup than to pass on a
+coincidence.
+
 ## A fixture records whether its values were observed or invented
 
 Parser tests need input, and the fastest way to get it is to write some. That is
