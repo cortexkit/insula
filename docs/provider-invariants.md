@@ -1704,6 +1704,37 @@ delimiter — the first run of this sweep silently could not have found the very
 defect it was written from. Split on lines and join each with its successor
 instead, since these claims wrap.
 
+## Where a rule is written decides who ever reads it
+
+Two places to record a durable constraint, and they trade the same resource in
+opposite directions. A note at the SITE reaches exactly the person already
+thinking about that code, costs nothing to everyone else, and is invisible to
+anyone who never opens the file. A note in a document read at the start of work
+reaches everyone, costs attention on every read, and pays out once.
+
+Neither is better. **The choice follows from what triggers the hazard.** If it
+fires when someone edits a known place — adding a provider, extending a tally,
+touching a formatter — the site note reaches them at the moment it matters. If it
+fires when someone writes something NEW that has no site yet — a first rule of a
+kind, a lane for a provider nobody has integrated — only the document can reach
+it, because the site does not exist to carry the warning.
+
+Two placement failures in this repo, both of which looked like the obvious
+choice at the time:
+
+- The add-a-provider procedure lives in `STRUCTURE.md`, which is gitignored AND
+  regenerated. An edit there reaches nobody and is overwritten by the next
+  doc-gen run. It is the natural place to look, which is exactly why it is the
+  wrong place to write.
+- The rule about which upstreams rotate refresh tokens — the one that stops a
+  future lane from spending a credential to measure it — sat in a `const` in one
+  provider file. Correct, and unreachable by anyone who had not already decided
+  to read that provider.
+
+The test for a site note is whether the person who needs it has a reason to be
+looking there. If they only find it AFTER making the mistake, it belongs in a
+document instead.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
