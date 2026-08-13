@@ -26,6 +26,21 @@ pub struct HealthSnapshot {
     /// Providers registered in the registry.
     pub providers_total: usize,
     /// Providers whose last fetch succeeded and is within the freshness horizon.
+    ///
+    /// **Provider-scoped, and ANY healthy handle is enough.** A provider with
+    /// three working accounts and one broken credential counts here, because it
+    /// is genuinely serving and putting it in `degraded` would fire an operator
+    /// alarm while the thing works. The consequence is that a broken credential
+    /// beside working ones is invisible in every bucket on this snapshot.
+    ///
+    /// That fact is not unreported, it is reported on the OTHER wire: such a
+    /// provider is omitted from `completeProviders` on `usage.get`, and its
+    /// failing credential appears there as its own entry carrying an
+    /// `errorClass`. Health answers "is this provider serving"; the usage array
+    /// answers "did every credential resolve". Reading `fresh` as the second
+    /// question is the misuse to avoid, and the buckets cannot answer it without
+    /// either breaking the conservation identity or alarming on healthy
+    /// providers.
     pub fresh: usize,
     /// Providers serving a prior good window after a transient failure (stale,
     /// but not wrong — the session is presumed intact).

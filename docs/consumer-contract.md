@@ -859,6 +859,16 @@ There is never more than one unlabeled entry per provider, so a consumer can
 rely on the count of unlabeled entries being zero or one — but not on it
 naming how many credentials are behind it.
 
+**Health will not tell you about this, and that is deliberate.** A provider with
+three working accounts and one broken credential counts as `fresh` on
+`supervisor.health`, because it is serving and alarming on it would be wrong.
+The broken credential is reported on the usage array instead: the provider is
+omitted from `completeProviders`, and the credential appears as its own entry
+with an `errorClass`. Health answers "is this provider serving"; the array
+answers "did every credential resolve". A monitor that wants the second question
+must read the array — the health buckets cannot answer it without alarming on
+providers that work.
+
 Neither is a fault, both clear on their own within a refresh cycle, and neither
 is distinguishable from the account having been removed by looking at the array.
 
