@@ -197,6 +197,27 @@ longer there. Its presence therefore says nothing about whether an entry is
 usable: test `usage` for that. It is absent only where a slot has never
 succeeded, which is the common case on a host lacking that credential.
 
+**Properties you may rely on if you key on it.** At least one consumer uses
+`fetchedAt` as part of a primary key, which is a stronger contract than a
+freshness hint, so the guarantees are stated rather than left to be discovered:
+
+- **Deterministic within a producer process.** The value derives from a
+  monotonic instant converted through a wall-clock anchor captured once at
+  startup, so the same success renders the same string on every read. Polling
+  twice never produces two timestamps for one reading.
+- **Nanosecond precision**, so two genuinely distinct successes cannot collide.
+- **Monotonic per slot within a process.** It comes from a monotonic clock, so
+  it cannot move backwards even if the host's wall clock is adjusted.
+
+**What a producer restart does, because it is not a defect and will look like
+one.** A restart discards every slot and each provider re-fetches, so the same
+underlying window produces a NEW `fetchedAt`. That is a genuine new observation
+rather than a duplicate — but a consumer appending a sample per distinct
+timestamp will gain a point whose utilization is unchanged. If a flat sample
+distorts what you are computing, the cause is the producer's lifecycle rather
+than your key, and `stale` does not mark it: this is a fresh read, not a
+preserved one.
+
 ## Degraded means "we cannot read it", not "the provider is down"
 
 The set that produces a degraded entry is the non-transient failures, defined by
