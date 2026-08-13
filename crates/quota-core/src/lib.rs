@@ -231,6 +231,33 @@ fn wall_time_from_anchor(
 /// produced this entry had banked credits and had not spent one; `is_fresh`
 /// bounds how long that finding is trusted, because a stale slot's eligibility
 /// describes an observation that may no longer hold.
+/// Disclose that an entry is a preserved reading served through a failure.
+///
+/// Stamped in the same walk as `fetched_at`, which is the ONE place every
+/// emitted entry passes through. A per-entry field set at the three emission
+/// sites instead would be set at two of them within a year: a consumer reading a
+/// bare entry cannot tell which path produced it, so a missing disclosure reads
+/// as a fresh entry rather than as an unvisited branch.
+///
+/// `since` is the start of the current failure run, not the last attempt. During
+/// a long outage the latter is always seconds ago, which would report the entry
+/// as freshly checked at the moment it is least trustworthy -- the conflation
+/// this field exists to prevent.
+fn staleness_disclosure(
+    slot: &ProviderSlot,
+    anchor: &(Instant, chrono::DateTime<chrono::Utc>),
+) -> Option<cortexkit_provider_usage::Stale> {
+    if slot.status != SlotStatus::StaleTransient {
+        return None;
+    }
+    slot.failing_since
+        .and_then(|timestamp| wall_time_from_anchor(anchor, timestamp))
+        .map(|since| cortexkit_provider_usage::Stale {
+            since: since.to_rfc3339(),
+            class: slot.error_class.map(|class| class.to_string()),
+        })
+}
+
 fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now: Instant) {
     if !(slot.relax_eligible && slot.is_fresh(read_now)) {
         return;
@@ -522,13 +549,18 @@ impl Registry {
             (store.snapshot(), store.wall_time_anchor(), enumerated_ok)
         };
         for (_, slot) in &mut snapshot {
+            // Read before the mutable borrow: the disclosure describes the SLOT,
+            // and the entry it lands on is a clone of an earlier successful read.
+            let fetched_at = slot
+                .last_success_at
+                .and_then(|timestamp| wall_time_from_anchor(&wall_time_anchor, timestamp))
+                .map(|timestamp| timestamp.to_rfc3339());
+            let stale = staleness_disclosure(slot, &wall_time_anchor);
             if let Some(entry) = slot.entry.as_mut() {
                 #[cfg(test)]
                 before_fetched_at_format();
-                entry.fetched_at = slot
-                    .last_success_at
-                    .and_then(|timestamp| wall_time_from_anchor(&wall_time_anchor, timestamp))
-                    .map(|timestamp| timestamp.to_rfc3339());
+                entry.fetched_at = fetched_at;
+                entry.stale = stale;
             }
         }
         let provider_index: HashMap<&str, usize> = self

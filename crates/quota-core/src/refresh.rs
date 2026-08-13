@@ -183,6 +183,16 @@ pub struct ProviderSlot {
     /// Whether fresh reads may zero the raw percentages stored in `entry`.
     pub relax_eligible: bool,
     pub last_success_at: Option<Instant>,
+    /// When the CURRENT run of consecutive failures began, cleared on success.
+    ///
+    /// Distinct from `last_attempt_at`, which moves on every retry: during an
+    /// hour-long outage that is always seconds ago, while this stays at the
+    /// hour-old first failure. The gap between this and `last_success_at` is how
+    /// long the refresher has been unable to look, which is what a consumer's
+    /// staleness policy wants -- an entry can be minutes old with the refresher
+    /// perfectly healthy, or seconds old with it failing since just after the
+    /// read.
+    pub failing_since: Option<Instant>,
     pub last_attempt_at: Option<Instant>,
     pub status: SlotStatus,
     /// Why the most recent attempt failed, as a stable class name.
@@ -208,6 +218,7 @@ impl ProviderSlot {
     /// A brand-new active fetch unit, due immediately.
     pub fn due_now(now: Instant, incarnation: Incarnation) -> Self {
         Self {
+            failing_since: None,
             incarnation,
             attempt_sequence: AttemptSequence::from_counter(0),
             entry: None,
@@ -298,6 +309,12 @@ fn healthy_entry(
         // "ok" sentinel: the field answers why an entry is degraded, and a
         // healthy entry is not.
         error_class: None,
+        // Set at READ time, not here. This entry is built from a successful
+        // fetch, and whether it is later served through a failure is a property
+        // of the slot at the moment it is read -- storing it now would freeze
+        // one tick's answer into a value re-served for as long as the failure
+        // lasts.
+        stale: None,
     }
 }
 
@@ -356,6 +373,10 @@ fn next_slot_after_attempt_inner(
     // the provider explicitly reports the identity used for that response.
     if prev.label_in_flux && attempt.observed.is_none() && attempt.usage.is_ok() {
         return ProviderSlot {
+            // This attempt neither succeeded nor failed for our purposes -- the
+            // usage came back but could not be attributed -- so whatever run of
+            // failures was in progress is neither started nor ended by it.
+            failing_since: prev.failing_since,
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             entry: None,
@@ -408,6 +429,8 @@ fn next_slot_after_attempt_inner(
 
     match attempt.usage {
         Ok(usage) => ProviderSlot {
+            // A success ends the run, so the next failure starts a new one.
+            failing_since: None,
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             error_class: None,
@@ -462,6 +485,19 @@ fn next_slot_after_attempt_inner(
             };
             let label_in_flux = account_changed || retry_base.label_in_flux;
             ProviderSlot {
+                // The FIRST failure of this run, not the latest. Preserved
+                // across retries so an hour-long outage reports an hour rather
+                // than the seconds since the last attempt.
+                //
+                // An account change resets it with the rest of the slot's
+                // history: the new credential has its own failure run, and
+                // inheriting the old one would date it to a failure that
+                // happened to a different account.
+                failing_since: if account_changed {
+                    Some(attempt_start)
+                } else {
+                    retry_base.failing_since.or(Some(attempt_start))
+                },
                 incarnation: prev.incarnation,
                 attempt_sequence: prev.attempt_sequence,
                 entry: if label_in_flux { None } else { entry },

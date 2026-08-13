@@ -5275,3 +5275,119 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
         "and it must be reported by one of those lines, or it vanishes entirely"
     );
 }
+
+/// A preserved reading says it is preserved, and says since when.
+///
+/// Without this an entry served through an ongoing failure is byte-identical to
+/// a fresh one apart from `fetchedAt`, so a consumer cannot separate "old
+/// because the provider is unreachable" from "old because nothing polled". The
+/// two have opposite remedies, and a consumer with only a timestamp has to guess
+/// with a wall-clock threshold that denies fresh-enough data to catch stale
+/// data.
+#[tokio::test]
+async fn a_reading_served_through_a_failure_says_so() {
+    struct FlakyProvider {
+        healthy: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl UsageProvider for FlakyProvider {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            if self.healthy.load(Ordering::SeqCst) {
+                FetchAttempt::success(None, "api", Usage::default())
+            } else {
+                // Transient, so the prior window is preserved rather than
+                // replaced by a degraded entry -- the state under test.
+                FetchAttempt::failure(None, None, FetchError::Upstream("HTTP 503".into()))
+            }
+        }
+    }
+
+    let healthy = Arc::new(AtomicBool::new(true));
+    let registry = Registry::new(vec![Box::new(FlakyProvider {
+        healthy: Arc::clone(&healthy),
+    })]);
+
+    tick(&registry).await;
+    let fresh = registry.get_usage(None).await;
+    assert_eq!(fresh.len(), 1);
+    assert!(
+        fresh[0].stale.is_none(),
+        "a successful read must not claim to be stale: {:?}",
+        fresh[0].stale
+    );
+
+    // The upstream starts failing transiently, so the last good window keeps
+    // being served rather than blanked.
+    healthy.store(false, Ordering::SeqCst);
+    force_due(&registry, "flaky");
+    tick(&registry).await;
+
+    let served = registry.get_usage(None).await;
+    assert_eq!(served.len(), 1);
+    assert!(
+        served[0].usage.is_some(),
+        "the preserved window is still served"
+    );
+    assert!(
+        served[0].error.is_none(),
+        "and it is not a degraded entry -- which is exactly why the disclosure is needed"
+    );
+    let stale = served[0]
+        .stale
+        .as_ref()
+        .expect("a preserved reading must disclose that it is one");
+    assert_eq!(
+        stale.class.as_deref(),
+        Some("upstream_failed"),
+        "the failure class travels with the disclosure"
+    );
+
+    // `since` is the failure, `fetchedAt` is the reading. Conflating them is the
+    // mistake the field exists to prevent, so they must not be equal.
+    let fetched_at = served[0]
+        .fetched_at
+        .as_deref()
+        .expect("a preserved reading carries the timestamp of the read it preserves");
+    assert_ne!(
+        stale.since, fetched_at,
+        "the two timestamps answer different questions"
+    );
+    assert!(
+        stale.since.as_str() > fetched_at,
+        "the failure began after the reading was taken: since={} fetched_at={fetched_at}",
+        stale.since
+    );
+
+    // A SECOND failure must not move `since`. This is the whole point of the
+    // field: during an outage the last attempt is always seconds ago, so
+    // reporting that would describe the entry as freshly checked at the moment
+    // it is least trustworthy. One failure cannot show this, because the first
+    // attempt and the run's start are the same instant.
+    force_due(&registry, "flaky");
+    tick(&registry).await;
+    let still_failing = registry.get_usage(None).await;
+    let later = still_failing[0]
+        .stale
+        .as_ref()
+        .expect("still preserved after a second failure");
+    assert_eq!(
+        later.since, stale.since,
+        "`since` marks the start of the failure run, not the latest attempt"
+    );
+
+    // Recovery clears it, or a provider that flapped once would look stale for
+    // the rest of its life.
+    healthy.store(true, Ordering::SeqCst);
+    force_due(&registry, "flaky");
+    tick(&registry).await;
+    let recovered = registry.get_usage(None).await;
+    assert!(
+        recovered[0].stale.is_none(),
+        "a recovered entry must stop claiming staleness: {:?}",
+        recovered[0].stale
+    );
+}
