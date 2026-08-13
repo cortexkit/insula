@@ -1204,6 +1204,21 @@ mod tests {
             Err(VaultGetError::Corrupt)
         ));
 
+        // The pair a caller may ACT on, asserted through the real body rather
+        // than by calling the classifier with two strings. This is the shape a
+        // dead handle produces -- one naming a credential the vault no longer
+        // holds -- and the class half is what makes it safe to act on, since a
+        // vault that cannot read its store answers transient instead. Testing
+        // the classifier alone leaves the extraction untested, so a decoder that
+        // stopped reading either field would keep every classifier test green.
+        let body = serde_json::json!({
+            "result": { "error": { "class": "permanent", "code": "not_found" } }
+        });
+        assert_eq!(
+            decode_get_response(&serde_json::to_vec(&body).unwrap()),
+            Err(VaultGetError::NotFound)
+        );
+
         // Not vacuous: the same shape without the code still decodes, as the
         // plain permanent outcome.
         let body = serde_json::json!({
