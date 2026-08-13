@@ -1438,6 +1438,43 @@ the same freshness error this module warns consumers about on the wire.
 believed, and a rule that has never returned clean has been exercised rather
 than tested.
 
+## Which surface a credential lives on is a per-provider fact
+
+Before writing a fetcher, establish WHICH surface answers for usage, because the
+obvious one is often wrong and the wrong one fails in a way that reads as the
+user's fault.
+
+Three shapes seen here, in rising cost order:
+
+**The API key does not reach the billing endpoint.** `ollama-cloud`'s key
+verifies access and returns no quota; `qwen-cloud`'s console billing answers a
+browser session and not the API credential. The tell is a structurally valid
+credential producing a refusal, and the trap is that the refusal reads as
+"sign in again" when signing in cannot fix it. PROBE THE BILLING ENDPOINT WITH
+THE API CREDENTIAL FIRST — one call, before any adapter exists, settles it.
+
+**The credential lives somewhere other than where its name suggests.**
+`synthetic`'s key sits in the shared harness auth store rather than an
+environment variable. Cheap to get wrong, cheap to fix, and the symptom is a
+provider reporting an absent credential on a host where the user believes they
+configured one.
+
+**The credential is rotating and reading it SPENDS it.** This is the expensive
+one and it is not recoverable. Anthropic's and OpenAI's OAuth refresh returns a
+REPLACEMENT refresh token and invalidates the old one, so a second reader
+breaks the user's sign-in to the tool that owns the credential — collecting a
+usage figure at the cost of the thing being measured. Google's does not rotate,
+which is why the antigravity plugin lane is safe and is NOT a pattern to copy.
+Establish which kind a provider's refresh is before adding any file-backed lane;
+the failure is silent on our side and expensive on theirs.
+
+The cookie cohort's mechanics are already shared — `browser_cookies` resolves a
+jar in one call, one snapshot per refresh tick across the whole cohort, with a
+single `SOURCE_LABEL`. What stays per-provider is the session-cookie predicate
+and the response decoder, and both are genuinely per-provider: some upstreams
+name a session cookie and some accept any jar for the domain, which is exactly
+the distinction `cookieLoginsStale` depends on.
+
 ## Registering a provider has a step that fails the build
 
 Adding an adapter means: the module under `crates/quota-core/src/`, the
