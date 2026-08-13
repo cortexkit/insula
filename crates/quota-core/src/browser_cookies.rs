@@ -307,6 +307,34 @@ static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 /// Separated from the extraction path so the decision can be tested without a
 /// cookie store, a keychain, or control over the clock.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Take a fresh snapshot only when the held one has aged out.
+///
+/// Separate from its caller so the REUSE can be tested. `snapshot_is_stale`
+/// answers whether a copy is needed and is easy to test on its own, but a
+/// correct answer nobody consults suppresses nothing — and the caller cannot be
+/// driven in a test, because it discovers and copies a real Chrome store. With
+/// the acquisition injected, a test can call twice and assert one copy, which is
+/// the property the reuse exists for: nine cookie providers fanning out in one
+/// refresh tick share a single snapshot instead of copying the same database
+/// nine times.
+fn refresh_snapshot_if_stale<F>(
+    guard: &mut Option<Snapshot>,
+    now: Instant,
+    ttl: Duration,
+    acquire: F,
+) -> Result<(), CookieError>
+where
+    F: FnOnce() -> Result<Snapshot, CookieError>,
+{
+    if snapshot_is_stale(guard.as_ref().map(|s| s.taken_at), now, ttl) {
+        // Dropped before the replacement is built so the old copy is removed
+        // even if taking the new one fails.
+        *guard = None;
+        *guard = Some(acquire()?);
+    }
+    Ok(())
+}
+
 fn snapshot_is_stale(taken_at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
     match taken_at {
         // Nothing cached yet: the first caller after start always pays for one.
@@ -329,24 +357,16 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if snapshot_is_stale(
-        guard.as_ref().map(|s| s.taken_at),
-        Instant::now(),
-        SNAPSHOT_TTL,
-    ) {
-        // Dropped before the replacement is built so the old copy is removed
-        // even if taking the new one fails.
-        *guard = None;
-
+    refresh_snapshot_if_stale(&mut guard, Instant::now(), SNAPSHOT_TTL, || {
         let store = locate_chrome_cookie_store()?.ok_or(CookieError::NoStore)?;
         let keys = cookie_keys()?;
         let path = copy_cookie_store(&store)?;
-        *guard = Some(Snapshot {
+        Ok(Snapshot {
             path,
             keys,
             taken_at: Instant::now(),
-        });
-    }
+        })
+    })?;
 
     let snapshot = guard
         .as_ref()
@@ -1381,6 +1401,62 @@ mod tests {
     }
 
     /// The bound is only correct relative to the refresher's cadence: below the
+    /// A second caller inside the bound reuses the snapshot instead of copying.
+    ///
+    /// `snapshot_is_stale` is tested on its own and that is not the same
+    /// property: a correct answer nobody consults suppresses nothing. The reuse
+    /// exists because nine cookie providers fan out in one refresh tick, and
+    /// each copying the same multi-megabyte database was reading roughly half a
+    /// gigabyte an hour off disk to collect a handful of cookies.
+    ///
+    /// Both directions are needed. Asserting only that the second call skips is
+    /// satisfied by an acquirer that never runs at all, so the third call —
+    /// past the bound — has to be shown to copy again.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_second_caller_inside_the_bound_reuses_the_snapshot() {
+        let mut held: Option<Snapshot> = None;
+        let copies = std::cell::Cell::new(0);
+        let start = Instant::now();
+
+        let acquire = |guard: &mut Option<Snapshot>, now: Instant| {
+            refresh_snapshot_if_stale(guard, now, Duration::from_secs(45), || {
+                copies.set(copies.get() + 1);
+                Ok(Snapshot {
+                    path: std::path::PathBuf::from("/tmp/witness"),
+                    keys: CookieKeys {
+                        v10: Vec::new(),
+                        v11: None,
+                    },
+                    taken_at: now,
+                })
+            })
+            .expect("the injected acquirer cannot fail");
+        };
+
+        acquire(&mut held, start);
+        assert_eq!(copies.get(), 1, "the first caller pays for a copy");
+
+        // Every other provider in the cohort, arriving within the same tick.
+        for offset in [1, 5, 20, 44] {
+            acquire(&mut held, start + Duration::from_secs(offset));
+        }
+        assert_eq!(
+            copies.get(),
+            1,
+            "callers inside the bound must share the first snapshot"
+        );
+
+        // Past the bound the store is read again, or the assertion above would
+        // hold for an acquirer that had simply stopped working.
+        acquire(&mut held, start + Duration::from_secs(45));
+        assert_eq!(
+            copies.get(),
+            2,
+            "a caller past the bound must take a fresh snapshot"
+        );
+    }
+
     /// 60s base interval so every tick reads the store at least once, and far
     /// enough above zero to actually be shared within one tick.
     #[cfg(target_os = "macos")]
