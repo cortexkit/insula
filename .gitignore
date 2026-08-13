@@ -27,6 +27,16 @@ _bmad-output
 .DS_Store
 *.swp
 
-# Cross-repo doc-gen artifacts (regenerated, not source)
+# Cross-repo doc-gen artifacts (regenerated, not source).
+#
+# Nothing inside these files says so, and both read as ordinary hand-written
+# documentation -- STRUCTURE.md even carries an add-a-provider procedure, which
+# makes it the natural place to record a new step. An edit there reaches nobody
+# (untracked) and is then erased by the next generation with no event marking
+# either, so the author cannot learn it happened.
+#
+# Durable equivalents: docs/provider-invariants.md for porting rules and
+# procedures, docs/consumer-contract.md for wire semantics, README.md for the
+# index. Both are tracked and authored.
 /ARCHITECTURE.md
 /STRUCTURE.md

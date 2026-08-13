@@ -1735,6 +1735,16 @@ The test for a site note is whether the person who needs it has a reason to be
 looking there. If they only find it AFTER making the mistake, it belongs in a
 document instead.
 
+**A derived file is a third case, and reachability is not what is wrong with
+it.** A note in the wrong file is unreachable; a note in a REGENERATED file is
+unreachable and then destroyed, with no event marking either — the next
+generation reverts it silently and the author has no way to learn that it
+happened. Whether a file is authored or derived is invisible from inside it,
+because the text is identical either way, so the question has to be asked before
+writing rather than noticed while reading. In this repo `ARCHITECTURE.md` and
+`STRUCTURE.md` are generated; the only marker is a comment in `.gitignore`, which
+nobody editing them will see.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
