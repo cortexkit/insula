@@ -311,6 +311,32 @@ To enumerate the callers, run `scripts/module_id_callers.py`. It separates
 routes from trees that cannot receive an edit, and refuses to report a clean
 result when it finds no routes at all.
 
+## A new wire field is not shipped until every consumer knows
+
+Deploying a field and documenting it is not the same as telling the people who
+read it. The contract file is authoritative and nobody re-reads it on a
+schedule, so a consumer learns about a field either because someone told them or
+because they trip over it.
+
+The failure is asymmetric in a way that hides it: an additive field breaks
+nothing, so no consumer reports a problem and the producer sees a clean deploy.
+What actually happens is that the field sits unread for months while the
+consumer keeps doing the thing it was added to replace.
+
+Enumerate the consumers rather than the ones involved in the conversation that
+produced the change. There are four surfaces reading `usage.get` today: the
+router that paces on it, the metering store that persists it, the CLI renderer,
+and whoever filed the request. The first two are the easiest to skip, because
+neither is in the room when a rendering or contract question is being settled —
+and they are the two that act on the data programmatically.
+
+Say what changes for each of them specifically. A consumer told "there is a new
+field" checks whether it breaks them and moves on; one told "this is the
+decision it puts in front of you" makes the decision. The metering store's
+question here was whether a preserved reading is a second observation of the
+same value or not a new observation at all, which is a modelling choice only
+they can make and which the field exists to let them make.
+
 ## When a deploy is not needed
 
 Commits touching only tests or documentation change no runtime behaviour, and
