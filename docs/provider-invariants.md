@@ -1435,6 +1435,43 @@ the same freshness error this module warns consumers about on the wire.
 believed, and a rule that has never returned clean has been exercised rather
 than tested.
 
+## A record and a currency claim look identical and age oppositely
+
+Both are a sentence with a date in it. One says something HAPPENED then — a
+probe was run, a credit was consumed, an Oracle pass was folded — and stays true
+forever. The other says something IS the case, checked then, and starts rotting
+immediately while the thing it describes usually stays correct. That asymmetry
+is what makes the second dangerous: nothing goes wrong, so nothing draws
+attention to the sentence.
+
+Two of these had rotted here, found by enumerating rather than by noticing:
+
+- `provider-matrix` said the four opaque upstream constants "matched CodexBar
+  v0.47.0" while five further releases had shipped. The constants had NOT
+  drifted, so no behaviour was wrong — only the line recording when anyone last
+  looked, which is the entire value of that line.
+- `vault-consumer-design` had a section headed "Live vault state" listing five
+  handles as of a date. The file holds nine today, because the credential vault
+  mints one whenever an account is added. The document was not wrong when
+  written and had a banner saying the source wins on disagreement — but a dated
+  INVENTORY is where a reader is most likely to read prose as data, since it
+  looks like a fact rather than an argument.
+
+Two habits, both cheap:
+
+**Say which kind you are writing.** A record can name its date and stop. A
+currency claim should carry the tag or command that re-derives it, so checking
+it is one line rather than an investigation — and should be phrased as a
+snapshot, not as the present tense.
+
+**Enumerate them rather than watching for them.** Grep for the verbs
+(`verified`, `checked`, `matched`, `confirmed`, `as of`) beside a date or
+version. Note the instrument trap: a naive sentence-splitter on `.` cannot
+capture a claim ending in a VERSION NUMBER, because the version contains the
+delimiter — the first run of this sweep silently could not have found the very
+defect it was written from. Split on lines and join each with its successor
+instead, since these claims wrap.
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
