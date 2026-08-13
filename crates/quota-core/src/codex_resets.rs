@@ -82,6 +82,12 @@ impl CreditsSnapshot {
             .min()
     }
 
+    /// The read-only credit inventory as it goes on the wire.
+    ///
+    /// Timestamps use the canonical formatter rather than `to_rfc3339`, which
+    /// picks its precision from the value and so gives one instant several
+    /// spellings. An expiry landing on a whole second would print with no
+    /// fractional part at all beside siblings carrying nine digits.
     pub fn saved_resets(&self) -> SavedResets {
         SavedResets {
             available_count: self.reported_available_count.min(u32::MAX as u64) as u32,
@@ -89,12 +95,13 @@ impl CreditsSnapshot {
                 .available_expiries
                 .iter()
                 .min()
-                .map(DateTime::to_rfc3339),
+                .copied()
+                .map(crate::rfc3339_canonical),
             credits: self
                 .available_expiries
                 .iter()
                 .map(|expires_at| CreditExpiry {
-                    expires_at: expires_at.to_rfc3339(),
+                    expires_at: crate::rfc3339_canonical(*expires_at),
                 })
                 .collect(),
         }

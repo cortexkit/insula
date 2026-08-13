@@ -4626,9 +4626,15 @@ fn credits_normalizer_matches_live_captured_contract() {
             .unwrap()
     );
     assert_eq!(credits.saved_resets().available_count, 1);
+    // Nine fractional digits even though this expiry is a whole second. The
+    // captured payload is the evidence that the truncating default reaches real
+    // data: upstream credit expiries land on whole seconds routinely, so under
+    // `to_rfc3339` this string had no fractional part while a sibling with
+    // non-zero nanoseconds carried nine digits, and one instant had two
+    // spellings on the same response.
     assert_eq!(
         credits.saved_resets().soonest_expires_at.as_deref(),
-        Some("2026-07-14T13:00:01+00:00")
+        Some("2026-07-14T13:00:01.000000000+00:00")
     );
     assert_eq!(credits.saved_resets().credits.len(), 1);
 }
@@ -5390,4 +5396,66 @@ async fn a_reading_served_through_a_failure_says_so() {
         "a recovered entry must stop claiming staleness: {:?}",
         recovered[0].stale
     );
+}
+
+/// One instant always renders as one string.
+///
+/// `to_rfc3339` picks precision from the value: a whole number of seconds
+/// prints no fractional part, nanoseconds ending in three zeros print six
+/// digits, everything else prints nine. All valid RFC 3339, all from the same
+/// call, so the variation reads as a code path difference when it is
+/// arithmetic.
+///
+/// Invisible while the timestamp is only a freshness hint, load-bearing the
+/// moment a consumer keys on it: several spellings of one instant means string
+/// equality is not instant equality, so a dedupe key on the raw string admits
+/// duplicates a parsed comparison would catch. The values below are the two
+/// that lose digits under the default.
+#[test]
+fn a_wire_timestamp_has_one_spelling_per_instant() {
+    use chrono::TimeZone;
+
+    let whole_second = chrono::Utc.timestamp_opt(1_760_000_000, 0).unwrap();
+    let trailing_zeros = chrono::Utc
+        .timestamp_opt(1_760_000_000, 98_805_000)
+        .unwrap();
+    let full_nanos = chrono::Utc
+        .timestamp_opt(1_760_000_000, 98_805_042)
+        .unwrap();
+
+    assert_eq!(
+        crate::rfc3339_canonical(whole_second),
+        "2025-10-09T08:53:20.000000000+00:00",
+        "a whole second must not drop the fractional part entirely"
+    );
+    assert_eq!(
+        crate::rfc3339_canonical(trailing_zeros),
+        "2025-10-09T08:53:20.098805000+00:00",
+        "trailing zero nanoseconds must not shorten the string to microseconds"
+    );
+    assert_eq!(
+        crate::rfc3339_canonical(full_nanos),
+        "2025-10-09T08:53:20.098805042+00:00"
+    );
+
+    // Every spelling is the same length, which is the property a consumer keying
+    // on the string depends on and the one the default formatter breaks.
+    let lengths: std::collections::HashSet<usize> = [whole_second, trailing_zeros, full_nanos]
+        .into_iter()
+        .map(|timestamp| crate::rfc3339_canonical(timestamp).len())
+        .collect();
+    assert_eq!(
+        lengths.len(),
+        1,
+        "one instant, one spelling: got {lengths:?} distinct lengths"
+    );
+
+    // And they still parse back to what they came from, so pinning the precision
+    // did not trade a formatting bug for a correctness one.
+    for timestamp in [whole_second, trailing_zeros, full_nanos] {
+        let rendered = crate::rfc3339_canonical(timestamp);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&rendered)
+            .expect("the canonical form must be valid RFC 3339");
+        assert_eq!(parsed.with_timezone(&chrono::Utc), timestamp);
+    }
 }

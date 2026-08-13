@@ -208,6 +208,23 @@ fn service_rank(status: SlotStatus) -> u8 {
     }
 }
 
+/// Format a timestamp so the same instant always produces the same string.
+///
+/// `to_rfc3339` picks its precision from the value: an instant with a whole
+/// number of seconds prints no fractional part, one whose nanoseconds end in
+/// three zeros prints six digits, and everything else prints nine. All three
+/// are valid RFC 3339 and all three are the same formatter, so the variation
+/// looks like a code path difference when it is arithmetic.
+///
+/// That is invisible while a timestamp is only a freshness hint and load-bearing
+/// the moment anything keys on it: if one instant has several spellings then
+/// string equality stops meaning instant equality, and a dedupe or cache key on
+/// the raw string admits duplicates a parsed comparison would have caught.
+/// Pinning the precision makes the string canonical.
+fn rfc3339_canonical(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+}
+
 fn wall_time_from_anchor(
     (created_at, created_at_wall): &(Instant, chrono::DateTime<chrono::Utc>),
     timestamp: Instant,
@@ -253,7 +270,7 @@ fn staleness_disclosure(
     slot.failing_since
         .and_then(|timestamp| wall_time_from_anchor(anchor, timestamp))
         .map(|since| cortexkit_provider_usage::Stale {
-            since: since.to_rfc3339(),
+            since: rfc3339_canonical(since),
             class: slot.error_class.map(|class| class.to_string()),
         })
 }
@@ -554,7 +571,7 @@ impl Registry {
             let fetched_at = slot
                 .last_success_at
                 .and_then(|timestamp| wall_time_from_anchor(&wall_time_anchor, timestamp))
-                .map(|timestamp| timestamp.to_rfc3339());
+                .map(rfc3339_canonical);
             let stale = staleness_disclosure(slot, &wall_time_anchor);
             if let Some(entry) = slot.entry.as_mut() {
                 #[cfg(test)]
