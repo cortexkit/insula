@@ -9,6 +9,14 @@ Ufuk's actual second account — a follow-on build, now unblocked (CKCRED shippe
 the field). The two-account live smoke waits on that wiring, not on any external
 gate.
 
+> **This is a record of a decision, not a description of the system.** Where it
+> and the source disagree, the source is right; the value here is the reasoning,
+> which the source does not carry. One known divergence: the C1 emission rule has
+> since been narrowed — a handle that resolves no identity collapses its provider
+> only while it is SERVING USAGE, so a failing handle now publishes one unlabeled
+> entry beside its labeled siblings. `docs/consumer-contract.md` is authoritative
+> for the emitted shape.
+
 History: CKCRED enumeration contract folded, then a design-Oracle pass (3 CRITICAL
 + 3 HIGH, folded into "Oracle-mandated corrections" below), then the build, then an
 implementation-Oracle pass that caught F1 (a CRITICAL stale-serve-old-account bug

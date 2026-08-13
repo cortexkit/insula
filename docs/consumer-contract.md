@@ -688,9 +688,13 @@ normalised vocabulary, so it is not comparable across providers.
 
 **`accountInfo` can be present while `account` is absent, and the pair must not
 be used as one another's proxy.** They are gated differently on purpose:
-`account` is the identity this module VERIFIED for the fetch unit, and it is
-withheld the moment any handle of that provider fails to resolve one, because a
-consumer cannot tell two unlabeled entries from two accounts. `accountInfo` is
+`account` is the identity this module VERIFIED for the fetch unit. It is withheld
+from every account of a provider when a handle that is SERVING USAGE resolves no
+identity, because that handle may be one of the labeled accounts reached by a
+second credential, and publishing both would state one account's capacity twice.
+A handle that resolves no identity and serves no usage does not force that: it
+publishes as one unlabeled entry beside its labeled siblings, since an entry with
+no usage cannot be double-counted. `accountInfo` is
 descriptive text the upstream happened to return with the payload, and it rides
 along unverified.
 
@@ -829,11 +833,31 @@ Both shapes are reachable and ordinary:
   unconfirmed. Its entry is cleared while its identity is kept, so the provider
   still counts as fully resolved and the remaining accounts stay labeled. The
   array names account A and does not mention account B at all.
-- **A new account collapses the whole provider.** A credential added for a
-  second account has no identity until its first fetch completes, and while any
-  account of a provider is unidentified all of them publish as a single
-  unlabeled entry. So adding an account briefly makes the accounts you already
-  had stop being named.
+- **A new account can briefly collapse the whole provider.** A credential added
+  for a second account has no identity until its first fetch completes. If that
+  first fetch SUCCEEDS before an identity is resolved, every account of the
+  provider publishes as a single unlabeled entry, so accounts you already had
+  stop being named until it settles.
+
+**A provider can publish labeled entries and an unlabeled one in the same
+response.** This is the shape when one credential of a multi-account provider
+fails while the others serve: the failing one appears as a single unlabeled
+entry carrying its error and NO usage, and its siblings keep their names. It is
+also the shape a handle reaches when the credential behind it is deleted while
+the handle stays configured, which does not clear on its own.
+
+Two consequences, opposite in direction:
+
+- Summing CAPACITY across a provider's entries is unaffected, because the
+  unlabeled entry carries no usage to add.
+- COUNTING accounts from entries overstates them. Three working accounts beside
+  one dead credential is four entries. Count the entries that carry an identity,
+  and read the unlabeled one as what it is: a credential that reached no
+  account, whose `errorClass` says whether it is absent, rejected, or unusable.
+
+There is never more than one unlabeled entry per provider, so a consumer can
+rely on the count of unlabeled entries being zero or one — but not on it
+naming how many credentials are behind it.
 
 Neither is a fault, both clear on their own within a refresh cycle, and neither
 is distinguishable from the account having been removed by looking at the array.

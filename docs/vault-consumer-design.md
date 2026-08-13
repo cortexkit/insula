@@ -262,6 +262,8 @@ snapshot per mapped entry. Prefix table: `chatgpt:openai*` → codex;
   credits are account-global; never make the bound handle-scoped).
 - anthropic / grok (merge 2): vault payload → bearer for the existing
   endpoints; account_id absent upstream today → C1 keeps one unlabeled entry
+  (narrowed since: the collapse now needs that handle to be SERVING USAGE — see
+  docs/consumer-contract.md, which is authoritative for the emitted shape)
   per provider (ALF-confirmed interim).
 - gemini (merge 3, V9): STRICT dispatch by handle source. Implicit-local
   keeps today's file/cache/refresh path. The vault lane parses the served

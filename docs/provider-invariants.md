@@ -306,10 +306,13 @@ usage. Two traps:
   is absent by contract, and it fails toward "these are the same" — the
   permissive answer. Some records carry no account id by design, so ask what
   happens when the compared value is missing on *both* sides.
-- One identity-less handle collapses a provider to a single unlabeled entry,
-  because the read path emits labeled entries only when *every* handle resolves
-  an account. A lane that cannot resolve identity therefore suppresses the
-  accounts that can.
+- An identity-less handle **that is serving usage** collapses a provider to a
+  single unlabeled entry, because it may be one of the labeled accounts reached
+  by another credential and publishing both would state that account's capacity
+  twice. A lane that cannot resolve identity therefore suppresses the accounts
+  that can — but only while it has usage to contribute. One that carries an
+  error publishes as a single unlabeled entry beside its labeled siblings, since
+  an entry with no usage cannot be double-counted.
 
 That second trap is **latent rather than absent** wherever a provider keeps an
 implicit local lane alongside vault lanes, and it is worth understanding before
