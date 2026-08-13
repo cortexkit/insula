@@ -168,6 +168,12 @@ python3 scripts/prod_body.py crates/quota-core/src/*.rs
 # Reports whether the mutation reddened a test, was never reached, or hung:
 python3 scripts/probe.py <file> <before> <after>
 
+# make a provider fail transiently against a loopback endpoint, so
+# preserve-the-window behaviour can be witnessed on the wire rather than
+# waited for. A field that only appears during a failure cannot be verified
+# on a healthy host: absent is what correct and never-populated both look like:
+python3 scripts/witness-transient.py 1
+
 # check that every rule in the wire checkers has a test that fails when the
 # rule is deleted, and a control that does not fire when it should not:
 python3 scripts/audit-checker-rules.py
