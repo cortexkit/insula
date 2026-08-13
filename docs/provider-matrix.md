@@ -35,7 +35,16 @@ excluded here as a validation probe with no usage payload, so nothing to port. C
 publishes a newer GitHub release. Read that release's content with `git show
 <tag>:<path>` or `git grep <tag>` — the checkout usually sits at an older tag, so
 plain `grep` silently reads a different version and reports a symbol added in the
-new release as absent. On a new release, diff `git -C ~/Work/OSS/CodexBar
+new release as absent. On a new release, do BOTH of these — the second is the one
+that gets skipped, because the first produces a satisfying result and the diff is
+where the eye goes:
+
+1. Re-check every row of **Opaque constants** below against the new tag. A
+   provider whose logic did not change can still have a rotated constant, so a
+   diff-driven read never reaches it. This step was missed for five consecutive
+   releases while the anchor line kept being updated, which is exactly what it
+   looks like when a check lives after the thing that feels like the whole job.
+2. Diff `git -C ~/Work/OSS/CodexBar
 diff v0.49.3..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and credit-pool
