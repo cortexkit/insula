@@ -25,10 +25,26 @@ emission gate C1, incarnation fencing, F1 unverified-failure path) is SHIPPED;
 this note adds the credential plumbing AND four machinery corrections the
 Oracle found necessary (V1, V2, V4, V6 below).
 
-## Live vault state (CKCRED-confirmed 2026-07-16, receipt-verified)
+## Vault state AS OF THE DESIGN (CKCRED-confirmed 2026-07-16, receipt-verified)
 
-`~/.config/cortexkit/ck-quota/vault-handles.json` EXISTS (0600) with five
-ck-quota-dedicated handles: `chatgpt:openai` (account 291f5165, v3),
+**This inventory is a snapshot, not a live reading, and it has already moved.**
+The heading used to say "live vault state", which invites the opposite. On
+2026-08-12 the file held NINE handles against the five below — four Anthropic
+accounts rather than one, plus `kimi-for-coding`, none of which existed when
+this was written. Nothing is wrong: handles are minted by the credential vault
+whenever an account is added, so this list ages by design.
+
+Read the real inventory instead of this paragraph:
+`python3 -c "import json;print(sorted(json.load(open('$HOME/.config/cortexkit/ck-quota/vault-handles.json'))['handles']))"`,
+or run `cargo run -q -p quota-module --example vault-lanes`, which enumerates the
+configured lanes and fails when one reaches no provider.
+
+The banner at the top of this file says the source wins where the two disagree.
+That covers the reasoning; a dated INVENTORY is the case where a reader is most
+likely to treat prose as data, because it looks like a fact rather than an
+argument.
+
+At design time the file existed (0600) with five ck-quota-dedicated handles: `chatgpt:openai` (account 291f5165, v3),
 `chatgpt:openai:gmail` (account 7b66addd, v1 — the second OpenAI account,
 vault-native login), `oauth:anthropic` (v22), `oauth:xai` (v10),
 `antigravity:google` (v116 — the ONLY google credential; no separate
