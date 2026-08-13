@@ -185,6 +185,23 @@ async fn main() {
     let entries: Vec<ProviderUsage> = serde_json::from_value(body["result"].clone())
         .expect("usage.get result must decode as ProviderUsage[]");
 
+    // Providers whose account set the producer fully enumerated this tick. A
+    // provider ABSENT from this list published fewer accounts than it holds,
+    // which is the failure a per-provider "did it serve at all" reading cannot
+    // see: one handle that resolves no identity collapses every sibling into a
+    // single unlabeled entry, so a provider with four configured accounts serves
+    // one row and still looks alive.
+    //
+    // The case that motivated reading it: a handle left pointing at a credential
+    // the vault no longer holds. It can never resolve, so it suppresses the
+    // labels of every healthy account beside it, permanently and silently.
+    let complete: BTreeSet<String> = body
+        .get("completeProviders")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     let mut serving_vault: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
         if entry.source.as_deref() == Some("vault") && entry.usage.is_some() {
@@ -247,8 +264,46 @@ async fn main() {
         }
     }
 
+    // A provider serving from the vault but absent from `completeProviders`
+    // published fewer accounts than it holds. Reported separately from a dark
+    // lane because the lane is UP: it serves real usage, and only the per-account
+    // breakdown is missing, so every other reading here says it is healthy.
+    // Absence from `completeProviders` is necessary but not sufficient: several
+    // providers resolve no account identity at all -- their upstream returns no
+    // account id -- so they are permanently absent from that list while being
+    // entirely healthy. Requiring FEWER PUBLISHED ENTRIES THAN CONFIGURED
+    // HANDLES separates the two without naming any provider, which matters
+    // because the null-identity set changes as upstreams add or drop the field.
+    let mut incomplete: Vec<(&'static str, usize, usize)> = Vec::new();
+    for (provider, keys) in &expected {
+        let is_dual = DUAL_LANE.iter().any(|(name, _)| name == provider);
+        if is_dual || !serving_vault.contains(*provider) || complete.contains(*provider) {
+            continue;
+        }
+        let published = entries
+            .iter()
+            .filter(|entry| entry.provider == *provider)
+            .count();
+        if published < keys.len() {
+            incomplete.push((provider, published, keys.len()));
+        }
+    }
+    if !incomplete.is_empty() {
+        println!(
+            "  findings: {} provider(s) serving with an incomplete account set",
+            incomplete.len()
+        );
+        for (provider, published, configured) in &incomplete {
+            println!(
+                "    {provider}: {published} entr(ies) published against {configured} configured \
+                 handle(s); a handle that resolves no account identity collapses its healthy \
+                 siblings into one unlabeled row"
+            );
+        }
+    }
+
     if dark.is_empty() {
-        if unmapped.is_empty() {
+        if unmapped.is_empty() && incomplete.is_empty() {
             println!("  findings: none");
             return;
         }
