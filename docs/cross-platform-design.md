@@ -1,6 +1,22 @@
 # Cross-platform credential discovery — design
 
-Status: DESIGN, not built. Nothing in this document is on master yet.
+Status: PARTLY SHIPPED. The Linux half is on master — profile discovery,
+`v10` and `v11` decryption with their per-platform PBKDF2 rounds, sealed-scheme
+classification, and the both-layouts probe are all live and verified against a
+real Chrome on a Linux host. Windows is not: the daemon's config path resolution
+and the JetBrains lookup landed, and no cookie extraction did.
+
+**Where this document and the source disagree, the source is right.** The
+sections below describe what the work required, not what exists — the browser
+list in particular is aspirational. Only Google Chrome is implemented; Chromium,
+Brave and Edge appear here because the design covered them, and nothing reads
+those paths today. A reader treating this as an inventory of supported browsers
+would be wrong in the direction that costs a user their login.
+
+The original banner said "nothing in this document is on master yet", which was
+true when written and became false without anyone editing it. That is the more
+dangerous state than being absent: a reader who checks the status line concludes
+none of it shipped, when most of it did.
 
 This module runs on macOS today. Everything it knows how to read — credential
 files, the browser cookie store, its own state — is located by a path built from
