@@ -5600,6 +5600,30 @@ fn every_doc_reference_between_documents_resolves() {
         }
     }
 
+    // The tracked set, which is what a fresh checkout actually contains.
+    let tracked_docs: std::collections::HashSet<String> = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["-C", &root.to_string_lossy(), "ls-files", "*.md"])
+            .output()
+            .expect("git must be available to list tracked files")
+            .stdout,
+    )
+    .expect("git output is utf-8")
+    .lines()
+    .map(str::to_string)
+    .collect();
+    assert!(
+        !tracked_docs.is_empty(),
+        "no tracked markdown found; the resolver would call every reference broken"
+    );
+
+    let ignored: Vec<String> = std::fs::read_to_string(root.join(".gitignore"))
+        .expect(".gitignore must be readable")
+        .lines()
+        .map(|line| line.trim().trim_start_matches('/').to_string())
+        .filter(|line| line.ends_with(".md"))
+        .collect();
+
     let mut checked = 0usize;
     let mut missing: Vec<String> = Vec::new();
     for source in &sources {
@@ -5616,9 +5640,39 @@ fn every_doc_reference_between_documents_resolves() {
             // Three spellings are all legitimate here: a sibling reference from
             // inside docs/, a repo-relative path, and a bare filename in the
             // README's documentation table, which means the file in docs/.
-            let resolves = dir.join(token).exists()
-                || root.join(token).exists()
-                || root.join("docs").join(token).exists();
+            //
+            // Resolved against TRACKED files rather than the filesystem, because
+            // the two disagree exactly where it matters. A generated or
+            // machine-local file is present on the machine that produced it and
+            // absent from every fresh checkout, so a filesystem check passes for
+            // the author and fails for everyone else -- and the author is the one
+            // who cannot see it.
+            let tracked = |candidate: &str| tracked_docs.contains(candidate);
+            // `docs/../README.md` and `README.md` are the same file and git
+            // lists only the second, so the parent hops are collapsed before
+            // comparing rather than matched textually.
+            let as_sibling = {
+                let mut parts: Vec<String> = Vec::new();
+                let rel = dir.strip_prefix(&root).unwrap_or(std::path::Path::new(""));
+                for component in rel.join(token).components() {
+                    match component {
+                        std::path::Component::ParentDir => {
+                            parts.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+                    }
+                }
+                parts.join("/")
+            };
+            let resolves = tracked(token)
+                || tracked(&as_sibling)
+                || tracked(&format!("docs/{token}"))
+                // A doc may deliberately NAME a generated artifact in order to
+                // warn against writing into it. That is a mention rather than a
+                // pointer, and `.gitignore` is the discriminator that already
+                // exists: a path it lists is derived on purpose, not missing.
+                || ignored.iter().any(|entry| entry == token);
             if !resolves {
                 missing.push(format!(
                     "{} -> {token}",
