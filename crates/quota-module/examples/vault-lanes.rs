@@ -164,9 +164,41 @@ async fn main() {
         }
     };
 
+    // The module refuses this file outright for reasons a plain read cannot see:
+    // a symbolic link, group- or world-accessible permissions, anything that is
+    // not a regular file. On refusal it serves ZERO vault handles and reaps every
+    // vault lane -- so a checker that parsed the same bytes successfully would
+    // report those lanes as configured and healthy while the module served none
+    // of them, which is a clean pass asserting the opposite of the truth.
+    //
+    // Asked through the module's own loader rather than by re-implementing its
+    // refusals here, because a second copy of that logic would drift from the
+    // first and the drift would be invisible in exactly this direction.
+    let loader = quota_core::vault_handles::VaultHandleLoader::new(Some(handles_path.clone()));
+    let module_sees_any = [
+        loader.codex_handles(),
+        loader.anthropic_handles(),
+        loader.grok_handles(),
+        loader.gemini_handles(),
+        loader.antigravity_handles(),
+        loader.kimi_for_coding_handles(),
+    ]
+    .iter()
+    .any(|result| result.as_ref().is_ok_and(|handles| !handles.is_empty()));
+
     let mut expected: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut unmapped: Vec<String> = Vec::new();
     if let Some(handles) = parsed.get("handles").and_then(|h| h.as_object()) {
+        if !handles.is_empty() && !module_sees_any {
+            eprintln!(
+                "the handle file names {} credential(s) and the module accepts none of \
+                 them: it is refusing the file itself, most likely a symbolic link or \
+                 group/world-accessible permissions. Every vault lane is reaped, so no \
+                 lane can be checked.",
+                handles.len()
+            );
+            std::process::exit(2);
+        }
         for key in handles.keys() {
             match provider_for_handle(key) {
                 Some(provider) => expected.entry(provider).or_default().push(key.clone()),
