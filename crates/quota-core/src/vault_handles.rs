@@ -380,6 +380,30 @@ fn transient_io(error: &std::io::Error) -> bool {
     false
 }
 
+/// Whether a handle id names this credential family.
+///
+/// A family's first credential is the bare prefix, and each additional account
+/// appends `:<label>` -- so this must accept both forms or that provider
+/// silently supports exactly one account. An id that matches neither falls
+/// through to the unsupported list, where a second account is dropped with only
+/// a stderr warning: the provider keeps serving its first account and looks
+/// entirely healthy, so nothing on the wire or in the health report says an
+/// account is missing.
+///
+/// Public because the deployed-module checkers classify the same ids against
+/// [`CREDENTIAL_FAMILIES`], and sharing the list without sharing this predicate
+/// leaves them free to disagree about which ids the list covers. That
+/// disagreement reports in both directions and both are false faults: an id
+/// this module consumes and a checker does not is reported as a stray
+/// credential, and an id a checker maps and this module drops is reported as a
+/// lane gone dark.
+pub fn handle_id_names_family(id: &str, prefix: &str) -> bool {
+    id == prefix
+        || id
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Option<String>) {
     let mut invalid_ids = handles
         .iter()
@@ -405,22 +429,6 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
         );
     }
 
-    /// Whether a handle id names this credential family.
-    ///
-    /// A family's first credential is the bare prefix, and each additional
-    /// account appends `:<label>` -- so every arm must accept both forms or that
-    /// provider silently supports exactly one account. An id matched exactly
-    /// falls through to the unsupported list, where a second account is dropped
-    /// with only a stderr warning: the provider keeps serving its first account
-    /// and looks entirely healthy, so nothing on the wire or in the health
-    /// report says an account is missing.
-    fn prefixed_id(id: &str, prefix: &str) -> bool {
-        id == prefix
-            || id
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with(':'))
-    }
-
     /// Resolve a handle id to the provider that consumes it.
     ///
     /// Walks [`CREDENTIAL_FAMILIES`] rather than a private chain of arms, so the
@@ -435,7 +443,7 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
     fn provider_for_id(id: &str) -> Option<ProviderKind> {
         let name = CREDENTIAL_FAMILIES
             .iter()
-            .find(|(prefix, _)| prefixed_id(id, prefix))
+            .find(|(prefix, _)| handle_id_names_family(id, prefix))
             .map(|(_, provider)| *provider)?;
         match name {
             "codex" => Some(ProviderKind::Codex),

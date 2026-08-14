@@ -109,9 +109,14 @@ whichever won",
 /// leaves the right provider with no credential, so the lane goes dark and this
 /// fires anyway.
 fn provider_for_handle(key: &str) -> Option<&'static str> {
+    // Both the family list and the matching predicate come from the module.
+    // Sharing only the list would leave this free to disagree about which ids
+    // the list covers -- and that disagreement reports as a finding either way:
+    // an id the module consumes and this does not reads as a stray credential,
+    // and an id this maps and the module drops reads as a lane gone dark.
     quota_core::vault_handles::CREDENTIAL_FAMILIES
         .iter()
-        .find(|(prefix, _)| key == *prefix || key.starts_with(&format!("{prefix}:")))
+        .find(|(prefix, _)| quota_core::vault_handles::handle_id_names_family(key, prefix))
         .map(|(_, provider)| *provider)
 }
 
