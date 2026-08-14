@@ -53,7 +53,29 @@ async fn main() {
         }
     };
 
-    print!("  stage 2  subscription  ");
+    // The provider's subscription call retries as a POST when the GET body does
+    // not parse, so a failure there can mean either that the GET answered with
+    // something we misread, or that the site refused the retry. Those need
+    // different fixes and the provider's own path cannot separate them.
+    print!("  stage 2a subscription GET  ");
+    match opencode::fetch_subscription_get(&client, &cookie, &workspace).await {
+        Ok(text) => {
+            println!("OK ({} bytes)", text.len());
+            let parsed = opencode::subscription_get_parses(&text);
+            println!(
+                "    our parser accepts it: {}",
+                if parsed { "yes" } else { "NO" }
+            );
+            if !parsed {
+                println!("    --- first 300 bytes of what we rejected ---");
+                let head = &text[..text.len().min(300)];
+                println!("    {}", head.replace('\n', " "));
+            }
+        }
+        Err(error) => println!("FAILED: {error}"),
+    }
+
+    print!("  stage 2  subscription (full path)  ");
     match opencode::fetch_subscription_text(&client, &cookie, &workspace).await {
         Ok(text) => {
             println!("OK ({} bytes)", text.len());

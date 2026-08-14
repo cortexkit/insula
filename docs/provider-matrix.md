@@ -88,7 +88,27 @@ from "the subscription call fails", and one no amount of reading found. Every
 send is now staged, fenced by a test comparing send sites to staged sites so a
 new one cannot publish an anonymous error.
 
-**The port is NOT taken, on evidence.** The live billing payload here reads
+**The root cause was ours, found by continuing past the stage names.** The retry
+only fires when the GET body does not parse, so the GET answers -- and it answers
+`null`, in the value slot of the server-function envelope:
+
+```text
+;0x41;((self.$R=self.$R||{})["server-fn:18cb..."]=[],null)
+```
+
+`is_explicit_null` recognised a bare `null` and a JSON null, and this is neither:
+it is a JavaScript statement. So the caller retried as a POST, the retry answered
+500, and a workspace with no subscription was published as an upstream failure
+for weeks. It is now recognised, and reported as `no_quota_reported` rather than
+`decode_failed` -- the class matters, because Decode counts toward the stale
+browser login metric and would send an operator to re-authenticate a session that
+works.
+
+This is upstream's pay-as-you-go case after all, reached from the other side:
+their fallback exists because that call "answers null or fails outright", and
+ours was answering null the whole time where we could not see it.
+
+**The spend fallback is still NOT taken, on evidence.** The live billing payload here reads
 `monthlyUsage:null, monthlyLimit:null, balance:0, subscription:null`, and
 upstream's parser requires `monthlyUsage` before it builds anything. On this
 account their fallback returns nothing and rethrows the original error, so

@@ -318,6 +318,37 @@ async fn server_get(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Fetch only the subscription GET, without the POST retry behind it.
+///
+/// The provider's own path retries when the GET body does not parse and then
+/// reports one error for both, so a diagnostic cannot tell a GET that answered
+/// something we misread from a retry the site refused. Those have different
+/// fixes -- one is ours and one is theirs.
+pub async fn fetch_subscription_get(
+    client: &reqwest::Client,
+    cookie: &str,
+    workspace_id: &str,
+) -> Result<String, FetchError> {
+    let referer = format!("{ORIGIN}/workspace/{workspace_id}/billing");
+    let args = vec![workspace_id.to_string()];
+    server_get(
+        client,
+        &server_get_url(SUBSCRIPTION_SERVER_ID, Some(&args)),
+        common_server_headers(cookie, SUBSCRIPTION_SERVER_ID, &referer),
+        "subscription GET",
+    )
+    .await
+}
+
+/// Whether the subscription parser accepts a body, for diagnostics.
+///
+/// Exposed so a probe asks the REAL parser rather than reimplementing its
+/// acceptance -- a second copy would answer for itself rather than for the
+/// provider, which is the failure mode being investigated here.
+pub fn subscription_get_parses(text: &str) -> bool {
+    parse_windows(text, Utc::now().timestamp(), false).is_ok()
+}
+
 pub async fn fetch_subscription_text(
     client: &reqwest::Client,
     cookie: &str,
@@ -339,8 +370,14 @@ pub async fn fetch_subscription_text(
         ));
     }
     if is_explicit_null(&text) {
-        return Err(FetchError::Decode(format!(
-            "opencode: no subscription data for workspace {workspace_id}"
+        // Not a Decode: the payload is well formed and states that this
+        // workspace has no subscription, which is a fact about the account
+        // rather than a failure of ours or theirs. The class is load-bearing --
+        // Decode is counted as a stale browser login, so reporting it that way
+        // sends an operator to re-authenticate a session that is working.
+        // opencodego already answers its own no-plan case this way.
+        return Err(FetchError::NoQuotaReported(format!(
+            "opencode: workspace {workspace_id} has no subscription"
         )));
     }
     let now = Utc::now().timestamp();
@@ -361,8 +398,8 @@ pub async fn fetch_subscription_text(
             ));
         }
         if is_explicit_null(&fallback) {
-            return Err(FetchError::Decode(format!(
-                "opencode: no subscription data for workspace {workspace_id}"
+            return Err(FetchError::NoQuotaReported(format!(
+                "opencode: workspace {workspace_id} has no subscription"
             )));
         }
         return Ok(fallback.into_owned());
@@ -370,15 +407,43 @@ pub async fn fetch_subscription_text(
     Ok(text)
 }
 
+/// Whether a server-function response states "there is nothing here".
+///
+/// The upstream says this three ways and only two were recognised: a bare
+/// `null`, a JSON null, and -- the one that reached production -- a null in the
+/// VALUE SLOT of the server-function envelope, which is a JavaScript statement
+/// rather than JSON and so parses as neither:
+///
+/// ```text
+/// ;0x41;((self.$R=self.$R||{})["server-fn:18cb..."]=[],null)
+/// ```
+///
+/// Missing it is not inert. The caller retries as a POST when the body does not
+/// parse, that retry answers HTTP 500, and the account is published as an
+/// upstream failure -- so a workspace with no subscription reads as a broken
+/// provider indefinitely. This host carried that for weeks, and the published
+/// error supported an outage reading the whole time.
+///
+/// Matched TIGHTLY, on the envelope's closing `,null)` rather than on `null`
+/// appearing anywhere, because the two directions cost differently: failing to
+/// recognise a null costs the current false failure, while wrongly recognising
+/// one would publish "no quota here" for an account that has some, and that
+/// reads as a true fact about the user rather than as an error.
 fn is_explicit_null(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.eq_ignore_ascii_case("null") {
         return true;
     }
-    serde_json::from_str::<Value>(trimmed)
+    if serde_json::from_str::<Value>(trimmed)
         .ok()
         .map(|v| v.is_null())
         .unwrap_or(false)
+    {
+        return true;
+    }
+    // The value slot is the last element of the envelope's comma expression, so
+    // a null there ends the statement exactly this way.
+    trimmed.contains("server-fn:") && trimmed.ends_with(",null)")
 }
 
 fn parse_date_value(val: &Value) -> Option<i64> {
@@ -811,6 +876,45 @@ mod stage_tests {
             published.contains("500"),
             "the upstream status must survive: {published}"
         );
+    }
+
+    /// A null in the server-function envelope is recognised as "nothing here".
+    ///
+    /// The live capture from a workspace with no subscription. Before this, the
+    /// body parsed as neither a bare null nor JSON, so the caller retried as a
+    /// POST, that retry answered 500, and the account was published as an
+    /// upstream failure for weeks.
+    #[test]
+    fn an_enveloped_null_states_that_there_is_nothing_here() {
+        // LIVE CAPTURE, 2026-08-14, subscription server function.
+        let live = ";0x00000041;((self.$R=self.$R||{})\
+[\"server-fn:18cbb183f80b87d88d59\"]=[],null)";
+        assert!(
+            is_explicit_null(live),
+            "the enveloped null must be recognised: {live}"
+        );
+    }
+
+    /// A payload carrying data is not mistaken for a null.
+    ///
+    /// The must-not-fire control, and it holds a real builder rather than a
+    /// hand-made blob: the two directions cost differently. Missing a null
+    /// produces the false failure above, while a false null publishes "no quota
+    /// here" for an account that has some -- which reads as a true fact about
+    /// the user and is the more expensive mistake.
+    #[test]
+    fn a_payload_with_data_is_not_read_as_null() {
+        // LIVE CAPTURE, 2026-08-14, billing server function on the same host.
+        let live = ";0x0000024c;((self.$R=self.$R||{})\
+[\"server-fn:18cbabdd5145c658f84d\"]=[],($R=>$R[0]={customerID:\"cus_x\",\
+balance:0,monthlyLimit:null,monthlyUsage:null})(self.$R))";
+        assert!(
+            !is_explicit_null(live),
+            "a payload with fields must not read as null: {live}"
+        );
+        // The word appears inside it as a FIELD VALUE, which is exactly what a
+        // looser match on "null" anywhere would trip over.
+        assert!(live.contains("null"), "the control must contain the word");
     }
 
     /// Every send in this provider names its stage, including the POST retries.
