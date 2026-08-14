@@ -251,7 +251,10 @@ pub async fn fetch_workspace_id(
             JsonRequest::post_json(SERVER_BASE, b"[]".to_vec()).timeout(REQUEST_TIMEOUT),
             common_server_headers(cookie, WORKSPACES_SERVER_ID, ORIGIN),
         );
-        let body = post_req.send(client).await?;
+        let body = post_req
+            .send(client)
+            .await
+            .map_err(|error| error.stage("workspaces POST"))?;
         let fallback = String::from_utf8_lossy(&body);
         if looks_signed_out(&fallback) {
             return Err(FetchError::Unauthorized(
@@ -347,7 +350,10 @@ pub async fn fetch_subscription_text(
             JsonRequest::post_json(SERVER_BASE, post_body).timeout(REQUEST_TIMEOUT),
             common_server_headers(cookie, SUBSCRIPTION_SERVER_ID, &referer),
         );
-        let body = post_req.send(client).await?;
+        let body = post_req
+            .send(client)
+            .await
+            .map_err(|error| error.stage("subscription POST"))?;
         let fallback = String::from_utf8_lossy(&body);
         if looks_signed_out(&fallback) {
             return Err(FetchError::Unauthorized(
@@ -804,6 +810,32 @@ mod stage_tests {
         assert!(
             published.contains("500"),
             "the upstream status must survive: {published}"
+        );
+    }
+
+    /// Every send in this provider names its stage, including the POST retries.
+    ///
+    /// Found by deploying the first version and reading the wire: the published
+    /// error was unchanged, because both server functions retry as a POST when
+    /// the GET parses to nothing and those two sends bypass `server_get`. The
+    /// live 500 comes from the subscription RETRY, not the call, which is a
+    /// materially different fact -- the GET answers.
+    ///
+    /// Counts sites rather than asserting on one, so a new unstaged send fails
+    /// here instead of silently publishing an anonymous error.
+    #[test]
+    fn every_send_in_this_provider_names_its_stage() {
+        let source = include_str!("opencode.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let sends = production.matches(".send(client)").count();
+        let staged = production.matches("error.stage(").count();
+        assert_eq!(
+            sends, staged,
+            "{sends} send(s) and {staged} stage name(s): an unstaged send publishes \
+             an error naming no call, which is what made a retry failure read as a \
+             site outage"
         );
     }
 

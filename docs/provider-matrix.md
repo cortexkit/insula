@@ -80,6 +80,14 @@ workspaces answers, subscription returns 500, billing answers. The failure is
 specific to one server function -- not a session, a cookie, or a site-wide
 outage, all of which the old error was consistent with.
 
+Narrowed once more after deploying: the stage name did NOT appear on the wire,
+because each server function retries as a POST when its GET parses to nothing,
+and those retries bypassed the helper carrying the stage. So the live 500 comes
+from the subscription RETRY while its GET answers -- a materially different fact
+from "the subscription call fails", and one no amount of reading found. Every
+send is now staged, fenced by a test comparing send sites to staged sites so a
+new one cannot publish an anonymous error.
+
 **The port is NOT taken, on evidence.** The live billing payload here reads
 `monthlyUsage:null, monthlyLimit:null, balance:0, subscription:null`, and
 upstream's parser requires `monthlyUsage` before it builds anything. On this
