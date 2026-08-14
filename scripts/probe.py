@@ -18,6 +18,7 @@ Exit codes: 0 nothing reddened, 1 something reddened (the usual proof), 2 the
 mutation could not be applied or the tree could not be restored.
 """
 
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -73,6 +74,23 @@ def main(argv):
     # mutated. Without it, Ctrl-C during a slow suite exits with the mutation
     # still applied and nothing saying so -- and the next thing anyone runs
     # reports on code they did not write.
+    #
+    # `finally` covers Ctrl-C, which arrives as an exception and unwinds. It does
+    # NOT cover SIGTERM, which terminates the process without unwinding -- so a
+    # `timeout` around this script, or any supervisor killing it, leaves the
+    # mutation in place. That is not hypothetical: it happened to the sibling
+    # audit script today, and a neutralised checker rule reached master under a
+    # `git add -A`. Both paths now reach the same restore.
+    def _restore_on_signal(signum, _frame):
+        run(["git", "checkout", "--", rel])
+        print(f"  restored {rel} on signal {signum}", file=sys.stderr)
+        sys.exit(128 + signum)
+
+    previous_handlers = {
+        sig: signal.signal(sig, _restore_on_signal)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    }
+
     try:
         result = run(["cargo", "test", *test_args], timeout=TIMEOUT_SECS)
         ran = "\ntest result:" in result.stdout or result.stdout.startswith("test result:")
@@ -85,6 +103,8 @@ def main(argv):
     except subprocess.TimeoutExpired:
         ran, failed, outcome = False, [], "hung"
     finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
         restored = run(["git", "checkout", "--", rel])
         if restored.returncode != 0 or path.read_text() != source:
             # Louder than a failed proof: the tree is now wrong, and every later
