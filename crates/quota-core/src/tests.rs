@@ -5589,6 +5589,14 @@ async fn the_idle_sleep_is_capped_so_discovery_keeps_running() {
 ///
 /// Checked rather than verified once by hand, so the pointers are stable for a
 /// structural reason instead of being right on the day someone looked.
+///
+/// **Scope: markdown targets only, and widening it needs care.** These documents
+/// deliberately name paths that are not in this repository and never will be —
+/// a user's `~/.codex/auth.json`, a reference implementation under `~/Work/OSS`,
+/// the deployed binary's install location. Those are subjects under discussion,
+/// not links a reader follows, and a checker extended to all path-shaped tokens
+/// would report every one as broken. The failures would look like findings and
+/// the natural repair would be to delete the most useful sentences in the docs.
 #[test]
 fn every_doc_reference_between_documents_resolves() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
