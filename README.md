@@ -141,6 +141,22 @@ cargo run -p quota-core --example completeness-envelopes
 
 ### Repository sweeps
 
+Every checker here — the two Rust ones and the Python tools — uses three exit
+codes, and the third is the one that matters:
+
+| code | meaning |
+| --- | --- |
+| 0 | checked, found nothing |
+| 1 | checked, found something — the findings are the output |
+| 2 | **could not check** — the run makes no claim either way |
+
+The 2 is not a severity level between the other two. It is the difference
+between "I looked and it was fine" and "I could not look", and collapsing it
+into either neighbour is how a checker starts lying: reported as 0 it claims a
+clean bill it never earned, and reported as 1 it becomes a failure someone
+retries until it passes. A missing daemon, an unreadable handle file, an empty
+population — none of those are findings, and none of them are passes.
+
 Python tools under `scripts/`, for questions the Rust checkers cannot answer
 because they are about the source, the host, or the fleet rather than the wire.
 Each exits non-zero on a finding and refuses to report a clean result when it
