@@ -5573,3 +5573,69 @@ async fn the_idle_sleep_is_capped_so_discovery_keeps_running() {
         "a slot due before the cap must shorten the sleep: slept {shorter:?}"
     );
 }
+
+/// Every document this repository points at from another document exists.
+///
+/// The charter's superseding banner, the README index and the cross-references
+/// between the contract and invariants notes are all paths in prose. A rename
+/// breaks them and nothing reports it: markdown has no build step here, so a
+/// dangling doc link is invisible until a reader follows it and finds nothing.
+///
+/// That matters most for the pointers that exist BECAUSE a document went stale.
+/// The charter is retained as a record and sends readers elsewhere for current
+/// behaviour; if those targets move, the stale document stays and its escape
+/// hatch is what breaks -- leaving a reader inside the overtaken description
+/// with no way out.
+///
+/// Checked rather than verified once by hand, so the pointers are stable for a
+/// structural reason instead of being right on the day someone looked.
+#[test]
+fn every_doc_reference_between_documents_resolves() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    for entry in std::fs::read_dir(root.join("docs")).expect("docs/ must be readable") {
+        let path = entry.expect("a readable dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "md") {
+            sources.push(path);
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for source in &sources {
+        let text = std::fs::read_to_string(source).expect("a readable markdown file");
+        let dir = source.parent().expect("a file has a parent");
+        for token in text.split(|c: char| "()`  \n\t<>\"".contains(c)) {
+            // Relative markdown targets only: a bare `foo.md` mention, a
+            // `../README.md` hop, or a `docs/x.md` path. URLs and anchors are
+            // somebody else's to keep alive.
+            if !token.ends_with(".md") || token.starts_with("http") || token.contains(':') {
+                continue;
+            }
+            checked += 1;
+            // Three spellings are all legitimate here: a sibling reference from
+            // inside docs/, a repo-relative path, and a bare filename in the
+            // README's documentation table, which means the file in docs/.
+            let resolves = dir.join(token).exists()
+                || root.join(token).exists()
+                || root.join("docs").join(token).exists();
+            if !resolves {
+                missing.push(format!(
+                    "{} -> {token}",
+                    source.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "documents point at files that do not exist: {missing:?}"
+    );
+    // Not vacuous: a tokenizer that matched nothing would pass silently, which
+    // is the failure this test exists to catch one level down.
+    assert!(
+        checked >= 20,
+        "expected the doc set to cross-reference itself; only found {checked}"
+    );
+}
