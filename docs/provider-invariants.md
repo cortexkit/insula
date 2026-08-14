@@ -78,6 +78,32 @@ The class also matters beyond the wire: `decode_failed` counts toward the stale
 browser login metric, so misfiling an account fact as a parse failure tells an
 operator to re-authenticate a session that works.
 
+### The enumeration, so nobody runs it twice
+
+Every optional collection this crate deserializes -- 13 of them -- checked for
+whether an empty one reaches an error path:
+
+- **Fixed**: `gemini` and `antigravity` `buckets`.
+- **Correct already, nine of them**: an empty collection is treated as nothing
+  to add rather than as a failure.
+- **`warp` `errors`**: inverted semantics, an empty list means no errors, and it
+  is handled that way.
+- **`deepseek` `balance_infos`**: folded on purpose, arguing the OPPOSITE
+  asymmetry, and the reasoning is at the site. For money, wrongly reporting "no
+  balance" makes a consumer stop routing, while wrongly reporting a decode
+  failure costs a retry. The direction of the cost is what decides this, not the
+  shape -- so the same conflation can be right in one provider and wrong in
+  another.
+- **`sub2api` `rate_limits`**: folded, and refused rather than fixed. Three
+  causes share one message and no credential on any machine here can say which
+  is live. Noted at the site with what to do if the provider is ever configured.
+
+The instrument that produced this list was wrong on its first run: it scoped to
+LINES containing the field name, and error arms sit on the lines after. It
+reported clean for the two providers fixed an hour earlier. A verdict from a
+check that misses its known cases says nothing about the unknown ones -- so put
+a case you have already established into any sweep before believing its nulls.
+
 
 ## Porting from a reference implementation
 

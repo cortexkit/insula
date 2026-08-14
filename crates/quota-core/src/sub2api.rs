@@ -251,6 +251,18 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .into_iter()
         .filter_map(rate_limit_to_extra)
         .collect();
+    // Three causes reach this one message: the field absent, a stated empty list,
+    // and entries present but none readable. They are not the same answer -- a
+    // stated empty list is the upstream saying this account has no windows, while
+    // the other two mean our struct and their payload disagree.
+    //
+    // Left folded DELIBERATELY, and the note is here because an unenforced
+    // decision is otherwise indistinguishable from an oversight. Splitting it
+    // needs evidence of what an account with no windows actually receives, and no
+    // credential on any machine here can produce that. If this provider is ever
+    // configured, split it: absent and unreadable stay Decode, stated-empty
+    // becomes NoQuotaReported. See "An absent field is not the same as a stated
+    // absence" in docs/provider-invariants.md.
     if extra_rate_windows.is_empty() {
         return Err(FetchError::Decode(
             "sub2api response has no usable rate limit windows".to_string(),
