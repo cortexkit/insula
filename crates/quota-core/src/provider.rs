@@ -422,6 +422,39 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Name the stage that produced this error, preserving its variant.
+    ///
+    /// For providers making several calls per fetch, where every call can fail
+    /// the same way and the published error names none of them. An unnamed
+    /// failure is compatible with every explanation, so the cheapest one wins by
+    /// default -- an opencode HTTP 500 read as a site outage for weeks when it
+    /// was one of three server functions, the other two answering on the same
+    /// cookie.
+    ///
+    /// The variant is deliberately preserved rather than rebuilt: it decides
+    /// transient versus non-transient, so a helper that "helpfully" normalised it
+    /// would silently change whether a cached window survives the failure.
+    /// `ProviderStatus` is returned untouched because it carries a bare code with
+    /// no message to prefix, and widening it to a string would lose the numeric
+    /// status that auth-failure reporting reads.
+    pub fn stage(self, stage: &str) -> Self {
+        match self {
+            Self::NoSession(m) => Self::NoSession(format!("{stage}: {m}")),
+            Self::CredentialUnusable(m) => Self::CredentialUnusable(format!("{stage}: {m}")),
+            Self::NoQuotaReported(m) => Self::NoQuotaReported(format!("{stage}: {m}")),
+            Self::LocalSourceUnavailable(m) => {
+                Self::LocalSourceUnavailable(format!("{stage}: {m}"))
+            }
+            Self::Unauthorized(m) => Self::Unauthorized(format!("{stage}: {m}")),
+            Self::Upstream(m) => Self::Upstream(format!("{stage}: {m}")),
+            Self::Decode(m) => Self::Decode(format!("{stage}: {m}")),
+            Self::Internal(m) => Self::Internal(format!("{stage}: {m}")),
+            Self::ProviderStatus(code) => Self::ProviderStatus(code),
+        }
+    }
+}
+
+impl FetchError {
     /// A stable, machine-readable name for this failure, published beside the
     /// human-readable message.
     ///

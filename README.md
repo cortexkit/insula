@@ -137,6 +137,13 @@ cargo run -p quota-core --example sweep-probe
 # print reference usage.get envelopes for the completeness cases, for a consumer
 # pinning its account reconciliation against real producer output:
 cargo run -p quota-core --example completeness-envelopes
+
+# run opencode's server-function calls one at a time, when its published error
+# says only that something returned 500. The provider makes three calls and any
+# of them can fail that way, so the entry alone cannot say which -- this reports
+# each stage separately and asks the billing function whether it answers on the
+# same cookie:
+cargo run -p quota-core --example opencode-stage
 ```
 
 ### Repository sweeps

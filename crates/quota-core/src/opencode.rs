@@ -35,6 +35,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub const WORKSPACES_SERVER_ID: &str =
     "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f";
+/// Customer/billing server function, carrying the monthly spend a pay-as-you-go
+/// workspace bills against.
+///
+/// A workspace on that plan has no subscription object at all, so the
+/// subscription function answers null or fails outright -- which this module
+/// reported as an upstream failure indistinguishable from an outage. Added at
+/// CodexBar v0.49.6 for the same reason.
+pub const BILLING_SERVER_ID: &str =
+    "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d";
+
 pub const SUBSCRIPTION_SERVER_ID: &str =
     "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4";
 
@@ -227,6 +237,7 @@ pub async fn fetch_workspace_id(
         client,
         &get_url,
         common_server_headers(cookie, WORKSPACES_SERVER_ID, ORIGIN),
+        "workspaces",
     )
     .await?;
     if looks_signed_out(&text) {
@@ -254,13 +265,53 @@ pub async fn fetch_workspace_id(
     })
 }
 
+/// Fetch the billing payload for a workspace.
+///
+/// Separate from the subscription call rather than folded into it: the two
+/// answer for different workspace types, and a helper that tried both would
+/// report one error for two questions -- which is the ambiguity that made a
+/// persistent failure here read as an outage for weeks.
+pub async fn fetch_billing_text(
+    client: &reqwest::Client,
+    cookie: &str,
+    workspace_id: &str,
+) -> Result<String, FetchError> {
+    let referer = format!("{ORIGIN}/workspace/{workspace_id}");
+    let args = vec![workspace_id.to_string()];
+    let text = server_get(
+        client,
+        &server_get_url(BILLING_SERVER_ID, Some(&args)),
+        common_server_headers(cookie, BILLING_SERVER_ID, &referer),
+        "billing",
+    )
+    .await?;
+    if looks_signed_out(&text) {
+        return Err(FetchError::Unauthorized(
+            "opencode session expired (billing)".to_string(),
+        ));
+    }
+    Ok(text)
+}
+
+/// Call one server function, naming the stage in any error it produces.
+///
+/// This provider makes several of these calls per fetch and every one can fail
+/// the same way, so an unnamed error is compatible with every explanation --
+/// which is how a persistent HTTP 500 here read as a site outage for weeks. It
+/// was in fact one specific call: a live probe found the workspaces and billing
+/// functions answering on the same cookie while the subscription function
+/// returned 500, and none of that was visible in the published error.
+///
+/// The stage name goes in the error rather than only in a log line because the
+/// published `error` string is what a consumer and an operator both see.
 async fn server_get(
     client: &reqwest::Client,
     url: &str,
     headers: Vec<Header>,
+    stage: &str,
 ) -> Result<String, FetchError> {
     let req = apply_headers(JsonRequest::get(url).timeout(REQUEST_TIMEOUT), headers);
-    let bytes = req.send(client).await?;
+    let bytes = req.send(client).await.map_err(|error| error.stage(stage))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -276,6 +327,7 @@ pub async fn fetch_subscription_text(
         client,
         &get_url,
         common_server_headers(cookie, SUBSCRIPTION_SERVER_ID, &referer),
+        "subscription",
     )
     .await?;
     if looks_signed_out(&text) {
@@ -694,6 +746,93 @@ impl UsageProvider for OpenCodeProvider {
         }
         .await;
         FetchAttempt::from_provider_usage(result)
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    /// The stage name reaches the published error, for every call this provider makes.
+    ///
+    /// Without it an HTTP 500 from any of three server functions produces one
+    /// indistinguishable string, and the reading that requires no evidence --
+    /// "the site is down" -- is the one a reader lands on. A live probe found
+    /// the workspaces and billing functions answering while subscription
+    /// returned 500; none of that was visible in what we published.
+    #[test]
+    fn every_stage_names_itself_in_the_published_error() {
+        for stage in ["workspaces", "subscription", "billing"] {
+            let published = FetchError::Upstream("HTTP 500".to_string())
+                .stage(stage)
+                .to_string();
+            assert!(
+                published.contains(stage),
+                "the {stage} call must name itself: {published}"
+            );
+            // Not vacuous: the original message survives beside the stage, so
+            // this cannot pass by replacing the error with its stage name.
+            assert!(
+                published.contains("HTTP 500"),
+                "the upstream message must survive: {published}"
+            );
+        }
+    }
+
+    /// The stage reaches the error through the real call, not just the helper.
+    ///
+    /// Testing `FetchError::stage` alone proves the helper works and says
+    /// nothing about whether any call site uses it -- deleting the `.stage()`
+    /// from `server_get` leaves those tests green. This drives a real HTTP 500
+    /// through the same function the provider calls.
+    #[tokio::test]
+    async fn a_failing_call_names_its_stage_through_server_get() {
+        let (base, task) = crate::loopback::serve_once(500, b"{\"status\":500}".to_vec()).await;
+        let client = reqwest::Client::new();
+        let error = server_get(&client, &base, Vec::new(), "subscription")
+            .await
+            .expect_err("a 500 must fail");
+        let _ = task.await;
+
+        let published = error.to_string();
+        assert!(
+            published.contains("subscription"),
+            "the failing stage must name itself on the wire: {published}"
+        );
+        // Not vacuous: the upstream detail survives beside the stage name, so a
+        // call site that replaced the error entirely would fail here.
+        assert!(
+            published.contains("500"),
+            "the upstream status must survive: {published}"
+        );
+    }
+
+    /// Naming a stage must not change how the failure is classified.
+    ///
+    /// The variant decides transient versus non-transient, which decides whether
+    /// a cached window survives. A helper that rebuilt the error into one
+    /// variant would move every stage-named failure onto the wrong side of that
+    /// line, and nothing about the published string would show it.
+    #[test]
+    fn naming_a_stage_preserves_the_variant() {
+        assert!(matches!(
+            FetchError::Upstream("x".into()).stage("s"),
+            FetchError::Upstream(_)
+        ));
+        assert!(matches!(
+            FetchError::Unauthorized("x".into()).stage("s"),
+            FetchError::Unauthorized(_)
+        ));
+        assert!(matches!(
+            FetchError::Decode("x".into()).stage("s"),
+            FetchError::Decode(_)
+        ));
+        // A bare status has no message to prefix and must come back untouched:
+        // widening it to a string would lose the code auth reporting reads.
+        assert!(matches!(
+            FetchError::ProviderStatus(500).stage("s"),
+            FetchError::ProviderStatus(500)
+        ));
     }
 }
 

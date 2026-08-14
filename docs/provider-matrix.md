@@ -27,8 +27,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.49.3** (36 providers registered; verified
-2026-08-12). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.49.6** (36 providers registered; verified
+2026-08-14). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -61,6 +61,51 @@ confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
 `/api/oauth/usage`, not CodexBar's CLI/web fetcher) and that the field actually
 changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
 
+
+### v0.49.4 - v0.49.6
+
+Upstream added a **pay-as-you-go fallback for OpenCode**: a workspace on that
+plan has no subscription object, so the subscription server function answers
+null or fails outright, and spend lives in a separate billing payload reachable
+with the same cookie.
+
+That is a second reading of a symptom this repo has carried for weeks. Our
+opencode entry publishes `HTTP 500` from the subscription call, and the standing
+diagnosis was an upstream outage -- reached partly because the published error
+named no stage, so it was equally compatible with every explanation and the
+cheapest one won.
+
+**Probed on this host rather than argued** (`crates/quota-core/examples/opencode-stage.rs`):
+workspaces answers, subscription returns 500, billing answers. The failure is
+specific to one server function -- not a session, a cookie, or a site-wide
+outage, all of which the old error was consistent with.
+
+**The port is NOT taken, on evidence.** The live billing payload here reads
+`monthlyUsage:null, monthlyLimit:null, balance:0, subscription:null`, and
+upstream's parser requires `monthlyUsage` before it builds anything. On this
+account their fallback returns nothing and rethrows the original error, so
+porting it would add a call, a constant to rotate, and change nothing
+observable. The constant and the billing call are in place for whenever an
+account on that plan appears; the fallback wiring is not, because nothing here
+can exercise it and an untested fallback is the shape that quietly stops
+working.
+
+**What was taken** is the diagnostic half: every opencode server-function error
+now names its stage, so the next reader can tell which call produced a failure
+without building a probe.
+
+Two things worth remembering from this round:
+
+- The probe's first verdict was wrong in my favour. It keyed "answered" on the
+  call returning 200, and billing returns 200 with nothing in it -- so it
+  printed a conclusion supporting the hypothesis under test. A second defect
+  stacked on it: the payload is a JS object literal, not JSON, so a quoted-key
+  search reported every field absent, which looks identical to an empty
+  response. Both errors pointed the same way.
+- A parity round can pay even when nothing is portable. The finding was not
+  upstream's code; it was that our own standing diagnosis of a live provider was
+  unsupported.
+
 ### Opaque constants, re-checked every round
 
 Four values are copied from the upstream rather than derived from anything we
@@ -81,7 +126,7 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All four matched CodexBar v0.49.3, re-verified 2026-08-12 by locating each value
+All four matched CodexBar v0.49.6, re-verified 2026-08-14 by locating each value
 in the tagged tree (`git grep <value> v0.49.3 -- Sources/`) rather than in the
 checkout, which usually sits at an older tag.
 
