@@ -703,10 +703,24 @@ struct RemoteQuotaBucket {
 fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
     let response: RemoteQuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
-    let buckets = response
-        .buckets
-        .filter(|buckets| !buckets.is_empty())
-        .ok_or_else(|| FetchError::Decode("antigravity remote quota has no buckets".to_string()))?;
+    // Two distinguishable inputs needing different answers. An ABSENT field means
+    // our struct and their payload disagree -- a rename upstream or a mistake
+    // here -- and Decode is the class that sends a reader to this repo. A field
+    // PRESENT AND EMPTY is the upstream stating that this account has no
+    // buckets, which is a fact about the account with nothing to fix.
+    let buckets = match response.buckets {
+        None => {
+            return Err(FetchError::Decode(
+                "antigravity remote quota response has no buckets field".to_string(),
+            ))
+        }
+        Some(buckets) if buckets.is_empty() => {
+            return Err(FetchError::NoQuotaReported(
+                "antigravity: this account has no quota buckets".to_string(),
+            ))
+        }
+        Some(buckets) => buckets,
+    };
 
     // Pool -> (worst used percent seen, its reset, how many models it covers).
     let mut pools: Vec<(Pool, f64, Option<String>, usize)> = Vec::new();
@@ -1673,16 +1687,33 @@ mod tests {
     /// what happened.
     #[test]
     fn a_remote_response_with_no_metered_bucket_degrades() {
+        // Every case still ERRORS -- that is what this test defends, and it is
+        // unchanged: an unusable response must never publish an empty window
+        // set, which a consumer cannot tell from capacity nobody measured.
+        //
+        // What differs is WHICH error, and the three inputs are not one case.
+        // An empty list is the upstream stating this account has no buckets. An
+        // absent field means our struct and their payload disagree. Buckets that
+        // are present but unmetered could equally mean our metering predicate is
+        // wrong, so that one stays a defect of ours until something proves
+        // otherwise.
+        let stated_empty = parse_remote_quota(&br#"{"buckets":[]}"#[..])
+            .expect_err("an empty bucket list must not publish an empty window set");
+        assert!(
+            matches!(stated_empty, FetchError::NoQuotaReported(_)),
+            "an upstream stating no buckets is an account fact: {stated_empty:?}"
+        );
+
         for body in [
-            &br#"{"buckets":[]}"#[..],
             &br#"{}"#[..],
-            // Present, but every bucket is unmetered: the same shape as an
-            // account with no quota to report.
             &br#"{"buckets":[{"modelId":"chat_1","remainingFraction":1}]}"#[..],
         ] {
             let error = parse_remote_quota(body)
                 .expect_err("an unusable response must not publish an empty window set");
-            assert!(matches!(error, FetchError::Decode(_)), "{error:?}");
+            assert!(
+                matches!(error, FetchError::Decode(_)),
+                "an absent field and an unmetered set both point at this repo: {error:?}"
+            );
         }
     }
 

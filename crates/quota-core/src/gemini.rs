@@ -236,10 +236,26 @@ fn window_minutes_from_reset(reset_time: &str, now: DateTime<Utc>) -> Option<i64
 fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
     let response: QuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("gemini quota not decodable: {e}")))?;
-    let buckets = response
-        .buckets
-        .filter(|b| !b.is_empty())
-        .ok_or_else(|| FetchError::Decode("gemini quota has no buckets".to_string()))?;
+    // Two distinguishable inputs, and they need different answers. An ABSENT
+    // field means our struct and their payload disagree -- a rename upstream or
+    // a mistake here -- and Decode is the class that says "look at this repo".
+    // A field PRESENT AND EMPTY is the upstream affirmatively stating the
+    // account has no buckets, which is a fact about the account with nothing to
+    // fix. Folding them together files an account fact as our defect, and it
+    // counts toward the stale-browser-login metric on a working session.
+    let buckets = match response.buckets {
+        None => {
+            return Err(FetchError::Decode(
+                "gemini quota response has no buckets field".to_string(),
+            ))
+        }
+        Some(buckets) if buckets.is_empty() => {
+            return Err(FetchError::NoQuotaReported(
+                "gemini: this account has no quota buckets".to_string(),
+            ))
+        }
+        Some(buckets) => buckets,
+    };
 
     let mut primary: Option<(f64, String, RateWindow)> = None;
     let mut extras = Vec::new();
@@ -1221,17 +1237,30 @@ mod tests {
         assert_eq!(usage.extra_rate_windows.unwrap().len(), 1);
     }
 
+    /// A stated-empty bucket list is an account fact; an absent field is ours.
+    ///
+    /// Both still ERROR, which is what matters most here -- returning Ok would
+    /// publish a window-less entry as a success, and a consumer cannot tell that
+    /// from capacity nobody measured. They differ in who the reader should go
+    /// and look at. An empty list is the upstream saying this account has no
+    /// buckets, with nothing to fix. A missing field means our struct and their
+    /// payload disagree, which is a defect in this repo and must not be filed as
+    /// a fact about the user.
     #[test]
-    fn empty_buckets_is_decode_error() {
-        let error = normalize_quota(br#"{ "buckets": [] }"#).unwrap_err();
-        match error {
-            FetchError::Decode(message) => assert!(
-                message.contains("no buckets"),
-                "an absent bucket list must stay distinguishable from a present but \
-                 unusable one: {message}"
-            ),
-            other => panic!("expected Decode, got {other:?}"),
-        }
+    fn a_stated_empty_bucket_list_is_not_our_defect() {
+        let stated = normalize_quota(br#"{ "buckets": [] }"#).unwrap_err();
+        assert!(
+            matches!(stated, FetchError::NoQuotaReported(_)),
+            "an upstream stating no buckets is an account fact: {stated:?}"
+        );
+
+        // Not vacuous: the neighbouring input keeps the other class, so this
+        // cannot pass by collapsing both into one answer.
+        let absent = normalize_quota(br#"{ }"#).unwrap_err();
+        assert!(
+            matches!(absent, FetchError::Decode(_)),
+            "an absent buckets field points at this repo: {absent:?}"
+        );
     }
 
     #[test]

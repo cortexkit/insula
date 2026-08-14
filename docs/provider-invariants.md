@@ -31,6 +31,54 @@ validating the upstream vocabulary would turn a new limit type into an outage.
 Swept 2026-07-25 across all `Ok`-producing normalization paths. Re-run the
 enumeration when a provider is added.
 
+## An absent field is not the same as a stated absence
+
+A payload can fail to give you a value two ways, and they need different error
+classes because they send a reader to different repositories.
+
+**The upstream STATES the absence.** An explicit `null` in a value slot, a
+present-but-empty list, a flag saying there is no plan. Nothing is broken and
+nothing is actionable: it is a fact about the account. `no_quota_reported`.
+
+**We LOOK FOR a key and do not find it.** Absence here is indistinguishable
+from a rename on their side or a misspelling on ours, and `decode_failed` is
+precisely the class that says *our parser and their payload disagree, look at
+this repo*. Reclassifying it to an account fact files our own defect as a true
+statement about the user, where nobody will look for it.
+
+The distinction is worth stating because the error MESSAGES read the same. A
+sweep of this repo found 25 `Decode` sites whose message names an absence, and
+the wording separates none of them; the code does. Ask whether serde already
+succeeded and a field was then found missing, or whether the payload
+affirmatively said there was nothing.
+
+Three fixed instances, all where the upstream stated it:
+
+- `opencode` subscription: an explicit `null` in the server-function envelope,
+  which is a JavaScript statement rather than JSON and parsed as neither. The
+  caller retried as a POST, that retry answered 500, and a workspace with no
+  subscription was published as an upstream failure for weeks.
+- `opencode` workspaces: the same shape one call up, yielding no ids and
+  published as our missing-workspace-id parse failure.
+- `gemini` and `antigravity` remote quota: `buckets` absent and `buckets: []`
+  shared one branch. The empty list is the upstream stating the account has no
+  buckets; the absent field could be a rename. Now separate, and this one needed
+  no knowledge of what any account receives -- only of what the JSON says.
+
+And one deliberately NOT changed, which is the boundary: `kimi` looks for a
+`FEATURE_CODING` scope in a list and reports `Decode` when it is not there.
+That reads like the same defect and is not. No account on this host carries that
+credential, so nothing here can establish what an account without the scope
+actually receives -- and if the scope were ever renamed, `Decode` is the answer
+that sends someone to fix it while `no_quota_reported` would say there is
+nothing to fix. A guard whose correctness cannot be measured from this machine
+must not ship.
+
+The class also matters beyond the wire: `decode_failed` counts toward the stale
+browser login metric, so misfiling an account fact as a parse failure tells an
+operator to re-authenticate a session that works.
+
+
 ## Porting from a reference implementation
 
 Fidelity is to observable meaning, not to expressions. Where our type asserts
