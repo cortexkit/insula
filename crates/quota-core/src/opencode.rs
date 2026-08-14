@@ -245,6 +245,17 @@ pub async fn fetch_workspace_id(
             "opencode session expired (workspace fetch)".to_string(),
         ));
     }
+    // Checked before the retry, for the same reason it is checked on the
+    // subscription call: an empty result and a stated "there is nothing here"
+    // are different answers that both yield no ids. Without this, an account
+    // with no workspace retries, fails to parse again, and is published as
+    // Decode -- our parser blamed for a fact about the account, and counted as a
+    // stale browser login on an entirely working session.
+    if is_explicit_null(&text) {
+        return Err(FetchError::NoQuotaReported(
+            "opencode: this account has no workspace".to_string(),
+        ));
+    }
     let mut ids = parse_workspace_ids(&text);
     if ids.is_empty() {
         let post_req = apply_headers(
@@ -259,6 +270,11 @@ pub async fn fetch_workspace_id(
         if looks_signed_out(&fallback) {
             return Err(FetchError::Unauthorized(
                 "opencode session expired (workspace POST)".to_string(),
+            ));
+        }
+        if is_explicit_null(&fallback) {
+            return Err(FetchError::NoQuotaReported(
+                "opencode: this account has no workspace".to_string(),
             ));
         }
         ids = parse_workspace_ids(&fallback);
@@ -892,6 +908,30 @@ mod stage_tests {
         assert!(
             is_explicit_null(live),
             "the enveloped null must be recognised: {live}"
+        );
+    }
+
+    /// Every server-function body this provider parses is checked for a null.
+    ///
+    /// The subscription call was fixed first and the workspaces call had the
+    /// identical defect one level up: a stated "nothing here" yields no ids,
+    /// falls through, and is published as our parse failure. Counting the sites
+    /// rather than testing one, so the next call added to this provider cannot
+    /// quietly reintroduce it.
+    #[test]
+    fn every_parsed_server_body_is_checked_for_a_null() {
+        let source = include_str!("opencode.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        // Four bodies get parsed: workspaces GET and its POST retry,
+        // subscription GET and its POST retry.
+        // Calls take a reference, so this counts uses and not the definition.
+        let checks = production.matches("is_explicit_null(&").count();
+        assert_eq!(
+            checks, 4,
+            "{checks} null check(s) for 4 parsed bodies: an unchecked body \
+             publishes a fact about the account as a defect of ours"
         );
     }
 
