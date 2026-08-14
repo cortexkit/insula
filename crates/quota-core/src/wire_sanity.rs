@@ -232,7 +232,7 @@ fn check_pools(
 
         // An empty id cannot be keyed on at all, which makes the pool
         // unselectable while still contributing to any total a consumer sums.
-        if false {
+        if pool.id.trim().is_empty() {
             findings.push(format!("{where_}: publishes a pool with an empty id"));
         }
 

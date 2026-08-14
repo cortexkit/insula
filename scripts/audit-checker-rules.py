@@ -19,8 +19,10 @@ reports "16 of 17 defended" without naming the seventeenth invites the reader to
 round up.
 """
 
+import atexit
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +92,37 @@ if status:
 
 original = TARGET.read_text()
 lines = original.splitlines(keepends=True)
+
+
+def _restore_target():
+    """Put the file back, whatever ends this process.
+
+    This script neutralises one rule at a time to see which test notices. Any
+    exit between the mutation and the inline restore strands a live checker rule
+    replaced by `if false`, and a neutralised rule is silent: the run stays
+    green, the checker reports `findings: none`, and the next `git add -A`
+    commits it. That happened -- a `timeout` around this script killed it
+    mid-run and the dead rule reached master.
+
+    `atexit` alone is not enough, because the signal `timeout` sends terminates
+    the process without running it. Both are registered so that an exception, a
+    `sys.exit`, Ctrl-C, and SIGTERM all reach the same restore.
+    """
+    if TARGET.read_text() != original:
+        TARGET.write_text(original)
+        print(f"  restored {REL} on exit", file=sys.stderr)
+
+
+def _restore_and_die(signum, _frame):
+    _restore_target()
+    # 128+signum: the shell's convention for death by signal, so a caller can
+    # still tell this apart from a clean exit or a finding.
+    sys.exit(128 + signum)
+
+
+atexit.register(_restore_target)
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_sig, _restore_and_die)
 
 # Cross-check the population against an independent count before doing anything
 # with it. This sweep enumerates by matching `findings.push`, and a rule that
