@@ -193,6 +193,56 @@ async fn main() {
         removal_envelope["completeProviders"], withheld_envelope["completeProviders"],
         "the pair is only interesting because the claim differs"
     );
+
+    // The pairing above holds no matter what the serializer emits: a field added
+    // to every entry appears in BOTH arrays and they stay byte-identical. So it
+    // proves the claim these envelopes carry and says nothing about the SHAPE a
+    // consumer decodes.
+    //
+    // That gap is the expensive one for anyone vendoring these bytes. A copy and
+    // its recorded digest are the same claim written twice, so they agree with
+    // each other forever while drifting from what this module actually sends,
+    // and nothing on the consumer's side can notice -- only the producer can.
+    //
+    // Pinned as a key SET rather than as bytes on purpose. Timestamps and
+    // account identifiers vary legitimately between runs, so byte equality would
+    // fail for reasons nobody needs to hear about, and an alarm that cries wrong
+    // when it means changed is ignored by its third firing. A changed key set is
+    // exactly the event worth re-looking at: additive changes leave a vendored
+    // copy valid, so this says the shape MOVED, never that a consumer is broken.
+    let entry_keys: Vec<&str> = removal_envelope["result"][0]
+        .as_object()
+        .expect("a populated envelope entry")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    // Sorted, because the JSON object here is a sorted map and key ORDER is a
+    // property of the serializer's container rather than of the wire. Asserting
+    // declaration order would pin something no consumer can observe and would
+    // fail on a dependency change that altered nothing anyone reads.
+    assert_eq!(
+        entry_keys,
+        [
+            "account",
+            "apiProvider",
+            "fetchedAt",
+            "provider",
+            "source",
+            "usage"
+        ],
+        "the emitted entry shape changed; consumers vendoring these envelopes need telling"
+    );
+    let envelope_keys: Vec<&str> = removal_envelope
+        .as_object()
+        .expect("an envelope object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        envelope_keys,
+        ["completeProviders", "result"],
+        "the envelope shape changed"
+    );
     println!(
         "\n=== pair check ===\nresult arrays are byte-identical ({} bytes); \
          completeProviders differs: {} vs {}",
