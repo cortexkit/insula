@@ -674,6 +674,17 @@ fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
     Ok(key.to_vec())
 }
 
+/// Filename prefix for the temp copy of Chrome's cookie database.
+///
+/// Named rather than inlined because `scripts/measure-disk-io.py` counts these
+/// copies by globbing for them, and it reads this constant out of this file
+/// rather than restating the format. Restating it would let a rename here
+/// silently reduce that count to zero -- and zero is exactly the figure that
+/// script prints when the snapshot sharing is working perfectly, so a broken
+/// instrument and the best possible result are indistinguishable in its output.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const COOKIE_SNAPSHOT_PREFIX: &str = "quota-chrome-cookies";
+
 /// Copy the (possibly locked) cookie DB to a temp path.
 ///
 /// Chrome keeps the database open, so this reads a consistent snapshot without
@@ -682,7 +693,7 @@ fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
     let tmp = std::env::temp_dir().join(format!(
-        "quota-chrome-cookies-{}-{}.db",
+        "{COOKIE_SNAPSHOT_PREFIX}-{}-{}.db",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));

@@ -12,6 +12,8 @@ import ctypes
 import glob
 import os
 import sys
+import pathlib
+import re
 import tempfile
 import time
 
@@ -48,12 +50,39 @@ def control():
         raise SystemExit("  counter is not tracking writes; readings below are void")
 
 
+SOURCE = pathlib.Path(__file__).resolve().parent.parent / "crates/quota-core/src/browser_cookies.rs"
+
+
+def snapshot_prefix():
+    """Read the temp-copy filename prefix out of the module that creates them.
+
+    Restating it here would make a rename in that file reduce the copy count to
+    zero with no other symptom -- and zero is what this script prints when the
+    snapshot sharing is working perfectly, so the broken instrument and the best
+    possible result would be indistinguishable in the output.
+
+    Refuses rather than falling back to a literal: a default would restore
+    exactly the silent-zero failure this exists to prevent, and would do it at
+    the moment the constant moved.
+    """
+    text = SOURCE.read_text(encoding="utf-8")
+    match = re.search(r'COOKIE_SNAPSHOT_PREFIX: &str = "([^"]+)"', text)
+    if not match:
+        sys.exit(
+            "refusing: no COOKIE_SNAPSHOT_PREFIX in %s.\n"
+            "The copy count cannot be measured without it, and a zero here would\n"
+            "read as a perfect result rather than as a broken instrument." % SOURCE
+        )
+    return match.group(1)
+
+
 def main():
     pid = int(sys.argv[1])
     window = float(sys.argv[2]) if len(sys.argv) > 2 else 180.0
     control()
 
-    pattern = os.path.join(tempfile.gettempdir(), "quota-chrome-cookies-%d-*.db" % pid)
+    prefix = snapshot_prefix()
+    pattern = os.path.join(tempfile.gettempdir(), "%s-%d-*.db" % (prefix, pid))
     start = counters(pid)
     t0 = time.time()
     seen = set()
