@@ -78,6 +78,31 @@ The class also matters beyond the wire: `decode_failed` counts toward the stale
 browser login metric, so misfiling an account fact as a parse failure tells an
 operator to re-authenticate a session that works.
 
+### A mutation tool must survive the signal, not just the exception
+
+Both tools here neutralise a piece of source, run the suite, and put it back.
+The restore has to survive every way the process can end, and `finally` does
+not do that: Ctrl-C arrives as an exception and unwinds, while SIGTERM
+terminates without unwinding. A `timeout` around either script -- or any
+supervisor killing it -- leaves the mutation applied.
+
+That is how a dead checker rule reached master: `audit-checker-rules.py` was run
+under `timeout`, killed between the mutation and the restore, and committed by a
+`git add -A`. **A neutralised rule is silent.** The suite stays green, the
+checker prints `findings: none`, and nothing distinguishes a rule that found
+nothing from one that cannot fire. Only a test pinning that specific rule caught
+it.
+
+Both scripts now restore from signal handlers as well, and both proofs were run
+non-vacuously -- on a clean tree, confirming a mutation was actually applied
+mid-run before the kill. The first attempt proved nothing: the script refused on
+a dirty tree and never mutated, so the clean result after the kill was the
+result of nothing having happened.
+
+Check when adding any tool that edits tracked files: does the restore run on
+SIGTERM, and has that been demonstrated with the mutation verified present
+first?
+
 ### The enumeration, so nobody runs it twice
 
 Every optional collection this crate deserializes -- 13 of them -- checked for
