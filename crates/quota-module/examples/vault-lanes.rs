@@ -132,12 +132,26 @@ async fn main() {
 
     let raw = match std::fs::read_to_string(&handles_path) {
         Ok(raw) => raw,
+        // Both outcomes are exit 2 -- neither can support a verdict -- but they
+        // are opposite conditions for whoever runs this. An absent file means no
+        // vault credentials are configured, which is the ordinary state on a host
+        // that uses none. An unreadable one means credentials may well be
+        // configured and this check cannot see them, which is a fault to fix
+        // before the result means anything. Reporting both as "no handle file"
+        // sends the second case away as normal.
+        //
+        // Exit 2 rather than 0 in either case: a clean pass would claim every
+        // configured lane is serving, which is vacuously true and
+        // indistinguishable from a real one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("no credential handle file: no vault credentials configured here");
+            std::process::exit(2);
+        }
         Err(error) => {
-            // No handle file means no vault credentials are configured, so there
-            // is nothing this check can assert. Exit 2 rather than 0: a clean
-            // pass would claim every configured lane is serving, which is
-            // vacuously true and indistinguishable from a real one.
-            eprintln!("no credential handle file to check ({error})");
+            eprintln!(
+                "credential handle file exists but could not be read ({error}); \
+                 configured lanes cannot be checked until that is fixed"
+            );
             std::process::exit(2);
         }
     };
