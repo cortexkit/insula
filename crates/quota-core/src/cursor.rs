@@ -170,9 +170,10 @@ impl UsageProvider for CursorProvider {
                 .map_err(FetchError::from)?;
 
             if !jar.has_cookie_named(is_session_cookie) {
-                return Err(FetchError::NoSession(
-                    "no cursor session cookie in browser".to_string(),
-                ));
+                return Err(FetchError::NoSession(format!(
+                    "no cursor session cookie in browser ({})",
+                    jar.session_absence_detail()
+                )));
             }
 
             let body_bytes = JsonRequest::get(USAGE_URL)

@@ -778,9 +778,10 @@ pub async fn load_cookie_header_async() -> Result<String, FetchError> {
 
 fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
     if !has_session_cookie(jar) {
-        return Err(FetchError::NoSession(
-            "no opencode auth cookie in browser".to_string(),
-        ));
+        return Err(FetchError::NoSession(format!(
+            "no opencode auth cookie in browser ({})",
+            jar.session_absence_detail()
+        )));
     }
     // A session cookie exists but nothing survives the filter, so the browser
     // holds a login that cannot be used: found, not absent.

@@ -10,18 +10,30 @@
 use quota_core::browser_cookies;
 
 fn main() {
-    match browser_cookies::chrome_cookies_for("qoder.com") {
-        Ok(jar) => {
-            let mut names: Vec<&str> = jar.cookies.iter().map(|c| c.name.as_str()).collect();
-            names.sort_unstable();
-            println!("  {} cookie(s) for qoder.com:", names.len());
-            for name in names {
-                println!("    {name}");
+    let domains = [
+        "qoder.com",
+        "ollama.com",
+        "factory.ai",
+        "xiaomimimo.com",
+        "opencode.ai",
+        "cursor.com",
+        "ampcode.com",
+        "qwencloud.com",
+    ];
+    for domain in domains {
+        match browser_cookies::chrome_cookies_for(domain) {
+            Ok(jar) => {
+                let mut names: Vec<&str> = jar.cookies.iter().map(|c| c.name.as_str()).collect();
+                names.sort_unstable();
+                println!("  {domain}: {} cookie(s)", names.len());
+                for name in names {
+                    println!("      {name}");
+                }
             }
-        }
-        Err(error) => {
-            eprintln!("cookie store unreadable ({error}): the question is unanswered.");
-            std::process::exit(2);
+            // A domain with no cookie is an ordinary state on any host, so it is
+            // reported and the sweep continues. Exiting here made the whole run
+            // describe whichever domain happened to sort first.
+            Err(error) => println!("  {domain}: none ({error})"),
         }
     }
 }

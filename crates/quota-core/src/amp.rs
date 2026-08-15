@@ -244,9 +244,10 @@ impl UsageProvider for AmpProvider {
                 .map_err(FetchError::from)?;
 
             if !jar.has_cookie_named(is_session_cookie) {
-                return Err(FetchError::NoSession(
-                    "no amp session cookie in browser".to_string(),
-                ));
+                return Err(FetchError::NoSession(format!(
+                    "no amp session cookie in browser ({})",
+                    jar.session_absence_detail()
+                )));
             }
 
             let response = JsonRequest::get(SETTINGS_URL)

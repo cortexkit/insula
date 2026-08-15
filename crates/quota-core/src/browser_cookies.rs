@@ -220,6 +220,30 @@ impl CookieJar {
     pub fn has_cookie_named(&self, predicate: impl Fn(&str) -> bool) -> bool {
         self.cookies.iter().any(|c| predicate(&c.name))
     }
+
+    /// Why no session was found, for the message that says so.
+    ///
+    /// Providers recognise a session by an allow-list of cookie names, so "no
+    /// session cookie" covers two states a reader needs to tell apart. An empty
+    /// jar means nobody signed in, which is ordinary and permanent. A jar with
+    /// cookies none of which we recognise means either the same thing, or that
+    /// the upstream renamed its session cookie and OUR LIST IS STALE -- in which
+    /// case a signed-in account is reporting as never configured, the class that
+    /// authorises a consumer to forget it.
+    ///
+    /// Nothing distinguishes those two from outside, which is exactly why the
+    /// count belongs in the message: someone who is signed in and sees this
+    /// provider missing needs to know cookies were there and went unrecognised.
+    /// Names are deliberately not included -- a cookie name is not a secret, but
+    /// this string is published on the wire and the count is what answers the
+    /// question.
+    pub fn session_absence_detail(&self) -> String {
+        match self.cookies.len() {
+            0 => "no cookies for this domain".to_string(),
+            1 => "1 cookie present, not recognised as a session".to_string(),
+            n => format!("{n} cookies present, none recognised as a session"),
+        }
+    }
 }
 
 /// Extract cookies without running keychain, filesystem, and SQLite work on an
@@ -976,6 +1000,58 @@ mod tests {
     /// is only checkable on the platform that compiles it, and that is the
     /// platform where someone is least likely to be looking when they change
     /// the other one.
+    /// The absence detail separates an empty jar from an unrecognised one.
+    ///
+    /// Both reach the same NoSession, and they are different facts. An empty jar
+    /// means nobody signed in. A jar with cookies we do not recognise means that
+    /// OR that the upstream renamed its session cookie and our allow-list is
+    /// stale -- in which case a signed-in account reports as never configured,
+    /// and the operator's only clue is this string.
+    ///
+    /// Measured shapes from this host: cursor holds three anonymous ids
+    /// (_rdt_uuid, cursor_anonymous_id, statsig_stable_id) and qoder holds one
+    /// tracking cookie, so both the singular and plural forms occur in practice.
+    #[test]
+    fn the_session_absence_detail_separates_empty_from_unrecognised() {
+        let jar = |names: &[&str]| CookieJar {
+            cookies: names
+                .iter()
+                .map(|name| Cookie {
+                    name: (*name).to_string(),
+                    value: "x".to_string(),
+                    host_key: "example.test".to_string(),
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            jar(&[]).session_absence_detail(),
+            "no cookies for this domain"
+        );
+        assert_eq!(
+            jar(&["tfstk"]).session_absence_detail(),
+            "1 cookie present, not recognised as a session"
+        );
+        assert_eq!(
+            jar(&["_rdt_uuid", "cursor_anonymous_id", "statsig_stable_id"])
+                .session_absence_detail(),
+            "3 cookies present, none recognised as a session"
+        );
+
+        // Not vacuous: the three answers differ, so a helper collapsing them into
+        // one string fails here rather than passing with a plausible message.
+        let all = [
+            jar(&[]).session_absence_detail(),
+            jar(&["a"]).session_absence_detail(),
+            jar(&["a", "b"]).session_absence_detail(),
+        ];
+        assert_eq!(
+            all.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "the three states must stay distinguishable: {all:?}"
+        );
+    }
+
     #[test]
     fn the_chrome_directory_is_pinned_for_every_platform() {
         assert_eq!(

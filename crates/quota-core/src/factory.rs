@@ -396,9 +396,10 @@ impl UsageProvider for FactoryProvider {
             let jar = browser_cookies::chrome_cookies_for_async(DOMAIN).await.map_err(FetchError::from)?;
 
             if !jar.has_cookie_named(is_session_cookie) {
-                return Err(FetchError::NoSession(
-                    "no factory session cookie in browser".to_string(),
-                ));
+                return Err(FetchError::NoSession(format!(
+                    "no factory session cookie in browser ({})",
+                    jar.session_absence_detail()
+                )));
             }
 
             // A session cookie was found immediately above, so the browser does
