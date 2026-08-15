@@ -31,6 +31,38 @@ validating the upstream vocabulary would turn a new limit type into an outage.
 Swept 2026-07-25 across all `Ok`-producing normalization paths. Re-run the
 enumeration when a provider is added.
 
+## A browser session is a fallback, not a requirement — check the app first
+
+Nine providers here read a browser cookie, and that was treated as their nature
+rather than as one available surface. It is not: `cursor` was dark on this host
+with only anonymous analytics cookies, and it now serves a labelled account from
+a token in Cursor.app's own `state.vscdb`, with no browser involved.
+
+The shape generalises to any provider whose vendor ships a desktop app or CLI:
+
+1. Does the app keep a credential locally? Editor-family apps commonly use an
+   SQLite `state.vscdb` under their global storage; CLIs commonly use a dotfile.
+2. If so, read it **immutably** (`file:...?immutable=1`) so a running app is
+   never disturbed and no lock is taken.
+3. Clear the rotation gate BEFORE building anything: an ACCESS token may be read
+   and used, a REFRESH token must never be exchanged. Anthropic and OpenAI rotate
+   refresh tokens single-use, so a second reader breaks the user's sign-in to
+   collect a usage figure. Google does not rotate. This is what killed the Claude
+   and Codex plugin lanes and it is the first question, not the last.
+4. Prove the whole path live before writing code — synthesize the credential the
+   app would send and call the endpoint the provider already uses.
+
+**This cannot be swept from one machine, and the distinction matters.** Checking
+this host found Cursor.app installed and nothing else from that cohort: no Amp,
+Qoder, Factory, Ollama, Windsurf or Trae, as apps or CLIs. That is "no install to
+inspect", NOT "no local store exists" — the two look identical in a sweep and
+mean opposite things.
+
+So the trigger is per-host rather than per-round: **when a provider's app turns
+up installed on a machine this module runs on, inspect its store before accepting
+that a browser session is required.** A provider marked cookie-only is marked
+that way because of where it was last looked at.
+
 ## An absent field is not the same as a stated absence
 
 A payload can fail to give you a value two ways, and they need different error
