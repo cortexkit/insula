@@ -842,6 +842,7 @@ pub struct AntigravityProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     quota_url: String,
+    token_url: String,
 }
 
 impl AntigravityProvider {
@@ -863,6 +864,7 @@ impl AntigravityProvider {
             credential_source,
             handle_loader,
             quota_url: REMOTE_QUOTA_URL.to_string(),
+            token_url: TOKEN_URL.to_string(),
         }
     }
 
@@ -954,9 +956,9 @@ impl AntigravityProvider {
 
     /// Exchange a stored refresh token for a short-lived access token.
     ///
-    /// A 400 or 401 here means the grant itself was rejected, which is a
-    /// credential the user must re-authorize rather than a transient fault, so
-    /// it must not be retried as though the network flapped.
+    /// Only an OAuth body that explicitly states `invalid_grant` proves the
+    /// credential needs re-authorization. Other refusal bodies can describe a
+    /// transient endpoint failure, so they retain their existing status class.
     async fn exchange_refresh_token(&self, refresh_token: &str) -> Result<String, FetchError> {
         if refresh_token.trim().is_empty() {
             return Err(FetchError::NoSession(
@@ -966,7 +968,7 @@ impl AntigravityProvider {
         let client_id = oauth_client_id();
         let client_secret = oauth_client_secret();
         let response = JsonRequest::post_form(
-            TOKEN_URL,
+            &self.token_url,
             &[
                 ("client_id", &client_id),
                 ("client_secret", &client_secret),
@@ -975,16 +977,36 @@ impl AntigravityProvider {
             ],
         )
         .timeout(REQUEST_TIMEOUT)
-        .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
+        .send_raw(&self.remote_http)
         .await?;
+
+        if !(200..300).contains(&response.status) {
+            #[derive(Deserialize)]
+            struct OAuthErrorResponse {
+                error: Option<String>,
+            }
+            let invalid_grant = serde_json::from_slice::<OAuthErrorResponse>(&response.body)
+                .ok()
+                .and_then(|response| response.error)
+                .as_deref()
+                == Some("invalid_grant");
+            return if invalid_grant {
+                Err(FetchError::CredentialUnusable(
+                    "antigravity refresh token was rejected: invalid_grant".to_string(),
+                ))
+            } else {
+                Err(FetchError::ProviderStatus(response.status))
+            };
+        }
 
         #[derive(Deserialize)]
         struct TokenResponse {
             access_token: Option<String>,
         }
-        let parsed: TokenResponse = serde_json::from_slice(&response.body).map_err(|e| {
-            FetchError::Decode(format!("antigravity token response not decodable: {e}"))
-        })?;
+        let parsed: TokenResponse =
+            serde_json::from_slice(response.body_for_parsing()?).map_err(|e| {
+                FetchError::Decode(format!("antigravity token response not decodable: {e}"))
+            })?;
         parsed
             .access_token
             .filter(|token| !token.trim().is_empty())
@@ -1753,6 +1775,7 @@ mod tests {
 #[cfg(test)]
 mod plugin_lane_tests {
     use super::*;
+    use crate::refresh::{classify, FetchClass};
 
     fn account(email: Option<&str>, token: Option<&str>, enabled: Option<bool>) -> StoredAccount {
         StoredAccount {
@@ -1761,6 +1784,25 @@ mod plugin_lane_tests {
             managed_project_id: Some("proj-1".to_string()),
             enabled,
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_refresh_invalid_grant_is_credential_unusable_and_non_transient() {
+        let (base_url, request) =
+            crate::loopback::serve_once(400, br#"{"error":"invalid_grant"}"#.to_vec()).await;
+        let mut provider = AntigravityProvider::new();
+        provider.token_url = format!("{base_url}/token");
+
+        let error = provider
+            .exchange_refresh_token("refresh-token")
+            .await
+            .expect_err("invalid_grant must reject the credential");
+        assert!(matches!(error, FetchError::CredentialUnusable(_)));
+        assert_eq!(classify(&error), FetchClass::NonTransient);
+
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /token "));
+        assert!(request.contains("refresh_token=refresh-token"));
     }
 
     /// The handle name keys on the email, not the slot.

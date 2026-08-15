@@ -326,6 +326,19 @@ struct RefreshResponse {
     expires_in: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    error: Option<String>,
+}
+
+fn stated_invalid_grant(body: &[u8]) -> bool {
+    serde_json::from_slice::<OAuthErrorResponse>(body)
+        .ok()
+        .and_then(|response| response.error)
+        .as_deref()
+        == Some("invalid_grant")
+}
+
 struct CachedToken {
     token: String,
     expires_at: Instant,
@@ -395,6 +408,60 @@ impl GeminiProvider {
         });
     }
 
+    async fn refresh_access_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<(String, Duration), FetchError> {
+        let cid = client_id();
+        let secret = client_secret();
+        let response = JsonRequest::post_form(
+            &self.token_url,
+            &[
+                ("client_id", &cid),
+                ("client_secret", &secret),
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token"),
+            ],
+        )
+        .send_raw(&self.http)
+        .await?;
+
+        if !(200..300).contains(&response.status) {
+            if stated_invalid_grant(&response.body) {
+                return Err(FetchError::CredentialUnusable(
+                    "gemini refresh token was rejected: invalid_grant".to_string(),
+                ));
+            }
+            if response.status == 401 || response.status == 403 {
+                return Err(FetchError::Unauthorized(format!(
+                    "HTTP {}",
+                    response.status
+                )));
+            }
+            let excerpt: String = String::from_utf8_lossy(&response.body)
+                .chars()
+                .take(200)
+                .collect();
+            return Err(FetchError::Upstream(format!(
+                "HTTP {}: {excerpt}",
+                response.status
+            )));
+        }
+
+        let refreshed: RefreshResponse = serde_json::from_slice(response.body_for_parsing()?)
+            .map_err(|e| FetchError::Decode(format!("gemini token refresh not decodable: {e}")))?;
+        let token = refreshed
+            .access_token
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                FetchError::Unauthorized("gemini refresh returned no access_token".to_string())
+            })?;
+        Ok((
+            token,
+            Duration::from_secs(refreshed.expires_in.unwrap_or(3600)),
+        ))
+    }
+
     /// Resolve a usable access token: a still-valid one from the creds file or the
     /// in-memory cache, else refresh via the OAuth2 token endpoint and cache it.
     async fn access_token(&self, now: Instant) -> Result<String, FetchError> {
@@ -425,29 +492,7 @@ impl GeminiProvider {
                 FetchError::CredentialUnusable("gemini creds have no refresh_token".to_string())
             })?;
 
-        let cid = client_id();
-        let secret = client_secret();
-        let body = JsonRequest::post_form(
-            &self.token_url,
-            &[
-                ("client_id", &cid),
-                ("client_secret", &secret),
-                ("refresh_token", &refresh_token),
-                ("grant_type", "refresh_token"),
-            ],
-        )
-        .send(&self.http)
-        .await?;
-
-        let refreshed: RefreshResponse = serde_json::from_slice(&body)
-            .map_err(|e| FetchError::Decode(format!("gemini token refresh not decodable: {e}")))?;
-        let token = refreshed
-            .access_token
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| {
-                FetchError::Unauthorized("gemini refresh returned no access_token".to_string())
-            })?;
-        let lifetime = Duration::from_secs(refreshed.expires_in.unwrap_or(3600));
+        let (token, lifetime) = self.refresh_access_token(&refresh_token).await?;
         let expires_at = now + lifetime.saturating_sub(EXPIRY_SKEW);
         self.store_token(token.clone(), expires_at);
         Ok(token)
@@ -852,6 +897,86 @@ mod tests {
 
     fn quota_body() -> Vec<u8> {
         br#"{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.4,"resetTime":"2026-07-16T00:00:00Z"}]}"#.to_vec()
+    }
+
+    async fn refresh_against(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (Result<(String, Duration), FetchError>, String) {
+        let (base_url, request) = crate::loopback::serve_once(status, body).await;
+        let mut provider = GeminiProvider::new();
+        provider.token_url = format!("{base_url}/token");
+        let result = provider.refresh_access_token("refresh-token").await;
+        (result, request.await.unwrap())
+    }
+
+    fn assert_refresh_request(request: &str) {
+        let request = request.to_ascii_lowercase();
+        assert!(request.starts_with("post /token "));
+        assert!(request.contains("content-type: application/x-www-form-urlencoded"));
+        assert!(request.contains("refresh_token=refresh-token"));
+        assert!(request.contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_refresh_is_credential_unusable_and_non_transient() {
+        let (result, request) =
+            refresh_against(400, br#"{"error":"invalid_grant"}"#.to_vec()).await;
+        assert_refresh_request(&request);
+
+        let error = result.expect_err("invalid_grant must reject the credential");
+        assert!(matches!(error, FetchError::CredentialUnusable(_)));
+        assert_eq!(classify(&error), FetchClass::NonTransient);
+    }
+
+    #[tokio::test]
+    async fn temporarily_unavailable_refresh_remains_upstream_and_transient() {
+        let (result, request) =
+            refresh_against(400, br#"{"error":"temporarily_unavailable"}"#.to_vec()).await;
+        assert_refresh_request(&request);
+
+        let error = result.expect_err("a temporary OAuth refusal must not reject the credential");
+        assert!(matches!(error, FetchError::Upstream(_)));
+        assert_eq!(classify(&error), FetchClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn non_json_refresh_refusal_remains_upstream_and_transient() {
+        let (result, request) =
+            refresh_against(400, b"gateway temporarily unavailable".to_vec()).await;
+        assert_refresh_request(&request);
+
+        let error = result.expect_err("an unreadable refusal must not reject the credential");
+        assert!(matches!(error, FetchError::Upstream(_)));
+        assert_eq!(classify(&error), FetchClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_in_error_description_does_not_reject_the_credential() {
+        let (result, request) = refresh_against(
+            400,
+            br#"{"error":"temporarily_unavailable","error_description":"proxy quoted invalid_grant"}"#.to_vec(),
+        )
+        .await;
+        assert_refresh_request(&request);
+
+        let error = result.expect_err("only the OAuth error field may reject the credential");
+        assert!(matches!(error, FetchError::Upstream(_)));
+        assert_eq!(classify(&error), FetchClass::Transient);
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_still_returns_the_access_token() {
+        let (result, request) = refresh_against(
+            200,
+            br#"{"access_token":"fresh-access-token","expires_in":300}"#.to_vec(),
+        )
+        .await;
+        assert_refresh_request(&request);
+
+        let (token, lifetime) = result.expect("a successful refresh must still succeed");
+        assert_eq!(token, "fresh-access-token");
+        assert_eq!(lifetime, Duration::from_secs(300));
     }
 
     /// The Antigravity Google credential is not a Gemini credential.
