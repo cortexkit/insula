@@ -8,7 +8,14 @@
 //!
 //! quotaInfo JSON: `{ "type", "current", "maximum", "until", "tariffQuota": {
 //! "available" } }` (numbers are STRINGS). usedPercent = current/maximum*100.
-//! nextRefill JSON: `{ "type", "next", "amount", "duration" }` → `next` is the
+//! nextRefill JSON: `next` is the reset when present. CodexBar also models
+//! `amount` and `duration` on this object, both optional -- transcribed here as
+//! fact once, and it is NOT fact: no payload observed on any host has carried
+//! them, and the one readable here (an account with no active AI quota) has
+//! `{ "exception", "previous", "type" }`, two of which neither implementation
+//! models. Treat the shape below as what we PARSE, never as what JetBrains
+//! sends. A comment describing someone else's payload ages with no signal, and
+//! this one was read back as evidence in a wire-design argument. `next` is the
 //! reset. A `type` of `Unknown`/`Error` (no active AI quota) degrades to NoSession.
 //!
 //! VERIFICATION: HYBRID. The file-discovery + XML-extract + entity-decode + JSON
@@ -248,6 +255,33 @@ impl UsageProvider for JetBrainsProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The degraded refill payload this host actually writes yields no reset.
+    ///
+    /// LIVE CAPTURE, 2026-08-15, DataGrip 2026.2 on an account with no active AI
+    /// quota: `nextRefill` carries `{"exception","previous","type"}`. No `next`,
+    /// and two keys neither this module nor CodexBar models.
+    ///
+    /// Pinned because this file's header once described the object as
+    /// `{type, next, amount, duration}` -- transcribed from CodexBar's optional
+    /// model, then read back in a wire-design argument as though it described
+    /// what JetBrains sends. This fixture is the only shape anyone here has
+    /// actually observed.
+    #[test]
+    fn the_observed_degraded_refill_payload_yields_no_reset() {
+        let refill: super::NextRefill = serde_json::from_str(
+            r#"{"type":"Error","exception":"quota unavailable","previous":null}"#,
+        )
+        .expect(
+            "unmodelled keys must not fail the parse: this upstream sends fields we do not model",
+        );
+
+        assert!(
+            refill.next.is_none(),
+            "this payload states no refill time, and inventing one would publish a \
+             reset the upstream never gave"
+        );
+    }
 
     /// The Windows roaming directory is a candidate, and only there.
     ///
