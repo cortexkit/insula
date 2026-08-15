@@ -501,6 +501,25 @@ and we CANNOT measure how stale:
 - No per-key write-timestamp exists in the cache; `state.vscdb` mtime is the
   shared-DB last-write of ANY VSCode key, reliable only as "file ancient ⇒ drop",
   never as freshness proof.
+**Re-examined 2026-08-15, and the deferral's condition has changed shape.** The
+`cursor` app-auth lane shipped that day reads a CREDENTIAL out of an editor's
+`state.vscdb` and performs a live fetch with it. That is a different thing from
+reading cached usage, and it sidesteps the staleness objection below entirely:
+a token is not stale, it is either accepted or refused by the upstream, and the
+usage figures come from the live call.
+
+So the question for windsurf is no longer "can we discount a cache" but "does
+its store hold a credential and does an endpoint accept it" — the shape cursor
+just proved. It stays deferred because that is unmeasurable here: no Windsurf
+install exists on this host, so there is no store to inspect and no way to test
+an endpoint. A lane whose correctness cannot be measured from this machine must
+not ship.
+
+THE CONDITION TO RE-EXAMINE IS NOW "a host with Windsurf installed", not a
+staleness field on the wire. Recording that because the old condition is the one
+a future reader would check, and it would keep looking unmet while pointing at
+the wrong question.
+
 - A designed staleness guard (KEEP for a future revisit — it's correct and reusable):
   (a) drop a window whose STORED `*ResetAtUnix` is already in the past (period rolled
   over since cache write — exact, no mtime needed); (b) bound cache-age to the window
