@@ -214,6 +214,34 @@ impl Default for QoderProvider {
     }
 }
 
+/// Cookies any visit sets, which prove nothing about being signed in.
+///
+/// Measured on this host: a browser that has merely loaded a Qoder page holds
+/// exactly one cookie, Alibaba's `tfstk`. Sending it produces a 401, which this
+/// module reported as a rejected credential -- so an account nobody ever signed
+/// into appeared in `cookieLoginsStale`, telling an operator a working login had
+/// expired.
+///
+/// Grows only with MEASURED evidence, never with plausible-looking names. The
+/// two directions are not symmetric: leaving a tracking cookie off this list
+/// keeps today's wrong-but-visible report, while wrongly listing a real session
+/// cookie makes a signed-in account report as never configured, which is the
+/// class that authorises a consumer to forget it.
+const TRACKING_ONLY_COOKIES: &[&str] = &["tfstk"];
+
+/// Whether every cookie present is one that proves nothing.
+///
+/// Requires ALL of them to be known-tracking. A single unrecognised cookie could
+/// be the session, so the jar is sent as before and the upstream decides -- the
+/// judgement stays with the only party that can actually make it.
+fn jar_is_tracking_only(jar: &browser_cookies::CookieJar) -> bool {
+    !jar.cookies.is_empty()
+        && jar
+            .cookies
+            .iter()
+            .all(|cookie| TRACKING_ONLY_COOKIES.contains(&cookie.name.as_str()))
+}
+
 #[async_trait]
 impl UsageProvider for QoderProvider {
     fn name(&self) -> &str {
@@ -234,6 +262,11 @@ impl UsageProvider for QoderProvider {
             let cookie = request_cookie_header(&jar).ok_or_else(|| {
                 FetchError::NoSession("no cookies for an exact Qoder browser host".to_string())
             })?;
+            if jar_is_tracking_only(&jar) {
+                return Err(FetchError::NoSession(
+                    "only tracking cookies for Qoder: nobody is signed in".to_string(),
+                ));
+            }
 
             let body = JsonRequest::get(USAGE_URL)
                 .timeout(REQUEST_TIMEOUT)
@@ -264,6 +297,53 @@ impl UsageProvider for QoderProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn jar_of(names: &[&str]) -> browser_cookies::CookieJar {
+        browser_cookies::CookieJar {
+            cookies: names
+                .iter()
+                .map(|name| browser_cookies::Cookie {
+                    name: (*name).to_string(),
+                    value: "x".to_string(),
+                    host_key: "qoder.com".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A jar holding only tracking cookies means nobody signed in.
+    ///
+    /// LIVE MEASUREMENT, this host: exactly one cookie, `tfstk`. Sending it
+    /// returns 401, which was published as a rejected credential and put qoder
+    /// in `cookieLoginsStale` -- telling an operator that a working login had
+    /// expired, for an account that never existed.
+    #[test]
+    fn a_tracking_only_jar_is_nobody_signed_in() {
+        assert!(jar_is_tracking_only(&jar_of(&["tfstk"])));
+    }
+
+    /// One unrecognised cookie is enough to send the jar as before.
+    ///
+    /// The asymmetry is deliberate and is the whole shape of this guard. An
+    /// unknown cookie could be the session, and reporting a signed-in account as
+    /// never configured is the class that authorises a consumer to forget it --
+    /// strictly worse than today's wrong-but-visible report. So the judgement
+    /// goes back to the upstream, which is the only party that can make it.
+    #[test]
+    fn an_unrecognised_cookie_keeps_the_jar_in_play() {
+        assert!(!jar_is_tracking_only(&jar_of(&["tfstk", "qoder_session"])));
+        assert!(!jar_is_tracking_only(&jar_of(&["qoder_session"])));
+    }
+
+    /// An empty jar is not "tracking only" -- it is handled before this runs.
+    ///
+    /// Without the emptiness check the predicate answers true for no cookies at
+    /// all, which is a different state with its own message, and folding them
+    /// would report "only tracking cookies" for a jar that has none.
+    #[test]
+    fn an_empty_jar_is_a_different_state() {
+        assert!(!jar_is_tracking_only(&jar_of(&[])));
+    }
 
     #[test]
     fn maps_snake_case_percentage_and_provider_reset_to_primary() {
