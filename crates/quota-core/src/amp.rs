@@ -174,6 +174,21 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
             resets_at.map(|resets_at| RateWindow {
                 used_percent,
                 raw_used_percent: None,
+                // PROJECTED, and the wire cannot say so. Amp replenishes
+                // continuously at `hourlyReplenishment`, so this timestamp is the
+                // computed time to FULL recovery, not a cutoff -- the account
+                // regains usable headroom throughout, and a consumer doing
+                // fixed-window math on it blocks dispatch for a wall that is not
+                // there. The decision to compute it was ratified as an
+                // "explicitly-labelled computed reset"; the label exists only in
+                // this file, because the wire has no way to distinguish a
+                // projection from an upstream-stated reset.
+                //
+                // The honest fix is to carry the RATE the upstream already sends
+                // instead of destroying it here, which is a shared-crate change.
+                // Tracked on issue #1 (WIRE-1) with the population count that
+                // decides it. Until then, do not let this arithmetic look like a
+                // reading.
                 resets_at: Some(resets_at),
                 // Dropped rather than emitted when the upstream number is not a
                 // duration: the conversion to an integer saturates instead of
