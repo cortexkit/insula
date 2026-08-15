@@ -1054,6 +1054,76 @@ fn accounts_of(snapshot: &crate::UsageSnapshot) -> Vec<Option<&str>> {
 /// consumer to delete its entire store at every module start. Completeness is
 /// keyed on a handle enumeration having SUCCEEDED, which cannot have happened
 /// before the first turn.
+/// Every error class the wire can carry is documented, and nothing extra is.
+///
+/// The class strings are the machine-readable half of the contract: three
+/// consumer teams branch on them, and the table in docs/consumer-contract.md is
+/// where they read what each one means. `FetchError::error_class` matches
+/// exhaustively over the variants, so adding a ninth breaks the BUILD -- but
+/// nothing makes anyone add the row, and a class published without a row is one
+/// a consumer meets with no way to learn what it means.
+///
+/// Compared BOTH directions on purpose. A missing row is the drift above; an
+/// extra row is a class documented and never emitted, which sends a consumer to
+/// write handling for a state that cannot occur.
+///
+/// Precedent for reading a doc from a test is the provider count pinned against
+/// the registry in this file: the same defect, the same fix.
+#[test]
+fn every_wire_error_class_has_a_documented_row() {
+    let contract = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/consumer-contract.md"),
+    )
+    .expect("consumer-contract.md must be readable from the crate directory");
+
+    // Constructed from the variants rather than listed, so a new class arrives
+    // here by construction instead of by someone remembering this test.
+    let emitted: Vec<&'static str> = vec![
+        FetchError::NoSession(String::new()).error_class(),
+        FetchError::CredentialUnusable(String::new()).error_class(),
+        FetchError::NoQuotaReported(String::new()).error_class(),
+        FetchError::LocalSourceUnavailable(String::new()).error_class(),
+        FetchError::Unauthorized(String::new()).error_class(),
+        FetchError::ProviderStatus(500).error_class(),
+        FetchError::Decode(String::new()).error_class(),
+        FetchError::Internal(String::new()).error_class(),
+    ];
+
+    for class in &emitted {
+        assert!(
+            contract.contains(&format!("`{class}`")),
+            "{class} reaches the wire with no row in docs/consumer-contract.md: a \
+             consumer meets it with nothing to read"
+        );
+    }
+
+    // The other direction: a row for a class nothing emits describes a state that
+    // cannot occur, which is worse than silence because it reads as reachable.
+    let documented: Vec<String> = contract
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(str::to_string))
+        .filter(|token| {
+            token.contains('_') && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        })
+        .collect();
+    for row in &documented {
+        assert!(
+            emitted.contains(&row.as_str()),
+            "docs/consumer-contract.md documents `{row}`, which no FetchError \
+             produces: a consumer would write handling for an unreachable state"
+        );
+    }
+
+    // Not vacuous: the table was actually found and read. Without this, a renamed
+    // heading or a moved table passes both loops above by matching nothing.
+    assert_eq!(
+        documented.len(),
+        emitted.len(),
+        "expected one row per class; found rows {documented:?} against {emitted:?}"
+    );
+}
+
 #[tokio::test]
 async fn no_provider_is_complete_before_the_first_turn() {
     let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
