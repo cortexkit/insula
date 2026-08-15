@@ -27,8 +27,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.49.6** (36 providers registered; verified
-2026-08-14). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.50.0** (36 providers registered; verified
+2026-08-15; the `cursor` app-auth lane from this round is in flight). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -134,6 +134,60 @@ Two things worth remembering from this round:
   upstream's code; it was that our own standing diagnosis of a live provider was
   unsupported.
 
+
+### v0.50.0
+
+**The tripwire did not fire for this one.** A watch-gap notice arrived saying
+stored data was behind the vendor, and checking the tag list directly found
+v0.50.0 already shipped. The lesson is not about that watch: a release-tracking
+mechanism fails silently by definition, because a release that never arrives
+looks exactly like no release. Treat a gap notice from ANY watch as a reason to
+check the thing it watches, not as information about the watch.
+
+Constants re-checked first per the procedure: all four present at v0.50.0.
+
+**`cursor` gains a headless credential lane, and this one is worth having.** The
+provider is dark on any host with no browser session — the jar holds only
+anonymous analytics ids. Upstream added `CursorAppAuth`, which reads the Cursor
+editor's own SQLite store rather than a browser:
+
+```text
+state.vscdb  ->  cursorAuth/accessToken (JWT)
+                 sub claim, last `|` segment  ->  user id
+WorkosCursorSessionToken = <user id>%3A%3A<access token>
+```
+
+Verified end to end on this host before any code was written: the synthesized
+cookie returns HTTP 200 with a real usage summary from the endpoint this module
+already calls. `cursorAuth/cachedEmail` sits beside it, so the entry can carry an
+account identity it has never had.
+
+Cleared the rotation gate first, which is what killed the Claude and Codex plugin
+lanes: this READS an access token and uses it directly. No refresh exchange, so
+nothing rotates and no editor sign-in is disturbed. The JWT carries an exp in
+2107, so no refresh is needed at all. `cursorAuth/refreshToken` sits in the same
+table and must never be touched.
+
+**`gemini`: Google shut down Gemini CLI OAuth for individual, AI Pro and Ultra
+accounts in June 2026.** Upstream now ships user-facing copy directing those
+accounts to Antigravity instead; workspace and education accounts keep working.
+
+Nothing to port — but recording it here because of what it will look like when it
+reaches an account. The lane will start failing with an auth rejection, and this
+module will publish `credential_rejected`, whose whole meaning is *the credential
+was refused, re-authenticate*. Re-authenticating cannot work, because the
+mechanism is gone rather than the session. A future reader seeing gemini fail on
+a consumer account should check this line before diagnosing a credential problem,
+and the remedy is the Antigravity provider, which already serves on this host.
+
+This host's gemini account is unaffected today: it returns four per-model windows
+on a live fetch, so its 0% is real unused quota rather than a hollow reading.
+
+**Declined: `CodexCLIBackendConfiguration`.** It classifies rate-limit errors by
+which backend the Codex CLI's `config.toml` selects. This module never reads that
+file — it reads `auth.json` and queries OpenAI's usage endpoint directly — so
+there is nothing here to classify.
+
 ### Opaque constants, re-checked every round
 
 Four values are copied from the upstream rather than derived from anything we
@@ -154,7 +208,7 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All four matched CodexBar v0.49.6, re-verified 2026-08-14 by locating each value
+All four matched CodexBar v0.50.0, re-verified 2026-08-15 by locating each value
 in the tagged tree (`git grep <value> v0.49.3 -- Sources/`) rather than in the
 checkout, which usually sits at an older tag.
 
