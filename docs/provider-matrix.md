@@ -28,7 +28,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 ## Parity status
 
 **Current parity: CodexBar v0.50.0** (36 providers registered; verified
-2026-08-15; the `cursor` app-auth lane from this round is in flight). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+2026-08-15; the `cursor` app-auth lane from this round is live). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -161,6 +161,10 @@ Verified end to end on this host before any code was written: the synthesized
 cookie returns HTTP 200 with a real usage summary from the endpoint this module
 already calls. `cursorAuth/cachedEmail` sits beside it, so the entry can carry an
 account identity it has never had.
+
+Shipped and verified on the wire: `cursor` moved from `credential_absent` to
+serving, labelled with a real account email it has never carried before, and the
+host's unconfigured count fell from 27 to 26.
 
 Cleared the rotation gate first, which is what killed the Claude and Codex plugin
 lanes: this READS an access token and uses it directly. No refresh exchange, so
