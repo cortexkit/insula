@@ -282,6 +282,18 @@ for health, never on this field's presence.
 | `decode_failed` | a response arrived in an unexpected shape | yes |
 | `internal_error` | a fault in this module, contained rather than crashing | sometimes |
 
+A revoked OAuth credential reaches you as `credential_unusable`, not as a
+transient failure. When a token endpoint refuses a refresh by *stating*
+`invalid_grant`, that is permanent under RFC 6749 §5.2 — the grant is gone and
+retrying cannot recover it — so the entry degrades rather than continuing to
+serve its last healthy window. Any other refusal from that endpoint stays
+transient and keeps stale-serving, because a rate-limited or malformed refresh
+must not condemn a working account.
+
+This is worth knowing precisely because the previous behaviour was invisible: a
+dead account kept publishing its last capacity reading with no upper age bound,
+never degraded, and went on counting as serving in the health snapshot.
+
 The self-recovery column is the one a user-facing surface should group on,
 because it decides between two sentences: **wait**, or **act**. Read it off the
 column rather than from any summary here — a `no` means someone must do
