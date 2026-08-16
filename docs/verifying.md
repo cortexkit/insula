@@ -10,6 +10,20 @@ repo that knows better.
 ## The gates
 
 ```bash
+scripts/gates.sh          # fmt, clippy, unit tests
+scripts/gates.sh --e2e    # also the integration suites, ~80s more
+```
+
+That runs the steps below in order and stops at the first failure. **Use it
+rather than the individual commands**: the ordering is load-bearing and this
+document said so for weeks while two breaks still reached master, because an
+ordering that depends on remembering is not an ordering. A stale sibling now
+triggers the forced recompile inside the script instead of printing advice at
+the moment of least suspicion.
+
+What it runs:
+
+```bash
 python3 scripts/sibling-freshness.py                              # see below
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings             # must be 0

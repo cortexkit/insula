@@ -185,6 +185,9 @@ python3 scripts/unread-credentials.py
 
 # read the production half of a Rust file, with the test module cut off. Any
 # sweep asking "does every provider do X" needs this, or assertions inside
+# run every gate in the order that makes them mean something:
+scripts/gates.sh
+
 # refuse a cargo gate result that may have come from cache. This workspace
 # path-depends on a sibling repo, so that repo can change while nothing here
 # does -- cargo then has nothing to redo and reports clean, and CI, which always
