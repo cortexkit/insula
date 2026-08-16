@@ -192,6 +192,30 @@ which backend the Codex CLI's `config.toml` selects. This module never reads tha
 file — it reads `auth.json` and queries OpenAI's usage endpoint directly — so
 there is nothing here to classify.
 
+### openrouter, added 2026-08-16 outside a parity round
+
+Not from CodexBar. Found by listing the opencode auth store against the
+registry: **five credentials on this host are read by no provider at all**
+(openrouter, cerebras, fireworks-ai, inception, amazon-bedrock). The
+unread-credentials detector crosses REGISTERED providers against the store, so
+it structurally cannot see a credential with no provider behind it — a blind
+spot nothing here covered.
+
+`openrouter` publishes `GET /api/v1/credits` -> `{total_credits, total_usage}`,
+proved live before any code was written. One derived USD pool, `funding:
+unknown` because the endpoint never says whether credits were bought or comped.
+
+**`GET /api/v1/auth/key` is deliberately unused.** It carries `usage`,
+`usage_daily/weekly/monthly` and `limit`, and on this account both `limit` and
+`limit_remaining` are null — spend-to-date with no cap. That fits no shape on
+this wire: a rate window needs a utilisation, a pool needs a balance, and
+publishing consumption with no denominator invites a consumer to invent one. If
+an account ever sets a spend limit, that is a separate decision with its own
+evidence.
+
+The remaining four uncovered credentials are unexamined. Worth a look when
+someone has reason to, but none is a known quota surface the way openrouter was.
+
 ### Opaque constants, re-checked every round
 
 Four values are copied from the upstream rather than derived from anything we
