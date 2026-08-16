@@ -24,6 +24,7 @@ Current, and kept true against the code:
 |---|---|
 | `provider-invariants.md` | what a provider normalizer must and must not do |
 | `consumer-contract.md` | what `usage.get` promises a consumer, and what it does not |
+| `verifying.md` | the gate procedure, in one place so a task prompt points at it rather than restating it |
 | `deploying.md` | how to replace a running build, and how to verify which one is live |
 | `provider-matrix.md` | per-provider auth archetype, endpoint, and verification status |
 | `codex-banked-resets-design.md` | how the one mutating feature is fenced against double-spend |
