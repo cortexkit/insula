@@ -2,6 +2,9 @@
 //!
 //! A browser session remains the first credential surface. When it has no recognized
 //! session cookie, Cursor's local app store supplies an access-token-backed cookie.
+//! Browser usage gets an account ID and optional cached email only when the user ID
+//! in its WorkOS session cookie matches the ID decoded from Cursor's local app-auth
+//! access token.
 
 use std::{
     path::{Path, PathBuf},
@@ -84,22 +87,43 @@ struct CursorAppAuth {
     email: Option<String>,
 }
 
+/// Browser account identity retained only after the app-auth access-token ID matches
+/// the user ID in the browser's WorkOS session cookie.
+struct CursorBrowserIdentity {
+    user_id: String,
+    email: Option<String>,
+}
+
 enum CursorCredential {
-    Browser { cookie_header: String },
+    Browser {
+        cookie_header: String,
+        identity: Option<CursorBrowserIdentity>,
+    },
     App(CursorAppAuth),
 }
 
 impl CursorCredential {
     fn cookie_header(&self) -> String {
         match self {
-            Self::Browser { cookie_header } => cookie_header.clone(),
+            Self::Browser { cookie_header, .. } => cookie_header.clone(),
             Self::App(auth) => app_auth_cookie_header(&auth.user_id, &auth.access_token),
+        }
+    }
+
+    fn observed_account(&self) -> Option<&str> {
+        match self {
+            Self::Browser { identity, .. } => {
+                identity.as_ref().map(|identity| identity.user_id.as_str())
+            }
+            Self::App(auth) => auth.email.as_deref(),
         }
     }
 
     fn account_email(&self) -> Option<&str> {
         match self {
-            Self::Browser { .. } => None,
+            Self::Browser { identity, .. } => identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref()),
             Self::App(auth) => auth.email.as_deref(),
         }
     }
@@ -153,6 +177,46 @@ fn cursor_user_id_from_access_token(access_token: &str) -> Result<String, FetchE
 /// Build Cursor's expected session-cookie value without percent-encoding it twice.
 fn app_auth_cookie_header(user_id: &str, access_token: &str) -> String {
     format!("WorkosCursorSessionToken={user_id}%3A%3A{access_token}")
+}
+
+/// Take only the user-id prefix from Cursor's encoded WorkOS session cookie.
+fn cursor_user_id_from_session_cookie(cookie_value: &str) -> Option<&str> {
+    cookie_value
+        .split_once("%3A%3A")
+        .map(|(user_id, _)| user_id)
+        .filter(|user_id| !user_id.is_empty())
+}
+
+fn workos_session_cookie_value(jar: &CookieJar) -> Option<&str> {
+    jar.cookies
+        .iter()
+        .find(|cookie| cookie.name == "WorkosCursorSessionToken")
+        .map(|cookie| cookie.value.as_str())
+}
+
+/// Attach the browser cookie's account ID and the app store's optional cached email
+/// only when the ID decoded from the access token matches the WorkOS cookie's ID.
+///
+/// The app store only enriches browser usage; if it is missing, unreadable, or
+/// belongs to another user, leave usage unlabelled instead of returning an error.
+fn browser_identity_from_app_auth(
+    browser_user_id: Option<&str>,
+    app_auth: Result<Option<CursorAppAuth>, FetchError>,
+) -> Option<CursorBrowserIdentity> {
+    let browser_user_id = browser_user_id?;
+    let app_auth = match app_auth {
+        Ok(Some(app_auth)) => app_auth,
+        Ok(None) | Err(_) => return None,
+    };
+
+    if app_auth.user_id == browser_user_id {
+        Some(CursorBrowserIdentity {
+            user_id: browser_user_id.to_string(),
+            email: app_auth.email,
+        })
+    } else {
+        None
+    }
 }
 
 fn immutable_app_auth_uri(path: &Path) -> Result<String, FetchError> {
@@ -227,8 +291,17 @@ fn resolve_cursor_credential(
     app_auth_path: Option<&Path>,
 ) -> Result<CursorCredential, FetchError> {
     if jar.has_cookie_named(is_session_cookie) {
+        let browser_user_id =
+            workos_session_cookie_value(jar).and_then(cursor_user_id_from_session_cookie);
+        let app_auth = if browser_user_id.is_some() {
+            load_app_auth_from_path(app_auth_path)
+        } else {
+            Ok(None)
+        };
+        let identity = browser_identity_from_app_auth(browser_user_id, app_auth);
         return Ok(CursorCredential::Browser {
             cookie_header: jar.header(),
+            identity,
         });
     }
 
@@ -349,16 +422,15 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 }
 
 fn provider_usage_from_credential(credential: &CursorCredential, usage: Usage) -> ProviderUsage {
-    let account = credential.account_email().map(str::to_string);
     let mut provider_usage = ProviderUsage::healthy(
         PROVIDER_NAME,
-        account.clone(),
+        credential.observed_account().map(str::to_string),
         credential.source_label(),
         usage,
     );
-    if let Some(email) = account {
+    if let Some(email) = credential.account_email() {
         provider_usage.account_info = Some(AccountInfo {
-            email: Some(email),
+            email: Some(email.to_string()),
             org_name: None,
             plan_type: None,
         });
@@ -447,6 +519,26 @@ mod tests {
 
     fn empty_jar() -> CookieJar {
         CookieJar { cookies: vec![] }
+    }
+
+    fn browser_jar(session_cookie_value: &str) -> CookieJar {
+        CookieJar {
+            cookies: vec![browser_cookies::Cookie {
+                name: "WorkosCursorSessionToken".to_string(),
+                value: session_cookie_value.to_string(),
+                host_key: DOMAIN.to_string(),
+            }],
+        }
+    }
+
+    fn healthy_usage() -> Usage {
+        normalize_usage(
+            br#"{
+                "billingCycleEnd": "2026-07-24T03:00:00Z",
+                "individualUsage": { "plan": { "totalPercentUsed": 45.5 } }
+            }"#,
+        )
+        .unwrap()
     }
 
     fn create_state_db(path: &Path, access_token: &str, email: Option<&str>) {
@@ -629,21 +721,128 @@ mod tests {
     }
 
     #[test]
+    fn matching_browser_and_app_user_ids_attach_identity_to_browser_usage() {
+        let path = test_path("matching-browser-app.vscdb");
+        let access_token = synthetic_jwt("organization|user-id");
+        create_state_db(&path, &access_token, Some("account@example.test"));
+
+        let credential = resolve_cursor_credential(
+            &browser_jar("user-id%3A%3Asynthetic-browser-session"),
+            Some(&path),
+        )
+        .unwrap();
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+
+        assert_eq!(provider_usage.account.as_deref(), Some("user-id"));
+        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(
+            provider_usage
+                .account_info
+                .as_ref()
+                .and_then(|info| info.email.as_deref()),
+            Some("account@example.test")
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn differing_browser_and_app_user_ids_leave_browser_usage_unlabelled() {
+        let path = test_path("differing-browser-app.vscdb");
+        let access_token = synthetic_jwt("organization|app-user-id");
+        create_state_db(&path, &access_token, Some("account@example.test"));
+
+        let credential = resolve_cursor_credential(
+            &browser_jar("browser-user-id%3A%3Asynthetic-browser-session"),
+            Some(&path),
+        )
+        .unwrap();
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+
+        assert!(
+            provider_usage.usage.is_some(),
+            "browser usage must still publish"
+        );
+        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert!(
+            provider_usage.account.is_none(),
+            "different accounts must not label usage"
+        );
+        assert!(provider_usage.account_info.is_none());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn absent_app_auth_store_leaves_browser_usage_unlabelled() {
+        let path = test_path("missing-browser-app.vscdb");
+        let credential = resolve_cursor_credential(
+            &browser_jar("user-id%3A%3Asynthetic-browser-session"),
+            Some(&path),
+        )
+        .unwrap();
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+
+        assert!(
+            provider_usage.usage.is_some(),
+            "browser usage must still publish"
+        );
+        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert!(provider_usage.account.is_none());
+        assert!(provider_usage.account_info.is_none());
+    }
+
+    #[test]
+    fn unreadable_app_auth_store_leaves_browser_usage_unlabelled() {
+        let path = test_path("unreadable-browser-app");
+        fs::create_dir(&path).unwrap();
+
+        let credential = resolve_cursor_credential(
+            &browser_jar("user-id%3A%3Asynthetic-browser-session"),
+            Some(&path),
+        )
+        .unwrap();
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+
+        assert!(
+            provider_usage.usage.is_some(),
+            "browser usage must still publish"
+        );
+        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert!(provider_usage.account.is_none());
+        assert!(provider_usage.account_info.is_none());
+
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_workos_cookie_leaves_browser_usage_unlabelled() {
+        let path = test_path("malformed-browser-cookie.vscdb");
+        let access_token = synthetic_jwt("organization|user-id");
+        create_state_db(&path, &access_token, Some("account@example.test"));
+
+        let credential = resolve_cursor_credential(&browser_jar("user-id"), Some(&path)).unwrap();
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+
+        assert!(
+            provider_usage.usage.is_some(),
+            "browser usage must still publish"
+        );
+        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert!(provider_usage.account.is_none());
+        assert!(provider_usage.account_info.is_none());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn app_auth_email_labels_the_observed_account_and_account_info() {
         let credential = CursorCredential::App(CursorAppAuth {
             access_token: synthetic_jwt("user-id"),
             user_id: "user-id".to_string(),
             email: Some("account@example.test".to_string()),
         });
-        let usage = normalize_usage(
-            br#"{
-                "billingCycleEnd": "2026-07-24T03:00:00Z",
-                "individualUsage": { "plan": { "totalPercentUsed": 45.5 } }
-            }"#,
-        )
-        .unwrap();
-
-        let provider_usage = provider_usage_from_credential(&credential, usage);
+        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
         assert_eq!(
             provider_usage.account.as_deref(),
             Some("account@example.test")
