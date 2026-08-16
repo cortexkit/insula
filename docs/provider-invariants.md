@@ -110,6 +110,33 @@ The class also matters beyond the wire: `decode_failed` counts toward the stale
 browser login metric, so misfiling an account fact as a parse failure tells an
 operator to re-authenticate a session that works.
 
+### Running a mutation proof: use the tool, do not hand-roll the restore
+
+`scripts/probe.py` applies a mutation, runs the tests, and restores — staging
+first so the restore lands on your work rather than on HEAD, in a `finally` and
+from signal handlers so no exit path leaves the tree mutated, and classifying the
+outcome into reddened / undefended / NOT REACHED / HUNG.
+
+**Do not hand-roll this with `git checkout --`.** That command restores from the
+index, so with uncommitted work in the tree it reverts the whole file, not the
+mutation. A worker here hit exactly that on 2026-08-16: its implementation
+vanished at the first restore, it re-applied the change by hand after each of
+five proofs, and the delivery's "verified byte-identical" became a claim rather
+than a checked fact. Every one of those proofs then ran against a hand-rebuilt
+copy of the code under test.
+
+Note where the failure actually came from: this repo had the hazard written down
+twice, and the three task prompts issued that day *instructed the unsafe method
+by name* — "confirm the restore was byte-identical via `git checkout --`". The
+worker followed its instructions correctly. **When a tool exists to make a
+procedure safe, name the tool at the point of use; describing the manual dance
+teaches the hazard to whoever reads it next**, and a prompt is read far more
+carefully than a doc.
+
+If you must mutate by hand — a file the tool cannot target, a multi-file change —
+then `git add` first, and verify the restore with `git diff` against the staged
+state rather than assuming.
+
 ### A mutation tool must survive the signal, not just the exception
 
 Both tools here neutralise a piece of source, run the suite, and put it back.
