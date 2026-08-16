@@ -62,6 +62,27 @@ serves most of the labelled accounts here — on this host it examines 16 window
 against the deployed module's 30. A clean result from it is not a statement about
 what production publishes.
 
+## Before claiming a gate result
+
+`cargo clippy --workspace --all-targets -- -D warnings` reporting `0` means
+cargo found nothing to redo, which is not the same as nothing being wrong. This
+workspace path-depends on `../subconscious`, so that repo can change while
+nothing in this tree does — and then a cached clean answer is reported as a gate
+result while CI, which always builds cold, fails on a compile error. That
+happened on 2026-08-16 and put a compile break on master.
+
+Run `python3 scripts/sibling-freshness.py` first. It exits 1 when a sibling
+repository's HEAD is newer than this workspace's newest build artifact, and
+prints the forced-recompile command. It does not check whether the sibling
+change breaks anything — it cannot, and the honest answer is "your cache may
+predate a change", not "you are broken".
+
+Related trap, same family: `cargo test --test <name>` does NOT rebuild the
+binaries an integration test spawns. A stale `ck-insula` fails registration with
+no error output at all, which reads as a hang rather than a build problem. Build
+the bins before running the e2e suites.
+
+
 ## Do not kill the process
 
 Use `ck module restart`. A bare `kill` has left the module in supervision state

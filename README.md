@@ -184,6 +184,12 @@ python3 scripts/unread-credentials.py
 
 # read the production half of a Rust file, with the test module cut off. Any
 # sweep asking "does every provider do X" needs this, or assertions inside
+# refuse a cargo gate result that may have come from cache. This workspace
+# path-depends on a sibling repo, so that repo can change while nothing here
+# does -- cargo then has nothing to redo and reports clean, and CI, which always
+# builds cold, fails. Exits 1 when a sibling moved after the last local build:
+python3 scripts/sibling-freshness.py
+
 # tests count as production code:
 python3 scripts/prod_body.py crates/quota-core/src/*.rs
 
