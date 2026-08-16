@@ -50,6 +50,7 @@ pub mod ollama;
 pub mod opencode;
 pub mod opencode_auth;
 pub mod opencodego;
+pub mod openrouter;
 pub mod provider;
 pub mod qoder;
 pub mod qwen_cloud;
@@ -325,6 +326,7 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         "synthetic" => Some("synthetic"),
         "opencode" => Some("opencode"),
         "opencodego" => Some("opencode-go"),
+        "openrouter" => Some("openrouter"),
         "ollama" => Some("ollama-cloud"),
         "sakana" => Some("sakana"),
         "neuralwatt" => Some("neuralwatt"),
@@ -474,6 +476,7 @@ impl Registry {
             Box::new(ollama::OllamaProvider::new()),
             Box::new(opencode::OpenCodeProvider::new()),
             Box::new(opencodego::OpenCodeGoProvider::new()),
+            Box::new(openrouter::OpenRouterProvider::new()),
             Box::new(qoder::QoderProvider::new()),
             Box::new(qwen_cloud::QwenCloudProvider::new()),
             Box::new(sakana::SakanaProvider::new()),
