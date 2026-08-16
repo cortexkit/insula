@@ -482,9 +482,26 @@ fn check_across_entries(entries: &[ProviderUsage], report: &mut SanityReport) {
         // the same account as one of the labelled ones, so a consumer summing
         // per-account capacity can count one account twice without any duplicate
         // key to notice.
-        if unlabelled > 0 && labelled > 0 {
+        //
+        // Only an unlabelled row that SERVES USAGE can be double-counted, and the
+        // producer draws the same line: the emission gate collapses labels only
+        // when an identity-less handle is actively serving. A handle that failed
+        // -- a credential needing re-auth, say -- publishes its own degraded row
+        // beside healthy labelled siblings ON PURPOSE, so that one broken account
+        // does not strip the labels off the working ones. That shape is correct
+        // and firing on it would report the fix as the defect.
+        //
+        // This rule was written before that narrowing and did not receive it. A
+        // checker that disagrees with its producer about a designed shape cries
+        // wolf on correct behaviour, and gets ignored by its third firing.
+        let unlabelled_serving = siblings
+            .iter()
+            .filter(|entry| entry.account.is_none() && entry.usage.is_some())
+            .count();
+        if unlabelled_serving > 0 && labelled > 0 {
             report.findings.push(format!(
-                "{provider}: {labelled} labelled and {unlabelled} unlabelled entries in the same array"
+                "{provider}: {labelled} labelled and {unlabelled_serving} unlabelled entries \
+                 serving usage in the same array"
             ));
         }
 
@@ -1740,6 +1757,39 @@ mod tests {
                 .any(|f| f.contains("2 unlabelled entries")),
             "{:?}",
             report.findings
+        );
+    }
+
+    /// A DEGRADED unlabelled entry beside labelled siblings is correct, not a finding.
+    ///
+    /// LIVE SHAPE, 2026-08-16: `claude` served two labelled accounts while a third
+    /// handle needed re-authentication and published its own degraded row. The
+    /// producer does that deliberately -- collapsing labels would strip them off
+    /// the two working accounts because of one broken credential.
+    ///
+    /// The double-counting this rule guards needs an unlabelled row carrying
+    /// USAGE; a degraded row contributes nothing to a capacity sum. Firing here
+    /// reports the fix as the defect, and a checker that cries wolf on designed
+    /// behaviour is ignored by its third firing.
+    #[test]
+    fn a_degraded_unlabelled_entry_beside_labelled_ones_is_not_a_finding() {
+        let mut broken = unlabelled("claude");
+        broken.usage = None;
+        broken.error = Some("credential requires authentication".to_string());
+        broken.error_class = Some("credential_unusable".to_string());
+
+        let report = check_entries(
+            &[
+                labelled("claude", "acct-1"),
+                labelled("claude", "acct-2"),
+                broken,
+            ],
+            at("2026-08-16T10:00:00Z"),
+        );
+        assert_eq!(
+            report.findings,
+            Vec::<String>::new(),
+            "a handle that failed must not read as a double-count risk"
         );
     }
 
