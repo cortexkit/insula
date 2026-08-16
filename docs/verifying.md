@@ -45,6 +45,41 @@ compiling for a while. A failure there is worth re-running alone before treating
 it as real, and worth NOT "fixing" by widening the gate: CI passes it as-is, and
 widening a gate to accommodate a busy dev machine is masking.
 
+## Why CI takes about three minutes, measured
+
+Audited 2026-08-16 across three green runs, because a fleet relay ranked seven
+pipeline mechanisms and the first was *measure before mechanism* — another
+repo's two intuitive wins had been falsified by its own logs. Mine falsifies the
+whole ranked list, which is worth more than adopting it would have been.
+
+The ubuntu job, 177.6s end to end:
+
+| phase | time |
+|---|---|
+| checkout, toolchain, clippy (33s), compile | 89.3s |
+| test execution | 88.3s |
+| — of which `i8_vault_stub_two_accounts_fail_closed_without_handle_reap` | **60.4s** |
+
+**One test is a third of the job**, and it is not slow by accident. It kills the
+vault stub and waits for the affected slot to fail closed, which happens on that
+slot's next refresh — so it is waiting out `BASE_INTERVAL`, a 60-second
+production cadence.
+
+Every mechanism on that ranked list (shard the build, share binaries across
+lanes, tune cache keys) attacks the 89s compile half. None touches the 60s,
+because the 60s is not work — it is elapsed time.
+
+**The obvious lever is a test-only override of `BASE_INTERVAL`, and it is
+refused.** `FRESH_HORIZON` must exceed `BASE_INTERVAL + FETCH_DEADLINE`, and a
+test running a one-second interval inverts that: the test would then pass under
+a timing configuration production never runs, while claiming to verify
+fail-closed behaviour that is entirely timing-dependent. A faster suite that
+proves something else is not a faster suite.
+
+Also worth the size check before optimising anything here: the relay's source
+repo went from 19–26 minutes to 8. This pipeline is already 3–4 minutes, so the
+mechanisms are sized for a problem this repo does not have.
+
 ## Mutation proofs
 
 Use `scripts/probe.py`. It stages first, restores in a `finally` and from signal
