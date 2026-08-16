@@ -208,18 +208,50 @@ def main() -> int:
         print(f"  {provider:21} {slug:26} YES ({kind})")
         findings.append((provider, slug, kind))
 
+    # A provider with no canonical slug is not necessarily uncheckable: the store
+    # may key on the provider's own name. Crossing on that too shrinks a blind
+    # spot that covered half the registry -- and "not crossable" was the honest
+    # label for it, which is exactly why it was worth re-reading rather than
+    # trusting the clean verdict beside it.
+    #
+    # Exact match only. `kimi` and the stored `kimi-for-coding` are DIFFERENT
+    # PRODUCTS -- a consumer subscription and a developer API with separate price
+    # tables -- which is why kimi deliberately has no canonical slug. A substring
+    # match here would report a credential the provider cannot use.
+    name_hits = []
+    for provider in list(unmapped):
+        entry = store.get(provider)
+        if not entry:
+            continue
+        kind = entry.get("type", "?") if isinstance(entry, dict) else "?"
+        if absent is not None and provider not in absent:
+            print(f"  {provider:21} {'(by name)':26} YES ({kind}) -- but not absent, so no gap")
+            unmapped.remove(provider)
+            continue
+        print(f"  {provider:21} {'(by name)':26} YES ({kind})")
+        findings.append((provider, provider, kind))
+        name_hits.append(provider)
+        unmapped.remove(provider)
+
     if unmapped:
         print()
-        print(f"  not crossable ({len(unmapped)}, no canonical slug, so no store key to look for):")
+        print(
+            f"  no slug and no store key under their own name ({len(unmapped)}); "
+            "nothing left to cross them against:"
+        )
         print("   ", ", ".join(unmapped))
 
     print()
     if findings:
         print(f"findings: {len(findings)}")
         for provider, slug, kind in findings:
-            print(f"  {provider} reads only its environment, but a {kind} credential for")
-            print(f"    '{slug}' is present on this host. If that key would authenticate")
-            print(f"    {provider}, it is reporting credential_absent while its credential exists.")
+            # The key is named separately from the provider because they are the
+            # same string only in the by-name case; saying "the key 'x'" keeps
+            # the sentence true either way.
+            print(f"  {provider} reads only its environment, but the store holds a")
+            print(f"    {kind} credential under the key '{slug}'. If that key would")
+            print(f"    authenticate {provider}, it is reporting credential_absent while")
+            print("    its credential exists on this host.")
         print()
         print("Not automatically a defect: a slug can hold a credential for a")
         print("DIFFERENT product on the same API. Check what the endpoint accepts")
@@ -228,7 +260,13 @@ def main() -> int:
         return 1
 
     print("findings: none")
-    print(f"({len(crossable)} providers crossed against {len(store)} stored credentials;")
+    # Two populations, stated separately: a single total would hide which half
+    # of the cross did the work, and the by-name half exists precisely because
+    # the by-slug half could not see those providers at all.
+    print(
+        f"({len(crossable)} crossed by slug + {len(unmapped) + len(name_hits)} by name "
+        f"against {len(store)} stored credentials;"
+    )
     print(" a clean result here is about THIS host's logins, not about the code)")
     return 0
 
