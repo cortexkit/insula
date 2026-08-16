@@ -926,10 +926,19 @@ impl Registry {
                 ),
                 FetchOutcome::Cancelled => continue,
             };
+            // Whether this attempt made the slot ENTER stale-serving. Decided
+            // here, where the transition is computed, and applied under the
+            // store lock below so the counter is consistent with the slot it
+            // describes. A slot already stale is a continuation, not a new
+            // episode.
+            let enters_stale = refresh::enters_stale_transient(&unit.prev, &next);
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if enters_stale {
+                store.record_stale_episode();
+            }
             store.publish_if_current(
                 &unit.key,
                 unit.prev.incarnation,
@@ -988,8 +997,13 @@ impl Registry {
             .filter(|provider| provider.cookie_based)
             .count();
 
-        let (snapshot, last_tick_at, created_at) = match self.store.lock() {
-            Ok(store) => (store.snapshot(), store.last_tick_at(), store.created_at()),
+        let (snapshot, last_tick_at, created_at, stale_episodes) = match self.store.lock() {
+            Ok(store) => (
+                store.snapshot(),
+                store.last_tick_at(),
+                store.created_at(),
+                store.stale_episodes(),
+            ),
             Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
         };
         let now = Instant::now();
@@ -1133,6 +1147,7 @@ impl Registry {
             providers_total,
             fresh,
             stale,
+            stale_episodes,
             pending,
             degraded,
             unconfigured,

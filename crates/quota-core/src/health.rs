@@ -45,6 +45,26 @@ pub struct HealthSnapshot {
     /// Providers serving a prior good window after a transient failure (stale,
     /// but not wrong — the session is presumed intact).
     pub stale: usize,
+    /// Monotonic count of stale-serving EPISODES since process start.
+    ///
+    /// An episode is a slot entering `StaleTransient` from any other status; a
+    /// slot that stays stale across many refresh turns is one episode, not one
+    /// per turn. This is the difference between counting failure incidence and
+    /// counting refresh cadence: `stale` above is a gauge of how many providers
+    /// are stale-serving at this instant, while this is a counter of how many
+    /// times stale-serving has ever begun since boot. A transient failure that
+    /// resolves between two polls leaves `stale` back at zero but this at one,
+    /// which is the trace a continuous watcher would otherwise miss.
+    ///
+    /// In-memory and reset by a restart on purpose: it answers "has this fired
+    /// since boot", and a durable file would be a second state store with its
+    /// own crash semantics for a diagnostic.
+    ///
+    /// NOT part of the conservation identity. It counts events over time, not
+    /// members of a population, so folding it into `fresh + stale + pending +
+    /// degraded + unconfigured + withoutHandles == providersTotal` would break
+    /// an instrument consumers rely on.
+    pub stale_episodes: u64,
     /// Providers serving nothing yet because at least one handle has not
     /// completed its first fetch.
     ///
@@ -167,6 +187,7 @@ impl HealthSnapshot {
             // classified at all. Consumers gate the identity on `last_tick_age`
             // being set, and this snapshot leaves it `None`.
             pending: 0,
+            stale_episodes: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
             without_handles: Vec::new(),

@@ -523,6 +523,14 @@ fn health_report(
         "providersTotal": snapshot.providers_total,
         "fresh": snapshot.fresh,
         "stale": snapshot.stale,
+        // Monotonic count of stale-serving EPISODES since process start, beside
+        // the instantaneous `stale` gauge above. A slot entering stale-serving
+        // from any other status is one episode; a slot that stays stale across
+        // many refresh turns is still one. This is the trace a transient failure
+        // that resolves between two polls would otherwise leave nowhere: `stale`
+        // returns to zero while this stays at one. NOT part of the conservation
+        // identity -- it counts events over time, not members of a population.
+        "staleEpisodes": snapshot.stale_episodes,
         // Providers whose first fetch has not completed. The refresher admits a
         // bounded number of fetch units per turn, so after a start the providers
         // beyond that cap are queued for several turns -- ordinary, not a fault.
@@ -923,6 +931,7 @@ mod tests {
             providers_total: 3,
             fresh: 3,
             stale: 0,
+            stale_episodes: 0,
             pending: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
@@ -1306,6 +1315,7 @@ mod tests {
             "providersTotal",
             "fresh",
             "stale",
+            "staleEpisodes",
             "pending",
             "degraded",
             "unconfigured",

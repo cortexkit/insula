@@ -361,6 +361,24 @@ pub fn next_slot_after_unverified_failure(
     )
 }
 
+/// Whether a completed attempt makes a slot ENTER stale-serving rather than
+/// continue it.
+///
+/// An episode is a slot entering `StaleTransient` from any other status. A slot
+/// that stays stale across many refresh turns is one episode, not one per turn:
+/// the counter this feeds measures failure incidence, not refresh cadence, and a
+/// single dead provider must not dominate it. The previous status is what
+/// distinguishes an entry from a continuation -- a slot already stale is not
+/// entering again.
+///
+/// This is an observation of the decision made in
+/// [`next_slot_after_attempt_inner`], not a second decision: the caller holds
+/// the store lock and increments a counter when this returns true, so the
+/// transition is counted exactly where it is decided.
+pub(crate) fn enters_stale_transient(prev: &ProviderSlot, next: &ProviderSlot) -> bool {
+    next.status == SlotStatus::StaleTransient && prev.status != SlotStatus::StaleTransient
+}
+
 fn next_slot_after_attempt_inner(
     prev: &ProviderSlot,
     provider_name: &str,

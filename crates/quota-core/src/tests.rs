@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2196,6 +2196,171 @@ async fn transient_failure_keeps_serving_last_good_window() {
     assert_eq!(usage.len(), 1);
     assert!(usage[0].error.is_none());
     assert_eq!(registry.health().stale, 1);
+}
+
+/// A provider that replays a scripted sequence of fetch outcomes, one per call.
+///
+/// `Ok` yields a healthy entry; `Err(Transient)` yields an upstream failure that
+/// stale-serves a prior window; `Err(NonTransient)` yields a failure that
+/// degrades. Driving the counter through the real refresher state machine rather
+/// than asserting `enters_stale_transient`'s return value directly is what makes
+/// the tests below non-vacuous: they observe the published metric, not the
+/// helper.
+struct ScriptedProvider {
+    name: &'static str,
+    script: Mutex<VecDeque<Result<(), FetchError>>>,
+}
+
+#[async_trait]
+impl UsageProvider for ScriptedProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let outcome = self.script.lock().unwrap().pop_front().unwrap();
+        match outcome {
+            Ok(()) => FetchAttempt::success(None, "test", Usage::default()),
+            Err(error) => FetchAttempt::failure(None, None, error),
+        }
+    }
+}
+
+fn scripted(name: &'static str, script: Vec<Result<(), FetchError>>) -> Registry {
+    Registry::new(vec![Box::new(ScriptedProvider {
+        name,
+        script: Mutex::new(script.into()),
+    })])
+}
+
+/// A slot that fails transiently while holding a healthy entry increments the
+/// stale-episode counter by exactly one.
+#[tokio::test]
+async fn a_transient_failure_entering_stale_serving_counts_one_episode() {
+    let registry = scripted(
+        "codex",
+        vec![Ok(()), Err(FetchError::Upstream("503".into()))],
+    );
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    assert_eq!(registry.health().stale, 1, "the slot is stale-serving");
+    assert_eq!(
+        registry.health().stale_episodes,
+        1,
+        "one entry into stale-serving must count one episode"
+    );
+}
+
+/// A slot that stays stale across THREE consecutive refresh turns still shows
+/// one episode.
+///
+/// This is the load-bearing distinction: an episode is a slot ENTERING
+/// stale-serving, not a slot being stale on a given turn. Counting per turn
+/// would measure refresh cadence rather than failure incidence, and a single
+/// dead provider would dominate the number entirely.
+#[tokio::test]
+async fn a_slot_stale_across_three_turns_counts_one_episode() {
+    let registry = scripted(
+        "codex",
+        vec![
+            Ok(()),
+            Err(FetchError::Upstream("503".into())),
+            Err(FetchError::Upstream("503".into())),
+            Err(FetchError::Upstream("503".into())),
+        ],
+    );
+    tick(&registry).await;
+    for _ in 0..3 {
+        force_due(&registry, "codex");
+        tick(&registry).await;
+    }
+
+    assert_eq!(registry.health().stale, 1, "the slot is stale-serving");
+    assert_eq!(
+        registry.health().stale_episodes,
+        1,
+        "staying stale across turns is a continuation, not a new episode"
+    );
+}
+
+/// Recovering and then failing transiently again shows two episodes.
+#[tokio::test]
+async fn recover_then_fail_again_counts_two_episodes() {
+    let registry = scripted(
+        "codex",
+        vec![
+            Ok(()),
+            Err(FetchError::Upstream("503".into())),
+            Ok(()),
+            Err(FetchError::Upstream("503".into())),
+        ],
+    );
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    assert_eq!(registry.health().stale_episodes, 2);
+}
+
+/// A non-transient failure does not increment the counter at all.
+#[tokio::test]
+async fn a_non_transient_failure_does_not_count_an_episode() {
+    let registry = scripted(
+        "codex",
+        vec![Ok(()), Err(FetchError::Unauthorized("401".into()))],
+    );
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    assert_eq!(
+        registry.health().stale,
+        0,
+        "the slot degraded, not stale-served"
+    );
+    assert_eq!(registry.health().stale_episodes, 0);
+}
+
+/// The conservation identity still holds with the counter non-zero, so nobody
+/// later folds it into the sum.
+///
+/// The identity consumers assert is `fresh + stale + pending + degraded +
+/// unconfigured + withoutHandles == providersTotal`. `staleEpisodes` records
+/// events over time rather than current provider membership, so it must not be
+/// included in that sum -- this test pins that boundary while the counter is
+/// non-zero, so a future change that folds it in reddens here.
+#[tokio::test]
+async fn conservation_identity_holds_with_stale_episodes_nonzero() {
+    let registry = scripted(
+        "codex",
+        vec![Ok(()), Err(FetchError::Upstream("503".into()))],
+    );
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert_eq!(
+        health.stale_episodes, 1,
+        "precondition: the counter is non-zero"
+    );
+    assert_eq!(
+        health.fresh
+            + health.stale
+            + health.pending
+            + health.degraded.len()
+            + health.unconfigured.len()
+            + health.without_handles.len(),
+        health.providers_total,
+        "staleEpisodes is an event counter, not a population member, so it must \
+         not participate in the conservation identity"
+    );
 }
 
 #[test]

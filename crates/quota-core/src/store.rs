@@ -72,6 +72,18 @@ pub struct SlotStore {
     last_tick_at: Option<Instant>,
     next_incarnation: u128,
     next_attempt_sequence: u128,
+    /// Monotonic count of stale-serving episodes since process start.
+    ///
+    /// An episode is a slot ENTERING `StaleTransient` from any other status; a
+    /// slot that stays stale across many refresh turns is one episode. In-memory
+    /// and reset by a restart on purpose: this answers "has stale-serving fired
+    /// since boot", and a durable file would be a second state store with its
+    /// own crash semantics for a diagnostic.
+    ///
+    /// NOT part of the conservation identity. It counts events over time, not
+    /// members of a population, so folding it into `fresh + stale + ... ==
+    /// providersTotal` would break an instrument consumers rely on.
+    stale_episodes: u64,
 }
 
 impl SlotStore {
@@ -84,6 +96,7 @@ impl SlotStore {
             last_tick_at: None,
             next_incarnation: 1,
             next_attempt_sequence: 1,
+            stale_episodes: 0,
         }
     }
 
@@ -220,6 +233,18 @@ impl SlotStore {
 
     pub fn created_at(&self) -> Instant {
         self.created_at
+    }
+
+    /// Monotonic count of stale-serving episodes since process start.
+    pub fn stale_episodes(&self) -> u64 {
+        self.stale_episodes
+    }
+
+    /// Record one slot entering stale-serving. Called under the store lock at
+    /// the transition site, so the increment is a cheap counter op consistent
+    /// with everything else that lock guards.
+    pub(crate) fn record_stale_episode(&mut self) {
+        self.stale_episodes = self.stale_episodes.saturating_add(1);
     }
 
     /// Copy the clock anchors needed for timestamp conversion after unlocking.
