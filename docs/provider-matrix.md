@@ -27,8 +27,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.50.0** (37 providers registered; verified
-2026-08-15; the `cursor` app-auth lane from this round is live). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.50.1** (37 providers registered; verified
+2026-08-16, a null round). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -192,6 +192,39 @@ which backend the Codex CLI's `config.toml` selects. This module never reads tha
 file — it reads `auth.json` and queries OpenAI's usage endpoint directly — so
 there is nothing here to classify.
 
+### v0.50.1 — a null round, and the null that mattered
+
+Constants first, per the procedure: all four present at v0.50.1.
+
+25 provider files changed and **nothing is portable.** Most of the delta is
+presentation — accent colours, branding, descriptors. The rest:
+
+- `ollama` fetcher: parses a pasted `curl`/`Cookie:` capture as an override. A
+  CodexBar UI affordance; this module's cookie comes from the browser store and
+  never from a pasted string.
+- `CodexTokenRefresher`: threads two existing fields through a struct. No parse
+  or wire change.
+- Codex error copy: "Run `codex`" → "Run `codex login`". Their string, not ours.
+
+**The one worth the round was a question rather than a port.** Upstream added a
+`keychainAccessRevoked` credential error whose message names a live mechanism:
+*"Claude Keychain access was revoked by Claude Code's token rotation."*
+
+That is a rotation event on the credential family this repo already treats as
+dangerous — anthropic and openai refresh tokens are single-use, which is why the
+plugin-store lanes were declined. So the question is whether **this module** could
+be a party to revoking a user's Claude Code session.
+
+It cannot, verified at source rather than recalled: `anthropic.rs` never
+exchanges a refresh token. The local lane reads an access token from the opencode
+store and sends it; the vault lane receives a token from `claustrum`, which owns
+refresh. Neither path performs the exchange that rotates.
+
+Recording the null because the question is the kind that recurs, and next time
+the answer should be checkable in one read rather than re-derived. If an
+anthropic refresh is ever added here, this is the paragraph that says why it
+would be a defect rather than a feature.
+
 ### openrouter, added 2026-08-16 outside a parity round
 
 Not from CodexBar. Found by listing the opencode auth store against the
@@ -249,7 +282,7 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All four matched CodexBar v0.50.0, re-verified 2026-08-15 by locating each value
+All four matched CodexBar v0.50.1, re-verified 2026-08-16 by locating each value
 in the tagged tree (`git grep <value> v0.49.3 -- Sources/`) rather than in the
 checkout, which usually sits at an older tag.
 
