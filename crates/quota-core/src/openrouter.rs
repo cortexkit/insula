@@ -54,6 +54,44 @@ fn input_units(amount: &Amount) -> Option<i128> {
     (amount.minor as i128).checked_mul(10_i128.pow(u32::from(shift)))
 }
 
+/// Floor a value in input units to a whole-cent USD [`Amount`].
+///
+/// FLOOR rather than round-half-up, and the direction is the whole point: these
+/// are money figures a consumer may decide to spend against, so overstating one
+/// -- even by half a cent -- reports money that is not there. Understating by a
+/// fraction of a cent costs nothing anyone can observe.
+///
+/// Shared by the remainder and the grant so the two cannot round differently. A
+/// total that rounded up beside a remainder that floored could publish a
+/// remaining greater than the total on the right input, which is a state no
+/// consumer should ever have to reason about.
+fn floor_units_to_usd(units: i128, field: &str) -> Result<Amount, FetchError> {
+    let cents = i64::try_from(units / INPUT_UNITS_PER_CENT)
+        .map_err(|_| FetchError::Decode(format!("openrouter: {field} exceeds USD amount range")))?;
+
+    // Format the floored cent value as a USD decimal and pass it through the
+    // shared parser instead of constructing minor units directly.
+    let cents_per_dollar = 10_i64.pow(u32::from(USD_EXPONENT));
+    parse_amount(
+        &format!(
+            "{}.{:0width$}",
+            cents / cents_per_dollar,
+            cents % cents_per_dollar,
+            width = usize::from(USD_EXPONENT),
+        ),
+        USD,
+    )
+    .ok_or_else(|| FetchError::Decode(format!("openrouter: {field} is not a readable USD amount")))
+}
+
+/// Convert one reported figure into whole-cent USD.
+fn floor_to_cents(amount: Amount, field: &str) -> Result<Amount, FetchError> {
+    let units = input_units(&amount).ok_or_else(|| {
+        FetchError::Decode(format!("openrouter: {field} exceeds supported precision"))
+    })?;
+    floor_units_to_usd(units, field)
+}
+
 /// Derive a whole-cent USD balance from OpenRouter's total and usage counters.
 fn remaining_amount(total: Amount, usage: Amount) -> Result<Amount, FetchError> {
     let total = input_units(&total).ok_or_else(|| {
@@ -66,31 +104,7 @@ fn remaining_amount(total: Amount, usage: Amount) -> Result<Amount, FetchError> 
     // Clamp before cent rounding. A negative credit balance means the account is
     // overdrawn, not that a router should receive a negative amount to compare.
     let remaining = total.saturating_sub(usage).max(0);
-    // FLOOR rather than round-half-up, and the direction is the whole point: this
-    // is a balance a consumer may decide to spend against, so overstating it --
-    // even by half a cent -- reports money that is not there. Understating by a
-    // fraction of a cent costs nothing anyone can observe.
-    let cents = Some(remaining / INPUT_UNITS_PER_CENT)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| {
-            FetchError::Decode("openrouter: remaining balance exceeds USD amount range".to_string())
-        })?;
-
-    // Format the rounded cent value as a USD decimal and pass it through the
-    // shared parser instead of constructing minor units directly.
-    let cents_per_dollar = 10_i64.pow(u32::from(USD_EXPONENT));
-    parse_amount(
-        &format!(
-            "{}.{:0width$}",
-            cents / cents_per_dollar,
-            cents % cents_per_dollar,
-            width = usize::from(USD_EXPONENT),
-        ),
-        USD,
-    )
-    .ok_or_else(|| {
-        FetchError::Decode("openrouter: remaining balance is not a readable USD amount".to_string())
-    })
+    floor_units_to_usd(remaining, "remaining balance")
 }
 
 /// Normalize the OpenRouter credits payload into its one derived credit pool.
@@ -99,6 +113,12 @@ pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
         .map_err(|error| FetchError::Decode(format!("openrouter: {error}")))?;
     let total = amount_from_number(&response.data.total_credits, "total_credits")?;
     let usage = amount_from_number(&response.data.total_usage, "total_usage")?;
+    // The grant is published beside the remainder because the upstream states
+    // it, and without it a consumer sees an amount with no denominator: 5.49 USD
+    // left OF WHAT is a different fact from 5.49 USD left. Floored on the same
+    // reasoning as the remainder -- this is money, and the direction that
+    // overstates is the one that misleads.
+    let total_published = floor_to_cents(total.clone(), "total_credits")?;
     let remaining = remaining_amount(total, usage)?;
 
     Ok(vec![Pool {
@@ -108,7 +128,7 @@ pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
         // bought or comped. A funding guess could make a router spend money.
         funding: PoolFunding::Unknown,
         remaining: Some(remaining),
-        total: None,
+        total: Some(total_published),
         // OpenRouter states a grant and its consumption, not a remainder.
         basis: PoolBasis::Derived,
         // No per-pool availability signal is present in this payload.
@@ -208,6 +228,36 @@ impl UsageProvider for OpenRouterProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The grant is published beside the remainder, not discarded.
+    ///
+    /// LIVE CAPTURE, 2026-08-16. Without the total a consumer sees an amount
+    /// with no denominator: "5.49 USD left" and "5.49 USD left of 25" are
+    /// different facts, and only the second supports a proportion. The upstream
+    /// states the grant, so dropping it would be this module discarding
+    /// something it was told.
+    ///
+    /// Also the only fixture that gives `wire_sanity`'s remaining-within-total
+    /// rule anything to compare -- that rule reported zero comparisons on live
+    /// data until this pool carried both figures.
+    #[test]
+    fn the_grant_is_published_beside_the_remainder() {
+        let body = br#"{"data":{"total_credits":25,"total_usage":19.506207297}}"#;
+        let pools = normalize_pools(body).expect("a credits payload must publish a pool");
+        let pool = &pools[0];
+
+        let total = pool.total.as_ref().expect("the upstream states a grant");
+        let remaining = pool.remaining.as_ref().expect("a derived remainder");
+        assert_eq!((total.minor, total.exponent), (2500, 2));
+        assert_eq!((remaining.minor, remaining.exponent), (549, 2));
+
+        // Not vacuous as a pair: the remainder must be inside the grant, which is
+        // the invariant a consumer would otherwise have to take on trust.
+        assert!(
+            remaining.minor <= total.minor,
+            "a remainder outside its grant is a state nobody should have to reason about"
+        );
+    }
 
     /// A sub-cent remainder rounds DOWN, never up.
     ///
