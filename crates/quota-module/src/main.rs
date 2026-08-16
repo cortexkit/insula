@@ -453,11 +453,7 @@ async fn send_control_error(
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-    })
-    .map_err(ModuleError::Json)?;
+    let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(ModuleError::Json)?;
     // Channel-0 control reply: channel and epoch are always 0.
     let frame = Frame::build_with_version(ver, FrameType::Error, control_flags(), 0, 0, corr, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -718,11 +714,7 @@ async fn send_route_error(
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-    })
-    .map_err(ModuleError::Json)?;
+    let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,

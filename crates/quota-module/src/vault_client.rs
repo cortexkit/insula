@@ -1369,10 +1369,10 @@ mod tests {
                 first.header.channel,
                 first.header.epoch,
                 first.header.corr,
-                serde_json::to_vec(&subc_protocol::ErrorBody {
-                    code: "unknown_channel".to_string(),
-                    message: "route expired".to_string(),
-                })
+                serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                    "unknown_channel",
+                    "route expired",
+                ))
                 .unwrap(),
             )
             .unwrap();
@@ -1706,10 +1706,10 @@ mod tests {
 
     #[test]
     fn canonical_error_body_unknown_channel_is_route_only_failure() {
-        let body = serde_json::to_vec(&subc_protocol::ErrorBody {
-            code: "unknown_channel".to_string(),
-            message: "unknown channel 7".to_string(),
-        })
+        let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(
+            "unknown_channel",
+            "unknown channel 7",
+        ))
         .unwrap();
         assert_eq!(classify_error_frame(&body), ClientFailure::RouteGone);
     }
