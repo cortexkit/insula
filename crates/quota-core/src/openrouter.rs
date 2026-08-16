@@ -66,9 +66,11 @@ fn remaining_amount(total: Amount, usage: Amount) -> Result<Amount, FetchError> 
     // Clamp before cent rounding. A negative credit balance means the account is
     // overdrawn, not that a router should receive a negative amount to compare.
     let remaining = total.saturating_sub(usage).max(0);
-    let cents = remaining
-        .checked_add(INPUT_UNITS_PER_CENT / 2)
-        .map(|value| value / INPUT_UNITS_PER_CENT)
+    // FLOOR rather than round-half-up, and the direction is the whole point: this
+    // is a balance a consumer may decide to spend against, so overstating it --
+    // even by half a cent -- reports money that is not there. Understating by a
+    // fraction of a cent costs nothing anyone can observe.
+    let cents = Some(remaining / INPUT_UNITS_PER_CENT)
         .and_then(|value| i64::try_from(value).ok())
         .ok_or_else(|| {
             FetchError::Decode("openrouter: remaining balance exceeds USD amount range".to_string())
@@ -206,6 +208,32 @@ impl UsageProvider for OpenRouterProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sub-cent remainder rounds DOWN, never up.
+    ///
+    /// The distinction is invisible in every other fixture, because whole-cent
+    /// figures round identically either way. It matters because this is a
+    /// balance a consumer may spend against: rounding up reports money the
+    /// account does not have, while rounding down understates by a fraction of a
+    /// cent that nobody can observe.
+    ///
+    /// 0.005 USD is exactly half a cent -- the value where half-up and floor
+    /// disagree by construction, so this fixture cannot pass under both.
+    #[test]
+    fn a_sub_cent_remainder_rounds_down_rather_than_inventing_money() {
+        let body = br#"{"data":{"total_credits":1.005,"total_usage":1.0}}"#;
+        let pools = normalize_pools(body).expect("a positive balance must publish a pool");
+        assert_eq!(pools.len(), 1);
+        let amount = pools[0]
+            .remaining
+            .as_ref()
+            .expect("a derived balance states a remainder");
+        assert_eq!(
+            amount.minor, 0,
+            "half a cent must floor to zero: rounding up publishes money the \
+             account does not have"
+        );
+    }
     use super::*;
 
     /// LIVE CAPTURE, 2026-08-16.
