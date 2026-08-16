@@ -306,6 +306,22 @@ resolves between two polls leaves no other trace. Read it for "has this host
 seen transient failure at all", never as a population count: it is an event
 tally and is deliberately excluded from the conservation identity.
 
+A provider's `account` does not depend on which credential lane fetched the
+usage. `cursor` has two — a browser cookie and Cursor.app's local token store —
+and only the second carries an identity. Signing into the vendor's website used
+to make the browser lane win and the account silently lose its name, which read
+downstream as an account disappearing and an unlabelled row appearing, and
+dropped the provider out of `completeProviders`.
+
+Identity is now resolved independently of the fetching lane, **and only on
+proof**: the browser session cookie and the local store both name a user id, and
+the email is attached only when those ids are equal. Different ids mean two
+different accounts signed in, and an unlabelled entry is the honest answer — a
+wrong name is worse than no name, because a consumer cannot tell them apart.
+
+The general rule, for any provider that grows a second lane: `source` may change
+between polls, `account` should not.
+
 The self-recovery column is the one a user-facing surface should group on,
 because it decides between two sentences: **wait**, or **act**. Read it off the
 column rather than from any summary here — a `no` means someone must do
