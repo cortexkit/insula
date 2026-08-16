@@ -294,6 +294,18 @@ This is worth knowing precisely because the previous behaviour was invisible: a
 dead account kept publishing its last capacity reading with no upper age bound,
 never degraded, and went on counting as serving in the health snapshot.
 
+`staleEpisodes` sits beside `stale` in the health metrics and answers a
+different question. `stale` is a gauge: how many providers are serving a
+preserved reading *right now*. `staleEpisodes` is a monotonic count of how many
+times any slot has ENTERED that state since the module started, so a slot stale
+across many refresh turns counts once.
+
+It exists because the gauge alone cannot distinguish "nothing is failing" from
+"nothing was failing at the instant you polled" — and a transient failure that
+resolves between two polls leaves no other trace. Read it for "has this host
+seen transient failure at all", never as a population count: it is an event
+tally and is deliberately excluded from the conservation identity.
+
 The self-recovery column is the one a user-facing surface should group on,
 because it decides between two sentences: **wait**, or **act**. Read it off the
 column rather than from any summary here — a `no` means someone must do
