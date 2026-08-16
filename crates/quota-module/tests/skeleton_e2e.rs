@@ -36,8 +36,8 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{ModuleControlRequest, ModuleControlResponse},
     Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION,
@@ -152,6 +152,9 @@ fn vault_manifest() -> ModuleManifest {
             config_schema: serde_json::json!({"type":"object"}),
             observability: Vec::new(),
             identity_scope: Vec::new(),
+            // The stub mirrors the module's own declaration; a vault stub that
+            // claimed different ordering would test a manifest nothing ships.
+            concurrency: Concurrency::StatelessParallel,
         }],
         consumes: Vec::new(),
         bindings: Bindings {

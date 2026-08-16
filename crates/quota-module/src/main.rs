@@ -25,8 +25,8 @@ use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -767,6 +767,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),
             identity_scope: Vec::new(),
+            // Every data-plane request is spawned on arrival (see handle_frame),
+            // so responses may complete out of order even within one channel, and
+            // nothing inbound mutates state -- `usage.get` is a cache-only read of
+            // an in-memory snapshot. Declared from that behaviour rather than from
+            // preference: claiming stricter ordering than the loop provides would
+            // be a promise this module does not keep.
+            concurrency: Concurrency::StatelessParallel,
         }],
         consumes: Vec::new(),
         bindings: Bindings {
