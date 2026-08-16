@@ -213,8 +213,21 @@ publishing consumption with no denominator invites a consumer to invent one. If
 an account ever sets a spend limit, that is a separate decision with its own
 evidence.
 
-The remaining four uncovered credentials are unexamined. Worth a look when
-someone has reason to, but none is a known quota surface the way openrouter was.
+The other four were probed on 2026-08-16 and **none is portable**. Recorded with
+what was tried, so the next reader inherits the evidence rather than the
+curiosity — all four are plain API keys, so the rotation gate is clear for every
+one of them and only the quota surface decides.
+
+| credential | probe | disposition |
+|---|---|---|
+| `cerebras` | `/v1/models` -> 403 code 1010 | Cloudflare bot block, not an auth answer. The key is neither proved nor disproved, and a provider built on a surface that refuses a plain request would be guessing at headers. |
+| `fireworks-ai` | `/v1/accounts` -> 412 | The account IS suspended for monthly spend — a genuine quota fact. But that string is the ONLY surface: `/v1/account`, `/v1/models` and `/verel/v1/accounts` all 404. Parsing prose from an error body for the word "suspended" is the fragile inference this repo refuses elsewhere; error text carries no stability promise, ours or theirs. |
+| `inception` | `/v1/models` -> 200; `/v1/usage`, `/v1/credits`, `/v1/account`, `/v1/billing` -> 404 | The key works and there is nothing to read. A live credential with no quota surface is not a gap. |
+| `amazon-bedrock` | not probed | AWS SigV4, not a bearer token, so the shape does not match any adaptor here. Usage would come from Cost Explorer or CloudWatch, which is an AWS integration rather than a provider port. |
+
+The `fireworks-ai` one is worth remembering if that vendor ever ships a billing
+endpoint: the account state is real and currently invisible, and only the
+*surface* is missing.
 
 ### Opaque constants, re-checked every round
 
