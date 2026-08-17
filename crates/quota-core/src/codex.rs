@@ -190,16 +190,35 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
     )
 }
 
+/// Read the account's email from an OAuth id token, for display.
+///
+/// TWO CLAIMS, because the token this host actually holds carries only the
+/// second. The OpenAI-namespaced `profile.email` is checked first so tokens that
+/// have it are unaffected; the standard OIDC top-level `email` is the fallback.
+///
+/// Found live: the local lane published an account with no email while the id
+/// token beside it carried one. Nothing failed -- the profile claim was simply
+/// absent from a 16-claim token, so the lookup returned None and the account
+/// rendered unlabelled. The sibling `https://api.openai.com/auth` claim was
+/// being read successfully for the plan type the whole time, which is why the
+/// gap was invisible: the token was clearly parsing.
+///
+/// `email_verified` is deliberately NOT gated on. This value is a display label
+/// beside an account id that carries the identity, so refusing an unverified
+/// address would drop a usable label without protecting anything.
 fn id_token_email(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let namespaced = claims
+        .get("https://api.openai.com/profile")
+        .and_then(|profile| profile.get("email"));
+    let standard = claims.get("email");
     canonical_label(
-        claims
-            .get("https://api.openai.com/profile")
-            .and_then(|profile| profile.get("email"))
+        namespaced
+            .or(standard)
             .and_then(serde_json::Value::as_str)
             .map(|email| email.trim().to_ascii_lowercase()),
     )
@@ -1578,6 +1597,34 @@ mod tests {
                 .email
                 .as_deref(),
             Some("user@example.com")
+        );
+    }
+
+    /// The standard OIDC `email` claim is read when the namespaced one is absent.
+    ///
+    /// SHAPE FROM A LIVE TOKEN, 2026-08-16: this host's `~/.codex/auth.json`
+    /// holds a 16-claim id token with a top-level `email` and NO
+    /// `https://api.openai.com/profile`. Before this, that account published
+    /// with no email at all while its own credential carried one.
+    #[test]
+    fn a_standard_oidc_email_claim_is_read_when_the_namespaced_one_is_absent() {
+        assert_eq!(
+            id_token_email("eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJwZXJzb25AZXhhbXBsZS50ZXN0IiwgImVtYWlsX3ZlcmlmaWVkIjogdHJ1ZSwgImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6IHsiY2hhdGdwdF9wbGFuX3R5cGUiOiAicHJvIn19.sig"),
+            Some("person@example.test".to_string())
+        );
+    }
+
+    /// The namespaced claim still wins where both exist.
+    ///
+    /// Order matters for tokens that carry both: the OpenAI-namespaced value is
+    /// the one this provider has always used, and a fallback must not silently
+    /// change which address an existing account renders under.
+    #[test]
+    fn the_namespaced_email_claim_takes_precedence_over_the_standard_one() {
+        assert_eq!(
+            id_token_email("eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJzdGFuZGFyZEBleGFtcGxlLnRlc3QiLCAiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9wcm9maWxlIjogeyJlbWFpbCI6ICJOYW1lc3BhY2VkQEV4YW1wbGUuVEVTVCJ9fQ.sig"),
+            Some("namespaced@example.test".to_string()),
+            "an existing account must not change the address it renders under"
         );
     }
 
