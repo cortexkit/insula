@@ -514,6 +514,89 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
 
 #[cfg(test)]
 mod tests {
+
+    /// A capability rewritten on disk is picked up without restarting the module.
+    ///
+    /// THE LAST IN-PROCESS CANDIDATE for insula#8, where a lane stayed
+    /// `credential_unusable` for an hour after an operator re-sealed the vault
+    /// record and recovered only on `ck module restart`. If a re-seal also
+    /// rewrites this file with a NEW capability and the loader kept serving the
+    /// old one from cache, every symptom in that report follows exactly --
+    /// including the restart being the only cure, because a restart is the one
+    /// event that guarantees a fresh parse.
+    ///
+    /// The cache is a cycle detector rather than a timer: it re-reads when a
+    /// provider asks twice, because the second ask means a new enumeration cycle
+    /// began. Nothing about that is obvious from reading it, and "it re-reads
+    /// every cycle" was an assertion I made from the code before it was a fact I
+    /// had checked.
+    /// The capability a handle carries, for comparison in the reload test.
+    ///
+    /// Reads it out of the enum rather than through a formatter: every formatting
+    /// path on this type deliberately redacts the secret, so a test that compared
+    /// rendered output would compare two identical redactions and pass on any
+    /// capability at all.
+    fn capability_of(handle: &CredentialHandle) -> Option<String> {
+        match handle {
+            CredentialHandle::Vault { capability, .. } => {
+                Some(capability.expose_secret().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_rewritten_capability_is_picked_up_without_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "insula-handle-reload-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("vault-handles.json");
+
+        let write = |body: &str| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).expect("write handles");
+            std::io::Write::write_all(&mut file, body.as_bytes()).expect("write body");
+        };
+
+        write(r#"{"handles":{"oauth:anthropic":"ckh_before_reseal"}}"#);
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+
+        let first = loader
+            .provider_handles(ProviderKind::Anthropic)
+            .expect("the file is well-formed");
+        assert_eq!(
+            first.first().and_then(capability_of),
+            Some("ckh_before_reseal".to_string()),
+            "the pre-re-seal capability is served"
+        );
+
+        // The operator re-seals; the file now names a different capability. No
+        // restart, no signal -- the next enumeration cycle is all that happens.
+        write(r#"{"handles":{"oauth:anthropic":"ckh_after_reseal"}}"#);
+
+        let second = loader
+            .provider_handles(ProviderKind::Anthropic)
+            .expect("the file is still well-formed");
+        assert_eq!(
+            second.first().and_then(capability_of),
+            Some("ckh_after_reseal".to_string()),
+            "a rewritten capability must reach the next fetch without a restart; \
+             serving the cached one would strand the lane until the process dies"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};

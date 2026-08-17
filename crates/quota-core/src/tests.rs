@@ -2308,6 +2308,75 @@ async fn recover_then_fail_again_counts_two_episodes() {
     assert_eq!(registry.health().stale_episodes, 2);
 }
 
+/// A lane that went `credential_unusable` recovers on the next successful fetch.
+///
+/// FILED AS A BUG AGAINST THIS MODULE (insula#8): after a vault re-seal replaced
+/// a live Anthropic record, the claude lane kept publishing `credential unusable`
+/// for over an hour and recovered only on `ck module restart`. The reporter's
+/// inference was that unusable lanes are dropped from the probe cycle with no
+/// clearing edge.
+///
+/// That inference is falsifiable here, and this test is the falsification: the
+/// non-transient backoff is a flat 300s with no terminal state, so the lane is
+/// re-probed indefinitely, and a success clears the entry with no restart
+/// involved. If this passes, the latch is not in the refresher and the search
+/// belongs upstream of it -- which is a materially different bug report to send
+/// back than "we will add a retry".
+///
+/// Written because the recovery direction had NO test at all. Every existing
+/// assertion about this class checks that the failure DEGRADES; nothing checked
+/// that the degradation LIFTS. That asymmetry is the grant-audit shape one level
+/// down: a refusal is visibly an outcome so someone tests it, while the
+/// un-refusal produces no symptom to write a test about.
+#[tokio::test]
+async fn a_credential_unusable_lane_recovers_without_a_restart() {
+    let registry = scripted(
+        "codex",
+        vec![
+            Ok(()),
+            Err(FetchError::CredentialUnusable(
+                "credential requires authentication".into(),
+            )),
+            Ok(()),
+        ],
+    );
+
+    tick(&registry).await;
+    let healthy = registry.get_usage(Some("codex")).await;
+    assert!(healthy[0].usage.is_some(), "the lane starts healthy");
+
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    let broken = registry.get_usage(Some("codex")).await;
+    assert_eq!(
+        broken[0].error_class.as_deref(),
+        Some("credential_unusable"),
+        "the re-seal window: the vault refuses and the lane degrades"
+    );
+    assert!(broken[0].usage.is_none(), "a degraded lane serves no usage");
+
+    // The credential is replaced underneath. Nothing restarts; the lane simply
+    // becomes due again and the next fetch succeeds.
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    let recovered = registry.get_usage(Some("codex")).await;
+    assert!(
+        recovered[0].usage.is_some(),
+        "a replaced credential must lift the degradation on the next successful \
+         fetch, with no restart: got error {:?}",
+        recovered[0].error
+    );
+    assert_eq!(
+        recovered[0].error_class, None,
+        "a recovered lane must publish no error class"
+    );
+    assert_eq!(
+        registry.health().degraded.len(),
+        0,
+        "health must stop naming a recovered provider as degraded"
+    );
+}
+
 /// A non-transient failure does not increment the counter at all.
 #[tokio::test]
 async fn a_non_transient_failure_does_not_count_an_episode() {
