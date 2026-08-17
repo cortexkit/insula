@@ -1950,6 +1950,39 @@ long-running audit ledger lived under `.cortexkit` once — reachable, never
 destroyed, and invisible to every other checkout for its whole life. Both markers
 now sit in `.gitignore` beside the entries.
 
+## A tripwire that is not firing cannot be proved by deleting it
+
+Mutation proof has a standing shape here: delete the guard, and the test named
+for it must redden. That shape assumes the guard is DOING something on today's
+inputs. A drift fence is not, and most fences are drift fences.
+
+The health-metric fence checks that every published metrics key is explained in
+`docs/consumer-contract.md`. Today every key is, so the assertion passes on every
+run. Deleting the assertion changed nothing and reddened nothing — correctly.
+Reading that as "undefended" would have been wrong, and the instinct to then
+"strengthen" a fence that is already correct is how a working check gets rewritten
+into a worse one.
+
+**Prove a tripwire by CREATING the drift it exists to catch, not by removing the
+check.** Rename a published key so it no longer matches the doc: the fence fires
+by name. That is the only mutation that establishes the thing is wired to
+anything.
+
+**And prove the vacuity guard separately.** A fence that iterates a collection
+passes trivially when the collection is empty, which is the failure mode that
+makes it silent forever — a renamed heading, an emptied payload, a scan whose
+anchor stopped matching. Empty the input and confirm the guard bites. Two
+mutations, because a fence has two ways to be useless and they are not the same
+way.
+
+The general form, worth checking before writing any proof: **ask whether the
+thing under test is currently ACTIVE or merely PRESENT.** An active guard is
+proved by deletion. A dormant one is proved by making it fire. Applying the first
+recipe to the second kind produces a confident `NOTHING REDDENED` about code that
+is working exactly as intended — the same false negative as mutating a
+behaviour-neutral edit, arriving from the opposite direction.
+
+
 ## A sweep for what is missing fails by finding more of it
 
 Several rules here were found by sweeping every provider for something that
