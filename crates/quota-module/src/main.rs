@@ -826,6 +826,64 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
 
+    /// Every health metric this module publishes is explained in the contract.
+    ///
+    /// The metrics are the operational surface three teams alert on, and
+    /// `docs/consumer-contract.md` is where they read what each key means. A key
+    /// published with nothing to read is a number an operator has to guess at,
+    /// and guessing produces either a false alarm or a missed one.
+    ///
+    /// Nothing forces the doc to keep up. Two keys were added since it was
+    /// written -- `staleEpisodes` and `handlesWithoutAccount` -- and both got
+    /// documented because someone remembered, which is not a mechanism. This is.
+    ///
+    /// ONE DIRECTION ONLY, deliberately. The reverse check -- a documented key
+    /// nothing publishes -- cannot be written the way the errorClass fence is,
+    /// because these keys are explained in prose across several sections rather
+    /// than in one table, so there is no anchor that separates a metric name from
+    /// any other backticked field. Checked by hand instead: the three
+    /// metric-shaped tokens that are not published (`availableCount`,
+    /// `expiresAt`, `soonestExpiresAt`) are all real fields on `SavedResets`, so
+    /// the reverse drift is not currently a live risk. Revisit if the doc grows a
+    /// metrics table worth scanning.
+    #[test]
+    fn every_published_health_metric_is_documented() {
+        let ModuleControlResponse::HealthCheck { metrics, .. } =
+            health_report(&healthy_snapshot(), &test_vault())
+        else {
+            panic!("health_report must answer a HealthCheck");
+        };
+        let metrics = metrics.expect("metrics are always published");
+        let keys: Vec<String> = metrics
+            .as_object()
+            .expect("the metrics payload is an object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let contract = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/consumer-contract.md"),
+        )
+        .expect("consumer-contract.md must be readable from the crate directory");
+
+        for key in &keys {
+            assert!(
+                contract.contains(&format!("`{key}`")),
+                "health metric `{key}` is published with no explanation in \
+                 docs/consumer-contract.md: an operator reads the number and guesses"
+            );
+        }
+
+        // Not vacuous: a renamed heading or an emptied payload would satisfy the
+        // loop above by iterating nothing.
+        assert!(
+            keys.len() >= 16,
+            "expected the full metrics payload, found {} key(s): {keys:?}",
+            keys.len()
+        );
+    }
+
     /// The config path follows the daemon's own resolution order.
     ///
     /// Each arm is asserted separately because they are tried in sequence, and a
