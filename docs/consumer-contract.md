@@ -294,6 +294,19 @@ This is worth knowing precisely because the previous behaviour was invisible: a
 dead account kept publishing its last capacity reading with no upper age bound,
 never degraded, and went on counting as serving in the health snapshot.
 
+`vaultConnectionsEstablished` counts the vault connections this process has
+opened. `1` means the first one is still in use; every increment is a reconnect
+after a transport failure. There is no idle timeout and no maximum lifetime, and
+the client answers pings, so a healthy connection is held for the life of the
+process and this number can legitimately sit at `1` for weeks.
+
+**Do not alert on it.** Reconnects are ordinary around a daemon restart. It
+answers a question about a moment — *did the connection change between these two
+observations?* — which is otherwise unanswerable from outside the process. It was
+added after a re-sealed vault credential kept being served with its pre-re-seal
+verdict until a module restart, where a restart is the one event in such a
+timeline that guarantees a new connection.
+
 `staleEpisodes` sits beside `stale` in the health metrics and answers a
 different question. `stale` is a gauge: how many providers are serving a
 preserved reading *right now*. `staleEpisodes` is a monotonic count of how many

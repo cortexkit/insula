@@ -561,6 +561,17 @@ fn health_report(
         // waiting for.
         "vaultUnmatchedDrops": vault.unmatched_terminal_drops(),
         "vaultStaleGenerationDrops": vault.stale_generation_drops(),
+        // Vault connections this process has established. 1 means the first is
+        // still in use; each increment is a reconnect after a transport failure.
+        // There is no idle timeout or maximum lifetime, so a healthy connection
+        // is held for the life of the process.
+        //
+        // Diagnostic rather than a health signal. It exists because an incident
+        // was not narrowable without it: a re-sealed vault record kept being
+        // published with its pre-re-seal verdict until a restart, and a restart
+        // is the one event in such a timeline that establishes a NEW connection.
+        // "Did the connection change?" previously required reading the source.
+        "vaultConnectionsEstablished": vault.connections_established(),
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieLoginsStale": snapshot.cookie_logins_stale,
         // Providers holding a credential that reaches no account while their
@@ -878,7 +889,7 @@ mod tests {
         // Not vacuous: a renamed heading or an emptied payload would satisfy the
         // loop above by iterating nothing.
         assert!(
-            keys.len() >= 16,
+            keys.len() >= 17,
             "expected the full metrics payload, found {} key(s): {keys:?}",
             keys.len()
         );
@@ -1384,6 +1395,7 @@ mod tests {
             "refresherStalled",
             "vaultUnmatchedDrops",
             "vaultStaleGenerationDrops",
+            "vaultConnectionsEstablished",
         ];
         let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
         published.sort_unstable();

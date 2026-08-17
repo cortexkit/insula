@@ -361,6 +361,33 @@ impl ClientState {
     }
 
     /// Frames discarded because no caller was waiting for them.
+    /// How many vault connections this process has established.
+    ///
+    /// 1 means the first connection is still in use; every increment is a
+    /// reconnect after a transport failure. There is no idle timeout and no
+    /// maximum lifetime here, and the client answers pings, so a healthy
+    /// connection is held indefinitely -- this number can sit at 1 for the life
+    /// of the process.
+    ///
+    /// PUBLISHED BECAUSE AN INCIDENT WAS NOT NARROWABLE WITHOUT IT. A vault
+    /// record was re-sealed and this module kept publishing the pre-re-seal
+    /// verdict for an hour, recovering only on restart (insula#8). Every
+    /// in-process explanation was falsifiable by test; what remained was that a
+    /// restart is the one event in such a timeline that establishes a NEW
+    /// connection. Answering "did the connection change?" required reading this
+    /// source, which is not available to whoever is looking at a stuck lane.
+    ///
+    /// Diagnostic, not a health signal: reconnects are ordinary around a daemon
+    /// restart. It answers a question about a moment, not about whether anything
+    /// is wrong.
+    pub fn connections_established(&self) -> u64 {
+        // The counter names the NEXT generation to hand out, so the number of
+        // connections made so far is one less.
+        self.next_connection_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+
     pub fn unmatched_terminal_drops(&self) -> u64 {
         self.unmatched_terminal_drops.load(Ordering::Relaxed)
     }
@@ -662,6 +689,11 @@ impl VaultClient {
     }
 
     /// Frames discarded because their caller belonged to an older connection.
+    /// See [`ClientState::connections_established`].
+    pub fn connections_established(&self) -> u64 {
+        self.state.connections_established()
+    }
+
     pub fn stale_generation_drops(&self) -> u64 {
         self.state.stale_generation_drops()
     }
