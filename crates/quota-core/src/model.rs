@@ -50,6 +50,38 @@ pub fn windows(usage: &Usage) -> impl Iterator<Item = &RateWindow> {
         )
 }
 
+/// The absolute counts for a window, when the provider states both as whole
+/// numbers.
+///
+/// SHARED BECAUSE THE RULE MUST NOT DRIFT, not for brevity. Two providers now
+/// report counts beside a percentage -- zenmux as `used_flows`/`max_flows`,
+/// jetbrains as `current`/`maximum` -- and a second hand-written copy of this
+/// judgement is a second chance to get it wrong in only one of them.
+///
+/// INTEGRAL ONLY. The wire field is `f64`, so the whole-number check is not a
+/// cast guard: it is what makes the value trustworthy. The rule came from the
+/// qwen-cloud round, where a console percentage divided by a different
+/// denominator than the one reported produced counts like `45.05` -- a
+/// fractional "count" means the field is not the count it appears to be, and
+/// publishing it invents a precision the upstream never claimed. Non-finite and
+/// negative are refused on the same footing.
+///
+/// BOTH OR NEITHER. A used count with no total states a numerator whose
+/// denominator the consumer has to guess, which is the shape this module refuses
+/// everywhere else.
+pub fn window_counts(used: f64, total: f64) -> (Option<f64>, Option<f64>) {
+    let integral = |value: f64| -> Option<f64> {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+            return None;
+        }
+        Some(value)
+    };
+    match (integral(used), integral(total)) {
+        (Some(used), Some(total)) => (Some(used), Some(total)),
+        _ => (None, None),
+    }
+}
+
 /// Drop any window whose percent is not a number, from every entry about to be
 /// published.
 ///

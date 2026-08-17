@@ -203,14 +203,42 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
         FetchError::Decode("jetbrains: quota present but no refill date".to_string())
     })?;
 
+    // The same two figures the percent is computed from, published as absolute
+    // counts. JetBrains states quota in units rather than requests, and a
+    // consumer asking "how many units are left" would otherwise have to multiply
+    // a percentage by a total it was never given.
+    //
+    // Whole numbers only, via the shared rule: an observed payload carries
+    // fractional values such as "8134.155", and a fractional count is not the
+    // count it appears to be.
+    let (used_count, total_count) = quota
+        .current
+        .as_deref()
+        .and_then(|c| c.trim().parse::<f64>().ok())
+        .zip(
+            quota
+                .maximum
+                .as_deref()
+                .and_then(|m| m.trim().parse::<f64>().ok()),
+        )
+        .map_or((None, None), |(current, maximum)| {
+            crate::model::window_counts(current, maximum)
+        });
+
     Ok(Usage {
         primary: Some(RateWindow {
             used_percent: used,
             raw_used_percent: None,
             resets_at: Some(resets_at),
+            // NOT derived from `nextRefill.tariff.duration`, though that states
+            // PT720H. The observed payload decomposes the balance into a tariff
+            // pool that refills on that period and a purchased top-up pool that
+            // does not, while `maximum` -- the percent's denominator -- is their
+            // sum. One window length would claim the whole balance resets
+            // monthly when part of it never does. See insula#1 for the capture.
             window_minutes: None,
-            used_count: None,
-            total_count: None,
+            used_count,
+            total_count,
         }),
         secondary: None,
         tertiary: None,
@@ -255,6 +283,88 @@ impl UsageProvider for JetBrainsProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// The first OBSERVED JetBrains payload, end to end through the normalizer.
+    ///
+    /// LIVE CAPTURE, not synthetic: posted on insula#1 on 2026-08-17 by a
+    /// credentialed account on another host, scrubbed with key names and value
+    /// shapes intact, numbers rounded, timestamps shifted, no keys dropped.
+    ///
+    /// Every other fixture in this file was transcribed from a reference
+    /// implementation, and one of those transcriptions was wrong -- it modelled
+    /// `amount`/`duration` fields as fact when no payload here had ever shown
+    /// them. This one is the reason that provenance distinction is annotated:
+    /// the same bytes look identical whether observed or invented.
+    ///
+    /// Pinning the ARITHMETIC, which was never checkable before. `current` is
+    /// the amount USED and `available` the remainder, proved by the payload's
+    /// own decomposition: tariff 8100 used + 991900 available = 1000000 maximum.
+    /// So the percent is 8100/1207000, and a reading of `current` as "remaining"
+    /// -- the plausible misreading -- would report 99.3% used on an account that
+    /// has spent two thirds of one percent.
+    #[test]
+    fn the_observed_credentialed_payload_normalizes_as_measured() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","until":"2026-11-14T21:00:00Z","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"},"topUpQuota":{"current":"0","maximum":"207000.000","available":"207000.000"}}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"PT720H"}}"#;
+        let escape = |raw: &str| {
+            raw.replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        let xml = format!(
+            r#"<application><component name="AIAssistantQuotaManager2"><option name="quotaInfo" value="{}" /><option name="nextRefill" value="{}" /></component></application>"#,
+            escape(quota_info),
+            escape(next_refill)
+        );
+
+        let usage = normalize_usage(xml.as_bytes()).expect("the observed payload must normalize");
+        let window = usage.primary.expect("a primary window");
+
+        assert!(
+            (window.used_percent - 0.6711).abs() < 0.001,
+            "expected 8100/1207000 = 0.6711%, got {}",
+            window.used_percent
+        );
+        assert_eq!(window.used_count, Some(8100.0));
+        assert_eq!(window.total_count, Some(1_207_000.0));
+        assert_eq!(
+            window.resets_at.as_deref(),
+            Some("2026-07-15T06:00:00.000Z")
+        );
+        // Deliberately absent: the tariff period refills only part of the
+        // balance the percent is measured against.
+        assert_eq!(window.window_minutes, None);
+    }
+
+    /// A fractional unit balance publishes the percent and no counts.
+    ///
+    /// The observed capture was rounded for posting, but the reporter stated the
+    /// real values are fractional (`"8134.155"`). The percent stays computable
+    /// from fractions; the counts must not be invented from them.
+    #[test]
+    fn a_fractional_unit_balance_publishes_no_counts() {
+        let quota_info = r#"{"type":"Available","current":"8134.155","maximum":"1207000.000"}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z"}"#;
+        let escape = |raw: &str| {
+            raw.replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        let xml = format!(
+            r#"<application><component name="AIAssistantQuotaManager2"><option name="quotaInfo" value="{}" /><option name="nextRefill" value="{}" /></component></application>"#,
+            escape(quota_info),
+            escape(next_refill)
+        );
+
+        let window = normalize_usage(xml.as_bytes())
+            .expect("a fractional balance is still a valid quota")
+            .primary
+            .expect("a primary window");
+
+        assert!(window.used_percent > 0.0, "the percent stays computable");
+        assert_eq!(window.used_count, None, "a fractional count is not a count");
+        assert_eq!(window.total_count, None, "both or neither");
+    }
 
     /// The degraded refill payload this host actually writes yields no reset.
     ///
