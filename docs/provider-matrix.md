@@ -27,7 +27,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.50.1** (37 providers registered; verified
+**Current parity: CodexBar v0.52.0** (37 providers registered; verified
 2026-08-16, a null round). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
@@ -261,6 +261,38 @@ one of them and only the quota surface decides.
 The `fireworks-ai` one is worth remembering if that vendor ever ships a billing
 endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
+
+### v0.50.1 -> v0.52.0 (checked 2026-08-17)
+
+Nine provider files changed; two touch providers we serve.
+
+**Constants: all five present, nothing rotated.** This round is also why the
+table above lists five rather than four -- `BILLING_SERVER_ID` had never been in
+it, so no previous round re-checked the function `opencode` falls back to.
+
+**OpenCodeGo -- no port, structurally.** Upstream added a `quotaIsAuthoritative`
+flag and marks non-authoritative readings `.estimated`. It distinguishes their
+LOCAL-FILE lane, whose monthly window is "anchored at the earliest local row",
+from the web overlay that knows the real billing anchors. We have no local-file
+lane -- our `opencodego` is cookie-and-web only, zero local-data references -- so
+everything we publish is already the path they call authoritative. Nothing to
+port, and the reason is structural rather than a judgement.
+
+**Grok -- no port.** Six files, and none of it moves a window. The credits-proxy
+diff looks like a reset-handling change (`guard resetsAt != nil else { throw }`
+became `if resetsAt != nil { return }` then `throw`) but the percent branches
+precede it in BOTH versions, so the two forms are behaviourally identical; a
+percent-bearing payload with no reset returned its percent before and returns it
+now. The real addition is `subscriptionTier`, a display label, sourced from a new
+endpoint (`cli-chat-proxy.grok.com/v1/settings`, field
+`subscription_tier_display`).
+
+Declined deliberately: our grok lane resolves no account identity, so the label
+would decorate an unlabelled row, and it costs an extra HTTP call per tick on a
+provider whose windows already serve. Reconsider if grok ever gains identity --
+the endpoint is recorded here so that is a lookup rather than a rediscovery.
+
+**Kiro and Zed:** not implemented here.
 
 ### Opaque constants, re-checked every round
 
