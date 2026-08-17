@@ -80,6 +80,38 @@ fn settings_from_env() -> Result<String, FetchError> {
         .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))
 }
 
+/// Absolute request counts for a window, when the payload states both.
+///
+/// ZenMux reports `used_flows` and `max_flows` beside the percentage, and those
+/// are exactly `usedCount`/`totalCount` on the wire -- a consumer that wants
+/// "how many requests are left" otherwise has to multiply a percentage by a
+/// total it was never given.
+///
+/// INTEGRAL ONLY, and this is the rule the qwen-cloud round established rather
+/// than a local preference: `usedCount` is emitted only when the provider states
+/// a whole count. These arrive as f64, so a fractional value means the field is
+/// not the count it looks like, and publishing `45.05 requests` would be worse
+/// than publishing nothing. A non-finite or negative value is refused for the
+/// same reason.
+fn window_counts(used: f64, max: f64) -> (Option<f64>, Option<f64>) {
+    // The wire field is f64, so the integral check is not a cast guard -- it is
+    // what makes the value trustworthy. A fractional count means the field is
+    // not the count it appears to be.
+    let integral = |value: f64| -> Option<f64> {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+            return None;
+        }
+        Some(value)
+    };
+    match (integral(used), integral(max)) {
+        // Both or neither: a used count with no total states a numerator whose
+        // denominator the consumer must guess, which is the shape this module
+        // refuses everywhere else.
+        (Some(used), Some(max)) => (Some(used), Some(max)),
+        _ => (None, None),
+    }
+}
+
 fn reported_reset_at(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let reset_at = raw.trim();
@@ -144,22 +176,24 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         ));
     }
 
+    let (used_5h, total_5h) = window_counts(quota_5h.used_flows, quota_5h.max_flows);
     let primary = RateWindow {
         used_percent: (quota_5h.usage_percentage * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_5h.resets_at),
         window_minutes: Some(5 * 60),
-        used_count: None,
-        total_count: None,
+        used_count: used_5h,
+        total_count: total_5h,
     };
 
+    let (used_7d, total_7d) = window_counts(quota_7d.used_flows, quota_7d.max_flows);
     let secondary = RateWindow {
         used_percent: (quota_7d.usage_percentage * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_7d.resets_at),
         window_minutes: Some(7 * 24 * 60),
-        used_count: None,
-        total_count: None,
+        used_count: used_7d,
+        total_count: total_7d,
     };
 
     let usage = Usage {
@@ -223,6 +257,40 @@ impl UsageProvider for ZenMuxProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// Whole flow counts reach the wire beside the percentage.
+    ///
+    /// ZenMux states used_flows and max_flows and this normalizer discarded
+    /// both, so a consumer asking "how many requests are left" had to multiply a
+    /// percentage by a total it was never given.
+    #[test]
+    fn whole_flow_counts_are_published_beside_the_percentage() {
+        assert_eq!(window_counts(25.0, 100.0), (Some(25.0), Some(100.0)));
+    }
+
+    /// A fractional count is refused rather than rounded.
+    ///
+    /// The rule the qwen-cloud round established: usedCount is emitted only when
+    /// the provider states a whole count. A fraction means the field is not the
+    /// count it looks like, and "45.05 requests" is worse than no number --
+    /// rounding it would invent a precision the upstream never claimed.
+    #[test]
+    fn a_fractional_flow_count_is_refused() {
+        assert_eq!(window_counts(45.05, 100.0), (None, None));
+        assert_eq!(window_counts(25.0, 99.5), (None, None));
+    }
+
+    /// A count with no total is refused, and so is a total with no count.
+    ///
+    /// A numerator whose denominator the consumer must guess is the shape this
+    /// module refuses everywhere else -- the openrouter grant landed for exactly
+    /// this reason. Non-finite and negative are refused on the same footing.
+    #[test]
+    fn a_count_without_its_denominator_is_refused() {
+        assert_eq!(window_counts(25.0, f64::NAN), (None, None));
+        assert_eq!(window_counts(f64::INFINITY, 100.0), (None, None));
+        assert_eq!(window_counts(-1.0, 100.0), (None, None));
+    }
     use super::*;
 
     #[test]

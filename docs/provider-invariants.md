@@ -31,6 +31,40 @@ validating the upstream vocabulary would turn a new limit type into an outage.
 Swept 2026-07-25 across all `Ok`-producing normalization paths. Re-run the
 enumeration when a provider is added.
 
+## The enumeration of what we receive and discard
+
+Five defects in one day shared one shape: **the upstream told us something and
+the normalizer dropped it.** amp's replenishment rate flattened into a fake
+cutoff, openrouter's grant left off the pool, cursor's identity lost to lane
+precedence, opencode's stated null unread, codex's email in a claim nobody
+looked at. Fixing five instances of a rule without enumerating where else it
+applies is the outstanding work, not the sixth instance.
+
+So: every field this crate deserializes and never reads. 32 of them.
+
+- **Live providers are clean, with reasons already at the site**: codex's
+  `unlimited` (the pool shape already states an uncapped pool by omitting
+  `total`), deepseek's `total_balance` (publishing it beside its two components
+  would double-count).
+- **One false positive**: qwen-cloud's `msg` IS surfaced, through
+  `v.get("msg")` on a raw `serde_json::Value` rather than the typed field. The
+  sweep keys on `.field` access, so **every read through an untyped Value is
+  invisible to it** — worth knowing before trusting its next run.
+- **One real finding**: zenmux states `used_flows` and `max_flows` beside the
+  percentage, and both were discarded. Those are exactly `usedCount`/`totalCount`
+  on the wire; without them a consumer asking "how many requests are left" must
+  multiply a percentage by a total it was never given. Now mapped, integral-only.
+- **The remaining 29** are in providers with no credential on this host
+  (neuralwatt 17, zenmux's siblings, minimax, doubao). Unverifiable here, which
+  is the same gate that blocks everything else about them.
+
+The asymmetry worth keeping: codex and deepseek carry their reasoning at the
+field, so a reader can tell a decision from an oversight. zenmux carried
+nothing, which is why it took a sweep to find. **An unread field with no note is
+indistinguishable from a forgotten one** — if you decide not to map something,
+say so where the field is declared.
+
+
 ## A browser session is a fallback, not a requirement — check the app first
 
 Nine providers here read a browser cookie, and that was treated as their nature
