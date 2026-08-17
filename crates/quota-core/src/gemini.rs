@@ -408,6 +408,24 @@ impl GeminiProvider {
         });
     }
 
+    /// THIS LANE REFRESHES, WHICH IS AN EXCEPTION -- READ BEFORE COPYING IT.
+    ///
+    /// The fleet rule is that a quota reader never touches a refresh endpoint,
+    /// because exactly one process may refresh a credential and that process is
+    /// its custodian. A second refresher on a family whose refresh tokens ROTATE
+    /// silently revokes the first holder's session -- for anthropic and openai
+    /// that means signing the user out of their editor, which is why those
+    /// plugin lanes were declined outright rather than built.
+    ///
+    /// Google's refresh tokens do NOT rotate on exchange. That was established
+    /// by probe, not by documentation, and it is the entire basis on which this
+    /// lane exists. It is a property of the credential family, not of this code.
+    ///
+    /// So the operative rule here has never been "never refresh". It is: NEVER
+    /// REFRESH A FAMILY WHOSE TOKENS ROTATE. If you are reading this as
+    /// precedent for a new lane, the question to answer first is which of those
+    /// two your family is -- and the answer is a probe, because getting it wrong
+    /// produces no error here and a logged-out user somewhere else.
     async fn refresh_access_token(
         &self,
         refresh_token: &str,
