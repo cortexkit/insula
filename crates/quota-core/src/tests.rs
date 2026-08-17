@@ -3009,6 +3009,7 @@ struct MockResetTransport {
     reservation_visible: AtomicBool,
     journal_path: Option<std::path::PathBuf>,
     credits_error: bool,
+    no_credits: bool,
     started: Semaphore,
     release: Semaphore,
 }
@@ -3023,6 +3024,7 @@ impl MockResetTransport {
             reservation_visible: AtomicBool::new(false),
             journal_path: None,
             credits_error: false,
+            no_credits: false,
             started: Semaphore::new(0),
             release: Semaphore::new(0),
         }
@@ -3035,6 +3037,15 @@ impl MockResetTransport {
 
     fn credits_failure(mut self) -> Self {
         self.credits_error = true;
+        self
+    }
+
+    /// Answer the credits endpoint the way a spent account does: a successful
+    /// call carrying an empty list. NOT an error -- the distinction is the whole
+    /// point, because a failed credits call and an account with none left take
+    /// different paths and only one of them may relax.
+    fn no_credits(mut self) -> Self {
+        self.no_credits = true;
         self
     }
 
@@ -3056,6 +3067,12 @@ impl ResetTransport for MockResetTransport {
         self.gets.fetch_add(1, Ordering::SeqCst);
         if self.credits_error {
             return Err(FetchError::Upstream("mock credits failure".into()));
+        }
+        if self.no_credits {
+            return Ok(CreditsHttpResponse {
+                body: br#"{"credits": [], "available_count": 0}"#.to_vec(),
+                date_header: Some("Tue, 14 Jul 2026 12:00:00 +0000".to_string()),
+            });
         }
         Ok(CreditsHttpResponse {
             body: br#"{
@@ -3292,6 +3309,120 @@ fn write_owner_only_test_file(path: &std::path::Path, body: &[u8]) {
     }
     let mut file = options.open(path).unwrap();
     std::io::Write::write_all(&mut file, body).unwrap();
+}
+
+/// An account with no banked credits left publishes its REAL usage.
+///
+/// THE JOIN THAT WAS MISSING. `zero_or_expiring_now_credits_cannot_arm` proves
+/// two things separately: that an empty credit list yields no usable expiry, and
+/// that `reporting_eligible` refuses when handed `armed: false`. It passes that
+/// `false` as a hand-written literal, so nothing connected the two -- no test
+/// established that a spent account actually PRODUCES an unrelaxed reading. Both
+/// halves were tested and the join was not.
+///
+/// FOUND FROM LIVE STATE, not by reading: both production Codex accounts ran out
+/// of credits, and the wire showed `usedPercent 82.0` with `rawUsedPercent`
+/// absent -- correct, and the first time that transition had ever been observed.
+/// Mutating `reset_trigger_expiry` to yield an expiry anyway reddened NOTHING.
+///
+/// The consequence of losing this guard is the worst this module can produce: an
+/// account at 82% publishing `usedPercent: 0` while holding nothing that could
+/// reset it. Consumers pace on the effective number, so a router would send work
+/// to an account that is nearly exhausted and cannot recover.
+///
+/// The window here is deliberately AT THE WALL (`limit_reached: true`, 100%),
+/// which is the exhaustion backstop -- the arm most likely to fire. A fixture
+/// below the wall would pass even with the guard deleted.
+#[tokio::test]
+async fn an_account_with_no_credits_left_publishes_its_real_usage() {
+    let temp = ResetTempDir::new("no-credits-publishes-real-usage");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 16 * 1024];
+        let size = stream.read(&mut request).await.unwrap();
+        let _ = String::from_utf8_lossy(&request[..size]);
+        let body = serde_json::json!({
+            "rate_limit": {
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 82.0,
+                    "reset_at": 1_900_000_000_i64,
+                    "limit_window_seconds": 604_800
+                }
+            }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"spent-account-token","account_id":"spent-account"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+
+    let transport = Arc::new(
+        MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset)).no_credits(),
+    );
+    let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+    let provider = crate::codex::CodexProvider::new_for_test(
+        // Armed as aggressively as the config allows, so nothing here is
+        // declining for want of configuration.
+        crate::config::CodexConfig {
+            auto_use_resets: 172_800,
+        },
+        None,
+        reset_transport,
+        Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        codex_home,
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    http_server.await.unwrap();
+
+    let usage = registry.get_usage(Some("codex")).await;
+    assert_eq!(usage.len(), 1, "the account still publishes");
+    let window = usage[0]
+        .usage
+        .as_ref()
+        .expect("a spent account still reports usage")
+        .primary
+        .as_ref()
+        .expect("a primary window");
+
+    assert_eq!(
+        window.used_percent, 82.0,
+        "an account with nothing left to spend must publish what it really used"
+    );
+    assert_eq!(
+        window.raw_used_percent, None,
+        "no relaxation happened, so there is no divergence to disclose"
+    );
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "there is nothing to consume, so no redemption may be attempted"
+    );
 }
 
 #[tokio::test]
@@ -4725,8 +4856,18 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
     );
 }
 
+/// Spent and about-to-expire credit lists yield no usable expiry.
+///
+/// RENAMED from `zero_or_expiring_now_credits_cannot_arm`, which stated a
+/// conclusion this test does not reach. It checks `earliest_usable_expiry`
+/// twice, then checks that `reporting_eligible` refuses an `armed: false` it is
+/// HANDED as a literal -- so nothing here connects a spent account to unrelaxed
+/// output. The old name asserted that join, a reader believed it, and the join
+/// went untested until a live account ran out of credits.
+///
+/// The join now lives in `an_account_with_no_credits_left_publishes_its_real_usage`.
 #[test]
-fn zero_or_expiring_now_credits_cannot_arm() {
+fn spent_and_expiring_credit_lists_yield_no_usable_expiry() {
     let now = reset_now();
     let zero = normalize_credits(br#"{"credits":[],"available_count":0}"#).unwrap();
     assert_eq!(zero.earliest_usable_expiry(now), None);
