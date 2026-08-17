@@ -33,8 +33,15 @@ const SERVER_BASE: &str = "https://opencode.ai/_server";
 const ORIGIN: &str = "https://opencode.ai";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
+///
+/// Hash naming the server function that lists workspaces. Rotates whenever they
+/// rebundle, and a stale one surfaces only as a rejected request -- which reads
+/// exactly like an outage while the defect is this line.
 pub const WORKSPACES_SERVER_ID: &str =
     "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f";
+/// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
+///
 /// Customer/billing server function, carrying the monthly spend a pay-as-you-go
 /// workspace bills against.
 ///
@@ -45,6 +52,10 @@ pub const WORKSPACES_SERVER_ID: &str =
 pub const BILLING_SERVER_ID: &str =
     "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d";
 
+/// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
+///
+/// Hash naming the subscription server function. Same rotation risk as the
+/// workspaces id.
 pub const SUBSCRIPTION_SERVER_ID: &str =
     "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4";
 

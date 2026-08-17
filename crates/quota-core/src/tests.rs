@@ -4866,6 +4866,104 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
 /// went untested until a live account ran out of credits.
 ///
 /// The join now lives in `an_account_with_no_credits_left_publishes_its_real_usage`.
+/// Every opaque upstream constant appears in the parity table, and nothing else does.
+///
+/// WHY THIS EXISTS. `docs/provider-matrix.md` carries a table of values copied
+/// from the upstream that we cannot compute or validate. It is the first step of
+/// every parity round, because a rotated constant is a one-line change a diff
+/// draws no attention to, and a stale one surfaces as a rejected request that
+/// reads exactly like an outage.
+///
+/// The table claimed to enumerate them and MISSED ONE: `BILLING_SERVER_ID`, the
+/// server function opencode falls back to when a workspace has no subscription.
+/// Same class, same rotation risk, absent from the list that gets re-checked. It
+/// also cited a line number that had drifted by ten.
+///
+/// So the population is declared AT EACH DEFINITION with a marker, and this test
+/// compares that set against the table. A new constant now announces itself from
+/// the file where it is written, rather than depending on its author remembering
+/// a document in another directory.
+///
+/// Line numbers are deliberately NOT asserted. They drift on every edit above the
+/// constant, and a test that fails on unrelated edits gets weakened or deleted.
+#[test]
+fn every_opaque_upstream_constant_is_in_the_parity_table() {
+    // Split so this file does not itself contain the contiguous marker: a scanner
+    // that counts occurrences of a name counts its own declaration, and the first
+    // run of this test found MARKER instead of a provider constant.
+    const MARKER: &str = concat!("OPAQUE-UPSTREAM", "-CONSTANT");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut marked: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("the source directory must be readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("a readable source file");
+        let lines: Vec<&str> = body.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(MARKER) {
+                continue;
+            }
+            // The marked item is the next `const` declaration below the comment.
+            let name = lines[i..]
+                .iter()
+                .find_map(|l| {
+                    let l = l.trim_start();
+                    let rest = l
+                        .strip_prefix("pub const ")
+                        .or_else(|| l.strip_prefix("const "))?;
+                    rest.split(':').next().map(str::to_string)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{MARKER} at {}:{} names no const below it",
+                        path.display(),
+                        i + 1
+                    )
+                });
+            marked.push(name);
+        }
+    }
+    marked.sort();
+    marked.dedup();
+
+    let matrix = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/provider-matrix.md"),
+    )
+    .expect("provider-matrix.md must be readable from the crate directory");
+    let table: Vec<String> = matrix
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(str::to_string))
+        .filter(|token| token.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        .collect();
+
+    for name in &marked {
+        assert!(
+            table.contains(name),
+            "{name} is marked {MARKER} in the source but is not a row in the \
+             provider-matrix parity table, so no round re-checks it"
+        );
+    }
+    for row in &table {
+        assert!(
+            marked.contains(row),
+            "the parity table lists {row}, which carries no {MARKER} marker: \
+             either it is not one, or the marker was lost in a refactor"
+        );
+    }
+
+    // Not vacuous: a lost marker convention or a renamed table heading would
+    // satisfy both loops above by comparing two empty sets.
+    assert_eq!(
+        marked.len(),
+        5,
+        "expected the five known opaque constants, found {marked:?}"
+    );
+}
+
 #[test]
 fn spent_and_expiring_credit_lists_yield_no_usable_expiry() {
     let now = reset_now();

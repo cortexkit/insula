@@ -33,6 +33,10 @@ use crate::{
 pub const PROVIDER_NAME: &str = "claude";
 const OPENCODE_PROVIDER: &str = "anthropic";
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
+///
+/// Dated opt-in header. Dated values get superseded, and the supersession is
+/// invisible here until a request is refused.
 const BETA_HEADER: &str = "oauth-2025-04-20";
 const CLAUDE_CODE_UA: &str = "claude-code/2.1.0";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

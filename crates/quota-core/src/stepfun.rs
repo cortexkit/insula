@@ -39,6 +39,10 @@ pub const PROVIDER_NAME: &str = "stepfun";
 const TOKEN_ENV: &[&str] = &["STEPFUN_TOKEN"];
 const API_URL: &str =
     "https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit";
+/// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
+///
+/// Fallback device identifier, used only when the token carries no `device_id`
+/// claim.
 const OASIS_WEB_ID: &str = "c8a1002d2c457e758785a9979832217c7c0b884c";
 const OASIS_APP_ID: &str = "10300";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \

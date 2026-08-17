@@ -388,6 +388,35 @@ failures that once read `no session: …` now read `credential unusable: …` or
 these strings will see a discontinuity at that release, and anything matching on
 them was relying on a promise this contract never made.
 
+## Measured behaviour is recorded here, not stamped on the wire
+
+Some questions a consumer needs answered are not things any upstream states.
+Whether a rate window resets at a boundary or slides is one: it changes how a
+router paces, and no provider on this wire says which it is.
+
+**Anthropic 5-hour windows reset at a boundary — they do not slide.** Measured
+2026-08-17 by polling one account every 100 seconds for five minutes: the reset
+instant held at `21:20:00`/`21:19:59`, sub-second jitter only, where a rolling
+last-5h window would have carried it forward by five minutes. Corroborating, two
+accounts on the same plan sat 30 minutes apart, which is a per-account session
+anchor — a sliding window has no anchor to differ on. Reproduce it the same way:
+poll ONE account repeatedly and watch its own `resetsAt`.
+
+This is deliberately NOT published as a `regeneration` mechanic. That object
+means *the upstream stated how quota returns*, and Anthropic states a reset
+instant and nothing else; `resetsAt` already carries that. Stamping a mechanic
+derived from our own observation would mint an upstream claim out of a
+measurement, and a wire field asserts itself indefinitely while a documented
+measurement carries its date and its method.
+
+**The failure that produced this section.** The same measurement was recorded
+the day before with the opposite conclusion, from two accounts in one output
+block read as one account over time. Different anchors look exactly like
+movement. A per-account field compared ACROSS accounts fabricates a time series,
+and the fabrication is invisible whenever the false reading is plausible for the
+thing being studied. Before concluding a value changed, confirm the rows share
+an identity and not merely a provider name.
+
 ## `spend` is money, and it fails in the opposite direction from a window
 
 Some providers sell credit alongside a plan, or instead of one. That credit is

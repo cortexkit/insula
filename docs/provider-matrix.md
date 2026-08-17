@@ -277,14 +277,29 @@ whose logic changed:
 
 | Constant | Where | What it is |
 |---|---|---|
-| `WORKSPACES_SERVER_ID` | `crates/quota-core/src/opencode.rs:36` | Hash naming the upstream server function that lists workspaces. Rotates when they rebundle. |
-| `SUBSCRIPTION_SERVER_ID` | `crates/quota-core/src/opencode.rs:38` | Same, for the subscription call. |
-| `BETA_HEADER` | `crates/quota-core/src/anthropic.rs:36` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
-| `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs:42` | Fallback device identifier, used only when the token carries no `device_id` claim. |
+| `WORKSPACES_SERVER_ID` | `crates/quota-core/src/opencode.rs` | Hash naming the upstream server function that lists workspaces. Rotates when they rebundle. |
+| `SUBSCRIPTION_SERVER_ID` | `crates/quota-core/src/opencode.rs` | Same, for the subscription call. |
+| `BILLING_SERVER_ID` | `crates/quota-core/src/opencode.rs` | Same, for the customer/billing call — the function a pay-as-you-go workspace is read from when it has no subscription object. Missing from this table until 2026-08-17. |
+| `BETA_HEADER` | `crates/quota-core/src/anthropic.rs` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
+| `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All four matched CodexBar v0.50.1, re-verified 2026-08-16 by locating each value
-in the tagged tree (`git grep <value> v0.49.3 -- Sources/`) rather than in the
-checkout, which usually sits at an older tag.
+All five matched CodexBar v0.52.0, re-verified 2026-08-17 by locating each
+value in the tagged tree (`git grep -l <value> v0.52.0`) rather than in a
+checkout, since a working tree can be on any commit.
+
+File paths here carry no line numbers on purpose. The two that had them were
+both stale by the time anyone read them -- a line number drifts on every edit
+above the constant, and a citation that is wrong in a detail teaches a reader to
+stop trusting the row.
+
+The membership of this table is fenced by
+`every_opaque_upstream_constant_is_in_the_parity_table`: each constant carries an
+`OPAQUE-UPSTREAM-CONSTANT` marker at its definition, and the test compares that
+set against these rows in both directions. It exists because this table said
+"four values" while the source had five -- `BILLING_SERVER_ID` was absent, so no
+round re-checked the one function opencode falls back to. Declaring the
+population where a new constant is written beats a table an author must remember
+to update from another directory.
 
 The re-check was overdue by five releases: this line read v0.47.0 while v0.48.0,
 v0.48.1, v0.49.0, v0.49.2 and v0.49.3 had all shipped. The values had not
