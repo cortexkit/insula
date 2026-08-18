@@ -63,6 +63,10 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "qwen-cloud";
 const DOMAIN: &str = "qwencloud.com";
+/// The script block the authenticated console shell emits. Its presence is what
+/// separates "we were served the real page" from "we were not signed in".
+const CONSOLE_BLOCK: &str = "ONE_CONSOLE_TOOL";
+
 const TOKEN_PLAN_URL: &str =
     "https://home.qwencloud.com/billing/subscription/token-plan-individual";
 const USAGE_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
@@ -228,6 +232,35 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
         if let Some(cap) = tier.weekly {
             secondary.total_count = Some(cap);
         }
+    }
+}
+
+/// Why the token-plan page carried no `SEC_TOKEN`, as two different faults.
+///
+/// A LOGGED-OUT PAGE AND A DRIFTED ONE BOTH LACK THE TOKEN, and the remedies are
+/// opposite: one is answered by signing in again, the other by re-porting the
+/// scrape. Both used to report `Decode`, which says the upstream sent something
+/// unparseable -- and `Decode` is one of the two classes counted as a stale
+/// browser login, so an upstream change made this module ask an operator to
+/// re-authenticate a session that was working perfectly.
+///
+/// Measured 2026-08-18: the console served a page to a LIVE session (HTTP 200,
+/// no redirect, `ONE_CONSOLE_TOOL` present, ticket cookie valid) with no
+/// `SEC_TOKEN` anywhere in 11.4 KB. That is the drift case, and it is why this
+/// split exists rather than a hypothetical.
+///
+/// The discriminator is the console block, not the word "login": a signed-in
+/// console page contains "login" in its own navigation, so matching on that
+/// would call every healthy page a logged-out one. The block is emitted by the
+/// authenticated shell, so its ABSENCE marks a page we were not served as a
+/// signed-in user.
+fn missing_token_error(html: &str) -> FetchError {
+    if html.contains(CONSOLE_BLOCK) {
+        FetchError::Decode("qwen-cloud token-plan page did not include SEC_TOKEN".to_string())
+    } else {
+        FetchError::Unauthorized(
+            "qwen-cloud token-plan page was not served to a signed-in session".to_string(),
+        )
     }
 }
 
@@ -426,11 +459,7 @@ impl UsageProvider for QwenCloudProvider {
                 .send(&self.http)
                 .await?;
             let html = String::from_utf8_lossy(&token_page);
-            let sec_token = extract_sec_token(&html).ok_or_else(|| {
-                FetchError::Decode(
-                    "qwen-cloud token-plan page did not include SEC_TOKEN".to_string(),
-                )
-            })?;
+            let sec_token = extract_sec_token(&html).ok_or_else(|| missing_token_error(&html))?;
 
             let body = JsonRequest::post_form(
                 USAGE_URL,
@@ -649,6 +678,49 @@ mod tests {
             normalize_usage(failed_result.to_string().as_bytes()),
             Err(FetchError::Decode(_))
         ));
+    }
+
+    /// A page from a LIVE session that lost the token is drift, not a logout.
+    ///
+    /// SHAPE FROM A LIVE FETCH, 2026-08-18: HTTP 200 on the real URL with no
+    /// redirect, the console block present, the ticket cookie valid, and no
+    /// `SEC_TOKEN` anywhere in 11.4 KB. Before this split it reported `Decode`,
+    /// which is counted as a stale browser login -- so an upstream change made
+    /// this module ask an operator to re-authenticate a working session.
+    #[test]
+    fn a_console_page_without_the_token_is_drift_not_a_logout() {
+        let page =
+            r#"<html><script>window.ONE_CONSOLE_TOOL={APP_ID:"x",LANG:"en"};</script></html>"#;
+        assert!(
+            matches!(missing_token_error(page), FetchError::Decode(_)),
+            "a page the signed-in shell rendered means our scrape drifted"
+        );
+    }
+
+    /// A page the signed-in shell did not render is a session problem.
+    #[test]
+    fn a_page_without_the_console_block_is_unauthorized() {
+        let page = r#"<html><body>Qwen Cloud login</body></html>"#;
+        assert!(
+            matches!(missing_token_error(page), FetchError::Unauthorized(_)),
+            "no console block means we were not served as a signed-in user"
+        );
+    }
+
+    /// The discriminator is the console block, never the word "login".
+    ///
+    /// A signed-in console page carries "login" in its own navigation, so a
+    /// keyword match would classify every healthy page as logged out -- and that
+    /// direction is the expensive one: it would tell an operator to
+    /// re-authenticate a working session on every genuine drift.
+    #[test]
+    fn the_word_login_in_a_console_page_does_not_make_it_a_logout() {
+        let page = r#"<html><nav><a href="/login">Sign in</a></nav>
+            <script>window.ONE_CONSOLE_TOOL={APP_ID:"x"};</script></html>"#;
+        assert!(
+            matches!(missing_token_error(page), FetchError::Decode(_)),
+            "the navigation word must not outrank the console block"
+        );
     }
 
     #[test]
