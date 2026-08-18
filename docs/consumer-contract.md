@@ -313,6 +313,13 @@ preserved reading *right now*. `staleEpisodes` is a monotonic count of how many
 times any slot has ENTERED that state since the module started, so a slot stale
 across many refresh turns counts once.
 
+It counts episodes, not providers, and nothing on the wire records WHICH lane
+flapped once the episode resolves — `stale` has returned to zero and the entry
+looks ordinary. So a non-zero count answers *did a transient failure happen*, and
+leaves *to whom* unanswerable after the fact. Catch it while `stale` is non-zero
+if you need the name; the entry discloses `stale: { since, class }` for as long
+as the failure lasts.
+
 It exists because the gauge alone cannot distinguish "nothing is failing" from
 "nothing was failing at the instant you polled" — and a transient failure that
 resolves between two polls leaves no other trace. Read it for "has this host
