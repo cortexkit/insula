@@ -1950,6 +1950,50 @@ long-running audit ledger lived under `.cortexkit` once — reachable, never
 destroyed, and invisible to every other checkout for its whole life. Both markers
 now sit in `.gitignore` beside the entries.
 
+## A bug report that arrives with a mechanism is the dangerous kind
+
+A report with only symptoms gets investigated. A report that also names a cause
+gets *implemented*, because the mechanism reads as work already done — and it is
+the one part of the report nobody re-derives.
+
+The instance (insula#8). A consumer filed a precise, well-evidenced timeline: a
+credential lane stayed `credential_unusable` for an hour after the vault record
+behind it was re-sealed, and recovered only on module restart. Attached was a
+mechanism — *unusable lanes are excluded from the probe cycle with no clearing
+edge* — and a fix: retry with backoff. Every symptom fitted.
+
+The mechanism was wrong. `NON_TRANSIENT_BACKOFF` is a flat 300s with no terminal
+state, so the lane was re-probed about twelve times during that hour, and a slot
+that fails and then succeeds recovers with no restart. Building the filed fix
+would have added a retry to a path that already retries, shipped as a fix, and
+reproduced identically on the next re-seal — with the report closed.
+
+**Reproduce the SYMPTOM, never the diagnosis.** Take the timeline as evidence and
+the mechanism as one hypothesis among the ones you have not thought of yet. The
+tell that you are implementing rather than investigating: you can describe the
+patch before you can name the test that fails without it.
+
+TWO THINGS THAT MADE THE ELIMINATION CHEAP, both worth reaching for early:
+
+- **Ask what the observation rules OUT.** Here, that a restart cured it. A
+  restart changes only in-process state, so every explanation living outside the
+  process was excluded in one step, and the remaining candidates were a short
+  list that could each be tested.
+- **Read the published string back to its single construction site.** The lane
+  reported `credential requires authentication`, which exactly one path produces:
+  a *successful* vault answer of `needs_reauth`. That distinguished "we latched a
+  stale verdict" from "we were told this, repeatedly, and correctly reported it"
+  — opposite investigations, identical appearance from outside.
+
+AND THE GAP IT EXPOSED, which generalises past this bug: every assertion about
+that failure class checked that a failure DEGRADES, and none checked that the
+degradation LIFTS. A refusal is visibly an outcome, so someone writes a test for
+it; its un-refusal produces no symptom to write a test about. **The recovery
+direction of a well-tested failure path is systematically the untested one.**
+Check it where the prior state differs — a lane recovering from stale-serving
+starts somewhere else than one recovering from degraded, and only the first has
+a disclosure that must be cleared.
+
 ## A tripwire that is not firing cannot be proved by deleting it
 
 Mutation proof has a standing shape here: delete the guard, and the test named
