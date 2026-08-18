@@ -551,11 +551,24 @@ pub fn class_means_credential_stopped_working(class: &str) -> bool {
         "credential_rejected" => true,
         // A credential was found and cannot be used as it stands.
         "credential_unusable" => true,
-        // The response arrived but did not carry usage. For a scraped page this
-        // is what an expired session looks like when the site answers 200 with a
-        // login form instead of data -- which is how several cookie providers
-        // fail, since they have no explicit signed-out detection.
-        "decode_failed" => true,
+        // NOT decode_failed, and this used to be. The reason it was here -- that
+        // several cookie providers have no explicit signed-out detection, so an
+        // expired session reaches us as an unparseable page -- was true when
+        // written and is not now: every one of the nine either constructs
+        // Unauthorized itself or reaches it through the 401 mapping.
+        //
+        // Measured the day it was removed. qwen-cloud reported decode_failed
+        // from a LIVE session (HTTP 200 on the real URL, no redirect, valid
+        // ticket cookie, authenticated console block present) because the
+        // upstream moved its CSRF token. Counting that as a stale login told the
+        // operator to re-authenticate a working session -- the fail-open
+        // direction on an observability surface, since it sends someone to do a
+        // thing that cannot help and looks like it should have.
+        //
+        // A parse failure is a statement about a PAYLOAD. Reading it as a
+        // statement about a CREDENTIAL is what made an upstream change look like
+        // a user problem.
+        "decode_failed" => false,
         // No credential was ever found: not logged in, which is the correct and
         // permanent state on a host that does not use the service.
         "credential_absent" => false,

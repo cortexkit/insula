@@ -307,13 +307,17 @@ async fn only_a_failed_cookie_counts_as_a_stale_login() {
     // Never logged in, and a working credential with no plan to report: both are
     // correct states rather than faults.
     assert_eq!(health.unconfigured, vec!["not-logged-in", "no-plan"]);
-    // Only the two that mean a stored login stopped working. Asserted as the
+    // Only the one that means a stored login stopped working. Asserted as the
     // whole list rather than by membership, so a class wrongly joining the count
     // fails here instead of passing unnoticed.
-    assert_eq!(
-        health.cookie_logins_stale,
-        vec!["login-expired", "page-unparseable"]
-    );
+    //
+    // `page-unparseable` USED TO BE HERE and is deliberately not. A decode
+    // failure is a statement about a payload, not about a credential: qwen-cloud
+    // produced one from a live session (HTTP 200 on the real URL, valid cookie,
+    // authenticated page) because the upstream moved its CSRF token, and
+    // counting it told the operator to re-authenticate something that was
+    // working. It still appears in `degraded` above, where it belongs.
+    assert_eq!(health.cookie_logins_stale, vec!["login-expired"]);
     assert_eq!(health.cookie_cohort_total, 6);
 }
 
