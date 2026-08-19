@@ -583,6 +583,18 @@ fn health_report(
         "handlesWithoutAccount": snapshot.handles_without_account,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
+        // How long since ANY fetch last succeeded, and whether that has gone on
+        // long enough to call the module degraded.
+        //
+        // `refresherStalled` watches the loop; these watch whether the loop
+        // accomplishes anything, which is a different claim and was the one
+        // nobody checked. On 2026-08-19 this module served 10-hour-old windows
+        // with `lastTickAgeSecs` at 1 and every number here reading normal.
+        //
+        // Null when nothing has ever succeeded, which is the ordinary state of a
+        // host holding credentials for none of these services.
+        "lastFetchSuccessAgeSecs": snapshot.last_fetch_success_age.map(|d| d.as_secs()),
+        "fetchBlackout": snapshot.fetch_blackout,
     });
     ModuleControlResponse::HealthCheck {
         status,
@@ -1009,6 +1021,8 @@ mod tests {
             handles_without_account: Vec::new(),
             last_tick_age: Some(std::time::Duration::from_secs(5)),
             refresher_stalled: false,
+            last_fetch_success_age: Some(std::time::Duration::from_secs(5)),
+            fetch_blackout: false,
             cache_poisoned: false,
         }
     }
@@ -1392,6 +1406,8 @@ mod tests {
             "cookieLoginsStale",
             "handlesWithoutAccount",
             "lastTickAgeSecs",
+            "fetchBlackout",
+            "lastFetchSuccessAgeSecs",
             "refresherStalled",
             "vaultUnmatchedDrops",
             "vaultStaleGenerationDrops",

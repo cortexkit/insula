@@ -92,6 +92,26 @@ pub const CONCURRENCY_CAP: usize = 8;
 /// to be replaced, so it is one of the three constants in the freshness
 /// relationship described on [`FRESH_HORIZON`].
 pub const FETCH_DEADLINE: Duration = Duration::from_secs(35);
+
+/// How long every previously-working lane may go without a success before this
+/// module stops calling itself healthy.
+///
+/// WHY THIS EXISTS. `STALL_HORIZON` watches the refresher LOOP, which is a
+/// liveness signal about the loop and not about the work: a process whose every
+/// fetch fails keeps ticking, keeps stale-serving (transient failures have no
+/// upper age bound by design), and reads `ok` forever. Measured on 2026-08-19 --
+/// the deployed module served 10-hour-old windows to every consumer, health said
+/// `ok`, `refresherStalled` said false, and a fresh process on the same host
+/// fetched everything in 20 seconds. Nothing escalated because nothing was
+/// watching whether ticking PRODUCED anything.
+///
+/// DERIVED, NOT PICKED. The longest a single healthy-then-failing lane may
+/// legitimately go between successes is `MAX_TRANSIENT_BACKOFF + FETCH_DEADLINE`
+/// (935s), since a transient failure retries on that ladder and each attempt may
+/// run to the deadline. This horizon is comfortably above that so an ordinary
+/// provider outage never trips it, and it is fenced against those two constants
+/// by test rather than by comment.
+pub const FETCH_BLACKOUT_HORIZON: Duration = Duration::from_secs(1800);
 /// Maximum idle sleep, which also bounds discovery of newly added handles.
 ///
 /// With [`FETCH_DEADLINE`] it bounds the gap between heartbeats, so it is one of

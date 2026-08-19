@@ -169,6 +169,18 @@ pub struct HealthSnapshot {
     /// The refresher loop is wedged/dead: its heartbeat is older than the stall
     /// horizon (or it never ticked well past startup). Maps to `degraded`.
     pub refresher_stalled: bool,
+    /// Age of the most recent SUCCESSFUL fetch across every slot; `None` when no
+    /// slot has ever succeeded, which is the ordinary state of a host holding
+    /// credentials for nothing.
+    pub last_fetch_success_age: Option<Duration>,
+    /// Every lane that once worked has now gone a long time without a success,
+    /// while the loop keeps ticking. Maps to `degraded`.
+    ///
+    /// This is the fault `refresher_stalled` cannot see. That flag watches the
+    /// LOOP; this one watches whether the loop accomplishes anything. A process
+    /// whose transport has died keeps ticking, keeps stale-serving, and reads
+    /// `ok` indefinitely -- observed for ten hours on 2026-08-19.
+    pub fetch_blackout: bool,
     /// The serving mutex was poisoned by a panicked task — the data path is
     /// faulted. Maps to `failing`.
     pub cache_poisoned: bool,
@@ -196,6 +208,8 @@ impl HealthSnapshot {
             handles_without_account: Vec::new(),
             last_tick_age: None,
             refresher_stalled: false,
+            last_fetch_success_age: None,
+            fetch_blackout: false,
             cache_poisoned: true,
         }
     }
@@ -205,10 +219,15 @@ impl HealthSnapshot {
         self.cache_poisoned
     }
 
-    /// The refresher loop is wedged/dead. Maps to `degraded`. (Not failing: the
-    /// last-known windows are still served; only their freshness decays.)
+    /// The refresher is not producing usable work. Maps to `degraded`. (Not
+    /// failing: the last-known windows are still served; only their freshness
+    /// decays -- and `failing` asks the supervisor to restart us, which is an
+    /// action taken on a theory rather than a measurement.)
+    ///
+    /// Two independent faults, because the loop being alive and the loop being
+    /// useful are different claims and only the first was ever checked.
     pub fn is_degraded(&self) -> bool {
-        self.refresher_stalled && !self.cache_poisoned
+        (self.refresher_stalled || self.fetch_blackout) && !self.cache_poisoned
     }
 
     /// Providers currently serving usable data (fresh or transiently-stale).

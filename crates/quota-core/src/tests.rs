@@ -19,7 +19,9 @@ use crate::codex_resets::{
 use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential, VaultGetError};
 use crate::model::{AccountInfo, ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, FetchError, HandlesError};
-use crate::refresh::{BASE_INTERVAL, FRESH_HORIZON};
+use crate::refresh::{
+    BASE_INTERVAL, FETCH_BLACKOUT_HORIZON, FETCH_DEADLINE, FRESH_HORIZON, MAX_TRANSIENT_BACKOFF,
+};
 use crate::vault_handles::VaultHandleLoader;
 
 fn handle(id: &str) -> CredentialHandle {
@@ -177,6 +179,111 @@ async fn f4_in_flight_refresh_revokes_previous_relaxation() {
 /// either mechanism, which is the level that stays true if one of them is later
 /// restructured -- and it does hold: removing both together fails this test,
 /// while removing either one alone does not.
+/// A module that fetches nothing for hours must stop calling itself healthy.
+///
+/// THE INCIDENT THIS COMES FROM (2026-08-19). The deployed module served
+/// 10-hour-old windows to every consumer while health read `ok` and
+/// `refresherStalled` read false. Both were literally true: the loop WAS
+/// ticking, once a second. Every fetch inside it failed with a transport error,
+/// transient failures stale-serve with no upper age bound by design, and nothing
+/// anywhere asked whether ticking was producing anything. A fresh process on the
+/// same host fetched all 37 providers in 20 seconds.
+///
+/// So this is not a stricter version of the stall check -- it is the other half.
+/// `refresher_stalled` asks whether the loop is ALIVE; this asks whether the
+/// loop is USEFUL, and only the first was ever checked.
+#[tokio::test]
+async fn a_lane_that_stops_succeeding_for_hours_reports_degraded() {
+    let registry = registry(&[("stub", false, true)]);
+    tick(&registry).await;
+    assert!(
+        !registry.health().is_degraded(),
+        "a module that just fetched successfully is not degraded"
+    );
+
+    // The loop keeps running; the fetches stop landing.
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            slot.status = SlotStatus::StaleTransient;
+            slot.last_success_at =
+                Some(Instant::now() - FETCH_BLACKOUT_HORIZON - Duration::from_secs(1));
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+        store.mark_tick(Instant::now());
+    }
+
+    let health = registry.health();
+    assert!(
+        health.fetch_blackout,
+        "every lane has gone {FETCH_BLACKOUT_HORIZON:?} without a success"
+    );
+    assert!(
+        health.is_degraded(),
+        "a module producing nothing must not report ok"
+    );
+    // Not vacuous: the OTHER fault is absent, so this is the new signal firing
+    // rather than the old one. The loop is ticking normally.
+    assert!(
+        !health.refresher_stalled,
+        "the loop is alive -- that was always the problem"
+    );
+}
+
+/// A host that has never fetched anything successfully is not in a blackout.
+///
+/// THE TRAP THIS AVOIDS, which is the reason the signal asks only about slots
+/// that have succeeded before: most hosts hold credentials for a handful of
+/// these services and nothing else. If "no recent success" counted a lane that
+/// never succeeded, the flag would be permanently true on the most ordinary
+/// machine there is -- and a signal that is never clear when nothing is wrong is
+/// trained into noise within a week, taking the real alarm with it.
+#[tokio::test]
+async fn a_host_that_never_fetched_anything_is_not_a_blackout() {
+    // `ok: false` makes the stub fail with NoSession -- a host holding no
+    // credential for this service, which is the ordinary case being defended.
+    let registry = registry(&[("stub", false, false)]);
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert!(
+        health.last_fetch_success_age.is_none(),
+        "nothing ever succeeded, so there is no age to report"
+    );
+    assert!(
+        !health.fetch_blackout,
+        "an unconfigured host is not a fetch blackout"
+    );
+    assert!(
+        !health.is_degraded(),
+        "a host holding no credentials is healthy, not degraded"
+    );
+}
+
+/// The blackout horizon must exceed the longest legitimate gap between successes.
+///
+/// A lane failing transiently retries on a ladder that caps at
+/// `MAX_TRANSIENT_BACKOFF`, and each attempt may run to `FETCH_DEADLINE` before
+/// giving up. So one provider having a bad afternoon can legitimately go that
+/// long between successes, and the horizon has to sit above the sum or an
+/// ordinary upstream outage would report this module as degraded.
+///
+/// Fenced here rather than explained in a comment because the three constants
+/// are declared apart and nothing else relates them -- the relationship is
+/// exactly what no single site owns.
+#[test]
+fn the_blackout_horizon_exceeds_the_longest_legitimate_success_gap() {
+    let longest_legitimate = MAX_TRANSIENT_BACKOFF + FETCH_DEADLINE;
+    assert!(
+        FETCH_BLACKOUT_HORIZON > longest_legitimate,
+        "blackout horizon {FETCH_BLACKOUT_HORIZON:?} must exceed \
+         MAX_TRANSIENT_BACKOFF + FETCH_DEADLINE = {longest_legitimate:?}, or a \
+         single provider outage reports the whole module degraded"
+    );
+}
+
 #[tokio::test]
 async fn a_cookie_login_leaves_the_stale_list_once_it_works_again() {
     struct RecoveringProvider {

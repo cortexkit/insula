@@ -81,7 +81,7 @@ use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
 use refresh::{
     next_slot_after_attempt, next_slot_after_unverified_failure, AttemptSequence, Incarnation,
-    ProviderSlot, SlotStatus, STALL_HORIZON,
+    ProviderSlot, SlotStatus, FETCH_BLACKOUT_HORIZON, STALL_HORIZON,
 };
 use store::{AuthoritativeHandles, SlotKey, SlotStore};
 
@@ -1146,6 +1146,20 @@ impl Registry {
             Some(age) => age > STALL_HORIZON,
             None => now.saturating_duration_since(created_at) > STALL_HORIZON,
         };
+
+        // How long ago the most recent SUCCESSFUL fetch was, across every slot.
+        //
+        // Asked only of slots that have succeeded at least once. A host holding
+        // credentials for nothing has no successes ever, and reading that as a
+        // blackout would make the signal permanently true on the most ordinary
+        // machine there is -- the same failure as any number that is never zero
+        // when nothing is wrong. With no prior success there is no claim to make.
+        let last_fetch_success_age = snapshot
+            .iter()
+            .filter_map(|(_, slot)| slot.last_success_at)
+            .max()
+            .map(|latest| now.saturating_duration_since(latest));
+        let fetch_blackout = last_fetch_success_age.is_some_and(|age| age > FETCH_BLACKOUT_HORIZON);
         HealthSnapshot {
             providers_total,
             fresh,
@@ -1160,6 +1174,8 @@ impl Registry {
             handles_without_account,
             last_tick_age,
             refresher_stalled,
+            last_fetch_success_age,
+            fetch_blackout,
             cache_poisoned: false,
         }
     }

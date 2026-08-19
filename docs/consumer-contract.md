@@ -307,6 +307,29 @@ added after a re-sealed vault credential kept being served with its pre-re-seal
 verdict until a module restart, where a restart is the one event in such a
 timeline that guarantees a new connection.
 
+`lastFetchSuccessAgeSecs` and `fetchBlackout` answer a question
+`refresherStalled` cannot: whether the refresher is accomplishing anything.
+
+`refresherStalled` watches the refresher LOOP — it goes true when the heartbeat
+stops. A process whose transport has died keeps ticking, keeps stale-serving
+(transient failures have no upper age bound by design), and reads `ok`
+indefinitely. That happened on 2026-08-19: this module served 10-hour-old
+windows to every consumer with `lastTickAgeSecs` at 1, `refresherStalled` false,
+and every other number reading normal. A fresh process on the same host fetched
+all 37 providers in twenty seconds.
+
+`lastFetchSuccessAgeSecs` is how long ago **any** slot last fetched successfully,
+and is `null` when nothing ever has — the ordinary state of a host holding
+credentials for none of these services. `fetchBlackout` is true once that age
+passes the blackout horizon, which sits above the longest gap a single flapping
+provider can legitimately produce, so one upstream having a bad afternoon does
+not trip it. When it is true the module reports `degraded`.
+
+It does not report `failing`, deliberately. `failing` asks the supervisor to
+restart the module — which would have cured that incident, and is still an action
+taken on a theory rather than a measurement. The signal says what is true; it
+does not act on a guess about why.
+
 `staleEpisodes` sits beside `stale` in the health metrics and answers a
 different question. `stale` is a gauge: how many providers are serving a
 preserved reading *right now*. `staleEpisodes` is a monotonic count of how many
