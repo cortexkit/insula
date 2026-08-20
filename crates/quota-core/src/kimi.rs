@@ -377,7 +377,7 @@ pub struct KimiProvider {
 impl KimiProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

@@ -724,7 +724,7 @@ impl CodexProvider {
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
-        let http = reqwest::Client::new();
+        let http = crate::http::provider_client();
         let reset_coordinator = if reset_config.is_enabled() {
             ResetCoordinator::from_env()
                 .map(Arc::new)
@@ -753,7 +753,7 @@ impl CodexProvider {
         codex_home_override: PathBuf,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
             reset_config,
             reset_transport,
             reset_coordinator: Ok(reset_coordinator),

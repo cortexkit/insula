@@ -231,7 +231,7 @@ impl AmpProvider {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::http::provider_client());
         Self { http }
     }
 }

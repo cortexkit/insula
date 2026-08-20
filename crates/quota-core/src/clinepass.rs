@@ -150,7 +150,7 @@ pub struct ClinePassProvider {
 impl ClinePassProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

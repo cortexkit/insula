@@ -203,7 +203,7 @@ pub struct QoderProvider {
 impl QoderProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

@@ -367,7 +367,7 @@ impl GeminiProvider {
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
             token: Mutex::new(None),
             credential_source,
             handle_loader,

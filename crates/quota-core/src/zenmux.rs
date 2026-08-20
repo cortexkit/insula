@@ -188,7 +188,7 @@ pub struct ZenMuxProvider {
 impl ZenMuxProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

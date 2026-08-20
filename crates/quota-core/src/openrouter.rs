@@ -167,7 +167,7 @@ impl OpenRouterProvider {
     pub fn new() -> Self {
         Self {
             url: CREDITS_URL.to_string(),
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 
@@ -187,7 +187,7 @@ impl OpenRouterProvider {
     fn with_url(url: String) -> Self {
         Self {
             url,
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

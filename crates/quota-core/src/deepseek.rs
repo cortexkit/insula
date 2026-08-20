@@ -164,7 +164,7 @@ impl DeepSeekProvider {
     pub fn new() -> Self {
         Self {
             url: BALANCE_URL.to_string(),
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 

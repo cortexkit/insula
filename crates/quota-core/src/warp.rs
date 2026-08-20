@@ -206,7 +206,7 @@ pub struct WarpProvider {
 impl WarpProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

@@ -192,6 +192,94 @@ async fn f4_in_flight_refresh_revokes_previous_relaxation() {
 /// So this is not a stricter version of the stall check -- it is the other half.
 /// `refresher_stalled` asks whether the loop is ALIVE; this asks whether the
 /// loop is USEFUL, and only the first was ever checked.
+/// A pooled connection must never survive from one refresh tick to the next.
+///
+/// THE INCIDENT (2026-08-19). reqwest holds an idle connection for 90 seconds by
+/// default; this module refetches every unit every `BASE_INTERVAL`, 60 seconds.
+/// Sixty is less than ninety, so a connection was ALWAYS handed back out before
+/// it could age out of the pool, and was therefore never evicted.
+///
+/// Harmless until the host slept. Sleep at 11:07:58, first fetch failure at
+/// 11:08:14 -- every provider at once, because every pool held sockets opened
+/// before the sleep. The refresher then reused those dead sockets every 60
+/// seconds for ten hours, each attempt refreshing the idle timer that had to
+/// expire for them to be discarded. Health read `ok` throughout.
+///
+/// The relationship is what nothing owned: one number is ours, the other is a
+/// dependency's default, and neither site can see the other. Asserted here
+/// because a later cadence change is exactly how it would come back -- raising
+/// BASE_INTERVAL is a harmless-looking edit that silently reopens this.
+/// No provider builds its own unbounded HTTP client.
+///
+/// The constant above is only worth having if the clients actually carry it,
+/// and reqwest exposes no way to read a built client's pool settings back --
+/// so the property is asserted where it is decidable: at the construction
+/// sites. Every one of the 35 providers used a bare `reqwest::Client::new()`
+/// until 2026-08-19, each with a 90-second pool a 60-second cadence could never
+/// age out, which is how a single host sleep took every lane down for ten hours.
+///
+/// This is the regression that will actually happen: a new provider copied from
+/// an old one, built the obvious way, silently outside the bound. Nothing about
+/// it looks wrong in review.
+#[test]
+fn no_provider_builds_its_own_http_client() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // http.rs owns the shared constructor and its fallback; loopback.rs and
+        // tests.rs are test scaffolding, where a bare client is correct.
+        if matches!(name.as_str(), "http.rs" | "loopback.rs" | "tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        // Production only: a bare client inside a provider's own test module is
+        // fine, and counting it would push authors toward weakening this test.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        examined += 1;
+        if production.contains("reqwest::Client::new()") {
+            offenders.push(name);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these providers build their own unbounded client instead of calling \
+         http::provider_client(): {offenders:?}"
+    );
+    // Not vacuous: if the directory walk or the test-boundary split ever breaks,
+    // this test would pass by examining nothing at all.
+    assert!(
+        examined > 30,
+        "expected to examine every provider module; examined only {examined}"
+    );
+}
+
+#[test]
+fn a_pooled_connection_cannot_outlive_a_refresh_tick() {
+    assert!(
+        crate::http::POOL_IDLE_TIMEOUT < BASE_INTERVAL,
+        "pool idle timeout {:?} must stay BELOW the refresh cadence {:?}, or a \
+         connection is reused across ticks and a dead one is never evicted",
+        crate::http::POOL_IDLE_TIMEOUT,
+        BASE_INTERVAL
+    );
+}
+
 #[tokio::test]
 async fn a_lane_that_stops_succeeding_for_hours_reports_degraded() {
     let registry = registry(&[("stub", false, true)]);

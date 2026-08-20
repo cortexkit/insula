@@ -189,6 +189,52 @@ impl Header {
     }
 }
 
+/// How long an idle connection may stay in the pool.
+///
+/// Must be BELOW `refresh::BASE_INTERVAL`, so a connection is never handed back
+/// out across ticks. See [`provider_client`]. Fenced by test, because the two
+/// numbers live in different modules and neither knows the other exists.
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client every provider should use.
+///
+/// WHY THIS EXISTS RATHER THAN `reqwest::Client::new()` AT EACH PROVIDER.
+/// reqwest keeps an idle connection in its pool for 90 seconds by default
+/// (verified at source, reqwest 0.12.28 `async_impl/client.rs`), and this module
+/// re-fetches every unit every `BASE_INTERVAL` -- 60 seconds. SIXTY IS LESS THAN
+/// NINETY, so a pooled connection is handed out again before it can ever age
+/// out. It is never idle long enough to be evicted.
+///
+/// That is harmless until a connection DIES WITHOUT SAYING SO. Measured
+/// 2026-08-19: the host entered sleep at 11:07:58 and the first fetch failure
+/// landed at 11:08:14, sixteen seconds later. Every provider failed at once --
+/// not because they share a client, but because every pool held sockets opened
+/// before that sleep. The refresher then reused those dead sockets every 60
+/// seconds for TEN HOURS, each attempt refreshing the very idle timer that
+/// needed to expire for them to be discarded. A fresh process on the same host
+/// fetched all 37 providers in twenty seconds; a restart cured it.
+///
+/// So the pool idle timeout must sit BELOW the refresh cadence. That trades
+/// cross-tick connection reuse -- one TLS handshake per provider per minute,
+/// which is nothing for a poller -- for the removal of a whole failure class.
+/// Reuse WITHIN a tick is preserved, which is the reuse that matters: providers
+/// making several calls per fetch make them seconds apart.
+pub fn provider_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // A peer that dies without sending a FIN is exactly what host sleep
+        // leaves behind. Keepalive gives the kernel a way to notice, rather than
+        // leaving detection entirely to the idle timeout above.
+        .tcp_keepalive(POOL_IDLE_TIMEOUT)
+        .build()
+        // A builder failure means the TLS backend could not initialise, which no
+        // provider can do anything about. Falling back keeps the process serving
+        // rather than turning every lane into a startup panic -- it loses the
+        // pool bound, and a bounded outage that heals on restart beats a module
+        // that will not start.
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// A small request spec the helper executes and maps to [`FetchError`].
 pub struct JsonRequest {
     method: Method,

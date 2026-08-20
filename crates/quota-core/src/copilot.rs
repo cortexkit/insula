@@ -203,7 +203,7 @@ pub struct CopilotProvider {
 impl CopilotProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

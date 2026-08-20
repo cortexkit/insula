@@ -857,10 +857,10 @@ impl AntigravityProvider {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::http::provider_client());
         Self {
             http,
-            remote_http: reqwest::Client::new(),
+            remote_http: crate::http::provider_client(),
             credential_source,
             handle_loader,
             quota_url: REMOTE_QUOTA_URL.to_string(),

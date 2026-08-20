@@ -249,7 +249,7 @@ impl AnthropicProvider {
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
             credential_source,
             handle_loader,
             usage_url: USAGE_URL.to_string(),

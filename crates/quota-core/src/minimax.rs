@@ -585,7 +585,7 @@ pub struct MinimaxProvider {
 impl MinimaxProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }

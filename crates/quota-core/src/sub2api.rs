@@ -285,7 +285,7 @@ pub struct Sub2ApiProvider {
 impl Sub2ApiProvider {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::provider_client(),
         }
     }
 }
