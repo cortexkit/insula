@@ -1994,6 +1994,60 @@ Check it where the prior state differs — a lane recovering from stale-serving
 starts somewhere else than one recovering from degraded, and only the first has
 a disclosure that must be cleared.
 
+## The dangerous constant is the one you do not own
+
+Two constants can be correct alone and wrong together — that is already recorded
+above, and the version of it that bit this module hardest had one constant that
+is not ours at all.
+
+`BASE_INTERVAL` is 60 seconds: how often the refresher refetches a unit. reqwest
+keeps an idle pooled connection for 90 seconds by default. Sixty is less than
+ninety, so a pooled connection was always handed back out before it could age
+out, and was therefore never evicted. Harmless for the life of the module —
+until a connection died without saying so. The host slept at 11:07:58 and the
+first fetch failure landed sixteen seconds later; every provider failed at once,
+because every pool held sockets opened before that sleep. The refresher then
+reused those dead sockets every 60 seconds for TEN HOURS, **each attempt
+refreshing the very idle timer that had to expire for them to be discarded**.
+
+WHY THIS IS HARDER THAN THE TWO-CONSTANTS-YOU-OWN CASE, which is the whole
+point of writing it down separately:
+
+- **The other number is invisible.** Ours is declared in a file with a comment
+  explaining it. Theirs is a default, written nowhere in this repo, discoverable
+  only by reading a dependency's source. Nothing in review will ever put the two
+  on the same page.
+- **It can change under you without a code change.** A dependency upgrade can
+  move their side of the relationship, and the diff that does it is a lockfile
+  line. Our constant did not move; the relationship can still break.
+- **The failure is delayed and unrelated.** The two constants met years of ticks
+  without incident. What surfaced it was an unrelated host event, which is why
+  the symptom arrived looking like a network problem rather than a design one.
+
+WHAT TO DO ABOUT IT:
+
+1. When a dependency's behaviour participates in a relationship with one of our
+   constants, **write their number down beside ours, with the version and the
+   file you read it in.** Not to trust it — to make its change visible when
+   someone next reads the line.
+2. **Prefer a bound you own to a bound you inherit.** Setting the pool timeout
+   explicitly costs one builder call and converts an invisible default into a
+   declared constant with a fence.
+3. **Fence the relationship where it is decidable.** The constants compare
+   directly. Whether the client actually *carries* the constant does not — the
+   library exposes no way to read it back — so that half is fenced by walking
+   the construction sites instead. Mutating the setting reddened nothing until
+   that second fence existed, which is the exact "coverage does not flow through
+   a call" trap one layer out.
+
+AND THE READING DISCIPLINE THE INCIDENT TAUGHT: the symptom was every lane
+failing at once with a transport error, on a box where `curl` reached the same
+endpoints fine. That combination says the fault is in *process state*, not the
+network and not the code — a fresh process fetching everything in twenty
+seconds proved it in one step. **Ask what an observation rules OUT before
+hunting for what causes it**; "a restart cures it" excluded every explanation
+living outside the process and left a list short enough to test.
+
 ## A tripwire that is not firing cannot be proved by deleting it
 
 Mutation proof has a standing shape here: delete the guard, and the test named
