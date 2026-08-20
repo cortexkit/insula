@@ -388,7 +388,96 @@ impl RedemptionJournal {
     /// the state it is trying to verify. Printing the resolved path lets an
     /// operator compare it against the one they expect, which is the only
     /// comparison that can be made from outside.
+    /// Take over a journal left at the pre-rename location.
+    ///
+    /// Runs once at startup, before the write probe, and does nothing unless the
+    /// current path holds NO records while the legacy path holds some. That
+    /// condition is the whole safety argument: it cannot overwrite a live
+    /// journal, and re-running it after a successful adoption is a no-op,
+    /// because the legacy file is gone.
+    ///
+    /// VERIFIED BY CONTENTS, NOT BY EXISTENCE. The legacy file is removed only
+    /// after the new one has been read back and found to hold the same number of
+    /// records. A move that "succeeds" while writing nothing is exactly the
+    /// failure this migration exists to avoid, and file existence cannot tell
+    /// the two apart.
+    ///
+    /// On any failure the legacy file is LEFT IN PLACE and the error is
+    /// announced. Losing a pending record is a double spend of real money; a
+    /// stale copy costs a confused reader, and the next startup retries.
+    fn adopt_legacy_journal(&self) -> Result<(), JournalError> {
+        let Ok(legacy) = legacy_redemption_journal_path() else {
+            // No resolvable home means no legacy path to consider. The write
+            // probe reports the real problem a moment later.
+            return Ok(());
+        };
+        self.adopt_from(&legacy)
+    }
+
+    /// The migration itself, taking the legacy path explicitly.
+    ///
+    /// Separated from the env lookup so it can be driven with real files on real
+    /// paths. Reaching it through the environment would mean mutating process
+    /// env from a test, which races every other test in the binary -- and this
+    /// is the one piece of code here whose failure costs money, so it must be
+    /// exercised directly rather than through a lookup.
+    fn adopt_from(&self, legacy: &Path) -> Result<(), JournalError> {
+        if legacy == self.path || !legacy.exists() {
+            return Ok(());
+        }
+        if !self.load().unwrap_or_default().is_empty() {
+            // The current journal is authoritative. Leave the legacy file rather
+            // than deleting it: this is the downgrade-then-upgrade case, and its
+            // records may not all be in the new file.
+            eprintln!(
+                "[insula] codex reset journal: {} also exists and was NOT adopted, because {} already holds records",
+                legacy.display(),
+                self.path.display()
+            );
+            return Ok(());
+        }
+
+        let carried = Self::new(legacy.to_path_buf()).load()?;
+        if carried.is_empty() {
+            // Nothing to carry. Remove the husk so the next reader is not sent
+            // to a second location for no reason.
+            let _ = std::fs::remove_file(legacy);
+            return Ok(());
+        }
+
+        self.save(&carried)?;
+        // Defensive readback. Its failure path is not reachable from a test
+        // without a deliberately broken `save`, so nothing exercises it -- but
+        // it is the difference between "the records are at the new path" and
+        // "a file exists at the new path", and only the first justifies
+        // deleting the old one.
+        let readback = self.load()?;
+        if readback.len() != carried.len() {
+            return Err(JournalError::new(format!(
+                "adopting {} into {} wrote {} of {} record(s); the legacy journal is left in place",
+                legacy.display(),
+                self.path.display(),
+                readback.len(),
+                carried.len()
+            )));
+        }
+        std::fs::remove_file(legacy).map_err(|error| {
+            JournalError::new(format!(
+                "adopted {} record(s) into {} but could not remove the legacy journal: {error}",
+                carried.len(),
+                self.path.display()
+            ))
+        })?;
+        eprintln!(
+            "[insula] codex reset journal: adopted {} record(s) from {}",
+            carried.len(),
+            legacy.display()
+        );
+        Ok(())
+    }
+
     fn probe_atomic_write(&self) -> Result<(), JournalError> {
+        self.adopt_legacy_journal()?;
         let records = self.load()?;
         eprintln!(
             "[ck-quota] codex reset journal: {} ({} record(s))",
@@ -668,34 +757,55 @@ fn prune_records(
     Ok(before - records.len())
 }
 
-/// Where the redemption journal lives.
+/// The directory segment this journal lives under, and the one it used to.
 ///
-/// THE `ck-quota` SEGMENT IS DELIBERATE AND MUST NOT BE TIDIED. It is a literal,
-/// not a value derived from the binary or the module id, and both of those have
-/// since been renamed — so beside a binary called `ck-insula` this path reads
-/// like a leftover from an old name. It is not. It is where every redemption
-/// this host has ever reserved is recorded.
-///
-/// Renaming the segment does not fail. The old file is simply not found, an
-/// empty journal is created in its place, and an empty journal is
+/// The `ck-quota` name was retired when the binary became `ck-insula`. The
+/// journal did NOT move with it, deliberately: a renamed segment does not fail,
+/// it silently finds no file, creates an empty journal, and an empty journal is
 /// indistinguishable from a correctly migrated one — while every pending
-/// redemption it used to fence is now unfenced, free to be spent a second time.
+/// redemption it used to fence is unfenced and free to be spent a second time.
 /// The cost is money and there is no symptom.
 ///
-/// If this ever has to move, it is a migration with its own window: move the
-/// file first, then verify by its CONTENTS rather than its existence.
+/// So the move is a migration rather than an edit, and `adopt_legacy_journal`
+/// is that migration: it verifies by CONTENTS, not by existence.
+const STATE_SEGMENT: &str = "cortexkit/insula";
+const LEGACY_STATE_SEGMENT: &str = "cortexkit/ck-quota";
+
+/// Where the redemption journal lives.
+///
+/// This is where every redemption this host has ever reserved is recorded. The
+/// `CK_QUOTA_STATE_DIR` override keeps its retired name on purpose: it is an
+/// operator-facing knob that may be set in a live config, and renaming it would
+/// silently relocate the journal for anyone who set it — the exact failure this
+/// whole migration exists to avoid, arriving through the escape hatch.
 pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
+    journal_path_under(STATE_SEGMENT)
+}
+
+/// Where it lived before the `ck-quota` to `insula` rename.
+///
+/// Read once at startup, adopted if the current path holds nothing, then
+/// removed. Not a fallback: a permanent two-location read would mean neither
+/// location is authoritative, and the next reader could not tell which one a
+/// given record came from.
+fn legacy_redemption_journal_path() -> Result<PathBuf, JournalError> {
+    journal_path_under(LEGACY_STATE_SEGMENT)
+}
+
+fn journal_path_under(segment: &str) -> Result<PathBuf, JournalError> {
     if let Some(path) = std::env::var_os("CK_QUOTA_STATE_DIR").filter(|value| !value.is_empty()) {
+        // An explicit directory is used verbatim for both the current and the
+        // legacy path, so a host that sets it has nothing to migrate and the
+        // adoption below is a no-op rather than a second location.
         return Ok(PathBuf::from(path).join("redemptions.json"));
     }
     if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path)
-            .join("cortexkit/ck-quota")
-            .join("redemptions.json"));
+        return Ok(PathBuf::from(path).join(segment).join("redemptions.json"));
     }
     crate::env::home_dir()
         .map(|home| {
-            home.join(".local/state/cortexkit/ck-quota")
+            home.join(".local/state")
+                .join(segment)
                 .join("redemptions.json")
         })
         .ok_or_else(|| {
@@ -1268,6 +1378,106 @@ mod tests {
     /// Separate from the gate test below because that one sets both signals at
     /// once: an account reported as limited *and* at 100%. Either term alone
     /// refuses that fixture, so it cannot show that both are required.
+    /// A per-test scratch directory, matching the idiom used elsewhere in this
+    /// crate rather than adding a dependency for two tests. Named so a failure
+    /// leaves an inspectable directory behind.
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "insula-journal-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A pending record, the state whose loss costs money.
+    fn pending_record(account: &str, request: &str) -> RedemptionRecord {
+        RedemptionRecord {
+            account_id: account.to_string(),
+            redeem_request_id: request.to_string(),
+            created_at: "2026-08-20T12:00:00+00:00".to_string(),
+            last_attempt_at: None,
+            attempt_count: 0,
+            status: JournalStatus::Pending,
+            outcome: None,
+        }
+    }
+
+    /// A journal at the pre-rename location is carried across, then removed.
+    ///
+    /// The rename from `ck-quota` to `insula` could not be a path edit: a
+    /// renamed segment finds no file, creates an empty journal, and an empty
+    /// journal is indistinguishable from a migrated one -- while every pending
+    /// redemption it fenced is free to be spent again. Money, no symptom.
+    #[test]
+    fn a_journal_at_the_old_location_is_adopted_and_the_old_file_removed() {
+        let dir = scratch_dir("adopt");
+        let legacy_dir = dir.join("cortexkit/ck-quota");
+        let current_dir = dir.join("cortexkit/insula");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+
+        let legacy = legacy_dir.join("redemptions.json");
+        let carried = vec![pending_record("acct-1", "req-1")];
+        RedemptionJournal::new(legacy.clone())
+            .save(&carried)
+            .expect("seed the legacy journal");
+
+        let journal = RedemptionJournal::new(current_dir.join("redemptions.json"));
+        journal.adopt_from(&legacy).expect("adoption succeeds");
+
+        let adopted = journal.load().expect("read the adopted journal");
+        assert_eq!(adopted.len(), 1, "the pending record must survive the move");
+        assert_eq!(adopted[0].redeem_request_id, "req-1");
+        assert!(
+            !legacy.exists(),
+            "the legacy journal must be removed once its contents are verified, \
+             or the next reader cannot tell which location is authoritative"
+        );
+    }
+
+    /// A populated current journal is never overwritten by a legacy one.
+    ///
+    /// This is the downgrade-then-upgrade case: an older binary wrote to the old
+    /// path after the migration. Adopting there would DISCARD the newer records,
+    /// which is the same double-spend hazard pointing the other way.
+    #[test]
+    fn a_populated_journal_is_not_overwritten_by_the_legacy_one() {
+        let dir = scratch_dir("adopt");
+        let legacy_dir = dir.join("cortexkit/ck-quota");
+        let current_dir = dir.join("cortexkit/insula");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+
+        let legacy = legacy_dir.join("redemptions.json");
+        RedemptionJournal::new(legacy.clone())
+            .save(&[pending_record("acct-old", "req-old")])
+            .expect("seed the legacy journal");
+
+        let journal = RedemptionJournal::new(current_dir.join("redemptions.json"));
+        journal
+            .save(&[pending_record("acct-new", "req-new")])
+            .expect("seed the current journal");
+
+        journal.adopt_from(&legacy).expect("adoption is a no-op");
+
+        let kept = journal.load().expect("read the current journal");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].redeem_request_id, "req-new",
+            "the current journal must win; adopting would discard newer records"
+        );
+        assert!(
+            legacy.exists(),
+            "the legacy file must be LEFT for inspection rather than deleted, \
+             because its records were not carried anywhere"
+        );
+    }
+
     #[test]
     fn a_window_at_its_limit_blocks_relaxation_even_when_the_upstream_reports_clear() {
         let mut usage = usage_at(4.0);
