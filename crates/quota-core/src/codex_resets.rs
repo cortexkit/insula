@@ -359,8 +359,28 @@ impl RedemptionJournal {
         Self { path }
     }
 
+    /// The journal at its environment-resolved location, migrating if needed.
+    ///
+    /// THE MIGRATION LIVES HERE AND NOWHERE ELSE, and that placement is the
+    /// whole safety property rather than a detail. It was briefly in
+    /// `probe_atomic_write`, which every coordinator runs -- including the ones
+    /// tests build over temporary directories. A test journal is empty, the
+    /// legacy path resolves from the real environment whatever the journal's own
+    /// path is, and the adoption is defined as "current empty, legacy populated":
+    /// so `cargo test` adopted this developer's real redemption records into a
+    /// scratch file and deleted the original. Observed 2026-08-20, and the
+    /// records happened to be resolved and past retention, so nothing was owed.
+    /// On a host with a pending record it would have destroyed a live fence
+    /// against spending real money twice.
+    ///
+    /// Only a journal that ASKED THE ENVIRONMENT where to live has any business
+    /// reading the environment's previous answer.
     pub fn from_env() -> Result<Self, JournalError> {
-        Ok(Self::new(redemption_journal_path()?))
+        let journal = Self::new(redemption_journal_path()?);
+        if let Ok(legacy) = legacy_redemption_journal_path() {
+            journal.adopt_from(&legacy)?;
+        }
+        Ok(journal)
     }
 
     pub fn path(&self) -> &Path {
@@ -390,37 +410,23 @@ impl RedemptionJournal {
     /// comparison that can be made from outside.
     /// Take over a journal left at the pre-rename location.
     ///
-    /// Runs once at startup, before the write probe, and does nothing unless the
-    /// current path holds NO records while the legacy path holds some. That
-    /// condition is the whole safety argument: it cannot overwrite a live
-    /// journal, and re-running it after a successful adoption is a no-op,
-    /// because the legacy file is gone.
+    /// Does nothing unless the current path holds NO records while the legacy
+    /// path holds some. That condition is the whole safety argument: it cannot
+    /// overwrite a live journal, and re-running after a successful adoption is a
+    /// no-op because the legacy file is gone.
     ///
     /// VERIFIED BY CONTENTS, NOT BY EXISTENCE. The legacy file is removed only
-    /// after the new one has been read back and found to hold the same number of
-    /// records. A move that "succeeds" while writing nothing is exactly the
-    /// failure this migration exists to avoid, and file existence cannot tell
-    /// the two apart.
+    /// after the new one has been read back and found to hold the same records.
+    /// A move that "succeeds" while writing nothing is exactly the failure this
+    /// migration exists to avoid, and existence cannot tell the two apart.
     ///
-    /// On any failure the legacy file is LEFT IN PLACE and the error is
-    /// announced. Losing a pending record is a double spend of real money; a
-    /// stale copy costs a confused reader, and the next startup retries.
-    fn adopt_legacy_journal(&self) -> Result<(), JournalError> {
-        let Ok(legacy) = legacy_redemption_journal_path() else {
-            // No resolvable home means no legacy path to consider. The write
-            // probe reports the real problem a moment later.
-            return Ok(());
-        };
-        self.adopt_from(&legacy)
-    }
-
-    /// The migration itself, taking the legacy path explicitly.
+    /// On any failure the legacy file is LEFT IN PLACE and the error announced:
+    /// losing a pending record costs real money, a stale copy costs a confused
+    /// reader, and the next startup retries.
     ///
-    /// Separated from the env lookup so it can be driven with real files on real
-    /// paths. Reaching it through the environment would mean mutating process
-    /// env from a test, which races every other test in the binary -- and this
-    /// is the one piece of code here whose failure costs money, so it must be
-    /// exercised directly rather than through a lookup.
+    /// Takes the legacy path explicitly so it can be driven with real files
+    /// rather than by mutating process env, which races every other test in the
+    /// binary. Its only caller is `from_env`.
     fn adopt_from(&self, legacy: &Path) -> Result<(), JournalError> {
         if legacy == self.path || !legacy.exists() {
             return Ok(());
@@ -477,7 +483,6 @@ impl RedemptionJournal {
     }
 
     fn probe_atomic_write(&self) -> Result<(), JournalError> {
-        self.adopt_legacy_journal()?;
         let records = self.load()?;
         eprintln!(
             "[ck-quota] codex reset journal: {} ({} record(s))",
@@ -1381,9 +1386,17 @@ mod tests {
     /// A per-test scratch directory, matching the idiom used elsewhere in this
     /// crate rather than adding a dependency for two tests. Named so a failure
     /// leaves an inspectable directory behind.
+    ///
+    /// The counter is load-bearing, not decoration. Two tests in this file
+    /// briefly shared a directory because they were given the same label and the
+    /// timestamp resolved identically -- one test then read the other's journal
+    /// and failed with a confusing mismatch. A monotonic counter makes a
+    /// collision impossible regardless of what labels callers choose.
     fn scratch_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "insula-journal-{label}-{}-{:?}",
+            "insula-journal-{label}-{seq}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1405,6 +1418,61 @@ mod tests {
             status: JournalStatus::Pending,
             outcome: None,
         }
+    }
+
+    /// Only the environment-resolving constructor may migrate.
+    ///
+    /// THE BUG THIS PINS WAS SHIPPED AND OBSERVED. The migration was briefly run
+    /// from `probe_atomic_write`, which every coordinator performs -- including
+    /// the ones tests build over temporary directories. The legacy path resolves
+    /// from the process environment regardless of where the journal itself
+    /// lives, and adoption is defined as "current empty, legacy populated", so a
+    /// plain `cargo test` adopted this developer's real redemption records into
+    /// a scratch file and deleted the original. The records happened to be
+    /// resolved and past retention; on a host with a pending one it would have
+    /// destroyed a live fence against spending real money twice.
+    ///
+    /// ASSERTED OVER THE SOURCE, deliberately, and the first attempt at this
+    /// test is why. Driving it through the real constructor cannot work: the
+    /// buggy path reads the ENVIRONMENT's legacy location, so a test that seeds
+    /// a legacy-shaped file in a scratch directory proves nothing -- reinstating
+    /// the bug left it green. Making it observable would mean setting
+    /// XDG_STATE_HOME, which is process-global and races every other test here.
+    /// What is actually decidable is the property itself: the universal probe
+    /// must not consult the environment's previous answer.
+    #[test]
+    fn only_the_env_constructor_reaches_the_legacy_path() {
+        let source = include_str!("codex_resets.rs");
+        let probe = source
+            .split_once("fn probe_atomic_write")
+            .expect("probe_atomic_write must exist")
+            .1;
+        let body = probe
+            .split_once("\n    fn ")
+            .map(|(body, _)| body)
+            .unwrap_or(probe);
+        assert!(
+            !body.contains("legacy_redemption_journal_path") && !body.contains("adopt_from"),
+            "probe_atomic_write runs for EVERY journal including temporary ones, \
+             so reaching the environment's legacy path from here lets a test \
+             consume real redemption records"
+        );
+        // Not vacuous: the migration must still exist somewhere, and that
+        // somewhere must be the constructor that asked the environment in the
+        // first place.
+        let from_env = source
+            .split_once("pub fn from_env() -> Result<Self, JournalError> {")
+            .expect("from_env must exist")
+            .1;
+        let from_env_body = from_env
+            .split_once("\n    }")
+            .map(|(b, _)| b)
+            .unwrap_or(from_env);
+        assert!(
+            from_env_body.contains("adopt_from"),
+            "the migration has to live in from_env; if it lives nowhere, a \
+             journal at the old location is silently abandoned"
+        );
     }
 
     /// A journal at the pre-rename location is carried across, then removed.
@@ -1447,7 +1515,7 @@ mod tests {
     /// which is the same double-spend hazard pointing the other way.
     #[test]
     fn a_populated_journal_is_not_overwritten_by_the_legacy_one() {
-        let dir = scratch_dir("adopt");
+        let dir = scratch_dir("no-overwrite");
         let legacy_dir = dir.join("cortexkit/ck-quota");
         let current_dir = dir.join("cortexkit/insula");
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
