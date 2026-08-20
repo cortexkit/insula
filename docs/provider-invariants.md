@@ -1994,6 +1994,49 @@ Check it where the prior state differs — a lane recovering from stale-serving
 starts somewhere else than one recovering from degraded, and only the first has
 a disclosure that must be cleared.
 
+## A migration belongs to the constructor that asked where to live
+
+Anything reachable from a general-purpose constructor is reachable from a test,
+and a test that runs a migration is a test with production side effects.
+
+The instance. Moving the redemption journal out of the retired `ck-quota`
+directory needed a real migration — a renamed segment does not fail, it finds no
+file, creates an empty journal, and an empty journal is indistinguishable from a
+correctly migrated one while every pending redemption it fenced becomes free to
+spend again. The migration itself was written carefully: adopt only when the new
+path is empty and the old one is not, verify by contents, delete the old file
+only after reading the new one back, leave everything in place on any error.
+
+It was then called from `probe_atomic_write`, which every coordinator runs —
+**including the ones tests build over temporary directories**. The legacy path
+resolves from the process environment regardless of where the journal itself
+lives, so a scratch journal is "empty" and the developer's real journal is
+"populated", which is exactly the adoption condition. A plain `cargo test`
+carried this host's real redemption records into a scratch file and deleted the
+original, eight minutes before the deploy meant to migrate them.
+
+**The rule:** a migration may only be reachable from the constructor that
+resolved its path from the environment. Only something that asked the
+environment where to live has any business reading the environment's previous
+answer. That makes test code safe by construction rather than by care — the
+alternative is every future caller of a general constructor remembering a
+hazard that is invisible at the call site.
+
+**The tell, generalised:** ask what else calls the function you are adding an
+effect to. A side effect added to a widely-called helper inherits every one of
+its callers, and in a test binary some of those callers exist only to be cheap.
+
+AND A TEST THAT CANNOT FAIL ON ITS OWN BUG. The first guard written for this
+seeded a legacy-shaped file in a scratch directory and drove the real
+constructor. It passed — and it passed with the bug reinstated, because the
+buggy path reads the ENVIRONMENT's legacy location and never looked at the
+scratch one. Reinstating the defect and watching the test stay green is the only
+thing that revealed it; the test name and the assertion both read as correct.
+Where a property is not observable without mutating process-global state, assert
+it over the source instead, which is decidable — the same move as fencing HTTP
+client construction sites when the library exposes no way to read the setting
+back.
+
 ## The dangerous constant is the one you do not own
 
 Two constants can be correct alone and wrong together — that is already recorded
