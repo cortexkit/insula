@@ -27,8 +27,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.52.0** (37 providers registered; verified
-2026-08-16, a null round). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.53.0** (37 providers registered; verified
+2026-08-20, a null round). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -262,6 +262,31 @@ The `fireworks-ai` one is worth remembering if that vendor ever ships a billing
 endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
 
+### v0.52.0 -> v0.53.0 (checked 2026-08-20)
+
+NULL. Constants all present at the tag. Fifteen provider files changed, eight of
+them Grok, and none of it reaches what we parse.
+
+**Grok** is the one that looked substantive and is not. The delta adds a
+credential-routing type that picks between an OAuth token and a manually pasted
+cookie header, which is a settings-UI concern with no counterpart here: our two
+lanes are the local opencode auth store and the vault, and neither is
+user-pasted. The only change inside the credits path we DO parse is a line
+wrapped across three lines -- `resetsAt` still resolves `currentPeriod.end` then
+falls back to `billingPeriodEnd`, unchanged. Read the functions whole in both
+tags before concluding; the fragment reads like a reset-resolution change.
+
+**OpenCodeGo** is the interesting null. Upstream now refuses to fall back to a
+local estimate when a manually configured credential fails authentication --
+"do not hide its authentication failure behind an unrelated local estimate".
+That is the invariant `classify_go_page` already enforces, for the reason its own
+doc comment gives: a signed-out page can carry an unsubscribed-looking record, so
+the signed-out check must come first. Same conclusion, reached independently, and
+their local-estimate lane still has no counterpart here.
+
+**OpenAI** adds `costProvenance: .vendorMetered` to its API-key usage snapshot,
+which is a spend concern on a lane we do not serve -- codex reads `wham/usage`.
+
 ### v0.50.1 -> v0.52.0 (checked 2026-08-17)
 
 Nine provider files changed; two touch providers we serve.
@@ -296,7 +321,7 @@ the endpoint is recorded here so that is a lookup rather than a rediscovery.
 
 ### Opaque constants, re-checked every round
 
-Four values are copied from the upstream rather than derived from anything we
+Five values are copied from the upstream rather than derived from anything we
 can compute. They carry no meaning we can validate, so a stale one is invisible
 here and surfaces only as a request the upstream rejects — which reads exactly
 like an outage, and the confusion is expensive: the provider looks broken
@@ -315,8 +340,8 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All five matched CodexBar v0.52.0, re-verified 2026-08-17 by locating each
-value in the tagged tree (`git grep -l <value> v0.52.0`) rather than in a
+All five matched CodexBar v0.53.0, re-verified 2026-08-20 by locating each
+value in the tagged tree (`git grep -l <value> v0.53.0`) rather than in a
 checkout, since a working tree can be on any commit.
 
 File paths here carry no line numbers on purpose. The two that had them were
