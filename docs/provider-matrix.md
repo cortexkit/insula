@@ -319,6 +319,35 @@ the endpoint is recorded here so that is a lookup rather than a rediscovery.
 
 **Kiro and Zed:** not implemented here.
 
+### qwen-cloud request fidelity, verified against a capture
+
+Checked 2026-08-21 against a capture of the working console, by enumerating
+every gateway call the browser made rather than sampling the ones we already
+knew about. Four distinct APIs, and the capture is now fully accounted for:
+
+| call | ours | verdict |
+|---|---|---|
+| `usage` | `GATEWAY_PARAMS` | `cornerstoneParam` identical |
+| `quota-config` | `QUOTA_CONFIG_PARAMS` | `cornerstoneParam` identical |
+| `subscription` | `SUBSCRIPTION_PARAMS` | identical, plus they send `commodityCode` — see below |
+| `reset-card/list` | not implemented | deferred, shape unobserved |
+
+**The one divergence is deliberate.** The console filters its subscription call
+by `commodityCode` and we do not, because filtering is the rejecting direction:
+an account on a different token-plan product would get no record at all where
+today it gets its own. The cost of staying unfiltered — another product's record
+reaching a cap lookup keyed by a bare tier name — is closed at the enrichment
+instead, which refuses counts it cannot attribute while leaving the percentage
+alone.
+
+**Method note, because the first run of this was wrong.** The comparison script
+named the constants it expected and reported `(not found)` for the usage call —
+whose constant is `GATEWAY_PARAMS`, not the `USAGE_PARAMS` it guessed. A
+not-found row must never read as a verified one. Deriving the constants from the
+source instead found all three, and is what makes a re-run trustworthy after a
+rename: **a comparison keyed on names you supply can only check the ones you
+thought of.**
+
 ### qwen-cloud reset cards, deferred on an unobserved shape
 
 The 2026-08-20 capture revealed a fourth gateway call this console makes:
