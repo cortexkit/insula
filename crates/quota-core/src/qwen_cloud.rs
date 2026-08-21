@@ -237,17 +237,36 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
 
 /// Why the token-plan page carried no `SEC_TOKEN`, as two different faults.
 ///
-/// A LOGGED-OUT PAGE AND A DRIFTED ONE BOTH LACK THE TOKEN, and the remedies are
-/// opposite: one is answered by signing in again, the other by re-porting the
-/// scrape. Both used to report `Decode`, which says the upstream sent something
+/// A LOGGED-OUT PAGE AND AN UNBOOTSTRAPPED ONE BOTH LACK THE TOKEN, and the
+/// remedies are opposite: one is answered by signing in again, the other by
+/// waiting. Both used to report `Decode`, which says the upstream sent something
 /// unparseable -- and `Decode` is one of the two classes counted as a stale
-/// browser login, so an upstream change made this module ask an operator to
-/// re-authenticate a session that was working perfectly.
+/// browser login, so this asked an operator to re-authenticate a working
+/// session.
 ///
-/// Measured 2026-08-18: the console served a page to a LIVE session (HTTP 200,
-/// no redirect, `ONE_CONSOLE_TOOL` present, ticket cookie valid) with no
-/// `SEC_TOKEN` anywhere in 11.4 KB. That is the drift case, and it is why this
-/// split exists rather than a hypothetical.
+/// THE SECOND CASE IS TRANSIENT, AND THAT WAS ESTABLISHED THE EXPENSIVE WAY.
+/// On 2026-08-18 the console served a live session (HTTP 200, no redirect,
+/// `ONE_CONSOLE_TOOL` present, ticket cookie valid) an 11.4 KB page with no
+/// `SEC_TOKEN` anywhere. I read that as the console having been rebuilt as a
+/// JavaScript app, and said so publicly. It was not: on 2026-08-21 the same URL
+/// with the same session returned 21.3 KB containing `SEC_TOKEN: "` -- the exact
+/// spelling this module already matches -- and the provider was serving again
+/// with no change from us. A capture of the working browser confirmed the
+/// gateway host and the `usage` and `quota-config` request bodies are byte for
+/// byte what we already send.
+///
+/// So the console can transiently serve a shell that has not bootstrapped. That
+/// makes this the same shape as an empty 2xx body, which this crate has
+/// classified as transient since the grok flaps: the response is well formed and
+/// content-free, and the next attempt is likely to differ. `Decode` would drop a
+/// healthy cached window over a page that comes back.
+///
+/// WHAT PAYS FOR THE RISK. Classifying it transient means a genuine console
+/// rebuild -- where the token really is gone for good -- stale-serves instead of
+/// degrading. That is acceptable only because the wire now discloses it: the
+/// entry carries `stale: { since, class }` for as long as the failure lasts, and
+/// `staleEpisodes` counts the run. Before those existed, `Decode` was the only
+/// way such a drift became visible at all.
 ///
 /// The discriminator is the console block, not the word "login": a signed-in
 /// console page contains "login" in its own navigation, so matching on that
@@ -256,7 +275,7 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
 /// signed-in user.
 fn missing_token_error(html: &str) -> FetchError {
     if html.contains(CONSOLE_BLOCK) {
-        FetchError::Decode("qwen-cloud token-plan page did not include SEC_TOKEN".to_string())
+        FetchError::Upstream("qwen-cloud token-plan page was served without SEC_TOKEN".to_string())
     } else {
         FetchError::Unauthorized(
             "qwen-cloud token-plan page was not served to a signed-in session".to_string(),
@@ -680,20 +699,30 @@ mod tests {
         ));
     }
 
-    /// A page from a LIVE session that lost the token is drift, not a logout.
+    /// A page from a LIVE session that lost the token must not degrade the lane.
     ///
     /// SHAPE FROM A LIVE FETCH, 2026-08-18: HTTP 200 on the real URL with no
     /// redirect, the console block present, the ticket cookie valid, and no
-    /// `SEC_TOKEN` anywhere in 11.4 KB. Before this split it reported `Decode`,
-    /// which is counted as a stale browser login -- so an upstream change made
-    /// this module ask an operator to re-authenticate a working session.
+    /// `SEC_TOKEN` anywhere in 11.4 KB. Three days later the same URL and the
+    /// same session returned 21.3 KB carrying the token, and the provider served
+    /// again with no change from us -- so the shell is transient, and a class
+    /// that drops the cached window over it manufactures an outage.
+    ///
+    /// Asserted as NOT-Unauthorized as well as transient, because the expensive
+    /// direction is still the logout reading: it would count against the stale
+    /// browser logins and send an operator to re-authenticate a working session.
     #[test]
-    fn a_console_page_without_the_token_is_drift_not_a_logout() {
+    fn a_console_page_without_the_token_is_transient_not_a_logout() {
         let page =
             r#"<html><script>window.ONE_CONSOLE_TOOL={APP_ID:"x",LANG:"en"};</script></html>"#;
+        let error = missing_token_error(page);
         assert!(
-            matches!(missing_token_error(page), FetchError::Decode(_)),
-            "a page the signed-in shell rendered means our scrape drifted"
+            matches!(error, FetchError::Upstream(_)),
+            "a shell the signed-in console rendered comes back; it must stale-serve"
+        );
+        assert!(
+            !matches!(error, FetchError::Unauthorized(_)),
+            "a working session must never be reported as a stale login"
         );
     }
 
@@ -718,7 +747,7 @@ mod tests {
         let page = r#"<html><nav><a href="/login">Sign in</a></nav>
             <script>window.ONE_CONSOLE_TOOL={APP_ID:"x"};</script></html>"#;
         assert!(
-            matches!(missing_token_error(page), FetchError::Decode(_)),
+            matches!(missing_token_error(page), FetchError::Upstream(_)),
             "the navigation word must not outrank the console block"
         );
     }
