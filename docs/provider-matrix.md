@@ -319,6 +319,31 @@ the endpoint is recorded here so that is a lookup rather than a rediscovery.
 
 **Kiro and Zed:** not implemented here.
 
+### qwen-cloud reset cards, deferred on an unobserved shape
+
+The 2026-08-20 capture revealed a fourth gateway call this console makes:
+`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list`, alongside the
+`usage`, `quota-config` and `subscription` calls we already make. The name says
+it holds something like the Codex banked resets — credits that reset a window on
+demand — and if so it belongs on the wire the same way `savedResets` does.
+
+**Not built, because the response was empty.** The captured call returned
+`success: true` with `data: []`: this account holds zero cards. So the endpoint
+is confirmed to exist and confirmed to answer, and the SHAPE OF A CARD is
+unobserved — no field names, no expiry, no count. Building a parser against that
+means inventing the field names and pinning them in a fixture that looks exactly
+like a real one, which is the provenance failure this repo has already paid for
+once (a transcribed JetBrains fixture asserted fields no payload had shown).
+
+What is known and worth keeping: an empty list here is a STATED absence
+(`success: true`), not a failure, so whoever builds this maps it to zero cards
+rather than to an error — the same distinction `savedResets` draws between an
+inventory of none and an inventory that could not be fetched.
+
+Unblocks when an account with at least one card is captured. The call shape is
+already known: same host, same `sec_token` form field, `Data` carrying only the
+standard `cornerstoneParam` block.
+
 ### Opaque constants, re-checked every round
 
 Five values are copied from the upstream rather than derived from anything we
