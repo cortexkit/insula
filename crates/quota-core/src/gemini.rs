@@ -451,10 +451,18 @@ impl GeminiProvider {
                 ));
             }
             if response.status == 401 || response.status == 403 {
-                return Err(FetchError::Unauthorized(format!(
-                    "HTTP {}",
-                    response.status
-                )));
+                // Named, because this lane makes two calls that fail the same
+                // way. Google answers 403 both when it refuses to renew the
+                // credential and when the renewed credential may not have the
+                // resource, and both rendered as a bare `unauthorized: HTTP
+                // 403` -- the string that reached the wire on 2026-08-21 while
+                // this provider was dark, telling nobody which had happened.
+                // The remedies differ: one is a credential that cannot be
+                // renewed, the other an account that is no longer entitled.
+                return Err(
+                    FetchError::Unauthorized(format!("HTTP {}", response.status))
+                        .stage("token refresh"),
+                );
             }
             let excerpt: String = String::from_utf8_lossy(&response.body)
                 .chars()
@@ -707,7 +715,8 @@ impl UsageProvider for GeminiProvider {
             let response = JsonRequest::post_json(&self.quota_url, quota_body)
                 .bearer(&access_token)
                 .send(&self.http)
-                .await?;
+                .await
+                .map_err(|error| error.stage("quota"))?;
 
             let usage = normalize_quota(&response)?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage))
@@ -934,6 +943,37 @@ mod tests {
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("refresh_token=refresh-token"));
         assert!(request.contains("grant_type=refresh_token"));
+    }
+
+    /// A refused REFRESH says so, because this lane has two ways to be refused.
+    ///
+    /// LIVE INCIDENT, 2026-08-21. This provider went dark publishing
+    /// `unauthorized: HTTP 403`, and that string was ambiguous between the two
+    /// calls it makes: Google answers 403 both when it will not renew the
+    /// credential and when the renewed credential may not have the resource.
+    /// Those have opposite remedies -- one credential cannot be renewed at all,
+    /// the other belongs to an account that is no longer entitled -- and neither
+    /// is the "sign in again" that a bare `unauthorized` implies.
+    ///
+    /// Paired with the quota-stage assertion in the vault test, which pins
+    /// `quota: HTTP 401` from a fixture that seeds a valid cached token so the
+    /// refresh is never reached. A stage name that does not DISTINGUISH is
+    /// decoration; these two are the discrimination.
+    #[tokio::test]
+    async fn a_refused_refresh_names_the_refresh_rather_than_the_quota_call() {
+        let (result, request) = refresh_against(403, Vec::new()).await;
+        assert_refresh_request(&request);
+
+        let error = result.expect_err("a 403 on the token endpoint is a refusal");
+        assert!(
+            matches!(&error, FetchError::Unauthorized(message)
+                if message == "token refresh: HTTP 403"),
+            "expected the refresh stage to be named, got {error}"
+        );
+        // The variant is load-bearing beyond the text: Unauthorized is
+        // non-transient, so this must not stale-serve a window behind a
+        // credential the upstream has stopped renewing.
+        assert_eq!(classify(&error), FetchClass::NonTransient);
     }
 
     #[tokio::test]
@@ -1216,7 +1256,11 @@ mod tests {
         let local = provider.fetch_handle(&CredentialHandle::implicit()).await;
         assert!(matches!(
             local.usage,
-            Err(FetchError::Unauthorized(message)) if message == "HTTP 401"
+            // `quota`, not `token refresh`: this fixture seeds a still-valid
+            // cached token, so the refresh is never reached and the 401 comes
+            // from the quota call. The two stages are exactly what this
+            // assertion now distinguishes.
+            Err(FetchError::Unauthorized(message)) if message == "quota: HTTP 401"
         ));
         tokio::task::yield_now().await;
         assert!(reports.lock().unwrap().is_empty());
