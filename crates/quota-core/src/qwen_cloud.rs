@@ -151,6 +151,42 @@ struct SubscriptionResult {
 struct SubscriptionData {
     #[serde(rename = "specCode")]
     spec_code: Option<String>,
+    /// Names the product this record belongs to, e.g.
+    /// `sfm_tokenplansolo_public_intl-sg-ycx4vlnxo0a`.
+    #[serde(rename = "instanceCode")]
+    instance_code: Option<String>,
+}
+
+/// The product whose caps `/quota-config` describes.
+///
+/// The console's own subscription call passes this as a `commodityCode` filter
+/// and ours does not -- observed in a capture of the working browser,
+/// 2026-08-20. We deliberately keep the unfiltered request: filtering is the
+/// REJECTING direction, and an account on a different token-plan product would
+/// get no record at all where today it gets its own.
+///
+/// The risk that creates is narrow and worth naming. `specCode` is a bare tier
+/// name -- the captured value is `"pro"` -- and we use it to index the
+/// quota-config cap table. If an unfiltered call ever returns another product's
+/// subscription on a multi-subscription account, a generic tier name can hit a
+/// real row and publish that product's cap as this window's `totalCount`. A
+/// wrong absolute count is worse than none: a percentage that disagrees with its
+/// own counts is visibly broken, while counts that agree with nothing are
+/// believed.
+const TOKEN_PLAN_COMMODITY: &str = "sfm_tokenplansolo_public_intl";
+
+/// Whether a subscription record describes the token plan we publish.
+///
+/// Absent means UNVERIFIABLE, not wrong: only one payload has ever been
+/// observed, so a record that omits `instanceCode` is enriched as before rather
+/// than refused. The check exists to catch a record that names a DIFFERENT
+/// product, which is the only case where a cap lookup can silently succeed with
+/// the wrong table row.
+fn record_is_the_token_plan(data: &SubscriptionData) -> bool {
+    match data.instance_code.as_deref() {
+        Some(code) => code.starts_with(TOKEN_PLAN_COMMODITY),
+        None => true,
+    }
 }
 
 /// Enrich windows with absolute counts from the quota-config + subscription
@@ -196,11 +232,15 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
         Some(c) => c,
         None => return,
     };
-    let spec = match sub_result
-        .data
-        .as_ref()
-        .and_then(|d| d.spec_code.as_deref())
-    {
+    let Some(sub_data) = sub_result.data.as_ref() else {
+        return;
+    };
+    if !record_is_the_token_plan(sub_data) {
+        // Another product's subscription. Leave the percentages alone rather
+        // than deriving counts from a cap table this record does not describe.
+        return;
+    }
+    let spec = match sub_data.spec_code.as_deref() {
         Some(s) => s,
         None => return,
     };
@@ -789,6 +829,77 @@ mod tests {
         format!(r#"{{"successResponse":true,"data":{{"DataV2":{{"data":{inner}}}}}}}"#).into_bytes()
     }
 
+    /// Counts are derived only from a record that belongs to the token plan.
+    ///
+    /// WHY THIS CAN HAPPEN AT ALL. The console filters its subscription call by
+    /// `commodityCode` and we deliberately do not, because filtering would
+    /// return nothing at all for an account on a different token-plan product.
+    /// The cost of staying unfiltered is this case: on a multi-subscription
+    /// account the gateway may answer with another product's record, and
+    /// `specCode` is a bare tier name -- the captured value is `"pro"` -- so it
+    /// can hit a real row of the token plan's cap table and publish that cap as
+    /// this window's `totalCount`.
+    ///
+    /// A wrong absolute count is worse than no count. A percentage that
+    /// disagrees with its own counts is visibly broken; counts that agree with
+    /// nothing are believed.
+    #[test]
+    fn another_products_subscription_does_not_enrich_the_counts() {
+        let mut usage = usage_at(50.0, 25.0);
+        enrich_with_counts(
+            &mut usage,
+            &caps_body("pro", "1000", "40000"),
+            &subscription_body_for("sfm_someotherproduct_public_intl", "pro"),
+        );
+        assert_eq!(
+            usage.primary.as_ref().unwrap().total_count,
+            None,
+            "a cap table this record does not describe must not produce counts"
+        );
+        // The window itself survives: the percentage was never in question, and
+        // dropping it would turn a missing enrichment into a missing provider.
+        assert_eq!(usage.primary.as_ref().unwrap().used_percent, 50.0);
+    }
+
+    /// The token plan's own record still enriches, suffix and all.
+    ///
+    /// The control for the test above: without it, a guard that rejected
+    /// everything would pass, and the enrichment would be silently dead.
+    #[test]
+    fn the_token_plans_own_subscription_still_enriches() {
+        let mut usage = usage_at(50.0, 25.0);
+        enrich_with_counts(
+            &mut usage,
+            &caps_body("pro", "1000", "40000"),
+            &subscription_body_for("sfm_tokenplansolo_public_intl", "pro"),
+        );
+        assert_eq!(
+            usage.primary.as_ref().unwrap().total_count,
+            Some(1000.0),
+            "the real record must still produce counts"
+        );
+    }
+
+    /// A record that does not say which product it is gets enriched as before.
+    ///
+    /// Absent is UNVERIFIABLE, not wrong. One payload has ever been observed, so
+    /// refusing on a missing field would trade a hypothetical wrong count for a
+    /// certain lost one -- the over-rejecting direction, on the evidence we have.
+    #[test]
+    fn a_record_without_an_instance_code_is_enriched_as_before() {
+        let mut usage = usage_at(50.0, 25.0);
+        enrich_with_counts(
+            &mut usage,
+            &caps_body("pro", "1000", "40000"),
+            &subscription_body("pro"),
+        );
+        assert_eq!(
+            usage.primary.as_ref().unwrap().total_count,
+            Some(1000.0),
+            "a record that cannot be checked must not be refused"
+        );
+    }
+
     fn caps_body(spec: &str, five_hour: &str, weekly: &str) -> Vec<u8> {
         gateway(&format!(
             r#"{{"success":true,"data":{{"{spec}":{{"five_hour":{five_hour},"weekly":{weekly}}}}}}}"#
@@ -798,6 +909,19 @@ mod tests {
     fn subscription_body(spec: &str) -> Vec<u8> {
         gateway(&format!(
             r#"{{"success":true,"data":{{"specCode":"{spec}"}}}}"#
+        ))
+    }
+
+    /// A subscription record that names the product it belongs to, in the shape
+    /// the console actually returns.
+    ///
+    /// LIVE-OBSERVED SHAPE (capture of the working browser, 2026-08-20): the
+    /// real record carried `instanceCode` `sfm_tokenplansolo_public_intl-sg-…`
+    /// beside `specCode: "pro"`. The suffix is an instance id and is not matched
+    /// on -- only the product prefix is.
+    fn subscription_body_for(commodity: &str, spec: &str) -> Vec<u8> {
+        gateway(&format!(
+            r#"{{"success":true,"data":{{"specCode":"{spec}","instanceCode":"{commodity}-sg-ycx4vlnxo0a"}}}}"#
         ))
     }
 
