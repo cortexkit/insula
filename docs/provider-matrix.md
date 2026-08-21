@@ -319,6 +319,41 @@ the endpoint is recorded here so that is a lookup rather than a rediscovery.
 
 **Kiro and Zed:** not implemented here.
 
+### gemini: the CLI-OAuth sunset, observed 2026-08-21
+
+Predicted during the v0.52.0 parity round from upstream's own copy; now seen on
+this host. Recorded because the wire cannot say it, and the next reader would
+otherwise re-derive it from an error that points the wrong way.
+
+**The evidence, in the order that makes it decisive:**
+
+| observation | rules out |
+|---|---|
+| `unauthorized: quota: HTTP 403` | a refresh failure — the credential renews fine |
+| `antigravity` serving on the same host, same family, same API host | a Google-wide or network fault |
+| refresh token present, refresh not refused | an expired or revoked credential |
+
+So Google renews this credential and then refuses it the Code Assist quota
+resource. That is an ENTITLEMENT change, not a credential fault: Google closed
+Gemini CLI OAuth for individual/AI Pro/Ultra accounts and directs them to
+Antigravity, which is exactly what this host shows — one Google lane dark, the
+other serving.
+
+**The published class is `credential_rejected`, and it is misleading here.** It
+means *a credential was presented and refused*, which is true at the transport
+level and reads as *sign in again* — an action that cannot help, because the
+mechanism the credential would be for is gone. That is the false-remedy shape
+this repo has hit twice before (a decode failure counted as a stale login; an
+opencode outage that was a null we could not read).
+
+**Not reclassified, deliberately.** Distinguishing a sunset 403 from an ordinary
+one needs a discriminator no single observation supplies, and a guard whose
+correctness cannot be measured from this machine must not ship. What made the
+diagnosis possible in minutes rather than hours was the STAGE NAME, not a new
+class: `quota:` versus `token refresh:` is the whole difference between an
+entitlement problem and a credential problem, and both had rendered identically
+until today.
+
 ### qwen-cloud request fidelity, verified against a capture
 
 Checked 2026-08-21 against a capture of the working console, by enumerating
