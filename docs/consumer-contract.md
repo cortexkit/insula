@@ -452,6 +452,27 @@ derived from our own observation would mint an upstream claim out of a
 measurement, and a wire field asserts itself indefinitely while a documented
 measurement carries its date and its method.
 
+**What that measurement does NOT establish, and cannot from this host.** It was
+taken from accounts this machine's own agent traffic drives, and a window that is
+never idle cannot show what happens when it expires unused. So the claim is
+bounded: *within an active window the reset instant is stable*, which rules out a
+rolling window. Whether the next window anchors at the next first use or lands on
+a fixed grid is a different question, and the very activity that makes these
+accounts worth measuring is what keeps it unanswerable here.
+
+One live corroboration of the anchoring half, observable on any host with an
+unused account: on 2026-08-21 three accounts on this box read 16.0% with a reset
+instant, 0.0% with a reset instant, and **0.0% with no `resetsAt` at all**. The
+third is an account nothing has used — so no window exists to state a reset for,
+which is what a per-session anchor looks like from outside. A fixed grid would
+publish the next boundary whether or not anyone had used the account.
+
+The general rule this is an instance of: a measurement of provider behaviour
+taken from a host that is itself driving that provider is shaped by that driving,
+and the shaping is invisible in the numbers. State what was feeding the lane
+beside the method and the date. Where nothing was, say so — an unstated
+influence and an absent one look identical to the next reader.
+
 **The failure that produced this section.** The same measurement was recorded
 the day before with the opposite conclusion, from two accounts in one output
 block read as one account over time. Different anchors look exactly like
