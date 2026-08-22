@@ -1994,6 +1994,59 @@ Check it where the prior state differs — a lane recovering from stale-serving
 starts somewhere else than one recovering from degraded, and only the first has
 a disclosure that must be cleared.
 
+## After a timeout with no socket error, what happens to the connection?
+
+"Nothing" is the defect. Found in this module 2026-08-22 and, once stated, in
+four other hand-rolled clients across the fleet.
+
+Every ordinary way a client drops a connection needs the socket to SAY
+something: the reader sees EOF, the reader sees an error, or a write fails. A
+socket killed while the host slept says none of those — writes are accepted into
+the void, no FIN arrives, and the reader stays blocked. **Silence is the only
+symptom**, and the only place it surfaces is a request timeout.
+
+So a timeout that reports failure to its caller and leaves the connection
+installed makes every later call reuse it, spend the full budget, and fail. The
+lane is dark until the process restarts, which is why this class always presents
+as *sticky until restart, cured by restart, everything reporting healthy
+throughout*.
+
+**The fail-before recipe**, which needs a stub rather than a unit test: accept
+the connection, complete the handshake and any route setup, then **never
+answer**, and hold the socket open — closing it proves nothing, because that
+exercises the EOF path instead of the one under test. Call twice. If the second
+call does not establish a NEW connection, the dead one was retained. A
+per-connection counter is the cleanest observable.
+
+**The asymmetry that settles the fix**: discarding a merely SLOW connection costs
+one handshake, and a retry usually already exists. Retaining a dead one costs an
+outage that ends only with a restart.
+
+### The population this belongs to
+
+Ask it of every long-lived resource, not the one that prompted the question.
+This module's inventory, and what notices when each dies silently:
+
+| resource | who notices |
+|---|---|
+| vault client connection | this module, on a call timeout — fixed `d7f262f` |
+| HTTP connection pools | evicted by an idle timeout below the refresh cadence — `564edde` |
+| the daemon frame loop | **the supervisor**, not us: it is an inbound connection the daemon probes, so recovery is theirs by design |
+
+The third row is the one worth stating explicitly rather than leaving blank. It
+is not an oversight that we do not self-detect there — the daemon spawned us and
+probes us — but "somebody else's probe covers it" is exactly the belief that made
+the vault connection's gap invisible, so it should be written down as a claim
+someone can check rather than assumed.
+
+### When a resilience fix ships in a shared SDK, the hand-rolled clients did not get it
+
+`subc-client-rs` 0.7.0 shipped liveness probes fleet-wide. This module does not
+use it — it depends on `subc-protocol` and `subc-transport` directly and
+hand-rolls its frame loop — so the prevention landed everywhere except here,
+silently. Nothing in a green fleet check distinguishes a module a fix skipped
+from one it covered.
+
 ## A migration belongs to the constructor that asked where to live
 
 Anything reachable from a general-purpose constructor is reachable from a test,
