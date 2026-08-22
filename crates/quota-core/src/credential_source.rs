@@ -174,13 +174,39 @@ pub trait CredentialSource: Send + Sync {
 /// Report a rejected vault credential to the store that issued it, if anyone is
 /// listening.
 ///
-/// WHY THIS IS SHARED RATHER THAN A METHOD ON EACH PROVIDER. Four vault lanes
-/// carried byte-identical copies of this, and the gate inside it is subtle
-/// enough that a fifth copy would be written wrong: it matches ONLY
-/// `ProviderStatus(401 | 403)`, an upstream status that survives to this point
-/// solely because the vault lane uses a send which PRESERVES it. The local lane
-/// maps 401 to `Unauthorized`, correctly, because a local credential has no
-/// custodian to tell.
+/// WHY THIS IS SHARED RATHER THAN A METHOD ON EACH PROVIDER. Seven vault lanes
+/// carried copies of this, and the gate inside it is subtle enough that an
+/// eighth would be written wrong: it matches ONLY `ProviderStatus(401)`, an
+/// upstream status that survives to this point solely because the vault lane
+/// uses a send which PRESERVES it. The local lane maps 401 to `Unauthorized`,
+/// correctly, because a local credential has no custodian to tell.
+///
+/// 403 IS DELIBERATELY EXCLUDED, AND THAT IS THE LOAD-BEARING PART.
+/// The vault's contract asks for reports when the credential is BELIEVED DEAD,
+/// never merely because a call was refused — and a report is terminal there: it
+/// latches the record and forecloses any later refresh, for every consumer, not
+/// just this one. So the question is not "was I refused" but "do I believe this
+/// credential is gone", and only one of the two statuses answers it.
+///
+/// Measured counterexample, on this host, 2026-08-21: gemini's Code Assist quota
+/// endpoint returned 403 to a credential whose refresh SUCCEEDED moments before.
+/// Google had withdrawn the entitlement, not the credential — the token renews
+/// perfectly and is refused this one resource. Reporting that as death would
+/// have killed a live Google credential for every consumer on the box, and
+/// antigravity's vault lane rides the same API family.
+///
+/// A 401 with a served bearer remains a reasonable death proxy: it is how
+/// revocation-on-rotation was correctly detected all month.
+///
+/// NOT gated on the response body instead. Distinguishing "invalid credential"
+/// from "insufficient permission" that way means parsing seven providers' error
+/// prose, which carries no stability promise from any of them — the same reason
+/// this wire tells consumers never to branch on its own error strings.
+///
+/// The cost of being wrong runs one way. Withholding a report leaves the lane
+/// failing visibly as `credential_rejected` on this wire, which is what an
+/// operator sees anyway; sending a wrong one destroys a working credential
+/// silently.
 ///
 /// So the gate depends on a transport decision made in another file, and
 /// deleting that decision once left every test green while silently ending all
@@ -201,7 +227,7 @@ pub fn report_vault_auth_failure(
     record_version: u64,
     error: &crate::provider::FetchError,
 ) {
-    let crate::provider::FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+    let crate::provider::FetchError::ProviderStatus(status @ 401) = error else {
         return;
     };
     let Some(source) = source else {
@@ -242,6 +268,114 @@ pub fn take_utf8_payload(payload: &mut Vec<u8>) -> Result<String, crate::provide
 
 #[cfg(test)]
 mod tests {
+
+    /// A 401 from the usage endpoint is reported: it is the death proxy.
+    ///
+    /// This is the arm that detected revocation-on-rotation all month, and for a
+    /// static API-key record it is the ONLY automatic invalidation trigger in
+    /// the system -- nothing else ever marks such a record dead.
+    #[tokio::test]
+    async fn a_401_is_reported_as_credential_death() {
+        let source = RecordingSource::default();
+        let reports = source.reports.clone();
+        let source: Arc<dyn CredentialSource> = Arc::new(source);
+
+        report_vault_auth_failure(
+            Some(&source),
+            &VaultCapability::new("ckh_test"),
+            7,
+            &crate::provider::FetchError::ProviderStatus(401),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            reports.lock().unwrap().as_slice(),
+            &[(401u16, 7u64)],
+            "a 401 with a served bearer must reach the credential store"
+        );
+    }
+
+    /// A 403 is NOT reported, and this is the arm that costs money to get wrong.
+    ///
+    /// A report is terminal in the vault: it latches the record and forecloses
+    /// any later refresh, for every consumer on the host. So it must mean "this
+    /// credential is dead", not "this call was refused".
+    ///
+    /// MEASURED COUNTEREXAMPLE, this host, 2026-08-21. Gemini's Code Assist quota
+    /// endpoint returned 403 to a credential whose refresh had just SUCCEEDED --
+    /// Google withdrew the entitlement, not the credential. Reporting that as
+    /// death would have destroyed a working Google credential for everyone, and
+    /// antigravity's vault lane rides the same API family.
+    #[tokio::test]
+    async fn a_403_is_not_reported_because_it_can_mean_a_live_credential() {
+        let source = RecordingSource::default();
+        let reports = source.reports.clone();
+        let source: Arc<dyn CredentialSource> = Arc::new(source);
+
+        report_vault_auth_failure(
+            Some(&source),
+            &VaultCapability::new("ckh_test"),
+            7,
+            &crate::provider::FetchError::ProviderStatus(403),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            reports.lock().unwrap().is_empty(),
+            "a 403 can be an entitlement refusal against a live credential; \
+             reporting it kills a working record for every consumer"
+        );
+    }
+
+    /// Anything that is not a refusal at all is left alone.
+    ///
+    /// The control for both tests above. Without it, a gate that reported
+    /// NOTHING would satisfy the 403 case and look correct.
+    #[tokio::test]
+    async fn an_ordinary_upstream_failure_is_not_a_credential_report() {
+        let source = RecordingSource::default();
+        let reports = source.reports.clone();
+        let source: Arc<dyn CredentialSource> = Arc::new(source);
+
+        report_vault_auth_failure(
+            Some(&source),
+            &VaultCapability::new("ckh_test"),
+            7,
+            &crate::provider::FetchError::ProviderStatus(500),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// A credential store that records what it was told.
+    #[derive(Default)]
+    struct RecordingSource {
+        reports: Arc<std::sync::Mutex<Vec<(u16, u64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialSource for RecordingSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            Err(VaultGetError::Transient)
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            status: u16,
+            record_version: u64,
+        ) {
+            self.reports.lock().unwrap().push((status, record_version));
+        }
+    }
     use super::*;
 
     /// The capability is the bearer of vault authority: anything holding it can

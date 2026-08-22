@@ -315,8 +315,10 @@ fn no_vault_lane_rebuilds_the_shared_credential_helpers() {
             .to_string();
         examined += 1;
         // The gate's own shape, not the function name: a copy under any name is
-        // the thing that matters.
-        if production.contains("ProviderStatus(status @ (401 | 403))") {
+        // the thing that matters. Matched on the BINDING rather than on one
+        // spelling of the status set -- keying on "(401 | 403)" went stale the
+        // day 403 was dropped, and a stale fence passes silently.
+        if production.contains("FetchError::ProviderStatus(status @") {
             offenders.push(format!("{name}: hand-rolled auth-failure gate"));
         }
         if production.contains("String::from_utf8(std::mem::take(&mut credential.payload))") {
