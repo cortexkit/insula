@@ -517,6 +517,21 @@ impl RedemptionJournal {
             }
         }
         let pending_id = pending.map(|record| record.redeem_request_id.clone());
+        // OUTCOME-BLIND ON PURPOSE. Any resolved redemption starts the cooldown,
+        // including `nothing_to_reset` and `no_credit`, which burn no credit at
+        // all. That reads like a bug -- why should a no-op block a real spend? --
+        // and the "fix" would remove the only rate limit on a mutation endpoint.
+        //
+        // The cooldown is a SPEND-RATE fence, not a credit ledger. Its job is to
+        // bound how fast this module can hit consume when something upstream of
+        // it is wrong, and a trigger misfiring in a loop produces exactly the
+        // no-op outcomes that an outcome-aware version would stop counting. The
+        // failure it prevents is hammering, which needs no credit to be spent.
+        //
+        // The cost of keeping it blind is small and self-limiting: a no-op means
+        // the server just said nothing needed resetting, so an account that
+        // becomes genuinely walled inside the next half hour waits at most that
+        // long. The cost of the tidy version is unbounded.
         let spend_bound_allows = !records.iter().any(|record| {
             record.account_id == account_id
                 && record.status == JournalStatus::Resolved
@@ -1418,6 +1433,76 @@ mod tests {
             status: JournalStatus::Pending,
             outcome: None,
         }
+    }
+
+    /// A consume that burned NO credit still starts the spend cooldown.
+    ///
+    /// `nothing_to_reset` and `no_credit` cost nothing, so blocking the next
+    /// consume for half an hour on their account reads like a bug -- and the tidy
+    /// fix, counting only `reset`, removes the only rate limit this module has on
+    /// a mutation endpoint. A trigger misfiring in a loop produces exactly these
+    /// no-op outcomes, which is the case the fence exists for.
+    ///
+    /// Pinned so the tidy version fails here rather than in production, where its
+    /// symptom is a consume attempt every tick.
+    #[test]
+    fn a_consume_that_burned_no_credit_still_holds_the_spend_bound() {
+        let dir = scratch_dir("spend-bound-outcome");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let journal = RedemptionJournal::new(dir.join("redemptions.json"));
+        let now = Utc::now();
+
+        for outcome in [ConsumeOutcome::NothingToReset, ConsumeOutcome::NoCredit] {
+            let mut record = pending_record("acct-noop", "req-noop");
+            record.status = JournalStatus::Resolved;
+            record.outcome = Some(outcome);
+            record.created_at = now.to_rfc3339();
+            record.last_attempt_at = Some(now.to_rfc3339());
+            journal.save(&[record]).expect("seed the journal");
+
+            let state = journal
+                .inspect_account("acct-noop", now)
+                .expect("inspect the seeded account");
+            assert!(
+                !state.spend_bound_allows,
+                "{} burned no credit, but the cooldown is a spend-RATE fence and \
+                 must still hold",
+                outcome.as_code()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And it releases once the bound has passed.
+    ///
+    /// The control. Without it, a fence that never allowed a consume at all would
+    /// satisfy the test above and disarm the feature entirely.
+    #[test]
+    fn the_spend_bound_releases_once_it_has_elapsed() {
+        let dir = scratch_dir("spend-bound-elapsed");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let journal = RedemptionJournal::new(dir.join("redemptions.json"));
+        let now = Utc::now();
+        // One second past the bound, derived from the constant rather than a
+        // number chosen by eye: a hand-picked margin silently under-covers the
+        // moment the constant moves.
+        let stale = now - chrono::Duration::seconds(SPEND_BOUND_SECS + 1);
+
+        let mut record = pending_record("acct-old", "req-old");
+        record.status = JournalStatus::Resolved;
+        record.outcome = Some(ConsumeOutcome::NothingToReset);
+        record.created_at = stale.to_rfc3339();
+        record.last_attempt_at = Some(stale.to_rfc3339());
+        journal.save(&[record]).expect("seed the journal");
+
+        let state = journal
+            .inspect_account("acct-old", now)
+            .expect("inspect the seeded account");
+        assert!(
+            state.spend_bound_allows,
+            "past the bound the fence must release, or the feature never fires again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only the environment-resolving constructor may migrate.
