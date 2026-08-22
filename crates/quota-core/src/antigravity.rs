@@ -679,6 +679,14 @@ struct RemoteQuotaBucket {
 /// either way: the native Gemini pool in the unnamed `primary`, both pools as
 /// named extra windows.
 ///
+/// So `primary` is a HEADLINE POINTING AT one of the extras, not an additional
+/// limit, and this provider is the only one on the wire where a slot and a named
+/// extra are the same window. That is invisible to the reduction the consumer
+/// contract recommends -- a maximum is duplication-insensitive -- and it double
+/// counts under a sum or a mean. Stated in docs/consumer-contract.md beside the
+/// place those other policies are invited; if this shape ever changes, that
+/// paragraph is the one that goes stale.
+///
 /// A model whose bucket states no reset is skipped rather than pooled. Those are
 /// the always-available internal models, and folding a permanently-idle bucket
 /// into a metered pool would drag the pool's worst-case reading toward zero.

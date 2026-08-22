@@ -751,6 +751,19 @@ So for "how much headroom does this account have", take the **maximum**
 whatever policy you want deliberately. Do not let slot position stand in for a
 judgement about which limit binds.
 
+**If your policy is not a maximum, deduplicate first.** A slot and a named extra
+can be the SAME window. `antigravity` publishes its native Gemini pool as
+`primary` *and* as the `Gemini Models` extra, byte-identical, because the slot is
+a headline pointing at one of the named pools rather than an additional limit —
+that reservation is deliberate, so a consumer reading only `primary` gets the
+native pool instead of whichever external pool happened to sort first.
+
+A maximum is unaffected by this, which is why the recommended reduction is safe
+and why nothing has ever noticed. A sum, a mean, or a count is not: it will
+weight that pool twice. Today one provider does this and the rest do not, so a
+consumer keying on "slots and extras are disjoint" is right about 36 of 37 —
+which is the ratio that makes a wrong assumption survive.
+
 ### A maximum over an incomplete set is biased downward
 
 That reduction has a property worth stating, because it is the direction that
