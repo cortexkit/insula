@@ -242,16 +242,9 @@ impl ServedCodexContext {
         capability: VaultCapability,
         mut credential: VaultCredential,
     ) -> Result<Self, FetchError> {
-        let bearer = match String::from_utf8(std::mem::take(&mut credential.payload)) {
-            Ok(bearer) => bearer,
-            Err(error) => {
-                let mut payload = error.into_bytes();
-                payload.fill(0);
-                return Err(FetchError::Decode(
-                    "vault credential payload is not valid UTF-8".to_string(),
-                ));
-            }
-        };
+        // This site returns a Result rather than an attempt: the caller turns it
+        // into one, with the observation it holds and this function does not.
+        let bearer = crate::credential_source::take_utf8_payload(&mut credential.payload)?;
         let canonical_account_id = canonical_account_id(credential.account_id.clone())
             .or_else(|| chatgpt_account_id(&bearer));
         let email = canonical_label(credential.email.clone());
@@ -768,24 +761,20 @@ impl CodexProvider {
     }
 
     fn report_auth_failure(&self, context: &ServedCodexContext, error: &FetchError) {
-        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+        // A served context may carry neither capability nor version: a local
+        // credential has no custodian to report to. Resolve those first, then let
+        // the shared helper decide whether the error itself is reportable.
+        let (Some(capability), Some(record_version)) =
+            (context.capability.as_ref(), context.record_version)
+        else {
             return;
         };
-        let (Some(source), Some(capability), Some(record_version)) = (
+        crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            context.capability.as_ref(),
-            context.record_version,
-        ) else {
-            return;
-        };
-        let source = Arc::clone(source);
-        let capability = capability.clone();
-        let status = *status;
-        tokio::spawn(async move {
-            source
-                .report_auth_failure(&capability, status, record_version)
-                .await;
-        });
+            capability,
+            record_version,
+            error,
+        );
     }
 
     async fn fetch_context(

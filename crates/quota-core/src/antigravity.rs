@@ -1064,18 +1064,11 @@ impl AntigravityProvider {
             .clone()
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty());
-        let access_token = match String::from_utf8(std::mem::take(&mut credential.payload)) {
-            Ok(access_token) => access_token,
-            Err(error) => {
-                let mut payload = error.into_bytes();
-                payload.fill(0);
-                return FetchAttempt::failure(
-                    observed,
-                    Some("vault".to_string()),
-                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
-                );
-            }
-        };
+        let access_token =
+            match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+                Ok(value) => value,
+                Err(error) => return FetchAttempt::failure(observed, None, error),
+            };
 
         let result: Result<Usage, FetchError> = async {
             // The project scopes the query where the vault knows one. The endpoint
@@ -1085,17 +1078,13 @@ impl AntigravityProvider {
         }
         .await;
 
-        if let (Some(source), Err(FetchError::ProviderStatus(status @ (401 | 403)))) =
-            (self.credential_source.as_ref(), &result)
-        {
-            let source = Arc::clone(source);
-            let capability = capability.clone();
-            let status = *status;
-            tokio::spawn(async move {
-                source
-                    .report_auth_failure(&capability, status, record_version)
-                    .await;
-            });
+        if let Err(error) = &result {
+            crate::credential_source::report_vault_auth_failure(
+                self.credential_source.as_ref(),
+                capability,
+                record_version,
+                error,
+            );
         }
 
         match result {

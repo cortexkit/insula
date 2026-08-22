@@ -848,19 +848,19 @@ pub struct ResetRequest {
 
 impl ResetRequest {
     pub fn report_auth_failure(&self, error: &FetchError) {
-        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
+        // This request carries its own reporting context, because a reset is
+        // issued from the coordinator rather than from a provider holding a
+        // credential source. Resolve it, then let the shared helper decide
+        // whether the error is reportable -- the gate belongs in one place.
+        let Some(context) = self.auth_failure.as_ref() else {
             return;
         };
-        let Some(context) = self.auth_failure.clone() else {
-            return;
-        };
-        let status = *status;
-        tokio::spawn(async move {
-            context
-                .source
-                .report_auth_failure(&context.capability, status, context.record_version)
-                .await;
-        });
+        crate::credential_source::report_vault_auth_failure(
+            Some(&context.source),
+            &context.capability,
+            context.record_version,
+            error,
+        );
     }
 }
 

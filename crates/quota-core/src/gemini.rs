@@ -552,20 +552,12 @@ impl GeminiProvider {
         record_version: u64,
         error: &FetchError,
     ) {
-        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
-            return;
-        };
-        let Some(source) = self.credential_source.as_ref() else {
-            return;
-        };
-        let source = Arc::clone(source);
-        let capability = capability.clone();
-        let status = *status;
-        tokio::spawn(async move {
-            source
-                .report_auth_failure(&capability, status, record_version)
-                .await;
-        });
+        crate::credential_source::report_vault_auth_failure(
+            self.credential_source.as_ref(),
+            capability,
+            record_version,
+            error,
+        );
     }
 
     async fn discover_project_for_vault(
@@ -623,18 +615,11 @@ impl GeminiProvider {
         let mut project = canonical_optional(credential.project_id.clone());
         // The vault payload is the bare access token; project metadata is carried
         // separately on the credential result and is never parsed from the payload.
-        let access_token = match String::from_utf8(std::mem::take(&mut credential.payload)) {
-            Ok(access_token) => access_token,
-            Err(error) => {
-                let mut payload = error.into_bytes();
-                payload.fill(0);
-                return FetchAttempt::failure(
-                    observed,
-                    None,
-                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
-                );
-            }
-        };
+        let access_token =
+            match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+                Ok(value) => value,
+                Err(error) => return FetchAttempt::failure(observed, None, error),
+            };
 
         let result: Result<Usage, FetchError> = async {
             if project.is_none() {

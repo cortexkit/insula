@@ -269,6 +269,74 @@ fn no_provider_builds_its_own_http_client() {
     );
 }
 
+/// No vault lane hand-rolls the auth report or the payload scrub.
+///
+/// Both were byte-identical in four providers until 2026-08-22, and neither is
+/// safe to re-derive:
+///
+/// * the auth report matches ONLY `ProviderStatus(401 | 403)`, an upstream
+///   status that reaches it because the vault lane uses a send which preserves
+///   it. The gate therefore depends on a transport decision in another file, and
+///   deleting that decision once left the whole suite green while ending all
+///   auth reporting. For a static API-key record this call is the ONLY automatic
+///   invalidation trigger there is.
+/// * the payload decode SCRUBS the bytes when they are not UTF-8, because
+///   `String::from_utf8` hands the failed credential back inside its error. A
+///   copy that omits the fill looks correct: the only difference is memory
+///   nobody inspects.
+///
+/// Same shape as the HTTP client fence above, and for the same reason — the
+/// regression that actually happens is a fifth lane copied from a fourth.
+#[test]
+fn no_vault_lane_rebuilds_the_shared_credential_helpers() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // credential_source.rs owns both helpers; tests.rs is scaffolding.
+        if matches!(name.as_str(), "credential_source.rs" | "tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        examined += 1;
+        // The gate's own shape, not the function name: a copy under any name is
+        // the thing that matters.
+        if production.contains("ProviderStatus(status @ (401 | 403))") {
+            offenders.push(format!("{name}: hand-rolled auth-failure gate"));
+        }
+        if production.contains("String::from_utf8(std::mem::take(&mut credential.payload))") {
+            offenders.push(format!("{name}: hand-rolled vault payload decode"));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "call credential_source::report_vault_auth_failure / take_utf8_payload \
+         instead of re-deriving them: {offenders:?}"
+    );
+    // Not vacuous: a broken directory walk or boundary split would otherwise
+    // pass by examining nothing.
+    assert!(
+        examined > 30,
+        "expected to examine every provider module; examined only {examined}"
+    );
+}
+
 #[test]
 fn a_pooled_connection_cannot_outlive_a_refresh_tick() {
     assert!(

@@ -434,20 +434,12 @@ impl KimiForCodingProvider {
         record_version: u64,
         error: &FetchError,
     ) {
-        let FetchError::ProviderStatus(status @ (401 | 403)) = error else {
-            return;
-        };
-        let Some(source) = self.credential_source.as_ref() else {
-            return;
-        };
-        let source = Arc::clone(source);
-        let capability = capability.clone();
-        let status = *status;
-        tokio::spawn(async move {
-            source
-                .report_auth_failure(&capability, status, record_version)
-                .await;
-        });
+        crate::credential_source::report_vault_auth_failure(
+            self.credential_source.as_ref(),
+            capability,
+            record_version,
+            error,
+        );
     }
 
     async fn fetch_local_bearer(&self, bearer: &str) -> FetchAttempt {
@@ -484,17 +476,9 @@ impl KimiForCodingProvider {
             canonical_account_id(credential.account_id.clone()),
             Some(record_version),
         ));
-        let bearer = match String::from_utf8(std::mem::take(&mut credential.payload)) {
-            Ok(bearer) => bearer,
-            Err(error) => {
-                let mut payload = error.into_bytes();
-                payload.fill(0);
-                return FetchAttempt::failure(
-                    observed,
-                    None,
-                    FetchError::Decode("vault credential payload is not valid UTF-8".to_string()),
-                );
-            }
+        let bearer = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(value) => value,
+            Err(error) => return FetchAttempt::failure(observed, None, error),
         };
 
         let result = usage_request(&self.usage_url, &bearer)
