@@ -8,11 +8,23 @@
 //! labelled accounts for them. Compare account labels against the running module,
 //! not against this dump.
 //!
-//! This is the module side of the codexbar-vs-module accuracy diff: run codexbar's
-//! `/usage` and this dump against the same machine credentials and compare the
-//! per-provider windows (usedPercent, resetsAt, windowMinutes). It exercises the
-//! real provider fetchers (no mocks), so it is the live-verification step before
-//! relying on the module as the daily quota source.
+//! This is the module side of the codexbar-vs-module accuracy diff: compare the
+//! per-provider windows (usedPercent, resetsAt, windowMinutes) against what
+//! CodexBar shows for the same machine credentials. It exercises the real
+//! provider fetchers (no mocks), and it is the ONLY check of CORRESPONDENCE this
+//! repo has -- `wire-sanity` and `deployed-sanity` check that our numbers are
+//! internally consistent, not that they are true.
+//!
+//! HOW TO GET THE OTHER SIDE, corrected 2026-08-22. This comment used to say
+//! "run codexbar's `/usage`". That is not runnable here: CodexBar was running
+//! (pid checked, `lsof -nP -iTCP -sTCP:LISTEN -a -p <pid>`) and exposed NO TCP
+//! listener and no HTTP preference. Whether it once did, or does under some
+//! build, I cannot tell from this host -- so the instruction stood as a
+//! procedure that fails at the moment someone follows it.
+//!
+//! What works today is the menu-bar UI: read CodexBar's own per-provider figures
+//! and compare by eye. Slower, and a human step rather than a diff, but it is
+//! the real remaining path and knowing that beats discovering it mid-check.
 //!
 //! Run: `cargo run -p quota-core --example accuracy-dump`
 //! Filter to one provider: `cargo run -p quota-core --example accuracy-dump -- codex`
