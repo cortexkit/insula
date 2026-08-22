@@ -627,7 +627,7 @@ impl ClientState {
     }
 
     async fn call(self: &Arc<Self>, body: Vec<u8>) -> Result<Frame, ClientFailure> {
-        tokio::time::timeout(self.request_timeout, async {
+        let outcome = tokio::time::timeout(self.request_timeout, async {
             let mut last = ClientFailure::Transport;
             for attempt in 0..2 {
                 match self.call_once(body.clone()).await {
@@ -642,8 +642,56 @@ impl ClientState {
             }
             Err(last)
         })
-        .await
-        .map_err(|_| ClientFailure::Transport)?
+        .await;
+
+        match outcome {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // THE CONNECTION DID NOT ANSWER, SO IT MUST NOT BE KEPT.
+                //
+                // Every other way this client drops a connection needs the
+                // socket to SAY something: the reader sees EOF or an error, or a
+                // write fails. A socket killed while the host slept says
+                // nothing -- writes are accepted into the void, no FIN arrives,
+                // and the reader stays blocked forever. Silence is the only
+                // symptom, and a timeout is the only place it surfaces.
+                //
+                // Leaving it installed made every later call reuse it, spend the
+                // full budget, and fail, so all vault-served lanes stayed dark
+                // until the process restarted. That is the shape of insula#8 and
+                // of a fleet-wide wake, which kills every connection at once
+                // without closing any.
+                //
+                // Discarding a connection that was merely SLOW costs one
+                // handshake, and `call` already retries a transport failure
+                // once. That asymmetry is the whole argument: a needless
+                // reconnect is a few milliseconds, a retained dead connection is
+                // an outage that ends only with a restart.
+                self.invalidate_current_connection().await;
+                Err(ClientFailure::Transport)
+            }
+        }
+    }
+
+    /// Drop whichever connection is installed right now.
+    ///
+    /// Separate from `invalidate_connection`, which fences on a generation so a
+    /// late failure cannot evict the connection that replaced it. Here there is
+    /// no generation to fence on: the timeout fires OUTSIDE the attempt, so the
+    /// caller cannot know which connection was in play, and the danger is
+    /// keeping a dead one rather than dropping a live one.
+    async fn invalidate_current_connection(self: &Arc<Self>) {
+        let generation = {
+            let state = self.connection.lock().await;
+            match &*state {
+                ConnectionState::Ready(connection) => Some(connection.generation),
+                ConnectionState::Connecting { generation, .. } => Some(*generation),
+                ConnectionState::Empty { .. } => None,
+            }
+        };
+        if let Some(generation) = generation {
+            self.invalidate_connection(generation).await;
+        }
     }
 }
 
@@ -1306,6 +1354,74 @@ mod tests {
             classify_error_frame(&unknown).vault_error(),
             VaultGetError::FailClosed
         );
+    }
+
+    /// A call that times out must not leave the dead connection in place.
+    ///
+    /// THE HAZARD, which is why this is worth a loopback stub. This client holds
+    /// ONE long-lived connection with no idle timeout and no maximum lifetime.
+    /// It is dropped when the reader sees EOF or an error, and when a write
+    /// fails -- all of which need the socket to SAY something. A socket killed
+    /// while the host slept says nothing: writes are accepted into the void, no
+    /// FIN arrives, and the reader stays blocked. The only symptom is that
+    /// replies stop.
+    ///
+    /// If a timeout leaves the connection installed, every later call reuses it,
+    /// costs the full request budget, and fails -- so every vault-served lane
+    /// stays dark until the process restarts. That is the shape filed as
+    /// insula#8 (`credential_unusable` sticky across a re-seal, cured only by a
+    /// restart) and the shape a fleet-wide mass route-invalidation event
+    /// produces: a host wake kills every connection at once without closing any.
+    ///
+    /// Observable is `connections_established`, which increments per connection:
+    /// if the timed-out one was discarded the second call builds a new one, and
+    /// if it was retained the second call reuses it and the count stays at 1.
+    #[tokio::test]
+    async fn a_timed_out_call_discards_the_connection_it_could_not_reach() {
+        let (listener, path, key, daemon_id) = loopback_listener("wedged").await;
+        // A daemon that accepts, completes the handshake and the route, and then
+        // never answers -- the observable shape of a connection that died
+        // without closing. It accepts twice, so a client that DOES reconnect is
+        // not blocked by the stub.
+        let server = tokio::spawn(async move {
+            let mut accepted = 0usize;
+            for _ in 0..2 {
+                let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+                reply_route(&mut stream, 7, 3).await;
+                let _ = read_frame(&mut stream).await;
+                accepted += 1;
+                // Hold the socket open: closing it would invalidate the
+                // connection through the EOF path and prove nothing about the
+                // timeout path this test exists for.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            accepted
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_millis(600));
+
+        let first = client
+            .get(&VaultCapability::new("ckh_wedged"), 120_000)
+            .await;
+        assert_eq!(first.unwrap_err(), VaultGetError::Transient);
+        assert_eq!(
+            client.state.connections_established(),
+            1,
+            "precondition: exactly one connection was built for the first call"
+        );
+
+        let second = client
+            .get(&VaultCapability::new("ckh_wedged"), 120_000)
+            .await;
+        assert_eq!(second.unwrap_err(), VaultGetError::Transient);
+        assert_eq!(
+            client.state.connections_established(),
+            2,
+            "the second call must build a NEW connection: reusing one that did \
+             not answer wedges every vault lane until the process restarts"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
