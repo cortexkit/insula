@@ -483,6 +483,13 @@ and the shaping is invisible in the numbers. State what was feeding the lane
 beside the method and the date. Where nothing was, say so — an unstated
 influence and an absent one look identical to the next reader.
 
+And state it as what was CONSULTED, never as what is true. "Nothing was feeding
+this lane" is a claim about the sources someone checked, not a guarantee that no
+influence existed; an unregistered process shaping a lane produces exactly the
+same sentence as an unshaped one. This is the same arm as every other absence on
+this wire — **an absence licenses nothing** — and it is the arm that decays
+quietest, because the reassuring reading requires no action from anybody.
+
 **The failure that produced this section.** The same measurement was recorded
 the day before with the opposite conclusion, from two accounts in one output
 block read as one account over time. Different anchors look exactly like

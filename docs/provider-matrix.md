@@ -319,6 +319,32 @@ the endpoint is recorded here so that is a lookup rather than a rediscovery.
 
 **Kiro and Zed:** not implemented here.
 
+### qwen-cloud flaps, measured rather than inferred
+
+The unbootstrapped-console reclassification (2026-08-21) was made on ONE
+observation plus a recovery three days later: the console served a live session a
+shell with no `SEC_TOKEN`, and later served the token again with no change from
+us. That is thin evidence for calling a failure transient, and the risk it buys
+is real — a genuine console rebuild now stale-serves instead of degrading.
+
+The stale-episode names, shipped the same week, supplied the evidence that was
+missing. Two hours after a restart:
+
+```
+staleEpisodes 2   staleEpisodeProviders ["qwen-cloud"]
+```
+
+**Two episodes, one lane** — which is the whole reason the names exist beside the
+count, since two episodes across two lanes would be an ordinary night. So this
+console does flap repeatedly, roughly hourly on this host, and the provider is
+serving its weekly window throughout. The transient call is doing exactly what it
+was reclassified to do.
+
+Worth keeping as a method note rather than only a fact: a classification made on
+thin evidence is not wrong for being thin, but it does leave a debt, and the debt
+is discharged by finding the instrument that would show it repeating. Here the
+instrument already existed for another reason.
+
 ### gemini: the CLI-OAuth sunset, observed 2026-08-21
 
 Predicted during the v0.52.0 parity round from upstream's own copy; now seen on
