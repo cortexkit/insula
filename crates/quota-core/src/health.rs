@@ -65,6 +65,18 @@ pub struct HealthSnapshot {
     /// degraded + unconfigured + withoutHandles == providersTotal` would break
     /// an instrument consumers rely on.
     pub stale_episodes: u64,
+    /// Which providers those episodes belonged to, sorted, deduplicated.
+    ///
+    /// The count says HOW MANY episodes; this says HOW MANY LANES they were
+    /// spread across, and only the pair separates one marginal upstream from
+    /// ordinary noise. Two episodes over one name is a provider worth looking
+    /// at; two over two names is a normal night.
+    ///
+    /// Also NOT part of the conservation identity, for the same reason as the
+    /// count: these are providers that flapped at some point since boot, not a
+    /// partition of the current population. A provider here may be perfectly
+    /// healthy right now, and usually is.
+    pub stale_episode_providers: Vec<String>,
     /// Providers serving nothing yet because at least one handle has not
     /// completed its first fetch.
     ///
@@ -200,6 +212,7 @@ impl HealthSnapshot {
             // being set, and this snapshot leaves it `None`.
             pending: 0,
             stale_episodes: 0,
+            stale_episode_providers: Vec::new(),
             degraded: Vec::new(),
             unconfigured: Vec::new(),
             without_handles: Vec::new(),

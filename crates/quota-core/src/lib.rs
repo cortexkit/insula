@@ -940,7 +940,7 @@ impl Registry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if enters_stale {
-                store.record_stale_episode();
+                store.record_stale_episode(&unit.key.provider);
             }
             store.publish_if_current(
                 &unit.key,
@@ -1000,15 +1000,17 @@ impl Registry {
             .filter(|provider| provider.cookie_based)
             .count();
 
-        let (snapshot, last_tick_at, created_at, stale_episodes) = match self.store.lock() {
-            Ok(store) => (
-                store.snapshot(),
-                store.last_tick_at(),
-                store.created_at(),
-                store.stale_episodes(),
-            ),
-            Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
-        };
+        let (snapshot, last_tick_at, created_at, stale_episodes, stale_episode_providers) =
+            match self.store.lock() {
+                Ok(store) => (
+                    store.snapshot(),
+                    store.last_tick_at(),
+                    store.created_at(),
+                    store.stale_episodes(),
+                    store.stale_episode_providers(),
+                ),
+                Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
+            };
         let now = Instant::now();
         let mut fresh = 0;
         let mut stale = 0;
@@ -1165,6 +1167,7 @@ impl Registry {
             fresh,
             stale,
             stale_episodes,
+            stale_episode_providers,
             pending,
             degraded,
             unconfigured,

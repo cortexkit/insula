@@ -4,7 +4,7 @@
 //! updates, and incarnation-fenced whole-slot publication. Enumeration, sorting,
 //! transition computation, and all asynchronous work happen outside its lock.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -84,6 +84,19 @@ pub struct SlotStore {
     /// members of a population, so folding it into `fresh + stale + ... ==
     /// providersTotal` would break an instrument consumers rely on.
     stale_episodes: u64,
+
+    /// Which providers have entered stale-serving at least once since boot.
+    ///
+    /// Beside the count, this answers the question the count alone cannot: two
+    /// episodes and one name is ONE provider flapping twice; two episodes and
+    /// two names is two providers flapping once. Those are a marginal upstream
+    /// and ordinary noise respectively, and nothing distinguished them.
+    ///
+    /// A SET RATHER THAN A GROWING LIST, and provider-scoped rather than
+    /// slot-scoped, so it is bounded by the registry (37) no matter how long the
+    /// process runs or how often a lane flaps. The count carries the magnitude;
+    /// this carries the spread. Neither is useful without the other.
+    stale_episode_providers: BTreeSet<String>,
 }
 
 impl SlotStore {
@@ -97,6 +110,7 @@ impl SlotStore {
             next_incarnation: 1,
             next_attempt_sequence: 1,
             stale_episodes: 0,
+            stale_episode_providers: BTreeSet::new(),
         }
     }
 
@@ -240,11 +254,24 @@ impl SlotStore {
         self.stale_episodes
     }
 
+    /// Providers that have entered stale-serving since boot, sorted.
+    ///
+    /// Sorted because it is published on a health surface that gets diffed
+    /// between polls, and a set whose order wanders makes every poll look like a
+    /// change.
+    pub fn stale_episode_providers(&self) -> Vec<String> {
+        self.stale_episode_providers.iter().cloned().collect()
+    }
+
     /// Record one slot entering stale-serving. Called under the store lock at
     /// the transition site, so the increment is a cheap counter op consistent
     /// with everything else that lock guards.
-    pub(crate) fn record_stale_episode(&mut self) {
+    pub(crate) fn record_stale_episode(&mut self, provider: &str) {
         self.stale_episodes = self.stale_episodes.saturating_add(1);
+        // Insert on every episode, not only the first: a set makes that free,
+        // and the alternative -- checking membership first -- would make the
+        // count and the set disagree if either ever moved.
+        self.stale_episode_providers.insert(provider.to_string());
     }
 
     /// Copy the clock anchors needed for timestamp conversion after unlocking.

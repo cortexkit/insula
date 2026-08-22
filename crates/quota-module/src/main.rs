@@ -527,6 +527,17 @@ fn health_report(
         // returns to zero while this stays at one. NOT part of the conservation
         // identity -- it counts events over time, not members of a population.
         "staleEpisodes": snapshot.stale_episodes,
+        // Which providers those episodes belonged to. The count says how many
+        // episodes; this says how many LANES they were spread across, and only
+        // the pair separates a marginal upstream from ordinary noise -- two
+        // episodes over one name is a provider worth looking at, two over two
+        // names is a normal night. Added after wanting that distinction twice
+        // and having no way to get it: once the episode resolves, nothing else
+        // on this wire records which lane it was.
+        //
+        // Membership is since boot, so a name here is usually healthy NOW. Not
+        // part of the conservation identity, for the same reason as the count.
+        "staleEpisodeProviders": snapshot.stale_episode_providers,
         // Providers whose first fetch has not completed. The refresher admits a
         // bounded number of fetch units per turn, so after a start the providers
         // beyond that cap are queued for several turns -- ordinary, not a fault.
@@ -1012,6 +1023,7 @@ mod tests {
             fresh: 3,
             stale: 0,
             stale_episodes: 0,
+            stale_episode_providers: Vec::new(),
             pending: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
@@ -1397,6 +1409,7 @@ mod tests {
             "providersTotal",
             "fresh",
             "stale",
+            "staleEpisodeProviders",
             "staleEpisodes",
             "pending",
             "degraded",

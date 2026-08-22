@@ -343,6 +343,16 @@ leaves *to whom* unanswerable after the fact. Catch it while `stale` is non-zero
 if you need the name; the entry discloses `stale: { since, class }` for as long
 as the failure lasts.
 
+`staleEpisodeProviders` names them. The count says how many episodes; this says
+how many LANES they were spread across, and only the pair separates a marginal
+upstream from ordinary noise — two episodes over one name is a provider worth
+looking at, two over two names is a normal night.
+
+Membership is since boot and deduplicated, so a provider listed here is usually
+healthy right now, and the list only grows until a restart. It is bounded by the
+registry, and it is **not** part of the conservation identity: these are lanes
+that flapped at some point, not a partition of the current population.
+
 It exists because the gauge alone cannot distinguish "nothing is failing" from
 "nothing was failing at the instant you polled" — and a transient failure that
 resolves between two polls leaves no other trace. Read it for "has this host
