@@ -2031,13 +2031,33 @@ This module's inventory, and what notices when each dies silently:
 |---|---|
 | vault client connection | this module, on a call timeout — fixed `d7f262f` |
 | HTTP connection pools | evicted by an idle timeout below the refresh cadence — `564edde` |
-| the daemon frame loop | **the supervisor**, not us: it is an inbound connection the daemon probes, so recovery is theirs by design |
+| the daemon frame loop | **the supervisor**, and barely exposed anyway — see below |
 
-The third row is the one worth stating explicitly rather than leaving blank. It
-is not an oversight that we do not self-detect there — the daemon spawned us and
-probes us — but "somebody else's probe covers it" is exactly the belief that made
-the vault connection's gap invisible, so it should be written down as a claim
-someone can check rather than assumed.
+The third row was written down rather than left blank because "somebody else's
+probe covers it" is exactly the belief that made the vault connection's gap
+invisible. Checking it produced a better answer than the assumption, in both
+directions.
+
+**The supervisor restarts on silence, not only on reported failure** (confirmed
+by SUBC at source in `supervise.rs`, 2026-08-22). A probe that times out records
+`NoAnswer` and increments a consecutive-failure streak; the restart escalation
+fires at the module's `failure_threshold`. A late answer resets the streak, and a
+dead socket never produces one, so the streak marches and the restart lands.
+Exposure is `probe cadence × failure_threshold + drain` — minutes here.
+
+**And this row is barely exposed at all, for a reason worth keeping.** The frame
+loop rides LOOPBACK. Silent half-open needs a real network underneath it — some
+path whose state a sleep or a NAT can lose. Over loopback the death modes are
+process exit and daemon close, and both arrive as EOF or RST. The disease needs a
+network; the two rows that had one are the two that were exposed, and both are
+fixed. I had assumed this row carried the same shape as the vault's, and the
+physics says otherwise.
+
+**The caveat that does apply**: the lifetime restart budget. Repeated silent
+deaths exhaust `max_restarts` and park the module `Failed`/disabled, and the gap
+is then unbounded until somebody looks. Measured here — `restarts 0/3` after a
+dozen deploys in a day, so an OPERATOR restart (`ck module restart`) does not
+spend the failure budget. Only real failures do.
 
 ### When a resilience fix ships in a shared SDK, the hand-rolled clients did not get it
 
