@@ -227,7 +227,26 @@ impl Default for QoderProvider {
 /// keeps today's wrong-but-visible report, while wrongly listing a real session
 /// cookie makes a signed-in account report as never configured, which is the
 /// class that authorises a consumer to forget it.
-const TRACKING_ONLY_COOKIES: &[&str] = &["tfstk"];
+///
+/// THE MEASUREMENT THAT ADMITTED THE REST (2026-08-22). Qoder runs on Alibaba
+/// infrastructure, so the tempting move is to add every name that LOOKS like an
+/// Alibaba tracker -- which is documentation, not evidence. The check that is
+/// actually available: does the same cookie NAME appear on unrelated Alibaba
+/// domains in this browser? A name shared with `alibabacloud.com`,
+/// `aliexpress.com`, `mmstat.com`, `qwen.ai` and `qwencloud.com` is shared
+/// infrastructure and cannot be a Qoder session. Counted on this host:
+///
+///   cna     7 other domains        isg     4 other domains
+///   tfstk   6 other domains        xlly_s  2 other domains
+///
+/// Two names in the same jar were NOT admitted, and the reason is the point:
+/// `_c_WBKFRo` and `_nb_ioWEgULi` appear on qoder.com and nowhere else. They
+/// have tracker-shaped randomised suffixes, but this test cannot separate a
+/// per-site tracker from a session cookie, so they stay off. They are also why
+/// this list does not change Qoder's verdict today -- the jar still holds
+/// unattributable cookies, the guard still declines to fire, and the upstream
+/// still decides. Recorded so the next reader does not re-run the same probe.
+const TRACKING_ONLY_COOKIES: &[&str] = &["cna", "isg", "tfstk", "xlly_s"];
 
 /// Whether every cookie present is one that proves nothing.
 ///
@@ -329,6 +348,47 @@ mod tests {
     /// never configured is the class that authorises a consumer to forget it --
     /// strictly worse than today's wrong-but-visible report. So the judgement
     /// goes back to the upstream, which is the only party that can make it.
+    /// The real jar this host holds reads as nobody signed in, once the
+    /// shared-infrastructure names are known.
+    ///
+    /// SHAPE OBSERVED ON THIS HOST 2026-08-22, minus the two names that could
+    /// not be attributed. Each of these appears on unrelated Alibaba domains in
+    /// the same browser -- `alibabacloud.com`, `aliexpress.com`, `mmstat.com`,
+    /// `qwen.ai`, `qwencloud.com` -- which is what admitted them: a name shared
+    /// across unrelated properties is infrastructure, not a Qoder session.
+    #[test]
+    fn a_jar_of_shared_alibaba_infrastructure_is_nobody_signed_in() {
+        assert!(jar_is_tracking_only(&jar_of(&[
+            "cna", "isg", "tfstk", "xlly_s"
+        ])));
+        // Order must not matter: the jar arrives in whatever order the store
+        // returns, and a rule that depended on it would pass here and fail live.
+        assert!(jar_is_tracking_only(&jar_of(&[
+            "xlly_s", "tfstk", "isg", "cna"
+        ])));
+    }
+
+    /// A qoder-only cookie keeps the jar in play, which is why the real jar
+    /// still reaches the upstream.
+    ///
+    /// THE CONTROL FOR THE TEST ABOVE, and the reason this provider still
+    /// reports a rejected credential rather than an absent one. `_c_WBKFRo` and
+    /// `_nb_ioWEgULi` sit in the live jar and appear on no other domain, so the
+    /// shared-name test cannot tell a per-site tracker from a session. Without
+    /// this case, widening the list until the guard fired would look like
+    /// progress -- and would report a signed-in account as never configured.
+    #[test]
+    fn a_cookie_seen_only_on_this_domain_is_not_assumed_to_be_tracking() {
+        assert!(!jar_is_tracking_only(&jar_of(&[
+            "cna",
+            "isg",
+            "tfstk",
+            "xlly_s",
+            "_c_WBKFRo",
+            "_nb_ioWEgULi"
+        ])));
+    }
+
     #[test]
     fn an_unrecognised_cookie_keeps_the_jar_in_play() {
         assert!(!jar_is_tracking_only(&jar_of(&["tfstk", "qoder_session"])));
