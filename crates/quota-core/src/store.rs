@@ -4,7 +4,7 @@
 //! updates, and incarnation-fenced whole-slot publication. Enumeration, sorting,
 //! transition computation, and all asynchronous work happen outside its lock.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -85,18 +85,22 @@ pub struct SlotStore {
     /// providersTotal` would break an instrument consumers rely on.
     stale_episodes: u64,
 
-    /// Which providers have entered stale-serving at least once since boot.
+    /// How many stale-serving episodes each provider has had since boot.
     ///
-    /// Beside the count, this answers the question the count alone cannot: two
-    /// episodes and one name is ONE provider flapping twice; two episodes and
-    /// two names is two providers flapping once. Those are a marginal upstream
-    /// and ordinary noise respectively, and nothing distinguished them.
+    /// Beside the total, this answers what the total cannot: seventeen episodes
+    /// spread evenly over ten lanes is an environmental problem, and seventeen
+    /// concentrated on one lane is that provider. Those want opposite responses.
     ///
-    /// A SET RATHER THAN A GROWING LIST, and provider-scoped rather than
-    /// slot-scoped, so it is bounded by the registry (37) no matter how long the
-    /// process runs or how often a lane flaps. The count carries the magnitude;
-    /// this carries the spread. Neither is useful without the other.
-    stale_episode_providers: BTreeSet<String>,
+    /// THIS REPLACED A SET OF NAMES, which was the first version and which
+    /// SATURATES. Every serving lane flaps eventually, so after enough uptime the
+    /// set lists all of them and stops discriminating -- observed here after
+    /// fourteen hours, with a lane known to flap hourly hidden inside a list that
+    /// looked like uniform noise. A structure that only grows answers its
+    /// question only while it is young.
+    ///
+    /// Still bounded by the registry (37 keys at most) however long the process
+    /// runs or how often a lane flaps, which is what the set was chosen for.
+    stale_episodes_by_provider: BTreeMap<String, u64>,
 }
 
 impl SlotStore {
@@ -110,7 +114,7 @@ impl SlotStore {
             next_incarnation: 1,
             next_attempt_sequence: 1,
             stale_episodes: 0,
-            stale_episode_providers: BTreeSet::new(),
+            stale_episodes_by_provider: BTreeMap::new(),
         }
     }
 
@@ -254,13 +258,13 @@ impl SlotStore {
         self.stale_episodes
     }
 
-    /// Providers that have entered stale-serving since boot, sorted.
+    /// Per-provider stale-episode counts since boot, ordered by provider name.
     ///
-    /// Sorted because it is published on a health surface that gets diffed
-    /// between polls, and a set whose order wanders makes every poll look like a
+    /// Ordered because it is published on a health surface that gets diffed
+    /// between polls, and a map whose order wanders makes every poll look like a
     /// change.
-    pub fn stale_episode_providers(&self) -> Vec<String> {
-        self.stale_episode_providers.iter().cloned().collect()
+    pub fn stale_episodes_by_provider(&self) -> BTreeMap<String, u64> {
+        self.stale_episodes_by_provider.clone()
     }
 
     /// Record one slot entering stale-serving. Called under the store lock at
@@ -268,10 +272,13 @@ impl SlotStore {
     /// with everything else that lock guards.
     pub(crate) fn record_stale_episode(&mut self, provider: &str) {
         self.stale_episodes = self.stale_episodes.saturating_add(1);
-        // Insert on every episode, not only the first: a set makes that free,
-        // and the alternative -- checking membership first -- would make the
-        // count and the set disagree if either ever moved.
-        self.stale_episode_providers.insert(provider.to_string());
+        // Counted on every episode, so the per-provider figures always sum to
+        // the total above. Two numbers describing one event must be produced
+        // from the same statement or they drift.
+        *self
+            .stale_episodes_by_provider
+            .entry(provider.to_string())
+            .or_insert(0) += 1;
     }
 
     /// Copy the clock anchors needed for timestamp conversion after unlocking.

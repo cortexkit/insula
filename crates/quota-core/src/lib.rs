@@ -1000,14 +1000,14 @@ impl Registry {
             .filter(|provider| provider.cookie_based)
             .count();
 
-        let (snapshot, last_tick_at, created_at, stale_episodes, stale_episode_providers) =
+        let (snapshot, last_tick_at, created_at, stale_episodes, stale_episodes_by_provider) =
             match self.store.lock() {
                 Ok(store) => (
                     store.snapshot(),
                     store.last_tick_at(),
                     store.created_at(),
                     store.stale_episodes(),
-                    store.stale_episode_providers(),
+                    store.stale_episodes_by_provider(),
                 ),
                 Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
             };
@@ -1167,7 +1167,7 @@ impl Registry {
             fresh,
             stale,
             stale_episodes,
-            stale_episode_providers,
+            stale_episodes_by_provider,
             pending,
             degraded,
             unconfigured,

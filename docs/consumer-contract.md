@@ -343,15 +343,24 @@ leaves *to whom* unanswerable after the fact. Catch it while `stale` is non-zero
 if you need the name; the entry discloses `stale: { since, class }` for as long
 as the failure lasts.
 
-`staleEpisodeProviders` names them. The count says how many episodes; this says
-how many LANES they were spread across, and only the pair separates a marginal
-upstream from ordinary noise — two episodes over one name is a provider worth
-looking at, two over two names is a normal night.
+`staleEpisodesByProvider` gives the distribution: a count per provider, summing
+to the total. The total says how many episodes; this says how they were SPREAD,
+and only the pair separates a marginal upstream from an environmental wobble —
+seventeen episodes concentrated on one lane is that provider's problem, and
+seventeen spread evenly over ten lanes is the network, and those want opposite
+responses.
 
-Membership is since boot and deduplicated, so a provider listed here is usually
-healthy right now, and the list only grows until a restart. It is bounded by the
-registry, and it is **not** part of the conservation identity: these are lanes
-that flapped at some point, not a partition of the current population.
+**This replaced a set of names, which saturated.** Every serving lane flaps
+eventually, so after enough uptime the set listed all of them and stopped
+discriminating — measured here after fourteen hours, with a lane known to flap
+hourly hidden inside a list that looked like uniform noise. Counts keep working
+at any uptime; a structure that only grows answers its question only while it is
+young.
+
+Counts are since boot, so a provider appearing here is usually healthy right now,
+and they only grow until a restart. Bounded by the registry, and **not** part of
+the conservation identity: these are lanes that flapped at some point, not a
+partition of the current population.
 
 It exists because the gauge alone cannot distinguish "nothing is failing" from
 "nothing was failing at the instant you polled" — and a transient failure that

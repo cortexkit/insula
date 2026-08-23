@@ -2577,14 +2577,18 @@ async fn recover_then_fail_again_counts_two_episodes() {
     assert_eq!(registry.health().stale_episodes, 2);
 }
 
-/// Two episodes on ONE provider name it once. The count carries the magnitude.
+/// Two episodes on ONE provider report as a count of two against that provider.
 ///
-/// This pair is the whole reason the names exist. `staleEpisodes: 2` is the same
-/// number whether one lane flapped twice or two lanes flapped once, and those
-/// are a marginal upstream and an ordinary night respectively. I wanted that
-/// distinction twice from live health output and could not get it: once the
-/// episode resolves, `stale` is back to zero and nothing else on the wire
-/// records which lane it was.
+/// This pair is the whole reason the per-provider figures exist. `staleEpisodes:
+/// 2` is the same number whether one lane flapped twice or two lanes flapped
+/// once, and those are a marginal upstream and an ordinary night respectively. I
+/// wanted that distinction twice from live health output and could not get it:
+/// once the episode resolves, `stale` is back to zero and nothing else on the
+/// wire records which lane it was.
+///
+/// The first version of this recorded NAMES, and this is the case that outgrew
+/// it: a name set is identical for one-lane-twice and one-lane-once, so it
+/// answered the question only while every lane had flapped at most once.
 #[tokio::test]
 async fn two_episodes_on_one_provider_report_one_name() {
     let registry = scripted(
@@ -2604,17 +2608,19 @@ async fn two_episodes_on_one_provider_report_one_name() {
     let health = registry.health();
     assert_eq!(health.stale_episodes, 2, "two entries into stale-serving");
     assert_eq!(
-        health.stale_episode_providers,
-        vec!["codex".to_string()],
+        health.stale_episodes_by_provider,
+        std::collections::BTreeMap::from([("codex".to_string(), 2)]),
         "one lane flapping twice must not read as two lanes flapping once"
     );
 }
 
-/// One episode each on two providers names both, against the same count.
+/// One episode each on two providers, against the same total.
 ///
 /// The twin of the test above, and the reason it is a separate case rather than
-/// an extra assertion: with only one of them, a set that always held exactly the
-/// first provider, or one that held every registered name, would pass.
+/// an extra assertion: with only one of them, a map that always held exactly the
+/// first provider, or one that counted every registered name, would pass. It is
+/// also the case a name set could not tell apart from its twin, which is why
+/// this pair now asserts counts.
 #[tokio::test]
 async fn one_episode_on_each_of_two_providers_reports_both_names() {
     let registry = Registry::new(vec![
@@ -2635,15 +2641,15 @@ async fn one_episode_on_each_of_two_providers_reports_both_names() {
     let health = registry.health();
     assert_eq!(health.stale_episodes, 2, "same count as the test above");
     assert_eq!(
-        health.stale_episode_providers,
-        vec!["claude".to_string(), "codex".to_string()],
-        "sorted, so a health surface diffed between polls does not see churn"
+        health.stale_episodes_by_provider,
+        std::collections::BTreeMap::from([("claude".to_string(), 1), ("codex".to_string(), 1)]),
+        "two lanes flapping once must not read as one lane flapping twice"
     );
 }
 
-/// A provider that never flapped is never named.
+/// A provider that never flapped is absent, not present with a zero.
 ///
-/// The control. Without it a set that recorded every provider it ever ticked --
+/// The control. Without it a map that counted every provider it ever ticked --
 /// which is a plausible way to get this wrong, since the transition site sees
 /// every unit -- would satisfy both tests above.
 #[tokio::test]
@@ -2666,8 +2672,8 @@ async fn a_provider_that_never_flapped_is_not_named() {
     let health = registry.health();
     assert_eq!(health.stale_episodes, 1);
     assert_eq!(
-        health.stale_episode_providers,
-        vec!["codex".to_string()],
+        health.stale_episodes_by_provider,
+        std::collections::BTreeMap::from([("codex".to_string(), 1)]),
         "a healthy lane must not appear merely because it was polled"
     );
 }
