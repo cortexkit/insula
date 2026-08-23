@@ -162,6 +162,7 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
         window_minutes: None,
         used_count: None,
         total_count: None,
+        regeneration: None,
     });
 
     Ok(Usage {
@@ -207,6 +208,7 @@ fn coding_plan_window(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 
@@ -674,6 +676,7 @@ mod tests {
                 window_minutes: Some(300),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             })
         );
         assert_eq!(
@@ -685,6 +688,7 @@ mod tests {
                 window_minutes: Some(10_080),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             })
         );
         assert_eq!(
@@ -696,6 +700,7 @@ mod tests {
                 window_minutes: Some(43_200),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             })
         );
         assert_eq!(usage.extra_rate_windows, None);

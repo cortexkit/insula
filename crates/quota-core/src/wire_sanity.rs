@@ -732,6 +732,7 @@ mod tests {
             resets_at: None,
             used_count: None,
             total_count: None,
+            regeneration: None,
         }
     }
 

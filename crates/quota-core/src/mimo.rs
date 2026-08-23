@@ -139,6 +139,7 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         window_minutes: Some(43200),
         used_count: None,
         total_count: None,
+        regeneration: None,
     });
 
     if primary.is_none() {

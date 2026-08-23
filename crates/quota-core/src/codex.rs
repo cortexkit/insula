@@ -415,6 +415,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         window_minutes,
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

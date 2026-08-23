@@ -2347,6 +2347,7 @@ impl UsageProvider for EmptyBodyProvider {
                     window_minutes: Some(300),
                     used_count: None,
                     total_count: None,
+                    regeneration: None,
                 }),
                 ..Usage::default()
             };
@@ -4497,6 +4498,7 @@ fn full_usage(percent: f64) -> Usage {
         window_minutes: Some(minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     };
     Usage {
         primary: Some(window(percent, "01:00", 300)),
@@ -5642,6 +5644,7 @@ impl UsageProvider for StaleDuplicateProvider {
                 window_minutes: Some(300),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             }),
             ..Usage::default()
         };
@@ -5681,6 +5684,7 @@ impl UsageProvider for ResetDuplicateProvider {
                 window_minutes: Some(300),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             }),
             ..Usage::default()
         };
@@ -5949,6 +5953,7 @@ fn named_window(id: &str) -> Usage {
                 window_minutes: None,
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             }),
         }]),
         ..Usage::default()

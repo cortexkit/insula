@@ -237,6 +237,7 @@ fn rate_window_from(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

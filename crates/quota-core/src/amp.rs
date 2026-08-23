@@ -199,6 +199,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 window_minutes: window_minutes_from_hours(window_hours),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             })
         }
     } else {

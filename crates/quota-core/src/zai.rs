@@ -235,6 +235,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             window_minutes: limit.window_minutes,
             used_count: None,
             total_count: None,
+            regeneration: None,
         });
 
     let secondary = if token_limit.is_some() && time_limit.is_some() {
@@ -245,6 +246,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             window_minutes: limit.window_minutes,
             used_count: None,
             total_count: None,
+            regeneration: None,
         })
     } else {
         None
@@ -257,6 +259,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         window_minutes: limit.window_minutes,
         used_count: None,
         total_count: None,
+        regeneration: None,
     });
 
     Ok(Usage {

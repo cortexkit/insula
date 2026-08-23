@@ -184,6 +184,7 @@ fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> 
                     window_minutes: *window_minutes,
                     used_count: None,
                     total_count: None,
+                    regeneration: None,
                 });
             }
         }

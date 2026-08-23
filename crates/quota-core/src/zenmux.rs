@@ -152,6 +152,7 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         window_minutes: Some(5 * 60),
         used_count: used_5h,
         total_count: total_5h,
+        regeneration: None,
     };
 
     let (used_7d, total_7d) = crate::model::window_counts(quota_7d.used_flows, quota_7d.max_flows);
@@ -162,6 +163,7 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         window_minutes: Some(7 * 24 * 60),
         used_count: used_7d,
         total_count: total_7d,
+        regeneration: None,
     };
 
     let usage = Usage {

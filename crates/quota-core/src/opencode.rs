@@ -556,6 +556,7 @@ fn window_from_map(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 
@@ -744,6 +745,7 @@ fn window_from_parts(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

@@ -168,6 +168,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             window_minutes: None,
             used_count: None,
             total_count: None,
+            regeneration: None,
         })
     } else {
         // The percent is the load-bearing field: a window is emitted from the
@@ -186,6 +187,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                     window_minutes: None,
                     used_count: None,
                     total_count: None,
+                    regeneration: None,
                 }
             })
     };

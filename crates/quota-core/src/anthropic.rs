@@ -157,6 +157,7 @@ fn scoped_weekly_extras(
                     window_minutes: Some(SEVEN_DAY_MINUTES),
                     used_count: None,
                     total_count: None,
+                    regeneration: None,
                 }),
             })
         })
@@ -179,6 +180,7 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWi
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

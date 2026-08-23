@@ -260,6 +260,7 @@ fn rate_window_from_left_and_reset(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 
@@ -276,6 +277,7 @@ fn credit_window(credit: Option<&CreditRateLimit>) -> Option<RateWindow> {
         window_minutes: None,
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

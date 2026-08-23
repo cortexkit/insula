@@ -223,6 +223,7 @@ fn parse_window(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     }))
 }
 

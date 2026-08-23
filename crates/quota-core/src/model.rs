@@ -17,7 +17,7 @@
 
 pub use cortexkit_provider_usage::{
     AccountInfo, Amount, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding, ProviderUsage,
-    RateWindow, SavedResets, Usage,
+    RateWindow, Regeneration, RegenerationRate, SavedResets, Usage,
 };
 
 /// Every rate window a `Usage` carries, in slot order then extras.
@@ -335,6 +335,7 @@ mod tests {
             window_minutes: None,
             used_count: None,
             total_count: None,
+            regeneration: None,
         }
     }
 

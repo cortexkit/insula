@@ -223,6 +223,7 @@ fn window_from_used_total_reset(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 

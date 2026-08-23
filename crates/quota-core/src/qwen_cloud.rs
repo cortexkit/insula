@@ -352,6 +352,7 @@ fn window_from_fraction(
         window_minutes: Some(window_minutes),
         used_count: None,
         total_count: None,
+        regeneration: None,
     })
 }
 
@@ -934,6 +935,7 @@ mod tests {
                 window_minutes: Some(300),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             }),
             secondary: Some(RateWindow {
                 used_percent: weekly,
@@ -942,6 +944,7 @@ mod tests {
                 window_minutes: Some(10080),
                 used_count: None,
                 total_count: None,
+                regeneration: None,
             }),
             ..Usage::default()
         }

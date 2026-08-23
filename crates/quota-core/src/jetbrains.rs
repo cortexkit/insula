@@ -38,7 +38,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{ProviderUsage, RateWindow, Regeneration, RegenerationRate, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -157,6 +157,134 @@ struct QuotaInfo {
 #[derive(Debug, Deserialize)]
 struct NextRefill {
     next: Option<String>,
+    /// The grant that arrives at `next`, when the payload states one.
+    tariff: Option<Tariff>,
+}
+
+/// The recurring grant: how much arrives, and how often.
+#[derive(Debug, Deserialize)]
+struct Tariff {
+    /// String-encoded like every other number in this payload (`"1000000"`).
+    amount: Option<String>,
+    /// ISO-8601 duration between grants. Observed: `"PT720H"`.
+    duration: Option<String>,
+}
+
+/// Parse an ISO-8601 duration into whole minutes.
+///
+/// Deliberately narrow, and the narrowness is the point: this feeds a wire field
+/// whose whole purpose is to carry a STATED mechanic, so a duration this parser
+/// cannot read must yield nothing rather than a guess.
+///
+/// `M` IS AMBIGUOUS AND THAT IS THE TRAP. In the date part it means months, in
+/// the time part minutes, and only position separates them -- `P1M` and `PT1M`
+/// differ by a factor of about forty-four thousand. Months and years are refused
+/// outright rather than approximated: a month is not a fixed number of minutes,
+/// and picking 30 days would publish a rate the upstream never stated.
+///
+/// Seconds are accepted and truncated toward zero, so a sub-minute period yields
+/// 0 and is refused by the caller. A rate of "some amount per zero minutes" is
+/// not a rate.
+fn iso8601_duration_minutes(raw: &str) -> Option<i64> {
+    let text = raw.trim();
+    let body = text.strip_prefix('P')?;
+    // Split at the time designator. Before it, only days are admissible; after
+    // it, hours/minutes/seconds.
+    let (date_part, time_part) = match body.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (body, None),
+    };
+
+    let mut minutes: i64 = 0;
+    let mut number = String::new();
+
+    for ch in date_part.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let value: i64 = number.parse().ok()?;
+        number.clear();
+        match ch {
+            'D' => minutes = minutes.checked_add(value.checked_mul(1440)?)?,
+            'W' => minutes = minutes.checked_add(value.checked_mul(10080)?)?,
+            // Years and months have no fixed length in minutes.
+            _ => return None,
+        }
+    }
+    if !number.is_empty() {
+        // Trailing digits with no unit: malformed.
+        return None;
+    }
+
+    if let Some(time_part) = time_part {
+        for ch in time_part.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                number.push(ch);
+                continue;
+            }
+            match ch {
+                'H' => {
+                    let value: i64 = number.parse().ok()?;
+                    minutes = minutes.checked_add(value.checked_mul(60)?)?;
+                }
+                'M' => {
+                    let value: i64 = number.parse().ok()?;
+                    minutes = minutes.checked_add(value)?;
+                }
+                'S' => {
+                    let value: f64 = number.parse().ok()?;
+                    minutes = minutes.checked_add((value / 60.0) as i64)?;
+                }
+                _ => return None,
+            }
+            number.clear();
+        }
+        if !number.is_empty() {
+            return None;
+        }
+    }
+
+    Some(minutes)
+}
+
+/// Build the stated replenishment mechanic from `nextRefill`.
+///
+/// EMITTED ONLY WHEN THE PAYLOAD STATES AN AMOUNT, which is what separates this
+/// from the anthropic decision six days earlier: an upstream that gives only a
+/// reset instant states WHEN quota returns and nothing about HOW, and `resets_at`
+/// already carries that. Stamping `cliff` on a bare instant would mint an
+/// upstream statement out of our own reading.
+///
+/// The `tariff` block is what makes this different. A named amount arriving at a
+/// discrete `next` instant is a lump, and `cliff` is precisely the claim that
+/// accrual before that instant is zero -- which the payload supports by giving
+/// the whole grant one arrival time.
+///
+/// An unparseable or absent `duration` keeps the mechanic and drops the rate. The
+/// shipped type documents that shape as real and common: a mechanic described
+/// without a quantity.
+fn regeneration_from(refill: &NextRefill) -> Option<Regeneration> {
+    let tariff = refill.tariff.as_ref()?;
+    let amount: f64 = tariff.amount.as_deref()?.trim().parse().ok()?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return None;
+    }
+
+    let rate = tariff
+        .duration
+        .as_deref()
+        .and_then(iso8601_duration_minutes)
+        .filter(|minutes| *minutes > 0)
+        .map(|per_minutes| RegenerationRate {
+            amount,
+            per_minutes,
+        });
+
+    Some(Regeneration {
+        mechanic: "cliff".to_string(),
+        rate,
+    })
 }
 
 /// Parse `current`/`maximum` (string numbers) → used percent. CodexBar `:24-25`.
@@ -193,10 +321,15 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
             ))
         })?;
 
-    let resets_at = extract_option_value(xml, "nextRefill")
-        .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok())
-        .and_then(|r| r.next)
-        .filter(|s| !s.trim().is_empty());
+    // Parsed ONCE and both halves kept. The reset instant and the stated
+    // mechanic come out of the same object, so reading it twice would let them
+    // disagree about a payload they both describe.
+    let refill = extract_option_value(xml, "nextRefill")
+        .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok());
+
+    let regeneration = refill.as_ref().and_then(regeneration_from);
+
+    let resets_at = refill.and_then(|r| r.next).filter(|s| !s.trim().is_empty());
 
     // A quota with no real refill date is not a well-formed window.
     let resets_at = resets_at.ok_or_else(|| {
@@ -239,6 +372,7 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
             window_minutes: None,
             used_count,
             total_count,
+            regeneration,
         }),
         secondary: None,
         tertiary: None,
@@ -334,6 +468,142 @@ mod tests {
         // Deliberately absent: the tariff period refills only part of the
         // balance the percent is measured against.
         assert_eq!(window.window_minutes, None);
+    }
+
+    /// The observed payload's stated mechanic, ASSERTED ON THE WIRE BYTES.
+    ///
+    /// Deliberately not a normalizer assertion. The defect this field exists to
+    /// prevent is a value escaping into the WRONG FIELD -- a replenishment
+    /// projected onto `resetsAt`, which is unrecoverable once published -- so the
+    /// check has to be what a consumer actually receives.
+    ///
+    /// Same capture as `the_observed_credentialed_payload_normalizes_as_measured`:
+    /// `tariff` states a 1,000,000-unit grant on a PT720H period, arriving whole
+    /// at `next`.
+    #[test]
+    fn the_observed_tariff_reaches_the_wire_as_a_stated_cliff() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"}}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"PT720H"}}"#;
+        let usage = normalize_usage(observed_xml(quota_info, next_refill).as_bytes())
+            .expect("the observed payload must normalize");
+
+        let json = serde_json::to_value(&usage).expect("usage must serialize");
+        let window = &json["primary"];
+
+        assert_eq!(
+            window["regeneration"]["mechanic"], "cliff",
+            "the payload names an amount arriving at one instant, which is a cliff"
+        );
+        assert_eq!(window["regeneration"]["rate"]["amount"], 1_000_000.0);
+        assert_eq!(
+            window["regeneration"]["rate"]["perMinutes"], 43_200,
+            "PT720H is 43200 minutes"
+        );
+
+        // The whole point of the field: the 720h period must NOT have leaked into
+        // the window's own length. They describe different things -- the period
+        // refills only the tariff pool, while the percent is measured against a
+        // total that includes a purchased pool that never refills.
+        assert!(
+            window.get("windowMinutes").is_none(),
+            "the refill period is not this window's length: {window}"
+        );
+        assert_eq!(window["resetsAt"], "2026-07-15T06:00:00.000Z");
+    }
+
+    /// A payload stating only an instant emits NO mechanic.
+    ///
+    /// The control, and the one that keeps this consistent with the anthropic
+    /// decision: an upstream giving a reset time states WHEN quota returns and
+    /// nothing about HOW, and `resetsAt` already carries that. Without this case a
+    /// producer stamping `cliff` on every window with a reset would pass, and it
+    /// would be minting an upstream claim out of our own reading.
+    #[test]
+    fn a_refill_instant_alone_states_no_mechanic() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000"}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z"}"#;
+        let usage = normalize_usage(observed_xml(quota_info, next_refill).as_bytes())
+            .expect("must normalize");
+        let window = usage.primary.expect("a primary window");
+
+        assert!(
+            window.regeneration.is_none(),
+            "a bare instant is not a statement about how quota returns"
+        );
+        assert!(
+            window.resets_at.is_some(),
+            "the instant itself still publishes"
+        );
+    }
+
+    /// An unreadable period keeps the mechanic and drops the rate.
+    ///
+    /// The shipped type documents this shape as real and common -- a mechanic
+    /// described without a quantity. The alternative, dropping the whole object,
+    /// would discard a fact the payload does state (the grant arrives whole at an
+    /// instant) because a second fact was unreadable.
+    #[test]
+    fn an_unparseable_period_keeps_the_mechanic_without_a_rate() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000"}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"P1M"}}"#;
+        let usage = normalize_usage(observed_xml(quota_info, next_refill).as_bytes())
+            .expect("must normalize");
+        let regeneration = usage
+            .primary
+            .expect("a primary window")
+            .regeneration
+            .expect("an amount was stated, so the mechanic stands");
+
+        assert_eq!(regeneration.mechanic, "cliff");
+        assert!(
+            regeneration.rate.is_none(),
+            "P1M is months, which has no fixed length in minutes"
+        );
+    }
+
+    /// `M` means months before the T and minutes after it.
+    ///
+    /// A factor of about forty-four thousand between two strings one character
+    /// apart, and only position separates them. Months are refused rather than
+    /// approximated: thirty days is a guess, and this parser feeds a field whose
+    /// entire purpose is carrying what the upstream STATED.
+    #[test]
+    fn the_duration_parser_reads_periods_and_refuses_ambiguous_ones() {
+        assert_eq!(iso8601_duration_minutes("PT720H"), Some(43_200));
+        assert_eq!(iso8601_duration_minutes("PT90M"), Some(90));
+        assert_eq!(iso8601_duration_minutes("P30D"), Some(43_200));
+        assert_eq!(iso8601_duration_minutes("P1DT2H30M"), Some(1_590));
+        assert_eq!(iso8601_duration_minutes("P1W"), Some(10_080));
+
+        // Refused, not approximated.
+        assert_eq!(
+            iso8601_duration_minutes("P1M"),
+            None,
+            "months are not fixed"
+        );
+        assert_eq!(iso8601_duration_minutes("P1Y"), None, "years are not fixed");
+        // Malformed rather than ambiguous.
+        assert_eq!(iso8601_duration_minutes("720H"), None, "no P prefix");
+        assert_eq!(
+            iso8601_duration_minutes("PT720"),
+            None,
+            "digits with no unit"
+        );
+        assert_eq!(iso8601_duration_minutes("PTXH"), None);
+    }
+
+    /// Build the IDE's XML around two JSON blobs, escaped as the IDE escapes them.
+    fn observed_xml(quota_info: &str, next_refill: &str) -> String {
+        let escape = |raw: &str| {
+            raw.replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        format!(
+            r#"<application><component name="AIAssistantQuotaManager2"><option name="quotaInfo" value="{}" /><option name="nextRefill" value="{}" /></component></application>"#,
+            escape(quota_info),
+            escape(next_refill)
+        )
     }
 
     /// A fractional unit balance publishes the percent and no counts.
