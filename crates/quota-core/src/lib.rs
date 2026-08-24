@@ -703,8 +703,35 @@ impl Registry {
             let mut skipped_a_slot = false;
             let mut unidentified: Vec<(&SlotKey, &ProviderSlot)> = Vec::new();
             for (key, slot) in slots {
-                if slot.label_in_flux || slot.entry.is_none() {
+                if slot.entry.is_none() {
                     skipped_a_slot = true;
+                    continue;
+                }
+                if slot.label_in_flux {
+                    // Identity is unverified, so this slot never contributes a
+                    // LABELED entry and never counts toward completeness.
+                    skipped_a_slot = true;
+                    // A usage-bearing entry is withheld entirely: serving one
+                    // account's readings under another's credential is the whole
+                    // reason the flux fence exists.
+                    //
+                    // A VERDICT is not withheld. A degraded entry carries no
+                    // account, no account_info and no usage, so there is nothing
+                    // for it to mis-attribute -- and dropping it publishes the
+                    // ABSENT shape for a credential this module reached and
+                    // concluded was unusable. The contract rules those apart, and
+                    // absence is the calmest reading a consumer can take: measured
+                    // at 285 seconds of a dead credential looking not-yet-fetched
+                    // (insula#8). It joins the unlabeled representatives below,
+                    // which is where an entry with a real error and no identity
+                    // already belongs.
+                    if slot
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.usage.is_none())
+                    {
+                        unidentified.push((key, slot));
+                    }
                     continue;
                 }
                 let Some(account_id) = slot.account_id() else {

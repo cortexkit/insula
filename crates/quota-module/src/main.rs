@@ -808,6 +808,15 @@ fn manifest(module_id: &str) -> ModuleManifest {
             operations: vec![ManagementOperation {
                 name: USAGE_GET_OP.to_string(),
                 kind: ManagementOperationKind::Query,
+                // One sentence, because this is discovery metadata a human reads
+                // in a catalog listing rather than something a caller branches
+                // on. It names the two properties that decide whether a consumer
+                // can use this op at all: the read never blocks on a network
+                // sweep, and the array it returns may be partial.
+                description: Some(
+                    "Cache-only read of per-account provider quota; never blocks on a fetch, so the array may be partial."
+                        .to_string(),
+                ),
             }],
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),

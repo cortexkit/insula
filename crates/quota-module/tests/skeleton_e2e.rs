@@ -140,13 +140,18 @@ fn vault_manifest() -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ManagementSurface {
             operations: vec![
+                // No description on either: the stub mirrors what the real vault
+                // declares, and inventing copy for another module's operations
+                // would put words in its manifest that nothing here can check.
                 ManagementOperation {
                     name: "credential.get".to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
                 ManagementOperation {
                     name: "credential.report_auth_failure".to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
             ],
             config_schema: serde_json::json!({"type":"object"}),
@@ -615,10 +620,23 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
             .iter()
             .filter(|entry| entry["provider"] == "codex")
             .collect::<Vec<_>>();
-        let failed_closed = codex.len() == 1
-            && codex[0]["account"] == "account-primary"
-            && codex[0]["error"].is_null()
-            && codex[0]["usage"]["primary"]["usedPercent"] == 21.0
+        // Fail-closed is about the second account's USAGE, not about its silence.
+        // The labeled row must be gone and must not be stale-served; a single
+        // UNLABELED verdict in its place is correct and is now asserted, because
+        // dropping that too publishes the "not fetched yet" shape for a credential
+        // the module reached and could not resolve (insula#8).
+        let labeled_primary = codex
+            .iter()
+            .filter(|entry| entry["account"] == "account-primary")
+            .collect::<Vec<_>>();
+        let unlabeled_verdict = codex
+            .iter()
+            .filter(|entry| entry["account"].is_null() && !entry["error"].is_null())
+            .count();
+        let failed_closed = labeled_primary.len() == 1
+            && labeled_primary[0]["error"].is_null()
+            && labeled_primary[0]["usage"]["primary"]["usedPercent"] == 21.0
+            && unlabeled_verdict == 1
             && !result
                 .iter()
                 .any(|entry| entry["provider"] == "codex" && entry["account"] == "account-second");

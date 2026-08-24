@@ -1956,9 +1956,28 @@ async fn account_change_observed_on_failure_clears_old_window_and_restarts_backo
     force_due(&registry, "swap");
     tick(&registry).await;
 
-    assert!(registry.get_usage(None).await.is_empty());
+    // The old account's USAGE is gone from the wire. The array is not EMPTY: the
+    // failure publishes one unlabeled verdict, because an absent entry means "not
+    // fetched yet" to a consumer following the contract, and this credential was
+    // reached and found unusable (insula#8).
+    let published = registry.get_usage(None).await;
+    assert_eq!(published.len(), 1, "one unlabeled verdict, not silence");
+    assert!(
+        published[0].usage.is_none(),
+        "no window crosses the identity"
+    );
+    assert!(published[0].account.is_none(), "and it attributes nothing");
+    assert!(published[0].error.is_some(), "the failure is stated");
+    // THE SAFE HALF MUST STILL HOLD. Publishing the verdict does not authorise a
+    // consumer to reconcile this provider's account set: identity is unverified,
+    // so the completeness claim is still forfeit. Asserted here because making the
+    // entry visible is exactly the change that could have granted it by accident.
+    assert!(
+        complete_set(&registry.usage_snapshot(None).await).is_empty(),
+        "an unverified identity never authorises pruning"
+    );
     let slot = slot(&registry, "swap", "implicit-local");
-    assert!(slot.entry.is_none());
+    assert!(slot.entry.as_ref().is_some_and(|e| e.usage.is_none()));
     assert!(slot.last_success_at.is_none());
     assert!(slot.label_in_flux);
     assert_eq!(slot.account_id(), Some("B"));
@@ -2995,10 +3014,21 @@ async fn outer_timeout_after_credential_swap_fails_closed() {
         .await;
 
     assert_eq!(*current_account.lock().unwrap(), "B");
-    assert!(registry.get_usage(None).await.is_empty());
+    // The old account's USAGE is gone from the wire. The array is not EMPTY: the
+    // failure publishes one unlabeled verdict, because an absent entry means "not
+    // fetched yet" to a consumer following the contract, and this credential was
+    // reached and found unusable (insula#8).
+    let published = registry.get_usage(None).await;
+    assert_eq!(published.len(), 1, "one unlabeled verdict, not silence");
+    assert!(
+        published[0].usage.is_none(),
+        "no window crosses the identity"
+    );
+    assert!(published[0].account.is_none(), "and it attributes nothing");
+    assert!(published[0].error.is_some(), "the failure is stated");
     let slot = slot(&registry, "outer-timeout", "implicit-local");
     assert!(slot.label_in_flux);
-    assert!(slot.entry.is_none());
+    assert!(slot.entry.as_ref().is_some_and(|e| e.usage.is_none()));
     assert!(slot.last_success_at.is_none());
     assert_eq!(slot.retry_count, 1);
 }

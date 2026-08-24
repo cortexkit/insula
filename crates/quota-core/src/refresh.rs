@@ -553,7 +553,25 @@ fn next_slot_after_attempt_inner(
                 },
                 incarnation: prev.incarnation,
                 attempt_sequence: prev.attempt_sequence,
-                entry: if label_in_flux { None } else { entry },
+                // Suppressed only when the entry CARRIES USAGE. The fence exists
+                // to stop one account's readings being served under another
+                // account's credential while identity is unverified -- and a
+                // degraded entry has nothing to mis-attribute: `ProviderUsage::
+                // degraded` sets `account`, `account_info` and `usage` all to
+                // None, so it is provider + error + class and no identity at all.
+                //
+                // Blanket suppression cost a measured 285 seconds of a dead
+                // credential presenting as NOT YET FETCHED, plus the same shape
+                // again for the whole recovery window (insula#8, two independent
+                // recorders). This module's own contract rules those apart: a
+                // degraded entry is a VERDICT, an absent one is UNFINISHED, and
+                // turning the first into the second gives a latched credential the
+                // calmest possible presentation.
+                entry: if label_in_flux && entry.as_ref().is_some_and(|e| e.usage.is_some()) {
+                    None
+                } else {
+                    entry
+                },
                 // The class of THIS attempt, even when a prior healthy window is
                 // still being served: a caller asking why a provider is failing
                 // wants the current cause, not the one that produced the entry.
@@ -863,7 +881,13 @@ mod tests {
             t1,
             t1,
         );
-        assert!(next.entry.is_none());
+        let entry = next.entry.as_ref().expect("the verdict stays visible");
+        assert!(
+            entry.usage.is_none(),
+            "the prior account's window must not survive"
+        );
+        assert!(entry.account.is_none(), "and it attributes nothing");
+        assert!(entry.error.is_some(), "the failure is stated, not implied");
         assert!(next.last_success_at.is_none());
         assert!(next.label_in_flux);
         assert_eq!(next.account_id(), Some("B"));
@@ -890,7 +914,10 @@ mod tests {
             t0 + BASE_INTERVAL,
         );
 
-        assert!(next.entry.is_none(), "old account window was stale-served");
+        let entry = next.entry.as_ref().expect("the verdict stays visible");
+        assert!(entry.usage.is_none(), "old account window was stale-served");
+        assert!(entry.account.is_none(), "and it attributes nothing");
+        assert!(entry.error.is_some(), "the failure is stated, not implied");
         assert!(next.label_in_flux);
         assert!(next.last_success_at.is_none());
         assert_eq!(next.retry_count, 1);
@@ -959,10 +986,18 @@ mod tests {
             t0,
         );
 
+        // The WINDOW must not survive, which is what this test is named for. The
+        // entry does, as a verdict with no account and no usage -- the assertion
+        // used to be `entry.is_none()`, which was stricter than the property and
+        // could not tell "the window is gone" from "everything is gone". The
+        // second of those publishes the absent shape for a reached verdict.
+        let entry = after.entry.as_ref().expect("the verdict stays visible");
         assert!(
-            after.entry.is_none(),
+            entry.usage.is_none(),
             "the previous account's window must not survive a record replacement"
         );
+        assert!(entry.account.is_none(), "and it attributes nothing");
+        assert!(entry.error.is_some(), "the failure is stated, not implied");
         assert!(
             after.label_in_flux,
             "identity is unconfirmed until a fetch succeeds"
@@ -970,6 +1005,66 @@ mod tests {
         assert_eq!(
             after.last_success_at, None,
             "backoff restarts from the change"
+        );
+    }
+
+    /// A usage-bearing entry is still withheld while identity is unverified.
+    ///
+    /// CURRENTLY UNREACHABLE BY CONSTRUCTION, and stated so rather than left to
+    /// look load-bearing: `label_in_flux` is only ever set on the failure path,
+    /// success clears it, and the failure path stores a degraded entry -- so a
+    /// flux slot holds no usage to withhold. The state is built directly here
+    /// because the guard encodes the invariant that matters if that ever changes,
+    /// and an untested guard on a safety property is one refactor from silently
+    /// inverting.
+    ///
+    /// Found by mutation: deleting the guard reddened nothing, which is a fact
+    /// about reachability rather than about the guard.
+    #[test]
+    fn a_usage_bearing_entry_is_withheld_while_identity_is_unverified() {
+        let t0 = Instant::now();
+        use crate::model::RateWindow;
+        let mut prior = ProviderSlot::due_now(t0, Incarnation::from_counter(1));
+        prior.entry = Some(ProviderUsage::healthy(
+            "codex",
+            None,
+            "oauth",
+            Usage {
+                primary: Some(RateWindow {
+                    used_percent: 21.0,
+                    raw_used_percent: None,
+                    resets_at: None,
+                    window_minutes: None,
+                    used_count: None,
+                    total_count: None,
+                    regeneration: None,
+                }),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: None,
+            },
+        ));
+        prior.label_in_flux = true;
+        prior.last_success_at = Some(t0);
+        prior.observation = Some(AccountObservation::new(Some("A".to_string()), None));
+
+        let next = next_slot_after_attempt(
+            &prior,
+            "codex",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(Some("A".to_string()), None)),
+                None,
+                FetchError::Upstream("503".to_string()),
+            ),
+            t0,
+            t0,
+        );
+
+        assert!(
+            next.entry
+                .as_ref()
+                .is_none_or(|entry| entry.usage.is_none()),
+            "a window must not be served under an unverified identity"
         );
     }
 

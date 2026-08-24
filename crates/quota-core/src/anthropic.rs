@@ -638,7 +638,15 @@ mod tests {
             now,
         );
         let next = next_slot_after_attempt(&prior, PROVIDER_NAME, attempt, now, now);
-        assert!(next.entry.is_none());
+        // The prior account's USAGE must not survive an unverified identity. The
+        // entry itself does survive, as a verdict carrying no account and no
+        // windows: dropping it too publishes the ABSENT shape for a credential
+        // this module reached and found unusable, which a consumer reads as "not
+        // fetched yet" (insula#8, measured).
+        let entry = next.entry.as_ref().expect("the verdict stays visible");
+        assert!(entry.usage.is_none(), "no window may cross an identity");
+        assert!(entry.account.is_none(), "and it attributes nothing");
+        assert!(entry.error.is_some(), "the failure is stated, not implied");
         assert!(next.label_in_flux);
         assert!(next.last_success_at.is_none());
     }
