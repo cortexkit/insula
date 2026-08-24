@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::model::{AccountInfo, ProviderUsage, SavedResets};
 use crate::provider::{AccountObservation, CredentialResolution, FetchAttempt, FetchError};
 
@@ -203,6 +205,21 @@ pub struct ProviderSlot {
     /// Whether fresh reads may zero the raw percentages stored in `entry`.
     pub relax_eligible: bool,
     pub last_success_at: Option<Instant>,
+    /// The same success, read from the WALL clock.
+    ///
+    /// Carried beside the `Instant` rather than derived from it, because on macOS
+    /// `Instant` is `CLOCK_UPTIME_RAW` -- explicitly documented in std as a clock
+    /// that "does not increment while the system is asleep". `fetchedAt` used to
+    /// be computed as a startup wall anchor plus monotonic elapsed, so across a
+    /// suspend every stamp fell behind real time by the suspended duration and
+    /// stayed there, because the anchor is fixed for the life of the process. A
+    /// laptop lid-close made a healthy module publish permanently ancient
+    /// timestamps.
+    ///
+    /// The `Instant` stays for DURATIONS -- scheduling, backoff, freshness
+    /// horizons -- where a monotonic clock is the right tool and a wall clock that
+    /// can jump is not. This field exists only to be published.
+    pub last_success_wall: Option<DateTime<Utc>>,
     /// When the CURRENT run of consecutive failures began, cleared on success.
     ///
     /// Distinct from `last_attempt_at`, which moves on every retry: during an
@@ -213,6 +230,9 @@ pub struct ProviderSlot {
     /// perfectly healthy, or seconds old with it failing since just after the
     /// read.
     pub failing_since: Option<Instant>,
+    /// The same first failure, read from the WALL clock, and published as
+    /// `stale.since`. Same reason as `last_success_wall`.
+    pub failing_since_wall: Option<DateTime<Utc>>,
     pub last_attempt_at: Option<Instant>,
     pub status: SlotStatus,
     /// Why the most recent attempt failed, as a stable class name.
@@ -239,6 +259,7 @@ impl ProviderSlot {
     pub fn due_now(now: Instant, incarnation: Incarnation) -> Self {
         Self {
             failing_since: None,
+            failing_since_wall: None,
             incarnation,
             attempt_sequence: AttemptSequence::from_counter(0),
             entry: None,
@@ -247,6 +268,7 @@ impl ProviderSlot {
             label_in_flux: false,
             relax_eligible: false,
             last_success_at: None,
+            last_success_wall: None,
             last_attempt_at: None,
             status: SlotStatus::Pending,
             next_due_at: now,
@@ -455,6 +477,7 @@ fn next_slot_after_attempt_inner(
             // usage came back but could not be attributed -- so whatever run of
             // failures was in progress is neither started nor ended by it.
             failing_since: prev.failing_since,
+            failing_since_wall: prev.failing_since_wall,
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             entry: None,
@@ -464,6 +487,7 @@ fn next_slot_after_attempt_inner(
             label_in_flux: true,
             relax_eligible: false,
             last_success_at: None,
+            last_success_wall: None,
             last_attempt_at: Some(attempt_start),
             status: prev.status,
             next_due_at: completed + BASE_INTERVAL,
@@ -484,6 +508,7 @@ fn next_slot_after_attempt_inner(
         Ok(usage) => ProviderSlot {
             // A success ends the run, so the next failure starts a new one.
             failing_since: None,
+            failing_since_wall: None,
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             error_class: None,
@@ -500,6 +525,8 @@ fn next_slot_after_attempt_inner(
             label_in_flux: false,
             relax_eligible: attempt.relax_eligible,
             last_success_at: Some(completed),
+            // Read now rather than derived, so a suspend cannot shift it.
+            last_success_wall: Some(Utc::now()),
             last_attempt_at: Some(attempt_start),
             status: SlotStatus::Fresh,
             next_due_at: completed + BASE_INTERVAL,
@@ -551,6 +578,13 @@ fn next_slot_after_attempt_inner(
                 } else {
                     retry_base.failing_since.or(Some(attempt_start))
                 },
+                // The wall twin moves with it, in the same expression, so the two
+                // cannot describe different failures.
+                failing_since_wall: if account_changed {
+                    Some(Utc::now())
+                } else {
+                    retry_base.failing_since_wall.or_else(|| Some(Utc::now()))
+                },
                 incarnation: prev.incarnation,
                 attempt_sequence: prev.attempt_sequence,
                 // Suppressed only when the entry CARRIES USAGE. The fence exists
@@ -583,6 +617,11 @@ fn next_slot_after_attempt_inner(
                     None
                 } else {
                     retry_base.last_success_at
+                },
+                last_success_wall: if account_changed {
+                    None
+                } else {
+                    retry_base.last_success_wall
                 },
                 last_attempt_at: Some(attempt_start),
                 status,

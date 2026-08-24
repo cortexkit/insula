@@ -1091,6 +1091,62 @@ fn every_slot_status_is_deliberately_bucketed() {
 /// credential this module reached and concluded on), it carries the class that
 /// names the remedy, and `completeProviders` still withholds so nothing
 /// authorises pruning the provider's accounts while identity is unverified.
+/// The published stamp follows the WALL reading, not the monotonic one.
+///
+/// A SUSPEND IS EXACTLY THIS DISAGREEMENT, and it is the only way to test the fix
+/// without one: `Instant` on macOS is `CLOCK_UPTIME_RAW`, which std documents as
+/// not incrementing while the system is asleep, so after a suspend the monotonic
+/// age of a fetch understates its real age by the suspended duration. The old
+/// derivation -- startup wall anchor plus monotonic elapsed -- inherited that
+/// error and never recovered, because the anchor is fixed for the process.
+///
+/// So the slot is built with the two clocks DISAGREEING by an hour, which is what
+/// the machine produces on its own after an hour's sleep, and the assertion is
+/// that the wire follows the wall.
+///
+/// The whole suite stayed green when the derivation was replaced, correctly: the
+/// two forms agree exactly while the host is awake. That is why this case has to
+/// be constructed rather than waited for.
+#[tokio::test]
+async fn the_published_timestamp_follows_the_wall_clock_not_the_monotonic_one() {
+    let registry = registry(&[("clockskew", false, true)]);
+    tick(&registry).await;
+
+    // Push the wall reading an hour back while leaving the Instant alone: the
+    // shape a suspend leaves behind.
+    let skewed = chrono::Utc::now() - chrono::Duration::hours(1);
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            if key.provider != "clockskew" {
+                continue;
+            }
+            slot.last_success_wall = Some(skewed);
+            let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+            assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+        }
+    }
+
+    let entry = registry
+        .get_usage(None)
+        .await
+        .into_iter()
+        .find(|entry| entry.provider == "clockskew")
+        .expect("the provider serves");
+    let published = entry
+        .fetched_at
+        .expect("a successful slot stamps fetchedAt");
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(&published)
+        .expect("the stamp must be canonical RFC3339")
+        .with_timezone(&chrono::Utc);
+    assert!(
+        (parsed - skewed).num_milliseconds().abs() < 5,
+        "expected the stored wall reading {skewed}, got {parsed}: a derived stamp \
+         would have ignored it and reported roughly now"
+    );
+}
+
 #[tokio::test]
 async fn a_vault_latch_on_an_identity_less_credential_publishes_a_verdict() {
     // THE CREDENTIAL MUST WORK FIRST. A cold slot holds no observation, so

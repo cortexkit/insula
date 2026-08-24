@@ -227,15 +227,6 @@ fn rfc3339_canonical(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
 
-fn wall_time_from_anchor(
-    (created_at, created_at_wall): &(Instant, chrono::DateTime<chrono::Utc>),
-    timestamp: Instant,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let elapsed =
-        chrono::Duration::from_std(timestamp.saturating_duration_since(*created_at)).ok()?;
-    created_at_wall.checked_add_signed(elapsed)
-}
-
 /// Apply the banked-reset relaxation to an entry about to be published, if this
 /// slot has earned it.
 ///
@@ -262,15 +253,13 @@ fn wall_time_from_anchor(
 /// a long outage the latter is always seconds ago, which would report the entry
 /// as freshly checked at the moment it is least trustworthy -- the conflation
 /// this field exists to prevent.
-fn staleness_disclosure(
-    slot: &ProviderSlot,
-    anchor: &(Instant, chrono::DateTime<chrono::Utc>),
-) -> Option<cortexkit_provider_usage::Stale> {
+fn staleness_disclosure(slot: &ProviderSlot) -> Option<cortexkit_provider_usage::Stale> {
     if slot.status != SlotStatus::StaleTransient {
         return None;
     }
-    slot.failing_since
-        .and_then(|timestamp| wall_time_from_anchor(anchor, timestamp))
+    // Same reasoning as `fetchedAt`: the wall reading taken when the failure run
+    // began, rather than a monotonic age that a suspend does not count.
+    slot.failing_since_wall
         .map(|since| cortexkit_provider_usage::Stale {
             since: rfc3339_canonical(since),
             class: slot.error_class.map(|class| class.to_string()),
@@ -557,7 +546,7 @@ impl Registry {
     /// than no claim at all: it authorises a consumer to delete accounts the
     /// array does not support.
     pub async fn usage_snapshot(&self, provider_filter: Option<&str>) -> UsageSnapshot {
-        let (mut snapshot, wall_time_anchor, enumerated_ok) = {
+        let (mut snapshot, enumerated_ok) = {
             let store = self
                 .store
                 .lock()
@@ -567,16 +556,19 @@ impl Registry {
                 .iter()
                 .map(|provider| store.enumeration_succeeded(provider.name.as_str()))
                 .collect();
-            (store.snapshot(), store.wall_time_anchor(), enumerated_ok)
+            (store.snapshot(), enumerated_ok)
         };
         for (_, slot) in &mut snapshot {
             // Read before the mutable borrow: the disclosure describes the SLOT,
             // and the entry it lands on is a clone of an earlier successful read.
-            let fetched_at = slot
-                .last_success_at
-                .and_then(|timestamp| wall_time_from_anchor(&wall_time_anchor, timestamp))
-                .map(rfc3339_canonical);
-            let stale = staleness_disclosure(slot, &wall_time_anchor);
+            // The WALL reading taken at the success, not a monotonic age added to
+            // a startup anchor. The anchor form fell behind real time by exactly
+            // any suspended duration, permanently, because `Instant` on macOS is
+            // `CLOCK_UPTIME_RAW` -- a clock std documents as not incrementing
+            // while the system is asleep. A lid-close made a healthy module
+            // publish ancient timestamps until it was restarted.
+            let fetched_at = slot.last_success_wall.map(rfc3339_canonical);
+            let stale = staleness_disclosure(slot);
             if let Some(entry) = slot.entry.as_mut() {
                 #[cfg(test)]
                 before_fetched_at_format();

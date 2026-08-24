@@ -7,8 +7,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
-
 use crate::provider::CredentialHandle;
 use crate::refresh::{AttemptSequence, Incarnation, ProviderSlot};
 
@@ -68,7 +66,6 @@ pub struct SlotStore {
     /// recording the outcome the two are indistinguishable afterwards.
     enumerated_ok: HashSet<String>,
     created_at: Instant,
-    created_at_wall: DateTime<Utc>,
     last_tick_at: Option<Instant>,
     next_incarnation: u128,
     next_attempt_sequence: u128,
@@ -125,7 +122,6 @@ impl SlotStore {
             slots: HashMap::new(),
             enumerated_ok: HashSet::new(),
             created_at: now,
-            created_at_wall: Utc::now(),
             last_tick_at: None,
             next_incarnation: 1,
             next_attempt_sequence: 1,
@@ -322,11 +318,6 @@ impl SlotStore {
             .stale_episodes_by_provider
             .entry(provider.to_string())
             .or_insert(0) += 1;
-    }
-
-    /// Copy the clock anchors needed for timestamp conversion after unlocking.
-    pub(crate) fn wall_time_anchor(&self) -> (Instant, DateTime<Utc>) {
-        (self.created_at, self.created_at_wall)
     }
 }
 
