@@ -454,22 +454,33 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     // opencodego's absent Go plan and jetbrains' inactive quota, and consumers
     // already treat that family as truth rather than a fetch problem.
     let Some(quota) = result.data.as_ref() else {
-        return Err(
-            if result_value
-                .get("data")
-                .is_some_and(serde_json::Value::is_null)
-            {
-                FetchError::NoQuotaReported(
-                "qwen-cloud: the account has no token plan (gateway reported success with a null plan block)"
-                    .to_string(),
-            )
-            } else {
-                degraded_response_error(
-                    Some(&result_value),
-                    "success envelope carries no token-plan block at all",
-                )
-            },
-        );
+        // THIS API SAYS "NO PLAN" BY OMITTING THE BLOCK, which is not what the
+        // first version of this guard assumed. It applied the general rule --
+        // an explicit null is a statement, a missing key is a schema
+        // disagreement -- and the live payload took the other arm: the gateway
+        // affirms success at BOTH levels and simply leaves `data` out.
+        //
+        // Learned by deploying and reading the wire, not from the source. Two
+        // independent observations agree on what the shape means: the router
+        // seat's operator knowledge that the subscription ended (insula#11), and
+        // this host reproducing the identical response for its own ended plan.
+        //
+        // THE RESIDUAL RISK, stated because it is real. A schema change that
+        // renamed this block would look the same from here. What makes the trade
+        // right is the direction of the costs, not certainty: `decode_failed` on
+        // an ended plan reads downstream as "cannot read it just now", so a
+        // consumer retaining its last healthy reading keeps routing to a
+        // subscription that no longer exists -- which is the reported harm, a day
+        // of it, with real work sent to a dead plan. The rename case would cost a
+        // silently retired provider, and it announces itself the way schema
+        // changes do: on every account at once, not on the one whose plan lapsed.
+        //
+        // The affirmed `code == "SUCCESS"` above is the guard that stays. A
+        // response that does not claim success still degrades.
+        return Err(FetchError::NoQuotaReported(
+            "qwen-cloud: the account has no token plan (gateway affirmed success and reported no plan block)"
+                .to_string(),
+        ));
     };
     let primary = window_from_fraction(
         quota.per_five_hour_percentage,
@@ -670,27 +681,50 @@ mod tests {
         }
     }
 
-    /// A success envelope with NO `data` key still degrades.
+    /// A response that does NOT affirm success still degrades.
     ///
-    /// The control, and the reason the raw value is consulted at all: serde
-    /// collapses "stated as null" and "key absent" to the same `None`, and they
-    /// are opposite facts. A missing key means their payload and this struct
-    /// disagree, which is the class that sends a reader to this repo -- reporting
-    /// it as "no quota" would retire a working provider silently on the day the
-    /// field is renamed.
+    /// The control, and the guard that survived the correction below: an omitted
+    /// plan block is read as "no plan" only under an affirmed `SUCCESS`. Without
+    /// this case, treating every block-less response as absent quota would pass,
+    /// and a provider-side failure would render as a healthy account with nothing
+    /// to report.
     ///
-    /// SYNTHETIC: constructed to exercise the arm the live payload does not take.
+    /// SYNTHETIC: constructed to exercise the rejecting arm.
     #[test]
-    fn a_success_envelope_with_no_data_key_still_degrades() {
-        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","msg":"Success."}}}}"#;
+    fn a_response_that_does_not_affirm_success_still_degrades() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":false,"code":"FORBIDDEN","msg":"denied"}}}}"#;
         match normalize_usage(body) {
             Err(FetchError::Decode(message)) => {
                 assert!(
-                    message.contains("no token-plan block"),
-                    "the message must point at the shape disagreement: {message}"
+                    message.contains("did not report success"),
+                    "the message must name the refusal: {message}"
                 );
             }
             other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    /// An omitted plan block under an affirmed success is absent quota.
+    ///
+    /// LIVE SHAPE, read off the deployed wire on 2026-08-24 and NOT what the
+    /// first version of this guard predicted. That version applied the general
+    /// rule -- an explicit null is a statement, a missing key is a schema
+    /// disagreement -- and this API takes the other arm: it affirms success at
+    /// both levels and simply leaves `data` out.
+    ///
+    /// The correction came from deploying and reading the wire rather than from
+    /// re-reading the source, which is the only place the difference was visible.
+    #[test]
+    fn an_omitted_plan_block_under_affirmed_success_reports_no_quota() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","msg":"Success."}}}}"#;
+        match normalize_usage(body) {
+            Err(FetchError::NoQuotaReported(message)) => {
+                assert!(
+                    message.contains("no token plan"),
+                    "the message must say what the account lacks: {message}"
+                );
+            }
+            other => panic!("expected NoQuotaReported, got {other:?}"),
         }
     }
 
