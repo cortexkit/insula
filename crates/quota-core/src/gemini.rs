@@ -243,6 +243,28 @@ fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchErr
     // account has no buckets, which is a fact about the account with nothing to
     // fix. Folding them together files an account fact as our defect, and it
     // counts toward the stale-browser-login metric on a working session.
+    //
+    // WHICH ARM A REAL NO-QUOTA ACCOUNT TAKES IS UNVERIFIED, and that matters
+    // because the same reasoning was WRONG for qwen-cloud: that gateway states
+    // "no plan" by OMITTING the block, so a rule built from this principle routed
+    // the real case to Decode -- the class a retaining consumer reads as "cannot
+    // read it just now", which kept a router serving a dead subscription for a day
+    // (insula#11). The principle is sound; how a given upstream expresses absence
+    // is a fact about that upstream and is not inferable from another one.
+    //
+    // The suspicion here runs the same way and cannot be settled from this host.
+    // proto3 JSON omits empty repeated fields by default, and this is a
+    // protobuf-backed Google API (`v1internal`, RPC-style method names), so an
+    // account with zero buckets plausibly sends NO `buckets` key rather than an
+    // empty list -- which would make the empty-list arm below unreachable and the
+    // Decode arm the one that fires.
+    //
+    // NOT FLIPPED ON THAT REASONING. Replacing an unverified guess with a better
+    // argued one is still a guess, and unlike qwen there is no ground truth here:
+    // no account on this host has ever produced a bucket-less quota response, and
+    // `QuotaResponse` carries exactly one field, so a `{}` body offers nothing to
+    // confirm the response is well-formed. What would settle it is one observed
+    // payload from an account without Code Assist entitlement.
     let buckets = match response.buckets {
         None => {
             return Err(FetchError::Decode(

@@ -717,6 +717,19 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
     // here -- and Decode is the class that sends a reader to this repo. A field
     // PRESENT AND EMPTY is the upstream stating that this account has no
     // buckets, which is a fact about the account with nothing to fix.
+    //
+    // WHICH ARM A REAL NO-QUOTA ACCOUNT TAKES IS UNVERIFIED, same as gemini's
+    // twin of this block, and for the same reason: proto3 JSON omits empty
+    // repeated fields, so this protobuf-backed Google API plausibly sends no
+    // `buckets` key at all rather than an empty list. If so the empty-list arm is
+    // unreachable and the Decode arm is what a bucket-less account gets -- the
+    // exact shape that cost a router a day of serving an ended qwen-cloud plan
+    // (insula#11), where the same principle predicted the wrong arm.
+    //
+    // Left as it stands deliberately: no account on this host has produced a
+    // bucket-less response, and swapping one unverified arm for another buys
+    // nothing. One observed payload from an unentitled account settles it, and
+    // this comment is here so whoever sees one knows it is worth capturing.
     let buckets = match response.buckets {
         None => {
             return Err(FetchError::Decode(
