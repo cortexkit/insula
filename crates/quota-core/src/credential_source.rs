@@ -218,13 +218,26 @@ pub trait CredentialSource: Send + Sync {
 /// written, and a number that keeps moving invites a reader to check it rather
 /// than the ratio, which is the durable part.
 ///
-/// And on the build deployed here, A REPORT LATCHES: the report-marks-stale
-/// behaviour that would make a wrong verdict recoverable exists upstream but its
-/// migration has not run, established from the live schema rather than the commit
-/// log. So a misreport against that family is terminal until an operator
-/// re-ingests — not a transient wrong answer that the next successful refresh
-/// corrects. That is what makes the asymmetry above one-way rather than merely
-/// lopsided.
+/// A PREVIOUS VERSION OF THIS COMMENT SAID A REPORT LATCHES THE RECORD. It does
+/// not, and the correction is worth keeping because of how the wrong version got
+/// here: it was written from a reading of the deployed schema, and the migration
+/// that changed the answer had landed twenty-four minutes earlier. Measured end
+/// to end afterwards (insula#10, 2026-08-24) on a genuine 401:
+///
+///   report_auth_failure  ->  stale marker set, record stays ACTIVE
+///   +300s, vault's own forced refresh  ->  invalid_grant  ->  needs_reauth
+///
+/// So the report does not kill the credential; the vault's next failed refresh
+/// does. A wrong report costs a forced refresh and, if the credential is
+/// genuinely healthy, that refresh SUCCEEDS and the record survives.
+///
+/// THE ASYMMETRY IS THEREFORE WEAKER THAN THE ARGUMENT THAT SHIPPED THE FIX, and
+/// the fix is still right on the remaining margin. A wrong report on a live
+/// credential still forces an unnecessary refresh against a rotation-sensitive
+/// endpoint, and this module cannot see whether that costs anything on the
+/// custody side. Withholding it costs a lane that fails visibly as
+/// `credential_rejected`, which an operator sees anyway. The direction survives
+/// even though the magnitude did not.
 ///
 /// So the gate depends on a transport decision made in another file, and
 /// deleting that decision once left every test green while silently ending all
