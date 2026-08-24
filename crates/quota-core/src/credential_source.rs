@@ -208,6 +208,24 @@ pub trait CredentialSource: Send + Sync {
 /// operator sees anyway; sending a wrong one destroys a working credential
 /// silently.
 ///
+/// SIZED FROM THE CUSTODY SIDE, which this module cannot see from where it sits
+/// (reported on insula#10, 2026-08-24, from the vault's append-only audit
+/// chain). The `antigravity:google` record — the one a 403 arm would have
+/// reported, since it rides the same `cloudcode-pa` family as the gemini lane
+/// that produced the live counterexample — had accumulated hundreds of
+/// `refresh_commit` entries and ZERO auth-failure reports, renewing continuously.
+/// The exact count is deliberately not repeated here: it was stale before it was
+/// written, and a number that keeps moving invites a reader to check it rather
+/// than the ratio, which is the durable part.
+///
+/// And on the build deployed here, A REPORT LATCHES: the report-marks-stale
+/// behaviour that would make a wrong verdict recoverable exists upstream but its
+/// migration has not run, established from the live schema rather than the commit
+/// log. So a misreport against that family is terminal until an operator
+/// re-ingests — not a transient wrong answer that the next successful refresh
+/// corrects. That is what makes the asymmetry above one-way rather than merely
+/// lopsided.
+///
 /// So the gate depends on a transport decision made in another file, and
 /// deleting that decision once left every test green while silently ending all
 /// auth reporting. That is not a thing to re-derive per provider.

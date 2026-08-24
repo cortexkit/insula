@@ -535,6 +535,22 @@ and the fabrication is invisible whenever the false reading is plausible for the
 thing being studied. Before concluding a value changed, confirm the rows share
 an identity and not merely a provider name.
 
+**And confirm they share a HOST.** The rule above was committed a second time,
+one level up, by a reader who had read this section that morning: two arrays
+from two different machines, compared as one module over ninety minutes. Nothing
+in a `usage.get` payload identifies which deployment produced it, so two hosts'
+output is indistinguishable once pasted side by side — and the cross-host version
+is EASIER to commit than the cross-account one, because the account labels differ
+legitimately and that difference is what a genuine change would also look like.
+
+The tell is available and is not in the changed rows. A host's credential surface
+is structural: whether a Chrome cookie store exists, which environment variables
+are set, which vault handles are configured. Four providers serving in one array
+and reporting `credential_absent` in the other — including an entire nine-provider
+cookie cohort — is not something that can change in ninety minutes. Before
+reading two arrays as one series, check the rows that DID NOT change; they carry
+the machine's fingerprint, and the rows under study do not.
+
 ## `spend` is money, and it fails in the opposite direction from a window
 
 Some providers sell credit alongside a plan, or instead of one. That credit is
