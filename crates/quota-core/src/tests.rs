@@ -1073,6 +1073,109 @@ fn every_slot_status_is_deliberately_bucketed() {
     assert_eq!(distinct.len(), 4);
 }
 
+/// A vault latch on an identity-less credential publishes its verdict.
+///
+/// THE EXACT SHAPE A CONSUMER MEASURED, and the one path the fix's other tests do
+/// not drive: a single handle, NO `account_id` at any point, and the vault
+/// refusing the credential get. That combination reaches the wire through the
+/// unlabeled representative rather than through `candidates`, which is the branch
+/// the fix rewired.
+///
+/// Written because `VaultGetError::AuthRequired` was driven nowhere in the
+/// registry-level suite. Every test updated with the fix used an account CHANGE
+/// to reach identity flux; this reaches it with no account existing at all, which
+/// is what a credential with no account dimension actually does.
+///
+/// Asserts three things a consumer distinguishes and cannot reconstruct from each
+/// other: the entry is PRESENT (absence would read as "not swept yet" for a
+/// credential this module reached and concluded on), it carries the class that
+/// names the remedy, and `completeProviders` still withholds so nothing
+/// authorises pruning the provider's accounts while identity is unverified.
+#[tokio::test]
+async fn a_vault_latch_on_an_identity_less_credential_publishes_a_verdict() {
+    // THE CREDENTIAL MUST WORK FIRST. A cold slot holds no observation, so
+    // `identity_may_have_changed` is false and flux never fires -- an
+    // AuthRequired on the very first fetch degrades normally and proves nothing.
+    // The measured sequence is a credential that serves, then latches, which is
+    // the only way `prev.observation.is_some()` becomes true.
+    //
+    // The observation exists WITHOUT an account_id: it carries the record
+    // version, which is what a credential with no account dimension still has.
+    struct LatchedVaultProvider {
+        latched: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl UsageProvider for LatchedVaultProvider {
+        fn name(&self) -> &str {
+            "latched"
+        }
+
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            if *self.latched.lock().unwrap() {
+                // What `fetch_vault` returns when `credential_source.get` fails
+                // with the vault's AuthRequired: unverified, no observation.
+                FetchAttempt::unverified_vault_failure(VaultGetError::AuthRequired)
+            } else {
+                FetchAttempt::success(
+                    Some(AccountObservation::new(None, Some(36))),
+                    "vault",
+                    Usage::default(),
+                )
+            }
+        }
+    }
+
+    let latched = Arc::new(Mutex::new(false));
+    let registry = Registry::new(vec![Box::new(LatchedVaultProvider {
+        latched: Arc::clone(&latched),
+    })]);
+    tick(&registry).await;
+    assert!(
+        registry
+            .get_usage(None)
+            .await
+            .iter()
+            .any(|entry| entry.provider == "latched" && entry.error.is_none()),
+        "precondition: the credential serves before it latches"
+    );
+
+    *latched.lock().unwrap() = true;
+    force_due(&registry, "latched");
+    tick(&registry).await;
+
+    let snapshot = registry.usage_snapshot(None).await;
+    let entries: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.provider == "latched")
+        .collect();
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "the verdict must be published, not withheld: {:?}",
+        snapshot.entries
+    );
+    assert!(
+        entries[0].account.is_none(),
+        "there is no identity to state"
+    );
+    assert!(entries[0].usage.is_none(), "and no window to attribute");
+    assert_eq!(
+        entries[0].error_class.as_deref(),
+        Some("credential_unusable"),
+        "the class names the remedy: this credential needs re-authentication"
+    );
+    assert!(
+        !snapshot
+            .complete_providers
+            .iter()
+            .any(|name| name == "latched"),
+        "an unverified identity never authorises reconciling the account set"
+    );
+}
+
 #[tokio::test]
 async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_deduplicates() {
     let labels = Arc::new(Mutex::new(HashMap::from([
