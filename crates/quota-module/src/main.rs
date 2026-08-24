@@ -539,6 +539,24 @@ fn health_report(
         // Membership is since boot, so a provider here is usually healthy now.
         // Not part of the conservation identity.
         "staleEpisodesByProvider": snapshot.stale_episodes_by_provider,
+        // How many times an account's used percent went DOWN, per provider.
+        //
+        // NAMED FOR THE OBSERVATION, NOT THE INFERENCE. A window rollover, a
+        // redeemed reset credit, a goodwill grant, a plan change and an upstream
+        // correction all look identical from here, so calling these "resets"
+        // would state a cause nothing measured. The one cause this module could
+        // attribute is its own redemptions, and that belongs with a consumable
+        // record rather than a counter.
+        //
+        // Exists to answer a design question before the record asked for on
+        // insula#5 gets built: whether a 60-second poll sees these at all.
+        "quotaDropsByProvider": snapshot.quota_drops_by_provider,
+        // How many of those were seen across a CONTINUOUS poll interval; the
+        // rest were inferred across a gap and understate what happened -- a drop
+        // plus later consumption reads smaller than it was, and a drop followed
+        // by a re-fill reads as nothing. The RATIO is the finding: if most are
+        // inferred, a consumable record has to carry that on every row.
+        "quotaDropsObservedContinuously": snapshot.quota_drops_observed_continuously,
         // Providers whose first fetch has not completed. The refresher admits a
         // bounded number of fetch units per turn, so after a start the providers
         // beyond that cap are queued for several turns -- ordinary, not a fault.
@@ -1040,6 +1058,8 @@ mod tests {
             stale: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            quota_drops_by_provider: std::collections::BTreeMap::new(),
+            quota_drops_observed_continuously: 0,
             pending: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
@@ -1426,6 +1446,8 @@ mod tests {
             "fresh",
             "stale",
             "staleEpisodesByProvider",
+            "quotaDropsByProvider",
+            "quotaDropsObservedContinuously",
             "staleEpisodes",
             "pending",
             "degraded",

@@ -338,6 +338,46 @@ fn healthy_entry(
     }
 }
 
+/// Whether two observations describe different accounts.
+///
+/// EXTRACTED SO THERE IS ONE PRODUCER. The slot computation needs this to decide
+/// whether stale-serving may cross an identity, and the quota-drop detector needs
+/// it to refuse a comparison between two different accounts. A second hand-written
+/// copy is a second chance to answer differently, and the two answers would
+/// disagree exactly when it matters -- during a credential swap.
+pub fn observations_differ(
+    before: Option<&AccountObservation>,
+    after: Option<&AccountObservation>,
+) -> bool {
+    match (before, after) {
+        (Some(old), Some(new)) => {
+            if old.account_id.is_some() || new.account_id.is_some() {
+                old.account_id != new.account_id
+            } else {
+                // Neither observation carries an account id, so a change of
+                // account cannot be seen directly. Some credential records are
+                // unlabeled by contract, yet the same durable handle can be
+                // repointed at a different account, and the record version is the
+                // only evidence of that: it identifies the served record and
+                // always advances when the record is replaced.
+                //
+                // Treating a version change as a possible identity change can
+                // discard a still-valid entry when a record is re-versioned
+                // without changing account. That costs one refresh cycle. The
+                // alternative is serving one account's usage under another
+                // account's credential for as long as fetches keep failing, which
+                // a consumer cannot detect and would act on.
+                //
+                // Local sources leave the version absent and re-resolve every
+                // fetch, so absent-vs-absent compares equal and they are
+                // unaffected.
+                old.record_version != new.record_version
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Compute the whole next slot from one completed attempt.
 ///
 /// A newly observed account invalidates all data belonging to the previous
@@ -431,33 +471,8 @@ fn next_slot_after_attempt_inner(
         };
     }
 
-    let observed_account_changed = match (&prev.observation, &attempt.observed) {
-        (Some(old), Some(new)) => {
-            if old.account_id.is_some() || new.account_id.is_some() {
-                old.account_id != new.account_id
-            } else {
-                // Neither observation carries an account id, so a change of
-                // account cannot be seen directly. Some credential records are
-                // unlabeled by contract, yet the same durable handle can be
-                // repointed at a different account, and the record version is the
-                // only evidence of that: it identifies the served record and
-                // always advances when the record is replaced.
-                //
-                // Treating a version change as a possible identity change can
-                // discard a still-valid entry when a record is re-versioned
-                // without changing account. That costs one refresh cycle. The
-                // alternative is serving one account's usage under another
-                // account's credential for as long as fetches keep failing, which
-                // a consumer cannot detect and would act on.
-                //
-                // Local sources leave the version absent and re-resolve every
-                // fetch, so absent-vs-absent compares equal and they are
-                // unaffected.
-                old.record_version != new.record_version
-            }
-        }
-        _ => false,
-    };
+    let observed_account_changed =
+        observations_differ(prev.observation.as_ref(), attempt.observed.as_ref());
     let identity_may_have_changed = identity_unverified && prev.observation.is_some();
     let account_changed = observed_account_changed || identity_may_have_changed;
     let observation = attempt

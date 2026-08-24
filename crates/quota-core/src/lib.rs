@@ -53,6 +53,7 @@ pub mod opencodego;
 pub mod openrouter;
 pub mod provider;
 pub mod qoder;
+pub mod quota_drop;
 pub mod qwen_cloud;
 pub mod refresh;
 pub mod sakana;
@@ -935,12 +936,39 @@ impl Registry {
             // describes. A slot already stale is a continuation, not a new
             // episode.
             let enters_stale = refresh::enters_stale_transient(&unit.prev, &next);
+            // Whether this attempt saw the account's used percent go DOWN.
+            // Decided here for the same reason as the line above: the comparison
+            // needs both readings, and this is the only place that holds them.
+            //
+            // The identity check is the load-bearing argument, not the
+            // percentages: comparing a reading of one account against a reading
+            // of another fabricates a transition nobody made.
+            let quota_drop = next
+                .entry
+                .as_ref()
+                .filter(|entry| entry.error.is_none())
+                .and_then(|entry| entry.usage.as_ref())
+                .and_then(|usage| {
+                    quota_drop::detect(
+                        &unit.prev,
+                        usage,
+                        refresh::observations_differ(
+                            unit.prev.observation.as_ref(),
+                            next.observation.as_ref(),
+                        ),
+                        completed_at,
+                        refresh::BASE_INTERVAL,
+                    )
+                });
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if enters_stale {
                 store.record_stale_episode(&unit.key.provider);
+            }
+            if let Some(drop) = quota_drop {
+                store.record_quota_drop(&unit.key.provider, drop.observed_continuously);
             }
             store.publish_if_current(
                 &unit.key,
@@ -1000,17 +1028,26 @@ impl Registry {
             .filter(|provider| provider.cookie_based)
             .count();
 
-        let (snapshot, last_tick_at, created_at, stale_episodes, stale_episodes_by_provider) =
-            match self.store.lock() {
-                Ok(store) => (
-                    store.snapshot(),
-                    store.last_tick_at(),
-                    store.created_at(),
-                    store.stale_episodes(),
-                    store.stale_episodes_by_provider(),
-                ),
-                Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
-            };
+        let (
+            snapshot,
+            last_tick_at,
+            created_at,
+            stale_episodes,
+            stale_episodes_by_provider,
+            quota_drops_by_provider,
+            quota_drops_observed_continuously,
+        ) = match self.store.lock() {
+            Ok(store) => (
+                store.snapshot(),
+                store.last_tick_at(),
+                store.created_at(),
+                store.stale_episodes(),
+                store.stale_episodes_by_provider(),
+                store.quota_drops_by_provider(),
+                store.quota_drops_observed_continuously(),
+            ),
+            Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
+        };
         let now = Instant::now();
         let mut fresh = 0;
         let mut stale = 0;
@@ -1168,6 +1205,8 @@ impl Registry {
             stale,
             stale_episodes,
             stale_episodes_by_provider,
+            quota_drops_by_provider,
+            quota_drops_observed_continuously,
             pending,
             degraded,
             unconfigured,

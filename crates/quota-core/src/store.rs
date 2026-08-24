@@ -101,6 +101,22 @@ pub struct SlotStore {
     /// Still bounded by the registry (37 keys at most) however long the process
     /// runs or how often a lane flaps, which is what the set was chosen for.
     stale_episodes_by_provider: BTreeMap<String, u64>,
+
+    /// How many used-percent decreases have been observed per provider.
+    ///
+    /// Counted per provider for the same reason as the stale episodes beside it:
+    /// a total says how many and the spread says whether one lane is doing all of
+    /// it. Bounded by the registry however long the process runs.
+    quota_drops_by_provider: BTreeMap<String, u64>,
+
+    /// How many of those decreases were seen across a CONTINUOUS poll interval.
+    ///
+    /// The rest were inferred across a gap, where the reading understates what
+    /// happened: a drop plus subsequent consumption looks smaller than it was,
+    /// and a drop followed by a re-fill looks like nothing at all. Published as a
+    /// pair with the total, because the ratio is the finding -- if most drops are
+    /// inferred, a consumable record needs to say so on every row.
+    quota_drops_observed_continuously: u64,
 }
 
 impl SlotStore {
@@ -115,6 +131,8 @@ impl SlotStore {
             next_attempt_sequence: 1,
             stale_episodes: 0,
             stale_episodes_by_provider: BTreeMap::new(),
+            quota_drops_by_provider: BTreeMap::new(),
+            quota_drops_observed_continuously: 0,
         }
     }
 
@@ -265,6 +283,31 @@ impl SlotStore {
     /// change.
     pub fn stale_episodes_by_provider(&self) -> BTreeMap<String, u64> {
         self.stale_episodes_by_provider.clone()
+    }
+
+    /// Per-provider counts of observed used-percent decreases, by provider name.
+    pub fn quota_drops_by_provider(&self) -> BTreeMap<String, u64> {
+        self.quota_drops_by_provider.clone()
+    }
+
+    /// How many observed decreases were seen across a continuous poll interval.
+    pub fn quota_drops_observed_continuously(&self) -> u64 {
+        self.quota_drops_observed_continuously
+    }
+
+    /// Record one observed decrease in an account's used percent.
+    ///
+    /// Both figures move from the same call, so the continuous count can never
+    /// exceed the total by construction rather than by discipline.
+    pub(crate) fn record_quota_drop(&mut self, provider: &str, observed_continuously: bool) {
+        *self
+            .quota_drops_by_provider
+            .entry(provider.to_string())
+            .or_insert(0) += 1;
+        if observed_continuously {
+            self.quota_drops_observed_continuously =
+                self.quota_drops_observed_continuously.saturating_add(1);
+        }
     }
 
     /// Record one slot entering stale-serving. Called under the store lock at

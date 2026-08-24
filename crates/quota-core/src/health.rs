@@ -75,6 +75,18 @@ pub struct HealthSnapshot {
     /// a partition of the current population. A provider named here may be
     /// perfectly healthy right now, and usually is.
     pub stale_episodes_by_provider: std::collections::BTreeMap<String, u64>,
+
+    /// Observed used-percent decreases per provider, since boot.
+    ///
+    /// What a decrease MEANS is not stated, deliberately: a rollover, a redeemed
+    /// reset credit, a grant and an upstream correction are identical from here.
+    /// The count is the observation; the cause is not observable.
+    pub quota_drops_by_provider: std::collections::BTreeMap<String, u64>,
+
+    /// How many of those were seen across a continuous poll interval.
+    ///
+    /// The remainder were inferred across a gap and understate what happened.
+    pub quota_drops_observed_continuously: u64,
     /// Providers serving nothing yet because at least one handle has not
     /// completed its first fetch.
     ///
@@ -211,6 +223,8 @@ impl HealthSnapshot {
             pending: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            quota_drops_by_provider: std::collections::BTreeMap::new(),
+            quota_drops_observed_continuously: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
             without_handles: Vec::new(),

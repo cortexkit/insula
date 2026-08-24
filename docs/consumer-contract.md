@@ -362,6 +362,34 @@ and they only grow until a restart. Bounded by the registry, and **not** part of
 the conservation identity: these are lanes that flapped at some point, not a
 partition of the current population.
 
+### `quotaDropsByProvider` and `quotaDropsObservedContinuously`
+
+How many times an account's used percent went **down** between two readings, per
+provider, and how many of those were seen across a continuous poll interval.
+
+**Named for the observation, not the inference.** A window rollover, a redeemed
+reset credit, a goodwill grant, a plan change and an upstream correction are
+identical from here — the cause of a drop is not observable, only the drop is.
+The one cause this module could attribute is its own banked-reset redemptions,
+which are recorded in a local journal; that attribution belongs with a consumable
+record, not with a counter.
+
+The pair matters more than either half. A drop inferred across a gap — host
+sleep, a fetch blackout, a long backoff — **understates what happened**: a drop
+followed by consumption reads as a smaller drop, and a drop followed by a re-fill
+reads as no drop at all. If most drops are inferred rather than observed, any
+future per-event record has to carry that on every row.
+
+Three things deliberately do not count: a decrease across an **account change**
+(two accounts are not one series), a decrease on a window stating a `drip`
+regeneration mechanic (a continuously refilling pool reads lower as a matter of
+course), and a decrease under one percentage point (upstream arithmetic rather
+than capacity returning).
+
+These exist to answer a design question before the reset events asked for in
+issue #5 are built: whether a 60-second poll observes these at all. Not part of
+the conservation identity.
+
 It exists because the gauge alone cannot distinguish "nothing is failing" from
 "nothing was failing at the instant you polled" — and a transient failure that
 resolves between two polls leaves no other trace. Read it for "has this host
