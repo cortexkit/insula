@@ -815,6 +815,21 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 optional: Vec::new(),
             },
         },
+        // No versioned capability grammar declared. `None` and an empty block are
+        // NOT the same statement: the protocol makes this optional precisely so a
+        // module can say nothing, and the daemon VALIDATES a present block before
+        // accepting a HELLO -- so an inaccurate declaration is a module that does
+        // not come up, which is worse than one that stays silent.
+        //
+        // Saying nothing is currently the accurate answer. The tempting entry is a
+        // `requires` on the credential vault, since vault lanes go dark without
+        // claustrum -- but that would be wrong twice over: this module degrades
+        // rather than fails without it (local lanes keep fetching, and the vault
+        // client retries a refused route indefinitely by design), and I have not
+        // established what the daemon's validation does with an unsatisfied
+        // requirement. Declaring a dependency I have not verified the semantics of
+        // trades a working module for a tidier manifest.
+        capabilities: None,
     }
 }
 

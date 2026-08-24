@@ -169,6 +169,10 @@ fn vault_manifest() -> ModuleManifest {
                 optional: Vec::new(),
             },
         },
+        // Mirrors the module's own `None`, for the reason on the line above about
+        // ordering: a stub declaring capabilities the real vault does not would
+        // exercise a handshake nothing ships.
+        capabilities: None,
     }
 }
 
