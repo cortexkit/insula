@@ -437,12 +437,40 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         ));
     }
 
-    let quota = result.data.as_ref().ok_or_else(|| {
-        degraded_response_error(
-            Some(&result_value),
-            "response is missing token-plan quota data",
-        )
-    })?;
+    // A SUCCESS envelope with no plan block. Two different facts arrive here as
+    // one `None`, and they send a reader to opposite places:
+    //
+    //   "data": null   the gateway AFFIRMS there is no token plan -- the account
+    //                  never had one, or the subscription ended. A fact about the
+    //                  account, nothing to fix.
+    //   no `data` key  their payload and our struct disagree about its shape,
+    //                  which is the class that sends someone to this repo.
+    //
+    // Serde collapses both to `None`, so the raw value is consulted instead. The
+    // distinction is load-bearing downstream: `decode_failed` reads as "cannot
+    // read it just now" and a consumer retaining last-known-good keeps routing to
+    // a plan that has ENDED -- reported on insula#11 after a day of it, with real
+    // work sent to a dead subscription. `no_quota_reported` is the same shape as
+    // opencodego's absent Go plan and jetbrains' inactive quota, and consumers
+    // already treat that family as truth rather than a fetch problem.
+    let Some(quota) = result.data.as_ref() else {
+        return Err(
+            if result_value
+                .get("data")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                FetchError::NoQuotaReported(
+                "qwen-cloud: the account has no token plan (gateway reported success with a null plan block)"
+                    .to_string(),
+            )
+            } else {
+                degraded_response_error(
+                    Some(&result_value),
+                    "success envelope carries no token-plan block at all",
+                )
+            },
+        );
+    };
     let primary = window_from_fraction(
         quota.per_five_hour_percentage,
         quota.per_five_hour_reset_time,
@@ -454,9 +482,27 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         WEEKLY_WINDOW_MINUTES,
     );
     if primary.is_none() && secondary.is_none() {
-        return Err(FetchError::Decode(
-            "qwen-cloud no quota windows found in response".to_string(),
-        ));
+        // The same discriminator one level down. A plan block that NAMES its
+        // percentage keys and leaves them empty is the upstream stating there are
+        // no windows; a block that mentions neither key is a payload we no longer
+        // understand, and calling that "no quota" would retire a working provider
+        // silently on the day they rename a field.
+        let stated_the_keys = ["per5HourPercentage", "perWeekPercentage"]
+            .iter()
+            .any(|key| {
+                result_value
+                    .get("data")
+                    .and_then(|data| data.get(key))
+                    .is_some()
+            });
+        return Err(if stated_the_keys {
+            FetchError::NoQuotaReported(
+                "qwen-cloud: the token plan reports no windows (percentage fields present and empty)"
+                    .to_string(),
+            )
+        } else {
+            FetchError::Decode("qwen-cloud plan block names neither percentage field".to_string())
+        });
     }
 
     Ok(Usage {
@@ -597,6 +643,93 @@ impl UsageProvider for QwenCloudProvider {
 
 #[cfg(test)]
 mod tests {
+
+    /// A gateway success with an explicitly null plan block is NOT a decode error.
+    ///
+    /// LIVE SHAPE, observed on this host 2026-08-24: the account's token-plan
+    /// subscription ended, and the console gateway kept answering `code: SUCCESS`,
+    /// `msg: "Success."` with no plan data. That was published as `decode_failed`,
+    /// which reads downstream as "cannot read it just now" -- so a consumer
+    /// retaining its last healthy reading kept routing to a subscription that no
+    /// longer existed, for a day, with real work sent to it (insula#11).
+    ///
+    /// The class is the fix. `no_quota_reported` is the same statement as
+    /// opencodego's absent Go plan: the credential works, the account has nothing
+    /// to report, and there is nothing for an operator to repair.
+    #[test]
+    fn a_success_envelope_with_a_null_plan_block_reports_no_quota() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","msg":"Success.","data":null}}}}"#;
+        match normalize_usage(body) {
+            Err(FetchError::NoQuotaReported(message)) => {
+                assert!(
+                    message.contains("no token plan"),
+                    "the message must say what the account lacks: {message}"
+                );
+            }
+            other => panic!("expected NoQuotaReported, got {other:?}"),
+        }
+    }
+
+    /// A success envelope with NO `data` key still degrades.
+    ///
+    /// The control, and the reason the raw value is consulted at all: serde
+    /// collapses "stated as null" and "key absent" to the same `None`, and they
+    /// are opposite facts. A missing key means their payload and this struct
+    /// disagree, which is the class that sends a reader to this repo -- reporting
+    /// it as "no quota" would retire a working provider silently on the day the
+    /// field is renamed.
+    ///
+    /// SYNTHETIC: constructed to exercise the arm the live payload does not take.
+    #[test]
+    fn a_success_envelope_with_no_data_key_still_degrades() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","msg":"Success."}}}}"#;
+        match normalize_usage(body) {
+            Err(FetchError::Decode(message)) => {
+                assert!(
+                    message.contains("no token-plan block"),
+                    "the message must point at the shape disagreement: {message}"
+                );
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    /// A plan block naming its percentage keys but leaving them empty states
+    /// "no windows" rather than failing to parse.
+    ///
+    /// SYNTHETIC: the same discriminator one level down, for the shape where the
+    /// plan exists but reports nothing.
+    #[test]
+    fn a_plan_block_with_empty_percentage_fields_reports_no_quota() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","data":{"per5HourPercentage":null,"perWeekPercentage":null}}}}}"#;
+        match normalize_usage(body) {
+            Err(FetchError::NoQuotaReported(message)) => {
+                assert!(message.contains("no windows"), "got {message}");
+            }
+            other => panic!("expected NoQuotaReported, got {other:?}"),
+        }
+    }
+
+    /// A plan block mentioning neither percentage key degrades.
+    ///
+    /// The control for the test above. Without it, treating any window-less plan
+    /// block as "no quota" would pass -- and that is exactly what a field rename
+    /// looks like.
+    ///
+    /// SYNTHETIC.
+    #[test]
+    fn a_plan_block_naming_neither_percentage_key_degrades() {
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","data":{"someRenamedField":0.42}}}}}"#;
+        match normalize_usage(body) {
+            Err(FetchError::Decode(message)) => {
+                assert!(
+                    message.contains("neither percentage field"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
     use super::*;
 
     const HAR_RESPONSE: &str = r#"{
