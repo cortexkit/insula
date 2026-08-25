@@ -27,8 +27,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.53.0** (37 providers registered; verified
-2026-08-20, a null round). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.55.0** (37 providers registered; verified
+2026-08-25). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -262,6 +262,37 @@ The `fireworks-ai` one is worth remembering if that vendor ever ships a billing
 endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
 
+### v0.53.0 -> v0.55.0 (checked 2026-08-25)
+
+Two releases at once; the tripwire fired correctly for the first time in five
+rounds rather than being caught by a generic gap notice.
+
+Constants all five present at the tag. 216 files changed, 57 of them providers,
+and most of the provider delta is a formatter pass.
+
+**One correction to our own record, which is the round's actual result.** Upstream
+added a 403 discrimination for Gemini whose comment states that a quota-403
+carries no migration wording, so it is not evidence of the consumer shutdown on
+its own. Our own write-up of the 2026-08-21 observation claimed the shutdown as
+established. Corrected in place: the evidence establishes *entitlement rather than
+credential* and does not identify which entitlement cause. Upstream also supplies
+the discriminator we had recorded as non-existent (`loadCodeAssist`'s
+`currentTier` / `ineligibleTiers`).
+
+**One finding, declined for want of a specimen.** Codex gained a PAT lane:
+`~/.codex/auth.json` may carry `personal_access_token` / `personalAccessToken`,
+and upstream reads it as an alternative credential against the *same* usage
+endpoint we already call. So a PAT-configured account is quota-visible upstream
+and would be dark here. This host's `auth.json` carries no such field
+(`auth_mode`, `tokens`, `OPENAI_API_KEY`), so building the parser means inventing
+the shape — the trap that produced a wrong `dataV2` fixture and a wrong
+`amount`/`duration` fixture in the same week. UNBLOCK: one observed PAT-mode
+`auth.json`, key names and value shapes intact.
+
+**Nulls worth naming:** OpenCodeGo's message reword (`session cookie` ->
+`credentials`) with a 401/403 branch we already have; Kiro is a provider we do not
+carry.
+
 ### v0.52.0 -> v0.53.0 (checked 2026-08-20)
 
 NULL. Constants all present at the tag. Fifteen provider files changed, eight of
@@ -360,10 +391,30 @@ otherwise re-derive it from an error that points the wrong way.
 | refresh token present, refresh not refused | an expired or revoked credential |
 
 So Google renews this credential and then refuses it the Code Assist quota
-resource. That is an ENTITLEMENT change, not a credential fault: Google closed
-Gemini CLI OAuth for individual/AI Pro/Ultra accounts and directs them to
-Antigravity, which is exactly what this host shows — one Google lane dark, the
-other serving.
+resource. That is an ENTITLEMENT change, not a credential fault.
+
+**CORRECTED 2026-08-25, during the v0.55.0 round: the sentence that followed
+claimed more than the evidence supports.** It said this *is* the CLI-OAuth
+shutdown. The three rows above rule out a refresh failure, a network fault and a
+revoked credential — they do not identify WHICH entitlement cause, and upstream's
+own code now says so explicitly:
+
+> The quota 403 (`SUBSCRIPTION_REQUIRED`) carries no migration wording; only
+> treat it as the consumer shutdown when loadCodeAssist flagged this client as
+> unsupported AND the account is not on a licensed tier.
+
+A bare quota-403 is what an account without Code Assist entitlement gets for any
+reason. The shutdown is the likeliest cause here — the timing fits and the other
+Google lane serves — but likeliest is not established, and the difference matters
+to whoever reads this: if it is the shutdown there is nothing to do, and if it is
+a missing subscription there is.
+
+**And the discriminator exists, which the paragraph below denies.**
+`v1internal:loadCodeAssist` returns `currentTier` and `ineligibleTiers`, so the
+two causes are separable by a call we already have the host and credential for.
+Probing it from here returned HTTP 401 on the stored access token, because this
+lane refreshes before use and the probe skipped that step — so the question is
+open for want of ten minutes, not for want of a mechanism.
 
 **The published class is `credential_rejected`, and it is misleading here.** It
 means *a credential was presented and refused*, which is true at the transport
@@ -372,9 +423,12 @@ mechanism the credential would be for is gone. That is the false-remedy shape
 this repo has hit twice before (a decode failure counted as a stale login; an
 opencode outage that was a null we could not read).
 
-**Not reclassified, deliberately.** Distinguishing a sunset 403 from an ordinary
-one needs a discriminator no single observation supplies, and a guard whose
-correctness cannot be measured from this machine must not ship. What made the
+**Not reclassified, deliberately** — and the reason has changed. It was "no
+discriminator exists"; that was wrong, per the correction above. The reason now is
+that the discriminator costs a second API call per fetch on every Gemini sweep, to
+change an error string on a lane that is dark either way. The behaviour is already
+right: we publish `credential_rejected` and do not stale-serve. Build it when a
+reader needs the two causes separated, not to satisfy a doc. What made the
 diagnosis possible in minutes rather than hours was the STAGE NAME, not a new
 class: `quota:` versus `token refresh:` is the whole difference between an
 entitlement problem and a credential problem, and both had rendered identically
@@ -455,8 +509,8 @@ whose logic changed:
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs` | Fallback device identifier, used only when the token carries no `device_id` claim. |
 
-All five matched CodexBar v0.53.0, re-verified 2026-08-20 by locating each
-value in the tagged tree (`git grep -l <value> v0.53.0`) rather than in a
+All five matched CodexBar v0.55.0, re-verified 2026-08-25 by locating each
+value in the tagged tree (`git grep -l <value> v0.55.0`) rather than in a
 checkout, since a working tree can be on any commit.
 
 File paths here carry no line numbers on purpose. The two that had them were
