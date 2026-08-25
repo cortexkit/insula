@@ -4,10 +4,59 @@
 //! updates, and incarnation-fenced whole-slot publication. Enumeration, sorting,
 //! transition computation, and all asynchronous work happen outside its lock.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+use chrono::Utc;
+
 use crate::provider::CredentialHandle;
+
+/// How many drop records the ring holds.
+///
+/// SIZED AS A GAP-CLOSER. At the measured rate on a busy host (~1.4/hour) and a
+/// 30-second consumer poll, a hundred records is days of margin -- the ring only
+/// has to survive the interval between two consecutive polls, because the durable
+/// record is the consumer's own log. Overflow is not silent: `oldest_retained`
+/// tells a consumer its cursor fell off.
+const DROP_LOG_CAPACITY: usize = 100;
+
+/// One observed decrease in an account's used percent.
+///
+/// Named for the OBSERVATION rather than a cause. A window rollover, a redeemed
+/// reset credit, a goodwill grant and an upstream correction are identical from
+/// here, so the record states what was seen and leaves the reading to whoever has
+/// more context.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropRecord {
+    /// Monotonic within one `epoch`. Meaningless across epochs.
+    pub seq: u64,
+    /// Wall clock at the moment the drop was observed, RFC3339 with nanoseconds.
+    pub at: String,
+    pub provider: String,
+    /// Whether the two readings either side were taken across a CONTINUOUS poll
+    /// interval. False means the interval had a gap -- suspend, blackout, backoff
+    /// -- and a gap hides magnitude: a drop plus later consumption reads smaller
+    /// than it was, and a drop followed by a re-fill reads as nothing.
+    pub observed_continuously: bool,
+}
+
+/// One page of the drop ring.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPage {
+    /// Identifies the ring these sequences belong to. A different value means the
+    /// module restarted and any held cursor is meaningless.
+    pub epoch: String,
+    /// The oldest sequence still retained, or absent when the ring is empty. A
+    /// consumer whose cursor is older than this LOST entries; without it, an
+    /// empty page and a lost cursor are the same bytes.
+    pub oldest_retained: Option<u64>,
+    /// The sequence the next record will take. A consumer resumes from here.
+    pub next: u64,
+    pub drops: Vec<DropRecord>,
+}
+
 use crate::refresh::{AttemptSequence, Incarnation, ProviderSlot};
 
 /// Active fetch-unit identity. The account label is not part of the key because
@@ -126,6 +175,34 @@ pub struct SlotStore {
     /// Keyed by a stable string from `NotComparable::as_key`, and incremented in
     /// the same statement that returns the reason so the two cannot disagree.
     quota_not_comparable: BTreeMap<String, u64>,
+
+    /// Recent drops, oldest first, so a consumer polling every minute cannot
+    /// miss one that happened between two polls.
+    ///
+    /// A GAP-CLOSER, NOT AN ARCHIVE. Its job is to survive the interval between
+    /// two consecutive consumer polls; the durable record is the consumer's own
+    /// log. Depth is therefore poll interval times expected rate with margin,
+    /// rather than a history depth -- and exceeding it is DETECTABLE rather than
+    /// silent, because the page reports the oldest sequence it still holds.
+    drop_log: VecDeque<DropRecord>,
+
+    /// The sequence the next record will take. Monotonic within one process.
+    drop_log_next_seq: u64,
+
+    /// Identifies THIS process's ring.
+    ///
+    /// The ring is in memory, so it dies with the process, and a consumer
+    /// holding `since=500` across a restart would otherwise resume against a
+    /// fresh ring whose sequence means something else entirely. A consumer
+    /// cannot currently detect a restart from the wire at all: a
+    /// process-lifetime counter that resets to the value it already had reads as
+    /// continuous, which is exactly what `vaultConnectionsEstablished` did across
+    /// a real restart (insula#5).
+    ///
+    /// The module already fences this internally with incarnations, attempt
+    /// sequences and vault connection generations. This is the same fence made
+    /// visible.
+    drop_log_epoch: String,
 }
 
 impl SlotStore {
@@ -143,6 +220,12 @@ impl SlotStore {
             quota_drops_observed_continuously: 0,
             quota_comparisons_no_drop: 0,
             quota_not_comparable: BTreeMap::new(),
+            drop_log: VecDeque::new(),
+            drop_log_next_seq: 0,
+            // Wall time at startup, to nanoseconds. Meaningful as well as
+            // unique: a consumer can see when this ring began, which a random
+            // token would not tell them.
+            drop_log_epoch: Utc::now().format("%Y%m%dT%H%M%S%.9f").to_string(),
         }
     }
 
@@ -328,11 +411,35 @@ impl SlotStore {
             .or_insert(0) += 1;
     }
 
+    /// A page of the drop ring, plus what the consumer needs to trust it.
+    pub fn drop_page(&self, since: Option<u64>) -> DropPage {
+        let drops: Vec<DropRecord> = match since {
+            Some(cursor) => self
+                .drop_log
+                .iter()
+                .filter(|record| record.seq > cursor)
+                .cloned()
+                .collect(),
+            None => self.drop_log.iter().cloned().collect(),
+        };
+        DropPage {
+            epoch: self.drop_log_epoch.clone(),
+            // The oldest sequence STILL HELD, so a consumer whose cursor is older
+            // than this knows it lost entries rather than reading an empty page
+            // as a quiet interval. An observation gap that looks identical to
+            // silence is the defect this exists to prevent.
+            oldest_retained: self.drop_log.front().map(|record| record.seq),
+            next: self.drop_log_next_seq,
+            drops,
+        }
+    }
+
     /// Record one observed decrease in an account's used percent.
     ///
     /// Both figures move from the same call, so the continuous count can never
     /// exceed the total by construction rather than by discipline.
     pub(crate) fn record_quota_drop(&mut self, provider: &str, observed_continuously: bool) {
+        self.push_drop_record(provider, observed_continuously);
         *self
             .quota_drops_by_provider
             .entry(provider.to_string())
@@ -341,6 +448,26 @@ impl SlotStore {
             self.quota_drops_observed_continuously =
                 self.quota_drops_observed_continuously.saturating_add(1);
         }
+    }
+
+    /// Append one record to the ring, evicting the oldest when full.
+    fn push_drop_record(&mut self, provider: &str, observed_continuously: bool) {
+        let record = DropRecord {
+            seq: self.drop_log_next_seq,
+            // BOTH a sequence and a timestamp, so a consumer that lost its cursor
+            // can re-derive its position from the last line of its OWN log. Every
+            // process on a busy host dies eventually; the log file is what
+            // survives, so requiring separate durable cursor state asks the
+            // consumer to keep exactly the thing that does not survive.
+            at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, false),
+            provider: provider.to_string(),
+            observed_continuously,
+        };
+        self.drop_log_next_seq = self.drop_log_next_seq.saturating_add(1);
+        if self.drop_log.len() >= DROP_LOG_CAPACITY {
+            self.drop_log.pop_front();
+        }
+        self.drop_log.push_back(record);
     }
 
     /// Record one slot entering stale-serving. Called under the store lock at
@@ -360,6 +487,96 @@ impl SlotStore {
 
 #[cfg(test)]
 mod tests {
+
+    /// A cursor older than the ring reports its loss instead of reading empty.
+    ///
+    /// THE CONDITION A CONSUMER ASKED FOR FIRST, and the one worth defending
+    /// hardest: an observation gap that reads identically to a quiet period is
+    /// how a monitoring series records silence where an outage was. `usage.get`
+    /// already gives them this shape with `completeProviders`; this is the same
+    /// property for events.
+    #[test]
+    fn a_cursor_that_fell_off_the_ring_is_distinguishable_from_a_quiet_interval() {
+        let mut store = SlotStore::new(Instant::now());
+        for _ in 0..(DROP_LOG_CAPACITY + 10) {
+            store.record_quota_drop("codex", true);
+        }
+
+        // A cursor from before the eviction.
+        let page = store.drop_page(Some(2));
+        let oldest = page.oldest_retained.expect("a full ring retains something");
+        assert!(
+            oldest > 2,
+            "the ring must say its oldest sequence is newer than the cursor, so a \
+             consumer can tell it lost records: oldest {oldest}"
+        );
+
+        // And the quiet case is genuinely different: a current cursor yields an
+        // empty page whose oldest is NOT newer than the cursor.
+        let caught_up = store.drop_page(Some(page.next - 1));
+        assert!(
+            caught_up.drops.is_empty(),
+            "nothing new since the last page"
+        );
+        assert!(
+            caught_up.oldest_retained.is_some_and(|old| old < page.next),
+            "a caught-up consumer must not look like one that lost records"
+        );
+    }
+
+    /// The ring is bounded, so a long-running process cannot grow it forever.
+    #[test]
+    fn the_ring_is_bounded_by_its_capacity() {
+        let mut store = SlotStore::new(Instant::now());
+        for _ in 0..(DROP_LOG_CAPACITY * 3) {
+            store.record_quota_drop("claude", false);
+        }
+        let page = store.drop_page(None);
+        assert_eq!(page.drops.len(), DROP_LOG_CAPACITY);
+        assert_eq!(
+            page.next,
+            (DROP_LOG_CAPACITY * 3) as u64,
+            "sequences keep counting past what is retained"
+        );
+    }
+
+    /// Records carry both a sequence and a timestamp.
+    ///
+    /// So a consumer that lost its cursor re-derives its position from the last
+    /// line of its OWN log. Every process on a busy host dies eventually and the
+    /// log file is what survives, so requiring a separate durable cursor asks the
+    /// consumer to keep precisely the state that does not.
+    #[test]
+    fn a_record_carries_both_a_sequence_and_a_timestamp() {
+        let mut store = SlotStore::new(Instant::now());
+        store.record_quota_drop("antigravity", true);
+        let page = store.drop_page(None);
+        let record = &page.drops[0];
+
+        assert_eq!(record.seq, 0);
+        assert!(record.observed_continuously);
+        assert_eq!(record.provider, "antigravity");
+        chrono::DateTime::parse_from_rfc3339(&record.at)
+            .expect("the timestamp must be canonical RFC3339");
+    }
+
+    /// Two stores do not share an epoch.
+    ///
+    /// A consumer holding a cursor across a module restart would otherwise resume
+    /// against a fresh ring whose sequences mean something else. A
+    /// process-lifetime counter that resets to the value it already had reads as
+    /// continuous -- which is exactly what a consumer observed across a real
+    /// restart, and why the epoch is stated rather than inferred.
+    #[test]
+    fn a_new_store_gets_a_new_epoch() {
+        let first = SlotStore::new(Instant::now()).drop_page(None).epoch;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = SlotStore::new(Instant::now()).drop_page(None).epoch;
+        assert_ne!(
+            first, second,
+            "a restarted module must not claim the previous ring's identity"
+        );
+    }
     use super::*;
 
     /// The test-only per-provider reconcile must agree with the shipped batch one.

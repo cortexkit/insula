@@ -44,6 +44,15 @@ use tokio_util::sync::CancellationToken;
 use vault_client::VaultClient;
 
 const USAGE_GET_OP: &str = "usage.get";
+
+/// Recently observed quota drops, as a cursor-paged ring.
+///
+/// A SECOND OPERATION rather than a field on `usage.get`, because a drop is an
+/// EVENT and that response is a statement of current state. Folding events into
+/// it would make one poll answer two questions with different retention rules --
+/// and a consumer polling for state would silently consume events it had no
+/// cursor for.
+const USAGE_DROPS_OP: &str = "usage.drops";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 /// The `ck-quota` name is a literal, deliberately not derived from the binary or
@@ -654,6 +663,9 @@ struct UsageRequest {
 struct UsageParams {
     #[serde(default)]
     provider: Option<String>,
+    /// A sequence from a previous drop page. Absent means "everything retained".
+    #[serde(default)]
+    since: Option<u64>,
 }
 
 async fn handle_usage_request(
@@ -684,6 +696,49 @@ async fn handle_usage_request(
         }
     };
 
+    if request.method == USAGE_DROPS_OP {
+        let page = registry.drop_page(request.params.since).await;
+        let body = match serde_json::to_vec(&page) {
+            Ok(body) => body,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "internal_error",
+                    &format!("drop page not serializable: {error}"),
+                )
+                .await;
+            }
+        };
+        let response = match Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "internal_error",
+                    &format!("drop page could not be framed: {error}"),
+                )
+                .await;
+            }
+        };
+        return send(writer, response).await;
+    }
+
     if request.method != USAGE_GET_OP {
         // The method name is echoed so the caller can see what was rejected, but
         // it comes from the request and nothing upstream bounds it. An error
@@ -699,7 +754,7 @@ async fn handle_usage_request(
             epoch,
             corr,
             "unknown_method",
-            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}'"),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}' or '{USAGE_DROPS_OP}'"),
         )
         .await;
     }
@@ -814,7 +869,8 @@ fn manifest(module_id: &str) -> ModuleManifest {
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ManagementSurface {
-            operations: vec![ManagementOperation {
+            operations: vec![
+                ManagementOperation {
                 name: USAGE_GET_OP.to_string(),
                 kind: ManagementOperationKind::Query,
                 // One sentence, because this is discovery metadata a human reads
@@ -826,7 +882,16 @@ fn manifest(module_id: &str) -> ModuleManifest {
                     "Cache-only read of per-account provider quota; never blocks on a fetch, so the array may be partial."
                         .to_string(),
                 ),
-            }],
+                },
+                ManagementOperation {
+                    name: USAGE_DROPS_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some(
+                        "Recently observed decreases in an account's used percent, as a cursor-paged in-memory ring."
+                            .to_string(),
+                    ),
+                },
+            ],
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),
             identity_scope: Vec::new(),

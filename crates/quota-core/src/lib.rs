@@ -811,6 +811,22 @@ impl Registry {
         }
     }
 
+    /// A page of recently observed quota drops.
+    ///
+    /// Cache-only, like every other read here: it returns what the refresher has
+    /// already recorded and never waits for a sweep.
+    ///
+    /// `since` is a sequence from a previous page. A consumer that has never
+    /// polled passes `None` and gets everything retained. A consumer whose cursor
+    /// predates `oldest_retained` has lost records, and can tell.
+    pub async fn drop_page(&self, since: Option<u64>) -> store::DropPage {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.drop_page(since)
+    }
+
     /// Run one bounded scheduler turn using the production fetch deadline.
     pub async fn refresh_tick(&self, cancel: &CancellationToken) {
         self.refresh_tick_with_deadline(cancel, refresh::FETCH_DEADLINE)

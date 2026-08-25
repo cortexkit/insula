@@ -1336,6 +1336,63 @@ them as a trend. The same applies to how quickly a revoked credential is
 detected: that gap can never exceed the fetch interval, so it records when the
 next fetch landed rather than anything about the revocation.
 
+## `usage.drops` — recently observed decreases
+
+A second operation on the same route. `usage.get` is a statement of **current
+state**; a drop is an **event**, and folding events into a state response would
+make one poll answer two questions with different retention rules.
+
+```jsonc
+{
+  "epoch": "20260825T081500.123456789",
+  "oldestRetained": 41,       // absent when the ring is empty
+  "next": 57,
+  "drops": [
+    { "seq": 56, "at": "…", "provider": "codex", "observedContinuously": true }
+  ]
+}
+```
+
+Poll with `{"method": "usage.drops", "params": {"since": 56}}`. Omit `since` to
+get everything retained.
+
+**It is a gap-closer, not an archive.** The ring lives in memory, bounded, and
+its job is to ensure a drop occurring between two consecutive polls is not
+missed. The durable record is yours.
+
+Three properties, each present because its absence has cost somebody a real
+observation:
+
+**`oldestRetained` tells you whether you lost records.** If your cursor is older
+than it, entries were evicted between your polls. Without this field an empty
+page and a lost cursor are the same bytes — and a gap that reads as a quiet
+interval is how a monitoring series records silence where an outage was.
+
+**`epoch` identifies the ring.** The ring dies with the process, so sequences
+mean nothing across a restart. A changed `epoch` means resync; a held cursor is
+meaningless. Do not assume a restart is visible any other way — a
+process-lifetime counter that resets to the value it already had reads as
+perfectly continuous.
+
+**Every record carries both `seq` and `at`**, so a consumer that lost its cursor
+re-derives its position from the last line of its own log rather than keeping
+separate durable state. The state you keep in memory is exactly the state that
+does not survive the events worth recording.
+
+### What a drop is, and is not
+
+`observedContinuously: false` means the two readings either side were taken
+across a **gap** — suspend, a fetch blackout, a long backoff. A gap hides
+magnitude: a drop followed by consumption reads smaller than it was, and a drop
+followed by a re-fill reads as nothing at all. Treat the magnitude as a lower
+bound and the record as weaker evidence.
+
+**The record names an observation, not a cause.** A window rollover, a redeemed
+reset credit, a goodwill grant, a plan change and an upstream correction are
+identical from here. The honest reading is *this went down, and across a
+continuous interval it was not something we caused* — nothing on this wire
+identifies why.
+
 ## Health is a separate axis
 
 Module health comes from the health check, not from the array: `failing` only
