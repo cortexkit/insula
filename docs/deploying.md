@@ -33,6 +33,19 @@ cargo run -p quota-module --example vault-lanes
 cargo run -p quota-module --example deployed-sanity
 ```
 
+**Run the checkers through `cargo run`, never from `target/release/examples/`.**
+`cargo build --release` does **not** build examples, so that directory can hold a
+checker from an earlier commit — and running it after a deploy silently validates
+the *old* contract against the *new* module. The failure is self-confirming: a
+stale checker that predates a wire field simply never mentions it, and a missing
+line reads as a quiet host rather than as a check that is not in the binary.
+A consumer hit exactly this while verifying `usage.drops` (insula#5): their
+checker was a day older than the module and printed `findings: none`.
+
+`cargo run` rebuilds the example first, which is why every command here uses it.
+If you want the binaries on disk, `cargo build --release --examples` is the form
+that actually produces them.
+
 The binary, the module id and this repository are all `insula` — but three paths
 on disk are still named `ck-quota` and are **not** leftovers: the redemption
 journal, the quota config, and the vault handle file. Each comes from its own
