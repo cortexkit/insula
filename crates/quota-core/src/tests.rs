@@ -1527,7 +1527,23 @@ fn every_wire_error_class_has_a_documented_row() {
 
     // The other direction: a row for a class nothing emits describes a state that
     // cannot occur, which is worse than silence because it reads as reachable.
-    let documented: Vec<String> = contract
+    //
+    // SCOPED TO ONE TABLE, not to every table in the file. The first version
+    // matched any row whose first cell was a backticked snake_case token, and
+    // that shape is used by several unrelated vocabularies in this document --
+    // adding a table of not-comparable reasons broke it immediately, and the
+    // failure named a bogus error class rather than the table that had just been
+    // added. A fence keyed on FORMATTING reads whatever happens to look like its
+    // subject.
+    const CLASS_TABLE_HEADER: &str = "| class | meaning | self-recovers? |";
+    let section = contract
+        .split_once(CLASS_TABLE_HEADER)
+        .unwrap_or_else(|| panic!("expected the error-class table header in the contract"))
+        .1;
+    // Ends at the blank line after the table, which is where a markdown table
+    // ends.
+    let section = section.split("\n\n").next().unwrap_or(section);
+    let documented: Vec<String> = section
         .lines()
         .filter(|line| line.starts_with("| `"))
         .filter_map(|line| line.split('`').nth(1).map(str::to_string))

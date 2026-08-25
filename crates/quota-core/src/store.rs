@@ -114,6 +114,18 @@ pub struct SlotStore {
     /// pair with the total, because the ratio is the finding -- if most drops are
     /// inferred, a consumable record needs to say so on every row.
     quota_drops_observed_continuously: u64,
+
+    /// How many paired readings ran and found no decrease.
+    ///
+    /// The denominator the drop counts were missing. Without it a low drop count
+    /// reads the same whether the host was quiet or nothing was comparable.
+    quota_comparisons_no_drop: u64,
+
+    /// How many readings could not be compared, by reason.
+    ///
+    /// Keyed by a stable string from `NotComparable::as_key`, and incremented in
+    /// the same statement that returns the reason so the two cannot disagree.
+    quota_not_comparable: BTreeMap<String, u64>,
 }
 
 impl SlotStore {
@@ -129,6 +141,8 @@ impl SlotStore {
             stale_episodes_by_provider: BTreeMap::new(),
             quota_drops_by_provider: BTreeMap::new(),
             quota_drops_observed_continuously: 0,
+            quota_comparisons_no_drop: 0,
+            quota_not_comparable: BTreeMap::new(),
         }
     }
 
@@ -289,6 +303,29 @@ impl SlotStore {
     /// How many observed decreases were seen across a continuous poll interval.
     pub fn quota_drops_observed_continuously(&self) -> u64 {
         self.quota_drops_observed_continuously
+    }
+
+    /// Paired readings that ran and found no decrease.
+    pub fn quota_comparisons_no_drop(&self) -> u64 {
+        self.quota_comparisons_no_drop
+    }
+
+    /// Readings that could not be compared, by reason.
+    pub fn quota_not_comparable(&self) -> BTreeMap<String, u64> {
+        self.quota_not_comparable.clone()
+    }
+
+    /// Record a comparison that ran and found the account had not gone down.
+    pub(crate) fn record_comparable_no_drop(&mut self) {
+        self.quota_comparisons_no_drop = self.quota_comparisons_no_drop.saturating_add(1);
+    }
+
+    /// Record a reading that could not be compared, under its own reason.
+    pub(crate) fn record_not_comparable(&mut self, reason: crate::quota_drop::NotComparable) {
+        *self
+            .quota_not_comparable
+            .entry(reason.as_key().to_string())
+            .or_insert(0) += 1;
     }
 
     /// Record one observed decrease in an account's used percent.

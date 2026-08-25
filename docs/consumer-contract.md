@@ -390,6 +390,32 @@ These exist to answer a design question before the reset events asked for in
 issue #5 are built: whether a 60-second poll observes these at all. Not part of
 the conservation identity.
 
+### `quotaComparisonsNoDrop` and `quotaNotComparable`
+
+The two counts that make the drop counts readable.
+
+`quotaComparisonsNoDrop` is how many paired readings **ran** and found the
+account had not gone down. It is the denominator the drop counts were missing:
+without it, a low drop count reads identically whether the host was quiet or
+whether nothing was comparable.
+
+`quotaNotComparable` is how many readings **could not be compared**, by reason:
+
+| reason | what it means |
+| --- | --- |
+| `account_changed` | the credential now serves a different account, so the two readings are not one series |
+| `no_prior_reading` | a cold slot, or an entry carrying no usage |
+| `prior_reading_was_an_error` | the previous reading was degraded |
+
+**The third is the one worth alerting on.** A latched credential produces a long
+run of them, and in every other measure that looks exactly like a quiet account:
+an 84-minute latch measured by a consumer produced no drop records at all and was
+invisible in the numbers. A sustained `prior_reading_was_an_error` is a
+credential problem wearing the shape of a quiet host.
+
+Each is incremented in the same statement that returns the reason, so the count
+and the decision cannot disagree. Not part of the conservation identity.
+
 It exists because the gauge alone cannot distinguish "nothing is failing" from
 "nothing was failing at the instant you polled" — and a transient failure that
 resolves between two polls leaves no other trace. Read it for "has this host

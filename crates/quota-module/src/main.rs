@@ -557,6 +557,15 @@ fn health_report(
         // by a re-fill reads as nothing. The RATIO is the finding: if most are
         // inferred, a consumable record has to carry that on every row.
         "quotaDropsObservedContinuously": snapshot.quota_drops_observed_continuously,
+        // The denominator the drop counts were missing: comparisons that RAN and
+        // found nothing. Without it a low drop count reads identically whether
+        // the host was quiet or nothing was comparable.
+        "quotaComparisonsNoDrop": snapshot.quota_comparisons_no_drop,
+        // Readings that could not be compared, by reason. A long run of
+        // `prior_reading_was_an_error` is a credential problem wearing the shape
+        // of a quiet host -- an 84-minute latch produces hundreds of these and is
+        // silence in every other measure.
+        "quotaNotComparable": snapshot.quota_not_comparable,
         // Providers whose first fetch has not completed. The refresher admits a
         // bounded number of fetch units per turn, so after a start the providers
         // beyond that cap are queued for several turns -- ordinary, not a fault.
@@ -1069,6 +1078,8 @@ mod tests {
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,
+            quota_comparisons_no_drop: 0,
+            quota_not_comparable: std::collections::BTreeMap::new(),
             pending: 0,
             degraded: Vec::new(),
             unconfigured: Vec::new(),
@@ -1457,6 +1468,8 @@ mod tests {
             "staleEpisodesByProvider",
             "quotaDropsByProvider",
             "quotaDropsObservedContinuously",
+            "quotaComparisonsNoDrop",
+            "quotaNotComparable",
             "staleEpisodes",
             "pending",
             "degraded",

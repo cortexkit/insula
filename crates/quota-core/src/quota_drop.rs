@@ -78,6 +78,49 @@ const CONTINUOUS_MULTIPLIER: u32 = 2;
 /// detector keyed on a decrease fires every tick for a drip provider.
 const DRIP: &str = "drip";
 
+/// What one paired reading concluded.
+///
+/// Three outcomes rather than two, because "no drop" and "could not compare" are
+/// different facts that look identical from outside a counter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DropObservation {
+    /// The comparison ran and found a decrease past the noise floor.
+    Drop(QuotaDrop),
+    /// The comparison ran and the account had not gone down.
+    NoDrop,
+    /// No comparison was possible.
+    NotComparable(NotComparable),
+}
+
+/// Why a pair of readings could not be compared.
+///
+/// Named individually so an operator can tell a quiet host from a broken one.
+/// Each maps to its own counter, incremented in the same statement that returns
+/// it, so the count and the decision cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotComparable {
+    /// The credential now serves a different account, so the two readings do not
+    /// describe one series.
+    AccountChanged,
+    /// Nothing to compare against: a cold slot, or an entry carrying no usage.
+    NoPriorReading,
+    /// The previous reading was a degraded entry. The one a consumer most needs
+    /// named -- a latched credential produces a long run of these, and they are
+    /// silence in every other measure.
+    PriorReadingWasAnError,
+}
+
+impl NotComparable {
+    /// The stable key this reason is counted under.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::AccountChanged => "account_changed",
+            Self::NoPriorReading => "no_prior_reading",
+            Self::PriorReadingWasAnError => "prior_reading_was_an_error",
+        }
+    }
+}
+
 /// Pair two readings of one account and report the largest decrease.
 ///
 /// Returns `None` when nothing decreased, when the comparison would be invalid,
@@ -99,32 +142,75 @@ pub fn detect(
     account_changed: bool,
     completed: Instant,
     base_interval: Duration,
-) -> Option<QuotaDrop> {
+) -> DropObservation {
+    // WHY THE REJECTIONS ARE NAMED RATHER THAN COLLAPSED TO ONE ABSENCE. A low
+    // drop count has two completely different readings -- a quiet host where
+    // quota simply did not come back, and a host where nothing was COMPARABLE
+    // because its credentials were failing -- and from outside the counters those
+    // are identical. A consumer measured an 84-minute credential latch that
+    // produced no drop records at all and was invisible in the numbers
+    // (insula#5).
     if account_changed {
-        return None;
+        return DropObservation::NotComparable(NotComparable::AccountChanged);
     }
 
-    let prev_entry = prev.entry.as_ref()?;
+    let Some(prev_entry) = prev.entry.as_ref() else {
+        return DropObservation::NotComparable(NotComparable::NoPriorReading);
+    };
     if prev_entry.error.is_some() {
-        return None;
+        return DropObservation::NotComparable(NotComparable::PriorReadingWasAnError);
     }
-    let prev_usage = prev_entry.usage.as_ref()?;
+    let Some(prev_usage) = prev_entry.usage.as_ref() else {
+        return DropObservation::NotComparable(NotComparable::NoPriorReading);
+    };
 
-    let magnitude = largest_decrease(prev_usage, next)?;
+    // Past here the comparison HAPPENED, so what follows is an answer about the
+    // account rather than a statement about our ability to look.
+    let Some(magnitude) = largest_decrease(prev_usage, next) else {
+        return DropObservation::NoDrop;
+    };
     if magnitude < NOISE_FLOOR_PERCENT {
-        return None;
+        return DropObservation::NoDrop;
     }
 
     // Measured from the previous SUCCESS rather than the previous attempt: a run
     // of failures between two successes is exactly the gap this flag is about,
     // and `last_attempt_at` advances on every one of them, so it would report a
     // continuous series across an outage.
-    let observed_continuously = prev
+    //
+    // BOTH CLOCKS, LARGER GAP WINS, because each is blind to something the other
+    // sees and the two blindnesses point opposite ways:
+    //
+    //   `Instant` on macOS is CLOCK_UPTIME_RAW, which std documents as not
+    //   incrementing while the system is asleep -- so a ten-hour suspend reads as
+    //   no gap at all, and the flag would claim continuity across the single most
+    //   likely cause of a real one.
+    //
+    //   The wall clock counts the suspend, but can also be moved by NTP. A
+    //   BACKWARD step would shrink the gap and manufacture continuity.
+    //
+    // The monotonic gap is a true lower bound on elapsed awake time; the wall gap
+    // includes suspended time. Taking the larger means a suspend and a forward
+    // step both read as a gap ("inferred", which understates confidence and is
+    // safe), while a backward step falls back to the monotonic reading (correct).
+    // Claiming continuity you do not have is the only unsafe direction here,
+    // because it is the claim a consumer acts on.
+    let horizon = base_interval * CONTINUOUS_MULTIPLIER;
+    let monotonic_gap = prev
         .last_success_at
-        .map(|previous| completed.duration_since(previous) <= base_interval * CONTINUOUS_MULTIPLIER)
-        .unwrap_or(false);
+        .map(|previous| completed.duration_since(previous));
+    let wall_gap = prev
+        .last_success_wall
+        .and_then(|previous| (chrono::Utc::now() - previous).to_std().ok());
+    let observed_continuously = match (monotonic_gap, wall_gap) {
+        (Some(monotonic), Some(wall)) => monotonic.max(wall) <= horizon,
+        (Some(gap), None) | (None, Some(gap)) => gap <= horizon,
+        // Nothing to measure the interval with. Not continuous by default: an
+        // unmeasurable gap is exactly the case the flag exists to disclose.
+        (None, None) => false,
+    };
 
-    Some(QuotaDrop {
+    DropObservation::Drop(QuotaDrop {
         magnitude,
         observed_continuously,
     })
@@ -209,6 +295,18 @@ mod tests {
 
     const BASE: Duration = Duration::from_secs(60);
 
+    /// Unwrap a `Drop`, naming what arrived instead.
+    ///
+    /// The outcome is printed rather than asserted away: a test that expected a
+    /// drop and got `NotComparable(PriorReadingWasAnError)` has a FIXTURE
+    /// problem, and a bare unwrap hides which of the two went wrong.
+    fn expect_drop(observation: DropObservation) -> QuotaDrop {
+        match observation {
+            DropObservation::Drop(drop) => drop,
+            other => panic!("expected a drop, got {other:?}"),
+        }
+    }
+
     fn window(used_percent: f64) -> RateWindow {
         RateWindow {
             used_percent,
@@ -235,6 +333,11 @@ mod tests {
         let mut slot = ProviderSlot::due_now(now, Incarnation::from_counter(1));
         slot.entry = Some(ProviderUsage::healthy("codex", None, "oauth", usage_value));
         slot.last_success_at = Some(now - age);
+        // Both clocks, as production sets them: they are written in one
+        // expression precisely so a fixture cannot drift into a state the
+        // refresher never produces.
+        slot.last_success_wall =
+            Some(chrono::Utc::now() - chrono::Duration::from_std(age).unwrap());
         slot
     }
 
@@ -243,8 +346,7 @@ mod tests {
     fn a_decrease_across_one_interval_is_an_observed_drop() {
         let now = Instant::now();
         let prev = slot_at(now, usage(Some(window(92.0))), BASE);
-        let found = detect(&prev, &usage(Some(window(0.0))), false, now, BASE)
-            .expect("92 to 0 is a decrease");
+        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
 
         assert!((found.magnitude - 92.0).abs() < 0.001);
         assert!(
@@ -268,13 +370,63 @@ mod tests {
             usage(Some(window(92.0))),
             Duration::from_secs(9 * 3600),
         );
-        let found = detect(&prev, &usage(Some(window(0.0))), false, now, BASE)
-            .expect("the decrease is still real");
+        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
 
         assert!((found.magnitude - 92.0).abs() < 0.001);
         assert!(
             !found.observed_continuously,
             "nine hours is not a continuous series"
+        );
+    }
+
+    /// A suspend is a GAP even though the monotonic clock did not notice.
+    ///
+    /// THE CASE THE FLAG EXISTS FOR, and the one it could not previously report.
+    /// `Instant` on macOS is CLOCK_UPTIME_RAW, documented in std as not
+    /// incrementing while the system is asleep, so a slot whose monotonic age is
+    /// one ordinary interval can have a wall age of ten hours -- exactly what a
+    /// laptop lid-close leaves behind. Reading only the monotonic clock reports
+    /// continuity across the single most likely cause of a real gap.
+    ///
+    /// Built by making the two clocks disagree, because no test can suspend a
+    /// machine and the awake case makes them agree exactly.
+    #[test]
+    fn a_suspend_shaped_clock_disagreement_is_not_observed_continuously() {
+        let now = Instant::now();
+        let mut prev = slot_at(now, usage(Some(window(92.0))), BASE);
+        // Monotonic says one interval; the wall says ten hours.
+        prev.last_success_wall = Some(chrono::Utc::now() - chrono::Duration::hours(10));
+
+        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        assert!(
+            !found.observed_continuously,
+            "ten hours of wall time is a gap, whatever the monotonic clock counted"
+        );
+    }
+
+    /// A backward wall step does not manufacture continuity.
+    ///
+    /// The control for taking the larger gap. NTP can move the wall clock
+    /// backwards, which would SHRINK the measured interval and claim a continuous
+    /// series across a real outage -- the one unsafe direction, because continuity
+    /// is the claim a consumer acts on. The monotonic reading is a true lower
+    /// bound and holds the line.
+    #[test]
+    fn a_backward_wall_step_does_not_manufacture_continuity() {
+        let now = Instant::now();
+        let mut prev = slot_at(
+            now,
+            usage(Some(window(92.0))),
+            Duration::from_secs(9 * 3600),
+        );
+        // The wall clock has been stepped back to just now, while the monotonic
+        // clock still records nine hours.
+        prev.last_success_wall = Some(chrono::Utc::now());
+
+        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        assert!(
+            !found.observed_continuously,
+            "a clock step must not turn a nine-hour outage into a continuous series"
         );
     }
 
@@ -291,7 +443,7 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(92.0))), BASE);
         assert_eq!(
             detect(&prev, &usage(Some(window(0.0))), true, now, BASE),
-            None,
+            DropObservation::NotComparable(NotComparable::AccountChanged),
             "two accounts are not one series"
         );
     }
@@ -313,7 +465,7 @@ mod tests {
 
         assert_eq!(
             detect(&prev, &usage(Some(after)), false, now, BASE),
-            None,
+            DropObservation::NoDrop,
             "a pool that refills continuously reads lower as a matter of course"
         );
     }
@@ -334,7 +486,10 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(90.0))), BASE);
 
         assert!(
-            detect(&prev, &usage(Some(after)), false, now, BASE).is_some(),
+            matches!(
+                detect(&prev, &usage(Some(after)), false, now, BASE),
+                DropObservation::Drop(_)
+            ),
             "a cliff window dropping IS the event this counts"
         );
     }
@@ -346,7 +501,7 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(50.5))), BASE);
         assert_eq!(
             detect(&prev, &usage(Some(window(50.0))), false, now, BASE),
-            None,
+            DropObservation::NoDrop,
             "half a point is upstream arithmetic, not capacity returning"
         );
     }
@@ -366,7 +521,7 @@ mod tests {
 
         assert_eq!(
             detect(&prev, &usage(Some(relaxed)), false, now, BASE),
-            None,
+            DropObservation::NoDrop,
             "the account did not change; only which number is effective did"
         );
     }
@@ -400,19 +555,48 @@ mod tests {
 
         assert_eq!(
             detect(&prev, &after, false, now, BASE),
-            None,
+            DropObservation::NoDrop,
             "a pool that did not exist before has nothing to have decreased from"
         );
     }
 
-    /// A slot that never succeeded has no series to compare against.
+    /// A slot that never succeeded is NOT COMPARABLE, which is not the same as
+    /// having found no drop.
+    ///
+    /// The distinction the three-outcome type exists for: a cold slot and a quiet
+    /// account both used to report the same absence, and an operator reading the
+    /// counters could not tell a host that saw nothing from a host that could not
+    /// look.
     #[test]
-    fn a_slot_with_no_previous_entry_reports_nothing() {
+    fn a_slot_with_no_previous_entry_is_not_comparable() {
         let now = Instant::now();
         let prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
         assert_eq!(
             detect(&prev, &usage(Some(window(0.0))), false, now, BASE),
-            None
+            DropObservation::NotComparable(NotComparable::NoPriorReading)
+        );
+    }
+
+    /// A degraded previous reading is named as its own reason.
+    ///
+    /// The one that made an 84-minute credential latch invisible: every tick in
+    /// that window had a previous entry carrying an error, so nothing was
+    /// comparable and the drop counters stayed silent in a way indistinguishable
+    /// from a quiet host.
+    #[test]
+    fn a_degraded_previous_reading_is_named_as_its_own_reason() {
+        let now = Instant::now();
+        let mut prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        prev.entry = Some(ProviderUsage::degraded(
+            "codex",
+            "provider returned HTTP 401",
+        ));
+        prev.last_success_at = Some(now - BASE);
+
+        assert_eq!(
+            detect(&prev, &usage(Some(window(0.0))), false, now, BASE),
+            DropObservation::NotComparable(NotComparable::PriorReadingWasAnError),
+            "a latched credential must not read as a quiet account"
         );
     }
 
@@ -423,7 +607,7 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(10.0))), BASE);
         assert_eq!(
             detect(&prev, &usage(Some(window(40.0))), false, now, BASE),
-            None
+            DropObservation::NoDrop
         );
     }
 }

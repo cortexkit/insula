@@ -962,23 +962,30 @@ impl Registry {
             // The identity check is the load-bearing argument, not the
             // percentages: comparing a reading of one account against a reading
             // of another fabricates a transition nobody made.
-            let quota_drop = next
+            //
+            // THIS attempt failing is itself a not-comparable reason, and is
+            // counted as one: a failed fetch produces no new reading, which is
+            // exactly the case an operator needs distinguished from a quiet host.
+            let observation = match next
                 .entry
                 .as_ref()
                 .filter(|entry| entry.error.is_none())
                 .and_then(|entry| entry.usage.as_ref())
-                .and_then(|usage| {
-                    quota_drop::detect(
-                        &unit.prev,
-                        usage,
-                        refresh::observations_differ(
-                            unit.prev.observation.as_ref(),
-                            next.observation.as_ref(),
-                        ),
-                        completed_at,
-                        refresh::BASE_INTERVAL,
-                    )
-                });
+            {
+                Some(usage) => quota_drop::detect(
+                    &unit.prev,
+                    usage,
+                    refresh::observations_differ(
+                        unit.prev.observation.as_ref(),
+                        next.observation.as_ref(),
+                    ),
+                    completed_at,
+                    refresh::BASE_INTERVAL,
+                ),
+                None => quota_drop::DropObservation::NotComparable(
+                    quota_drop::NotComparable::PriorReadingWasAnError,
+                ),
+            };
             let mut store = self
                 .store
                 .lock()
@@ -986,8 +993,14 @@ impl Registry {
             if enters_stale {
                 store.record_stale_episode(&unit.key.provider);
             }
-            if let Some(drop) = quota_drop {
-                store.record_quota_drop(&unit.key.provider, drop.observed_continuously);
+            match observation {
+                quota_drop::DropObservation::Drop(drop) => {
+                    store.record_quota_drop(&unit.key.provider, drop.observed_continuously);
+                }
+                quota_drop::DropObservation::NoDrop => store.record_comparable_no_drop(),
+                quota_drop::DropObservation::NotComparable(reason) => {
+                    store.record_not_comparable(reason);
+                }
             }
             store.publish_if_current(
                 &unit.key,
@@ -1055,6 +1068,8 @@ impl Registry {
             stale_episodes_by_provider,
             quota_drops_by_provider,
             quota_drops_observed_continuously,
+            quota_comparisons_no_drop,
+            quota_not_comparable,
         ) = match self.store.lock() {
             Ok(store) => (
                 store.snapshot(),
@@ -1064,6 +1079,8 @@ impl Registry {
                 store.stale_episodes_by_provider(),
                 store.quota_drops_by_provider(),
                 store.quota_drops_observed_continuously(),
+                store.quota_comparisons_no_drop(),
+                store.quota_not_comparable(),
             ),
             Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
         };
@@ -1226,6 +1243,8 @@ impl Registry {
             stale_episodes_by_provider,
             quota_drops_by_provider,
             quota_drops_observed_continuously,
+            quota_comparisons_no_drop,
+            quota_not_comparable,
             pending,
             degraded,
             unconfigured,

@@ -87,6 +87,15 @@ pub struct HealthSnapshot {
     ///
     /// The remainder were inferred across a gap and understate what happened.
     pub quota_drops_observed_continuously: u64,
+
+    /// Paired readings that ran and found no decrease -- the denominator the
+    /// drop counts were missing.
+    pub quota_comparisons_no_drop: u64,
+
+    /// Readings that could not be compared, by reason. A long run of
+    /// `prior_reading_was_an_error` is a credential problem wearing the shape of
+    /// a quiet host.
+    pub quota_not_comparable: std::collections::BTreeMap<String, u64>,
     /// Providers serving nothing yet because at least one handle has not
     /// completed its first fetch.
     ///
@@ -225,6 +234,8 @@ impl HealthSnapshot {
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,
+            quota_comparisons_no_drop: 0,
+            quota_not_comparable: std::collections::BTreeMap::new(),
             degraded: Vec::new(),
             unconfigured: Vec::new(),
             without_handles: Vec::new(),
