@@ -44,6 +44,34 @@ pub struct QuotaDrop {
     /// as a SMALLER drop than happened, and a drop followed by a full re-fill
     /// reads as no drop at all. A record that cannot say which kind it is would
     /// be worse than none, because it looks like evidence.
+    ///
+    /// FALSE IS RARER THAN "THERE WAS A GAP", and the narrowness is worth knowing
+    /// before reading a run of `true` as proof the flag works. Four conditions
+    /// must hold together (traced from source by a consumer on insula#5):
+    ///
+    ///   1. `detect` is reached at all -- so the prior entry exists, carries
+    ///      usage, and carries no error;
+    ///   2. the prior entry SURVIVED the failure -- only the
+    ///      `Transient if prev_is_healthy` arm clones it forward, and a
+    ///      credential-source failure cannot take that arm, because an
+    ///      unverified identity rebases the retry on a FRESH slot (see
+    ///      `next_slot_after_unverified_failure`), so `prev_is_healthy` is false;
+    ///   3. the gap exceeds two base intervals -- `last_success_at` only advances
+    ///      on success, so it grows across a stale-serving run;
+    ///   4. the later reading is actually lower.
+    ///
+    /// (3) and (4) together are the tight part: the gap grows only while stale
+    /// serving, and a decrease appears only if a window boundary fell INSIDE that
+    /// same outage. So the false arm needs a provider-side transient outage longer
+    /// than the horizon that also spans a quota reset -- a conjunction of two
+    /// independent rare events, which explains an unfired arm better than sample
+    /// size does.
+    ///
+    /// The case it is really for is a HOST SUSPEND spanning a window boundary,
+    /// which the wall clock sees and a monotonic clock does not. That is also the
+    /// case no co-located consumer can witness, because their poller slept too --
+    /// which is precisely why the record has to carry its own confidence rather
+    /// than leaving it to be checked afterwards.
     pub observed_continuously: bool,
 }
 
