@@ -51,7 +51,20 @@ async fn main() {
     let mut stream = common::connect_consumer(&path).await;
     common::wait_for_catalog(&mut stream, common::MODULE_ID, Duration::from_secs(10)).await;
     let route = common::route_open(&mut stream, &std::env::temp_dir(), 1).await;
-    let body = common::usage_get(&mut stream, route, 2).await;
+    // Called BEFORE usage.get so a broken drops op cannot hide behind a clean
+    // usage report. Shipping an operation and verifying only the neighbouring one
+    // is how a fix looked complete for a week in August: the tests drove a path
+    // production does not take, and nothing read the wire.
+    let drops = common::raw_route_request(
+        &mut stream,
+        route,
+        2,
+        serde_json::json!({ "method": "usage.drops", "params": {} }),
+    )
+    .await;
+    check_drop_page(&drops);
+
+    let body = common::usage_get(&mut stream, route, 3).await;
 
     let health_findings = check_health_identity(&mut stream).await;
 
@@ -256,4 +269,79 @@ async fn check_health_identity(stream: &mut tokio::net::TcpStream) -> Vec<String
         )];
     }
     Vec::new()
+}
+
+/// Check the shape a consumer polls for events, on the deployed module.
+///
+/// Deliberately not "did it return 200". The three fields a consumer needs are
+/// exactly the three that make an empty page readable, and an empty ring -- the
+/// ordinary state on a quiet host -- is when they are easiest to get wrong,
+/// because every assertion about the records themselves passes vacuously.
+fn check_drop_page(page: &serde_json::Value) {
+    let epoch = page["epoch"].as_str().unwrap_or_else(|| {
+        panic!("usage.drops must state an epoch, or a held cursor cannot be validated: {page}")
+    });
+    assert!(
+        !epoch.trim().is_empty(),
+        "an empty epoch identifies nothing: {page}"
+    );
+
+    let next = page["next"].as_u64().unwrap_or_else(|| {
+        panic!("usage.drops must state the next sequence so a consumer can resume: {page}")
+    });
+
+    let drops = page["drops"]
+        .as_array()
+        .unwrap_or_else(|| panic!("usage.drops must carry a drops array, empty or not: {page}"));
+
+    // `oldestRetained` is absent exactly when the ring is empty, and present
+    // otherwise. Checking BOTH directions here rather than one, because the
+    // absent case is the one this host produces and it would pass on its own.
+    match page.get("oldestRetained").and_then(|v| v.as_u64()) {
+        None => assert!(
+            drops.is_empty(),
+            "a ring holding records must say which is oldest, or a consumer \
+             cannot tell a lost cursor from a quiet interval: {page}"
+        ),
+        Some(oldest) => {
+            assert!(
+                !drops.is_empty(),
+                "an empty ring must not claim to retain a sequence: {page}"
+            );
+            assert!(
+                oldest < next,
+                "the oldest retained sequence must precede the next: {page}"
+            );
+        }
+    }
+
+    for drop in drops {
+        assert!(
+            drop["seq"].as_u64().is_some_and(|seq| seq < next),
+            "every record needs a sequence below the next cursor: {drop}"
+        );
+        let at = drop["at"].as_str().unwrap_or_else(|| {
+            panic!(
+                "every record needs a timestamp, so a consumer can resume from its own log: {drop}"
+            )
+        });
+        // Shape-checked rather than parsed: this crate does not depend on a date
+        // library, and pulling one in for a checker would add a dependency to the
+        // deployed binary's crate to satisfy an example. The property that
+        // matters here is that a timestamp is present and looks like an instant;
+        // the canonical-format guarantee is pinned by unit tests in quota-core.
+        assert!(
+            at.len() >= 20 && at.contains('T') && (at.ends_with('Z') || at.contains('+')),
+            "record timestamp does not look like RFC3339: {drop}"
+        );
+        assert!(
+            drop["observedContinuously"].is_boolean(),
+            "the confidence flag must be stated, never inferred from absence: {drop}"
+        );
+    }
+
+    println!(
+        "  usage.drops: epoch {epoch}, next {next}, {} record(s) retained",
+        drops.len()
+    );
 }
