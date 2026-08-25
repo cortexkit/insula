@@ -412,9 +412,29 @@ a missing subscription there is.
 **And the discriminator exists, which the paragraph below denies.**
 `v1internal:loadCodeAssist` returns `currentTier` and `ineligibleTiers`, so the
 two causes are separable by a call we already have the host and credential for.
-Probing it from here returned HTTP 401 on the stored access token, because this
-lane refreshes before use and the probe skipped that step — so the question is
-open for want of ten minutes, not for want of a mechanism.
+
+**SETTLED 2026-08-25 by running it.** Refreshed this host's credential through the
+same masked client the lane uses, then called `loadCodeAssist`:
+
+```
+refresh            OK                       the credential is alive
+currentTier        null                     not on a licensed tier
+ineligibleTiers    reasonCode UNSUPPORTED_CLIENT, tierId free-tier
+                   "This client is no longer supported for Gemini Code Assist
+                    for individuals. To continue using Gemini, please migrate
+                    to the Antigravity suite of products"
+```
+
+Both of upstream's conditions hold exactly: the client is flagged unsupported AND
+the account is not on a licensed tier. **So the shutdown reading was right**, and
+the upstream response names the remedy itself — migrate to Antigravity, which this
+module already serves on the same host.
+
+The correction above still stands as a correction, and that is the point worth
+keeping: the conclusion survived, the EVIDENCE FOR IT DID NOT. A quota-403 plus a
+working refresh plus a healthy sibling lane is consistent with the shutdown and
+does not establish it, and "right for weaker reasons than claimed" is
+indistinguishable from "right" until someone supplies the discriminator.
 
 **The published class is `credential_rejected`, and it is misleading here.** It
 means *a credential was presented and refused*, which is true at the transport
