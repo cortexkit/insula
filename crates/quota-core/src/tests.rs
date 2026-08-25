@@ -1656,12 +1656,18 @@ fn every_wire_error_class_has_a_documented_row() {
         .split_once(CLASS_TABLE_HEADER)
         .unwrap_or_else(|| panic!("expected the error-class table header in the contract"))
         .1;
-    // Ends at the blank line after the table, which is where a markdown table
-    // ends.
-    let section = section.split("\n\n").next().unwrap_or(section);
+    // Taken line by line to the first non-table line, NOT by splitting on a blank
+    // line. The blank-line form was `split("\n\n")`, which fails on a CRLF
+    // checkout: the separator there is "\r\n\r\n", the split never matches, the
+    // section runs to end of file, and the fence picks up every other table in the
+    // document -- the exact over-wide read this scoping was added to prevent. It
+    // passed on the developer's machine and failed on the Windows CI leg.
+    // `lines()` handles both endings, so the boundary is stated in a way that
+    // does not depend on how the file was checked out.
     let documented: Vec<String> = section
         .lines()
-        .filter(|line| line.starts_with("| `"))
+        .skip_while(|line| !line.starts_with("| `"))
+        .take_while(|line| line.starts_with("| `"))
         .filter_map(|line| line.split('`').nth(1).map(str::to_string))
         .filter(|token| {
             token.contains('_') && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
