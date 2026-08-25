@@ -1073,6 +1073,122 @@ fn every_slot_status_is_deliberately_bucketed() {
     assert_eq!(distinct.len(), 4);
 }
 
+/// A credential verdict carries no `stale` disclosure; a stale-served window does.
+///
+/// PUBLISHED AS AN ASSERTION TO A CONSUMER (insula#8) before it was defended,
+/// which is the reason this exists: `stale` is emitted only for
+/// `SlotStatus::StaleTransient`, and a latched credential is `Degraded`, so the
+/// two cannot co-occur. True by construction, and deleting the status gate
+/// reddened nothing — so a refactor could have removed it silently while a
+/// consumer was relying on the promise.
+///
+/// THE CONTROL IS HALF THE TEST. Asserting only that the verdict lacks `stale`
+/// would pass just as well if `stale` were never emitted at all, so the same
+/// case checks that a transient failure over a prior success DOES disclose. Two
+/// providers, one tick, opposite outcomes.
+#[tokio::test]
+async fn a_verdict_discloses_no_staleness_while_a_stale_served_window_does() {
+    struct SucceedsThenFails {
+        name: &'static str,
+        latched: Arc<Mutex<bool>>,
+        transient: bool,
+    }
+
+    #[async_trait]
+    impl UsageProvider for SucceedsThenFails {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            if !*self.latched.lock().unwrap() {
+                return FetchAttempt::success(
+                    Some(AccountObservation::new(None, Some(1))),
+                    "vault",
+                    Usage {
+                        primary: Some(RateWindow {
+                            used_percent: 10.0,
+                            raw_used_percent: None,
+                            resets_at: None,
+                            window_minutes: None,
+                            used_count: None,
+                            total_count: None,
+                            regeneration: None,
+                        }),
+                        secondary: None,
+                        tertiary: None,
+                        extra_rate_windows: None,
+                    },
+                );
+            }
+            if self.transient {
+                // Stale-serves the prior healthy window, which is the only state
+                // that discloses.
+                FetchAttempt::failure(
+                    Some(AccountObservation::new(None, Some(1))),
+                    None,
+                    FetchError::Upstream("503".to_string()),
+                )
+            } else {
+                // A credential verdict: identity unverified, so the entry is a
+                // verdict with no usage and no timestamp.
+                FetchAttempt::unverified_vault_failure(VaultGetError::AuthRequired)
+            }
+        }
+    }
+
+    let latched = Arc::new(Mutex::new(false));
+    let registry = Registry::new(vec![
+        Box::new(SucceedsThenFails {
+            name: "verdict",
+            latched: Arc::clone(&latched),
+            transient: false,
+        }),
+        Box::new(SucceedsThenFails {
+            name: "staleserved",
+            latched: Arc::clone(&latched),
+            transient: true,
+        }),
+    ]);
+    tick(&registry).await;
+
+    *latched.lock().unwrap() = true;
+    force_due(&registry, "verdict");
+    force_due(&registry, "staleserved");
+    tick(&registry).await;
+
+    let entries = registry.get_usage(None).await;
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.provider == name)
+            .unwrap_or_else(|| panic!("{name} must publish an entry: {entries:?}"))
+    };
+
+    let verdict = find("verdict");
+    assert!(verdict.error.is_some(), "precondition: it is a verdict");
+    assert!(
+        verdict.fetched_at.is_none(),
+        "precondition: an unverified identity attributes no prior success"
+    );
+    assert!(
+        verdict.stale.is_none(),
+        "a credential verdict is not a stale-served reading: {:?}",
+        verdict.stale
+    );
+
+    let stale_served = find("staleserved");
+    assert!(
+        stale_served.error.is_none(),
+        "precondition: the prior window is still being served"
+    );
+    assert!(
+        stale_served.stale.is_some(),
+        "a transient failure over a prior success MUST disclose, or the assertion \
+         above would hold for the wrong reason"
+    );
+}
+
 /// A vault latch on an identity-less credential publishes its verdict.
 ///
 /// THE EXACT SHAPE A CONSUMER MEASURED, and the one path the fix's other tests do
