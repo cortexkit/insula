@@ -1288,12 +1288,46 @@ never produced data, so there is nothing to retain and nothing to hard-age, and
 its error text may name a transient cause. The retention question only arises
 for a degraded entry that *does* carry a `fetchedAt`.
 
-That split is exhaustive: on the wire, a degraded entry without `fetchedAt`
-means the slot has never succeeded, with no third case. The only thing that
-clears the timestamp is an account change, and an account change also puts the
-label in flux — which suppresses the entry entirely rather than publishing it
-without a timestamp. So there is no "succeeded once, but the timestamp is gone"
-entry to account for.
+**That split is no longer exhaustive, and the third case is common.** It used to
+be: the only thing that cleared the timestamp was an account change, and an
+account change also suppressed the entry entirely, so a published degraded entry
+without `fetchedAt` could only be a slot that had never succeeded.
+
+Suppressing those entries was a defect — a credential this module had reached and
+concluded was unusable presented as *not yet fetched*, which is the calmest
+reading a consumer can take — and it was fixed. The verdict is now published. So
+a **third** shape exists on the wire:
+
+> a degraded entry, no `fetchedAt`, on a slot that **has** succeeded before —
+> because identity is unverified, so nothing about the prior reading may be
+> attributed to the credential now in place.
+
+Measured on real traffic across a 105-minute credential rotation: 199 consecutive
+samples of `credential_unusable` with a null `fetchedAt`, on a credential that had
+been serving for hours (insula#8).
+
+**Read the pair, not either field alone.** Two fields give three states, and this
+is the discriminator, confirmed across two independent episodes:
+
+| `errorClass` | `fetchedAt` | what happened |
+| --- | --- | --- |
+| absent | present | served |
+| present | present | a provider call failed; the timestamp is the last success |
+| present | **absent** | a credential verdict was reached and the provider was never called |
+
+The third row is the one that changed. Do **not** read a missing `fetchedAt` as
+"never worked" — read it as "nothing here may be attributed to this credential".
+The remedy differs: the first invites waiting, the second needs someone to
+re-authenticate.
+
+### Recovery after a latch is backoff-gated, not immediate
+
+A re-sealed credential does not serve on the next poll. The slot is on its
+scheduled retry, so recovery takes **up to one non-transient backoff interval**
+— measured at 146.8 s and 285.6 s in two episodes. That is the scheduler working
+as specified, not a stall, and a consumer should not treat continued
+`credential_unusable` in the minutes after a repair as evidence the repair
+failed.
 
 ## Health is a separate axis
 
