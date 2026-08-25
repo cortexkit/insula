@@ -1254,6 +1254,16 @@ Two consequences worth stating plainly:
   account-keyed store, so completeness is meaningless for them. Their permanent
   absence is correct, not a fault.
 
+  **Expect this to be most of them.** On the hosts measured so far the account
+  dimension exists for a small minority of providers — the rest carry credentials
+  with no account field at all — so a consumer gating on `completeProviders`
+  should expect abstention to be the ordinary case and authorisation the
+  exception. That is not a wire limitation to work around: for a provider with no
+  account dimension there is no account-keyed state to reconcile, so the
+  abstention costs nothing. It matters only for setting expectations, because a
+  consumer that builds a reconciliation path and sees it fire for one provider in
+  dozens will reasonably suspect its own code first.
+
 Health cannot substitute for this. Its counts are per provider, so they cannot
 say how many accounts a provider ought to have — and a provider with one healthy
 and one withheld account reports as *serving*, because the bucket is decided by
