@@ -1323,11 +1323,18 @@ re-authenticate.
 ### Recovery after a latch is backoff-gated, not immediate
 
 A re-sealed credential does not serve on the next poll. The slot is on its
-scheduled retry, so recovery takes **up to one non-transient backoff interval**
-— measured at 146.8 s and 285.6 s in two episodes. That is the scheduler working
-as specified, not a stall, and a consumer should not treat continued
-`credential_unusable` in the minutes after a repair as evidence the repair
-failed.
+scheduled retry, so recovery takes **up to one non-transient backoff interval**.
+That is the scheduler working as specified, not a stall, and a consumer should
+not treat continued `credential_unusable` in the minutes after a repair as
+evidence the repair failed.
+
+**A bound, not a measurement.** Observed figures for this lag (146.8 s, 280.3 s,
+285.6 s across three episodes) are dominated by *where in the backoff cycle the
+repair happened to land* — a uniform draw on `[0, backoff)`, not a property of
+the credential or the module. Quoting one as a latency invites reading three of
+them as a trend. The same applies to how quickly a revoked credential is
+detected: that gap can never exceed the fetch interval, so it records when the
+next fetch landed rather than anything about the revocation.
 
 ## Health is a separate axis
 
