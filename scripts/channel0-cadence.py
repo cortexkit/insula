@@ -199,6 +199,22 @@ def main() -> int:
             probe = in_flight_probe(cli, IN_FLIGHT_MODULE)
             print(f"{offset:7.1f}  {'--':>8}  in-flight probe issued on "
                   f"{IN_FLIGHT_MODULE}; TRIGGER THE DRAIN NOW", flush=True)
+        # BLOCKING, AND THAT BOUNDS WHAT THIS ARM CAN ANSWER. The loop cannot
+        # issue sample N+1 until N returns, so a window that hangs requests
+        # yields ONE sample inside it however short the cadence is, followed by
+        # a catch-up burst as the missed schedule slots fire back to back.
+        #
+        # The burst is an artefact of this line and carries no information about
+        # recovery -- bunched sub-10ms samples after an outlier are this loop
+        # catching up, not the daemon healing. Any report from this arm must say
+        # so in the body, because the tail looks exactly like a fast recovery.
+        #
+        # Deliberately kept for the binary question, which one sample settles:
+        # the request is catalog.list, which names no module, so a single sample
+        # hanging for a drain's duration proves a drain starves callers unrelated
+        # to it. Anything distributional -- onset, clearance, total vs partial --
+        # needs concurrent sampling and is a different instrument state, verified
+        # between windows rather than inside one.
         elapsed, verdict = one_request(cli)
         results.append((offset, elapsed, verdict))
         print(f"{offset:7.1f}  {elapsed:8.3f}  {verdict}", flush=True)
