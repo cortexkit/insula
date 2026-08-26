@@ -4,6 +4,14 @@ Properties every provider normalizer must uphold, each recovered from a defect
 that shipped. Check them when adding a provider or changing how one maps its
 response to windows.
 
+**This document OWNS producer behaviour and engineering method** — what a
+normalizer must do, how failures are classified at their construction sites, and
+how work here is tested and proved. It does NOT own the wire: where it states what
+a field MEANS to a consumer, `consumer-contract.md` is authoritative and this one
+is quoting. Declared because two documents that disagree have no oracle between
+them, and naming which loses converts a contradiction from a question into a
+verdict.
+
 ## A successful fetch must carry a window
 
 `Ok(Usage { primary: None, .. })` is the worst outcome a fetch can produce. A

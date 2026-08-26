@@ -5,6 +5,18 @@ each answer comes from in the source. Every rule here was settled by checking a
 real consumer against the code from both ends, and four of them exist because
 doing that found a defect.
 
+**This document OWNS the wire.** Field meanings, error classes, freshness and
+staleness semantics, and what a consumer may infer are settled here; where any
+other document in this repository states one of those facts differently, THIS ONE
+WINS and the other is the defect. Written down because two documents disagreeing
+have no oracle between them — code settles a document, but nothing settles a
+document against another document unless precedence is declared. This repo has hit
+that three times, and every one was resolved by hand after the fact.
+
+What it does NOT own: how a normalizer must behave to produce those fields (see
+`provider-invariants.md`) and how to deploy or verify a build (see
+`deploying.md`). Where this document describes those, it is quoting them.
+
 ## The core rule
 
 **A well-formed response is always a successful poll.** Per-provider failure is
