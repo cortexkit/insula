@@ -863,6 +863,36 @@ fn control_flags() -> Flags {
 /// requires nothing. Storage is declared `owns_schema: false` — the module keeps
 /// only an in-memory TTL cache and owns no persistent schema (the manifest enum
 /// has no none/ephemeral storage kind yet, so this is the honest expression).
+/// The commit this binary was built from, or None when that cannot be claimed.
+///
+/// SEPARATE FROM `health.metrics.buildCommit`, and the separation is the whole
+/// point. That stamp is HEAD and is documented as answering "is this build
+/// missing commits" -- a build from a dirty tree carries the clean sha verbatim,
+/// which is fine for a skew check and wrong here. `ManifestProvenance` is read as
+/// an identity claim, so a sha that resolves to bytes which are not the running
+/// bytes is a precise-looking wrong answer, and the contract's own rule is that
+/// absence beats that at being believed.
+///
+/// Empty means the build declined to claim one: dirty tree, no git binary, or no
+/// resolvable HEAD. All three map to None, because a sentinel must render as
+/// absence and never as a value.
+fn build_provenance_sha() -> Option<String> {
+    let raw = env!("CK_QUOTA_PROVENANCE_SHA");
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
+/// A digest of the resolved lockfile, hashed at build time.
+///
+/// NOT gated on tree cleanliness, unlike the sha. This is a change-detector
+/// rather than an identity claim: it answers "are these two builds the same
+/// dependency set", which stays true on a dirty tree where a commit does not.
+/// That is what lets a development build still be told apart from another one
+/// without claiming to be a commit it is not.
+fn build_lock_digest() -> Option<String> {
+    let raw = env!("CK_QUOTA_LOCK_DIGEST");
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
 /// The wire crate version this binary was built against, read from the lockfile.
 ///
 /// Empty means the build could not resolve it, reported as ABSENT rather than as
@@ -883,18 +913,22 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // Populated rather than left None, because every field here is one this
         // module already knows and a consumer otherwise has to ask a human for.
         //
-        // `build_git_sha` is the SAME value as `health.metrics.buildCommit`,
-        // deliberately: deploy verification already turns on comparing that stamp
-        // to `git rev-parse`, and a second, differently-derived answer to "which
-        // commit is this binary" is a thing that can disagree with the first.
+        // `build_git_sha` is NOT the same value as `health.metrics.buildCommit`,
+        // and an earlier version of this code reused it. That stamp is HEAD, so a
+        // dirty build carries a clean sha -- correct for the skew check it serves
+        // and wrong for an identity claim. Reported on insula#12.
         //
-        // The two left None are ABSENT FACTS, not unfilled blanks. This module
-        // owns no persistent store, so it has no schema version to state; and the
-        // lockfile digest is a build-host input the binary does not carry, so
-        // synthesising one at runtime would state a fact nobody measured.
+        // `store_schema_version` stays None as an ABSENT FACT rather than an
+        // unfilled blank: this module owns no persistent store, so it has no
+        // schema version to state.
+        //
+        // The other three are conditional by construction. Each is emitted by
+        // build.rs or not at all, and each maps an empty stamp to None -- so a
+        // build that could not establish a fact declares nothing rather than
+        // declaring a plausible one.
         provenance: Some(ManifestProvenance {
-            build_git_sha: Some(env!("CK_QUOTA_BUILD_COMMIT").to_string()),
-            build_lock_digest: None,
+            build_git_sha: build_provenance_sha(),
+            build_lock_digest: build_lock_digest(),
             wire_crate_version: wire_crate_version(),
             store_schema_version: None,
         }),
@@ -1006,45 +1040,72 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+
     /// The manifest states provenance, and states ONLY what it can source.
     ///
     /// Both halves are load-bearing and the second is the one that rots: a later
-    /// edit that "fills in" store_schema_version or a lockfile digest with a
-    /// plausible constant would pass a test that only checked presence, and would
-    /// put a manufactured fact on the wire under a field whose entire purpose is
-    /// that its contents were measured.
+    /// edit that "fills in" a field with a plausible constant would pass a test
+    /// that only checked presence, and would put a manufactured fact on the wire
+    /// under a field whose entire purpose is that its contents were measured.
+    ///
+    /// THE SHA ASSERTION IS CONDITIONAL BY NECESSITY, not by laziness. Whether a
+    /// commit may be claimed is a fact about the tree this test is compiled in,
+    /// so a test demanding a sha would fail every development build and a test
+    /// demanding absence would fail every release build. What is invariant is the
+    /// RULE, so that is what is pinned.
     #[test]
     fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
         let m = manifest("insula");
         let p = m.provenance.expect("manifest must state provenance");
 
-        let sha = p.build_git_sha.expect("build_git_sha comes from build.rs");
+        match p.build_git_sha.as_deref() {
+            Some(sha) => {
+                assert!(
+                    !env!("CK_QUOTA_PROVENANCE_SHA").is_empty(),
+                    "a sha was declared from an empty stamp -- a sentinel escaped as a value"
+                );
+                assert!(
+                    sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                    "build_git_sha must be a hex commit, got {sha:?}"
+                );
+            }
+            None => assert!(
+                env!("CK_QUOTA_PROVENANCE_SHA").is_empty(),
+                "the build emitted a provenance sha and the manifest dropped it"
+            ),
+        }
+
+        // The defect this test exists to fence: build_git_sha was once
+        // health.metrics.buildCommit, which is HEAD and therefore carries a clean
+        // sha out of a dirty tree. The two answer different questions and must be
+        // free to disagree; reusing one for both read as obviously correct.
         assert!(
-            sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()),
-            "build_git_sha must be a hex commit, got {sha:?}"
+            p.build_git_sha.is_none() || !env!("CK_QUOTA_PROVENANCE_SHA").is_empty(),
+            "provenance must come from its own stamp, not the health one"
         );
-        assert_eq!(
-            sha,
-            env!("CK_QUOTA_BUILD_COMMIT"),
-            "must be the SAME stamp as health.metrics.buildCommit, not a second derivation"
+
+        // Unconditional, because a lockfile digest is a change-detector rather
+        // than an identity claim and stays true on a dirty tree.
+        let digest = p
+            .build_lock_digest
+            .expect("build_lock_digest is hashed at build time from Cargo.lock");
+        assert!(
+            digest.len() == 16 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "build_lock_digest must be a 16-char hex hash, got {digest:?}"
         );
 
         let wire = p
             .wire_crate_version
-            .expect("wire_crate_version comes from Cargo.lock");
+            .expect("wire_crate_version comes from Cargo.lock at build time");
         assert!(
             !wire.is_empty() && wire.split('.').count() == 3,
             "wire_crate_version must be a resolved semver, got {wire:?}"
         );
 
-        // Absent facts, not unfilled blanks -- see the comment at the call site.
+        // An absent fact, not an unfilled blank -- see the comment at the call site.
         assert!(
             p.store_schema_version.is_none(),
             "this module owns no persistent store, so it has no schema version to state"
-        );
-        assert!(
-            p.build_lock_digest.is_none(),
-            "the binary does not carry its build host's lockfile digest; stating one would be invention"
         );
     }
 

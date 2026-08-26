@@ -72,6 +72,35 @@ fn main() {
     );
     // Re-run when the lockfile moves, or the stamped version outlives the bump.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+
+    // Provenance stamps, kept SEPARATE from CK_QUOTA_BUILD_COMMIT above rather
+    // than replacing it. The health stamp answers "is this build missing
+    // commits" and is documented as carrying a clean sha from a dirty tree;
+    // these answer an identity question and must not. One value cannot mean both
+    // things, and reusing it read as obviously correct until someone checked.
+    let worktree = locate_worktree_root();
+    let clean = worktree.as_deref().and_then(tree_clean);
+    println!(
+        "cargo:rustc-env=CK_QUOTA_PROVENANCE_SHA={}",
+        // head_commit takes the GIT DIR (which for a worktree is not under the
+        // worktree root at all); tree_clean and lock_digest take the WORKTREE
+        // ROOT. Two different paths, and passing one to the other compiles fine
+        // and yields None on every worktree build.
+        match (clean, locate_git_dir().as_deref().and_then(head_commit)) {
+            // The ONLY case that may state a commit: we looked, and it was clean.
+            (Some(true), Some(sha)) => short(&sha),
+            // Dirty, or undeterminable, or no HEAD. Empty string, which the
+            // consumer maps to None -- a sentinel must never render as a value.
+            _ => String::new(),
+        }
+    );
+    println!(
+        "cargo:rustc-env=CK_QUOTA_LOCK_DIGEST={}",
+        worktree
+            .as_deref()
+            .and_then(lock_digest)
+            .unwrap_or_default()
+    );
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     println!(
         "cargo:rustc-env=CK_QUOTA_WIRE_CRATE_VERSION={}",
@@ -81,6 +110,71 @@ fn main() {
 
 /// Whether a string has the shape this build stamps: short hex, as [`short`]
 /// produces.
+/// The directory CONTAINING `.git`, which is what `git status` must run from.
+///
+/// NOT `locate_git_dir().parent()`. That is right for a normal checkout and wrong
+/// for a worktree, where `.git` is a FILE pointing at
+/// `<main>/.git/worktrees/<name>` — whose parent is `<main>/.git/worktrees`.
+/// Running `git status` there exits 128 ("this operation must be run in a work
+/// tree"), and since a non-zero exit is treated as undeterminable, the clean
+/// check would return None on EVERY worktree build. The emit arm would be
+/// structurally unreachable and its absence would look exactly like a correctly
+/// detected dirty tree. Reported on insula#12 by someone who hit it.
+fn locate_worktree_root() -> Option<PathBuf> {
+    let mut dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Whether the working tree had no uncommitted changes.
+///
+/// `Some(true)` clean, `Some(false)` dirty, `None` UNDETERMINABLE — git missing,
+/// non-zero exit, or unreadable output. None and false are deliberately distinct
+/// at the type level even though both suppress the stamp, because "we looked and
+/// it was dirty" and "we could not look" are different facts and collapsing them
+/// is the error this repo keeps finding elsewhere.
+///
+/// DEGRADES ALONE. The HEAD walk reads `.git` directly and needs no git binary;
+/// only this check does. A source-tarball build with no git therefore still
+/// answers "is this missing commits" via the health stamp, and simply declines
+/// to make the stronger provenance claim.
+fn tree_clean(worktree_root: &Path) -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().is_empty())
+}
+
+/// Hash the resolved lockfile, so a build that cannot claim a commit can still
+/// be told apart from a different build.
+///
+/// A BUILD-TIME READ, which is what the contract requires. The prohibited
+/// version is reading Cargo.lock when the manifest is CONSTRUCTED: that
+/// describes the source tree sitting beside the running binary rather than the
+/// binary itself, and the two diverge the moment anyone pulls.
+///
+/// Deliberately not gated on tree cleanliness. It is a change-detector, not an
+/// identity claim — it answers "are these two builds the same dependencies",
+/// which stays true and useful on a dirty tree where the sha does not.
+fn lock_digest(worktree_root: &Path) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let text = std::fs::read(worktree_root.join("Cargo.lock")).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 fn is_stamp(raw: &str) -> bool {
     raw.len() == 12 && raw.chars().all(|c| c.is_ascii_hexdigit())
 }
