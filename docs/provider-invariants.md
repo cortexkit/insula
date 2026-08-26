@@ -1130,6 +1130,21 @@ THE RESULT, which needs enough context to hold an opinion about it rather than
 just enough to execute the check. A reader who can only run the check returns a
 value; a reader who can contest the reading returns a finding.
 
+**And a completion condition, which is the fourth clause and the cheapest.** A
+rule is not finished being written until it has been RUN AGAINST THE REPOSITORY
+THAT PRODUCED IT, with whatever that run returned recorded beside it — including a
+null, because "no instance found" and "not looked" are the distinction this whole
+document keeps insisting on, applied to its own contents.
+
+In the same act as writing it, NOT as a follow-up, and the reason is mechanical
+rather than motivational: AT THE MOMENT OF ARTICULATION THE PREDICATE IS AT ITS
+SHARPEST, and every later encounter is with a remembered gist. A follow-up is
+scheduled against the summary and runs something vaguer. Two rules in this
+document found an instance in the repository that produced them when applied one
+step after being written — the account-level bucketing case, and a peer's
+ownership case found while they were still explaining the rule to me. Neither was
+looked for.
+
 **The reduction that survives, checked against every finding in that exchange:**
 it is the DISAGREEMENT that produces the finding, not the second reading. Each one
 came from one side asserting the other was wrong about something specific and
@@ -1138,9 +1153,25 @@ falsification locating the real mechanism; a rejected suspend-bug explanation; t
 corrected rule statements. None came from either side reading more carefully.
 
 The cost of that, stated because it is uncomfortable: a second reading by a
-CO-OPERATIVE reader is worth much less than it feels like, and most review is
-co-operative reading. A reviewer with no position of their own can only find what
-the author already almost saw. Run against a repository
+CO-OPERATIVE reader is worth much less than it feels like FOR CONTRADICTIONS, and
+most review is co-operative reading. A reviewer with no position of their own can
+only find what the author already almost saw.
+
+**That qualifier is load-bearing and the sentence was wrong without it.** It holds
+for DEFECTS — a claim that contradicts the code or another claim — because
+catching one requires holding a rival account. It does NOT hold for OMISSIONS: a
+reader who does not know what you meant is excellent at noticing something is
+UNSTATED, because their confusion is itself the signal and no position is
+required. The two arrive differently — contradictions need a reader holding the
+whole document, gaps need a reader trying to BUILD from it.
+
+The evidence here is one-sided in exactly that pattern. The consumer defects were
+found by readers holding a position: one reading `usage.primary` as the most
+constrained window, one comparing two hosts' arrays as one series. The omissions
+were all found by readers with no position at all, simply trying to consume — the
+partial-account-set gap, refused-versus-empty rendering, and three issue filers
+finding unstated cases by building against the contract and hitting a case it did
+not cover. Run against a repository
 written by someone else, it found a live divergence on the first surface it was
 pointed at: two independent spend-report producers, one querying SQLite directly
 and one reading an in-memory projection, sharing five guards — invalid window,
