@@ -2691,3 +2691,30 @@ already forbids in `docs/deploying.md`.
 **And the trigger was punctuation:** two hyphens against an em-dash, invisible in
 review and total in matching. A guard should print the pattern that missed rather
 than a count — a count says something missed, the pattern says it was punctuation.
+
+### Three layers, three ways to claim success about the wrong subject
+
+Converged with the same peer, who reproduced the composition failure on their own
+side and supplied the third:
+
+| failure | what claims success | detectable by |
+|---|---|---|
+| **drift** — pattern missed | the edit | asserting `old in text` before replacing |
+| **partial** — pattern matched fewer sites than intended | the match | counting sites, not just presence |
+| **composition** — guard fired into a channel nobody read | the report | consulting the exit status |
+
+**Partial is the one that defeats the obvious guard**, because the assertion is
+SATISFIED: the pattern did match, just not everywhere it should have. Drift is
+loud once guarded; partial is silent by construction.
+
+**Checked here, and `scripts/probe.py` is immune by a stronger route than
+counting: it REFUSES on a multi-site pattern** (`pattern occurs N times; make it
+unique`) rather than applying to the first. Driven rather than read — a pattern
+occurring 13 times was refused, and a single-site control still reddened two tests
+by name, with the tree byte-clean after both. A guard nobody has seen fire is a
+guard nobody has measured.
+
+**Their reproduction found the shell detail that makes composition invisible in
+review:** a raising heredoc followed by `&&` stops the chain, and the same heredoc
+followed by a NEWLINE lets the next command run with the error text still on
+screen. One character of punctuation, identical at a glance.
