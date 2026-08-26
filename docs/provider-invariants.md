@@ -2900,6 +2900,29 @@ treating a repeated interval as evidence, ask which events bound it and whether 
 change in the phenomenon could move either end independently. If not, the number
 is a property of the instruments.
 
+**The consumer then found the stronger form, and it is the one to remember.** A
+third figure had been treated as corroboration: the credential store's own audit
+log timed report-to-verdict at ~301s, from a different system with its own clock
+and its own log file. It is the same constant again. This module holds no token
+cache -- `fetch_vault` calls `credential_source.get` inline per attempt
+(`anthropic.rs:294`), which the F1 identity fence requires -- so the store's
+verdict is not merely OBSERVED on the next attempt, it is CAUSED by it: the
+inline refresh that produces the verdict cannot happen until this module asks
+again, one `NON_TRANSIENT_BACKOFF` later.
+
+So the store's number is `300s + one refresh round-trip`, and three instruments
+were reporting one constant.
+
+**A number arriving through an independent instrument is not thereby an
+independent measurement.** Independence is a property of what CAUSES the number,
+not of what reports it -- and a figure from another team's system, in another
+process, with its own timestamps, is the most convincing possible presentation of
+a value your own constant produced. The falsifier is to break the causal link
+rather than to compare the numbers again: if a verdict ever lands ~300s after a
+report while this module is NOT attempting, the store has its own timer and the
+two are genuinely independent. Until someone runs that, the store's figure is not
+corroboration.
+
 ### Filing a defect as a skill problem terminates the search for a mechanism
 
 The two instances above sat in these notes for weeks as "probe selection is itself
