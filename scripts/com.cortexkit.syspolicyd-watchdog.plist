@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Runs scripts/syspolicyd-watchdog.py as a root daemon.
+
+  KeepAlive, because the whole point is to be running during the one state in
+  which nothing new can be launched. A watchdog that needs launching when the
+  fault is "nothing can launch" is not a watchdog.
+
+  RunAtLoad so it survives reboots without anyone remembering it.
+
+  INSTALL (from the repo root):
+      sudo cp scripts/syspolicyd-watchdog.py /usr/local/bin/
+      sudo cp scripts/com.cortexkit.syspolicyd-watchdog.plist /Library/LaunchDaemons/
+      sudo launchctl load -w /Library/LaunchDaemons/com.cortexkit.syspolicyd-watchdog.plist
+
+  REMOVE:
+      sudo launchctl unload -w /Library/LaunchDaemons/com.cortexkit.syspolicyd-watchdog.plist
+      sudo rm /Library/LaunchDaemons/com.cortexkit.syspolicyd-watchdog.plist /usr/local/bin/syspolicyd-watchdog.py
+
+  WATCH WHAT IT DOES:
+      tail -f /var/log/syspolicyd-watchdog.log
+
+  The log is the point as much as the restart is: every action carries the CPU
+  reading, how long it was sustained, and the process age, so the record shows
+  whether the wedge is getting more frequent rather than leaving you to guess.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cortexkit.syspolicyd-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/syspolicyd-watchdog.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Its own output already goes to the log file; these catch anything that
+         escapes before logging is set up, such as an interpreter error. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/syspolicyd-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/syspolicyd-watchdog.log</string>
+
+    <!-- Low priority: it samples `ps` every ten seconds and must never be part
+         of the load it is watching for. -->
+    <key>Nice</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

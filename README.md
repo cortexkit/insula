@@ -238,6 +238,13 @@ python3 scripts/measure-disk-io.py
 # which is why reinstalling does not clear it. Exit 1 means maintenance is
 # indicated; clearing needs Recovery, because SIP protects the file while booted:
 python3 scripts/gatekeeper-scanlist.py
+
+# restart syspolicyd when it wedges, so recovery does not require a terminal --
+# which is exactly what a wedge prevents you from opening. Errs toward NOT
+# killing: high threshold, 120s sustain, startup grace, hard rate limit. See the
+# plist header for install and removal:
+sudo /usr/bin/python3 scripts/syspolicyd-watchdog.py   # foreground, to watch it
+
 ```
 
 ## Install as a supervised subc module
