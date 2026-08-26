@@ -2602,3 +2602,42 @@ Five files here truncate under the naive cut, and the worst is not a provider:
 inject a hook. That file holds the emission gate, the completeness claim and the
 whole read path — so any sweep over the module's most consequential logic read
 essentially none of it.
+
+## A verdict over a set needs its denominator, and homogeneity hides the gap
+
+From a consumer whose capacity axis read healthy for months while one provider's
+row had not moved in a week (2026-08-26). Their diagnosis generalises past that
+incident and has now been tested here.
+
+**The tell:** any health verdict computed over a SET rather than a single subject
+needs its population published, and the test is whether ONE ANOMALOUS MEMBER
+WOULD BE VISIBLE IN THE OUTPUT. If not, the verdict is a claim about the
+healthiest member wearing the population's name.
+
+**Why these survive review:** they are undetectable while the population is
+homogeneous. Their axis was correct for months because every provider refreshed,
+and it became wrong the moment one stopped — with no code change. Nothing in the
+verdict's own history warns you, because its history is the period when it
+happened to be right.
+
+Four instances across three modules, all the same shape: a drop count that could
+not separate a quiet host from one where nothing was comparable; a confidence flag
+whose run of `true` could not separate always-continuous from a stuck arm; their
+axis verdict; and their per-axis staleness reading. In every case the aggregate
+was TRUE and the population UNSTATED.
+
+**Tested against this module's health surface, and it passes — for a reason worth
+stating rather than by luck.** `lastFetchSuccessAgeSecs` really is an aggregate
+(`max` over slots, so the freshest wins) and would hide a stalled lane on its own.
+It is not on its own: every provider is partitioned into `fresh` / `stale` /
+`pending` / `degraded` / `unconfigured` / `withoutHandles` by ITS OWN state, so an
+anomalous member moves buckets and shows up. The conservation identity is what
+makes the population visible, which was not why it was built.
+
+**Where the shape does exist here, and is documented rather than fixed:** health
+buckets are per PROVIDER, and a multi-account provider is bucketed by its best
+slot — one healthy account and one withheld reads as `serving`. At the account
+level, one anomalous member is invisible in health. The remedy is not a better
+health number; it is that account-level questions are answered from the `usage.get`
+array, which carries every account separately. Stated in the consumer contract as
+"health cannot substitute for this".
