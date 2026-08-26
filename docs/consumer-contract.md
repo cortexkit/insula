@@ -1370,6 +1370,24 @@ is the discriminator, confirmed across two independent episodes:
 | present | present | a provider call failed; the timestamp is the last success |
 | present | **absent** | a credential verdict was reached and the provider was never called |
 
+**These are stages, not stable states, and one failure passes through both.** A
+vault credential going bad is observed as row 2 first — the provider itself
+refuses, so `credential_rejected` rides beside a frozen `fetchedAt` — and then as
+row 3 once the vault reaches its own verdict and this module stops calling the
+provider at all. Measured identically across eight consecutive episodes by a
+consumer polling at 30s: about ten samples of the first shape, then the second for
+the rest of the latch, with the switch landing one non-transient backoff after the
+first refusal.
+
+Two consequences worth designing for. **An `errorClass` change is not necessarily a
+state change** — `credential_rejected` becoming `credential_unusable` on one
+account is the same failure being described by a better-informed party, so
+alerting on class transitions will fire mid-latch on something that did not
+happen. And **`fetchedAt` disappearing is not evidence the account never worked**:
+within one episode it is present for the early samples and absent thereafter. The
+third row means the verdict was reached without calling the provider on THIS
+attempt, not that no attempt ever succeeded.
+
 The third row is the one that changed. Do **not** read a missing `fetchedAt` as
 "never worked" — read it as "nothing here may be attributed to this credential".
 The remedy differs: the first invites waiting, the second needs someone to
