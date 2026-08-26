@@ -1145,6 +1145,18 @@ step after being written — the account-level bucketing case, and a peer's
 ownership case found while they were still explaining the rule to me. Neither was
 looked for.
 
+**Stop adding clauses before the rule becomes a document nobody runs.** Each
+addition above was a real improvement and the sum can still be worse than any
+intermediate version — the same shape as everything else here, an artifact
+reporting success about a subject that is no longer the one that matters, which is
+whether anyone EXECUTES it.
+
+**The measure is execution cost, not clause count.** A four-clause rule that runs
+as one shell line is affordable; a two-clause rule needing judgement on both is
+already too long. This one stops at four because three are mechanically checkable
+and the fourth is a caveat about reading a result, which is the cheapest kind of
+clause to carry.
+
 **The reduction that survives, checked against every finding in that exchange:**
 it is the DISAGREEMENT that produces the finding, not the second reading. Each one
 came from one side asserting the other was wrong about something specific and
