@@ -1115,7 +1115,32 @@ unfounded.
 
 **Externally confirmed, which every rule here should be and most are not.** Until
 2026-08-12 every instance of this was in this repository, which makes it an
-observation about one codebase rather than a rule. Run against a repository
+observation about one codebase rather than a rule.
+
+**And running it elsewhere is only half the confirmation.** A peer ran a rule of
+theirs against this module's health surface on 2026-08-26 and got a NULL — the
+surface passes. The null was a FACT and not a finding. The finding appeared when
+they disagreed with what I had recorded the null to mean: I wrote that the rule
+was "publish the population", and they corrected it to "partition by member
+state", because a denominator beside an aggregate satisfies the first and is not
+what saves this surface.
+
+So the rule wants a third clause: THE OTHER PARTY MUST BE ABLE TO DISAGREE WITH
+THE RESULT, which needs enough context to hold an opinion about it rather than
+just enough to execute the check. A reader who can only run the check returns a
+value; a reader who can contest the reading returns a finding.
+
+**The reduction that survives, checked against every finding in that exchange:**
+it is the DISAGREEMENT that produces the finding, not the second reading. Each one
+came from one side asserting the other was wrong about something specific and
+being right about half of it — three hypotheses about a frozen row, all false, the
+falsification locating the real mechanism; a rejected suspend-bug explanation; two
+corrected rule statements. None came from either side reading more carefully.
+
+The cost of that, stated because it is uncomfortable: a second reading by a
+CO-OPERATIVE reader is worth much less than it feels like, and most review is
+co-operative reading. A reviewer with no position of their own can only find what
+the author already almost saw. Run against a repository
 written by someone else, it found a live divergence on the first surface it was
 pointed at: two independent spend-report producers, one querying SQLite directly
 and one reading an in-memory projection, sharing five guards — invalid window,
