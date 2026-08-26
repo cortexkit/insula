@@ -219,6 +219,13 @@ python3 scripts/channel0-cadence.py <baseline|drain|drain-with-in-flight> [sampl
 # on a healthy host: absent is what correct and never-populated both look like:
 python3 scripts/witness-transient.py 1
 
+# make a quota drop happen ACROSS A GAP, so `observedContinuously: false` can be
+# witnessed rather than waited for. Thirteen recorded drops across two hosts have
+# all read true, and a field that has only ever taken one value is
+# indistinguishable from one that is stuck. Reads the continuity horizon from
+# source, and refuses if either constant was renamed:
+python3 scripts/witness-gap-drop.py
+
 # check that every rule in the wire checkers has a test that fails when the
 # rule is deleted, and a control that does not fire when it should not:
 python3 scripts/audit-checker-rules.py
