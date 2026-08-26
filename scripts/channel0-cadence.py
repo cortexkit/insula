@@ -23,6 +23,23 @@ Reports every sample rather than an aggregate: a distribution with one 30s outli
 and a distribution of uniformly slow requests have the same mean and different
 causes. Exit codes follow the repo convention: 0 checked and clean, 1 checked with
 findings (a hang or a refusal), 2 could not check.
+
+IDENTIFIER NOTE, because the daemon side plans to join on correlation ids and THIS
+INSTRUMENT CANNOT SUPPLY THEM FOR HEALTHY REQUESTS. The CLI prints `local_port=N
+channel 0 corr N` only inside its own timeout error, so a request that answers
+exposes no identifier at all, and one killed at THIS script's deadline never gets
+to print one either. What the join can rely on:
+
+    healthy request   wall-clock time and cadence position only
+    CLI-timed-out     full `local_port` + `corr` in the preserved error text
+    killed by us      nothing
+
+So daemon-side arrival records must be joined to these samples BY TIME, not by id,
+and the sample offsets are printed to make that possible. Raising this script's
+timeout above the CLI's would convert the third row into the second and recover
+ids for hung requests -- deliberately not done, because the CLI's timeout is 30s
+and a longer one would stop distinguishing "the CLI gave up" from "the request is
+still outstanding", which is a distinction the hunt needs.
 """
 
 from __future__ import annotations
@@ -70,11 +87,18 @@ def one_request(cli: Path) -> tuple[float, str]:
             timeout=REQUEST_TIMEOUT_SECS,
         )
     except subprocess.TimeoutExpired:
+        # No correlation id is recoverable here: the CLI prints one only in its own
+        # timeout error, and killing it at OUR deadline means that error was never
+        # written. Deliberately left as-is rather than raising this script's
+        # timeout above the CLI's -- see IDENTIFIER NOTE below.
         return time.monotonic() - started, "HUNG"
     elapsed = time.monotonic() - started
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip().splitlines()
-        return elapsed, f"REFUSED ({detail[0][:48]})" if detail else "REFUSED"
+        # The CLI's own timeout message carries `local_port=N channel 0 corr N`,
+        # which is the only identifier this instrument can offer for a join
+        # against daemon-side records. Preserved verbatim rather than summarised.
+        return elapsed, f"REFUSED ({detail[0][:96]})" if detail else "REFUSED"
     return elapsed, "ok"
 
 
