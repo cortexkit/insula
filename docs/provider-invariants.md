@@ -2846,11 +2846,20 @@ shipped code has guards for exactly this and the throwaway scripts do not, which
 the whole pattern: THE RULE WAS APPLIED WHERE IT WAS WRITTEN DOWN AND NOT WHERE IT
 WAS TYPED IN A HURRY.
 
-**The cheap discipline, since a probe should not need a test suite:** when reading
-a metric you have not read before, print the RAW value including `None` before
-deriving anything from it. `or 0` and `or []` are the constructs to distrust —
-they are load-bearing defaults wearing convenience syntax. If the derived number
-matters enough to report, the raw one is worth one extra line.
+**The first remedy written here was vigilance, and a peer caught it within the
+hour:** "print the raw value before deriving anything" is a rule enforced only by
+care, which this document has an entire section warning about. Written one turn
+after recording that warning.
+
+**The mechanical version is `scripts/health.py`**, which removes the site rather
+than guarding it. It requires nobody to name a key or supply a default: it prints
+EVERY published metric with its raw value, and a key asked for by name that is not
+published renders `ABSENT (not a published metric)` and exits 1. Driven against
+the exact call that fabricated the datum — `uptimeSecs` now reports ABSENT where
+the hand-written probe reported `0.0h` — with a real key as the control.
+
+`or 0` and `or []` remain the constructs to distrust wherever they survive: they
+are load-bearing defaults wearing convenience syntax.
 
 **And prefer an independent instrument for a claim about process identity.** The
 health surface cannot answer "did this process restart" at all, and no amount of
