@@ -2718,3 +2718,33 @@ guard nobody has measured.
 review:** a raising heredoc followed by `&&` stops the chain, and the same heredoc
 followed by a NEWLINE lets the next command run with the error text still on
 screen. One character of punctuation, identical at a glance.
+
+### The fourth is upstream of all three: the anchor means something else
+
+An anchor that matches EXACTLY ONCE, satisfying every guard above, in a place that
+is not the place you meant. Pattern found, one site, exit zero, tree dirty, commit
+real — the artifact is wrong and nothing in the pipeline is.
+
+**Not a fourth stage.** The three above are failures of EXECUTING an intent;
+this is a failure of the intent-to-anchor step, which is MODELLING rather than
+execution. It fails when your mental map of the file has drifted from the file —
+the same root as mode one, one layer earlier, producing a false POSITIVE where
+drift produces a false negative.
+
+**Two instances here, both already recorded and neither previously connected to
+the others.** Probing a corpus guard, the mutation hit the failure MESSAGE rather
+than a map entry; probing an extraction floor, it appended a comment to a mapping
+arm. Both were unique, both applied cleanly, both reported NOTHING REDDENED with
+complete accuracy about the wrong thing.
+
+**What catches it here is not a guard, it is the naming discipline.** A mutation
+proof must redden the TARGET TEST BY NAME, so a wrong-site anchor shows up as the
+wrong tests reddening or none at all. That rule was written to prove a mutation
+was not vacuous; it also catches anchoring in the wrong place, which is the
+stronger reason to keep it.
+
+**And the uncomfortable cost of refusing multi-site patterns:** forced to make a
+pattern unique, the natural move is to extend it with neighbouring text until it
+matches once — and the extended pattern can be unique in the WRONG PLACE just as
+easily. UNIQUENESS IS NOT CORRECTNESS. Worth knowing at the moment the refusal
+fires, because that is exactly when the temptation appears.
