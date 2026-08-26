@@ -2866,6 +2866,40 @@ health surface cannot answer "did this process restart" at all, and no amount of
 careful reading of it would have; `ps -o lstart=` answers it directly and shares no
 machinery with the thing under suspicion.
 
+### A constant divided by your sampling rate is not a measurement
+
+A consumer reported the same figure across nine independent episodes: the number
+of samples between a credential's first refusal and the vault's verdict was ten,
+every time. Nine consistent observations of a system under real load reads as one
+of the strongest results on that thread. It was arithmetic.
+
+Both endpoints are anchored to THE SAME EVENT. This module's report fires on the
+provider's refusal; the vault's verdict is only observable on the next attempt,
+which `NON_TRANSIENT_BACKOFF` puts 300 seconds later. The consumer polls at 30
+seconds. Ten is `300 / 30`, and the repetition across episodes was the repetition
+of two constants, one of which has a unit test asserting it directly.
+
+**The tell is that both ends of the interval trace back to one event.** An interval
+between two consequences of the same cause measures the machinery between them,
+not the world. It cannot vary with the thing you are watching, so it cannot
+falsify anything about it — and the consumer proved this by deriving what a
+shorter prefix would require: an earlier provider refusal makes the report fire
+earlier and the verdict land one backoff later still, leaving the count unchanged.
+
+**The question that number was supposed to answer was mine, and it could not.** I
+asked whether a short prefix would show the provider failing before the credential
+did. Nothing about that count could have shown it. The observable that answers it
+is TERMINAL rather than DURATIONAL: a refusal phase that ends in RECOVERY instead
+of in a verdict — a refusal the vault declines to convict — which is visible in a
+single sample and would mean this module reported an auth failure for a credential
+that was fine.
+
+**Where else this shape appears here:** any figure derived from `BASE_INTERVAL`,
+`FETCH_DEADLINE` or the backoff ladder divided by an observer's cadence. Before
+treating a repeated interval as evidence, ask which events bound it and whether a
+change in the phenomenon could move either end independently. If not, the number
+is a property of the instruments.
+
 ### Filing a defect as a skill problem terminates the search for a mechanism
 
 The two instances above sat in these notes for weeks as "probe selection is itself
