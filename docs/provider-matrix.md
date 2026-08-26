@@ -27,7 +27,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.55.0** (37 providers registered; verified
+**Current parity: CodexBar v0.55.1** (37 providers registered; verified
 2026-08-25). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
@@ -261,6 +261,36 @@ one of them and only the quota surface decides.
 The `fireworks-ai` one is worth remembering if that vendor ever ships a billing
 endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
+
+### v0.55.0 -> v0.55.1 (checked 2026-08-26)
+
+Constants first, all five located in the v0.55.1 tree: BETA_HEADER,
+WORKSPACES_SERVER_ID, BILLING_SERVER_ID, SUBSCRIPTION_SERVER_ID, OASIS_WEB_ID.
+
+Eleven provider files moved. Triaged by counting credential and failure-path lines
+in each delta rather than reading all of them: Grok 10, Amp 1, the rest zero.
+
+**DECLINED, UNVERIFIABLE HERE — Alibaba token-plan CLI lane.** The round's one
+substantive addition is `AlibabaTokenPlanCLIUsageFetcher.swift` (+155), which
+shells out to the Bailian CLI (`bl usage token-plan --output json`) resolved off
+PATH, with a sanitised child environment. That is a genuinely headless credential
+source for the provider we serve as `qwen-cloud`, and it would sidestep both the
+browser-cookie dependency and the console-drift that broke this lane twice. `bl`
+is NOT installed on this machine, so the output shape is unobserved.
+UNBLOCK: one captured `bl usage token-plan --output json` payload. Building a
+parser against an invented shape is the trap that produced a wrong `dataV2`
+fixture and a wrong tariff fixture in the same week.
+
+**NOT APPLICABLE — Amp.** `stripANSICodes(displayText).replacingOccurrences(of:
+"**", with: "")` strips markdown bold from a RENDERED STRING. Our parser reads
+named numeric fields (`quota`, `used`) out of the page block via
+`find_numeric_field`, so a bold marker in display text never reaches our numbers.
+Different lane, not a smaller version of the same bug.
+
+**NOT APPLICABLE — Grok.** The credential lines are plumbing for their
+`resolvingUnknownUsage` fallback joining a web-billing fetch to the gRPC one. Our
+grok resolves no account identity and already serves from the gRPC lane; the
+standing decline on their `cli-chat-proxy` settings endpoint is unchanged.
 
 ### v0.53.0 -> v0.55.0 (checked 2026-08-25)
 
