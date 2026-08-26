@@ -1222,6 +1222,39 @@ A provider named there has had its **whole account set** published in that same
 response, so a consumer holding stored accounts for it may replace that set,
 including removing accounts the entries do not name.
 
+### Telling an identity transition from a broken handle
+
+A consumer holding account-keyed rows needs one distinction this wire does not
+name in a single field, and it is derivable from the array:
+
+```
+you hold labelled rows for P
+AND this response has an unlabelled entry for P
+AND that entry is USABLE (no `error`, carries `usage`)
+AND this response has no labelled entries for P
+=> P currently resolves no identity
+```
+
+Your labelled rows are then from a prior regime. They are not wrong, they are
+**undated** — nothing has replaced them because nothing can: an unlabelled entry
+never mints an observation for an account, and a provider serving one is never in
+`completeProviders`. So the only thing that ages those rows out is a judgement you
+make from this signal.
+
+**The third clause is load-bearing.** An unlabelled entry *carrying an error* can
+sit beside labelled serving siblings — that is deliberate, and the shape that
+forced it was one Anthropic handle needing re-authentication while three healthy
+accounts served. Keying on "an unlabelled entry exists" would mark all three as
+transitioned on a provider whose identity resolution is fine. The condition is
+that the unlabelled entry is **serving usage**.
+
+**Mark, do not delete.** This signal says the labelled rows are stale, not that
+those accounts are gone. Deletion is still authorised only by `completeProviders`,
+and trading an old row for a wrong one is the failure that rule exists to prevent.
+
+The state has an exit and no timer: if the provider's credentials resolve identity
+again it becomes labelled and completable, and the ordinary path reaps.
+
 A provider **not** named is **unknown, never empty**. Its entries are as usable
 as any other; the module is declining to say that they are all of them. Reading
 absence as an empty account set is the destructive misreading the field exists
