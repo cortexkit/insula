@@ -56,6 +56,35 @@ elif [ "$freshness" -eq 1 ]; then
     find crates -name '*.rs' -exec touch {} + || fail "could not touch sources"
 fi
 
+step "python instruments compile"
+# Eleven Python instruments live under scripts/ and exactly ONE of them was
+# executed by any automated step, so a syntax error in the other ten would have
+# been discovered by the person who reached for one during an incident. That is
+# the worst possible moment: the tools most likely to sit unrun for weeks are the
+# diagnostic ones, and they are wanted precisely when something else is already
+# wrong. Sub-second, and it fails closed.
+#
+# Compilation only, deliberately. This proves the file will start, not that it is
+# correct -- a linter here would be a second opinion about style, while this
+# answers the one question an incident asks.
+python3 - <<'PYGATE' || fail "a python instrument does not compile"
+import pathlib, py_compile, sys, tempfile
+broken = []
+scripts = sorted(pathlib.Path("scripts").glob("*.py"))
+if not scripts:
+    print("  no python instruments found -- refusing rather than passing")
+    sys.exit(1)
+for script in scripts:
+    try:
+        py_compile.compile(str(script), cfile=tempfile.mktemp(), doraise=True)
+    except py_compile.PyCompileError as error:
+        broken.append(f"{script.name}: {str(error).splitlines()[0][:70]}")
+for entry in broken:
+    print(f"  {entry}")
+print(f"  {len(scripts) - len(broken)}/{len(scripts)} compile")
+sys.exit(1 if broken else 0)
+PYGATE
+
 step "cargo fmt --check"
 cargo fmt --check || fail "formatting"
 
