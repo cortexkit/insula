@@ -26,7 +26,8 @@ use serde_json::json;
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        ManifestProvenance, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -862,12 +863,41 @@ fn control_flags() -> Flags {
 /// requires nothing. Storage is declared `owns_schema: false` — the module keeps
 /// only an in-memory TTL cache and owns no persistent schema (the manifest enum
 /// has no none/ephemeral storage kind yet, so this is the honest expression).
+/// The wire crate version this binary was built against, read from the lockfile.
+///
+/// Empty means the build could not resolve it, reported as ABSENT rather than as
+/// an empty string: a consumer reading `Some("")` would take it as a stated
+/// version that happens to be blank, and the point of this field is that a stated
+/// fact came from somewhere.
+fn wire_crate_version() -> Option<String> {
+    let raw = env!("CK_QUOTA_WIRE_CRATE_VERSION");
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
 fn manifest(module_id: &str) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
+        // Populated rather than left None, because every field here is one this
+        // module already knows and a consumer otherwise has to ask a human for.
+        //
+        // `build_git_sha` is the SAME value as `health.metrics.buildCommit`,
+        // deliberately: deploy verification already turns on comparing that stamp
+        // to `git rev-parse`, and a second, differently-derived answer to "which
+        // commit is this binary" is a thing that can disagree with the first.
+        //
+        // The two left None are ABSENT FACTS, not unfilled blanks. This module
+        // owns no persistent store, so it has no schema version to state; and the
+        // lockfile digest is a build-host input the binary does not carry, so
+        // synthesising one at runtime would state a fact nobody measured.
+        provenance: Some(ManifestProvenance {
+            build_git_sha: Some(env!("CK_QUOTA_BUILD_COMMIT").to_string()),
+            build_lock_digest: None,
+            wire_crate_version: wire_crate_version(),
+            store_schema_version: None,
+        }),
         provides: vec![ProviderRole::ManagementSurface {
             operations: vec![
                 ManagementOperation {
@@ -976,6 +1006,47 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+    /// The manifest states provenance, and states ONLY what it can source.
+    ///
+    /// Both halves are load-bearing and the second is the one that rots: a later
+    /// edit that "fills in" store_schema_version or a lockfile digest with a
+    /// plausible constant would pass a test that only checked presence, and would
+    /// put a manufactured fact on the wire under a field whose entire purpose is
+    /// that its contents were measured.
+    #[test]
+    fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
+        let m = manifest("insula");
+        let p = m.provenance.expect("manifest must state provenance");
+
+        let sha = p.build_git_sha.expect("build_git_sha comes from build.rs");
+        assert!(
+            sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "build_git_sha must be a hex commit, got {sha:?}"
+        );
+        assert_eq!(
+            sha,
+            env!("CK_QUOTA_BUILD_COMMIT"),
+            "must be the SAME stamp as health.metrics.buildCommit, not a second derivation"
+        );
+
+        let wire = p
+            .wire_crate_version
+            .expect("wire_crate_version comes from Cargo.lock");
+        assert!(
+            !wire.is_empty() && wire.split('.').count() == 3,
+            "wire_crate_version must be a resolved semver, got {wire:?}"
+        );
+
+        // Absent facts, not unfilled blanks -- see the comment at the call site.
+        assert!(
+            p.store_schema_version.is_none(),
+            "this module owns no persistent store, so it has no schema version to state"
+        );
+        assert!(
+            p.build_lock_digest.is_none(),
+            "the binary does not carry its build host's lockfile digest; stating one would be invention"
+        );
+    }
 
     /// Every health metric this module publishes is explained in the contract.
     ///

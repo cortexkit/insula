@@ -60,7 +60,7 @@ DAEMON_CLI_CANDIDATES = (
 CADENCE_SECS = 5.0
 IN_FLIGHT_ARM = "drain-with-in-flight"
 # Sacrificial and cheap to bounce, chosen by the daemon's owner.
-IN_FLIGHT_MODULE = "entorhinal"
+IN_FLIGHT_MODULE = "drain-probe"
 # Above the daemon's own 30s drain timeout, so a request that is merely waiting
 # for a drain to finish is recorded as a long latency rather than truncated into
 # a timeout -- the duration is the measurement.

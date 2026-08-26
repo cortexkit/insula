@@ -70,6 +70,13 @@ fn main() {
         "cargo:rustc-env=CK_QUOTA_BUILD_COMMIT={}",
         commit.as_deref().unwrap_or("unknown")
     );
+    // Re-run when the lockfile moves, or the stamped version outlives the bump.
+    println!("cargo:rerun-if-changed=../../Cargo.lock");
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!(
+        "cargo:rustc-env=CK_QUOTA_WIRE_CRATE_VERSION={}",
+        wire_crate_version(&manifest_dir).unwrap_or_default()
+    );
 }
 
 /// Whether a string has the shape this build stamps: short hex, as [`short`]
@@ -179,4 +186,37 @@ fn read_sha(path: &Path) -> Option<String> {
 
 fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
+}
+
+/// Resolve the wire crate's version from the tracked lockfile.
+///
+/// READ RATHER THAN HARDCODED, because a literal here is a second place the
+/// version lives and the two drift silently -- the manifest would keep announcing
+/// an old wire version after a dependency bump, which is exactly the kind of
+/// stale-but-plausible fact this repo has been bitten by. Cargo.lock is tracked,
+/// so it is the resolved truth for the binary being built.
+///
+/// Returns None rather than guessing when the entry is absent: an unstated
+/// version is an honest gap, a wrong one is a claim.
+fn wire_crate_version(manifest_dir: &std::path::Path) -> Option<String> {
+    let lock = manifest_dir.parent()?.parent()?.join("Cargo.lock");
+    let text = std::fs::read_to_string(lock).ok()?;
+    let mut in_pkg = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            in_pkg = false;
+            continue;
+        }
+        if line == "name = \"cortexkit-provider-usage\"" {
+            in_pkg = true;
+            continue;
+        }
+        if in_pkg {
+            if let Some(rest) = line.strip_prefix("version = \"") {
+                return rest.strip_suffix('"').map(str::to_string);
+            }
+        }
+    }
+    None
 }

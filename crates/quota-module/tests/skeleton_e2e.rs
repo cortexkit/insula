@@ -138,6 +138,13 @@ fn vault_manifest() -> ModuleManifest {
         module_version: "test-stub".to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
+        // None, for the same reason the operations carry no description: this
+        // stub stands in for ANOTHER module, and provenance is a claim about
+        // which source built a binary. Stamping this test's own build stamp here
+        // would attribute our provenance to the credential vault; inventing a
+        // plausible one would put an unmeasured fact in a field that exists to
+        // carry measured ones. A stub that cannot source it should say so.
+        provenance: None,
         provides: vec![ProviderRole::ManagementSurface {
             operations: vec![
                 // No description on either: the stub mirrors what the real vault
