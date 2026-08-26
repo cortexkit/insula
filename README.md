@@ -207,6 +207,12 @@ python3 scripts/probe.py <file> <before> <after>
 # not happened:
 python3 scripts/health.py [metricName ...]
 
+# drive daemon control-plane requests at a fixed cadence, one fresh CLI process
+# each, and time every one. Built for the subc-core control-plane starvation hunt:
+# a distribution with one 30s outlier and a uniformly slow one have the same mean
+# and different causes, so it reports every sample rather than an aggregate:
+python3 scripts/channel0-cadence.py <baseline|drain|drain-with-in-flight> [samples]
+
 # make a provider fail transiently against a loopback endpoint, so
 # preserve-the-window behaviour can be witnessed on the wire rather than
 # waited for. A field that only appears during a failure cannot be verified
