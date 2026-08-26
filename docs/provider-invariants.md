@@ -2655,3 +2655,39 @@ The remedy is not a better
 health number; it is that account-level questions are answered from the `usage.get`
 array, which carries every account separately. Stated in the consumer contract as
 "health cannot substitute for this".
+
+## An instrument reports on its own subject, not on yours
+
+From a peer exchange (2026-08-26) after a commit here reported success while
+having changed nothing. Four instances across two modules, and the shape is not
+about editing.
+
+**`git commit` reports on the repository, not on your edit.** An edit that
+silently did nothing plus a commit that finds a clean tree still prints a hash —
+the PREVIOUS one — and any reasonable reader takes it as the commit just made. A
+silent no-op fails quietly; this composition fails AFFIRMATIVELY, producing a
+positive artifact that needs no further mistake to become permanent.
+
+Same shape elsewhere: `lsof` reports the path recorded at open time rather than
+the file on disk now, which is how a peer ran green for hours against an orphaned
+inode while every path check passed. A deploy step reports what it SENT, not what
+is serving. In each case the instrument is honest about its own subject and the
+reader supplies a subject it never claimed.
+
+**The remedy is one move: when a step reports success, check the THING YOU
+CHANGED, not the thing that reported.** Grep the file for the text you believe you
+wrote. Read the wire after deploying. Compare inode to path rather than path to
+path.
+
+**What actually failed here is worth separating from what looked like it failed.**
+The edit script's guard DID fire — it asserted its patterns and raised. The defect
+was that the surrounding shell ran `git add` and `git commit` regardless, because
+the heredoc's exit status was never consulted. So the lesson is not "add
+assertions to edit scripts" (`scripts/probe.py` already refuses on a missed
+pattern and says so); it is that A GUARD THAT FIRES INTO AN IGNORED EXIT STATUS IS
+NOT A GUARD. Same family as reading an exit code through a pipe, which this repo
+already forbids in `docs/deploying.md`.
+
+**And the trigger was punctuation:** two hyphens against an em-dash, invisible in
+review and total in matching. A guard should print the pattern that missed rather
+than a count — a count says something missed, the pattern says it was punctuation.
