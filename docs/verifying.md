@@ -128,3 +128,31 @@ Exit codes across every checker and script here: `0` checked and found nothing,
 `1` checked and found something, `2` could not check — the run makes no claim
 either way. The third is the one that matters, because a `2` read as a `0` is a
 clean bill of health from an instrument that never looked.
+
+## What the gate does NOT cover
+
+Written down because `scripts/gates.sh` passing reads as "everything passed", and
+on 2026-08-26 it did not: master was red on a doctest while the gate was green,
+and the gap was found by a consumer running plain `cargo test --workspace`.
+
+The trap generalises past that one target. **`--all-targets` excludes doctests.**
+It reads as the widest possible flag and silently omits one target, which is why
+both the local gate and CI missed the same break.
+
+| target | covered by | note |
+| --- | --- | --- |
+| lib + bin unit tests | gate and CI | |
+| doctests | gate and CI | added 2026-08-26; neither had it before |
+| `skeleton_e2e` | gate and CI | |
+| `real_daemon_e2e` | CI only | `#[ignore]`d, needs a live daemon |
+| `*_live` provider tests | NEITHER | `#[ignore]`d by design, hit real providers |
+| examples: compile | gate and CI | via `clippy --all-targets` |
+| examples: run | CI only | `completeness-envelopes` alone |
+
+The two NEITHER rows are deliberate, not gaps to close: the live provider tests
+reach real upstreams and would make the gate depend on someone else's uptime.
+Run them by hand with `--ignored` when touching a provider's request shape.
+
+The rows that ARE worth watching are the CI-only ones, because a green local gate
+says nothing about them. If a change touches the daemon handshake or an example's
+behaviour, the local gate cannot tell you.

@@ -122,6 +122,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      # SEPARATE STEP BECAUSE --all-targets EXCLUDES DOCTESTS. The flag reads as
+      # "everything" and silently omits this one target, which is how an ASCII
+      # table in a /// comment reached master with both this pipeline and the
+      # local gate green (insula#13). An indented block in a doc comment is a
+      # Rust code block to rustdoc, so prose gets compiled.
+      - name: Doctests
+        run: cargo test --workspace --doc
+
       # The only test where the subc module id must round-trip through daemon
       # config, process launch and a routed call: a real ck-subc binary reads a
       # generated subc.jsonc, spawns this module from it, and serves usage.get
