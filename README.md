@@ -201,6 +201,12 @@ python3 scripts/prod_body.py crates/quota-core/src/*.rs
 # Reports whether the mutation reddened a test, was never reached, or hung:
 python3 scripts/probe.py <file> <before> <after>
 
+# print every published health metric with its raw value. A metric asked for by
+# name that is not published reports ABSENT and exits 1, rather than defaulting
+# to zero -- which is how a hand-written probe once reported a restart that had
+# not happened:
+python3 scripts/health.py [metricName ...]
+
 # make a provider fail transiently against a loopback endpoint, so
 # preserve-the-window behaviour can be witnessed on the wire rather than
 # waited for. A field that only appears during a failure cannot be verified
