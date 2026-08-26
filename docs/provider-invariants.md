@@ -2748,3 +2748,39 @@ pattern unique, the natural move is to extend it with neighbouring text until it
 matches once — and the extended pattern can be unique in the WRONG PLACE just as
 easily. UNIQUENESS IS NOT CORRECTNESS. Worth knowing at the moment the refusal
 fires, because that is exactly when the temptation appears.
+
+### Filing a defect as a skill problem terminates the search for a mechanism
+
+The two instances above sat in these notes for weeks as "probe selection is itself
+a skill". That framing is why no catcher was ever looked for: a lesson whose only
+remedy is CARE is unfalsifiable and actionable only as try-harder, so it closes
+the question before a mechanism can be found. The naming discipline had been
+catching this class the whole time and nobody noticed, because nobody was looking.
+
+**The tell is a recorded lesson whose remedy is care.** When a write-up ends in
+"be more careful about X", the class has been named and the search abandoned in
+the same sentence. Ask instead what would have caught it without anyone being
+careful — and if the honest answer is nothing, say THAT, because "no mechanism
+found" stays open while "a skill problem" does not.
+
+### The layer above intent: is this the right change
+
+One half is judgement — does the design serve the product — and no tool reaches
+it. The other half is mechanical and worth separating: **does this contradict
+something already settled?** A change can be locally correct and globally
+contradictory, and detecting that needs no taste, only the settled set written
+somewhere a checker can hold.
+
+**Measured here, and the split is uneven.** Statement-versus-code contradictions
+ARE fenced: the wire error classes against their contract table, the health
+metrics against their documentation, the opaque parity constants against their
+source markers, the provider count against the registry. Each of those has caught
+a real drift.
+
+**Statement-versus-statement is not fenced at all**, and this repo has hit it three
+times — a `fetchedAt` fact stated differently in two documents, a prose count
+beside its own five-row table, and an exhaustiveness claim that a later fix
+falsified while the claim stayed. All three were found by hand, after the fact.
+The standing practice ("when correcting a fact in one doc, grep every other doc
+for it") is a HABIT, not a mechanism, and habits are what get optimised away when
+a step feels slow.
