@@ -277,7 +277,7 @@ for health, never on this field's presence.
 | `credential_unusable` | a credential is present but cannot be used as one | no |
 | `credential_rejected` | the credential was sent and refused (401/403) | no — needs re-authentication |
 | `no_quota_reported` | the credential works; the account reports no quota | no, and nothing is wrong |
-| `local_source_unavailable` | a program on this machine that this provider reads usage from is not running | yes — when it runs again |
+| `local_source_unavailable` | a local source this provider reads usage from cannot be reached — a program that is not running, or data this process is not permitted to read | yes — when the program runs again, or the permission is granted |
 | `upstream_failed` | the provider's endpoint failed (429, 5xx, network) | yes |
 | `decode_failed` | a response arrived in an unexpected shape | yes |
 | `internal_error` | a fault in this module, contained rather than crashing | sometimes |

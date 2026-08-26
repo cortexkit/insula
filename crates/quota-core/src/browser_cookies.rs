@@ -69,6 +69,21 @@ pub enum CookieError {
     UnreadableScheme(&'static str),
     /// Reading the store or decrypting failed.
     Extract(String),
+    /// The store exists but this process is not permitted to read it.
+    ///
+    /// DISTINCT FROM [`Self::Extract`] BECAUSE THE REMEDY IS, and because it
+    /// arrives looking like a provider fault. On macOS the whole cohort fails at
+    /// once with `Operation not permitted` when the binary lacks the TCC grant
+    /// for another application's data directory -- observed on this host
+    /// 2026-08-26, nine providers dark in one tick. Reported as `upstream_failed`
+    /// that sends an operator to check nine providers' servers; the actual fix is
+    /// one permission grant on this machine.
+    ///
+    /// It is also a STABLE fact rather than a moment: the `Extract` arm is
+    /// classified transient because a keychain may be locked or the browser may
+    /// be mid-write, and neither describes a permission that persists until
+    /// somebody changes it.
+    PermissionDenied(String),
     /// This platform is not supported (not macOS).
     Unsupported,
 }
@@ -164,6 +179,13 @@ impl From<CookieError> for crate::provider::FetchError {
             CookieError::NoKeychainKey(_) | CookieError::Extract(_) => {
                 crate::provider::FetchError::Upstream(detail)
             }
+            // A local source this lane needs cannot be reached, which is what
+            // that class says and what an operator can act on. Not `Upstream`:
+            // the provider's servers are fine and nine of them saying otherwise
+            // at once is a machine-level fact wearing a provider-level costume.
+            CookieError::PermissionDenied(_) => {
+                crate::provider::FetchError::LocalSourceUnavailable(detail)
+            }
         }
     }
 }
@@ -182,6 +204,14 @@ impl std::fmt::Display for CookieError {
                  which only the browser itself can decrypt"
             ),
             Self::Extract(m) => write!(f, "cookie extraction failed: {m}"),
+            // Names the remedy, because the reader of this string is deciding
+            // where to look. "extraction failed" sends them to the provider; this
+            // sends them to the machine, which is where the fix is.
+            Self::PermissionDenied(m) => write!(
+                f,
+                "this process is not permitted to read the browser profile \
+                 (grant it access to application data on this machine): {m}"
+            ),
             Self::Unsupported => write!(
                 f,
                 "browser-cookie extraction is not supported on this platform"
@@ -513,6 +543,14 @@ fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> 
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Named separately so the class points at this machine rather than at the
+        // provider. macOS answers `Operation not permitted` here when the binary
+        // has no TCC grant for another application's data directory.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(CookieError::PermissionDenied(format!(
+                "listing the Chrome profile directory: {error}"
+            )))
+        }
         Err(error) => {
             return Err(CookieError::Extract(format!(
                 "listing the Chrome profile directory: {error}"
@@ -845,6 +883,99 @@ mod tests {
     /// Every cookie failure is judged for which wire class it becomes.
     ///
     /// The class decides what a consumer does, and the three outcomes are not
+    /// The SYSCALL classifies a denial, not just the mapping below it.
+    ///
+    /// Two layers, and the mapping test alone leaves this one open: it builds the
+    /// variant by hand, so deleting the `PermissionDenied` arm at `read_dir`
+    /// reddens nothing while every cookie provider silently returns to reporting
+    /// a machine permission as a provider fault. Found by mutation -- the first
+    /// proof of this fix came back NOTHING REDDENED for exactly that reason.
+    ///
+    /// Drives a real unreadable directory rather than a mock, because the thing
+    /// under test is which `io::ErrorKind` the OS returns and no fake supplies it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_profile_directory_is_classified_at_the_syscall() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "insula-denied-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("the fixture directory must be creatable");
+        // Unreadable and unsearchable: read_dir answers PermissionDenied.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions must be settable");
+
+        let result = locate_under(&base);
+
+        // Restore before asserting, so a failure cannot leave an unreadable
+        // directory behind for the next run to trip over.
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&base);
+
+        match result {
+            Err(CookieError::PermissionDenied(message)) => {
+                assert!(
+                    message.contains("listing the Chrome profile directory"),
+                    "the message must name what could not be listed: {message}"
+                );
+            }
+            // Running as root defeats the fixture: root can list a 0o000
+            // directory, so the case cannot be constructed and asserting would
+            // fail for a reason unrelated to the code.
+            other if nix_running_as_root() => {
+                eprintln!("skipped: running as root, got {other:?}");
+            }
+            other => {
+                panic!("expected PermissionDenied from an unreadable directory, got {other:?}")
+            }
+        }
+    }
+
+    /// Whether this process can bypass directory permissions.
+    #[cfg(unix)]
+    fn nix_running_as_root() -> bool {
+        // SAFETY: getuid is always safe; it reads a process property and cannot fail.
+        unsafe { libc::getuid() == 0 }
+    }
+
+    /// A permission denial is not an upstream failure.
+    ///
+    /// THE LIVE SHAPE, 2026-08-26: nine cookie providers went dark in one tick
+    /// with `Operation not permitted` from macOS, and every one published
+    /// `upstream_failed` -- a class that sends an operator to check nine
+    /// providers' servers when the fix is one permission grant on this machine.
+    ///
+    /// Asserts the discrimination rather than the mapping alone: a transient
+    /// extraction failure must STILL be `Upstream`, or this passes by collapsing
+    /// both into the new class and loses the mid-write case the transient arm
+    /// exists for.
+    #[test]
+    fn a_permission_denial_names_the_machine_rather_than_the_provider() {
+        use crate::provider::FetchError;
+
+        let denied: FetchError =
+            CookieError::PermissionDenied("Operation not permitted".into()).into();
+        assert!(
+            matches!(denied, FetchError::LocalSourceUnavailable(_)),
+            "a permission denial must point at this host, got {denied:?}"
+        );
+        assert!(
+            denied.to_string().contains("not permitted to read"),
+            "the message must name the remedy: {denied}"
+        );
+
+        let mid_write: FetchError = CookieError::Extract("mid-write".into()).into();
+        assert!(
+            matches!(mid_write, FetchError::Upstream(_)),
+            "a genuinely transient extraction failure must stay Upstream, or the \
+             assertion above passes by collapsing both cases: got {mid_write:?}"
+        );
+    }
+
     /// interchangeable: `credential_absent` says nobody logged in, and the
     /// health check keeps such providers out of its `degraded` list so that
     /// list stays a set of things somebody can act on; `credential_unusable`
@@ -865,6 +996,7 @@ mod tests {
             CookieError::UnreadableScheme("v20"),
             CookieError::NoKeychainKey("locked".into()),
             CookieError::Extract("mid-write".into()),
+            CookieError::PermissionDenied("Operation not permitted".into()),
         ];
 
         for case in &all {
@@ -874,7 +1006,8 @@ mod tests {
                 | CookieError::Unsupported
                 | CookieError::UnreadableScheme(_)
                 | CookieError::NoKeychainKey(_)
-                | CookieError::Extract(_) => {}
+                | CookieError::Extract(_)
+                | CookieError::PermissionDenied(_) => {}
             }
         }
 
