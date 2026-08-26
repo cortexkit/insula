@@ -49,16 +49,16 @@ pub struct QuotaDrop {
     /// before reading a run of `true` as proof the flag works. Four conditions
     /// must hold together (traced from source by a consumer on insula#5):
     ///
-    ///   1. `detect` is reached at all -- so the prior entry exists, carries
-    ///      usage, and carries no error;
-    ///   2. the prior entry SURVIVED the failure -- only the
-    ///      `Transient if prev_is_healthy` arm clones it forward, and a
-    ///      credential-source failure cannot take that arm, because an
-    ///      unverified identity rebases the retry on a FRESH slot (see
-    ///      `next_slot_after_unverified_failure`), so `prev_is_healthy` is false;
-    ///   3. the gap exceeds two base intervals -- `last_success_at` only advances
-    ///      on success, so it grows across a stale-serving run;
-    ///   4. the later reading is actually lower.
+    /// 1. `detect` is reached at all -- so the prior entry exists, carries usage,
+    ///    and carries no error;
+    /// 2. the prior entry SURVIVED the failure -- only the
+    ///    `Transient if prev_is_healthy` arm clones it forward, and a
+    ///    credential-source failure cannot take that arm, because an unverified
+    ///    identity rebases the retry on a FRESH slot (see
+    ///    `next_slot_after_unverified_failure`), so `prev_is_healthy` is false;
+    /// 3. the gap exceeds two base intervals -- `last_success_at` only advances on
+    ///    success, so it grows across a stale-serving run;
+    /// 4. the later reading is actually lower.
     ///
     /// (3) and (4) together are the tight part: the gap grows only while stale
     /// serving, and a decrease appears only if a window boundary fell INSIDE that
@@ -97,8 +97,10 @@ const NOISE_FLOOR_PERCENT: f64 = 1.0;
 /// healthy window at 80%, then 503 (transient, so the prior reading survives)
 /// through four backoff rungs, then a healthy window at 10%:
 ///
-///     before   quotaDropsByProvider {}                continuous 0
-///     after    quotaDropsByProvider {"sub2api": 1}    continuous 0
+/// ```text
+/// before   quotaDropsByProvider {}                continuous 0
+/// after    quotaDropsByProvider {"sub2api": 1}    continuous 0
+/// ```
 ///
 /// One drop recorded, none of them continuous. The producer path emits the false
 /// arm when handed the shape, which is the half unit tests could not establish.

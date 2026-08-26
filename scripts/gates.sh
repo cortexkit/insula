@@ -94,6 +94,15 @@ cargo clippy --workspace --all-targets -- -D warnings || fail "clippy"
 step "cargo test --workspace --lib --bins"
 cargo test --workspace --lib --bins || fail "unit tests"
 
+# DOCTESTS ARE A SEPARATE TARGET AND --lib --bins DOES NOT INCLUDE THEM. Neither
+# does --all-targets, which is the trap: it reads as "everything" and silently
+# omits exactly this. An indented block inside a /// comment is a Rust code block
+# to rustdoc, so an ASCII table in a doc comment is compiled -- and this gate ran
+# green over a broken master until a consumer ran plain `cargo test --workspace`
+# and reported it (insula#13).
+step "cargo test --workspace --doc"
+cargo test --workspace --doc || fail "doctests"
+
 if [ "$WITH_E2E" -eq 1 ]; then
     # The harness SPAWNS this binary; `cargo test --test` does not rebuild it,
     # and a stale one fails registration with no error output at all.
