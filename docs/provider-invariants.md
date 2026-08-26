@@ -2825,6 +2825,38 @@ matches once — and the extended pattern can be unique in the WRONG PLACE just 
 easily. UNIQUENESS IS NOT CORRECTNESS. Worth knowing at the moment the refusal
 fires, because that is exactly when the temptation appears.
 
+### A diagnostic that defaults an absent field to zero fabricates a measurement
+
+This repository's standing rule is that absence and a stated zero must not
+collapse. It is enforced on the wire, in provider normalizers, and in the contract.
+It was NOT enforced in the ad-hoc probes used to read this module's own health, and
+the result was a fabricated datum handed to a peer as a measurement.
+
+The probe read `(metrics.get('uptimeSecs') or 0) / 3600` and printed `0.0h`.
+`uptimeSecs` IS NOT A PUBLISHED FIELD. The output was indistinguishable from a
+module that had just restarted, so a stall was reported with a restart beside it,
+and a peer spent a log pass disproving the restart against their retained daemon
+log. `ps -o lstart=` settled it in one line: the process had been up three and a
+half hours.
+
+**Third instance this month, all in diagnostics rather than in shipped code.** A
+provider read an omitted block as a stated emptiness; a probe read a renamed metric
+as an unpopulated counter; this one read a field that never existed as a zero. The
+shipped code has guards for exactly this and the throwaway scripts do not, which is
+the whole pattern: THE RULE WAS APPLIED WHERE IT WAS WRITTEN DOWN AND NOT WHERE IT
+WAS TYPED IN A HURRY.
+
+**The cheap discipline, since a probe should not need a test suite:** when reading
+a metric you have not read before, print the RAW value including `None` before
+deriving anything from it. `or 0` and `or []` are the constructs to distrust —
+they are load-bearing defaults wearing convenience syntax. If the derived number
+matters enough to report, the raw one is worth one extra line.
+
+**And prefer an independent instrument for a claim about process identity.** The
+health surface cannot answer "did this process restart" at all, and no amount of
+careful reading of it would have; `ps -o lstart=` answers it directly and shares no
+machinery with the thing under suspicion.
+
 ### Filing a defect as a skill problem terminates the search for a mechanism
 
 The two instances above sat in these notes for weeks as "probe selection is itself
