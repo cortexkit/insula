@@ -230,6 +230,14 @@ python3 scripts/module_id_callers.py
 # measure this process's real disk reads and writes, with a control write to
 # prove the counter moves before reporting anything:
 python3 scripts/measure-disk-io.py
+
+# report when macOS Gatekeeper's scan list has filled with dead Rust build
+# artifacts. syspolicyd re-walks target/debug/deps looking for binaries cargo
+# already deleted -- measured here at 13k directory syscalls a second and
+# 40-137% of a core with NO build running. The database survives OS upgrades,
+# which is why reinstalling does not clear it. Exit 1 means maintenance is
+# indicated; clearing needs Recovery, because SIP protects the file while booted:
+python3 scripts/gatekeeper-scanlist.py
 ```
 
 ## Install as a supervised subc module
