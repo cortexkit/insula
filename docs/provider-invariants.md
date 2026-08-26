@@ -2610,9 +2610,15 @@ row had not moved in a week (2026-08-26). Their diagnosis generalises past that
 incident and has now been tested here.
 
 **The tell:** any health verdict computed over a SET rather than a single subject
-needs its population published, and the test is whether ONE ANOMALOUS MEMBER
-WOULD BE VISIBLE IN THE OUTPUT. If not, the verdict is a claim about the
-healthiest member wearing the population's name.
+needs its population PARTITIONED BY MEMBER STATE, and the test is whether ONE
+ANOMALOUS MEMBER WOULD BE VISIBLE IN THE OUTPUT. If not, the verdict is a claim
+about the healthiest member wearing the population's name.
+
+**Partitioned, not merely counted** — that wording is the result of running this
+test rather than the version that arrived. Publishing a denominator is only one
+way to satisfy it, and not the way this module does: what makes an anomalous lane
+visible here is that each provider lands in a bucket by its own state and the
+buckets are forced to sum. A count beside an aggregate would not have done it.
 
 **Why these survive review:** they are undetectable while the population is
 homogeneous. Their axis was correct for months because every provider refreshed,
@@ -2637,7 +2643,15 @@ makes the population visible, which was not why it was built.
 **Where the shape does exist here, and is documented rather than fixed:** health
 buckets are per PROVIDER, and a multi-account provider is bucketed by its best
 slot — one healthy account and one withheld reads as `serving`. At the account
-level, one anomalous member is invisible in health. The remedy is not a better
+level, one anomalous member is invisible in health.
+
+That is THE SAME DEFECT ONE LEVEL DOWN, not a smaller one: a provider bucketed by
+its best slot is precisely "the healthiest member wearing the population's name".
+The shape survived the fix at the provider level and reappeared at the account
+level, which is what to expect of it — fixing an instance does not exhaust the
+class, and the next place to look is one level in.
+
+The remedy is not a better
 health number; it is that account-level questions are answered from the `usage.get`
 array, which carries every account separately. Stated in the consumer contract as
 "health cannot substitute for this".
