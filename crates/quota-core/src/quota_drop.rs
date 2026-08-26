@@ -91,6 +91,23 @@ const NOISE_FLOOR_PERCENT: f64 = 1.0;
 
 /// How far past the base interval a gap must reach before the pair is untrusted.
 ///
+/// WITNESSED ON THE WIRE 2026-08-26, after thirteen recorded drops across two
+/// hosts had all read `true` and neither of us could say whether the false arm
+/// worked in production or only in tests. `scripts/witness-gap-drop.py` served a
+/// healthy window at 80%, then 503 (transient, so the prior reading survives)
+/// through four backoff rungs, then a healthy window at 10%:
+///
+///     before   quotaDropsByProvider {}                continuous 0
+///     after    quotaDropsByProvider {"sub2api": 1}    continuous 0
+///
+/// One drop recorded, none of them continuous. The producer path emits the false
+/// arm when handed the shape, which is the half unit tests could not establish.
+///
+/// Note what is required and why no real episode had produced it: the failure has
+/// to be TRANSIENT. A non-transient one resets the slot and destroys the prior
+/// reading the comparison needs, so no credential outage can fire this however
+/// long it lasts.
+///
 /// The refresher targets one reading per `BASE_INTERVAL`, and a tick that runs
 /// late by a few seconds is ordinary scheduling rather than a gap. Two intervals
 /// is comfortably outside normal jitter and comfortably inside the shortest
