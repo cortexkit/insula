@@ -83,6 +83,18 @@ pub enum CookieError {
     /// classified transient because a keychain may be locked or the browser may
     /// be mid-write, and neither describes a permission that persists until
     /// somebody changes it.
+    ///
+    /// WHAT RESOLVED IT HERE, because the next occurrence will look identical and
+    /// the obvious check misleads. A macOS 27 upgrade reset the grant. Once the
+    /// operator restored it, a FRESH process could read the profile immediately
+    /// while this module still could not -- macOS binds the decision to a process
+    /// at launch, so a long-running module keeps its denial until it restarts.
+    /// Granting is therefore not enough and the wire is not evidence the grant
+    /// failed: `ck module restart insula` is what applies it.
+    ///
+    /// The grant is also per process tree, so a shell that can read the file
+    /// proves nothing about this binary -- the daemon spawns it under a different
+    /// subject. The restart is the only real test.
     PermissionDenied(String),
     /// This platform is not supported (not macOS).
     Unsupported,

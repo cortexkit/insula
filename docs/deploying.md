@@ -33,6 +33,18 @@ cargo run -p quota-module --example vault-lanes
 cargo run -p quota-module --example deployed-sanity
 ```
 
+**If the whole browser-cookie cohort fails at once, restart before diagnosing.**
+Nine providers failing in one tick is a machine-level fact, not nine upstreams.
+On macOS the usual cause is a lost disk-access grant — an OS upgrade resets them —
+and the module reports it as `local_source_unavailable` naming the remedy.
+
+The trap is that granting access does **not** fix a running module: macOS binds
+the decision to a process at launch, so a fresh shell can read the profile while
+the module still cannot. `ck module restart insula` is what applies it, and until
+that restart the wire is not evidence the grant failed. The grant is per process
+tree too, so a shell reading the file proves nothing about this binary — the
+daemon spawns it under a different subject.
+
 **Run the checkers through `cargo run`, never from `target/release/examples/`.**
 `cargo build --release` does **not** build examples, so that directory can hold a
 checker from an earlier commit — and running it after a deploy silently validates
