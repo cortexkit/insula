@@ -97,7 +97,7 @@ uses `buffer_unordered(CONCURRENCY_CAP)`. The cap value of 8 is accurate.
 - **Read-time freshness (Oracle fix #5):** the served window's freshness is
   computed AT READ from `last_success_at` (`now - t <= FRESH_HORIZON`), never a
   stored boolean — a wedged refresher can therefore never serve `fresh=true`
-  forever. (`fresh` on the WIRE stays deferred until the ALF-coordinated serde
+  forever. (`fresh` on the WIRE stays deferred until the router-coordinated serde
   change; the spike computes+tests it internally.)
 
 ## Failure policy by class (Oracle fix #2: stale-healthy must not mislead)
@@ -196,8 +196,8 @@ remains the condition on any future implementation.
 `FRESH_HORIZON = 2 · BASE_INTERVAL` (120s) — i.e. fresh while the refresher is
 keeping the entry current; false once it falls a cycle behind (backoff / wedge).
 Tracked internally + in tests for the spike. `fresh: bool` on the WIRE is a
-shared-shape serde change (two consumers: ALF pace extractor + router) and is
-NOT shipped until coordinated with ALF.
+shared-shape serde change (two consumers: the router's pace extractor and its dispatcher) and is
+NOT shipped until coordinated with the router.
 
 ## Health integration (Q4 observable) — Oracle fix #3
 
@@ -222,8 +222,8 @@ detail:
 ## Explicitly OUT of the spike (full-scope, later)
 
 - Multi-account per-`(provider, account)` fetch (needs vault list-accounts + own
-  handles) — gated on ALF bandwidth + Ufuk sequencing.
-- Shipping `fresh: bool` on the wire — coordinate with ALF's extractor first.
+  handles) — gated on router-side bandwidth + Ufuk sequencing.
+- Shipping `fresh: bool` on the wire — coordinate with the router's extractor first.
 - Prod graduation — reserved behind the pre-ship Oracle pass + a live smoke.
 
 ## Oracle verdicts (bg_f9972eaf) — resolved
@@ -245,9 +245,9 @@ Architecture confirmed sound (cache-only read + single background refresher);
 ## Cross-module / graduation gates (unchanged)
 
 - Ship `fresh: bool` on the wire only after coordinating the serde change with
-  ALF's extractor (two consumers).
+  the router's extractor (two consumers).
 - A SECOND Oracle pass on the implementation + a live prod smoke before the
   refresher graduates from spike to prod.
 - Cold-start "absent provider = no-data (not a signal)" is a router-contract
-  assumption — confirm ALF's reader treats an absent provider as unusable-for-
+  assumption — confirm the router's reader treats an absent provider as unusable-for-
   ranking, not as zero/healthy/negative.

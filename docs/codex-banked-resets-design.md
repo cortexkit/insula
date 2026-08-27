@@ -11,7 +11,7 @@ was written in, not the state of the system.
 > `docs/consumer-contract.md` for what reaches the wire.
 
 Original status: DESIGN v2 — adversarial Oracle pass folded (8 findings, 4 critical).
-Date: 2026-07-14. Ufuk-approved shape (one knob, module-local, no ALF change;
+Date: 2026-07-14. Ufuk-approved shape (one knob, module-local, no the router change;
 exhaustion backstop confirmed). v1 of this note was ruled UNSAFE by the Oracle
 pass; every mechanism below that differs from v1 exists to close a named
 finding (F1..F8).
@@ -25,8 +25,8 @@ OpenAI grants Codex accounts banked rate-limit reset credits ("Full reset",
    letting the account sit hard-blocked at the rate-limit wall while credits
    exist.
 2. While the feature is armed and credits are verifiably available, report
-   codex windows to the consumer as unused (`usedPercent: 0`) so ALF's pace
-   model relaxes. No ALF-side change; the relaxation is expressed entirely
+   codex windows to the consumer as unused (`usedPercent: 0`) so the router's pace
+   model relaxes. No the router-side change; the relaxation is expressed entirely
    through the existing wire shape.
 
 The v1 claim "the account can never sit at the wall" is NOT achievable with a

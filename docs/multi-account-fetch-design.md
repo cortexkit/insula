@@ -5,7 +5,7 @@ per-(provider, handle) machinery, all 7 design-Oracle corrections, and all
 implementation-Oracle fixes are merged; every provider is migrated and codex emits
 a real single-account label. What remains is the VAULT-CONSUMER WIRING (a vault
 client + minted handles reading `GetResult.account_id` per handle) that lights up
-Ufuk's actual second account — a follow-on build, now unblocked (CKCRED shipped
+Ufuk's actual second account — a follow-on build, now unblocked (the credential vault shipped
 the field). The two-account live smoke waits on that wiring, not on any external
 gate.
 
@@ -17,13 +17,13 @@ gate.
 > entry beside its labeled siblings. `docs/consumer-contract.md` is authoritative
 > for the emitted shape.
 
-History: CKCRED enumeration contract folded, then a design-Oracle pass (3 CRITICAL
+History: the credential vault enumeration contract folded, then a design-Oracle pass (3 CRITICAL
 + 3 HIGH, folded into "Oracle-mandated corrections" below), then the build, then an
 implementation-Oracle pass that caught F1 (a CRITICAL stale-serve-old-account bug
 on timeout) + 5 latent traps, all fixed with non-vacuous regression tests before
 merge.
 
-## CKCRED enumeration contract (the load-bearing input, now known)
+## the credential vault enumeration contract (the load-bearing input, now known)
 
 Corrects the earlier `list-accounts` assumption:
 - **No `list-accounts` endpoint.** The vault read model is anonymous capability
@@ -48,7 +48,7 @@ reads a single credential from a fixed location (codex from `~/.codex/auth.json`
 grok/claude from the opencode auth store, etc.) and emits one `ProviderUsage`.
 
 Ufuk runs **two OpenAI OAuth accounts** (one in `~/.codex/auth.json`, one in the
-vault). The router's account-scoped overlay (ALF's S1, independently deployable)
+vault). The router's account-scoped overlay (the router's S1, independently deployable)
 needs a usage signal **per account** to pace each account's routes on that
 account's own remaining quota. The module cannot supply that yet: it emits usage
 for whichever single account sits in `~/.codex/auth.json` and nothing for the
@@ -62,11 +62,11 @@ other. This note is the module-side change that emits **one labeled entry per
   (`codex.rs:72,254`) — the ChatGPT-Account-Id claim, a JSON field separate from
   `access_token`, so it survives token refresh and changes only on an account
   swap. This is the agreed identity contract; the join key is that same string.
-- **Emission rule (ALF-confirmed).** Label present on every entry once a provider
+- **Emission rule (router-confirmed).** Label present on every entry once a provider
   has multiple credentials; absent OK for single-credential providers; two
   unlabeled entries for one provider = contract violation. The 28 non-codex
   providers pass `account: None` today and stay single-credential.
-- **Freshness (ALF-confirmed, unchanged).** `fresh: bool` per window,
+- **Freshness (router-confirmed, unchanged).** `fresh: bool` per window,
   serde-default; the router owns discount policy. Not part of this change.
 - **Refresher base (prod-proven).** The background refresher + cache-only read
   (`refresh.rs`, `store.rs`, `Registry::refresh_tick`) is the base this builds
@@ -111,7 +111,7 @@ units. Concretely:
    ```
    `handles()` is a cheap config read (the known handle set), enumerated for every
    provider on every scheduler turn (H5) — there is NO `list-accounts` vault RPC
-   (CKCRED contract). Machine-local providers return one implicit handle and
+   (the credential vault contract). Machine-local providers return one implicit handle and
    behave exactly as today.
 
 2. **Slot key.** `SlotStore` keys on `SlotKey { provider: String, handle:
@@ -281,9 +281,9 @@ findings each get an explicit adversarial test:
 
 ## Sequencing
 
-Design note (this doc — CKCRED contract + Oracle corrections folded) → implement
+Design note (this doc — the credential vault contract + Oracle corrections folded) → implement
 on a branch with the C1–M7 fixes → unit + integration green with account_id
-absent (safe degrade, the router-contract-critical interim) → CKCRED ships
+absent (safe degrade, the router-contract-critical interim) → the credential vault ships
 `GetResult.account_id` → live smoke via driver drain-restart proving two labeled
 codex entries + a live `replace` flipping the label → merge. No rush; do not
 preempt current lane priorities. The only hard external dependency remaining is

@@ -15,7 +15,8 @@
 > response shapes, and the reasoning behind each deferral. Read it as a study of
 > upstream, and check the registry for what we actually serve.
 
-Reverse-engineered from CodexBar source (`/Users/ufukaltinok/Work/OSS/CodexBar/Sources/CodexBarCore/Providers/*`),
+Reverse-engineered from [CodexBar](https://github.com/steipete/CodexBar) source
+(`Sources/CodexBarCore/Providers/*`),
 every row cited to `file:line` in the study transcripts. This is the map that
 makes parallel fan-out safe: the **auth archetype** is the unit of effort (shared
 auth+fetch scaffolding within a group), so one worker owns one archetype group.
@@ -719,21 +720,21 @@ refresh-coordination detail; **Doubao** is a struct-field cleanup.
 
 ## The load-bearing finding: only ~24 of 46 actually have a RATE WINDOW
 
-Alfonso consumes **RateWindows** — `{ utilization, resetsAt, windowMinutes }` —
+The router consumes **RateWindows** — `{ utilization, resetsAt, windowMinutes }` —
 and its pace/pressure projection is built on them. But a large fraction of
 CodexBar's providers expose **no window at all** — they report a credit balance, a
 cumulative cost, or a remaining count with no reset time or window length. Those
-do not fit the RateWindow model and Alfonso's pace projection cannot use them.
+do not fit the RateWindow model and the router's pace projection cannot use them.
 
 - **HAS WINDOW (~24)** — session/weekly/monthly utilization + reset. These are the
-  providers worth porting for Alfonso's actual need.
+  providers worth porting for the router's actual need.
 - **NO WINDOW (~17)** — cost/credits/balance/count only. Porting them produces an
   entry with no usable window (silent-degrade territory, or a different "credits"
-  signal Alfonso doesn't model today).
+  signal the router doesn't model today).
 - **PARTIAL (~5)** — a window on one sub-signal (e.g. codebuff's weekly
   subscription limit) but credits on the primary.
 
-> **RULINGS (Ufuk + ALF, locked):** v1 = the window-bearing set only; the
+> **RULINGS (Ufuk + the router, locked):** v1 = the window-bearing set only; the
 > "all 46" lock is revised. The former NO-WINDOW set is re-categorized in Group 6
 > below into IMPLICIT-RESET (faithful reset → promotable into v1, e.g. **copilot**),
 > TRULY-RESETLESS (prepaid balance → the reserved `Balance` seam, deferred), and
@@ -743,9 +744,9 @@ do not fit the RateWindow model and Alfonso's pace projection cannot use them.
 **Q-matrix-1 — RESOLVED:** v1 is window-bearing only; NO-WINDOW deferred as an
 additive fan-out. (Kept below for history.) The original question was: port all 46
 (NO-WINDOW emit a degraded/credits entry), or scope the fan-out to
-the ~24 window-bearing providers that Alfonso's pace model can actually use? My
+the ~24 window-bearing providers that the router's pace model can actually use? My
 lean: port the ~24 window-bearing first (real value), defer NO-WINDOW until we
-decide whether Alfonso should model a credits/balance signal at all. This is a
+decide whether the router should model a credits/balance signal at all. This is a
 behavior/scope decision, so I'm surfacing it before dispatching workers.
 
 ---
@@ -856,8 +857,8 @@ headless-SOURCEABLE (reads the editor's own native SQLite `state.vscdb` →
 `windsurf.settings.cachedPlanInfo`, with real `dailyResetAtUnix`/`weeklyResetAtUnix`),
 but it is fundamentally a DIFFERENT KIND of signal: an editor CACHE, not a live
 fetch. The deciding problem is "consumed AS-LIVE" — any window we emit is used by
-Alfonso's router identically to a live-fetched one (source is observability-only;
-the router does not discount on it), yet windsurf's value can be hours-to-days stale
+the router identically to a live-fetched one (source is observability-only; the
+router does not discount on it), yet windsurf's value can be hours-to-days stale
 and we CANNOT measure how stale:
 - No per-key write-timestamp exists in the cache; `state.vscdb` mtime is the
   shared-DB last-write of ANY VSCode key, reliable only as "file ancient ⇒ drop",
@@ -895,8 +896,8 @@ the wrong question.
 UNBLOCK CONDITIONS (revisit precisely when any lands): (1) windsurf exposes a real
 headless USAGE FETCH endpoint (live value) → builds like any live provider; (2) the
 cache grows a per-key write-timestamp → staleness becomes measurable; (3) we add a
-staleness/confidence field to `ProviderUsage` that the router discounts on (ALF's-
-call model+consumer change, same shape as the balance seam) → the reset-guarded
+staleness/confidence field to `ProviderUsage` that the router discounts on (a
+consumer-side model change, same shape as the balance seam) → the reset-guarded
 design above becomes shippable as-is.
 
 **Condition (3) is now PARTLY met, and the gap is smaller than this section
@@ -995,7 +996,7 @@ protobuf decoding of the billing Timestamps, not JSON.
 | kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL (not in v1) |
 | **codebuff** ✅ | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage + GET /api/user/subscription | weekly (subscription) — DONE, commit 7a3f4c9 |
 
-### Group 6 — the former "NO WINDOW" set, re-categorized (ALF ruling)
+### Group 6 — the former "NO WINDOW" set, re-categorized (router ruling)
 
 "No window" conflated two different things. Each provider below is now tagged:
 - **IMPLICIT-RESET** — quota-like with a FAITHFUL reset the provider itself
@@ -1050,7 +1051,7 @@ not parallel workers:
 - 1 worker per archetype GROUP (disjoint files: `<provider>.rs` each), starting
   with Group 2 (api-key-env + window — simplest, highest parity-per-effort).
 - Group 1 (antigravity/gemini) — 1 worker; Google oauth refresh is the shared cost.
-- Group 3 (cookie/web) — deferred or per-provider, decide which matter to Alfonso.
+- Group 3 (cookie/web) — deferred or per-provider, decide which matter to the router.
 - Workers touch ONLY their `<provider>.rs` + one additive Registry line; any
   model.rs/lib.rs change routes through me.
 
@@ -1061,6 +1062,6 @@ not parallel workers:
   deepseek, google, xai, ollama-cloud, ...), prefer the opencode-store bearer over
   CodexBar's cookie/keychain path? (my lean: yes — simpler, cross-platform, already
   proven for claude.)
-- **Q-matrix-3 (credits signal):** should Alfonso model a credits/balance signal at
+- **Q-matrix-3 (credits signal):** should the router model a credits/balance signal at
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)

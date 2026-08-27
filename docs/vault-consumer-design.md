@@ -25,7 +25,7 @@ emission gate C1, incarnation fencing, F1 unverified-failure path) is SHIPPED;
 this note adds the credential plumbing AND four machinery corrections the
 Oracle found necessary (V1, V2, V4, V6 below).
 
-## Vault state AS OF THE DESIGN (CKCRED-confirmed 2026-07-16, receipt-verified)
+## Vault state AS OF THE DESIGN (confirmed by the credential vault 2026-07-16, receipt-verified)
 
 **This inventory is a snapshot, not a live reading, and it has already moved.**
 The heading used to say "live vault state", which invites the opposite. On
@@ -51,7 +51,7 @@ vault-native login), `oauth:anthropic` (v22), `oauth:xai` (v10),
 gemini-cli entry; its get also serves `project_id`; account_id None by
 design, claim table maps openai-family only).
 
-## Upstream contract (verified live + CKCRED-confirmed)
+## Upstream contract (verified live, and confirmed by the credential vault)
 
 - `credential.get { handle, min_ttl_ms? }` → two-level decode (broca-proven):
   Response `{ "result": ... }` where success = `{ payload: [u8],
@@ -264,7 +264,7 @@ snapshot per mapped entry. Prefix table: `chatgpt:openai*` → codex;
   endpoints; account_id absent upstream today → C1 keeps one unlabeled entry
   (narrowed since: the collapse now needs that handle to be SERVING USAGE — see
   docs/consumer-contract.md, which is authoritative for the emitted shape)
-  per provider (ALF-confirmed interim).
+  per provider (router-confirmed interim).
 - gemini (merge 3, V9): STRICT dispatch by handle source. Implicit-local
   keeps today's file/cache/refresh path. The vault lane parses the served
   credential JSON, uses ONLY the served access token, NEVER consults or
