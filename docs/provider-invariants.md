@@ -2931,12 +2931,31 @@ well inside the window, and watch the verdict arrive early.
 
 ```text
 ep13  one off-schedule get at report+60.2s   verdict +60.7s   prefix collapsed
-ep14  unperturbed control, same everything    verdict ~+300s   prefix exactly 10
+ep14  unperturbed control, same everything    verdict ~+300s   prefix 9 or 10
 ```
 
 One frame separates them. So the ~301s is this module's `NON_TRANSIENT_BACKOFF`
 plus a round-trip, twelve prior episodes agreed because they shared a cause, and
 the store's figure was never corroboration.
+
+**A COUNT OBTAINED BY SAMPLING IS NOT AN INTEGER PROPERTY OF THE MECHANISM.** The
+filer first published the prefix as "exactly 10", citing two independent recorders
+agreeing, and then corrected it when a third episode had the same two recorders
+disagree — 9 against 10, from a 15s phase offset between them. Both readings were
+correct: a 300s interval sampled every 30s yields 9 or 10 observations depending
+on where the observer's phase falls against the window boundaries.
+
+The correction is worth more than the number. Two independent recorders agreeing
+is the strongest evidence available for a sampled quantity, and it still did not
+establish an integer — because both shared the cadence, so the agreement was
+about their common phase rather than about the mechanism. The same shape as the
+single-consumer confound below, one level down: agreement between instruments
+that share a property carries no information about that property.
+
+Stated correctly: the rejected phase lasts one `NON_TRANSIENT_BACKOFF`, and a
+poller measures it to within its own sampling period. `docs/consumer-contract.md`
+says "about ten samples" and did not need correcting; this file said "exactly"
+and did.
 
 **The general form is theirs and it is the part to keep: a single-consumer system
 cannot distinguish a property of the server from a property of its only client.**
