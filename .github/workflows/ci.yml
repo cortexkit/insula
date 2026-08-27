@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
   workflow_call:
+  # Manual re-run without a dummy commit. Added when the repo went public: a
+  # contributor whose run failed on infrastructure rather than on their change
+  # otherwise has to push an empty commit to retry, which puts noise in the
+  # history to work around a missing button.
+  workflow_dispatch:
 
 # Rapid pushes supersede each other: only the tip ships, so paying for a full run
 # of every intermediate commit buys nothing.
