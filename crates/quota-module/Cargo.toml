@@ -3,7 +3,9 @@ name = "quota-module"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "The ai-provider-quota subc module: registers a ManagementSurface, answers usage.get over the subc wire with ProviderUsage[]."
+description = "The insula subc module: registers a ManagementSurface and answers usage.get over the subc wire with ProviderUsage[]."
+license = "MIT"
+repository = "https://github.com/cortexkit/insula"
 
 # The binary name is the process name an operator sees in Activity Monitor, so
 # it tracks the module's own name rather than the crate's. Renaming it also

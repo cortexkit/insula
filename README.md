@@ -1,14 +1,30 @@
 # insula
 
-A subc-supervised module that knows every AI provider's usage limits and reset
-windows — the headless engine that replaces the external **CodexBar** dependency.
+Reads how much quota is left on every AI provider you have an account with, and
+when each window resets.
 
-Alfonso's model router needs to know how much quota each provider has left and when
-each window resets, so it can route around exhaustion (the "provider is in a quota
-cooldown" decisions). This module fetches each provider's usage by reusing the
-user's OWN existing session (OAuth token, API key, local CLI file), normalizes it to
-a uniform `ProviderUsage[]` shape, and serves it **through subc** — so Alfonso
-connects to subc (not an external binary) for its quota signal.
+If you route work across several providers, the thing you need before dispatching
+is not a price list — it is whether the account you are about to use has capacity
+left, and if not, when it comes back. That answer exists behind ~37 different
+endpoints, in ~37 different shapes, behind ~37 different kinds of credential.
+This module fetches all of them, normalizes the result to one shape, and answers
+from cache so a caller never blocks on the network.
+
+**It reuses the session you already have.** No new credential is issued and no
+password is asked for: it reads the OAuth token your provider CLI already wrote,
+the API key already in your environment, the browser cookie your logged-in
+session already holds. A provider you are not signed in to simply reports that,
+rather than failing the request for the others.
+
+It runs as a module under [subc](https://github.com/cortexkit/subconscious), a
+local supervisor that spawns it, health-checks it, and routes requests to it — so
+a consumer talks to one daemon rather than to a binary per concern.
+
+Prior art worth naming: [CodexBar](https://github.com/steipete/CodexBar) solves
+the display half of this problem on macOS, and its provider fetchers are the
+reference this module's normalizers are checked against on every upstream
+release. The difference is that this one is headless, cross-platform, and
+answers over a wire rather than drawing a menu bar.
 
 **Adding or changing a provider: read `docs/provider-invariants.md` first.** It lists
 the properties a normalizer must uphold, each recovered from a defect that shipped.
