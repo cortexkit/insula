@@ -42,34 +42,39 @@ from __future__ import annotations
 
 import datetime
 import os
+import shutil
 import subprocess
 import sys
 import time
 
-# PERCENT OF ONE CORE, the `ps -o %cpu` convention -- so 137 means 1.37 cores, and
-# on this 18-core machine full capacity is 1800. Healthy syspolicyd is 0-4;
-# observed wedges ran 40-137 sustained.
+# EXEC LATENCY IS THE TRIGGER, NOT CPU. The first version of this file fired on
+# syspolicyd CPU >= 60% and would have sat armed through the very episodes it was
+# built for: the operator reported that during a real wedge there is NO notable
+# CPU load, and measurement backed them up.
 #
-# WHICH MEANS THE WEDGE IS NOT CPU STARVATION, and reading this number as load is
-# the wrong lesson to draw from it. 1.37 cores out of 18 is 7.6% of the machine:
-# it cannot stall anything by consuming capacity, and during the episodes the
-# other 16 cores sat idle. syspolicyd stalls the machine because EVERY exec must
-# be validated by IT SPECIFICALLY -- it is a serialisation point, not a hog. The
-# remedy is therefore fewer or cheaper validations, never more cores.
+# What is actually expensive is the FIRST exec of a freshly written binary --
+# roughly 250-620 ms against 4 ms to re-exec the same file, measured on real Rust
+# test binaries. That cost is a wait, not a spin, which is exactly why the machine
+# looks idle while nothing can start. A CPU threshold cannot see a queue of waits.
 #
-# So this threshold is not a load measurement. It is a proxy for "syspolicyd is
-# doing far more work than its steady state", which is the only externally visible
-# sign that its queue is backed up. Verified that `ps -o %cpu` is current enough to
-# trigger on: against a known 100%-of-one-core burner it read 98.4 within 2
-# seconds, so it is not a long-decayed average.
-TRIGGER_PCT = 60.0
+# So this probes the symptom itself: write a small fresh binary, exec it, time it.
+# It fires whether syspolicyd spins, blocks, or dies, and it needs no privileged
+# read to decide. The healthy figure has a wide margin below the trigger, and
+# during a wedge the probe's own exec is subject to the wedge -- so a probe that
+# takes many seconds IS the measurement rather than a failure of it.
+PROBE_TRIGGER_MS = 3000.0
+
+# Retained only for the post-trigger record, never as the trigger.
+BUSY_PCT = 60.0
 
 # Two consecutive samples, so a momentary spike during normal validation work does
 # not fire it. Deliberately much shorter than the watchdog's 120s sustain: this
 # wants to catch the ONSET, and waiting two minutes to be sure would record the
 # middle of an episode rather than its beginning.
-SAMPLE_SECS = 5
-CONSECUTIVE = 2
+# The probe itself costs ~250-400 ms of real validation work, so its cadence is a
+# cost decision rather than a resolution one. At 30s that is under 1.5% duty, and
+# an episode lasting less than one interval is not one anybody noticed.
+SAMPLE_SECS = 30
 
 # Do not re-capture the same episode over and over.
 COOLDOWN_SECS = 900
@@ -79,6 +84,101 @@ OUT_DIR = os.path.expanduser("~/.local/state/cortexkit/syspolicyd-captures")
 
 def now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+_PROBE_SRC: str | None = None
+
+
+def probe_source() -> str:
+    """A binary from the EXPENSIVE set, resolved once.
+
+    Cached because the search walks the fleet's build directories, and doing that
+    every few seconds would make the watcher part of the load it is watching for.
+    """
+    global _PROBE_SRC
+    if _PROBE_SRC:
+        return _PROBE_SRC
+    root = os.path.expanduser("~/Work/Projects/CortexKit")
+    skip = (".rlib", ".rmeta", ".d", ".o", ".dylib", ".so", ".a")
+    if os.path.isdir(root):
+        for repo in sorted(os.listdir(root)):
+            deps = os.path.join(root, repo, "target", "debug", "deps")
+            if not os.path.isdir(deps):
+                continue
+            try:
+                names = os.listdir(deps)
+            except OSError:
+                continue
+            for f in names:
+                cand = os.path.join(deps, f)
+                if f.endswith(skip):
+                    continue
+                try:
+                    ok = (os.path.isfile(cand) and os.access(cand, os.X_OK)
+                          and os.path.getsize(cand) > 100_000)
+                except OSError:
+                    continue
+                if ok:
+                    _PROBE_SRC = cand
+                    return _PROBE_SRC
+    _PROBE_SRC = "/usr/bin/true"
+    return _PROBE_SRC
+
+
+def probe_exec_ms() -> float:
+    """Time the first exec of a freshly written binary -- the thing that stalls.
+
+    A NEW FILE EVERY TIME, deliberately. Re-execing one file measures the cached
+    path (4 ms even mid-wedge) and would report health throughout an episode. The
+    cost being probed is specifically the first-evaluation cost, so the probe has
+    to pay it.
+
+    Copies a system binary rather than compiling one: the wedge blocks exec, and a
+    probe that needed a toolchain to run would be the first thing to stop working.
+
+    THE SOURCE BINARY IS NOT ARBITRARY, and picking it wrong makes the probe read
+    healthy through an episode. Measured on this machine: fresh copies of
+    /bin/echo, /bin/ls and /usr/bin/git cost ~1.5 ms, while fresh copies of
+    /usr/bin/true and of real Rust test binaries cost 250-620 ms. Something
+    distinguishes those two sets that I have not identified -- it is not size, not
+    signature presence, and not content caching, all of which were tested and
+    ruled out.
+
+    Rather than probe with a binary from the cheap set and call the machine
+    healthy, this prefers a REAL Rust test binary from the fleet, which is both
+    the population that actually stalls and a member of the expensive set by
+    measurement. `/usr/bin/true` is the fallback because it is the only expensive
+    member guaranteed to exist. `/bin/echo` is deliberately NOT used.
+    """
+    # A FIXED PATH, REWRITTEN, not a fresh name each time. This matters more than
+    # it looks: `scan_targets_v2` has PRIMARY KEY (path), so a unique probe name
+    # every interval would add a row every interval -- about 17k/day at a 5s
+    # cadence, roughly three times this machine's natural accumulation rate. The
+    # watcher would then be feeding the exact pile it was written to diagnose.
+    #
+    # Rewriting one path is free of that AND still pays the full cost: measured
+    # 244 ms for a rewritten same-path binary versus 4 ms to re-exec an untouched
+    # one. Validation keys on the bytes, the scan list keys on the name, and this
+    # probe sits deliberately on the right side of both.
+    path = os.path.join(OUT_DIR, "probe-fixed-path")
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        shutil.copy(probe_source(), path)
+        os.chmod(path, 0o755)
+        start = time.perf_counter()
+        subprocess.run([path], capture_output=True, timeout=120)
+        return (time.perf_counter() - start) * 1000.0
+    except subprocess.TimeoutExpired:
+        # Two minutes to exec /bin/echo is the strongest possible reading, not an
+        # instrument failure. Report it as the number it is.
+        return 120_000.0
+    except Exception:  # noqa: BLE001 - a probe must never take the watcher down
+        return -1.0
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def syspolicyd() -> tuple[int, float] | None:
@@ -113,14 +213,17 @@ def run(cmd: list[str], timeout: int) -> str:
         return f"<<< FAILED: {exc} >>>\n"
 
 
-def capture(pid: int, cpu: float) -> str:
+def capture(pid: int, cpu: float, probe_ms: float) -> str:
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"wedge-{now().replace(':', '')}.txt")
 
     # Written FIRST, before anything is spawned, so that a capture which cannot
     # run its own commands still leaves the one fact it already knows.
     with open(path, "w") as fh:
-        fh.write(f"syspolicyd wedge captured {now()}\n  pid {pid} at {cpu:.0f}%\n\n")
+        fh.write(f"syspolicyd wedge captured {now()}\n"
+                 f"  fresh-binary exec took {probe_ms:.0f} ms "
+                 f"(healthy is single-digit)\n"
+                 f"  syspolicyd pid {pid} at {cpu:.0f}% of one core\n\n")
         fh.flush()
 
         fh.write("=== open handles (which paths is it walking) ===\n")
@@ -161,30 +264,32 @@ def capture(pid: int, cpu: float) -> str:
 
 
 def main() -> int:
-    print(f"{now()} capture armed (trigger {TRIGGER_PCT}% x{CONSECUTIVE} "
-          f"@{SAMPLE_SECS}s, output {OUT_DIR})", flush=True)
-    hot = 0
+    print(
+        f"{now()} capture armed (fires when a fresh-binary exec exceeds "
+        f"{PROBE_TRIGGER_MS:.0f} ms; output {OUT_DIR})",
+        flush=True,
+    )
     last = 0.0
     while True:
         time.sleep(SAMPLE_SECS)
-        state = syspolicyd()
-        if state is None:
-            hot = 0
+        elapsed = probe_exec_ms()
+        if elapsed < 0:
             continue
-        pid, cpu = state
-        if cpu < TRIGGER_PCT:
-            hot = 0
+        if elapsed < PROBE_TRIGGER_MS:
             continue
-        hot += 1
-        if hot < CONSECUTIVE:
-            continue
+        # One consecutive reading is enough here, unlike the CPU version: a
+        # multi-second exec of /bin/echo is not something a healthy machine does
+        # transiently, and waiting for a second sample spends another interval of
+        # an episode that is already underway.
         if time.monotonic() - last < COOLDOWN_SECS:
             continue
-        print(f"{now()} TRIGGER pid {pid} at {cpu:.0f}%", flush=True)
-        path = capture(pid, cpu)
+        state = syspolicyd()
+        pid, cpu = state if state else (0, 0.0)
+        print(f"{now()} TRIGGER exec took {elapsed:.0f} ms "
+              f"(syspolicyd pid {pid} at {cpu:.0f}%)", flush=True)
+        path = capture(pid, cpu, elapsed)
         print(f"{now()} captured -> {path}", flush=True)
         last = time.monotonic()
-        hot = 0
 
 
 if __name__ == "__main__":
