@@ -2964,6 +2964,65 @@ the confound lives IN the loop — it took a stimulus the only client would neve
 produce. Watch for it wherever this module is the sole caller of something whose
 timing we then characterise.
 
+### Refusal is correct only where the walker knows the value is adjudicable
+
+A rule written for TYPED VALUES, applied by a traversal that also reaches PROSE,
+refuses on content that merely contains a value-shaped substring. Where a walk
+might be traversing content rather than fields, the honest arms are pass-through
+or report — never refuse.
+
+**We shipped this bug and a reviewer caught it.** `PoolFunding` / `PoolBasis` on
+the shared wire crate originally failed deserialization of the WHOLE
+`ProviderUsage` entry on an unrecognised variant, so one unknown funding kind
+would have discarded an entry carrying a live 42% window. The fix was fallback
+variants (`Unknown`, `Unstated`), not a longer list of known ones — a longer list
+defers the next unknown, a fallback ends the class.
+
+**And we have the mirror case, which survived for a reason worth naming.**
+`scripts/public-flip-verifier.py` applies credential patterns to every blob in
+history, necessarily including test fixtures. It found three hits and all three
+were legitimate: two are `user:pass@host` URLs that exist to prove the userinfo
+guard REJECTS them, so deleting the specimens would delete the tests defending
+the exposure class the scan is for.
+
+It survived because it REPORTS FOR A HUMAN READ rather than refusing. The pattern
+design was not better than the one that broke a peer's module — the same false
+positives fired. **Report-versus-refuse was the load-bearing choice**, and that
+was not obvious when the tool was written.
+
+THE STRUCTURAL FIX BEATS THE BETTER PREDICATE: fix the traversal so it cannot
+reach content, rather than sharpening the pattern so it matches less. A sharper
+pattern is a patch; the next document with different prose finds it again.
+
+### Exit codes name the mechanism, never the intent
+
+An exit code reports what happened to a process. It does not report what the
+result MEANS for the question you were asking, and the gap between those is where
+false proofs live.
+
+**Found in `scripts/probe.py`, the tool every mutation proof here depends on.** It
+returned `1` for a hung suite, and `1` is documented as "something reddened (the
+usual proof)". The printed text was honest — "load-bearing, but no test named it"
+— but a caller reading only the exit code would have been handed a proof nobody
+wrote. HUNG now exits 2, with load-bearing and defended kept as separate claims.
+
+Three more instances from one day, all the same shape:
+
+| observed | mechanism | what it was read as |
+| --- | --- | --- |
+| gate exit 1 after a mutation | formatting failed first | the doctest arm proving itself |
+| `timeout` kill, exit 124 | SIGTERM skipped a `finally` | a clean failed run, tree left mutated |
+| peer module exit 101 | deliberate refusal-before-write | a crash mid-migration |
+
+The last was a peer's, and the correction is the reusable part: **right about the
+signal, wrong about what it meant.** The rollback was byte-clean every attempt,
+which is why their recovery was pure fix-forward rather than repair.
+
+THE CHECK: before reading a non-zero exit as evidence for your question, name the
+mechanism that produced it. If more than one mechanism produces the same code,
+the code is not the evidence — the text is, and an automated caller reading only
+the code is being told something nobody asserted.
+
 ### A median over repetitions reports the cached cost, not the first-time one
 
 Measured 2026-08-27 while confirming a peer's hypothesis that macOS code-signature
