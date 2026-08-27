@@ -57,6 +57,10 @@ what is there — each carries a list of the details that shipped differently:
 | `multi-account-fetch-design.md` | why slots key on credential handle rather than account |
 | `vault-consumer-design.md` | how credentials are fetched from the vault, and what fails closed |
 
+**Reporting a bug that involves a provider payload:** read `SECURITY.md`
+first. A captured response often carries a live token, and this project's whole
+subject matter makes that the easy mistake to make.
+
 ## What it serves
 
 A subc `ManagementSurface` exposing one query operation, `usage.get`, which returns
