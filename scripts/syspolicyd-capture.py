@@ -46,8 +46,22 @@ import subprocess
 import sys
 import time
 
-# Healthy is 0-4% of a core; observed wedges ran 40-137% sustained. 60 is above
-# any healthy reading seen and below the floor of every observed episode.
+# PERCENT OF ONE CORE, the `ps -o %cpu` convention -- so 137 means 1.37 cores, and
+# on this 18-core machine full capacity is 1800. Healthy syspolicyd is 0-4;
+# observed wedges ran 40-137 sustained.
+#
+# WHICH MEANS THE WEDGE IS NOT CPU STARVATION, and reading this number as load is
+# the wrong lesson to draw from it. 1.37 cores out of 18 is 7.6% of the machine:
+# it cannot stall anything by consuming capacity, and during the episodes the
+# other 16 cores sat idle. syspolicyd stalls the machine because EVERY exec must
+# be validated by IT SPECIFICALLY -- it is a serialisation point, not a hog. The
+# remedy is therefore fewer or cheaper validations, never more cores.
+#
+# So this threshold is not a load measurement. It is a proxy for "syspolicyd is
+# doing far more work than its steady state", which is the only externally visible
+# sign that its queue is backed up. Verified that `ps -o %cpu` is current enough to
+# trigger on: against a known 100%-of-one-core burner it read 98.4 within 2
+# seconds, so it is not a long-decayed average.
 TRIGGER_PCT = 60.0
 
 # Two consecutive samples, so a momentary spike during normal validation work does
