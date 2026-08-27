@@ -14,8 +14,16 @@ which makes the destructive version unreachable rather than discouraged.
 
     probe.py <file> <old-text> <new-text> [-- cargo test args...]
 
-Exit codes: 0 nothing reddened, 1 something reddened (the usual proof), 2 the
-mutation could not be applied or the tree could not be restored.
+Exit codes: 0 nothing reddened, 1 A NAMED TEST reddened (the usual proof), 2 no
+proof could be established -- the mutation would not build, the tree could not be
+restored, or the suite hung.
+
+HUNG EXITS 2, NOT 1, and the reason is worth stating because the text and the exit
+code used to disagree. A hang IS evidence that the mutated thing is load-bearing,
+so reporting it as a finding is right in prose. But the proof this tool exists to
+produce is "a named test asserts this", and a hang produces no name -- so a caller
+reading only `$? == 1` as "mutation proven" would have been given a proof that
+nobody wrote. The exit code names the mechanism; only the text carries the intent.
 """
 
 import signal
@@ -120,8 +128,11 @@ def main(argv):
         # A third outcome, distinct from red and green: removing the thing under
         # test changed control flow enough that the suite never finished, so it
         # is load-bearing but nothing reported on it.
+        #
+        # Exits 2 rather than 1: load-bearing is not the same claim as defended,
+        # and 1 is reserved for "a named test reddened". See the module docstring.
         print(f"  HUNG after {TIMEOUT_SECS}s -- load-bearing, but no test named it")
-        return 1
+        return 2
     if outcome == "did-not-build":
         print("  DID NOT BUILD -- the mutation was malformed, so this says nothing about coverage")
         return 2
