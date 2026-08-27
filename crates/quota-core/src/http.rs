@@ -339,6 +339,28 @@ impl JsonRequest {
             return Err(FetchError::Unauthorized(format!("HTTP {}", raw.status)));
         }
         if !(200..300).contains(&raw.status) {
+            // THE EXCERPT IS UNREDACTED BY CONSTRUCTION, and it reaches the wire
+            // in `ProviderUsage.error`. Every other leak class here is closed --
+            // URLs are stripped, credential paths are replaced by descriptions,
+            // lengths are bounded -- but this path echoes 200 characters of
+            // whatever the upstream sent, which is what makes it useful for
+            // diagnosis and also what makes it the one uninspected channel.
+            //
+            // No provider currently returns a secret in an error body. The hazard
+            // is that a SUCCESS payload can carry one and nobody would look here:
+            // minimax's `token_plan_credit` response includes a live `api_key`
+            // field (reported on insula#2, 2026-08-17). That endpoint signals
+            // app-level errors as `base_resp.status_code` on HTTP 200, so its
+            // failures are parsed rather than excerpted and it does not leak
+            // today -- but a provider that carried a secret in a payload AND
+            // answered non-2xx with it would, silently.
+            //
+            // Deliberately not scrubbed with a key-shaped heuristic: it would
+            // mangle genuine diagnostics far more often than it would catch a
+            // secret, and a scrubber that mostly fires on false positives trains
+            // people to distrust the field. The rule instead is a REVIEW POINT --
+            // when adding a provider whose payload carries credentials, check
+            // what its non-2xx bodies contain before routing it through here.
             let excerpt: String = String::from_utf8_lossy(&raw.body)
                 .chars()
                 .take(200)
