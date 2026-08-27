@@ -1,6 +1,6 @@
-# Provider matrix — the 46 CodexBar providers, by auth archetype
+# Provider matrix — the provider landscape, by auth archetype
 
-> **This document maps the UPSTREAM CodexBar inventory, not this module's
+> **This document maps the SURVEYED provider inventory, not this module's
 > registry.** It was written to plan the porting effort and its per-provider
 > statuses — BUILD, DEFER, v1 — record what was decided at the time each row was
 > written. Many have since been built, so **a status here is not evidence of what
@@ -45,7 +45,7 @@ where the eye goes:
    diff-driven read never reaches it. This step was missed for five consecutive
    releases while the anchor line kept being updated, which is exactly what it
    looks like when a check lives after the thing that feels like the whole job.
-2. Diff `git -C ~/Work/OSS/CodexBar
+2. Diff `git -C <CodexBar checkout>
 diff v0.49.3..<new-tag> -- Sources/CodexBarCore/Providers/` and triage into: window
 drift on providers we already serve (highest risk — no live creds to catch a
 silent degradation), new window-bearing providers to port, and credit-pool

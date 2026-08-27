@@ -18,7 +18,7 @@ than designed from a blank page.
 
 ## Mission
 
-Replace the external **CodexBar** dependency with a native **subc module** that serves
+Serve per-provider quota from a native **subc module** rather than an external binary, exposing
 per-provider usage/quota windows. The model router consumes this to route around
 provider exhaustion. Today the router polls `codexbar serve --port 8087` over HTTP; after this
 lands, **the router connects to subc** and reaches this module over the subc wire — no external
@@ -26,7 +26,7 @@ binary, no HTTP coexistence (clean cutover).
 
 ## The two contracts (reverse-engineered — verify against source yourself)
 
-### A. What CodexBar's `serve` exposes (the thing to replicate)
+### A. What the reference implementation's `serve` exposes
 Source: [CodexBar](https://github.com/steipete/CodexBar) (Swift). The serve entry is
 `Sources/CodexBarCLI/CLIServeCommand.swift`; the per-provider fetchers are
 `Sources/CodexBarCore/Providers/*`. The serve API (loopback `127.0.0.1`, 60s response cache):
@@ -34,7 +34,7 @@ Source: [CodexBar](https://github.com/steipete/CodexBar) (Swift). The serve entr
 - `GET /usage?provider=<id>` → per-provider array (THE endpoint the router uses)
 - `GET /cost?provider=<id>` → cost payloads (Claude/Codex only; the router does NOT use this)
 
-The hard part CodexBar does and you must port: each provider reuses its OWN existing session
+The hard part, and what makes this more than an HTTP client: each provider reuses its OWN existing session
 to fetch usage — OAuth tokens, browser cookies, API keys, or local app files — and normalizes
 to uniform JSON. That bespoke per-provider auth+fetch+normalize is the real engineering.
 
@@ -51,7 +51,7 @@ Source: `~/Work/Projects/CortexKit/alfonso/src/features/model-routing/quota/`
 So the load-bearing output is **RateWindows per provider/account** (utilization + resetsAt +
 windowMinutes). Get that shape right and the router's existing pace/pressure projection just works.
 
-## Scope: ALL providers CodexBar supports, day 1
+## Scope: the full surveyed provider set, day 1
 
 Not just the router's current 6. The authoritative provider list is the directories under
 `Sources/CodexBarCore/Providers/` (~46: Abacus, Alibaba, Amp, Antigravity, Augment, AzureOpenAI,
@@ -88,7 +88,7 @@ and parallelizable — once the pattern is proven for one provider, the rest fan
 
 ## Phase 0 charter
 
-1. **Study the fetchers**: enumerate CodexBar's providers and, per provider, capture {auth source
+1. **Study the fetchers**: enumerate the surveyed providers and, per provider, capture {auth source
    (OAuth/cookie/api-key/local-file), usage endpoint, response→RateWindow normalization}. Produce a
    provider matrix doc. Reuse existing sessions exactly as CodexBar does — e.g. OpenCode/Anthropic
    OAuth lives at `~/.local/share/opencode/auth.json`.
