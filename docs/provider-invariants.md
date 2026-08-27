@@ -2920,8 +2920,30 @@ process, with its own timestamps, is the most convincing possible presentation o
 a value your own constant produced. The falsifier is to break the causal link
 rather than to compare the numbers again: if a verdict ever lands ~300s after a
 report while this module is NOT attempting, the store has its own timer and the
-two are genuinely independent. Until someone runs that, the store's figure is not
-corroboration.
+two are genuinely independent.
+
+**RUN AND SETTLED 2026-08-26** (insula#8), and by a better experiment than the
+one proposed. Mine asked for an ABSENCE — stop the module for 400s and watch for
+no verdict — which costs every provider lane going dark and is only as strong as
+the enumeration of everything else that could suppress a verdict. The filer
+inverted it to ask for a PRESENCE: issue a single off-schedule `credential.get`
+well inside the window, and watch the verdict arrive early.
+
+```text
+ep13  one off-schedule get at report+60.2s   verdict +60.7s   prefix collapsed
+ep14  unperturbed control, same everything    verdict ~+300s   prefix exactly 10
+```
+
+One frame separates them. So the ~301s is this module's `NON_TRANSIENT_BACKOFF`
+plus a round-trip, twelve prior episodes agreed because they shared a cause, and
+the store's figure was never corroboration.
+
+**The general form is theirs and it is the part to keep: a single-consumer system
+cannot distinguish a property of the server from a property of its only client.**
+No amount of further observation of the normal loop would have caught it, because
+the confound lives IN the loop — it took a stimulus the only client would never
+produce. Watch for it wherever this module is the sole caller of something whose
+timing we then characterise.
 
 ### Filing a defect as a skill problem terminates the search for a mechanism
 
