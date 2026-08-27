@@ -2964,6 +2964,39 @@ the confound lives IN the loop — it took a stimulus the only client would neve
 produce. Watch for it wherever this module is the sole caller of something whose
 timing we then characterise.
 
+### A median over repetitions reports the cached cost, not the first-time one
+
+Measured 2026-08-27 while confirming a peer's hypothesis that macOS code-signature
+validation cost scales with binary size. It does: fresh-path first exec runs about
+300 ms fixed plus 5 ms/MB, from 363 ms at 9.8 MB to 1257 ms at 188 MB.
+
+My first sweep reported 3.5-9.7 ms flat across that whole range -- a clean, tidy
+refutation of a true hypothesis. The instrument copied each source to a FIXED path
+three times and took the median. Repetition 1 pays the first-exec cost;
+repetitions 2 and 3 hit the validation cache; the median of one expensive and two
+cheap samples IS the cheap value. The statistic averaged away the only thing being
+measured.
+
+**The rule: when a measurement has a first-time cost and a cached cost, take the
+first sample or none.** Any central statistic over repetitions is a measurement of
+the cache.
+
+WHY THIS IS THE MOST DANGEROUS MEMBER OF THE FAMILY SO FAR, in the peer's
+formulation: the instrument did not fail silent, it failed CONCLUSIVE. A vacuous
+test passes and tells you nothing, which at least leaves the question open. This
+produced a specific, plausible, internally consistent number that contradicted a
+correct hypothesis -- and had it not been checked against a differently-shaped
+measurement (fresh unique paths), it would have closed the question in the wrong
+direction with data attached.
+
+Same shape as the guard-resolution blind spot on the checker side -- a check whose
+own resolution hides exactly what it measures -- but on the instrument side, where
+the output is a number rather than a pass.
+
+THE CHECK: for any instrument reporting a summary statistic, ask what the FIRST
+observation was and whether it differed from the rest. If it did, the summary is
+describing the steady state and the transient is the thing you were after.
+
 ### Filing a defect as a skill problem terminates the search for a mechanism
 
 The two instances above sat in these notes for weeks as "probe selection is itself
