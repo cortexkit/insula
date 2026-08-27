@@ -1401,11 +1401,28 @@ That is the scheduler working as specified, not a stall, and a consumer should
 not treat continued `credential_unusable` in the minutes after a repair as
 evidence the repair failed.
 
-**A bound, not a measurement.** Observed figures for this lag (146.8 s, 280.3 s,
-285.6 s across three episodes) are dominated by *where in the backoff cycle the
-repair happened to land* — a uniform draw on `[0, backoff)`, not a property of
-the credential or the module. Quoting one as a latency invites reading three of
-them as a trend. The same applies to how quickly a revoked credential is
+**A bound, not a measurement**, and the mechanism is now known rather than
+inferred from a scatter. The lag is fully determined by *where in the backoff
+cycle the repair happened to land*:
+
+```text
+lag = NON_TRANSIENT_BACKOFF − (repair offset into the current cycle)
+```
+
+That holds because `backoff()` returns `NON_TRANSIENT_BACKOFF` unconditionally
+for this class — no exponential term, no retry count — so the next attempt is at a
+fixed distance from the last one and a repair anywhere inside that span waits out
+the remainder. Verified predictively by the insula#8 filer on 2026-08-27: repair
+at 34.9 s into the cycle, predicted 265.1 s, **observed 265.07 s**.
+
+So the lag is a uniform draw on `[0, backoff)` — expected value ≈ 150 s, not
+300 s. Nine warm-slot observations: 146.8 · 280.3 · 209.3 · 149.5 · 209.0 ·
+202.2 · 147.9 · 64.0 · 265.1. Sizing an alert at the 300 s bound is correct but
+pessimistic by a factor of two on the average case; sizing it at an observed
+figure is wrong in the other direction.
+
+Quoting one as a latency invites reading three of them as a trend, and this is a
+model rather than a fit: it predicts the next one. The same applies to how quickly a revoked credential is
 detected: that gap can never exceed the fetch interval, so it records when the
 next fetch landed rather than anything about the revocation.
 
