@@ -253,6 +253,12 @@ python3 scripts/measure-disk-io.py
 # the capture script below:
 python3 scripts/gatekeeper-scanlist.py
 
+# whole-history exposure audit: scans every blob on disk (reachable or not) and
+# every commit message against narrow credential/identity classes. Proved in both
+# directions before its verdict is trusted -- synthetic positives must fire,
+# example/test/loopback specimens must stay silent. Exit 1 means hits to read:
+python3 scripts/public-flip-verifier.py
+
 # restart syspolicyd when it wedges, so recovery does not require a terminal --
 # which is exactly what a wedge prevents you from opening. Errs toward NOT
 # killing: high threshold, 120s sustain, startup grace, hard rate limit. See the
