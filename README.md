@@ -252,6 +252,12 @@ python3 scripts/gatekeeper-scanlist.py
 # plist header for install and removal:
 sudo /usr/bin/python3 scripts/syspolicyd-watchdog.py   # foreground, to watch it
 
+# capture what syspolicyd is doing WHEN it wedges, instead of diagnosing the
+# wreckage afterwards. Arms at negligible cost and only records once the CPU
+# signature appears; writes the trigger record BEFORE spawning anything, because
+# during a wedge the follow-up commands may block too:
+sudo /usr/bin/python3 scripts/syspolicyd-capture.py
+
 ```
 
 ## Install as a supervised subc module
