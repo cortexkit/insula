@@ -110,6 +110,41 @@ the bins before running the e2e suites.
 
 ## Do not kill the process
 
+## Use the `ck` on PATH, not a repo build
+
+Every command here says plain `ck`, which resolves through
+`~/.local/bin/ck` to the DEPLOYED CLI. That is deliberate and worth stating,
+because a freshly built `subconscious/target/release/ck` sits right there and
+looks like the better choice.
+
+It is not. The house rule pairs the deployed CLI with the RUNNING DAEMON'S
+commit, and a repo build tracks the repo instead. Both directions hurt:
+
+| repo build is | what you see | what it looks like |
+| --- | --- | --- |
+| ahead of the daemon | skew warning on every call; new verbs refused | a broken daemon |
+| behind the daemon | verb missing entirely | a daemon that lacks the feature |
+
+The second one bit on 2026-08-26. `./target/release/ck provenance insula` returned
+`unknown domain`, which reads as "the daemon does not serve this" and was actually
+"this binary predates the verb". The discrimination is a one-line ancestor check
+against the repo the CLI is built from:
+
+```sh
+git -C ../subconscious merge-base --is-ancestor <commit-that-added-it> HEAD
+```
+
+Ancestor means the source is present and only the artifact is stale: a REBUILD.
+Not an ancestor means the source is genuinely absent: a RELEASE. Those have very
+different costs and the error message cannot tell them apart.
+
+Confirming which binary you are on:
+
+```sh
+readlink $(which ck)          # -> ~/.local/share/cortexkit/bin/ck when correct
+shasum -a256 $(which ck) ../subconscious/target/release/ck   # differ = not paired
+```
+
 Use `ck module restart`. A bare `kill` has left the module in supervision state
 `failed` with **no respawn**, and because a supervised module dying looks much
 like a supervised module restarting, it stayed down unnoticed. The daemon's
