@@ -47,11 +47,12 @@ jobs:
   # sibling daemon, which this job already checks out and already compiles since
   # subc-core is a dev-dep, so it runs in its own step below.
   #
-  # Runners are Blacksmith, not GitHub-hosted: these repos are owned by a free-plan
-  # organization where GitHub bills private-repo Actions minutes and blocks jobs once
-  # the (zero) spending limit is hit. Blacksmith third-party runners do not consume
-  # GitHub's included minutes. Revert `runner` to GitHub-hosted `ubuntu-latest` if the
-  # repo becomes public (public-repo Actions minutes are free).
+  # Runners are GitHub-hosted. They were Blacksmith while this repo was private,
+  # because GitHub bills private-repo Actions minutes against a free-plan org that
+  # blocks jobs at its zero spending limit, and third-party runners do not consume
+  # the included minutes. Actions minutes are free on public repositories, so the
+  # reason expired when the repo went public on 2026-08-27 and the third-party
+  # dependency went with it.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -63,9 +64,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - os: windows
-            runner: blacksmith-4vcpu-windows-2025
+            runner: windows-latest
     # A wedged test must surface as a fast red run, not burn the runner for
     # the 6-hour Actions default. Healthy runs finish well under 15 minutes.
     timeout-minutes: 20
