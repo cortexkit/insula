@@ -893,15 +893,26 @@ fn build_lock_digest() -> Option<String> {
     (!raw.is_empty()).then(|| raw.to_string())
 }
 
-/// The wire crate version this binary was built against, read from the lockfile.
+/// The subc-protocol version this binary LINKS.
 ///
-/// Empty means the build could not resolve it, reported as ABSENT rather than as
-/// an empty string: a consumer reading `Some("")` would take it as a stated
-/// version that happens to be blank, and the point of this field is that a stated
-/// fact came from somewhere.
+/// THE REFERENT IS THE FLEET'S WIRE CRATE, NOT OURS. An earlier version declared
+/// `cortexkit-provider-usage` here -- our own envelope crate, read from the
+/// lockfile. That is real information about this module and the wrong answer to
+/// this field, and the two live in different numbering spaces: a census gate of
+/// the form `wire_crate_version >= 0.13.0` would have scored this module
+/// non-conformant while it demonstrably speaks the current protocol. A confident
+/// wrong answer at a gate, which is worse than declaring nothing.
+///
+/// Taken from the linked constant rather than from a lockfile read, which is also
+/// strictly better under the contract's from-the-build rule: `env!` in the crate
+/// we actually link describes THE BINARY, while a lockfile describes the source
+/// tree that happened to sit beside it at build time.
+///
+/// Our provider-usage version is still worth declaring somewhere -- but that is a
+/// case for a second field, not for redefining this one, and minting fleet wire
+/// fields is not ours to do unilaterally.
 fn wire_crate_version() -> Option<String> {
-    let raw = env!("CK_QUOTA_WIRE_CRATE_VERSION");
-    (!raw.is_empty()).then(|| raw.to_string())
+    Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string())
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
@@ -1094,12 +1105,18 @@ mod tests {
             "build_lock_digest must be a 16-char hex hash, got {digest:?}"
         );
 
+        // THE REFERENT IS THE FLEET'S WIRE CRATE. Asserted by identity against the
+        // linked constant, not by shape: a semver-shaped check passes just as
+        // happily on our own provider-usage version, which is what this field
+        // previously carried and what a census gate would have misread.
         let wire = p
             .wire_crate_version
-            .expect("wire_crate_version comes from Cargo.lock at build time");
-        assert!(
-            !wire.is_empty() && wire.split('.').count() == 3,
-            "wire_crate_version must be a resolved semver, got {wire:?}"
+            .expect("wire_crate_version is the linked subc-protocol version");
+        assert_eq!(
+            wire,
+            subc_protocol::SUBC_PROTOCOL_CRATE_VERSION,
+            "must declare the SUBC-PROTOCOL version this binary links, not our own \
+             envelope crate -- the two are in different numbering spaces"
         );
 
         // An absent fact, not an unfilled blank -- see the comment at the call site.
