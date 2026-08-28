@@ -12,16 +12,33 @@ reach the agent to ask, until he killed it from an already-running shell.
 second, and it was done four times during diagnosis with no ill effect. The only
 cost is that in-flight assessments are re-done.
 
-WHAT IT WATCHES. Sustained CPU, not instantaneous. A brief burst is NORMAL and
-must not trigger a kill: syspolicyd legitimately burns ~29s of CPU in its first
-49 seconds after a restart while it rebuilds state. Killing during that would
-produce a restart loop that looks exactly like the fault it is meant to cure.
+WHAT IT WATCHES, AND A PREMISE THAT WAS WRONG. This first triggered on syspolicyd
+CPU alone. The operator killed that premise with one sentence -- the lockups
+happen "when the wedge happens, there's not much cpu load, it doesn't happen on
+cpu load" -- and the mechanism measured afterwards agrees: first-exec validation
+is a SERIALISATION POINT, so a process waiting on a round trip burns no CPU while
+every exec on the machine queues behind it.
+
+CPU was not disproved, it was demoted. 40-137% of a core was real in several
+episodes. But a proxy that correlates in some episodes and reads healthy through
+others cannot be the sole trigger for the instrument that ACTS. So the primary
+trigger is now EXEC LATENCY, which is the symptom itself and therefore cannot
+miss an episode, with CPU kept as a second sufficient arm.
+
+Either arm firing is enough; both must SUSTAIN. A brief burst is NORMAL and must
+not trigger a kill: syspolicyd legitimately burns ~29s of CPU in its first 49
+seconds after a restart while it rebuilds state. Killing during that would produce
+a restart loop that looks exactly like the fault it is meant to cure.
 
 WHY NOT WATCH THE DIRECTORY HANDLES INSTEAD. The wedge correlates with syspolicyd
-holding open `target/debug/deps` handles, which is a sharper signal -- but
-reading it needs `lsof` against a root process on every sample, which is heavy
-enough to matter on a machine already in trouble. CPU is cheap to sample and was
-unambiguous in every observed episode (40-137% of a core versus 0-4% healthy).
+holding open `target/debug/deps` handles, which is a sharper signal -- but reading
+it needs `lsof` against a root process on every sample, which is heavy enough to
+matter on a machine already in trouble.
+
+THE PROBE IS SHARED WITH THE CAPTURE SCRIPT, not copied. They must agree on what a
+wedge is: one records an episode, this one acts on it. Two implementations would
+be two answers to that question, free to drift while each kept passing its own
+checks.
 
 FAILURE DIRECTION. This errs toward NOT killing. A missed wedge costs what today
 already costs; a spurious kill costs re-assessment plus the risk of a loop. Hence
@@ -36,10 +53,21 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from syspolicyd_probe import PROBE_TRIGGER_MS, probe_exec_ms  # noqa: E402
+
 # Healthy is 0-4% of a core. Observed wedges ran 40-137% sustained. 80 sits well
 # above normal noise and well below the observed floor of a real episode, so the
 # gap is wide in both directions rather than tuned to one sample.
+#
+# SECOND ARM, not the definition. See the module docstring: CPU reads healthy
+# through a serialisation stall, which is the shape the operator reported.
 CPU_THRESHOLD_PCT = 80.0
+
+# Where the probe writes its fixed-path binary. Under /var/tmp rather than a home
+# directory because this runs as root: writing into a user's tree as root leaves
+# root-owned files behind that the user then cannot clean up.
+PROBE_DIR = "/var/tmp/syspolicyd-watchdog"
 
 # It must stay hot this long before we act. The legitimate startup burst lasted
 # ~49s, so 120 clears it with margin. This is the single most important constant
@@ -113,9 +141,9 @@ def main() -> int:
         return 2
 
     log(
-        f"watchdog started (threshold {CPU_THRESHOLD_PCT}% sustained "
-        f"{SUSTAIN_SECS}s, grace {STARTUP_GRACE_SECS}s, "
-        f"min gap {MIN_SECS_BETWEEN_KILLS}s)"
+        f"watchdog started (exec probe >{PROBE_TRIGGER_MS:.0f}ms OR cpu "
+        f">{CPU_THRESHOLD_PCT}%, sustained {SUSTAIN_SECS}s, grace "
+        f"{STARTUP_GRACE_SECS}s, min gap {MIN_SECS_BETWEEN_KILLS}s)"
     )
 
     hot_since: float | None = None
@@ -136,30 +164,43 @@ def main() -> int:
         if pid != hot_pid:
             hot_pid, hot_since = pid, None
 
-        if cpu < CPU_THRESHOLD_PCT:
+        # PRIMARY ARM. -1.0 means the probe could not run at all, which says
+        # nothing about the machine and must never be read as a large latency --
+        # otherwise a broken probe becomes a kill trigger.
+        probe_ms = probe_exec_ms(PROBE_DIR)
+        probe_hot = probe_ms >= PROBE_TRIGGER_MS
+        cpu_hot = cpu >= CPU_THRESHOLD_PCT
+
+        if not (probe_hot or cpu_hot):
             if hot_since is not None:
-                log(f"pid {pid} cooled to {cpu:.0f}% -- streak cleared")
+                log(
+                    f"pid {pid} cooled (exec {probe_ms:.0f}ms, cpu {cpu:.0f}%) "
+                    "-- streak cleared"
+                )
             hot_since = None
             continue
 
+        reason = (
+            f"exec {probe_ms:.0f}ms" if probe_hot else f"cpu {cpu:.0f}%"
+        )
         now = time.monotonic()
         if hot_since is None:
             hot_since = now
-            log(f"pid {pid} hot at {cpu:.0f}% -- watching")
+            log(f"pid {pid} hot ({reason}) -- watching")
             continue
 
         if now - hot_since < SUSTAIN_SECS:
             continue
         if elapsed < STARTUP_GRACE_SECS:
-            log(f"pid {pid} hot but only {elapsed:.0f}s old -- startup grace")
+            log(f"pid {pid} hot ({reason}) but only {elapsed:.0f}s old -- grace")
             continue
         if now - last_kill < MIN_SECS_BETWEEN_KILLS:
-            log(f"pid {pid} hot but killed recently -- rate limited")
+            log(f"pid {pid} hot ({reason}) but killed recently -- rate limited")
             continue
 
         log(
-            f"RESTARTING pid {pid}: {cpu:.0f}% for {now - hot_since:.0f}s, "
-            f"age {elapsed:.0f}s"
+            f"RESTARTING pid {pid}: {reason} for {now - hot_since:.0f}s, "
+            f"age {elapsed:.0f}s (exec {probe_ms:.0f}ms, cpu {cpu:.0f}%)"
         )
         try:
             subprocess.run(["/usr/bin/killall", "syspolicyd"], timeout=15)

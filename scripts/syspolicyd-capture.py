@@ -45,6 +45,13 @@ import os
 import shutil
 import subprocess
 import sys
+
+# The probe lives in a shared module because the capture and the watchdog must
+# agree on what a wedge IS -- one records it, the other acts on it. Two copies
+# would be two answers, free to drift invisibly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from syspolicyd_probe import PROBE_TRIGGER_MS, probe_exec_ms, probe_source  # noqa: E402
+import sys
 import time
 
 # EXEC LATENCY IS THE TRIGGER, NOT CPU. The first version of this file fired on
@@ -62,7 +69,6 @@ import time
 # read to decide. The healthy figure has a wide margin below the trigger, and
 # during a wedge the probe's own exec is subject to the wedge -- so a probe that
 # takes many seconds IS the measurement rather than a failure of it.
-PROBE_TRIGGER_MS = 3000.0
 
 # Retained only for the post-trigger record, never as the trigger.
 BUSY_PCT = 60.0
@@ -89,96 +95,6 @@ def now() -> str:
 _PROBE_SRC: str | None = None
 
 
-def probe_source() -> str:
-    """A binary from the EXPENSIVE set, resolved once.
-
-    Cached because the search walks the fleet's build directories, and doing that
-    every few seconds would make the watcher part of the load it is watching for.
-    """
-    global _PROBE_SRC
-    if _PROBE_SRC:
-        return _PROBE_SRC
-    root = os.path.expanduser("~/Work/Projects/CortexKit")
-    skip = (".rlib", ".rmeta", ".d", ".o", ".dylib", ".so", ".a")
-    if os.path.isdir(root):
-        for repo in sorted(os.listdir(root)):
-            deps = os.path.join(root, repo, "target", "debug", "deps")
-            if not os.path.isdir(deps):
-                continue
-            try:
-                names = os.listdir(deps)
-            except OSError:
-                continue
-            for f in names:
-                cand = os.path.join(deps, f)
-                if f.endswith(skip):
-                    continue
-                try:
-                    ok = (os.path.isfile(cand) and os.access(cand, os.X_OK)
-                          and os.path.getsize(cand) > 100_000)
-                except OSError:
-                    continue
-                if ok:
-                    _PROBE_SRC = cand
-                    return _PROBE_SRC
-    _PROBE_SRC = "/usr/bin/true"
-    return _PROBE_SRC
-
-
-def probe_exec_ms() -> float:
-    """Time the first exec of a freshly written binary -- the thing that stalls.
-
-    A NEW FILE EVERY TIME, deliberately. Re-execing one file measures the cached
-    path (4 ms even mid-wedge) and would report health throughout an episode. The
-    cost being probed is specifically the first-evaluation cost, so the probe has
-    to pay it.
-
-    Copies a system binary rather than compiling one: the wedge blocks exec, and a
-    probe that needed a toolchain to run would be the first thing to stop working.
-
-    THE SOURCE BINARY IS NOT ARBITRARY, and picking it wrong makes the probe read
-    healthy through an episode. Measured on this machine: fresh copies of
-    /bin/echo, /bin/ls and /usr/bin/git cost ~1.5 ms, while fresh copies of
-    /usr/bin/true and of real Rust test binaries cost 250-620 ms. Something
-    distinguishes those two sets that I have not identified -- it is not size, not
-    signature presence, and not content caching, all of which were tested and
-    ruled out.
-
-    Rather than probe with a binary from the cheap set and call the machine
-    healthy, this prefers a REAL Rust test binary from the fleet, which is both
-    the population that actually stalls and a member of the expensive set by
-    measurement. `/usr/bin/true` is the fallback because it is the only expensive
-    member guaranteed to exist. `/bin/echo` is deliberately NOT used.
-    """
-    # A FIXED PATH, REWRITTEN, not a fresh name each time. This matters more than
-    # it looks: `scan_targets_v2` has PRIMARY KEY (path), so a unique probe name
-    # every interval would add a row every interval -- about 17k/day at a 5s
-    # cadence, roughly three times this machine's natural accumulation rate. The
-    # watcher would then be feeding the exact pile it was written to diagnose.
-    #
-    # Rewriting one path is free of that AND still pays the full cost: measured
-    # 244 ms for a rewritten same-path binary versus 4 ms to re-exec an untouched
-    # one. Validation keys on the bytes, the scan list keys on the name, and this
-    # probe sits deliberately on the right side of both.
-    path = os.path.join(OUT_DIR, "probe-fixed-path")
-    try:
-        os.makedirs(OUT_DIR, exist_ok=True)
-        shutil.copy(probe_source(), path)
-        os.chmod(path, 0o755)
-        start = time.perf_counter()
-        subprocess.run([path], capture_output=True, timeout=120)
-        return (time.perf_counter() - start) * 1000.0
-    except subprocess.TimeoutExpired:
-        # Two minutes to exec /bin/echo is the strongest possible reading, not an
-        # instrument failure. Report it as the number it is.
-        return 120_000.0
-    except Exception:  # noqa: BLE001 - a probe must never take the watcher down
-        return -1.0
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
 
 
 def syspolicyd() -> tuple[int, float] | None:
@@ -272,7 +188,7 @@ def main() -> int:
     last = 0.0
     while True:
         time.sleep(SAMPLE_SECS)
-        elapsed = probe_exec_ms()
+        elapsed = probe_exec_ms(OUT_DIR)
         if elapsed < 0:
             continue
         if elapsed < PROBE_TRIGGER_MS:
