@@ -3166,3 +3166,57 @@ interpretation. Here the decisive one is empirical: build both commits with
 `CK_QUOTA_BUILD_COMMIT_OVERRIDE` set identically and compare hashes. That requires
 a determinism control first (rebuild ONE commit twice and confirm the hashes
 match), because without it an inequality means nothing.
+
+
+## Text about a property clusters where the property is absent
+
+A fleet census of ours said six modules populate `build_lock_digest` and three pass
+`None`. Two of the six were wrong, caught by the maintainers of those modules
+reading their own source. Re-derived properly, it is four and two.
+
+The instrument was one line:
+
+```sh
+grep -h 'build_lock_digest' | grep -vc 'None'
+```
+
+It counted MENTIONS-WITHOUT-THE-WORD-None as ASSIGNMENTS. The two false positives
+in `cerebellum` are worth reading in full, because of what they say:
+
+```
+manifest.rs:173  /// That distinction is why it is filled while `build_lock_digest` is not
+manifest.rs:186          build_lock_digest: None,
+manifest.rs:652              provenance.build_lock_digest.is_none(),
+```
+
+Line 173 is a doc comment stating the field is NOT filled, counted as evidence
+that it IS. Line 652 is a test asserting the field is absent — `.is_none()`,
+lowercase, which `grep -v 'None'` does not exclude — counted as a population.
+**Both false positives were statements of the truth, read as their opposite.**
+
+That is not bad luck, and it generalises past greps:
+
+> When you search for evidence of a property, the text that DISCUSSES the property
+> clusters exactly where the property is ABSENT — because absence is what needs
+> explaining. A present thing is usually one unremarked line.
+
+So a mention-counting instrument is biased toward false positives precisely in the
+population it exists to exclude, and the more carefully a team documented their
+decision NOT to do something, the more certainly it is miscounted as having done
+it. `cerebellum` and `claustrum` were miscounted BECAUSE they wrote down their
+reasoning; a module that silently omitted the field would have been classified
+correctly.
+
+The fix is to match the CONSTRUCT, not the NAME: `build_lock_digest:` followed by
+something that is not `None`, excluding comment lines. Better still, prefer a
+predicate needing no source reading at all — for this question, build two commits
+and compare hashes.
+
+Two second-order notes, both costly:
+
+- A roster derived this way was handed to another seat, who relayed its rows into
+  per-seat instructions. A wrong measurement travels further than a wrong
+  conclusion, because it arrives as a fact rather than as an argument.
+- When an instrument is disproved, EVERY row it produced is suspect, not the rows
+  someone happened to check. Two were corrected by their owners; the other four
+  were re-derived here, and could equally have been wrong.
