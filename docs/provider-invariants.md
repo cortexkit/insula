@@ -2964,6 +2964,36 @@ the confound lives IN the loop — it took a stimulus the only client would neve
 produce. Watch for it wherever this module is the sole caller of something whose
 timing we then characterise.
 
+**A THIRD INSTANCE, and the only one where the shared property is PERMANENT.** A
+consumer building a shadow reader against an external quota-header feed confirmed
+at the producer's source that only unified `5h` and `7d` headers exist on that
+lane. Every scoped window in that feed therefore arrived by POLLING THE SAME
+ENDPOINT THIS MODULE POLLS — so their feed's `Fable` reading of 62 beside our
+`extraRateWindows` 62.0 is not two instruments agreeing, it is one measurement
+seen twice.
+
+That matters for the feed design on issue #7, where the rule was heading toward
+"a feed fact may UPDATE a window where sameness is established by paired
+measurement". Paired measurement cannot establish it here: for scoped windows the
+two readings share a source by construction, so the agreement table would be
+filled with tautologies for exactly the windows where independent confirmation was
+the point. **Divergence stays informative — two readings that disagree cannot both
+be the same source — while agreement does not.** The asymmetry is the usable part.
+
+The first two instances were accidents of timing that a different measurement could
+dissolve. This one is structural, so it should be encoded as a precondition rather
+than re-derived: before treating any second source as confirmation, establish that
+it does not reach the same upstream by the same route.
+
+**A related trap from the same reading, worth its own line: the same quantity on
+two surfaces can carry two scales.** Raw wire headers are `0-1` floats; the feed
+publishes them already multiplied and clamped to `0-100`, which is our scale too
+(`anthropic.rs` clamps to `0.0..=100.0`). A consumer told "headers are 0-1, apply
+100x" and pointed at the FEED would be 100x high on every window — and the error
+would read as a plausible number rather than a fault. If a normalisation is ever
+applied to an inbound feed here, it belongs behind an assertion that REFUSES on a
+suspected scale mismatch, never behind a silent correction.
+
 ### Refusal is correct only where the walker knows the value is adjudicable
 
 A rule written for TYPED VALUES, applied by a traversal that also reaches PROSE,
