@@ -3242,6 +3242,27 @@ something that is not `None`, excluding comment lines. Better still, prefer a
 predicate needing no source reading at all — for this question, build two commits
 and compare hashes.
 
+**THE BIAS IS IN THE MEASUREMENT; THE HARM IS IN WHAT IT FEEDS.** Ran this rule
+against another repo's `audit-markers.sh`, which counts `grep -c 'RunMarker'` and
+subtracts match arms. Same bias exactly: planting one ordinary comment mentioning
+the type moved its count from 2 to 3 (proved by planting it and restoring
+byte-identical). But their count feeds a CROSS-CHECK THAT REFUSES ON MISMATCH,
+not an assertion — so the false positive makes the tool decline to run and say why,
+where ours made it state a fact.
+
+So the same defective measurement is a nuisance in one position and a lie in the
+other:
+
+```
+count -> assert a property        a false fact, which travels
+count -> cross-check, refuse      a false refusal, which announces itself
+```
+
+When a mention-count cannot be avoided, put it where a wrong answer STOPS the tool
+rather than where it becomes the tool's output. That is a placement decision, not
+a regex decision, and it survives the regex being wrong — which it eventually will
+be.
+
 Two second-order notes, both costly:
 
 - A roster derived this way was handed to another seat, who relayed its rows into
