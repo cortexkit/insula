@@ -3245,10 +3245,25 @@ and compare hashes.
 **THE BIAS IS IN THE MEASUREMENT; THE HARM IS IN WHAT IT FEEDS.** Ran this rule
 against another repo's `audit-markers.sh`, which counts `grep -c 'RunMarker'` and
 subtracts match arms. Same bias exactly: planting one ordinary comment mentioning
-the type moved its count from 2 to 3 (proved by planting it and restoring
-byte-identical). But their count feeds a CROSS-CHECK THAT REFUSES ON MISMATCH,
-not an assertion — so the false positive makes the tool decline to run and say why,
-where ours made it state a fact.
+the type moves its count from 10 to 11 against an enumerated 8, so the tool
+refuses. Proved by planting it and restoring byte-identical. But their count feeds
+a CROSS-CHECK THAT REFUSES ON MISMATCH, not an assertion — so the false positive
+makes the tool decline to run and say why, where ours made it state a fact.
+
+**MY FIRST NUMBERS FOR THAT WERE WRONG, AND WRONGLY IN A WAY THE TOOL HAD ALREADY
+FIXED.** I published 2 and 3. The real figures are 10 and 11, and the gap is the
+boundary: my ad-hoc probe grepped `#\[cfg(test)\]` unanchored and stopped at an
+INDENTED one inside an impl block at line 754, while the script anchors
+`^#\[cfg(test)\]` and finds the real module boundary at 2619. So I measured a
+fragment. That exact unanchored-boundary bug had bitten their script months earlier
+— it audited 2 of 7 sites before the anchor went in — and I reproduced it in my
+probe OF the fixed tool.
+
+The general form is the two-reader rule pointed at PROBING: **a probe that
+re-derives the tool's own boundary is a second reader of that boundary, and it
+drifts exactly where the tool has already been repaired.** The repair lives in the
+tool, not in the idea, so a fresh re-derivation starts from the unrepaired
+version. When probing an instrument, take its predicate from the instrument.
 
 So the same defective measurement is a nuisance in one position and a lie in the
 other:
