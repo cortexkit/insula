@@ -3091,3 +3091,78 @@ falsified while the claim stayed. All three were found by hand, after the fact.
 The standing practice ("when correcting a fact in one doc, grep every other doc
 for it") is a HABIT, not a mechanism, and habits are what get optimised away when
 a step feels slow.
+
+## A guard that prevents and a guard that reveals are not substitutes
+
+`ManifestProvenance.wire_crate_version` was populated from our own lockfile when
+the field means the LINKED PROTOCOL crate — two different numbering spaces, so a
+census gate reading it would have scored this module non-conformant while it
+demonstrably spoke the current protocol. A confident wrong answer, which the
+contract's own rule says is worse than an absence.
+
+The fix was one line. What took longer was working out what still guards it.
+
+For a day, nothing here could check that declaration at all: the manifest is sent
+once at HELLO and had no consumer-visible readback, so the module's own inspection
+could confirm what it INTENDED to send and nothing more. That is worth naming as a
+class:
+
+> A declaration with no readback path is unfalsifiable by its own producer.
+
+The gap between "the binary computes X" and "the peer received X" is exactly where
+serialisation bugs and version skew live, which is why an external census found
+this and local inspection could not have.
+
+When the readback shipped, the daemon-side maintainer offered that the identity
+assertion in our test was now retired. It is not, and the readback's own output
+says why:
+
+```
+RUNNING IMAGE: match (macos_spawn_inode)   <- a COMPARISON the daemon performs
+COMMIT / LOCK DIGEST / WIRE CRATE VERSION  <- no annotation: RELAYED
+```
+
+Regress the field back to the lockfile read and `ck provenance` prints the wrong
+version faithfully. Nothing fails. **The test PREVENTS the wrong value shipping;
+the readback REVEALS it to whoever looks.** Retire the first because the second
+exists and the regression becomes detectable only by someone who happens to check.
+
+The pair generalises — it is the same split as write-ahead intent versus done-probe
+(record what you meant, check what the world holds). But the halves are NOT equally
+strong, and the asymmetry is the argument for keeping the preventing half: a
+done-probe checks against a WORLD that can disagree with you, while a relayed
+declaration checks against nothing. The weaker second half is the reason the first
+one stays.
+
+Practical form: when adding a field to any outbound manifest or handshake, ask
+which of the two you have. If the value is relayed rather than compared, the test
+asserting its REFERENT — not its shape — is the only guard, and a shape check is
+not one. `wire_crate_version` had a test that checked "three dot-separated parts",
+which passes just as happily on the wrong crate's version.
+
+## An overstated rule manufactures its own counterexamples
+
+A finding of ours went into a fleet recipe: a lock-only commit changes the binary,
+because `build_lock_digest` hashes the on-disk `Cargo.lock` at build time, so a
+module that absorbs a lock wave and skips its next deploy declares the PRE-wave
+digest. Proved across a commit with zero source lines changed, read from the
+provenance readback at both ends.
+
+True here, and not true everywhere. Checked at source across the fleet: six modules
+populate that field, three pass `None` — and those three have no `build.rs` at all,
+so nothing reads the lock and their binaries are byte-identical across a lock-only
+commit on a path-dep workspace.
+
+The cost of shipping the rule unscoped is NOT the wasted rebuild. It is that a seat
+in the second group follows it, rebuilds, gets an identical hash, and now holds
+first-hand evidence AGAINST a rule that is correct for the six seats where it
+bites. **An unscoped rule hands its own counterexample to the people it does not
+apply to**, and they are the ones who will repeat it.
+
+The roster is not the fix either, because a list of instances is dated the moment
+one of the three adds a build script. State the PREDICATE and let each reader
+evaluate it against their own tree — and prefer a predicate that needs no source
+interpretation. Here the decisive one is empirical: build both commits with
+`CK_QUOTA_BUILD_COMMIT_OVERRIDE` set identically and compare hashes. That requires
+a determinism control first (rebuild ONE commit twice and confirm the hashes
+match), because without it an inequality means nothing.
