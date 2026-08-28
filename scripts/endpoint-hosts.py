@@ -78,6 +78,12 @@ EXPECTED: dict[str, dict[str, str]] = {
     "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
     "minimax": {"CHINA_API_BASE": "api.minimaxi.com", "GLOBAL_API_BASE": "api.minimax.io"},
     "neuralwatt": {"DEFAULT_BASE": "api.neuralwatt.com"},
+    # Balance-only lane: this provider publishes no rate window, just a prepaid
+    # credit pool, so its single constant is the credits endpoint rather than a
+    # usage one. Added after the checker caught it missing -- the provider shipped
+    # and the manifest entry did not, which is exactly the drift this file exists
+    # to name.
+    "openrouter": {"CREDITS_URL": "openrouter.ai"},
     "ollama": {"SETTINGS_URL": "ollama.com"},
     "opencode": {"SERVER_BASE": "opencode.ai"},
     "qoder": {"USAGE_URL": "qoder.com"},

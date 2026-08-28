@@ -85,6 +85,19 @@ print(f"  {len(scripts) - len(broken)}/{len(scripts)} compile")
 sys.exit(1 if broken else 0)
 PYGATE
 
+step "endpoint host manifest"
+# RUN, not merely compiled. This checker existed for two weeks reporting a real
+# finding that nobody saw, because the gate only py_compile'd it: the openrouter
+# provider shipped on 2026-08-16 and its host never entered the manifest. A
+# checker that is only syntax-checked finds nothing, and its green compile reads
+# like coverage.
+#
+# Cheap enough to belong here: it parses source for `const *_URL: &str = "https…"`
+# and compares against a recorded host per module. No network, no build, sub-second.
+# It matches a CONSTRUCT rather than a name, so a comment mentioning a host cannot
+# manufacture an entry -- the failure mode that broke a fleet census the same day.
+python3 scripts/endpoint-hosts.py || fail "endpoint host manifest is out of date"
+
 step "cargo fmt --check"
 cargo fmt --check || fail "formatting"
 
