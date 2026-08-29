@@ -247,6 +247,49 @@ pub struct CookieJar {
 }
 
 impl CookieJar {
+    /// Build a jar from a `Cookie:` REQUEST header, the form an operator pastes.
+    ///
+    /// The exact inverse of [`Self::header`], and unambiguous in a way that
+    /// parsing `Set-Cookie` would not be: a request header is bare `name=value`
+    /// pairs with no attributes, no expiry, no domain and no flags. There is
+    /// nothing to interpret, which is why this is not the RFC 6265 parser the
+    /// vault deliberately does not own -- the vault stores the bytes verbatim
+    /// and never looks inside; this splits them at the point of USE.
+    ///
+    /// Exists so a vault-deposited cookie reaches the same predicates a
+    /// live-store one does. Seven providers ask a jar whether it holds a
+    /// recognised session cookie and report a specific diagnosis when it does
+    /// not -- "you pasted a header with only trackers in it" versus "your session
+    /// expired" are different instructions to a human, and a vault lane that
+    /// handed back an opaque string could give neither.
+    ///
+    /// `host_key` is empty because a request header does not carry one. Absent
+    /// rather than wrong: the browser store knows which domain a cookie came
+    /// from, a pasted header does not, and inventing the provider's own domain
+    /// there would assert a provenance nobody established.
+    pub fn from_header(header: &str) -> Self {
+        let cookies = header
+            .split(';')
+            .filter_map(|pair| {
+                let pair = pair.trim();
+                // split_once, not splitn: a cookie VALUE may contain '=' (base64
+                // padding routinely does), so only the first separator is a
+                // delimiter and the rest is payload.
+                let (name, value) = pair.split_once('=')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(Cookie {
+                    name: name.to_string(),
+                    value: value.trim().to_string(),
+                    host_key: String::new(),
+                })
+            })
+            .collect();
+        Self { cookies }
+    }
+
     /// `name=value; name=value` header from all cookies.
     pub fn header(&self) -> String {
         self.cookies
@@ -891,6 +934,64 @@ fn decrypt_cbc(encrypted: &[u8], prefix: &[u8], host_key: &str, key: &[u8]) -> O
 
 #[cfg(test)]
 mod tests {
+
+    /// A pasted header round-trips to the same jar the browser store yields.
+    ///
+    /// The inverse pair is asserted rather than each direction alone: a parser
+    /// checked only against hand-written input drifts from the serializer it is
+    /// supposed to invert, and the two live in this file precisely so they
+    /// cannot.
+    #[test]
+    fn a_header_round_trips_through_the_jar() {
+        let jar = CookieJar {
+            cookies: vec![
+                Cookie {
+                    name: "session".into(),
+                    value: "abc123".into(),
+                    host_key: ".x.com".into(),
+                },
+                Cookie {
+                    name: "other".into(),
+                    value: "v".into(),
+                    host_key: ".x.com".into(),
+                },
+            ],
+        };
+        let parsed = CookieJar::from_header(&jar.header());
+        assert_eq!(parsed.cookies.len(), 2);
+        assert_eq!(parsed.cookies[0].name, "session");
+        assert_eq!(parsed.cookies[0].value, "abc123");
+    }
+
+    /// A value containing '=' survives, because base64 padding routinely has one.
+    ///
+    /// The tempting split is on every '=', which silently truncates such a value
+    /// to its first segment -- producing a cookie that is well-formed, shorter
+    /// than what was pasted, and rejected upstream as a bad session with no
+    /// indication the truncation happened here.
+    #[test]
+    fn a_value_containing_equals_is_not_truncated() {
+        let jar = CookieJar::from_header("t=YWJjZA==; s=1");
+        assert_eq!(jar.cookies[0].value, "YWJjZA==");
+        assert_eq!(jar.cookies.len(), 2);
+    }
+
+    /// Whitespace around pairs is tolerated, since a human pastes this.
+    #[test]
+    fn a_pasted_header_tolerates_spacing() {
+        let jar = CookieJar::from_header("  a=1 ;  b=2  ");
+        assert_eq!(jar.cookies.len(), 2);
+        assert_eq!(jar.cookies[1].name, "b");
+        assert_eq!(jar.cookies[1].value, "2");
+    }
+
+    /// A fragment with no '=' is dropped rather than becoming a nameless cookie.
+    #[test]
+    fn a_fragment_without_a_separator_is_dropped() {
+        let jar = CookieJar::from_header("a=1; garbage; =novalue; b=2");
+        let names: Vec<&str> = jar.cookies.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "only well-formed pairs survive");
+    }
 
     /// Every cookie failure is judged for which wire class it becomes.
     ///

@@ -117,6 +117,51 @@ impl CookieVault {
         }
     }
 
+    /// The cookie JAR to fetch with, and the `source` label to publish.
+    ///
+    /// Same precedence as [`Self::cookie_for`]; the difference is shape. Seven
+    /// of the nine cookie providers work from a jar rather than a header string,
+    /// because they ask it whether a recognised session cookie is present and
+    /// give a different diagnosis when it is not.
+    ///
+    /// THAT DIAGNOSIS IS WHY THE VAULT LANE RETURNS A JAR RATHER THAN A STRING.
+    /// A pasted header full of tracking cookies and no session is well-formed to
+    /// the vault, deposits cleanly, and fails on first use. "Your session
+    /// expired, sign in again" sends the operator to repeat the action that just
+    /// failed; "no session was captured, make sure you are signed in before
+    /// copying" sends them to the actual cause. Handing back an opaque string
+    /// would lose that distinction for exactly the hosts this lane exists for.
+    pub(crate) async fn jar_for<F, Fut>(
+        &self,
+        handle: &CredentialHandle,
+        local: F,
+    ) -> Result<(crate::browser_cookies::CookieJar, &'static str), FetchError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<crate::browser_cookies::CookieJar, FetchError>>,
+    {
+        if let Some(capability) = handle.vault_capability() {
+            let header = self.fetch(capability).await?;
+            return Ok((
+                crate::browser_cookies::CookieJar::from_header(&header),
+                "vault",
+            ));
+        }
+        match local().await {
+            Ok(jar) => Ok((jar, crate::browser_cookies::SOURCE_LABEL)),
+            Err(local_error) => match self.bare_deposit()? {
+                Some(capability) => {
+                    let header = self.fetch(&capability).await?;
+                    Ok((
+                        crate::browser_cookies::CookieJar::from_header(&header),
+                        "vault",
+                    ))
+                }
+                None => Err(local_error),
+            },
+        }
+    }
+
     fn deposits(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.handle_loader.cookie_handles(self.family)
     }

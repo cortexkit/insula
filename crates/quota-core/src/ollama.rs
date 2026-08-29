@@ -37,6 +37,10 @@ use crate::{
 };
 
 pub const PROVIDER_NAME: &str = "ollama";
+/// The bare vault credential id for this domain; a suffixed deposit under it
+/// names an account and takes the provider vault-only.
+const COOKIE_FAMILY: &str = "cookie:ollama.com";
+
 const DOMAIN: &str = "ollama.com";
 const SETTINGS_URL: &str = "https://ollama.com/settings";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -263,13 +267,29 @@ pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
 
 /// The Ollama usage provider.
 pub struct OllamaProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl OllamaProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
         }
     }
 }
@@ -290,11 +310,20 @@ impl UsageProvider for OllamaProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
 
             // A jar without a recognized session cookie is not a usable login.
             if !jar.has_cookie_named(is_session_cookie) {
@@ -322,12 +351,7 @@ impl UsageProvider for OllamaProvider {
 
             let html = String::from_utf8_lossy(&html_bytes);
             let usage = normalize_usage(&html)?;
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                SOURCE_LABEL,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
