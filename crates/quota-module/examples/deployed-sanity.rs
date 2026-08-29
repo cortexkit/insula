@@ -452,6 +452,23 @@ fn check_drop_page(page: &serde_json::Value) {
         );
     }
 
+    // Print the records, not only the count. This is the ONLY reader of
+    // usage.drops on this host -- there is no CLI path to it -- and a feature
+    // whose entire deliverable IS these records was verifiable only as a number.
+    // A count answers "did the ring accumulate"; it cannot answer "is this drop
+    // real", which is the question every design decision on the transition-event
+    // work depends on. Four codex drops in ninety minutes is either a defect in
+    // the relaxation guard or a genuine reset, and the count reads identically
+    // either way.
+    for drop in drops {
+        println!(
+            "    drop seq {} {} {} continuous={}",
+            drop["seq"],
+            drop["at"].as_str().unwrap_or("?"),
+            drop["provider"].as_str().unwrap_or("?"),
+            drop["observedContinuously"]
+        );
+    }
     println!(
         "  usage.drops: epoch {epoch}, next {next}, {} record(s) retained",
         drops.len()
