@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar, SOURCE_LABEL},
+    browser_cookies::{self, CookieJar},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -27,6 +27,10 @@ use crate::{
 };
 
 pub const PROVIDER_NAME: &str = "qoder";
+/// Base key for storing Qoder credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:qoder.com";
+
 const DOMAIN: &str = "qoder.com";
 const COOKIE_DOMAINS: &[&str] = &["qoder.com", "www.qoder.com"];
 const USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
@@ -198,13 +202,29 @@ fn request_cookie_header(jar: &CookieJar) -> Option<String> {
 
 /// The Qoder browser-cookie usage provider.
 pub struct QoderProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl QoderProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
         }
     }
 }
@@ -272,11 +292,20 @@ impl UsageProvider for QoderProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
             // Qoder's importer does not designate one session-cookie name, so send
             // every cookie from its two exact international hosts.
             let cookie = request_cookie_header(&jar).ok_or_else(|| {
@@ -302,12 +331,7 @@ impl UsageProvider for QoderProvider {
                 .await?;
             let usage = normalize_usage(&body)?;
 
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                SOURCE_LABEL,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -503,5 +527,15 @@ mod tests {
                 extra_rate_windows: None,
             }
         );
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = QoderProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }

@@ -477,7 +477,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(openrouter::OpenRouterProvider::new()),
-            Box::new(qoder::QoderProvider::new()),
+            Box::new(qoder::QoderProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(qwen_cloud::QwenCloudProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
