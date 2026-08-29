@@ -66,7 +66,31 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "antigravity";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// The cloud Code Assist quota endpoint, used when no local process is running.
+/// The cloud Code Assist quota SUMMARY endpoint, used when no local process is
+/// running.
+///
+/// This returns merged pools carrying explicit per-cadence windows -- the same
+/// `gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly` bucket ids the local
+/// probe returns, so [`parse_quota_summary`] handles both and the two lanes
+/// cannot describe one account differently.
+const REMOTE_QUOTA_SUMMARY_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+/// The per-model fallback, used only when the summary endpoint refuses.
+///
+/// IT IS A FALLBACK, NOT AN EQUIVALENT, and this module treated it as the
+/// primary for weeks. It answers with one bucket per model carrying a single
+/// implicit window, so every cadence collapses into one number: on this host it
+/// published the Gemini pool's 5h figure of 0.09% used while the same account's
+/// weekly window sat at 16.63%. A consumer reading that sees roughly sixteen
+/// points of headroom that does not exist, and nothing on the wire says a window
+/// was dropped -- `windowMinutes` is simply null, which reads as "cadence
+/// unknown" rather than "a second window was discarded".
+///
+/// Both reference implementations order these the same way and neither treats
+/// them as interchangeable: CodexBar logs "Falling back to retrieveUserQuota"
+/// only on permissionDenied, and pane comments its summary call "Authoritative
+/// endpoint first: merged pools + weekly windows".
 const REMOTE_QUOTA_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 /// Identifies the calling product on that shared endpoint.
 const REMOTE_USER_AGENT: &str = "antigravity";
@@ -709,6 +733,23 @@ struct RemoteQuotaBucket {
 /// pool, so which of the two meters that reset belongs to is not knowable from
 /// this response. An absent cadence is a state consumers already handle; a
 /// guessed one would be acted on.
+/// Whether a summary-endpoint failure means "not permitted here", the one
+/// condition that justifies dropping to the per-model lane.
+///
+/// Narrow ON PURPOSE. The fallback publishes strictly less than the summary
+/// endpoint -- one collapsed window instead of a cadence pair -- so widening
+/// this predicate trades a loud, retryable failure for a quiet wrong number.
+/// A 403 is the account not being entitled to the summary; a timeout, a 5xx or
+/// a decode failure are all conditions where the good endpoint may answer on the
+/// next tick, and stale-serving through them is what the refresher already does
+/// correctly.
+fn summary_unavailable(error: &FetchError) -> bool {
+    matches!(
+        error,
+        FetchError::ProviderStatus(403 | 404) | FetchError::Unauthorized(_)
+    )
+}
+
 fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
     let response: RemoteQuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
@@ -865,6 +906,7 @@ pub struct AntigravityProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     quota_url: String,
+    quota_summary_url: String,
     token_url: String,
 }
 
@@ -887,6 +929,7 @@ impl AntigravityProvider {
             credential_source,
             handle_loader,
             quota_url: REMOTE_QUOTA_URL.to_string(),
+            quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
         }
     }
@@ -966,15 +1009,48 @@ impl AntigravityProvider {
             None => serde_json::json!({}),
         };
         let body = serde_json::to_vec(&body).map_err(|e| FetchError::Decode(e.to_string()))?;
-        let response = JsonRequest::post_json(&self.quota_url, body)
+
+        // Summary first, per-model only if it refuses. See the constants above
+        // for why these are not interchangeable.
+        //
+        // NOT DEFENDED BY A UNIT TEST, and mutation-checked to confirm that:
+        // swapping this back to `quota_url` reddens nothing, because which URL is
+        // dialled is observable only against a live server. The check that would
+        // catch a revert is the post-deploy wire read -- antigravity carrying a
+        // `windowMinutes` pair (300 and 10080) rather than a single null. If that
+        // pair is ever absent again, this line is the first place to look.
+        match self
+            .post_quota(&self.quota_summary_url, body.clone(), access_token)
+            .await
+        {
+            Ok(response) => return parse_quota_summary(&String::from_utf8_lossy(&response.body)),
+            Err(error) if summary_unavailable(&error) => {
+                // Fall through. Only a REFUSAL falls back: a timeout or a 5xx is
+                // a transient condition on the good endpoint, and degrading to a
+                // lane that silently drops a window would turn a retryable blip
+                // into a wrong number that looks fine.
+            }
+            Err(error) => return Err(error),
+        }
+
+        let response = self.post_quota(&self.quota_url, body, access_token).await?;
+        parse_remote_quota(&response.body)
+    }
+
+    async fn post_quota(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        access_token: &str,
+    ) -> Result<crate::http::HttpResponse, FetchError> {
+        JsonRequest::post_json(url, body)
             .bearer(access_token)
             // Identifies the calling product to the shared endpoint, matching
             // what the Antigravity client sends.
             .header(Header::new("User-Agent", REMOTE_USER_AGENT))
             .timeout(REQUEST_TIMEOUT)
             .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
-            .await?;
-        parse_remote_quota(&response.body)
+            .await
     }
 
     /// Exchange a stored refresh token for a short-lived access token.
@@ -1381,6 +1457,41 @@ mod tests {
         ]
       }
     }"#;
+
+    /// Only a REFUSAL drops to the per-model lane; a transient condition does not.
+    ///
+    /// Both directions are asserted together because either alone is satisfied by
+    /// a constant: "always fall back" passes the first group, "never fall back"
+    /// passes the second. What must hold is the SPLIT.
+    ///
+    /// The cost is asymmetric, which is why the predicate is narrow: falling back
+    /// too eagerly publishes a collapsed window that reads as a real, lower
+    /// number and says nothing about the window it dropped, while declining to
+    /// fall back on a genuine refusal costs one degraded entry that names itself.
+    #[test]
+    fn only_a_refusal_drops_to_the_per_model_lane() {
+        for refusal in [
+            FetchError::ProviderStatus(403),
+            FetchError::ProviderStatus(404),
+            FetchError::Unauthorized("not entitled".to_string()),
+        ] {
+            assert!(
+                summary_unavailable(&refusal),
+                "a refusal must fall back to the per-model lane: {refusal:?}"
+            );
+        }
+        for transient in [
+            FetchError::ProviderStatus(500),
+            FetchError::ProviderStatus(429),
+            FetchError::Upstream("timed out".to_string()),
+            FetchError::Decode("bad json".to_string()),
+        ] {
+            assert!(
+                !summary_unavailable(&transient),
+                "a transient failure must not degrade to the collapsed-window lane: {transient:?}"
+            );
+        }
+    }
 
     #[test]
     fn gemini_pool_owns_primary_and_no_secondary_is_emitted() {

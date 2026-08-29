@@ -280,15 +280,33 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::KimiForCoding)
     }
 
-    pub fn amp_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Amp) }
-    pub fn cursor_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Cursor) }
-    pub fn qwen_cloud_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::QwenCloud) }
-    pub fn qoder_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Qoder) }
-    pub fn factory_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Factory) }
-    pub fn mimo_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Mimo) }
-    pub fn ollama_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Ollama) }
-    pub fn opencode_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::OpenCode) }
-    pub fn opencodego_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::OpenCodeGo) }
+    pub fn amp_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Amp)
+    }
+    pub fn cursor_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Cursor)
+    }
+    pub fn qwen_cloud_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::QwenCloud)
+    }
+    pub fn qoder_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Qoder)
+    }
+    pub fn factory_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Factory)
+    }
+    pub fn mimo_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Mimo)
+    }
+    pub fn ollama_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Ollama)
+    }
+    pub fn opencode_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::OpenCode)
+    }
+    pub fn opencodego_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::OpenCodeGo)
+    }
 
     fn provider_handles(
         &self,
@@ -512,6 +530,20 @@ pub fn cookie_lane(handles: Vec<CredentialHandle>, family: &str) -> CookieLane {
     )
 }
 
+/// The bare cookie credential id a provider's deposits live under.
+///
+/// Derived from the routing table rather than restated per provider, so the
+/// family a provider ROUTES from and the family it TESTS bare-vs-suffixed
+/// against cannot disagree. Returns `None` for providers that are not cookie
+/// backed, which is what makes "is this a cookie provider" a table fact rather
+/// than a second list someone maintains.
+pub fn cookie_family_for(provider: &str) -> Option<&'static str> {
+    CREDENTIAL_FAMILIES
+        .iter()
+        .find(|(prefix, name)| *name == provider && prefix.starts_with("cookie:"))
+        .map(|(prefix, _)| *prefix)
+}
+
 pub fn handle_id_names_family(id: &str, prefix: &str) -> bool {
     id == prefix
         || id
@@ -543,7 +575,6 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             Some(format!("rejected invalid vault handle entries [{ids}]")),
         );
     }
-
 
     fn providers_for_id(id: &str) -> Vec<ProviderKind> {
         CREDENTIAL_FAMILIES
@@ -604,7 +635,10 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
         if providers.is_empty() {
             unsupported.push(credential_id);
         } else {
-            by_capability.entry(capability).or_default().push((credential_id, providers));
+            by_capability
+                .entry(capability)
+                .or_default()
+                .push((credential_id, providers));
         }
     }
 
@@ -849,7 +883,10 @@ mod tests {
 
     #[test]
     fn opencode_cookie_reaches_both_consumers() {
-        let path = write_file("opencode-cookie", r#"{"handles":{"cookie:opencode.ai":"ckh_opencode"}}"#);
+        let path = write_file(
+            "opencode-cookie",
+            r#"{"handles":{"cookie:opencode.ai":"ckh_opencode"}}"#,
+        );
         let loader = VaultHandleLoader::new(Some(path.clone()));
         assert_eq!(loader.opencode_handles().unwrap().len(), 1);
         assert_eq!(loader.opencodego_handles().unwrap().len(), 1);
@@ -858,7 +895,10 @@ mod tests {
 
     #[test]
     fn multiple_cookie_accounts_are_refused_without_reaping_other_families() {
-        let path = write_file("cookie-conflict", r#"{"handles":{"cookie:qwencloud.com:work":"ckh_work","cookie:qwencloud.com:personal":"ckh_personal","oauth:anthropic":"ckh_claude"}}"#);
+        let path = write_file(
+            "cookie-conflict",
+            r#"{"handles":{"cookie:qwencloud.com:work":"ckh_work","cookie:qwencloud.com:personal":"ckh_personal","oauth:anthropic":"ckh_claude"}}"#,
+        );
         let loader = VaultHandleLoader::new(Some(path.clone()));
         assert!(loader.qwen_cloud_handles().unwrap().is_empty());
         assert_eq!(loader.anthropic_handles().unwrap().len(), 1);

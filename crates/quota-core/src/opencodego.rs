@@ -13,11 +13,6 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 
 use crate::{
-    credential_source::CredentialSource,
-    provider::{CredentialHandle, FetchAttempt},
-    vault_handles::VaultHandleLoader,
-};
-use crate::{
     browser_cookies::SOURCE_LABEL,
     http::{Header, JsonRequest},
     model::ProviderUsage,
@@ -25,6 +20,11 @@ use crate::{
         fetch_workspace_id, load_cookie_header_async, looks_signed_out, parse_windows, USER_AGENT,
     },
     provider::{FetchError, UsageProvider},
+};
+use crate::{
+    credential_source::CredentialSource,
+    provider::{CredentialHandle, FetchAttempt},
+    vault_handles::VaultHandleLoader,
 };
 
 pub const PROVIDER_NAME: &str = "opencodego";
@@ -126,12 +126,25 @@ impl OpenCodeGoProvider {
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
-        Self { http: crate::http::provider_client(), credential_source, handle_loader }
+        Self {
+            http: crate::http::provider_client(),
+            credential_source,
+            handle_loader,
+        }
     }
 
-    async fn vault_cookie(&self, capability: &crate::credential_source::VaultCapability) -> Result<String, FetchError> {
-        let source = self.credential_source.as_ref().ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
-        let mut credential = source.get(capability, 120_000).await.map_err(|error| FetchError::Upstream(error.to_string()))?;
+    async fn vault_cookie(
+        &self,
+        capability: &crate::credential_source::VaultCapability,
+    ) -> Result<String, FetchError> {
+        let source = self
+            .credential_source
+            .as_ref()
+            .ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
+        let mut credential = source
+            .get(capability, 120_000)
+            .await
+            .map_err(|error| FetchError::Upstream(error.to_string()))?;
         crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }
@@ -171,12 +184,7 @@ impl UsageProvider for OpenCodeGoProvider {
             let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
             let now = chrono::Utc::now().timestamp();
             let usage = parse_windows(&text, now, true)?;
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                source,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)

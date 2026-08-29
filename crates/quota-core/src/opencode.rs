@@ -19,16 +19,16 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
-    credential_source::CredentialSource,
-    provider::{CredentialHandle, FetchAttempt},
-    vault_handles::{cookie_lane, CookieLane, VaultHandleLoader},
-};
-use crate::{
     browser_cookies::{self, CookieJar, SOURCE_LABEL},
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
+};
+use crate::{
+    credential_source::CredentialSource,
+    provider::{CredentialHandle, FetchAttempt},
+    vault_handles::{cookie_lane, CookieLane, VaultHandleLoader},
 };
 
 /// The bare vault credential id for this domain. A suffixed deposit
@@ -831,7 +831,11 @@ impl OpenCodeProvider {
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
-        Self { http: crate::http::provider_client(), credential_source, handle_loader }
+        Self {
+            http: crate::http::provider_client(),
+            credential_source,
+            handle_loader,
+        }
     }
 
     /// The bare `cookie:<domain>` deposit, if one exists.
@@ -850,16 +854,23 @@ impl OpenCodeProvider {
             .opencode_handles()
             .map_err(|error| FetchError::Internal(error.to_string()))?;
         Ok(match cookie_lane(handles, COOKIE_FAMILY) {
-            CookieLane::LocalWithFallback(Some(handle)) => {
-                handle.vault_capability().cloned()
-            }
+            CookieLane::LocalWithFallback(Some(handle)) => handle.vault_capability().cloned(),
             _ => None,
         })
     }
 
-    async fn vault_cookie(&self, capability: &crate::credential_source::VaultCapability) -> Result<String, FetchError> {
-        let source = self.credential_source.as_ref().ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
-        let mut credential = source.get(capability, 120_000).await.map_err(|error| FetchError::Upstream(error.to_string()))?;
+    async fn vault_cookie(
+        &self,
+        capability: &crate::credential_source::VaultCapability,
+    ) -> Result<String, FetchError> {
+        let source = self
+            .credential_source
+            .as_ref()
+            .ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
+        let mut credential = source
+            .get(capability, 120_000)
+            .await
+            .map_err(|error| FetchError::Upstream(error.to_string()))?;
         crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }
@@ -889,10 +900,12 @@ impl UsageProvider for OpenCodeProvider {
         // independently, so enumerating both would make both serve and leave the
         // emission gate to pick one identity-less entry by an invisible tie-break.
         // See `vault_handles::cookie_lane`.
-        Ok(match cookie_lane(self.handle_loader.opencode_handles()?, COOKIE_FAMILY) {
-            CookieLane::VaultOnly(handles) => handles,
-            CookieLane::LocalWithFallback(_) => vec![CredentialHandle::implicit()],
-        })
+        Ok(
+            match cookie_lane(self.handle_loader.opencode_handles()?, COOKIE_FAMILY) {
+                CookieLane::VaultOnly(handles) => handles,
+                CookieLane::LocalWithFallback(_) => vec![CredentialHandle::implicit()],
+            },
+        )
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -917,12 +930,7 @@ impl UsageProvider for OpenCodeProvider {
             let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
             let now = Utc::now().timestamp();
             let usage = parse_windows(&text, now, false)?;
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                source,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
