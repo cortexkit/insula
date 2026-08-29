@@ -67,6 +67,7 @@ async fn main() {
     let body = common::usage_get(&mut stream, route, 3).await;
 
     let health_findings = check_health_identity(&mut stream).await;
+    let signal_findings = check_self_signals(&mut stream).await;
 
     // The envelope is an OBJECT with `result` beside `completeProviders`, and this
     // checker had verified only the first half since the day the second shipped --
@@ -173,6 +174,7 @@ async fn main() {
         .findings
         .iter()
         .chain(health_findings.iter())
+        .chain(signal_findings.iter())
         .collect();
     if !findings.is_empty() {
         println!("findings: {}", findings.len());
@@ -200,6 +202,71 @@ async fn main() {
 /// must see what a consumer sees: a field that stopped being published should
 /// fail here, not be quietly defaulted.
 ///
+/// Check that the daemon ACCEPTED our self-signal declaration, not merely that a
+/// binary carrying it is running.
+///
+/// THOSE ARE DIFFERENT CLAIMS AND I CONFLATED THEM ONCE. `buildCommit` matching
+/// HEAD proves the deployed bytes contain the declaration. It says nothing about
+/// whether the daemon parsed it, kept it, or dropped it at HELLO -- and a
+/// manifest block that fails validation is exactly the kind of thing that can be
+/// discarded without failing the registration that carried it. The module would
+/// then be up, healthy, and declaring nothing, with every surface I habitually
+/// check reading clean.
+///
+/// `catalog.list` is where the daemon republishes what it stored, so it is the
+/// only consumer-reachable answer to "did the claim survive the trip".
+///
+/// Asserted as SHAPE, not as contents: that the block is present, non-empty, and
+/// that every entry carries the two fields the registry exists to convey. Pinning
+/// the entries themselves would redden on any honest change to what this module
+/// does, which is the opposite of what a drift fence should do.
+async fn check_self_signals(stream: &mut tokio::net::TcpStream) -> Vec<String> {
+    let modules = common::catalog_list(stream, 4).await;
+    let Some(me) = modules.iter().find(|m| m["module_id"] == common::MODULE_ID) else {
+        return vec![format!(
+            "{} is not in catalog.list, so nothing can be said about its manifest",
+            common::MODULE_ID
+        )];
+    };
+
+    let signals = &me["self_signals"];
+    if signals.is_null() {
+        return vec![
+            "the daemon holds no self_signals for this module: either the block was \
+             dropped in transit or this binary predates the declaration"
+                .to_string(),
+        ];
+    }
+    let Some(entries) = signals.as_array() else {
+        return vec![format!("self_signals is not an array: {signals}")];
+    };
+    if entries.is_empty() {
+        return vec![
+            "self_signals is an affirmative empty list, but this module runs a \
+             refresher and can spend banked credits -- an empty declaration here \
+             would be a false zero, not an honest one"
+                .to_string(),
+        ];
+    }
+
+    let mut findings = Vec::new();
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap_or("<unnamed>");
+        // effect and anchored_to are the two axes the registry was built for:
+        // effect separates a reading that can be subtracted afterwards from one
+        // that rewrote the surface, and anchored_to separates a signal a
+        // periodicity check can find from one that reproduces the surface's own
+        // event grid. An entry missing either is a row that cannot be acted on.
+        if entry["effect"].is_null() {
+            findings.push(format!("self_signal {name} carries no effect"));
+        }
+        if entry["anchored_to"].is_null() {
+            findings.push(format!("self_signal {name} carries no anchored_to"));
+        }
+    }
+    findings
+}
+
 /// Asked as `supervisor.health`, which is the consumer-facing op. `health.check`
 /// is the daemon's own request to a module and is not in the consumer
 /// vocabulary, so this reads the record the supervisor last collected -- the same
