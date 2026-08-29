@@ -38,18 +38,27 @@ def probe_source() -> str:
     """A binary from the EXPENSIVE set, resolved once.
 
     THE SOURCE BINARY IS NOT ARBITRARY, and picking it wrong makes the probe read
-    healthy through an episode. Measured on this machine: fresh copies of
-    /bin/echo, /bin/ls and /usr/bin/git cost ~1.5 ms, while fresh copies of
-    /usr/bin/true and of real Rust test binaries cost 250-620 ms. Something
-    distinguishes those two sets that nobody has identified -- not size, not
-    signature presence, not content caching, all tested and ruled out.
+    healthy through an episode.
 
-    So this prefers a REAL Rust test binary from the fleet, which is both the
-    population that actually stalls and a measured member of the expensive set.
-    `/usr/bin/true` is the fallback because it is the only expensive member
-    guaranteed to exist. `/bin/echo` is deliberately NOT used: an earlier version
-    of the probe used it, read 2 ms, and would have reported health straight
-    through a wedge.
+    An earlier version used /bin/echo, read 2 ms, and would have reported health
+    straight through a wedge. That was first blamed on echo being "cheap to
+    validate" alongside /bin/ls, /usr/bin/env and /usr/bin/git, against
+    /usr/bin/true and Rust binaries at 250-900 ms -- a split that stood for two
+    days as an unexplained anomaly after size, signature shape and architecture
+    were each ruled out.
+
+    THERE IS NO CHEAP SET. Those binaries were never executing. Copied out of
+    their canonical location they lose platform-binary status and the kernel
+    refuses them (rc=-9 SIGKILL, shell exit 137; /bin/ls also ships an arm64e-only
+    slice on an arm64 host). The ~1.5 ms was the cost of a REFUSAL. The real rule
+    is simpler: a binary that can actually run from a copied path pays 200-900 ms,
+    and one that cannot is rejected instantly and says nothing about the machine.
+
+    Hence a REAL Rust test binary from the fleet -- the population that actually
+    stalls, native to this architecture, and verified to exit 0 when copied.
+    `/usr/bin/true` is the fallback: the one system binary measured to still RUN
+    from a copied path here. ANY REPLACEMENT MUST BE CHECKED BY RETURN CODE, never
+    by how fast it comes back.
 
     Cached because the search walks the fleet's build directories, and doing that
     every few seconds would make the watcher part of the load it watches for.
