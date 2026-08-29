@@ -494,7 +494,10 @@ impl Registry {
             Box::new(zenmux::ZenMuxProvider::new()),
             Box::new(kilo::KiloProvider::new()),
             Box::new(alibaba::AlibabaProvider::new()),
-            Box::new(amp::AmpProvider::new()),
+            Box::new(amp::AmpProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
         ]);
         registry.credential_source = credential_source;
         registry

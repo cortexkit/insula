@@ -13,13 +13,17 @@ use chrono::{DateTime, Utc};
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, SOURCE_LABEL},
+    browser_cookies,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "amp";
+/// Base key for storing Amp credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:ampcode.com";
+
 const DOMAIN: &str = "ampcode.com";
 const SETTINGS_URL: &str = "https://ampcode.com/settings";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -224,16 +228,34 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
 
 /// The Amp usage provider.
 pub struct AmpProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl AmpProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| crate::http::provider_client());
-        Self { http }
+        Self {
+            http,
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
+        }
     }
 }
 
@@ -253,11 +275,20 @@ impl UsageProvider for AmpProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
@@ -324,12 +355,7 @@ impl UsageProvider for AmpProvider {
 
             let html = String::from_utf8_lossy(response.body_for_parsing()?);
             let usage = normalize_usage(&html, chrono::Utc::now())?;
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                SOURCE_LABEL,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -501,5 +527,15 @@ mod tests {
         let now = Utc::now();
         let res = normalize_usage("<html><body>no usage here</body></html>", now);
         assert!(matches!(res, Err(FetchError::Decode(_))));
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = AmpProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }
