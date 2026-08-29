@@ -437,7 +437,10 @@ impl Registry {
             )),
             Box::new(codebuff::CodebuffProvider::new()),
             Box::new(copilot::CopilotProvider::new()),
-            Box::new(cursor::CursorProvider::new()),
+            Box::new(cursor::CursorProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(deepseek::DeepSeekProvider::new()),
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
