@@ -467,7 +467,10 @@ impl Registry {
             Box::new(clinepass::ClinePassProvider::new()),
             Box::new(llmproxy::LlmProxyProvider::new()),
             Box::new(manus::ManusProvider::new()),
-            Box::new(mimo::MimoProvider::new()),
+            Box::new(mimo::MimoProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(minimax::MinimaxProvider::new()),
             Box::new(neuralwatt::NeuralWattProvider::new()),
             Box::new(ollama::OllamaProvider::new()),
