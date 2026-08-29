@@ -89,7 +89,7 @@ whichever won",
     ),
 ];
 
-/// Maps a credential handle key to the provider that consumes it.
+/// Maps a credential handle key to every provider that consumes it.
 ///
 /// Keys are matched by prefix because the vault mints additional accounts for a
 /// family as `<base>:<label>` — `oauth:anthropic:ufuk2` alongside
@@ -108,16 +108,14 @@ whichever won",
 /// independent of each other — a family mapped to the wrong provider still
 /// leaves the right provider with no credential, so the lane goes dark and this
 /// fires anyway.
-fn provider_for_handle(key: &str) -> Option<&'static str> {
-    // Both the family list and the matching predicate come from the module.
-    // Sharing only the list would leave this free to disagree about which ids
-    // the list covers -- and that disagreement reports as a finding either way:
-    // an id the module consumes and this does not reads as a stray credential,
-    // and an id this maps and the module drops reads as a lane gone dark.
+fn providers_for_handle(key: &str) -> Vec<&'static str> {
+    // A cookie may deliberately feed both OpenCode plans. The list is therefore
+    // collected rather than first-matched; ordinary families still yield one.
     quota_core::vault_handles::CREDENTIAL_FAMILIES
         .iter()
-        .find(|(prefix, _)| quota_core::vault_handles::handle_id_names_family(key, prefix))
+        .filter(|(prefix, _)| quota_core::vault_handles::handle_id_names_family(key, prefix))
         .map(|(_, provider)| *provider)
+        .collect()
 }
 
 #[tokio::main]
@@ -187,6 +185,15 @@ async fn main() {
         loader.gemini_handles(),
         loader.antigravity_handles(),
         loader.kimi_for_coding_handles(),
+        loader.amp_handles(),
+        loader.cursor_handles(),
+        loader.qwen_cloud_handles(),
+        loader.qoder_handles(),
+        loader.factory_handles(),
+        loader.mimo_handles(),
+        loader.ollama_handles(),
+        loader.opencode_handles(),
+        loader.opencodego_handles(),
     ]
     .iter()
     .any(|result| result.as_ref().is_ok_and(|handles| !handles.is_empty()));
@@ -205,13 +212,17 @@ async fn main() {
             std::process::exit(2);
         }
         for key in handles.keys() {
-            match provider_for_handle(key) {
-                Some(provider) => expected.entry(provider).or_default().push(key.clone()),
+            let providers = providers_for_handle(key);
+            if providers.is_empty() {
                 // An unmapped key is reported rather than ignored: it means this
                 // host is configured for a credential no provider here consumes,
                 // which is a real configuration finding and would otherwise be
                 // invisible.
-                None => unmapped.push(key.clone()),
+                unmapped.push(key.clone());
+            } else {
+                for provider in providers {
+                    expected.entry(provider).or_default().push(key.clone());
+                }
             }
         }
     }
