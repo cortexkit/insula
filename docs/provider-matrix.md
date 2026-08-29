@@ -28,7 +28,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.55.1** (37 providers registered; verified
+**Current parity: CodexBar v0.56.0** (37 providers registered; verified
 2026-08-25). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
@@ -264,6 +264,45 @@ endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
 
 ### v0.55.0 -> v0.55.1 (checked 2026-08-26)
+
+### Round: v0.55.1 -> v0.56.0 (2026-08-29) — null, with one decline worth recording
+
+Constants first, all five PRESENT in the v0.56.0 tree, verified by taking each
+value from OUR source and running `git grep -l -F <value> v0.56.0`.
+
+A NOTE ON HOW THAT CHECK NEARLY WENT WRONG, because the failure is repeatable:
+my first attempt parsed the values out of THIS TABLE with a fresh regex and
+reported all five ABSENT. They were not absent; the regex had matched the prose
+sentence naming the constants rather than the rows carrying their values, so it
+was comparing empty strings. Five simultaneous "upstream changed everything"
+results should read as an instrument fault, not a finding — and the standing
+instruction in the tripwire note is precisely DO NOT WRITE YOUR OWN EXTRACTOR.
+Take the values from source, where they are declarations rather than prose.
+
+Fourteen provider files moved. The delta's centre of mass is a NEW ANTIGRAVITY
+LOCAL FAMILY — roughly 1,300 lines across JSONL, SQLite, proto and scan readers.
+
+DECLINED, and the reason matters more than the decline: it is a USAGE-STATISTICS
+lane, not a quota lane. `AntigravityLocalReader.makeDailyReportWithStatus`
+aggregates request counts and token totals per day out of the editor's local
+databases. That is the CONSUMPTION axis — how much was spent — where this module
+reports the CAPACITY axis: how much is left and when it resets. The two are not
+smaller and larger versions of each other; a daily token total cannot answer
+"what fraction of the window is gone" without a denominator the local files do
+not carry.
+
+It is genuinely interesting for a spend-accounting consumer, which is why it is
+recorded here rather than dropped: local per-day token counts with no network
+call are exactly what a usage ledger wants and cannot easily get.
+
+Grok's change is a testability refactor — the descriptor now takes its billing
+fetchers as injected closures rather than constructing them inline. No endpoint,
+window or credential-resolution change. Read whole per the standing warning that
+Grok diff fragments have inverted meaning twice.
+
+Everything else: Cursor's usage-EVENTS fetcher (event log, not quota), Codex
+workspace identity caching, an OpenCodeGo local-lane change against the
+local-file lane we do not have, and a presentation string.
 
 Constants first, all five located in the v0.55.1 tree: BETA_HEADER,
 WORKSPACES_SERVER_ID, BILLING_SERVER_ID, SUBSCRIPTION_SERVER_ID, OASIS_WEB_ID.
