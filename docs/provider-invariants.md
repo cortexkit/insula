@@ -3286,3 +3286,47 @@ Two second-order notes, both costly:
 - When an instrument is disproved, EVERY row it produced is suspect, not the rows
   someone happened to check. Two were corrected by their owners; the other four
   were re-derived here, and could equally have been wrong.
+
+
+## A measurement that never reached its subject still returns a number
+
+Three wrong conclusions in one day, all from instruments that ran cleanly, returned
+well-formed values, and never touched the thing being measured. None announced
+itself; each was caught by a different accident.
+
+```
+strings | grep -oE '[0-9a-f]{16}'   returned a real 16-hex token from
+                                     elsewhere in the binary, not the digest
+median over three repetitions        reported the CACHED cost, refuting a
+                                     hypothesis that was true
+timing a copied system binary        ~1.5ms readings were SIGKILL refusals;
+                                     the process never executed
+```
+
+The third one stood for two days as a recorded, actively-investigated *anomaly* —
+"some binaries are cheap to validate and nobody has found why" — with size,
+signature shape and architecture each tested and ruled out. There was nothing to
+explain. The cheap set was not cheap; it was refused.
+
+**The concrete check, which costs nothing: when a timing comes back unexpectedly
+cheap, read the exit status before believing it.** `subprocess.run(...)` returns a
+completed object whether the program ran or was killed, and `-9` versus `0` is the
+whole difference between "fast" and "never happened". A shell reports the same
+thing as exit 137.
+
+The general form is worth more than the check, because it covers instruments with
+no exit status at all:
+
+> A measurement that never reached its subject still returns a number, and the
+> number is usually plausible. Plausibility is what makes it survive review.
+
+So the question to ask of any instrument is not "is this value reasonable" but
+"what path did it take, and could that path have skipped the subject entirely".
+For the three above the answers were: matched a different token, hit a cache,
+and was refused at exec — none of which a reasonable-looking result would ever
+reveal.
+
+Related, and the reason this section sits beside the vacuity ones: a test that
+cannot fail and a measurement that never happened are the same defect at different
+scales. Both produce evidence of a thing not examined, and both read as
+confirmation.
