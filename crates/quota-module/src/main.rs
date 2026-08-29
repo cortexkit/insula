@@ -18,7 +18,17 @@ mod vault_client;
 
 use ids::DEFAULT_MODULE_ID;
 
-use std::{error::Error, ffi::OsString, fmt, path::PathBuf, sync::Arc};
+use std::{
+    error::Error,
+    ffi::OsString,
+    fmt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
 
 use quota_core::{config::QuotaConfig, credential_source::CredentialSource, Registry};
 use serde::Deserialize;
@@ -186,6 +196,10 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     // not expose because they are a property of THIS transport rather than of
     // credential lookup.
     let vault = Arc::new(VaultClient::new(config.connection_file_path.clone()));
+    // Process-lifetime consumption counters. Reset on restart like every other
+    // process-lifetime metric here, which is why the AGES matter more than the
+    // totals for an operator: a fresh process legitimately shows zero served.
+    let serve = Arc::new(ServeCounters::default());
     let credential_source: Arc<dyn CredentialSource> = vault.clone();
     let registry = Arc::new(Registry::with_defaults(
         quota_config,
@@ -208,6 +222,7 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
         &config,
         Arc::clone(&registry),
         Arc::clone(&vault),
+        Arc::clone(&serve),
     )
     .await;
     drop(tx);
@@ -250,6 +265,7 @@ async fn module_loop<R>(
     config: &ModuleConfig,
     registry: Arc<Registry>,
     vault: Arc<VaultClient>,
+    serve: Arc<ServeCounters>,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -264,7 +280,7 @@ where
         else {
             return Ok(()); // clean EOF: subc closed the connection.
         };
-        if !handle_frame(frame, &writer, &registry, &vault).await? {
+        if !handle_frame(frame, &writer, &registry, &vault, &serve).await? {
             return Ok(());
         }
     }
@@ -345,11 +361,84 @@ where
 }
 
 /// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
+/// Counts of route requests this process answered and refused.
+///
+/// EVERY OTHER HEALTH METRIC THIS MODULE PUBLISHES IS PRODUCER-SIDE -- am I
+/// fetching, am I fresh, is the refresher ticking. None of them answers whether
+/// anything is READING. If every consumer on a host stopped dialling an hour ago
+/// (route died, client wedged, their delivery plane starved), health would read
+/// exactly as it does when all is well: ok, serving, blackout false. Perfectly
+/// healthy and talking to nobody.
+///
+/// The queue-backed answer does not transfer here. A push surface can count rows
+/// owed and undelivered; `usage.get` is PULL, so there is no owed row and no
+/// undelivered anything -- the only evidence a consumer exists is that it asked.
+///
+/// SPLIT SERVED FROM REFUSED because `last_served_age` alone cannot separate
+/// nobody-asked from asked-and-failed: a consumer whose every request is refused
+/// (bad body, unknown method, unframeable reply) never advances a served
+/// watermark, and looks identical to silence. With both, the three states an
+/// operator triages -- quiet, consuming, failing-to-consume -- are each one read.
+///
+/// DELIBERATELY NOT AN ALARM. A host with nobody polling is a legitimate
+/// configuration, so a "no consumers" degraded state would fire on every quiet
+/// host and train the surface into noise. These are numbers for a reader who has
+/// context this module cannot have; the producer reports, the reader judges.
+/// The four header fields every route reply must echo, carried as one value.
+///
+/// They are not four independent arguments -- they are the identity of the
+/// request being answered, and the daemon drops a reply that gets any of them
+/// wrong as belonging to a stale binding. Bundling them means a new reply site
+/// cannot pass three of four, and keeps the error helper under the argument
+/// count where a reader stops tracking positional meaning.
+#[derive(Debug, Clone, Copy)]
+struct RouteReply {
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+}
+
+#[derive(Debug, Default)]
+struct ServeCounters {
+    served: AtomicU64,
+    refused: AtomicU64,
+    /// Monotonic instant of the last answered request, for an age at read time.
+    /// Ages are computed live rather than stored, so a stalled reporter cannot
+    /// publish a frozen "seconds ago" that keeps looking recent.
+    last_served: Mutex<Option<Instant>>,
+    last_refused: Mutex<Option<Instant>>,
+}
+
+impl ServeCounters {
+    fn record_served(&self) {
+        self.served.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_served.lock() {
+            *slot = Some(Instant::now());
+        }
+    }
+
+    fn record_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_refused.lock() {
+            *slot = Some(Instant::now());
+        }
+    }
+
+    fn age_secs(slot: &Mutex<Option<Instant>>) -> Option<u64> {
+        slot.lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map(|at| at.elapsed().as_secs())
+    }
+}
+
 async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
     vault: &Arc<VaultClient>,
+    serve: &Arc<ServeCounters>,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -369,7 +458,7 @@ async fn handle_frame(
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => Ok(true), // route goodbye: nothing to tear down (no per-route state).
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, registry, vault).await?;
+            handle_control_request(frame, writer, registry, vault, serve).await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -377,8 +466,9 @@ async fn handle_frame(
             // head-of-line-blocks another route (ManagementSurface concurrency).
             let writer = writer.clone();
             let registry = Arc::clone(registry);
+            let serve = Arc::clone(serve);
             tokio::spawn(async move {
-                let _ = handle_usage_request(frame, &writer, &registry).await;
+                let _ = handle_usage_request(frame, &writer, &registry, &serve).await;
             });
             Ok(true)
         }
@@ -391,6 +481,7 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
     vault: &VaultClient,
+    serve: &ServeCounters,
 ) -> Result<(), ModuleError> {
     // A body this module cannot decode is answered, not escalated. Returning an
     // error here propagates to the frame loop, which treats it as fatal and ends
@@ -427,7 +518,7 @@ async fn handle_control_request(
             // a poisoned serving cache (a panicked serving task) is `failing`;
             // otherwise `ok`, because a provider degrading on a box without its
             // creds is this prober's normal state, carried as detail not status.
-            health_report(&registry.health(), vault)
+            health_report(&registry.health(), vault, serve)
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -483,6 +574,7 @@ const BUILD_COMMIT: &str = env!("CK_QUOTA_BUILD_COMMIT");
 fn health_report(
     snapshot: &quota_core::health::HealthSnapshot,
     vault: &VaultClient,
+    serve: &ServeCounters,
 ) -> ModuleControlResponse {
     let status = if snapshot.is_failing() {
         HealthStatus::Failing
@@ -526,6 +618,29 @@ fn health_report(
         // Reporting it here makes "is the deployed build current?" answerable from
         // the RUNNING process, which a file's modification time cannot establish.
         "buildCommit": BUILD_COMMIT,
+        // CONSUMPTION, not production. Every other field here answers "am I
+        // producing correctly"; these four answer "is anyone reading", which
+        // nothing else on this surface could. A host whose consumers all stopped
+        // dialling an hour ago reports identically to a healthy one on every
+        // other metric -- serving, fresh, blackout false, refresher ticking.
+        //
+        // NOT ALARMED, and that is deliberate. A host with nobody polling is a
+        // legitimate configuration, so degrading on it would fire everywhere and
+        // train the surface into noise. These are for a reader who has context
+        // the producer cannot: the module reports, the operator judges.
+        //
+        // Served and refused are SEPARATE because an age alone cannot tell
+        // nobody-asked from asked-and-failed -- a consumer whose every request is
+        // refused never advances the served watermark and looks like silence.
+        // With both, quiet / consuming / failing-to-consume are each one read.
+        //
+        // Ages are computed at read time from a stored instant rather than
+        // stored as numbers, so a stalled reporter cannot publish a frozen
+        // "seconds ago" that keeps looking recent.
+        "usageRequestsServed": serve.served.load(Ordering::Relaxed),
+        "usageRequestsRefused": serve.refused.load(Ordering::Relaxed),
+        "lastServedAgeSecs": ServeCounters::age_secs(&serve.last_served),
+        "lastRefusedAgeSecs": ServeCounters::age_secs(&serve.last_refused),
         "providersTotal": snapshot.providers_total,
         "fresh": snapshot.fresh,
         "stale": snapshot.stale,
@@ -673,6 +788,7 @@ async fn handle_usage_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     registry: &Arc<Registry>,
+    serve: &Arc<ServeCounters>,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     // The route's binding epoch must be echoed on every reply, or the daemon
@@ -680,16 +796,20 @@ async fn handle_usage_request(
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
+    let reply = RouteReply {
+        ver,
+        channel,
+        epoch,
+        corr,
+    };
 
     let request: UsageRequest = match serde_json::from_slice(&frame.body) {
         Ok(r) => r,
         Err(e) => {
             return send_route_error(
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
+                serve,
+                reply,
                 "invalid_request",
                 &format!("usage request body not decodable: {e}"),
             )
@@ -704,10 +824,8 @@ async fn handle_usage_request(
             Err(error) => {
                 return send_route_error(
                     writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
+                    serve,
+                    reply,
                     "internal_error",
                     &format!("drop page not serializable: {error}"),
                 )
@@ -727,10 +845,8 @@ async fn handle_usage_request(
             Err(error) => {
                 return send_route_error(
                     writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
+                    serve,
+                    reply,
                     "internal_error",
                     &format!("drop page could not be framed: {error}"),
                 )
@@ -750,10 +866,8 @@ async fn handle_usage_request(
         let echoed = quota_core::text::truncate_for_wire(&request.method, MAX_ECHOED_METHOD_BYTES);
         return send_route_error(
             writer,
-            ver,
-            channel,
-            epoch,
-            corr,
+            serve,
+            reply,
             "unknown_method",
             &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}' or '{USAGE_DROPS_OP}'"),
         )
@@ -787,10 +901,8 @@ async fn handle_usage_request(
         Err(error) => {
             return send_route_error(
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
+                serve,
+                reply,
                 "internal_error",
                 &format!("usage response could not be serialized: {error}"),
             )
@@ -810,36 +922,43 @@ async fn handle_usage_request(
         Err(error) => {
             return send_route_error(
                 writer,
-                ver,
-                channel,
-                epoch,
-                corr,
+                serve,
+                reply,
                 "internal_error",
                 &format!("usage response could not be framed: {error}"),
             )
             .await;
         }
     };
+    serve.record_served();
     send(writer, response).await
 }
 
+/// Answer a route request with an error frame, and count it as a refusal.
+///
+/// The counting lives HERE rather than at the six call sites because a return
+/// site is easy to add without remembering the counter, and a refusal that is
+/// not counted reads on the health surface as a request nobody made -- exactly
+/// the confusion the counters exist to remove. Verified at the time of writing
+/// that every caller is inside `handle_usage_request`, so this counts route
+/// refusals only; a control-plane caller added later would need its own counter
+/// rather than borrowing this one.
 async fn send_route_error(
     writer: &mpsc::Sender<Frame>,
-    ver: u8,
-    channel: u16,
-    epoch: u32,
-    corr: u64,
+    serve: &Arc<ServeCounters>,
+    reply: RouteReply,
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
+    serve.record_refused();
     let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
-        ver,
+        reply.ver,
         FrameType::Error,
         Flags::new(false, Priority::Interactive, false),
-        channel,
-        epoch,
-        corr,
+        reply.channel,
+        reply.epoch,
+        reply.corr,
         body,
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -1148,9 +1267,11 @@ mod tests {
     /// metrics table worth scanning.
     #[test]
     fn every_published_health_metric_is_documented() {
-        let ModuleControlResponse::HealthCheck { metrics, .. } =
-            health_report(&healthy_snapshot(), &test_vault())
-        else {
+        let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
+            &healthy_snapshot(),
+            &test_vault(),
+            &ServeCounters::default(),
+        ) else {
             panic!("health_report must answer a HealthCheck");
         };
         let metrics = metrics.expect("metrics are always published");
@@ -1311,7 +1432,7 @@ mod tests {
 
     fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
         let ModuleControlResponse::HealthCheck { status, .. } =
-            health_report(snapshot, &test_vault())
+            health_report(snapshot, &test_vault(), &ServeCounters::default())
         else {
             panic!("health_report must produce a HealthCheck response");
         };
@@ -1343,7 +1464,7 @@ mod tests {
         };
 
         let ModuleControlResponse::HealthCheck { detail, .. } =
-            health_report(&snapshot, &test_vault())
+            health_report(&snapshot, &test_vault(), &ServeCounters::default())
         else {
             panic!("health_report must produce a HealthCheck response");
         };
@@ -1470,7 +1591,33 @@ mod tests {
             .unwrap();
 
             let registry = Arc::new(quota_core::Registry::new(Vec::new()));
-            let _ = handle_usage_request(frame, &tx, &registry).await;
+            let serve = Arc::new(ServeCounters::default());
+            let _ = handle_usage_request(frame, &tx, &registry, &serve).await;
+
+            // Every case in this table is a REFUSAL, so the refused counter must
+            // advance and the served one must not. Asserted here rather than in a
+            // dedicated test because a counter that is merely PUBLISHED, and never
+            // driven, passes a key-set fence perfectly while counting nothing --
+            // and the whole point of the pair is that an operator can tell
+            // failing-to-consume from nobody-asked.
+            assert_eq!(
+                serve.refused.load(Ordering::Relaxed),
+                1,
+                "{label}: a refusal must be counted"
+            );
+            assert_eq!(
+                serve.served.load(Ordering::Relaxed),
+                0,
+                "{label}: a refusal must not count as served"
+            );
+            assert!(
+                ServeCounters::age_secs(&serve.last_refused).is_some(),
+                "{label}: a refusal must stamp last_refused"
+            );
+            assert!(
+                ServeCounters::age_secs(&serve.last_served).is_none(),
+                "{label}: a refusal must leave last_served unset"
+            );
 
             let reply = rx
                 .try_recv()
@@ -1502,6 +1649,65 @@ mod tests {
     /// Driven here at a size that is fast to run rather than at the cap itself;
     /// the property under test is that the reply size does not follow the
     /// request's, which a bounded echo gives at every size.
+    /// A well-formed `usage.get` advances the SERVED counter, not the refused one.
+    ///
+    /// The refusal arm is covered by the table above, and covering only that arm
+    /// would leave the pair half-proved in the direction that matters least: a
+    /// module counting every request as refused still tells an operator that
+    /// something is happening. A module that counts NOTHING as served, while
+    /// consumers are being answered normally, reports permanent silence on a
+    /// healthy host -- the exact wrong belief these counters exist to prevent.
+    ///
+    /// Driven with an empty registry, because the counter is about the REQUEST
+    /// being answered rather than about what the answer contains: an empty
+    /// provider set is still a served request.
+    #[tokio::test]
+    async fn a_well_formed_usage_request_counts_as_served() {
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "method": USAGE_GET_OP,
+            "params": {}
+        }))
+        .unwrap();
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            9,
+            3,
+            77,
+            body,
+        )
+        .unwrap();
+
+        let registry = Arc::new(quota_core::Registry::new(Vec::new()));
+        let serve = Arc::new(ServeCounters::default());
+        handle_usage_request(frame, &tx, &registry, &serve)
+            .await
+            .expect("a well-formed request is answered");
+
+        let reply = rx.try_recv().expect("the consumer received a reply");
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(
+            serve.served.load(Ordering::Relaxed),
+            1,
+            "an answered request must be counted as served"
+        );
+        assert_eq!(
+            serve.refused.load(Ordering::Relaxed),
+            0,
+            "an answered request must not be counted as refused"
+        );
+        assert!(
+            ServeCounters::age_secs(&serve.last_served).is_some(),
+            "an answered request must stamp last_served"
+        );
+        assert!(
+            ServeCounters::age_secs(&serve.last_refused).is_none(),
+            "an answered request must leave last_refused unset"
+        );
+    }
+
     #[tokio::test]
     async fn an_oversized_method_name_still_receives_an_error_reply() {
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
@@ -1521,7 +1727,7 @@ mod tests {
         .unwrap();
 
         let registry = Arc::new(quota_core::Registry::new(Vec::new()));
-        handle_usage_request(frame, &tx, &registry)
+        handle_usage_request(frame, &tx, &registry, &Arc::new(ServeCounters::default()))
             .await
             .expect("the rejection must be deliverable");
 
@@ -1582,7 +1788,9 @@ mod tests {
 
             let registry = Arc::new(quota_core::Registry::new(Vec::new()));
             let vault = VaultClient::new(std::path::PathBuf::from("/nonexistent"));
-            let result = handle_control_request(frame, &tx, &registry, &vault).await;
+            let result =
+                handle_control_request(frame, &tx, &registry, &vault, &ServeCounters::default())
+                    .await;
 
             // The handler must not signal failure upward: that is what the frame
             // loop treats as fatal.
@@ -1648,9 +1856,15 @@ mod tests {
         )
         .unwrap();
 
-        handle_control_request(frame, &tx, &registry, &test_vault())
-            .await
-            .unwrap();
+        handle_control_request(
+            frame,
+            &tx,
+            &registry,
+            &test_vault(),
+            &ServeCounters::default(),
+        )
+        .await
+        .unwrap();
 
         let response = rx.try_recv().expect("a response frame was sent");
         assert_eq!(response.header.ty, FrameType::Response);
@@ -1699,6 +1913,10 @@ mod tests {
             "vaultUnmatchedDrops",
             "vaultStaleGenerationDrops",
             "vaultConnectionsEstablished",
+            "usageRequestsServed",
+            "usageRequestsRefused",
+            "lastServedAgeSecs",
+            "lastRefusedAgeSecs",
         ];
         let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
         published.sort_unstable();
@@ -1741,9 +1959,15 @@ mod tests {
         )
         .unwrap();
 
-        handle_control_request(frame, &tx, &registry, &test_vault())
-            .await
-            .unwrap();
+        handle_control_request(
+            frame,
+            &tx,
+            &registry,
+            &test_vault(),
+            &ServeCounters::default(),
+        )
+        .await
+        .unwrap();
 
         let response = rx.try_recv().expect("a response frame was sent");
         assert_eq!(response.header.ty, FrameType::Response);

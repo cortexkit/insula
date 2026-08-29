@@ -1581,6 +1581,32 @@ worth acting on is that `cookie` providers cannot work headless and break when a
 here — so a fleet that runs without a desktop browser should expect them absent
 rather than treat it as a fault.
 
+**Four health metrics describe CONSUMPTION rather than production.**
+`usageRequestsServed` and `usageRequestsRefused` count route requests this process
+answered and refused since it started; `lastServedAgeSecs` and `lastRefusedAgeSecs`
+give the seconds since each, or null if it has not happened.
+
+Every other metric on this surface answers *am I producing correctly* — fresh,
+stale, degraded, blackout, refresher ticking. None of them answers *is anyone
+reading*. A host whose consumers all stopped dialling an hour ago publishes
+health identical to a perfectly healthy one, because nothing in the producing
+path notices. These four close that gap.
+
+**They are deliberately not alarmed, and consumers should not alarm on them
+either.** A host with nobody polling is a legitimate configuration; a rule that
+degrades on it fires everywhere and trains the surface into noise. They exist so
+that *is anything reading insula* is answerable by looking rather than inferring.
+
+**Served and refused are separate because an age alone cannot tell
+nobody-asked from asked-and-failed.** A consumer whose every request is refused —
+undecodable body, unknown method — never advances the served watermark and looks
+exactly like silence. Read as a pair they separate the three states worth
+triaging: quiet (neither advancing), consuming (served advancing), and
+failing-to-consume (refused advancing while served does not).
+
+Counts are process-lifetime and reset on restart, so the AGES carry more meaning
+than the totals: a freshly restarted module legitimately reports zero served.
+
 **Two health metrics describe this module's own client, not any provider.**
 `vaultUnmatchedDrops` and `vaultStaleGenerationDrops` count frames this module
 read from the credential vault and discarded: one whose caller had already gone,
