@@ -452,6 +452,66 @@ fn transient_io(error: &std::io::Error) -> bool {
 /// this module consumes and a checker does not is reported as a stray
 /// credential, and an id a checker maps and this module drops is reported as a
 /// lane gone dark.
+/// Which lanes a cookie provider should expose, given its deposited handles.
+///
+/// PRECEDENCE FOR COOKIE PROVIDERS CANNOT LIVE IN `fetch_handle`, and getting that
+/// wrong is how the first implementation of this shipped. Every handle a provider
+/// returns becomes its own SLOT and is fetched independently, so enumerating a
+/// local lane beside a vault lane does not mean "prefer one" -- it means BOTH
+/// fetch, both produce identity-less entries (a cookie session discloses no
+/// account), and the emission gate collapses them to one representative chosen by
+/// a tie-break no operator can see or influence. `anthropic.rs` states the same
+/// consequence at its own `handles()`, for the same reason.
+///
+/// So precedence is expressed by WHICH LANES ARE ENUMERATED AT ALL:
+///
+/// - An ACCOUNT-SUFFIXED deposit (`cookie:<domain>:<label>`) is an explicit
+///   statement that this account is the intended one. It takes the provider
+///   vault-only, exactly as an anthropic vault handle does -- the ambient browser
+///   session must not be able to answer instead of the account that was named.
+/// - A BARE deposit (`cookie:<domain>`) is a fallback for hosts where the live
+///   store cannot be read at all. The local lane stays primary and consults it
+///   inside one fetch, so there is one slot and no tie-break.
+///
+/// The asymmetry is deliberate: a stale deposit FAILS LOUDLY (401, marked, prompt
+/// to re-capture) while a wrong account SUCCEEDS, reporting a real current figure
+/// for somebody else's quota. Preferring ambient over explicit trades a loud
+/// failure for a silent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CookieLane {
+    /// An account was named. Serve only it; do not enumerate the local lane.
+    VaultOnly(Vec<CredentialHandle>),
+    /// No account named. Local lane is primary; the bare deposit, if any, is the
+    /// fallback consulted inside that single fetch.
+    LocalWithFallback(Option<CredentialHandle>),
+}
+
+/// Choose the lane shape for a cookie family from its deposited handles.
+///
+/// `family` is the bare credential id for the domain (`cookie:ollama.com`), and
+/// the bare-vs-suffixed test goes through [`handle_id_names_family`] rather than
+/// searching for a colon, so this rule and the routing rule read the grammar
+/// through ONE reader and cannot drift apart.
+pub fn cookie_lane(handles: Vec<CredentialHandle>, family: &str) -> CookieLane {
+    let suffixed: Vec<CredentialHandle> = handles
+        .iter()
+        .filter(|handle| {
+            handle
+                .vault_credential_id()
+                .is_some_and(|id| id != family && handle_id_names_family(id, family))
+        })
+        .cloned()
+        .collect();
+    if !suffixed.is_empty() {
+        return CookieLane::VaultOnly(suffixed);
+    }
+    CookieLane::LocalWithFallback(
+        handles
+            .into_iter()
+            .find(|handle| handle.vault_credential_id().is_some_and(|id| id == family)),
+    )
+}
+
 pub fn handle_id_names_family(id: &str, prefix: &str) -> bool {
     id == prefix
         || id

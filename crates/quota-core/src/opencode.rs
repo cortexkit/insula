@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::{
     credential_source::CredentialSource,
     provider::{CredentialHandle, FetchAttempt},
-    vault_handles::VaultHandleLoader,
+    vault_handles::{cookie_lane, CookieLane, VaultHandleLoader},
 };
 use crate::{
     browser_cookies::{self, CookieJar, SOURCE_LABEL},
@@ -31,7 +31,16 @@ use crate::{
     provider::{FetchError, UsageProvider},
 };
 
-pub const PROVIDER_NAME: &str = "opencode";
+/// The bare vault credential id for this domain. A suffixed deposit
+/// (`cookie:opencode.ai:work`) names an account and takes the provider
+/// vault-only; this bare one is the fallback for hosts that cannot read the live
+/// browser store at all.
+///
+/// Note `opencode` and `opencodego` deliberately share this id: they are two
+/// plans on ONE session, so there is one record and both providers consume it.
+pub const COOKIE_FAMILY: &str = "cookie:opencode.ai";
+
+const PROVIDER_NAME: &str = "opencode";
 const DOMAIN: &str = "opencode.ai";
 const SERVER_BASE: &str = "https://opencode.ai/_server";
 const ORIGIN: &str = "https://opencode.ai";
@@ -825,6 +834,29 @@ impl OpenCodeProvider {
         Self { http: crate::http::provider_client(), credential_source, handle_loader }
     }
 
+    /// The bare `cookie:<domain>` deposit, if one exists.
+    ///
+    /// Looked up here rather than carried on the handle because the local lane's
+    /// handle is `ImplicitLocal` and holds no capability -- the fallback is a
+    /// property of the PROVIDER's configuration, not of the handle being fetched.
+    fn bare_vault_handle(
+        &self,
+    ) -> Result<Option<crate::credential_source::VaultCapability>, FetchError> {
+        if self.credential_source.is_none() {
+            return Ok(None);
+        }
+        let handles = self
+            .handle_loader
+            .opencode_handles()
+            .map_err(|error| FetchError::Internal(error.to_string()))?;
+        Ok(match cookie_lane(handles, COOKIE_FAMILY) {
+            CookieLane::LocalWithFallback(Some(handle)) => {
+                handle.vault_capability().cloned()
+            }
+            _ => None,
+        })
+    }
+
     async fn vault_cookie(&self, capability: &crate::credential_source::VaultCapability) -> Result<String, FetchError> {
         let source = self.credential_source.as_ref().ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
         let mut credential = source.get(capability, 120_000).await.map_err(|error| FetchError::Upstream(error.to_string()))?;
@@ -849,11 +881,18 @@ impl UsageProvider for OpenCodeProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
-        if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.opencode_handles()?);
+        if self.credential_source.is_none() {
+            return Ok(vec![CredentialHandle::implicit()]);
         }
-        Ok(handles)
+        // Precedence is expressed by WHICH lanes exist, not by a choice inside the
+        // fetch: every handle returned here becomes its own slot and is fetched
+        // independently, so enumerating both would make both serve and leave the
+        // emission gate to pick one identity-less entry by an invisible tie-break.
+        // See `vault_handles::cookie_lane`.
+        Ok(match cookie_lane(self.handle_loader.opencode_handles()?, COOKIE_FAMILY) {
+            CookieLane::VaultOnly(handles) => handles,
+            CookieLane::LocalWithFallback(_) => vec![CredentialHandle::implicit()],
+        })
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -861,7 +900,18 @@ impl UsageProvider for OpenCodeProvider {
             let (cookie, source) = if let Some(capability) = handle.vault_capability() {
                 (self.vault_cookie(capability).await?, "vault")
             } else {
-                (load_cookie_header_async().await?, SOURCE_LABEL)
+                // Local lane primary, bare deposit as the fallback INSIDE this one
+                // fetch rather than as a second slot -- a host where the live store
+                // cannot be read at all (Windows App-Bound Encryption, or no
+                // browser) otherwise has no lane, while a host where it can keeps
+                // the fresher source.
+                match load_cookie_header_async().await {
+                    Ok(cookie) => (cookie, SOURCE_LABEL),
+                    Err(local_error) => match self.bare_vault_handle()? {
+                        Some(capability) => (self.vault_cookie(&capability).await?, "vault"),
+                        None => return Err(local_error),
+                    },
+                }
             };
             let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
             let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;

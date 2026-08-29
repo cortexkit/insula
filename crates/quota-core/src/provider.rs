@@ -58,6 +58,20 @@ impl CredentialHandle {
         !matches!(self, Self::Vault { .. })
     }
 
+    /// The vault credential id this handle was minted from, if any.
+    ///
+    /// Needed because the id carries information the capability does not: the
+    /// vault grammar is `<method>:<provider>[:<account>]`, so whether an operator
+    /// NAMED an account is visible only here. The served payload and the vault's
+    /// own response carry no id, which is why a consumer cannot recover this from
+    /// the wire and must read it from the handle it already holds.
+    pub fn vault_credential_id(&self) -> Option<&str> {
+        match self {
+            Self::Vault { credential_id, .. } => Some(credential_id.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn vault_capability(&self) -> Option<&VaultCapability> {
         match self {
             Self::Vault { capability, .. } => Some(capability),
