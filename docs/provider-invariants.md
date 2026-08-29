@@ -3378,8 +3378,33 @@ question before it is asked, so the check never happens — and the citation kee
 vouching long after the fact it cites has moved. The four names were complete
 when written; ten differ now.
 
-PRACTICE: when writing a comment that attributes a fact to another system or
-another team, record HOW TO RE-DERIVE IT rather than only the fact — the query,
+PRACTICE, in the sharpened form the same consumer sent back after sweeping their
+own source with it: A COMMENT CITING ANOTHER SYSTEM NEEDS THE DERIVATION ONLY
+WHEN THE CLAIM IS THE LOAD-BEARING PART. Where the reasoning travels with the
+citation, the attribution is provenance rather than evidence and re-derivation
+buys nothing -- a reader can agree or disagree by reading it, and if the argument
+is wrong it is wrong on its face. Where the comment is a BARE CLAIM whose weight
+rests on someone having checked, record the query, the file, or the command.
+
+Their two examples separate the cases cleanly:
+
+    carries its own argument   "a capability matches a SHAPE, not an identity, so
+                                the day a second module declares the same
+                                operation, resolution picks one silently"
+    bare claim                 "ordinals are the intended cursor per the owner"
+
+The first is checkable by reading it. The second cost them weeks.
+
+SWEPT OUR OWN SOURCE WITH IT AND FOUND ONE TRUE HIT, on the most safety-critical
+comment in the tree. `antigravity.rs` justified reading another tool's refresh
+token with "Google does not rotate ... verified against the live endpoint rather
+than assumed" -- load-bearing, because it guards a user's sign-in (a rotating
+credential spent by a reader that does not own it breaks the plugin's actual
+login), and unrepeatable as written. It now records the exact exchange and the
+response field to look for. The other hit was already correct: `http.rs` cites
+`reqwest 0.12.28 async_impl/client.rs`, which a reader can open.
+
+So: record HOW TO RE-DERIVE IT rather than only the fact — the query,
 the file, the command. A citation that cannot be re-run is a claim wearing the
 costume of evidence. Our own version of this is the parity anchor in
 `docs/provider-matrix.md`, which names the upstream tag it was checked against

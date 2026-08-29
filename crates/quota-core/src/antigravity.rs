@@ -109,7 +109,19 @@ const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 /// Google does not rotate: a refresh exchange returns an access token and no
 /// new refresh token, so the value in the plugin's file stays valid and two
 /// readers can each refresh independently without disturbing the other.
-/// Verified against the live endpoint rather than assumed.
+///
+/// HOW TO RE-DERIVE THIS, because the claim is what carries the safety and a
+/// bare "verified" cannot be re-run: POST to `https://oauth2.googleapis.com/token`
+/// with `grant_type=refresh_token` and this lane's client id, then read the
+/// response body for a `refresh_token` field. Google's response contains
+/// `access_token`, `expires_in`, `scope`, `token_type` and NO `refresh_token`,
+/// which is what makes the stored value survive the exchange. If that field ever
+/// appears, this lane is spending a credential it does not own and must stop.
+/// (Contrast Anthropic, whose token response does carry a replacement.)
+///
+/// The check costs one request and answers definitively, so re-run it rather
+/// than trusting this paragraph -- a citation that cannot be re-run is a claim
+/// wearing the costume of evidence, and this one guards a user's sign-in.
 ///
 /// THAT IS A PROPERTY OF GOOGLE, NOT A PATTERN TO COPY. Anthropic's OAuth
 /// rotates -- its token response carries a replacement refresh token and the
