@@ -502,3 +502,22 @@ So walk forward to the first completed run whose head contains the change:
 
 The stricter reading — "the run at the commit that introduced it" — is the
 natural one and would report a third of this repository's history as unverified.
+
+## `deployed-sanity` is RED on purpose right now
+
+As of 2026-08-29 it reports one finding and exits 1:
+
+    the daemon holds no self_signals for this module
+
+That is TRUE and is not a defect in this module. The running daemon predates
+`subc-protocol` 0.14.0, which introduced the manifest field, so it has no such
+field to store and serde discards the block at HELLO. Registration succeeds,
+health reads ok, `buildCommit` matches — the declaration is genuinely in our
+binary and genuinely on the wire, and the daemon keeps none of it.
+
+DO NOT SUPPRESS IT. The check exists to make exactly this state visible, and
+every other surface reads clean through it. It clears on its own when the daemon
+carrying 0.14.0 is placed; the daemon owner has committed to announcing that.
+
+Until then, when running the checker before a deploy, expect that one finding and
+confirm the count is ONE. A second finding is a real one.
