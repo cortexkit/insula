@@ -1747,3 +1747,50 @@ same text. **Silence from a consumer is not confirmation.** A misreading produce
 no error on the producing side — no failed request, no exception, no support
 ticket — so the absence of complaints measures visibility rather than
 correctness.
+
+
+## A window set carries no completeness claim
+
+`completeProviders` tells you the ACCOUNT axis was fully enumerated. Nothing on
+the wire says the same about the WINDOW axis, and the difference bit a consumer.
+
+Before 2026-08-29, `antigravity` published one window with `windowMinutes: null`.
+A renderer showed a single figure and labelled the cadence `?`, which was a
+faithful rendering of what arrived. What it could not know, in the words of the
+consumer who hit it:
+
+> Nothing distinguished "this provider has one limit" from "we asked the endpoint
+> that only reports one."
+
+It was the second. The lane dialled an endpoint returning one bucket per model
+with a single implicit window, so both cadences collapsed and the weekly one —
+the constrained one, at 17.6% against the 5h reading of 1.2% — was never
+published. The consumer had no signal, because a dropped window and an absent
+window look identical: `windowMinutes: null` reads as "cadence unknown", never as
+"a second window existed and was discarded".
+
+THERE IS NO FLAG FOR THIS AND THERE SHOULD NOT BE. A per-entry `windows_complete`
+would be `true` on every row this module emits, since a lane that cannot
+enumerate its cadences is a lane with a defect rather than a lane with a
+different shape. A field with one value reads as a check being performed while
+being a constant — the failure it would be introduced to prevent, wearing the
+costume of a fix.
+
+So the rule is a producer obligation rather than a wire field:
+
+- A window set is COMPLETE unless the entry carries an error. Publishing a subset
+  silently is a defect on this side, not a state consumers must detect.
+- Where a lane genuinely cannot enumerate cadences, it must say so through the
+  error taxonomy — `no_quota_reported` if the upstream states there is nothing,
+  `decode_failed` if we could not read what it sent — rather than by publishing
+  the subset it managed to read.
+- A consumer therefore may treat the windows on a clean entry as all of them.
+  That guarantee is only worth what this side's discipline is worth, which is why
+  it is written here where a future partial lane will be reviewed against it.
+
+The general form, which is why this sits beside the discard rules rather than
+under antigravity: DROPPING A WINDOW BIASES EVERY READING TAKEN FROM THE SET, and
+biases it toward more headroom, because the window most likely to be dropped is
+the one whose shape the parser did not expect. Silence about the drop is what
+makes it dangerous — a reduction over an incomplete set returns a smaller number
+with no indication it is smaller.
