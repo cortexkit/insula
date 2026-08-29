@@ -437,11 +437,17 @@ impl Registry {
             )),
             Box::new(codebuff::CodebuffProvider::new()),
             Box::new(copilot::CopilotProvider::new()),
-            Box::new(cursor::CursorProvider::new()),
+            Box::new(cursor::CursorProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(deepseek::DeepSeekProvider::new()),
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
-            Box::new(factory::FactoryProvider::new()),
+            Box::new(factory::FactoryProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(gemini::GeminiProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
@@ -461,7 +467,10 @@ impl Registry {
             Box::new(clinepass::ClinePassProvider::new()),
             Box::new(llmproxy::LlmProxyProvider::new()),
             Box::new(manus::ManusProvider::new()),
-            Box::new(mimo::MimoProvider::new()),
+            Box::new(mimo::MimoProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(minimax::MinimaxProvider::new()),
             Box::new(neuralwatt::NeuralWattProvider::new()),
             Box::new(ollama::OllamaProvider::new()),
@@ -474,8 +483,14 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(openrouter::OpenRouterProvider::new()),
-            Box::new(qoder::QoderProvider::new()),
-            Box::new(qwen_cloud::QwenCloudProvider::new()),
+            Box::new(qoder::QoderProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(qwen_cloud::QwenCloudProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(sakana::SakanaProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(sub2api::Sub2ApiProvider::new()),
@@ -485,7 +500,10 @@ impl Registry {
             Box::new(zenmux::ZenMuxProvider::new()),
             Box::new(kilo::KiloProvider::new()),
             Box::new(alibaba::AlibabaProvider::new()),
-            Box::new(amp::AmpProvider::new()),
+            Box::new(amp::AmpProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
         ]);
         registry.credential_source = credential_source;
         registry

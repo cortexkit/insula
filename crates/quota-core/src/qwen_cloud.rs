@@ -54,14 +54,17 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, SOURCE_LABEL},
-    env,
+    browser_cookies, env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "qwen-cloud";
+/// Base key for storing Qwen Cloud credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:qwencloud.com";
+
 const DOMAIN: &str = "qwencloud.com";
 /// The script block the authenticated console shell emits. Its presence is what
 /// separates "we were served the real page" from "we were not signed in".
@@ -526,13 +529,29 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
 /// The Qwen Cloud token-plan usage provider.
 pub struct QwenCloudProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl QwenCloudProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
         }
     }
 }
@@ -553,11 +572,20 @@ impl UsageProvider for QwenCloudProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
             if !jar.has_cookie_named(|name| name == "login_qwencloud_ticket") {
                 return Err(FetchError::NoSession(
                     "no Qwen Cloud login ticket in browser".to_string(),
@@ -643,7 +671,7 @@ impl UsageProvider for QwenCloudProvider {
             Ok(ProviderUsage::healthy(
                 PROVIDER_NAME,
                 None,
-                SOURCE_LABEL,
+                source,
                 enriched,
             ))
         }
@@ -1216,5 +1244,15 @@ mod tests {
             // discarding the window.
             assert_eq!(primary.used_percent, 27.8, "{name}");
         }
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = QwenCloudProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }

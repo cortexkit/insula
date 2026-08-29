@@ -17,13 +17,17 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, SOURCE_LABEL},
+    browser_cookies,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "mimo";
+/// Base key for storing MiMo credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:xiaomimimo.com";
+
 const DOMAIN: &str = "xiaomimimo.com";
 const DETAIL_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/detail";
 const USAGE_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
@@ -158,16 +162,34 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
 
 /// The MiMo usage provider.
 pub struct MimoProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl MimoProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| crate::http::provider_client());
-        Self { http }
+        Self {
+            http,
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
+        }
     }
 }
 
@@ -187,11 +209,20 @@ impl UsageProvider for MimoProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
 
             let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
             let has_user_id = jar.has_cookie_named(|n| n == "userId");
@@ -282,12 +313,7 @@ impl UsageProvider for MimoProvider {
             let usage_json = String::from_utf8_lossy(usage_res.body_for_parsing()?);
 
             let usage = normalize(&detail_json, &usage_json)?;
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
-                SOURCE_LABEL,
-                usage,
-            ))
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -385,5 +411,15 @@ mod tests {
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = MimoProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }

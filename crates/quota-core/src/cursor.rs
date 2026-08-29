@@ -18,17 +18,20 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar, SOURCE_LABEL},
+    browser_cookies::{self, CookieJar},
     http::{Header, JsonRequest},
     model::{AccountInfo, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "cursor";
+/// Base key for storing Cursor credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:cursor.com";
+
 const DOMAIN: &str = "cursor.com";
 const USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const APP_AUTH_SOURCE_LABEL: &str = "cursor-app-auth";
 const ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
 const CACHED_EMAIL_KEY: &str = "cursorAuth/cachedEmail";
 
@@ -125,13 +128,6 @@ impl CursorCredential {
                 .as_ref()
                 .and_then(|identity| identity.email.as_deref()),
             Self::App(auth) => auth.email.as_deref(),
-        }
-    }
-
-    fn source_label(&self) -> &'static str {
-        match self {
-            Self::Browser { .. } => SOURCE_LABEL,
-            Self::App(_) => APP_AUTH_SOURCE_LABEL,
         }
     }
 }
@@ -422,11 +418,15 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     }
 }
 
-fn provider_usage_from_credential(credential: &CursorCredential, usage: Usage) -> ProviderUsage {
+fn provider_usage_from_credential(
+    credential: &CursorCredential,
+    source: &'static str,
+    usage: Usage,
+) -> ProviderUsage {
     let mut provider_usage = ProviderUsage::healthy(
         PROVIDER_NAME,
         credential.observed_account().map(str::to_string),
-        credential.source_label(),
+        source,
         usage,
     );
     if let Some(email) = credential.account_email() {
@@ -441,13 +441,29 @@ fn provider_usage_from_credential(credential: &CursorCredential, usage: Usage) -
 
 /// The Cursor usage provider.
 pub struct CursorProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl CursorProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
         }
     }
 }
@@ -468,11 +484,20 @@ impl UsageProvider for CursorProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-                .await
-                .map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
             let credential = resolve_cursor_credential_async(jar, app_auth_db_path()).await?;
             let cookie = credential.cookie_header();
 
@@ -483,7 +508,7 @@ impl UsageProvider for CursorProvider {
                 .await?;
 
             let usage = normalize_usage(&body_bytes)?;
-            Ok(provider_usage_from_credential(&credential, usage))
+            Ok(provider_usage_from_credential(&credential, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -499,6 +524,8 @@ mod tests {
     };
 
     use rusqlite::Connection;
+
+    use crate::browser_cookies::SOURCE_LABEL;
 
     use super::*;
 
@@ -732,7 +759,8 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
 
         assert_eq!(provider_usage.account.as_deref(), Some("user-id"));
         assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
@@ -758,7 +786,8 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
@@ -782,7 +811,8 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
@@ -803,7 +833,8 @@ mod tests {
             Some(&path),
         )
         .unwrap();
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
@@ -823,7 +854,8 @@ mod tests {
         create_state_db(&path, &access_token, Some("account@example.test"));
 
         let credential = resolve_cursor_credential(&browser_jar("user-id"), Some(&path)).unwrap();
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
@@ -843,7 +875,8 @@ mod tests {
             user_id: "user-id".to_string(),
             email: Some("account@example.test".to_string()),
         });
-        let provider_usage = provider_usage_from_credential(&credential, healthy_usage());
+        let provider_usage =
+            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
         assert_eq!(
             provider_usage.account.as_deref(),
             Some("account@example.test")
@@ -912,5 +945,15 @@ mod tests {
         }"#;
         let res = normalize_usage(json.as_bytes());
         assert!(matches!(res, Err(FetchError::Decode(_))));
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = CursorProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }

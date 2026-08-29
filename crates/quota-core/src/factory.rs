@@ -35,13 +35,17 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar, SOURCE_LABEL},
+    browser_cookies::{self, CookieJar},
     http::{Header, JsonRequest},
     model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
 pub const PROVIDER_NAME: &str = "factory";
+/// Base key for storing Factory credentials in the provider vault. An account-specific
+/// suffix identifies each account, and these credentials are read only from the provider vault.
+const COOKIE_FAMILY: &str = "cookie:factory.ai";
+
 const DOMAIN: &str = "factory.ai";
 const BILLING_LIMITS_URL: &str = "https://api.factory.ai/api/billing/limits";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -365,13 +369,29 @@ fn map_billing_http_status(status: u16, body_excerpt: &str) -> Result<(), FetchE
 
 /// The Factory.ai usage provider (cookie-direct billing limits path).
 pub struct FactoryProvider {
+    vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
 }
 
 impl FactoryProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
+        )
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                COOKIE_FAMILY,
+            ),
         }
     }
 }
@@ -392,9 +412,20 @@ impl UsageProvider for FactoryProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        self.vault.handles()
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let jar = browser_cookies::chrome_cookies_for_async(DOMAIN).await.map_err(FetchError::from)?;
+            let (jar, source) = self
+                .vault
+                .jar_for(handle, || async {
+                    browser_cookies::chrome_cookies_for_async(DOMAIN)
+                        .await
+                        .map_err(FetchError::from)
+                })
+                .await?;
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
@@ -435,7 +466,7 @@ impl UsageProvider for FactoryProvider {
             Ok(ProviderUsage::healthy(
                 PROVIDER_NAME,
                 None,
-                SOURCE_LABEL,
+                source,
                 usage,
             ))
         }
@@ -717,5 +748,15 @@ mod tests {
         let usage = normalize_billing_limits(&value, now).unwrap();
         assert_eq!(usage.primary.expect("standard 5h").used_percent, 7.0);
         assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn handles_without_credential_source_return_only_implicit_local() {
+        let provider = FactoryProvider::new_with_handle_loader(
+            None,
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 }
