@@ -101,10 +101,29 @@ def probe_exec_ms(work_dir: str) -> float:
     roughly three times this machine's natural accumulation rate. The watcher would
     then be feeding the exact pile it was written to diagnose.
 
-    Rewriting one path avoids that AND still pays the full cost: measured 244 ms
-    for a rewritten same-path binary versus 4 ms to re-exec an untouched one.
-    Validation keys on the BYTES, the scan list keys on the NAME, and this probe
-    sits deliberately on the right side of both.
+    Rewriting one path avoids that AND still pays the full cost -- but for a more
+    specific reason than "rewriting is expensive", and the `finally` unlink below
+    is what makes it true. Measured 2026-08-28, every row checked by RETURN CODE:
+
+        new inode (fresh path, or delete+recreate)     200-600ms  rc=0
+        same inode, untouched re-exec                       ~2ms  rc=0
+        same inode, rewritten with IDENTICAL bytes          ~2ms  rc=0
+        same inode, rewritten with DIFFERENT bytes          ~2ms  rc=-9
+
+    The cache is per-VNODE, so an in-place rewrite of the same file does NOT
+    re-pay. This probe deletes the file after every run, so each iteration creates
+    a new inode and pays in full -- which is the behaviour wanted, and it is the
+    unlink rather than the copy that guarantees it. Removing that unlink as a
+    tidy-up collapses the probe to single-digit milliseconds and it reports health
+    through a wedge. Measured directly rather than argued: three runs with the
+    unlink read 1301/2581/665 ms, three without read 677/401/9 ms -- it takes an
+    iteration or two to settle into the cache rather than dropping immediately,
+    which is worth knowing if this is ever re-tested.
+
+    (The last row is a REFUSAL, not a cheap validation: the kernel SIGKILLs a
+    binary whose content no longer matches what it validated at that vnode, and it
+    reads as fast only because it never ran. A timing that comes back unexpectedly
+    cheap needs its return code checked before it is believed.)
 
     `--list` IS LOAD-BEARING AND NEARLY SHIPPED MISSING. The preferred source is a
     Rust TEST binary, and exec'ing one with no arguments RUNS ITS TEST SUITE. On an
