@@ -478,7 +478,10 @@ impl Registry {
             )),
             Box::new(openrouter::OpenRouterProvider::new()),
             Box::new(qoder::QoderProvider::new()),
-            Box::new(qwen_cloud::QwenCloudProvider::new()),
+            Box::new(qwen_cloud::QwenCloudProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(sakana::SakanaProvider::new()),
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(sub2api::Sub2ApiProvider::new()),
