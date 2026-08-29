@@ -126,4 +126,36 @@ if [ "$WITH_E2E" -eq 1 ]; then
     cargo test -p quota-module --test skeleton_e2e || fail "skeleton_e2e"
 fi
 
+# A .rs file that no `mod` declaration reaches is compiled by NOTHING: cargo never
+# reads it, so clippy reports no dead code in it, the formatter still formats it,
+# and every gate passes over a file that does not exist as far as the crate is
+# concerned. That is how 150 lines of a half-finished refactor rode into a commit
+# whose message described something else -- present in the tree, absent from the
+# build, and invisible to every check that was supposed to notice.
+#
+# Cheap, and it fails closed: a src/*.rs with no matching `mod` in the crate root
+# is either work someone forgot to wire or a leftover that should have been
+# deleted. Both want a human, and neither announces itself.
+printf '\n  == orphan module check\n'
+orphans=0
+for crate_src in crates/*/src; do
+  root="$crate_src/lib.rs"
+  [ -f "$root" ] || root="$crate_src/main.rs"
+  [ -f "$root" ] || continue
+  for f in "$crate_src"/*.rs; do
+    [ -e "$f" ] || continue
+    m="$(basename "$f" .rs)"
+    case "$m" in lib|main) continue;; esac
+    if ! grep -q "mod $m;" "$root"; then
+      printf '    ORPHAN: %s is declared by no mod in %s\n' "$f" "$root"
+      orphans=$((orphans + 1))
+    fi
+  done
+done
+if [ "$orphans" -ne 0 ]; then
+  printf '\n  GATE FAILED: %s orphan module(s)\n' "$orphans"
+  exit 1
+fi
+printf '    no orphan modules\n'
+
 printf '\n  all gates passed\n'
