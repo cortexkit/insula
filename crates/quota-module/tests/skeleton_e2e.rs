@@ -137,11 +137,15 @@ fn vault_manifest() -> ModuleManifest {
         module_id: VAULT_MODULE_ID.to_string(),
         module_version: "test-stub".to_string(),
         protocol_ver: PROTOCOL_VERSION,
-        // None rather than an empty vec: this stub declares nothing about its own
-        // behaviour, which is different from declaring that it has none. The
-        // harness exists to drive the wire, not to make claims about a module
-        // that does not run a refresher or spend anything.
-        self_signals: None,
+        // An empty list, not None. The two are wire-distinct as of subc-protocol
+        // 0.14.0: None means the module has not adopted the vocabulary, an empty
+        // list is an affirmative "examined, and there are none".
+        //
+        // This stub was examined -- it drives frames and nothing else, running no
+        // refresher and spending nothing -- so the affirmative zero is the true
+        // statement. Declaring None would say the question had not been asked,
+        // which is false for a manifest edited in the same commit that asked it.
+        self_signals: Some(Vec::new()),
         trust_tier: TrustTier::FirstParty,
         // None, for the same reason the operations carry no description: this
         // stub stands in for ANOTHER module, and provenance is a claim about
