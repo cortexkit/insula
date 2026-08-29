@@ -68,8 +68,45 @@ async fn main() {
 
     let health_findings = check_health_identity(&mut stream).await;
 
+    // The envelope is an OBJECT with `result` beside `completeProviders`, and this
+    // checker had verified only the first half since the day the second shipped --
+    // caught 2026-08-29 when a consumer reported the route hands back a bare array
+    // and I could not disprove it from my own live check. `completeProviders` is
+    // the ONLY thing that authorises a consumer to prune stored accounts, so a
+    // checker blind to it would pass through the exact regression that silently
+    // costs someone their account rows.
+    //
+    // Asserted as SHAPE, not as membership: which providers are complete varies
+    // with what resolved identity this tick, so pinning names would fail on an
+    // ordinary degraded lane. What must hold is that the key EXISTS, is an array,
+    // and names only registered providers -- a rename or a dropped key reddens.
+    let complete = body.get("completeProviders").unwrap_or_else(|| {
+        panic!(
+            "usage.get envelope must carry completeProviders beside result; got keys {:?}",
+            body.as_object().map(|map| map.keys().collect::<Vec<_>>())
+        )
+    });
+    let complete: Vec<String> = serde_json::from_value(complete.clone())
+        .expect("completeProviders must decode as a string array");
+
     let entries: Vec<ProviderUsage> = serde_json::from_value(body["result"].clone())
         .expect("usage.get result must decode as ProviderUsage[]");
+
+    // Cross-checked against the SERVED set rather than a hardcoded list, because a
+    // hardcoded list is a second copy of the registry that drifts on the next
+    // provider added. A name here that no entry carries means the completeness
+    // claim references a provider this response never mentioned -- which is the
+    // shape that would authorise pruning accounts under a name nobody served.
+    let served: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .map(|entry| entry.provider.as_str())
+        .collect();
+    for name in &complete {
+        assert!(
+            served.contains(name.as_str()),
+            "completeProviders names {name:?}, which no entry in this same response carries"
+        );
+    }
 
     // Decoding through the wire type rather than reading JSON keys by hand is
     // deliberate: a field renamed in the shared crate has to fail here, instead
