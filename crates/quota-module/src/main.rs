@@ -36,8 +36,9 @@ use serde_json::json;
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ManifestProvenance, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
+        ManifestProvenance, ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect,
+        SelfSignalKind, SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope,
+        TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1039,6 +1040,70 @@ fn manifest(module_id: &str) -> ModuleManifest {
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
+        // What this module does to the surfaces it reports on, so an analyst
+        // measuring provider quota can subtract our own contribution.
+        //
+        // THE SECOND ENTRY IS WHY THIS FIELD HAS THE SHAPE IT DOES. The kinds
+        // first proposed were all observers, and an observer's contribution can
+        // be subtracted after the fact once its cadence is known. A MUTATOR has
+        // already rewritten the surface's history for every later reader,
+        // including ones who never heard of this module: a used-percent falling
+        // to zero because we SPENT a banked credit is indistinguishable on the
+        // wire from the provider resetting the window, and no consumer can undo
+        // a credit we consumed.
+        self_signals: Some(vec![
+            SelfSignalDeclaration {
+                name: "provider_refresh".to_string(),
+                kind: SelfSignalKind::Poller,
+                effect: SelfSignalEffect::Observe,
+                // Fixed interval, so a periodicity check finds it unaided.
+                // Declared anyway, because "findable in principle" and "found by
+                // the person who needed it" are different things.
+                anchored_to: SignalAnchor::FixedInterval,
+                cadence: Some(SignalCadence::Literal {
+                    interval_ms: quota_core::refresh::BASE_INTERVAL.as_millis() as u64,
+                }),
+                domain: Some("provider-usage".to_string()),
+                note: Some(
+                    "Reads every configured provider's usage endpoint. Read-only: it \
+                     consumes no quota and changes nothing upstream."
+                        .to_string(),
+                ),
+            },
+            SelfSignalDeclaration {
+                name: "codex_banked_reset_consume".to_string(),
+                kind: SelfSignalKind::Other("mutation".to_string()),
+                effect: SelfSignalEffect::Mutate,
+                // EVENT-ANCHORED, which is what makes it inseparable by
+                // measurement: it fires at the window's own boundary -- near a
+                // credit's expiry, or at the rate-limit wall -- so it reproduces
+                // the surface's grid exactly. A periodicity check cannot find
+                // it, because it has no period of its own.
+                anchored_to: SignalAnchor::Event {
+                    event: "codex quota window at the rate-limit wall, or a banked credit \
+                            near expiry"
+                        .to_string(),
+                },
+                // Config-resolved rather than constant: the arming threshold is
+                // read from ck-quota.jsonc at STARTUP, so the effective value is
+                // whatever that file said when this process began. Naming the
+                // source rather than a number keeps the declaration from
+                // claiming a cadence it cannot know.
+                cadence: Some(SignalCadence::Derived {
+                    source: "codex.auto_use_resets in ck-quota.jsonc, read at startup"
+                        .to_string(),
+                }),
+                domain: Some("provider-usage".to_string()),
+                note: Some(
+                    "Spends a banked OpenAI reset credit, which ZEROES the account's used \
+                     percent upstream. Disabled unless auto_use_resets is set. When \
+                     engaged, the entry publishes usedPercent 0 beside the real figure in \
+                     rawUsedPercent -- that pair is the per-observation discriminator, and \
+                     it is on the wire whether or not this declaration is read."
+                        .to_string(),
+                ),
+            },
+        ]),
         trust_tier: TrustTier::FirstParty,
         // Populated rather than left None, because every field here is one this
         // module already knows and a consumer otherwise has to ask a human for.

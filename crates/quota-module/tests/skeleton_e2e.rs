@@ -137,6 +137,11 @@ fn vault_manifest() -> ModuleManifest {
         module_id: VAULT_MODULE_ID.to_string(),
         module_version: "test-stub".to_string(),
         protocol_ver: PROTOCOL_VERSION,
+        // None rather than an empty vec: this stub declares nothing about its own
+        // behaviour, which is different from declaring that it has none. The
+        // harness exists to drive the wire, not to make claims about a module
+        // that does not run a refresher or spend anything.
+        self_signals: None,
         trust_tier: TrustTier::FirstParty,
         // None, for the same reason the operations carry no description: this
         // stub stands in for ANOTHER module, and provenance is a claim about
