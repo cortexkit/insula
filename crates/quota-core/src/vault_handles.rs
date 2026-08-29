@@ -308,6 +308,30 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::OpenCodeGo)
     }
 
+    /// Deposits under one cookie family, by its bare credential id.
+    ///
+    /// Keyed by the FAMILY STRING rather than by `ProviderKind` because one
+    /// record can serve several providers: `cookie:opencode.ai` is one session
+    /// covering both `opencode` and `opencodego`, and asking by provider would
+    /// make each of them a separate lookup for the same deposit. The family is
+    /// also what the bare-vs-suffixed test reads, so both questions go through
+    /// one spelling of the id.
+    pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
+        let mut handles = Vec::new();
+        for kind in providers_for_id(family) {
+            for handle in self.provider_handles(kind)? {
+                // One record can reach several providers, so the same handle
+                // arrives once per provider it routes to. Dedup by identity
+                // rather than by count: two DIFFERENT deposits under one family
+                // is a distinct case, refused elsewhere by `cookie_lane`.
+                if !handles.iter().any(|existing| existing == &handle) {
+                    handles.push(handle);
+                }
+            }
+        }
+        Ok(handles)
+    }
+
     fn provider_handles(
         &self,
         provider: ProviderKind,
@@ -544,6 +568,38 @@ pub fn cookie_family_for(provider: &str) -> Option<&'static str> {
         .map(|(prefix, _)| *prefix)
 }
 
+/// Which providers a vault credential id routes to.
+///
+/// Returns SEVERAL where one record serves several providers -- `cookie:opencode.ai`
+/// is one browser session covering both opencode plans. Module-level rather than
+/// nested inside the loader because the cookie-family lookup needs the same
+/// mapping, and a second copy of a name-to-kind table is a second place for a
+/// provider rename to be half-applied.
+pub(crate) fn providers_for_id(id: &str) -> Vec<ProviderKind> {
+    CREDENTIAL_FAMILIES
+        .iter()
+        .filter(|(prefix, _)| handle_id_names_family(id, prefix))
+        .filter_map(|(_, name)| match *name {
+            "codex" => Some(ProviderKind::Codex),
+            "claude" => Some(ProviderKind::Anthropic),
+            "grok" => Some(ProviderKind::Grok),
+            "antigravity" => Some(ProviderKind::Antigravity),
+            "gemini" => Some(ProviderKind::Gemini),
+            "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
+            "amp" => Some(ProviderKind::Amp),
+            "cursor" => Some(ProviderKind::Cursor),
+            "qwen-cloud" => Some(ProviderKind::QwenCloud),
+            "qoder" => Some(ProviderKind::Qoder),
+            "factory" => Some(ProviderKind::Factory),
+            "mimo" => Some(ProviderKind::Mimo),
+            "ollama" => Some(ProviderKind::Ollama),
+            "opencode" => Some(ProviderKind::OpenCode),
+            "opencodego" => Some(ProviderKind::OpenCodeGo),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn handle_id_names_family(id: &str, prefix: &str) -> bool {
     id == prefix
         || id
@@ -574,31 +630,6 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             ProviderHandleSnapshot::default(),
             Some(format!("rejected invalid vault handle entries [{ids}]")),
         );
-    }
-
-    fn providers_for_id(id: &str) -> Vec<ProviderKind> {
-        CREDENTIAL_FAMILIES
-            .iter()
-            .filter(|(prefix, _)| handle_id_names_family(id, prefix))
-            .filter_map(|(_, name)| match *name {
-                "codex" => Some(ProviderKind::Codex),
-                "claude" => Some(ProviderKind::Anthropic),
-                "grok" => Some(ProviderKind::Grok),
-                "antigravity" => Some(ProviderKind::Antigravity),
-                "gemini" => Some(ProviderKind::Gemini),
-                "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
-                "amp" => Some(ProviderKind::Amp),
-                "cursor" => Some(ProviderKind::Cursor),
-                "qwen-cloud" => Some(ProviderKind::QwenCloud),
-                "qoder" => Some(ProviderKind::Qoder),
-                "factory" => Some(ProviderKind::Factory),
-                "mimo" => Some(ProviderKind::Mimo),
-                "ollama" => Some(ProviderKind::Ollama),
-                "opencode" => Some(ProviderKind::OpenCode),
-                "opencodego" => Some(ProviderKind::OpenCodeGo),
-                _ => None,
-            })
-            .collect()
     }
 
     let mut entries: Vec<_> = handles.into_iter().collect();
