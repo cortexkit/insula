@@ -80,6 +80,14 @@ async fn main() {
     // with what resolved identity this tick, so pinning names would fail on an
     // ordinary degraded lane. What must hold is that the key EXISTS, is an array,
     // and names only registered providers -- a rename or a dropped key reddens.
+    //
+    // Three failure modes, each driven against the live module rather than argued:
+    //   key absent / renamed   -> the .get() arm below, "must carry completeProviders"
+    //   present but null       -> "invalid type: null, expected a sequence"
+    //   array of wrong element -> "invalid type: integer `1`, expected a string"
+    // The first two share a code path in the sense that both end in a panic, but
+    // NOT the same one: absence is caught by the .get(), a wrong type by the
+    // decode. Proving one does not prove the other, which is why both were run.
     let complete = body.get("completeProviders").unwrap_or_else(|| {
         panic!(
             "usage.get envelope must carry completeProviders beside result; got keys {:?}",
