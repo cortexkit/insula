@@ -1,5 +1,21 @@
 //! Gemini (Google Code Assist) usage fetcher — OAuth refresh sub-archetype.
 //!
+//! EXPECT A PERMANENT 403 ON INDIVIDUAL ACCOUNTS. Google sunset Code Assist for
+//! the free/individual tier in favour of Antigravity, so on such an account this
+//! provider degrades with `credential_rejected` and stays there. The stage name
+//! distinguishes it: `unauthorized: quota: HTTP 403` means the token refresh
+//! SUCCEEDED and the quota call was refused, which is the sunset, while
+//! `unauthorized: token refresh: HTTP 403` is a credential problem. Confirmed by
+//! probing `v1internal:loadCodeAssist` with a freshly refreshed token:
+//! `currentTier: null`, `ineligibleTiers: [UNSUPPORTED_CLIENT]`. Details and the
+//! probe are in docs/provider-matrix.md under "the CLI-OAuth sunset".
+//!
+//! RE-AUTHENTICATING DOES NOT HELP, so the error class is doing something subtle:
+//! `credential_rejected` is correct because a credential WAS presented and
+//! refused, but the usual remedy it implies is unavailable here. The lane is kept
+//! rather than removed because Workspace and Enterprise accounts are not sunset,
+//! and this same code serves them.
+//!
 //! Auth source: `~/.gemini/oauth_creds.json`, the file gemini-cli ITSELF creates
 //! (a real native, headless path), holding `access_token` / `refresh_token` /
 //! `expiry_date` (epoch ms) with the Code Assist scope (`cloud-platform`). The
