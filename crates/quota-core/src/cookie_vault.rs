@@ -49,11 +49,6 @@ impl CookieVault {
         }
     }
 
-    /// A lane with no vault behind it, for `new()`/`Default` paths.
-    pub(crate) fn local_only(family: &'static str) -> Self {
-        Self::new(None, Arc::new(VaultHandleLoader::from_env()), family)
-    }
-
     /// Which lanes this provider exposes.
     ///
     /// PRECEDENCE IS EXPRESSED BY WHICH LANES EXIST, not by a choice made during
@@ -151,5 +146,55 @@ impl CookieVault {
             .await
             .map_err(|error| FetchError::Upstream(error.to_string()))?;
         crate::credential_source::take_utf8_payload(&mut credential.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser_cookies::SOURCE_LABEL;
+
+    /// The shared lane publishes the cohort's cookie label on the local branch.
+    ///
+    /// Load-bearing because the per-provider source-walk in `tests.rs` now
+    /// accepts delegation to this type INSTEAD of a literal in the provider
+    /// file. That widening is only sound if the delegate actually produces the
+    /// label, so this is the other half of that check -- without it, a cohort
+    /// that all delegate would satisfy the walk while publishing nothing.
+    #[tokio::test]
+    async fn the_local_branch_publishes_the_cookie_label() {
+        let vault = CookieVault::new(None, Arc::new(VaultHandleLoader::new(None)), "cookie:test");
+        let (cookie, source) = vault
+            .cookie_for(&CredentialHandle::implicit(), || async {
+                Ok("session=abc".to_string())
+            })
+            .await
+            .expect("the local branch answers");
+        assert_eq!(cookie, "session=abc");
+        assert_eq!(
+            source, SOURCE_LABEL,
+            "a cookie fetched from the live browser store must publish the cookie label"
+        );
+    }
+
+    /// A local failure with no bare deposit reports the LOCAL error.
+    ///
+    /// Not a credential-absent verdict invented here: the live-store failure
+    /// already carries the right class, and replacing it would trade a specific
+    /// diagnosis for a vaguer one at the moment a reader most needs the specific
+    /// one.
+    #[tokio::test]
+    async fn a_local_failure_without_a_deposit_reports_the_local_error() {
+        let vault = CookieVault::new(None, Arc::new(VaultHandleLoader::new(None)), "cookie:test");
+        let error = vault
+            .cookie_for(&CredentialHandle::implicit(), || async {
+                Err(FetchError::Unauthorized("signed out".to_string()))
+            })
+            .await
+            .expect_err("no lane can answer");
+        assert!(
+            matches!(error, FetchError::Unauthorized(ref message) if message == "signed out"),
+            "the live-store failure must survive, got {error:?}"
+        );
     }
 }

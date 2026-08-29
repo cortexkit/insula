@@ -575,7 +575,7 @@ pub fn cookie_family_for(provider: &str) -> Option<&'static str> {
 /// nested inside the loader because the cookie-family lookup needs the same
 /// mapping, and a second copy of a name-to-kind table is a second place for a
 /// provider rename to be half-applied.
-pub(crate) fn providers_for_id(id: &str) -> Vec<ProviderKind> {
+fn providers_for_id(id: &str) -> Vec<ProviderKind> {
     CREDENTIAL_FAMILIES
         .iter()
         .filter(|(prefix, _)| handle_id_names_family(id, prefix))

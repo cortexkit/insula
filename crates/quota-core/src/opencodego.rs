@@ -13,18 +13,17 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 
 use crate::{
-    browser_cookies::SOURCE_LABEL,
+    credential_source::CredentialSource,
+    provider::{CredentialHandle, FetchAttempt},
+    vault_handles::VaultHandleLoader,
+};
+use crate::{
     http::{Header, JsonRequest},
     model::ProviderUsage,
     opencode::{
         fetch_workspace_id, load_cookie_header_async, looks_signed_out, parse_windows, USER_AGENT,
     },
     provider::{FetchError, UsageProvider},
-};
-use crate::{
-    credential_source::CredentialSource,
-    provider::{CredentialHandle, FetchAttempt},
-    vault_handles::VaultHandleLoader,
 };
 
 pub const PROVIDER_NAME: &str = "opencodego";
@@ -113,8 +112,7 @@ fn looks_unsubscribed(text: &str) -> bool {
 
 pub struct OpenCodeGoProvider {
     http: reqwest::Client,
-    credential_source: Option<Arc<dyn CredentialSource>>,
-    handle_loader: Arc<VaultHandleLoader>,
+    vault: crate::cookie_vault::CookieVault,
 }
 
 impl OpenCodeGoProvider {
@@ -128,24 +126,12 @@ impl OpenCodeGoProvider {
     ) -> Self {
         Self {
             http: crate::http::provider_client(),
-            credential_source,
-            handle_loader,
+            vault: crate::cookie_vault::CookieVault::new(
+                credential_source,
+                handle_loader,
+                crate::opencode::COOKIE_FAMILY,
+            ),
         }
-    }
-
-    async fn vault_cookie(
-        &self,
-        capability: &crate::credential_source::VaultCapability,
-    ) -> Result<String, FetchError> {
-        let source = self
-            .credential_source
-            .as_ref()
-            .ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
-        let mut credential = source
-            .get(capability, 120_000)
-            .await
-            .map_err(|error| FetchError::Upstream(error.to_string()))?;
-        crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }
 
@@ -166,20 +152,15 @@ impl UsageProvider for OpenCodeGoProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
-        if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.opencodego_handles()?);
-        }
-        Ok(handles)
+        self.vault.handles()
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (cookie, source) = if let Some(capability) = handle.vault_capability() {
-                (self.vault_cookie(capability).await?, "vault")
-            } else {
-                (load_cookie_header_async().await?, SOURCE_LABEL)
-            };
+            let (cookie, source) = self
+                .vault
+                .cookie_for(handle, load_cookie_header_async)
+                .await?;
             let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
             let text = fetch_go_page_html(&self.http, &cookie, &workspace_id).await?;
             let now = chrono::Utc::now().timestamp();

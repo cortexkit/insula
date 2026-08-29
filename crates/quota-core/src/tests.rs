@@ -985,10 +985,23 @@ fn every_cookie_provider_publishes_the_cookie_source_label() {
                 wrong.push(format!("{provider}: {}", line.trim()));
             }
         }
-        if !runtime.contains("SOURCE_LABEL") {
+        // A provider satisfies this either by naming the label itself, or by
+        // delegating its credential lane to CookieVault, which returns the label
+        // for the local branch. Delegation is not a loophole: the shared lane is
+        // the ONLY other producer of a cookie provider's source string, and it
+        // is asserted separately in cookie_vault::tests.
+        //
+        // Widened when the cohort moved onto the shared lane. Before that, every
+        // provider carried its own copy and the literal was the only mechanism;
+        // leaving the check as-written would have failed a provider that now
+        // publishes the label through one reader instead of nine.
+        let names_label = runtime.contains("SOURCE_LABEL");
+        let delegates = runtime.contains("CookieVault");
+        if !names_label && !delegates {
             wrong.push(format!(
-                "{provider}: publishes no SOURCE_LABEL, so its healthy entries \
-                 are indistinguishable from a key-based provider's"
+                "{provider}: publishes no SOURCE_LABEL and delegates to no shared \
+                 cookie lane, so its healthy entries are indistinguishable from a \
+                 key-based provider's"
             ));
         }
     }
