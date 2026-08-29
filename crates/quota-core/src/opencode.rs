@@ -12,13 +12,17 @@
 //! :32-64, parse :312-756, signed-out :451-462, workspace :361-401) and
 //! `OpenCode/OpenCodeWebCookieSupport.swift:4-15` (cookie names).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::{
+    credential_source::CredentialSource,
+    provider::{CredentialHandle, FetchAttempt},
+    vault_handles::VaultHandleLoader,
+};
 use crate::{
     browser_cookies::{self, CookieJar, SOURCE_LABEL},
     env,
@@ -805,13 +809,26 @@ fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
 
 pub struct OpenCodeProvider {
     http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
 }
 
 impl OpenCodeProvider {
     pub fn new() -> Self {
-        Self {
-            http: crate::http::provider_client(),
-        }
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
+        Self { http: crate::http::provider_client(), credential_source, handle_loader }
+    }
+
+    async fn vault_cookie(&self, capability: &crate::credential_source::VaultCapability) -> Result<String, FetchError> {
+        let source = self.credential_source.as_ref().ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
+        let mut credential = source.get(capability, 120_000).await.map_err(|error| FetchError::Upstream(error.to_string()))?;
+        crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }
 
@@ -831,9 +848,21 @@ impl UsageProvider for OpenCodeProvider {
         true
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        let mut handles = vec![CredentialHandle::implicit()];
+        if self.credential_source.is_some() {
+            handles.extend(self.handle_loader.opencode_handles()?);
+        }
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let cookie = load_cookie_header_async().await?;
+            let (cookie, source) = if let Some(capability) = handle.vault_capability() {
+                (self.vault_cookie(capability).await?, "vault")
+            } else {
+                (load_cookie_header_async().await?, SOURCE_LABEL)
+            };
             let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
             let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
             let now = Utc::now().timestamp();
@@ -841,7 +870,7 @@ impl UsageProvider for OpenCodeProvider {
             Ok(ProviderUsage::healthy(
                 PROVIDER_NAME,
                 None,
-                SOURCE_LABEL,
+                source,
                 usage,
             ))
         }

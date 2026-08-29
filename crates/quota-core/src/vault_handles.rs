@@ -42,6 +42,15 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("antigravity:google", "antigravity"),
     ("oauth:google", "gemini"),
     ("kimi-for-coding", "kimi-for-coding"),
+    ("cookie:ampcode.com", "amp"),
+    ("cookie:cursor.com", "cursor"),
+    ("cookie:qwencloud.com", "qwen-cloud"),
+    ("cookie:qoder.com", "qoder"),
+    ("cookie:factory.ai", "factory"),
+    ("cookie:xiaomimimo.com", "mimo"),
+    ("cookie:ollama.com", "ollama"),
+    ("cookie:opencode.ai", "opencode"),
+    ("cookie:opencode.ai", "opencodego"),
 ];
 /// The `ck-quota` segment is a literal and is deliberately not derived from the
 /// binary or module name, both of which have since been renamed. Beside a binary
@@ -142,6 +151,15 @@ enum ProviderKind {
     Gemini,
     Antigravity,
     KimiForCoding,
+    Amp,
+    Cursor,
+    QwenCloud,
+    Qoder,
+    Factory,
+    Mimo,
+    Ollama,
+    OpenCode,
+    OpenCodeGo,
 }
 
 #[derive(Clone, Default)]
@@ -152,6 +170,15 @@ struct ProviderHandleSnapshot {
     gemini: Vec<CredentialHandle>,
     antigravity: Vec<CredentialHandle>,
     kimi_for_coding: Vec<CredentialHandle>,
+    amp: Vec<CredentialHandle>,
+    cursor: Vec<CredentialHandle>,
+    qwen_cloud: Vec<CredentialHandle>,
+    qoder: Vec<CredentialHandle>,
+    factory: Vec<CredentialHandle>,
+    mimo: Vec<CredentialHandle>,
+    ollama: Vec<CredentialHandle>,
+    opencode: Vec<CredentialHandle>,
+    opencodego: Vec<CredentialHandle>,
 }
 
 impl ProviderHandleSnapshot {
@@ -163,6 +190,15 @@ impl ProviderHandleSnapshot {
             ProviderKind::Gemini => &self.gemini,
             ProviderKind::Antigravity => &self.antigravity,
             ProviderKind::KimiForCoding => &self.kimi_for_coding,
+            ProviderKind::Amp => &self.amp,
+            ProviderKind::Cursor => &self.cursor,
+            ProviderKind::QwenCloud => &self.qwen_cloud,
+            ProviderKind::Qoder => &self.qoder,
+            ProviderKind::Factory => &self.factory,
+            ProviderKind::Mimo => &self.mimo,
+            ProviderKind::Ollama => &self.ollama,
+            ProviderKind::OpenCode => &self.opencode,
+            ProviderKind::OpenCodeGo => &self.opencodego,
         }
     }
 
@@ -174,6 +210,15 @@ impl ProviderHandleSnapshot {
             ProviderKind::Antigravity => self.antigravity.push(handle),
             ProviderKind::Gemini => self.gemini.push(handle),
             ProviderKind::KimiForCoding => self.kimi_for_coding.push(handle),
+            ProviderKind::Amp => self.amp.push(handle),
+            ProviderKind::Cursor => self.cursor.push(handle),
+            ProviderKind::QwenCloud => self.qwen_cloud.push(handle),
+            ProviderKind::Qoder => self.qoder.push(handle),
+            ProviderKind::Factory => self.factory.push(handle),
+            ProviderKind::Mimo => self.mimo.push(handle),
+            ProviderKind::Ollama => self.ollama.push(handle),
+            ProviderKind::OpenCode => self.opencode.push(handle),
+            ProviderKind::OpenCodeGo => self.opencodego.push(handle),
         }
     }
 }
@@ -234,6 +279,16 @@ impl VaultHandleLoader {
     pub fn kimi_for_coding_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::KimiForCoding)
     }
+
+    pub fn amp_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Amp) }
+    pub fn cursor_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Cursor) }
+    pub fn qwen_cloud_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::QwenCloud) }
+    pub fn qoder_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Qoder) }
+    pub fn factory_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Factory) }
+    pub fn mimo_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Mimo) }
+    pub fn ollama_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::Ollama) }
+    pub fn opencode_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::OpenCode) }
+    pub fn opencodego_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> { self.provider_handles(ProviderKind::OpenCodeGo) }
 
     fn provider_handles(
         &self,
@@ -429,50 +484,67 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
         );
     }
 
-    /// Resolve a handle id to the provider that consumes it.
-    ///
-    /// Walks [`CREDENTIAL_FAMILIES`] rather than a private chain of arms, so the
-    /// deployed-module checkers can ask the same question against the same list.
-    /// A second copy of it would drift, and a family missing from the copy reads
-    /// as a stray credential rather than as a gap in the checker.
-    ///
-    /// Matching stops at the first family whose prefix fits, so adding an entry
-    /// that is a prefix of an existing one would shadow it. No current pair has
-    /// that relationship — including the two Google families, whose ids are
-    /// disjoint despite looking similar.
-    fn provider_for_id(id: &str) -> Option<ProviderKind> {
-        let name = CREDENTIAL_FAMILIES
+
+    fn providers_for_id(id: &str) -> Vec<ProviderKind> {
+        CREDENTIAL_FAMILIES
             .iter()
-            .find(|(prefix, _)| handle_id_names_family(id, prefix))
-            .map(|(_, provider)| *provider)?;
-        match name {
-            "codex" => Some(ProviderKind::Codex),
-            "claude" => Some(ProviderKind::Anthropic),
-            "grok" => Some(ProviderKind::Grok),
-            "antigravity" => Some(ProviderKind::Antigravity),
-            "gemini" => Some(ProviderKind::Gemini),
-            "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
-            // Unreachable while every family names a provider handled above.
-            // Returning None rather than panicking keeps a future entry from
-            // taking down the refresher: the credential is dropped with the
-            // stderr warning the unsupported path already emits.
-            _ => None,
-        }
+            .filter(|(prefix, _)| handle_id_names_family(id, prefix))
+            .filter_map(|(_, name)| match *name {
+                "codex" => Some(ProviderKind::Codex),
+                "claude" => Some(ProviderKind::Anthropic),
+                "grok" => Some(ProviderKind::Grok),
+                "antigravity" => Some(ProviderKind::Antigravity),
+                "gemini" => Some(ProviderKind::Gemini),
+                "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
+                "amp" => Some(ProviderKind::Amp),
+                "cursor" => Some(ProviderKind::Cursor),
+                "qwen-cloud" => Some(ProviderKind::QwenCloud),
+                "qoder" => Some(ProviderKind::Qoder),
+                "factory" => Some(ProviderKind::Factory),
+                "mimo" => Some(ProviderKind::Mimo),
+                "ollama" => Some(ProviderKind::Ollama),
+                "opencode" => Some(ProviderKind::OpenCode),
+                "opencodego" => Some(ProviderKind::OpenCodeGo),
+                _ => None,
+            })
+            .collect()
     }
 
     let mut entries: Vec<_> = handles.into_iter().collect();
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
+    // Cookie sessions deliberately have no account identity. Two deposits for one
+    // domain would therefore collapse into one unlabelled row with an arbitrary
+    // survivor, so reject only that family while leaving unrelated vault lanes up.
+    let mut refused_cookie_families: Vec<(&str, Vec<String>)> = CREDENTIAL_FAMILIES
+        .iter()
+        .filter(|(prefix, _)| prefix.starts_with("cookie:"))
+        .filter_map(|(prefix, _)| {
+            let ids: Vec<_> = entries
+                .iter()
+                .filter(|(id, _)| handle_id_names_family(id, prefix))
+                .map(|(id, _)| id.clone())
+                .collect();
+            (ids.len() > 1).then_some((*prefix, ids))
+        })
+        .collect();
+    refused_cookie_families.dedup_by(|left, right| left.0 == right.0);
+    let refused_cookie_ids: HashSet<String> = refused_cookie_families
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().cloned())
+        .collect();
+
     let mut unsupported = Vec::new();
-    let mut by_capability: HashMap<String, Vec<(String, ProviderKind)>> = HashMap::new();
+    let mut by_capability: HashMap<String, Vec<(String, Vec<ProviderKind>)>> = HashMap::new();
     for (credential_id, capability) in entries {
-        if let Some(provider) = provider_for_id(&credential_id) {
-            by_capability
-                .entry(capability)
-                .or_default()
-                .push((credential_id, provider));
-        } else {
+        if refused_cookie_ids.contains(&credential_id) {
+            continue;
+        }
+        let providers = providers_for_id(&credential_id);
+        if providers.is_empty() {
             unsupported.push(credential_id);
+        } else {
+            by_capability.entry(capability).or_default().push((credential_id, providers));
         }
     }
 
@@ -489,10 +561,12 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
                     .join(","),
             );
         }
-        mapped.push(
-            ids[0].1,
-            CredentialHandle::vault(ids[0].0.clone(), VaultCapability::new(capability)),
-        );
+        for provider in &ids[0].1 {
+            mapped.push(
+                *provider,
+                CredentialHandle::vault(ids[0].0.clone(), VaultCapability::new(capability.clone())),
+            );
+        }
     }
 
     let mut warnings = Vec::new();
@@ -500,6 +574,13 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
         warnings.push(format!(
             "deduplicated identical capabilities for ids [{}]",
             duplicate_groups.join("; ")
+        ));
+    }
+    for (family, mut ids) in refused_cookie_families {
+        ids.sort();
+        warnings.push(format!(
+            "two vault handles name the cookie family `{family}` ({}) ; a cookie session discloses no account, so both would publish as one unlabelled row with an invisible winner -- keep the one whose account should be reported",
+            ids.join(", ")
         ));
     }
     if !unsupported.is_empty() {
@@ -704,6 +785,27 @@ mod tests {
 
         assert_eq!(antigravity, vec!["antigravity:google:second".to_string()]);
         assert_eq!(gemini, vec!["oauth:google".to_string()]);
+    }
+
+    #[test]
+    fn opencode_cookie_reaches_both_consumers() {
+        let path = write_file("opencode-cookie", r#"{"handles":{"cookie:opencode.ai":"ckh_opencode"}}"#);
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        assert_eq!(loader.opencode_handles().unwrap().len(), 1);
+        assert_eq!(loader.opencodego_handles().unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multiple_cookie_accounts_are_refused_without_reaping_other_families() {
+        let path = write_file("cookie-conflict", r#"{"handles":{"cookie:qwencloud.com:work":"ckh_work","cookie:qwencloud.com:personal":"ckh_personal","oauth:anthropic":"ckh_claude"}}"#);
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        assert!(loader.qwen_cloud_handles().unwrap().is_empty());
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+        let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
+        assert!(warning.contains("qwencloud.com"));
+        assert!(warning.contains("whose account should be reported"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
