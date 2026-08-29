@@ -3330,3 +3330,57 @@ Related, and the reason this section sits beside the vacuity ones: a test that
 cannot fail and a measurement that never happened are the same defect at different
 scales. Both produce evidence of a thing not examined, and both read as
 confirmation.
+
+
+## A green suite can be green about the wrong thing
+
+A consumer team replaced a hardcoded provider-name mapping with a read of the
+`apiProvider` field we publish. All 239 of their existing tests passed the moment
+the change landed — and none of them exercised the new code:
+
+> Every fixture I had carried a bare `provider` and no slug, so they exercised
+> the fallback and said nothing about the path I had just written. The green was
+> real and about the wrong thing.
+
+This is NOT the fixture-generalisation trap recorded above, where a test is true
+of its fixture and false in general. Here the tests were correct and the code was
+correct; the fixtures simply all took the OTHER BRANCH. Nothing was wrong, and
+nothing was verified.
+
+WHY IT IS HARD TO SEE FROM INSIDE: a full-suite pass is the signal everyone reads
+as "this change is safe", and it is the same signal whether the suite covered the
+change or never reached it. Coverage of the DIFF is a different question from
+coverage of the codebase, and only the first one is being asked after an edit.
+
+CHECK: after changing a branch, confirm at least one fixture takes it. The cheap
+version is to break the new code deliberately and watch something redden — if the
+suite stays green, the fixtures are all on the other side of the branch. That is
+the same act as a mutation proof, applied to a code path rather than to a rule.
+
+WE HAVE THE MIRROR AND IT HOLDS, checked rather than assumed: our
+`StubProvider` fixtures set no slug, so the emission tests could have exercised
+only the None arm. `a_mapped_provider_publishes_its_canonical_slug` asserts both
+directions on real wire entries — `codex` publishes `openai`, `mock` publishes
+nothing — so the populated arm is defended. A clean negative, but only because it
+was measured; the fixture shape alone predicted the gap.
+
+## A wrong fact with a citation outlives one without
+
+The mapping that consumer deleted carried a comment asserting it was "the
+complete, stable mapping" and attributing that to us. It had been wrong for
+weeks, and their account of why it survived is the useful part:
+
+> The comment made it look settled, which is why it survived every reading of
+> that function.
+
+An unsourced constant invites a reader to check it. A sourced one answers the
+question before it is asked, so the check never happens — and the citation keeps
+vouching long after the fact it cites has moved. The four names were complete
+when written; ten differ now.
+
+PRACTICE: when writing a comment that attributes a fact to another system or
+another team, record HOW TO RE-DERIVE IT rather than only the fact — the query,
+the file, the command. A citation that cannot be re-run is a claim wearing the
+costume of evidence. Our own version of this is the parity anchor in
+`docs/provider-matrix.md`, which names the upstream tag it was checked against
+precisely so the next reader can tell whether the check is current or stale.
