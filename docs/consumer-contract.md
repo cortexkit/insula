@@ -362,6 +362,26 @@ seventeen episodes concentrated on one lane is that provider's problem, and
 seventeen spread evenly over ten lanes is the network, and those want opposite
 responses.
 
+BUT A CONCENTRATION IS NOT AUTOMATICALLY A PROBLEM, and the standing example is
+`antigravity`. It has run 3-5x every other lane on this host for a full day, and
+none of it is an incident: it is the only provider carrying a lane that is
+STRUCTURALLY EXPECTED TO BE ABSENT. Its local probe needs the editor process
+running, `local_source_unavailable` is classified transient ON PURPOSE so a
+closed editor does not discard last-healthy windows, and the cloud lane serves
+throughout. Every poll while the editor is shut counts one episode.
+
+So the counter is honest about what it counts and misleading about what it
+implies: **a provider with a graceful fallback accrues episodes faster than one
+with a single brittle lane**, and the metric ranks the better-designed provider
+worse. Before treating a concentration as a provider problem, check whether that
+provider has a lane whose absence is ordinary — a local process probe, an editor,
+a browser session. Read this one against `errorClass` on the entry: episodes
+paired with a healthy served entry are a fallback working, and only episodes
+paired with a degraded entry are a lane in trouble.
+
+Recorded because the author of the metric misread it three times in one night
+before checking the mechanism.
+
 **This replaced a set of names, which saturated.** Every serving lane flaps
 eventually, so after enough uptime the set listed all of them and stopped
 discriminating — measured here after fourteen hours, with a lane known to flap
