@@ -225,26 +225,27 @@ a whole file included by `#[cfg(test)] mod tests;`, a `tests/` directory — and
 rule that counts lines against the first `#[cfg(test)]` marker silently reports
 whichever arrangement it does not model as a runtime change.
 
-Ask the compiler instead. `CK_QUOTA_BUILD_COMMIT_OVERRIDE` pins the stamp, so
-two commits can be built into byte-comparable binaries:
+**DO NOT USE THE HASH COMPARISON THAT WAS HERE.** It compared two builds made
+with `CK_QUOTA_BUILD_COMMIT_OVERRIDE` pinned, and it cannot work: there are TWO
+git-derived stamps and the override covers one. `CK_QUOTA_PROVENANCE_SHA` embeds
+the real HEAD sha and deliberately resists override, so two builds at different
+commits always differ whether or not any runtime code changed. Full measurement
+and the tell that exposed it are at the end of this file.
+
+Ask the SOURCE instead, which answers the question directly:
 
 ```sh
-# From the SAME directory, so embedded absolute paths match.
-# Do NOT reach for `git stash` on a clean tree: it stashes nothing, and the
-# `git stash pop` afterwards then restores whatever unrelated entry was already
-# on the stack -- which on a tree that has been worked in for days can be a
-# months-old reversal of code that has since shipped. Verify the tree is clean
-# with `git status --porcelain` and skip the stash entirely.
-git checkout <deployed-commit>
-CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
-shasum -a 256 target/release/ck-insula
-
-git checkout <head-commit>
-CK_QUOTA_BUILD_COMMIT_OVERRIDE=000000000000 cargo build --release -p quota-module
-shasum -a 256 target/release/ck-insula
+git diff --name-only <deployed-commit>..HEAD -- crates/
 ```
 
-**Equal hashes mean no deploy is needed** — the commits produce the same binary.
+Read the FILE LIST first. A change confined to `tests/` or `examples/` is not
+linked into `ck-insula` and cannot reach the deployed binary, so no deploy is
+needed however many lines moved.
+
+If runtime files did change, count the non-comment added lines — with an
+instrument you have checked. A failed `grep` prints `0`, and a zero from a
+failed command is not a measurement.
+
 
 **Unequal hashes prove nothing on their own.** Panic messages embed their own
 file and line, so adding a comment above a function in a runtime file shifts

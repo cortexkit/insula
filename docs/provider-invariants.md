@@ -3192,10 +3192,32 @@ apply to**, and they are the ones who will repeat it.
 The roster is not the fix either, because a list of instances is dated the moment
 one of the three adds a build script. State the PREDICATE and let each reader
 evaluate it against their own tree — and prefer a predicate that needs no source
-interpretation. Here the decisive one is empirical: build both commits with
-`CK_QUOTA_BUILD_COMMIT_OVERRIDE` set identically and compare hashes. That requires
-a determinism control first (rebuild ONE commit twice and confirm the hashes
-match), because without it an inequality means nothing.
+interpretation. Here the decisive one is empirical.
+
+THE VERSION THIS PARAGRAPH ORIGINALLY GAVE — build both commits with
+`CK_QUOTA_BUILD_COMMIT_OVERRIDE` set identically and compare hashes — IS WRONG
+and is kept only as the worked example. It stopped working when a second
+git-derived stamp landed: `CK_QUOTA_PROVENANCE_SHA` embeds the real HEAD sha and
+deliberately resists override, so two builds at different commits always differ
+whether or not any runtime code changed. Nothing failed when that landed; the
+procedure kept running and started answering a different question.
+
+Which makes it the best illustration of the rule it was written to support. A
+STATED PREDICATE ALSO ROTS — it just rots quietly, because a reader evaluating it
+gets an answer and has no reason to doubt one. The roster was dated the moment a
+module added a build script; the predicate was dated the moment a second stamp
+did.
+
+So the surviving guidance is one level up: state the predicate AND what would
+make it stop being decisive. Here: this comparison is decisive only while exactly
+one embedded value varies with the commit. The determinism control (rebuild ONE
+commit twice, confirm the hashes match) remains necessary and is not sufficient —
+it proves the build is reproducible, not that the thing you are comparing is the
+thing you care about. Mine passed cleanly while the comparison was meaningless.
+
+The working check for this particular question is in `docs/deploying.md`: diff
+the source and read the changed file list, since a change confined to `tests/` or
+`examples/` cannot reach the binary.
 
 
 ## Text about a property clusters where the property is absent
