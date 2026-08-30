@@ -521,3 +521,48 @@ carrying 0.14.0 is placed; the daemon owner has committed to announcing that.
 
 Until then, when running the checker before a deploy, expect that one finding and
 confirm the count is ONE. A second finding is a real one.
+
+## The pinned-stamp hash comparison is BROKEN and must not be used
+
+This runbook has prescribed proving a binary unchanged by building both commits
+with `CK_QUOTA_BUILD_COMMIT_OVERRIDE` set to a fixed value and comparing hashes.
+That check cannot work any more, and has not since the provenance stamps landed.
+
+THERE ARE TWO GIT-DERIVED STAMPS AND THE OVERRIDE COVERS ONE:
+
+    CK_QUOTA_BUILD_COMMIT     overridable  -- what the procedure pins
+    CK_QUOTA_PROVENANCE_SHA   NOT overridable, deliberately -- it embeds the real
+                              HEAD sha when the tree is clean, and refuses to
+                              state one otherwise
+
+So two builds at different commits ALWAYS differ, whether or not a line of
+runtime code changed. Measured 2026-08-30:
+
+    build at deployed commit, clean tree   69cdaa72bdd84638
+    build at HEAD, clean tree              15db8a59ebd08eaa
+    two bisect builds, dirty tree          f93469fbe20d308f  -- BOTH of them
+
+The two dirty builds agreeing is the tell: they carried DIFFERENT source and
+produced identical binaries, because a dirty tree makes the provenance stamp
+refuse to state a commit, so both embedded the same non-answer. Different source,
+same hash; same source, different hash. The instrument reports the stamp, not the
+code.
+
+That the provenance stamp resists override is CORRECT — its whole value is that a
+build cannot claim a commit it was not built from. The defect is in the procedure
+that assumed one override covered every embedded git value, which was true when
+it was written and stopped being true without anything failing.
+
+USE THIS INSTEAD. The question is "did any runtime code change", and source
+answers it directly:
+
+    git diff <deployed>..HEAD -- crates/
+
+Read the changed FILE LIST first: a change confined to `tests/` or `examples/` is
+not linked into `ck-insula` and cannot reach the deployed binary. If runtime
+files did change, count the non-comment added lines — and count them with an
+instrument you have checked, since a failed `grep` prints `0` and a zero from a
+failed command is not a measurement.
+
+If a hash comparison is ever wanted again, it needs BOTH stamps neutralised, and
+neutralising the provenance one would defeat the reason it exists.
