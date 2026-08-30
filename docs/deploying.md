@@ -567,3 +567,15 @@ failed command is not a measurement.
 
 If a hash comparison is ever wanted again, it needs BOTH stamps neutralised, and
 neutralising the provenance one would defeat the reason it exists.
+
+AND DO NOT SUBSTITUTE THE LOCK DIGEST FOR IT. `build_lock_digest` hashes
+`Cargo.lock`, so it moves whenever ANY dependency version moves — including a
+DEV-only one that never links into `ck-insula`. Measured 2026-08-30: a
+`subc-core` bump changed the digest while `cargo tree -p quota-module -e normal`
+showed zero normal-dependency edges to it, so the runtime binary was unaffected.
+A reader treating a digest difference as "this binary is stale" would redeploy
+for a test-only dependency.
+
+The digest answers "did the lock change", which is the question it was added for
+(spotting a missed wave). It does not answer "did the binary change", and the two
+diverge on exactly the dependencies that never ship.
