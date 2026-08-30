@@ -1510,12 +1510,14 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
+ "reqwest",
  "rlimit",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
