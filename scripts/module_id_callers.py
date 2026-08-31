@@ -310,9 +310,39 @@ def main() -> int:
     print(f"fixture hits (leave alone; editing breaks a golden comparison): {fixtures}")
 
     if not routes:
-        print("\nno route references found at all -- suspect the search before "
-              "concluding there are no callers", file=sys.stderr)
-        return 2
+        # ZERO IS A LEGITIMATE ANSWER HERE, which is why this is a control and not
+        # a floor. Sweeping for callers of a RETIRED id is the main use of this
+        # script, and success is zero -- so refusing on an empty result reports
+        # "could not check" at the exact moment the answer is "checked, and
+        # clean". A refusal that fires on the desired outcome gets muted, and a
+        # muted check is worse than none because it still looks present.
+        #
+        # But an empty result is ALSO what a broken search returns, and those two
+        # causes print the same number. So separate them by measurement rather
+        # than by assumption: run the same machinery against a token that must be
+        # present in this fleet, and let the control decide which zero this is.
+        #
+        # The control is this repo's own directory name. It cannot be absent --
+        # the search walks the fleet root and this repo is under it -- and it
+        # exercises the same `hits()` path, so a regression in the search reaches
+        # both. A constant chosen for being definitionally present is the point:
+        # a control that could legitimately return zero proves nothing.
+        control_token = Path(__file__).resolve().parents[1].name
+        control_hits = sum(len(hits(repo, control_token)) for repo in all_repos)
+        if control_hits == 0:
+            print(
+                f"\nno route references for {args.id!r} AND the control token "
+                f"{control_token!r} also found nothing -- the search is broken, "
+                "not the fleet; this says nothing about callers",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"\nno route references for {args.id!r}. Search verified: the control "
+            f"token {control_token!r} found {control_hits} hit(s) through the same "
+            "path, so this is a real absence rather than a failed scan."
+        )
+        return 0
     return 0
 
 
