@@ -2764,6 +2764,44 @@ pattern and says so); it is that A GUARD THAT FIRES INTO AN IGNORED EXIT STATUS 
 NOT A GUARD. Same family as reading an exit code through a pipe, which this repo
 already forbids in `docs/deploying.md`.
 
+### A command that does not print a value invites an invented one
+
+**End every commit with `git log --oneline -1`.** Not for the record — for the
+report. A commit line of the shape `git commit -q … && git push -q … && echo
+"pushed"` prints no hash, so when a hash is later quoted in a message, a runbook,
+or a note, there is nothing to copy from and the value gets RECONSTRUCTED.
+
+This was measured rather than supposed, across two repositories on the same day
+and with the same split both times:
+
+```
+hash was printed by a command      quoted correctly
+hash was NOT printed by a command  fabricated — plausible hex, resolves to nothing
+```
+
+Here it was 24 of 25 correct and one invented (`7c2c07b` for what is really
+`fd57a8d`), and the single wrong one was the single one whose commit line printed
+nothing. A peer auditing their own quotes the same hour found two of seven, both
+from the same hole.
+
+**The failure is upstream of discipline, which is why re-committing to care does
+not fix it.** A rule saying "only copy concrete values from tool output" is
+already right and was already held in both cases. It cannot fire when there is no
+tool output to copy from: the hole appears exactly where a specific fact is
+expected, and prose does not tolerate a blank. Print the value and the rule has
+something to obey.
+
+**A fabricated hash is worse than a wrong one.** It is shaped correctly, so it
+reads as evidence and survives every review that does not run `git rev-parse`. It
+then propagates into places that cannot check it — another seat's notes, an issue
+comment, a runbook — where it is indistinguishable from a real reference to a
+commit that has since been rebased away. Both instances here were found by
+accident, one while building an unrelated control.
+
+The same reasoning applies to any specific value quoted from a step that reported
+only success: a deployed digest, a row count, a generated id. If the command said
+`ok` and you are about to write a number, get the number from a command.
+
 **And the trigger was punctuation:** two hyphens against an em-dash, invisible in
 review and total in matching. A guard should print the pattern that missed rather
 than a count — a count says something missed, the pattern says it was punctuation.
