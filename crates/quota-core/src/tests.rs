@@ -847,6 +847,62 @@ fn every_api_provider_key_names_a_registered_provider() {
     );
 }
 
+/// Every cookie-cohort provider has a vault lane it can be deposited into.
+///
+/// THE FAILURE THIS PREVENTS IS SILENT ON THE ONLY PLATFORM THAT CAN SEE IT.
+/// A cookie provider with no `cookie:` entry in `CREDENTIAL_FAMILIES` still works
+/// perfectly here: it reads the live Chrome store, publishes real windows, emits
+/// the right source label, and passes every other test in this file. It simply
+/// cannot be reached by a deposit -- `cookie_family_for` returns None, so no
+/// pasted header can ever route to it.
+///
+/// Which means it is dark on Windows and on any headless host, permanently, with
+/// no error anywhere. App-Bound Encryption refuses the live store to every
+/// non-Chrome process by design, so the deposit lane is not a fallback there, it
+/// is the ONLY lane. A macOS-only test matrix cannot observe the difference,
+/// because macOS is exactly where the local path still works.
+///
+/// WRITTEN AFTER NOTICING THE SHAPE ELSEWHERE. I warned another seat that if both
+/// capture paths get built the good one hides the broken one, and a team testing
+/// on Macs would ship a feature that is complete for them and degraded for the
+/// users it was built for. That warning already described this test's absence.
+///
+/// Derived from `is_cookie_based` rather than from a list, so adding the tenth
+/// cookie provider fails here until it is routable, instead of failing for an
+/// operator on a platform none of us develops on.
+#[test]
+fn every_cookie_provider_can_be_reached_by_a_deposit() {
+    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+
+    let mut cohort = 0;
+    let mut unroutable = Vec::new();
+    for provider in &registry.providers {
+        if !provider.fetcher.is_cookie_based() {
+            continue;
+        }
+        cohort += 1;
+        if crate::vault_handles::cookie_family_for(provider.name.as_str()).is_none() {
+            unroutable.push(provider.name.clone());
+        }
+    }
+
+    // The denominator is asserted because a cohort of zero would pass the
+    // emptiness check below while proving nothing -- the same vacuity this repo
+    // requires every checker to refuse.
+    assert!(
+        cohort >= 9,
+        "expected the cookie cohort to be enumerable, found {cohort} providers; \
+         if is_cookie_based stopped reporting, this test is vacuous"
+    );
+    assert!(
+        unroutable.is_empty(),
+        "these cookie providers have no cookie: family in CREDENTIAL_FAMILIES, so a \
+         deposited header can never route to them -- they work on macOS and are \
+         permanently dark on Windows and headless hosts with no error: \
+         {unroutable:?} (of {cohort} in the cohort)"
+    );
+}
+
 /// Every cookie-cohort provider publishes the cookie source label.
 ///
 /// `source` is observability only, but its job is to tell a reader how a figure
