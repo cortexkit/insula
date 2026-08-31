@@ -504,24 +504,39 @@ So walk forward to the first completed run whose head contains the change:
 The stricter reading — "the run at the commit that introduced it" — is the
 natural one and would report a third of this repository's history as unverified.
 
-## `deployed-sanity` is RED on purpose right now
+## `deployed-sanity` was RED on purpose, and CLEARED ITSELF on 2026-08-30
 
-As of 2026-08-29 it reports one finding and exits 1:
+RESOLVED. The expected finding count is ZERO again. If the checker reports
+anything, it is real — do not read the section below as licence to expect one.
+
+For roughly a day it reported one finding and exited 1:
 
     the daemon holds no self_signals for this module
 
-That is TRUE and is not a defect in this module. The running daemon predates
-`subc-protocol` 0.14.0, which introduced the manifest field, so it has no such
-field to store and serde discards the block at HELLO. Registration succeeds,
-health reads ok, `buildCommit` matches — the declaration is genuinely in our
-binary and genuinely on the wire, and the daemon keeps none of it.
+That was TRUE and never a defect in this module. The running daemon predated
+`subc-protocol` 0.14.0, which introduced the manifest field, so it had no such
+field to store and serde discarded the block at HELLO. Registration succeeded,
+health read ok, `buildCommit` matched — the declaration was genuinely in our
+binary and genuinely on the wire, and the daemon kept none of it. The daemon
+carrying it was placed on 2026-08-30 and the checker went green with no edit
+here.
 
-DO NOT SUPPRESS IT. The check exists to make exactly this state visible, and
-every other surface reads clean through it. It clears on its own when the daemon
-carrying 0.14.0 is placed; the daemon owner has committed to announcing that.
+KEPT AS A WORKED EXAMPLE, because two things about it generalise.
 
-Until then, when running the checker before a deploy, expect that one finding and
-confirm the count is ONE. A second finding is a real one.
+A CHECKER LEFT DELIBERATELY RED NEEDS ITS EXPECTED COUNT WRITTEN DOWN, and then
+needs that number RETIRED the moment the condition clears. The note that said
+"expect one finding, a second is real" was correct for a day and would have been
+actively harmful the day after: a reader following it would see one finding, tick
+the box, and miss the real one. A stale expected-count is worse than no note,
+because it converts a working alarm into a silenced one and looks like diligence
+while doing it. If you ever write "expect N findings" here again, write the
+condition that retires it in the same edit.
+
+AND THE CLEAN CLEAR IS THE PROOF THE CHECK WAS SOUND. It fired while the
+condition held, and stopped when the condition lifted, with no change to the
+checker in between. That is the discrimination property this repo demands of
+every rule, obtained for free from a real state transition rather than from a
+synthetic fixture — which is the strongest form of it available.
 
 ## The pinned-stamp hash comparison is BROKEN and must not be used
 
