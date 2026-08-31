@@ -1036,98 +1036,36 @@ fn wire_crate_version() -> Option<String> {
 }
 
 fn manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        // What this module does to the surfaces it reports on, so an analyst
-        // measuring provider quota can subtract our own contribution.
-        //
-        // THE SECOND ENTRY IS WHY THIS FIELD HAS THE SHAPE IT DOES. The kinds
-        // first proposed were all observers, and an observer's contribution can
-        // be subtracted after the fact once its cadence is known. A MUTATOR has
-        // already rewritten the surface's history for every later reader,
-        // including ones who never heard of this module: a used-percent falling
-        // to zero because we SPENT a banked credit is indistinguishable on the
-        // wire from the provider resetting the window, and no consumer can undo
-        // a credit we consumed.
-        self_signals: Some(vec![
-            SelfSignalDeclaration {
-                name: "provider_refresh".to_string(),
-                kind: SelfSignalKind::Poller,
-                effect: SelfSignalEffect::Observe,
-                // Fixed interval, so a periodicity check finds it unaided.
-                // Declared anyway, because "findable in principle" and "found by
-                // the person who needed it" are different things.
-                anchored_to: SignalAnchor::FixedInterval,
-                cadence: Some(SignalCadence::Literal {
-                    interval_ms: quota_core::refresh::BASE_INTERVAL.as_millis() as u64,
-                }),
-                domain: Some("provider-usage".to_string()),
-                note: Some(
-                    "Reads every configured provider's usage endpoint. Read-only: it \
-                     consumes no quota and changes nothing upstream."
-                        .to_string(),
-                ),
+    // Built through the builder rather than as a literal: `ModuleManifest` is
+    // `#[non_exhaustive]` upstream, so a field added there becomes a compile
+    // error here instead of a silent default. That is the point of the shape,
+    // and the reason not to route around it.
+    //
+    // EVERY OPTIONAL IS PASSED EXPLICITLY, including the ones that are None.
+    // The builder permits omitting them, and omitting `capabilities` would read
+    // as "not reached yet" when it is a decision with a paragraph behind it. A
+    // deliberate None and an unwritten one are identical on the wire and
+    // opposite facts about the author.
+    ModuleManifest::builder(
+        module_id.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        TrustTier::FirstParty,
+        Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: false,
             },
-            SelfSignalDeclaration {
-                name: "codex_banked_reset_consume".to_string(),
-                kind: SelfSignalKind::Other("mutation".to_string()),
-                effect: SelfSignalEffect::Mutate,
-                // EVENT-ANCHORED, which is what makes it inseparable by
-                // measurement: it fires at the window's own boundary -- near a
-                // credit's expiry, or at the rate-limit wall -- so it reproduces
-                // the surface's grid exactly. A periodicity check cannot find
-                // it, because it has no period of its own.
-                anchored_to: SignalAnchor::Event {
-                    event: "codex quota window at the rate-limit wall, or a banked credit \
-                            near expiry"
-                        .to_string(),
-                },
-                // Config-resolved rather than constant: the arming threshold is
-                // read from ck-quota.jsonc at STARTUP, so the effective value is
-                // whatever that file said when this process began. Naming the
-                // source rather than a number keeps the declaration from
-                // claiming a cadence it cannot know.
-                cadence: Some(SignalCadence::Derived {
-                    source: "codex.auto_use_resets in ck-quota.jsonc, read at startup"
-                        .to_string(),
-                }),
-                domain: Some("provider-usage".to_string()),
-                note: Some(
-                    "Spends a banked OpenAI reset credit, which ZEROES the account's used \
-                     percent upstream. Disabled unless auto_use_resets is set. When \
-                     engaged, the entry publishes usedPercent 0 beside the real figure in \
-                     rawUsedPercent -- that pair is the per-observation discriminator, and \
-                     it is on the wire whether or not this declaration is read."
-                        .to_string(),
-                ),
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: Vec::new(),
             },
-        ]),
-        trust_tier: TrustTier::FirstParty,
-        // Populated rather than left None, because every field here is one this
-        // module already knows and a consumer otherwise has to ask a human for.
-        //
-        // `build_git_sha` is NOT the same value as `health.metrics.buildCommit`,
-        // and an earlier version of this code reused it. That stamp is HEAD, so a
-        // dirty build carries a clean sha -- correct for the skew check it serves
-        // and wrong for an identity claim. Reported on insula#12.
-        //
-        // `store_schema_version` stays None as an ABSENT FACT rather than an
-        // unfilled blank: this module owns no persistent store, so it has no
-        // schema version to state.
-        //
-        // The other three are conditional by construction. Each is emitted by
-        // build.rs or not at all, and each maps an empty stamp to None -- so a
-        // build that could not establish a fact declares nothing rather than
-        // declaring a plausible one.
-        provenance: Some(ManifestProvenance {
-            build_git_sha: build_provenance_sha(),
-            build_lock_digest: build_lock_digest(),
-            wire_crate_version: wire_crate_version(),
-            store_schema_version: None,
-        }),
-        provides: vec![ProviderRole::ManagementSurface {
+        },
+    )
+    .protocol_ver(PROTOCOL_VERSION)
+    .provides(
+        vec![ProviderRole::ManagementSurface {
             operations: vec![
                 ManagementOperation {
                 name: USAGE_GET_OP.to_string(),
@@ -1161,20 +1099,96 @@ fn manifest(module_id: &str) -> ModuleManifest {
             // preference: claiming stricter ordering than the loop provides would
             // be a promise this module does not keep.
             concurrency: Concurrency::StatelessParallel,
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: Vec::new(),
-            },
+        }]
+    )
+    .consumes(Vec::new())
+    .self_signals(Some(vec![
+    // What this module does to the surfaces it reports on, so an analyst
+    // measuring provider quota can subtract our own contribution.
+    //
+    // THE SECOND ENTRY IS WHY THIS FIELD HAS THE SHAPE IT DOES. The kinds
+    // first proposed were all observers, and an observer's contribution can
+    // be subtracted after the fact once its cadence is known. A MUTATOR has
+    // already rewritten the surface's history for every later reader,
+    // including ones who never heard of this module: a used-percent falling
+    // to zero because we SPENT a banked credit is indistinguishable on the
+    // wire from the provider resetting the window, and no consumer can undo
+    // a credit we consumed.
+        SelfSignalDeclaration {
+            name: "provider_refresh".to_string(),
+            kind: SelfSignalKind::Poller,
+            effect: SelfSignalEffect::Observe,
+            // Fixed interval, so a periodicity check finds it unaided.
+            // Declared anyway, because "findable in principle" and "found by
+            // the person who needed it" are different things.
+            anchored_to: SignalAnchor::FixedInterval,
+            cadence: Some(SignalCadence::Literal {
+                interval_ms: quota_core::refresh::BASE_INTERVAL.as_millis() as u64,
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: Some(
+                "Reads every configured provider's usage endpoint. Read-only: it \
+                 consumes no quota and changes nothing upstream."
+                    .to_string(),
+            ),
         },
+        SelfSignalDeclaration {
+            name: "codex_banked_reset_consume".to_string(),
+            kind: SelfSignalKind::Other("mutation".to_string()),
+            effect: SelfSignalEffect::Mutate,
+            // EVENT-ANCHORED, which is what makes it inseparable by
+            // measurement: it fires at the window's own boundary -- near a
+            // credit's expiry, or at the rate-limit wall -- so it reproduces
+            // the surface's grid exactly. A periodicity check cannot find
+            // it, because it has no period of its own.
+            anchored_to: SignalAnchor::Event {
+                event: "codex quota window at the rate-limit wall, or a banked credit \
+                        near expiry"
+                    .to_string(),
+            },
+            // Config-resolved rather than constant: the arming threshold is
+            // read from ck-quota.jsonc at STARTUP, so the effective value is
+            // whatever that file said when this process began. Naming the
+            // source rather than a number keeps the declaration from
+            // claiming a cadence it cannot know.
+            cadence: Some(SignalCadence::Derived {
+                source: "codex.auto_use_resets in ck-quota.jsonc, read at startup"
+                    .to_string(),
+            }),
+            domain: Some("provider-usage".to_string()),
+            note: Some(
+                "Spends a banked OpenAI reset credit, which ZEROES the account's used \
+                 percent upstream. Disabled unless auto_use_resets is set. When \
+                 engaged, the entry publishes usedPercent 0 beside the real figure in \
+                 rawUsedPercent -- that pair is the per-observation discriminator, and \
+                 it is on the wire whether or not this declaration is read."
+                    .to_string(),
+            ),
+        },
+    ]))
+    .provenance(Some(ManifestProvenance {
+    // Populated rather than left None, because every field here is one this
+    // module already knows and a consumer otherwise has to ask a human for.
+    //
+    // `build_git_sha` is NOT the same value as `health.metrics.buildCommit`,
+    // and an earlier version of this code reused it. That stamp is HEAD, so a
+    // dirty build carries a clean sha -- correct for the skew check it serves
+    // and wrong for an identity claim. Reported on insula#12.
+    //
+    // `store_schema_version` stays None as an ABSENT FACT rather than an
+    // unfilled blank: this module owns no persistent store, so it has no
+    // schema version to state.
+    //
+    // The other three are conditional by construction. Each is emitted by
+    // build.rs or not at all, and each maps an empty stamp to None -- so a
+    // build that could not establish a fact declares nothing rather than
+    // declaring a plausible one.
+        build_git_sha: build_provenance_sha(),
+        build_lock_digest: build_lock_digest(),
+        wire_crate_version: wire_crate_version(),
+        store_schema_version: None,
+    }))
+    .capabilities(
         // No versioned capability grammar declared. `None` and an empty block are
         // NOT the same statement: the protocol makes this optional precisely so a
         // module can say nothing, and the daemon VALIDATES a present block before
@@ -1189,8 +1203,9 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // established what the daemon's validation does with an unsatisfied
         // requirement. Declaring a dependency I have not verified the semantics of
         // trades a working module for a tidier manifest.
-        capabilities: None,
-    }
+        None,
+    )
+    .build()
 }
 
 fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, ModuleError> {
@@ -1248,6 +1263,50 @@ mod tests {
     /// so a test demanding a sha would fail every development build and a test
     /// demanding absence would fail every release build. What is invariant is the
     /// RULE, so that is what is pinned.
+    /// The manifest carries both self-signals, and the mutator is declared as
+    /// one.
+    ///
+    /// WRITTEN BECAUSE NOTHING ELSE WOULD NOTICE A SILENT DROP. This field is
+    /// discarded by the deployed daemon (its ModuleManifest predates the
+    /// field, so serde drops it at HELLO and registration still succeeds), so
+    /// a regression here is invisible from the wire, invisible from health,
+    /// and invisible from `catalog.list`. That already made a migration risky:
+    /// moving these fields onto the upstream builder is exactly the kind of
+    /// mechanical edit where an optional can be dropped without a compiler
+    /// complaint, since every setter is optional by construction.
+    ///
+    /// The MUTATOR entry is the one worth pinning by name. An observer's
+    /// contribution can be subtracted after the fact; a mutator has already
+    /// rewritten the surface's history for every later reader. Losing that
+    /// declaration would leave this module spending banked credits while
+    /// telling the fleet it only observes.
+    #[test]
+    fn manifest_declares_both_self_signals_including_the_mutator() {
+        let m = manifest("insula");
+        let signals = m
+            .self_signals
+            .expect("manifest must declare self-signals, not stay silent");
+
+        let names: Vec<&str> = signals.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["provider_refresh", "codex_banked_reset_consume"],
+            "both signals must survive: an observer and the credit-spending mutator"
+        );
+
+        let mutators: Vec<&str> = signals
+            .iter()
+            .filter(|s| matches!(s.effect, SelfSignalEffect::Mutate))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            mutators,
+            vec!["codex_banked_reset_consume"],
+            "the reset consumer must be declared as a MUTATOR; downgrading it to \
+                 an observer tells the fleet its effect can be subtracted after the fact"
+        );
+    }
+
     #[test]
     fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
         let m = manifest("insula");
