@@ -81,8 +81,66 @@ const EGRESS_BUFFER: usize = 64;
 /// `usedPercent` and omits `rawUsedPercent` entirely.
 const QUOTA_CONFIG_RELATIVE_PATH: &str = "cortexkit/ck-quota.jsonc";
 
+/// Answer `--version` / `--help` before anything else, and exit.
+///
+/// This binary is normally SPAWNED BY THE DAEMON with a connection file, so
+/// every other path here assumes supervision. But an installer has to identify
+/// what it just placed on disk before any daemon exists to spawn it, and a human
+/// who runs it directly deserves better than an error about a flag they have
+/// never heard of.
+///
+/// Handled ahead of `ModuleConfig::from_env` deliberately: that call requires
+/// `--subc` and fails without it, so asking this binary its version used to
+/// print `--subc <connection-file> is required` and exit 1 -- a true statement
+/// about a question nobody asked, and indistinguishable from a broken install to
+/// the script that asked.
+fn answer_informational_flag(args: &[OsString]) -> Option<String> {
+    for arg in args {
+        match arg.to_str() {
+            Some("--version" | "-V") => {
+                return Some(format!("{} {}", BINARY_NAME, env!("CARGO_PKG_VERSION")))
+            }
+            Some("--help" | "-h") => {
+                return Some(format!(
+                    "{name} {version}\n\n\
+                     Quota and balance readings for AI provider accounts, served to the\n\
+                     subc daemon as module `{module}`.\n\n\
+                     USAGE:\n    \
+                       {name} --subc <connection-file>\n\n\
+                     This binary is normally started BY the daemon, which supplies the\n\
+                     connection file and the module id. Running it by hand is useful only\n\
+                     for --version.\n\n\
+                     FLAGS:\n    \
+                       -V, --version    print the version and exit\n    \
+                       -h, --help       print this message and exit\n\n\
+                     ENVIRONMENT:\n    \
+                       SUBC_MODULE_ID   module id to register under (default: {module})\n\
+                       CK_QUOTA_STATE_DIR  redemption journal directory",
+                    name = BINARY_NAME,
+                    version = env!("CARGO_PKG_VERSION"),
+                    module = DEFAULT_MODULE_ID,
+                ))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The installed file name, which is NOT the crate name.
+///
+/// The package is `quota-module` and the binary is `ck-insula`; an installer and
+/// a human both know the second. Taken from the target rather than restated, so
+/// a rename cannot leave this reporting the old name.
+const BINARY_NAME: &str = env!("CARGO_BIN_NAME");
+
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if let Some(message) = answer_informational_flag(&args) {
+        println!("{message}");
+        return Ok(());
+    }
     let config = ModuleConfig::from_env()?;
     let quota_config = load_quota_config();
     eprintln!(
