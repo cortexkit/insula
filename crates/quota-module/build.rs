@@ -63,7 +63,13 @@ fn main() {
         // Only a well-formed stamp is honoured, so a stray or malformed value
         // cannot put an arbitrary string where a commit is expected.
         Ok(value) if is_stamp(&value) => Some(value),
-        _ => git_dir.as_deref().and_then(head_commit),
+        // Abbreviated HERE rather than in `head_commit`, which now returns the
+        // full sha for provenance. This stamp stays short: it is compared
+        // against `git rev-parse --short=12 HEAD` in the deploy runbook.
+        _ => git_dir
+            .as_deref()
+            .and_then(head_commit)
+            .map(|sha| short(&sha)),
     };
 
     println!(
@@ -278,9 +284,16 @@ fn packed_ref(git_dir: &Path, reference: &str) -> Option<String> {
 
 /// Accept only a full hex object id, so a malformed line cannot become a stamp
 /// that looks like a commit.
+/// The FULL 40-hex sha, validated but not abbreviated.
+///
+/// This used to abbreviate, because its only consumer wanted the short form.
+/// Two consumers now want different widths -- the health stamp is short by
+/// design, provenance must be full 40 -- so shortening here silently capped
+/// both. Each caller narrows for itself; a shared helper that pre-narrows can
+/// only ever serve the narrower one.
 fn sha_if_valid(raw: &str) -> Option<String> {
     let raw = raw.trim();
-    (raw.len() >= 40 && raw.chars().all(|c| c.is_ascii_hexdigit())).then(|| short(raw))
+    (raw.len() >= 40 && raw.chars().all(|c| c.is_ascii_hexdigit())).then(|| raw.to_string())
 }
 
 fn read_sha(path: &Path) -> Option<String> {
