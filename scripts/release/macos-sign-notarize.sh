@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Sign and notarize the darwin ck-insula archive, in the order the checksum needs.
+#
+# WHY THIS EXISTS AT ALL: an ad-hoc signed binary carrying a browser's
+# `com.apple.quarantine` attribute does not fail on macOS -- it HANGS. No output,
+# no error, no dialog. Measured on this project's own v0.1.0 asset: the same
+# bytes fetched with curl answer `ck-insula 0.1.0` instantly, and the copy with a
+# Safari-shaped quarantine attribute was still blocked when killed at 25s. The
+# installer's curl path never sets that attribute, so this is invisible to every
+# check a publisher naturally runs, and lands only on people who download from
+# the release page -- which for a public alpha is the people evaluating us.
+#
+# ORDER IS LOAD-BEARING AND THE CALLER MUST NOT REARRANGE IT:
+#
+#     build -> SIGN the binary -> package the zip -> NOTARIZE + staple the zip
+#           -> checksum the zip -> upload
+#
+# Signing mutates the binary and stapling mutates the ZIP, so a checksum taken
+# before either covers bytes that are no longer the ones published. That failure
+# is silent here and loud for the user: `shasum -c` mismatches on a file we said
+# was correct, which is indistinguishable from tampering -- the exact thing a
+# checksum exists to detect, manufactured by us.
+set -euo pipefail
+
+SOURCE_DIR="${1:?usage: $0 <source-dir> <archive>}"
+ARCHIVE="${2:?usage: $0 <source-dir> <archive>}"
+BINARY="ck-insula"
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+# REFUSE ON THE WRONG IDENTITY RATHER THAN SIGNING WITH IT. An Apple Development
+# certificate signs successfully and notarizes never; catching that here names
+# the cause, where catching it at notarytool names a submission id.
+all_identities="$(security find-identity -v -p codesigning)"
+developer_id="$(printf '%s\n' "$all_identities" | awk -F'"' '$2 ~ /^Developer ID Application:/ { print $2 }')"
+if [[ -z "$developer_id" ]]; then
+  if printf '%s\n' "$all_identities" | grep -Fq '"Apple Development:'; then
+    fail "refusing release: only an Apple Development identity is present; notarization requires Developer ID Application"
+  fi
+  fail "refusing release: no Developer ID Application signing identity in the keychain"
+fi
+identity_count="$(printf '%s\n' "$developer_id" | awk 'NF { c += 1 } END { print c + 0 }')"
+[[ "$identity_count" == "1" ]] || fail "refusing release: ${identity_count} Developer ID identities present, cannot choose"
+identity="$(printf '%s\n' "$developer_id" | head -n 1)"
+
+binary_path="${SOURCE_DIR}/${BINARY}"
+[[ -f "$binary_path" ]] || fail "missing release binary: ${binary_path}"
+
+# `--options runtime` is required for notarization to be accepted at all.
+codesign --force --options runtime --timestamp --sign "$identity" "$binary_path"
+codesign --verify --strict --verbose=2 "$binary_path"
+
+# RUN IT AFTER SIGNING, not only before. `--options runtime` enables the hardened
+# runtime, which changes what the process is permitted to do at launch -- a valid
+# signature over a binary that no longer starts verifies perfectly and ships. The
+# workflow's earlier version check exercised the UNSIGNED artifact, so this is the
+# only place the thing actually published is known to execute.
+reported="$("$binary_path" --version)" || fail "refusing release: the signed binary does not run"
+echo "signed binary reports: ${reported}"
+
+: "${APP_STORE_CONNECT_API_KEY_PATH:?App Store Connect API key path is required}"
+: "${APP_STORE_CONNECT_API_KEY_ID:?App Store Connect API key ID is required}"
+: "${APP_STORE_CONNECT_API_ISSUER_ID:?App Store Connect API issuer ID is required}"
+[[ -r "$APP_STORE_CONNECT_API_KEY_PATH" ]] || fail "App Store Connect API key is not readable"
+
+# Package AFTER signing so the archive carries the signed binary, and notarize
+# the archive itself.
+( cd "$SOURCE_DIR" && rm -f "${OLDPWD}/${ARCHIVE}" && zip -q -j "${OLDPWD}/${ARCHIVE}" "$BINARY" )
+
+xcrun notarytool submit "$ARCHIVE" \
+  --key "$APP_STORE_CONNECT_API_KEY_PATH" \
+  --key-id "$APP_STORE_CONNECT_API_KEY_ID" \
+  --issuer "$APP_STORE_CONNECT_API_ISSUER_ID" \
+  --wait
+
+# A ZIP cannot always take a ticket immediately. Notarization has already
+# succeeded at this point, and an unstapled notarized asset still passes
+# Gatekeeper via the online check, so this warns rather than failing the release.
+if ! xcrun stapler staple "$ARCHIVE"; then
+  echo "::warning title=staple-pending::${ARCHIVE} notarized but not stapled; published unstapled for alpha."
+fi
+
+echo "signed and notarized with: ${identity}"

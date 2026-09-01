@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "quota-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "async-trait",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "quota-module"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "quota-core",

@@ -148,10 +148,74 @@ jobs:
             exit 1
           fi
 
+      # DARWIN SIGNS AND NOTARIZES BEFORE PACKAGING, and the ordering is the
+      # whole point -- see scripts/release/macos-sign-notarize.sh. Signing mutates
+      # the binary and stapling mutates the ZIP, so the checksum step below must
+      # stay AFTER this or the published sidecar describes bytes nobody receives.
+      #
+      # NOT GATED ON SECRET PRESENCE. Absent secrets fail this step rather than
+      # skipping it, because a silently unsigned darwin asset is the exact defect
+      # this exists to remove and it is invisible to every check we run: curl and
+      # gh-download set no quarantine attribute, so an adhoc asset passes
+      # consumer verification here and hangs for anyone who downloads it in a
+      # browser. Skipping on absence would restore that silently on the first run
+      # with a misnamed secret. Opting out is explicit and recorded.
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS' && vars.ALPHA_DARWIN_UNSIGNED != 'true'
+        env:
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" ] || [ -z "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Developer ID secrets are absent. A darwin asset signed ad-hoc HANGS for"
+            echo "::error::anyone who downloads it in a browser, and passes every check we run."
+            echo "::error::Set the secrets, or set the ALPHA_DARWIN_UNSIGNED variable to ship unsigned deliberately."
+            exit 1
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/developer-id.keychain-db"
+          KEYCHAIN_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          export CERTIFICATE_PATH DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64
+          python3 -c 'import base64, os; open(os.environ["CERTIFICATE_PATH"], "wb").write(base64.b64decode(os.environ["DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64"]))'
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" -A
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Write App Store Connect API key
+        if: runner.os == 'macOS' && vars.ALPHA_DARWIN_UNSIGNED != 'true'
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_STORE_CONNECT_API_KEY" ] || [ -z "$APP_STORE_CONNECT_API_KEY_ID" ] || [ -z "$APP_STORE_CONNECT_API_ISSUER_ID" ]; then
+            echo "::error::App Store Connect API credentials are absent; notarization cannot run."
+            exit 1
+          fi
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+
+      - name: Sign, notarize, and package (darwin)
+        if: runner.os == 'macOS' && vars.ALPHA_DARWIN_UNSIGNED != 'true'
+        env:
+          APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: bash scripts/release/macos-sign-notarize.sh target/release "${{ matrix.asset }}.zip"
+
       # Binary at the archive ROOT, per the installer contract -- no directory
-      # prefix, so extraction yields the executable directly.
+      # prefix, so extraction yields the executable directly. Darwin is already
+      # packaged by the signing step above, which must own the ordering.
       - name: Package
         shell: bash
+        if: runner.os != 'macOS' || vars.ALPHA_DARWIN_UNSIGNED == 'true'
         run: |
           set -euo pipefail
           cd target/release

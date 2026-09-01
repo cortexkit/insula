@@ -1,6 +1,6 @@
 [package]
 name = "quota-module"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "The insula subc module: registers a ManagementSurface and answers usage.get over the subc wire with ProviderUsage[]."
