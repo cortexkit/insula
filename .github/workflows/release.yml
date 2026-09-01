@@ -1,0 +1,176 @@
+name: Release
+
+# Cuts the installable assets `ck setup insula` and `ck upgrade` resolve from
+# GitHub's latest release.
+#
+# THE TAG AND THE CRATE VERSION MUST AGREE, and this workflow refuses to build
+# when they do not. `ck upgrade` verifies an installed binary by running its
+# `--version` and comparing that against the release it just fetched, so a
+# disagreement does not fail once -- it reads as a failed upgrade on every run,
+# forever, for every user who installed that version. That is a permanent,
+# silent-to-us break produced by a one-character mismatch, which is exactly the
+# kind of thing that must be a gate rather than a habit.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify tag matches crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Read the version from the manifest rather than from anywhere it is
+      # restated. `cargo metadata` resolves the same value the binary compiles
+      # into itself via CARGO_PKG_VERSION, so agreement here IS agreement with
+      # what `--version` will print -- a grep of Cargo.toml would only agree with
+      # the file.
+      - name: Compare tag against the crate version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="quota-module"))')
+          echo "tag: ${tag}   crate: ${crate}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match crate version ${crate}."
+            echo "::error::ck upgrade compares the binary's --version against the release tag;"
+            echo "::error::shipping this would read as a failed upgrade for every user, permanently."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Every target builds to completion. A Windows packaging failure and a
+      # macOS one have different causes, and cancelling the matrix on the first
+      # hides whichever would have finished second.
+      fail-fast: false
+      matrix:
+        include:
+          - asset: ck-insula-darwin-arm64
+            runner: macos-latest
+          - asset: ck-insula-linux-x64
+            runner: ubuntu-latest
+          # Shipped deliberately with a stated limitation rather than omitted:
+          # the nine browser-cookie providers cannot read Chrome's store on
+          # Windows (App-Bound Encryption hands the key only to chrome.exe), and
+          # every file- and API-backed provider works. Nine providers dark with a
+          # published reason beats an absent platform.
+          - asset: ck-insula-windows-x64
+            runner: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: insula
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: insula
+
+      # Same single-sibling checkout as CI: quota-module path-deps the private
+      # cortexkit/subconscious for subc-protocol and subc-transport, and the
+      # default GITHUB_TOKEN cannot read it.
+      - name: Mint cross-repo read token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
+      - name: Checkout subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p quota-module
+
+      # RUN THE BINARY, DO NOT ASSUME IT RUNS. An asset that cannot execute on
+      # the platform it is named for is indistinguishable from a good one until a
+      # user installs it, and `--version` is the first thing the installer asks --
+      # so exercising exactly that call is both the liveness check and a rehearsal
+      # of the installer's own step.
+      #
+      # This binary answered that question with a connection-file error until
+      # 81fee3d, because it is normally spawned by the daemon and nobody had run
+      # it by hand.
+      - name: Verify the binary self-reports its version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/release/ck-insula"
+          [ "${{ runner.os }}" = "Windows" ] && bin="target/release/ck-insula.exe"
+          reported=$("$bin" --version)
+          echo "reported: ${reported}"
+          expected="ck-insula ${GITHUB_REF_NAME#v}"
+          if [ "$reported" != "$expected" ]; then
+            echo "::error::binary reports '${reported}', release is '${expected}'"
+            exit 1
+          fi
+
+      # Binary at the archive ROOT, per the installer contract -- no directory
+      # prefix, so extraction yields the executable directly.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "../../${{ matrix.asset }}.zip" ck-insula.exe
+          else
+            zip -j "../../${{ matrix.asset }}.zip" ck-insula
+          fi
+
+      # shasum format (`<hex>  <filename>`), over the ZIP bytes, so a consumer can
+      # verify with `shasum -a 256 -c` without reformatting.
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "${{ matrix.asset }}.zip" > "${{ matrix.asset }}.zip.sha256"
+          else
+            sha256sum "${{ matrix.asset }}.zip" > "${{ matrix.asset }}.zip.sha256"
+          fi
+          cat "${{ matrix.asset }}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            insula/${{ matrix.asset }}.zip
+            insula/${{ matrix.asset }}.zip.sha256
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List what is being published
+        run: ls -l assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            assets/*.zip
+            assets/*.zip.sha256
+          generate_release_notes: true
