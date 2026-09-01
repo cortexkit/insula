@@ -15,9 +15,22 @@ rather than inferred.
 # 1. build
 cargo build --release
 
-# 2. back up what is running, then replace it
+# 2. back up what is running, then replace it BY RENAME, never by overwrite.
+#    `cp` onto the live path writes new bytes into the EXISTING inode, and macOS
+#    caches code-signature validation per vnode -- so the next exec finds bytes
+#    that do not match the cached verdict and the kernel SIGKILLs it. Silently:
+#    no output, no error, exit 137, and `ck module status` keeps reporting `ok`
+#    from the process that is still running the OLD image. That is a deploy that
+#    did not happen while every surface says it did; the only tell is
+#    `last_exit: sig9` in the supervisor row.
 cp ~/.local/share/cortexkit/bin/ck-insula ~/.local/share/cortexkit/bin/ck-insula.bak
-cp target/release/ck-insula ~/.local/share/cortexkit/bin/ck-insula
+cp target/release/ck-insula ~/.local/share/cortexkit/bin/ck-insula.new
+mv -f ~/.local/share/cortexkit/bin/ck-insula.new ~/.local/share/cortexkit/bin/ck-insula
+
+# 2b. prove the file you just placed can EXECUTE before restarting anything.
+#     One second, and it is the difference between finding this now and finding
+#     it in step 4 with a supervisor that has already fallen back.
+~/.local/share/cortexkit/bin/ck-insula --version    # must print, must exit 0
 
 # 3. restart under supervision
 ck module restart insula
