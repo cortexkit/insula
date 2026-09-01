@@ -36,9 +36,8 @@ use serde_json::json;
 use subc_protocol::{
     manifest::{
         Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ManifestProvenance, ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect,
-        SelfSignalKind, SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope,
-        TrustTier,
+        ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
+        SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1071,28 +1070,6 @@ fn build_lock_digest() -> Option<String> {
     (!raw.is_empty()).then(|| raw.to_string())
 }
 
-/// The subc-protocol version this binary LINKS.
-///
-/// THE REFERENT IS THE FLEET'S WIRE CRATE, NOT OURS. An earlier version declared
-/// `cortexkit-provider-usage` here -- our own envelope crate, read from the
-/// lockfile. That is real information about this module and the wrong answer to
-/// this field, and the two live in different numbering spaces: a census gate of
-/// the form `wire_crate_version >= 0.13.0` would have scored this module
-/// non-conformant while it demonstrably speaks the current protocol. A confident
-/// wrong answer at a gate, which is worse than declaring nothing.
-///
-/// Taken from the linked constant rather than from a lockfile read, which is also
-/// strictly better under the contract's from-the-build rule: `env!` in the crate
-/// we actually link describes THE BINARY, while a lockfile describes the source
-/// tree that happened to sit beside it at build time.
-///
-/// Our provider-usage version is still worth declaring somewhere -- but that is a
-/// case for a second field, not for redefining this one, and minting fleet wire
-/// fields is not ours to do unilaterally.
-fn wire_crate_version() -> Option<String> {
-    Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string())
-}
-
 fn manifest(module_id: &str) -> ModuleManifest {
     // Built through the builder rather than as a literal: `ModuleManifest` is
     // `#[non_exhaustive]` upstream, so a field added there becomes a compile
@@ -1224,28 +1201,34 @@ fn manifest(module_id: &str) -> ModuleManifest {
             ),
         },
     ]))
-    .provenance(Some(ManifestProvenance {
-    // Populated rather than left None, because every field here is one this
-    // module already knows and a consumer otherwise has to ask a human for.
+    // Built through `build_provenance` rather than as a struct literal, and that
+    // is the difference between declaring these facts and declaring them in a
+    // form anyone can join on. The literal still compiles, so nothing forced
+    // this -- it would simply keep publishing a 12-hex sha beside other modules'
+    // 40-hex ones, which can never compare equal and read as permanent drift
+    // rather than as a format difference. Reported against this module as
+    // iceteaSA #87.
     //
-    // `build_git_sha` is NOT the same value as `health.metrics.buildCommit`,
-    // and an earlier version of this code reused it. That stamp is HEAD, so a
-    // dirty build carries a clean sha -- correct for the skew check it serves
-    // and wrong for an identity claim. Reported on insula#12.
+    // ON A FORM ERROR THE WHOLE BLOCK IS OMITTED, not defaulted and not fatal: a
+    // build that cannot state a conforming fact should say nothing, exactly as a
+    // build that could not establish the fact at all does.
     //
-    // `store_schema_version` stays None as an ABSENT FACT rather than an
-    // unfilled blank: this module owns no persistent store, so it has no
-    // schema version to state.
+    // `build_git_sha` is NOT `health.metrics.buildCommit`, and an earlier version
+    // reused it. That stamp is HEAD, so a dirty build carries a clean sha --
+    // correct for the skew check it serves and wrong for an identity claim.
+    // Reported on insula#12.
     //
-    // The other three are conditional by construction. Each is emitted by
-    // build.rs or not at all, and each maps an empty stamp to None -- so a
-    // build that could not establish a fact declares nothing rather than
-    // declaring a plausible one.
-        build_git_sha: build_provenance_sha(),
-        build_lock_digest: build_lock_digest(),
-        wire_crate_version: wire_crate_version(),
-        store_schema_version: None,
-    }))
+    // `store_schema_version` is None as an ABSENT FACT rather than an unfilled
+    // blank: this module owns no persistent store. `wire_crate_version` is filled
+    // by the constructor from the linked crate, so it is no longer ours to pass.
+    .provenance(
+        subc_protocol::manifest::build_provenance(
+            build_provenance_sha().as_deref(),
+            build_lock_digest().as_deref(),
+            None,
+        )
+        .ok(),
+    )
     .capabilities(
         // No versioned capability grammar declared. `None` and an empty block are
         // NOT the same statement: the protocol makes this optional precisely so a
@@ -1401,15 +1384,28 @@ mod tests {
         let digest = p
             .build_lock_digest
             .expect("build_lock_digest is hashed at build time from Cargo.lock");
+        // 64 lowercase hex, the form subc-protocol validates. Asserted here as
+        // well as upstream because the constructor OMITS a non-conforming value
+        // rather than failing: a build that regressed to a shorter digest would
+        // publish no digest at all, and "absent" is a legitimate state that no
+        // consumer can distinguish from "never stamped".
         assert!(
-            digest.len() == 16 && digest.chars().all(|c| c.is_ascii_hexdigit()),
-            "build_lock_digest must be a 16-char hex hash, got {digest:?}"
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "build_lock_digest must be 64 lowercase hex, got {digest:?}"
         );
 
         // THE REFERENT IS THE FLEET'S WIRE CRATE. Asserted by identity against the
         // linked constant, not by shape: a semver-shaped check passes just as
         // happily on our own provider-usage version, which is what this field
         // previously carried and what a census gate would have misread.
+        //
+        // Still asserted although `build_provenance` now fills this itself. The
+        // value moved upstream; the CLAIM this module publishes did not, and a
+        // test that stops checking a published field because someone else
+        // computes it is trusting a dependency to keep meaning what it meant.
         let wire = p
             .wire_crate_version
             .expect("wire_crate_version is the linked subc-protocol version");

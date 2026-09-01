@@ -30,5 +30,12 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+# build.rs stamps a lock digest that the manifest publishes as provenance, and
+# subc-protocol validates it as exactly 64 lowercase hex -- a real SHA-256 rather
+# than a hash whose width happens to fit. sha2 is already in the dependency graph
+# for the runtime, so this adds no new third-party surface.
+[build-dependencies]
+sha2 = { workspace = true }
+
 [dev-dependencies]
 subc-core = { workspace = true }

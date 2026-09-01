@@ -88,7 +88,13 @@ fn main() {
         // and yields None on every worktree build.
         match (clean, locate_git_dir().as_deref().and_then(head_commit)) {
             // The ONLY case that may state a commit: we looked, and it was clean.
-            (Some(true), Some(sha)) => short(&sha),
+            //
+            // FULL 40-hex, not the abbreviated form the health stamp uses.
+            // subc-protocol validates provenance shas as exactly 40 lowercase
+            // hex, and an abbreviated one is not a shorter answer to the same
+            // question -- it false-drifts a fleet census against every module
+            // publishing the full form, because the two can never compare equal.
+            (Some(true), Some(sha)) => sha,
             // Dirty, or undeterminable, or no HEAD. Empty string, which the
             // consumer maps to None -- a sentinel must never render as a value.
             _ => String::new(),
@@ -162,12 +168,22 @@ fn tree_clean(worktree_root: &Path) -> Option<bool> {
 /// Deliberately not gated on tree cleanliness. It is a change-detector, not an
 /// identity claim — it answers "are these two builds the same dependencies",
 /// which stays true and useful on a dirty tree where the sha does not.
+/// SHA-256 of `Cargo.lock`, rendered as 64 lowercase hex.
+///
+/// WAS A `DefaultHasher`, which is wrong here for two independent reasons and
+/// only one of them is the width. `DefaultHasher`'s algorithm is explicitly not
+/// guaranteed stable across Rust releases, so the same lockfile could stamp
+/// differently after a toolchain bump -- and this value's entire job is to say
+/// whether two builds resolved the same dependencies. A digest that changes
+/// without its input changing answers that question wrongly while looking fine.
+///
+/// The width matters too: subc-protocol validates this as exactly 64 hex, and a
+/// 16-hex value false-drifts a fleet census against modules publishing full
+/// digests.
 fn lock_digest(worktree_root: &Path) -> Option<String> {
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
     let text = std::fs::read(worktree_root.join("Cargo.lock")).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    Some(format!("{:016x}", hasher.finish()))
+    Some(format!("{:x}", Sha256::digest(&text)))
 }
 
 fn is_stamp(raw: &str) -> bool {
