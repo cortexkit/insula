@@ -24,13 +24,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: insula
+
+      # `cargo metadata` resolves the whole dependency graph, including the
+      # private path-dep sibling -- so this job needs the same checkout the build
+      # legs do. Without it the command fails to load the workspace manifest and
+      # this gate refuses for a reason that has nothing to do with the version,
+      # which is how the first v0.1.0 attempt failed: correctly closed, wrongly
+      # explained.
+      - name: Mint cross-repo read token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
+      - name: Checkout subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
 
       # Read the version from the manifest rather than from anywhere it is
       # restated. `cargo metadata` resolves the same value the binary compiles
       # into itself via CARGO_PKG_VERSION, so agreement here IS agreement with
       # what `--version` will print -- a grep of Cargo.toml would only agree with
-      # the file.
+      # the file, and would read nothing at all if the version ever moved to
+      # workspace inheritance.
       - name: Compare tag against the crate version
+        working-directory: insula
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
