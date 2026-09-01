@@ -68,7 +68,18 @@ echo "signed binary reports: ${reported}"
 
 # Package AFTER signing so the archive carries the signed binary, and notarize
 # the archive itself.
-( cd "$SOURCE_DIR" && rm -f "${OLDPWD}/${ARCHIVE}" && zip -q -j "${OLDPWD}/${ARCHIVE}" "$BINARY" )
+#
+# The destination is resolved to an ABSOLUTE path before any `cd`. The obvious
+# spelling -- zipping to "${OLDPWD}/${ARCHIVE}" from inside a subshell that has
+# cd'd -- happens to work, and depends on subshell OLDPWD semantics to put the
+# archive where the caller's checksum step will look for it. If it ever resolved
+# elsewhere the zip would be created successfully somewhere nobody reads, and the
+# failure would surface as a missing asset at upload time rather than here.
+archive_path="$(cd "$(dirname "$ARCHIVE")" && pwd)/$(basename "$ARCHIVE")"
+rm -f "$archive_path"
+( cd "$SOURCE_DIR" && zip -q -j "$archive_path" "$BINARY" )
+[[ -f "$archive_path" ]] || fail "packaging produced no archive at ${archive_path}"
+ARCHIVE="$archive_path"
 
 xcrun notarytool submit "$ARCHIVE" \
   --key "$APP_STORE_CONNECT_API_KEY_PATH" \
