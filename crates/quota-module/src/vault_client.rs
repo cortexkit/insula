@@ -74,11 +74,25 @@ impl ClientFailure {
             // next one: Rust has no reflection over the daemon's constants, so a
             // new code falls through here silently.
             //
-            // This is the vault's own TypeScript client's default, arrived at
-            // independently from the other side of the wire
-            // (packages/client/src/errors.ts:57-66): unrecognised or absent class
-            // is transient, and the discarded value is logged. Retrying costs one
-            // tick; failing closed costs an outage with a misattributed cause.
+            // The vault's own TypeScript client reached this default independently
+            // from the other side of the wire: unrecognised or absent class is
+            // transient, and the discarded value is logged.
+            //
+            // BORROWED, NOT VERIFIED HERE: that reading is the vault seat's report
+            // of their own code (packages/client/src/errors.ts:57-66, reported
+            // 2026-09-02), not something this repository can check. It is
+            // corroboration for a decision the paragraph above already justifies
+            // on its own, so if it has since drifted the argument does not move.
+            // The date is here because a cited source with no date reads as
+            // current forever.
+            //
+            // Note their premise does NOT transfer automatically: a
+            // request/response client surfaces a repeated failure to its caller,
+            // while this background refresher does not. It holds here only
+            // because a stale-served entry publishes `stale: { since, class }`.
+            //
+            // Retrying costs one tick; failing closed costs an outage with a
+            // misattributed cause.
             //
             // The accepted risk is the same one the `unknown_module` arm takes: a
             // permanently unrecognised code stale-serves a healthy-looking window

@@ -285,10 +285,16 @@ fn no_provider_builds_its_own_http_client() {
 /// re-deposit either way.
 ///
 /// An earlier version of this comment said the latch "has to be cleared" and
-/// that the cost was therefore one-sided. THAT WAS FALSE, checked at the vault's
-/// source: an overwrite sets `state = 'active', stale_pending = 0`, so the
-/// re-deposit the operator is already making clears the latch itself. A latched
-/// cookie is mislabelled until the next deposit, not stranded.
+/// that the cost was therefore one-sided. THAT WAS FALSE: an overwrite sets
+/// `state = 'active', stale_pending = 0`, so the re-deposit the operator is
+/// already making clears the latch itself, and a latched cookie is mislabelled
+/// until the next deposit rather than stranded.
+///
+/// That correction is BORROWED -- the vault seat's reading of their own store
+/// (reported 2026-09-02), not a fact this repository can check. Dated because a
+/// cited source with no date reads as current forever, and because the claim it
+/// replaced was itself borrowed, believed, and wrong for weeks. The argument
+/// above does not rest on it either way.
 ///
 /// Recorded because a fence resting on an overstated cost is one someone later
 /// dismantles by discovering the cost is small. The residual harm is real but
