@@ -195,6 +195,30 @@ fn workos_session_cookie_value(jar: &CookieJar) -> Option<&str> {
 ///
 /// The app store only enriches browser usage; if it is missing, unreadable, or
 /// belongs to another user, leave usage unlabelled instead of returning an error.
+///
+/// RETURNING `None` HERE ALSO WITHHOLDS A PRUNING AUTHORISATION, AND THAT IS
+/// PROTECTION BY COINCIDENCE RATHER THAN BY DESIGN -- worth knowing before making
+/// this function more determined about finding an identity.
+///
+/// `completeProviders` is the only thing that authorises a consumer to replace a
+/// provider's stored account set, and a provider is complete only when EVERY
+/// handle resolved an identity. Cursor is the one cookie provider that resolves
+/// one at all (the other eight are identity-less by contract and can never be
+/// complete), so cursor is the only one where a cookie read that comes back
+/// ambiguous -- a sealed store on Windows returns SUCCESS WITH NO COOKIES, which
+/// is indistinguishable from a signed-out browser -- is in reach of a destructive
+/// act.
+///
+/// What prevents it is this `None`: no identity, so not complete, so no prune.
+/// But the refusal is for an unrelated reason. Nothing here knows it is standing
+/// between an unreadable cookie store and someone deleting a live account, and a
+/// change that made identity resolution succeed more often -- a fallback to the
+/// app store's user when the cookie has none, say -- would remove that cover
+/// silently while looking like an improvement.
+///
+/// So if this ever grows a path that yields an identity WITHOUT a confirmed
+/// browser session, the completeness gate needs its own reason to refuse a
+/// provider whose credential source could not be read.
 fn browser_identity_from_app_auth(
     browser_user_id: Option<&str>,
     app_auth: Result<Option<CursorAppAuth>, FetchError>,
