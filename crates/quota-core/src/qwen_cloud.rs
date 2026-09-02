@@ -587,9 +587,10 @@ impl UsageProvider for QwenCloudProvider {
                 })
                 .await?;
             if !jar.has_cookie_named(|name| name == "login_qwencloud_ticket") {
-                return Err(FetchError::NoSession(
-                    "no Qwen Cloud login ticket in browser".to_string(),
-                ));
+                return Err(FetchError::NoSession(format!(
+                    "no Qwen Cloud login ticket {}",
+                    crate::cookie_vault::source_phrase(source)
+                )));
             }
 
             let cookie_header = jar.header();

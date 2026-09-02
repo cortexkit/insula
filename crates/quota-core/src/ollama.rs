@@ -328,7 +328,8 @@ impl UsageProvider for OllamaProvider {
             // A jar without a recognized session cookie is not a usable login.
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
-                    "no ollama session cookie in browser ({})",
+                    "no ollama session cookie {} ({})",
+                    crate::cookie_vault::source_phrase(source),
                     jar.session_absence_detail()
                 )));
             }

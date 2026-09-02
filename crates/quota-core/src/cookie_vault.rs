@@ -36,6 +36,25 @@ pub(crate) struct CookieVault {
     family: &'static str,
 }
 
+/// Name the place a jar came from, for an operator's next action.
+///
+/// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE, and because the wrong answer is
+/// worse than a vague one. These providers all reported "no session cookie in
+/// browser" from a point AFTER the jar was resolved -- true when the browser
+/// store was the only lane, and false the moment a deposit answers instead. It
+/// sends the operator to check a browser session that is not what failed.
+///
+/// It is worst on exactly the hosts the deposit lane exists for. Windows cannot
+/// read Chrome's cookie store at all (App-Bound Encryption hands the key only to
+/// chrome.exe), so "in browser" there names a lane that cannot work, about a
+/// credential the operator pasted in by hand.
+pub(crate) fn source_phrase(source: &str) -> &'static str {
+    match source {
+        "vault" => "in the deposited cookie",
+        _ => "in browser",
+    }
+}
+
 impl CookieVault {
     pub(crate) fn new(
         credential_source: Option<Arc<dyn CredentialSource>>,
@@ -162,6 +181,19 @@ impl CookieVault {
         }
     }
 
+    /// Name the place a jar came from, for an operator's next action.
+    ///
+    /// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE, and because the wrong answer
+    /// is worse than a vague one. These providers all reported "no session cookie
+    /// in browser" from a point AFTER the jar was resolved -- true when the
+    /// browser store was the only lane, and false the moment a deposit answers
+    /// instead. It sends the operator to check a browser session that is not what
+    /// failed.
+    ///
+    /// It is worst on exactly the hosts the deposit lane exists for. Windows
+    /// cannot read Chrome's cookie store at all (App-Bound Encryption hands the
+    /// key only to chrome.exe), so "in browser" there names a lane that cannot
+    /// work, about a credential the operator pasted in by hand.
     fn deposits(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.handle_loader.cookie_handles(self.family)
     }
@@ -198,6 +230,24 @@ impl CookieVault {
 mod tests {
     use super::*;
     use crate::browser_cookies::SOURCE_LABEL;
+
+    /// The absence diagnosis names the lane that actually answered.
+    ///
+    /// These providers report "no session cookie ..." from a point AFTER the jar
+    /// is resolved, so the phrase has to follow the lane. Saying "in browser"
+    /// about a deposited cookie sends an operator to re-check a browser session
+    /// that is not what failed -- and on Windows it names a lane that CANNOT
+    /// work, since App-Bound Encryption hands Chrome's cookie key only to
+    /// chrome.exe. The wrong word lands hardest on the platform the deposit lane
+    /// exists for.
+    ///
+    /// Pinned because a revert here is otherwise silent: nothing parses this
+    /// message, so no other test in the suite would notice it going wrong.
+    #[test]
+    fn the_absence_message_names_the_lane_that_answered() {
+        assert_eq!(source_phrase("vault"), "in the deposited cookie");
+        assert_eq!(source_phrase(SOURCE_LABEL), "in browser");
+    }
 
     /// The shared lane publishes the cohort's cookie label on the local branch.
     ///

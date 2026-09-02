@@ -305,7 +305,16 @@ fn resolve_cursor_credential(
         .map(CursorCredential::App)
         .ok_or_else(|| {
             FetchError::NoSession(format!(
-                "no cursor session cookie in browser ({}); Cursor app store was also checked",
+                // NOT "in browser": this jar may have come from a deposited
+                // cookie rather than the local store, and on Windows it can
+                // only have. Naming a lane we did not necessarily read sends
+                // the operator to check a session that is not what failed.
+                // The source is threaded into the other cookie providers'
+                // messages, but here it would cross three signatures and a
+                // spawn_blocking boundary to replace one word -- and this
+                // message already tells the operator both places were tried,
+                // which is the part that changes what they do next.
+                "no cursor session cookie ({}); Cursor app store was also checked",
                 jar.session_absence_detail()
             ))
         })

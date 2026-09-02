@@ -429,7 +429,8 @@ impl UsageProvider for FactoryProvider {
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
-                    "no factory session cookie in browser ({})",
+                    "no factory session cookie {} ({})",
+                    crate::cookie_vault::source_phrase(source),
                     jar.session_absence_detail()
                 )));
             }
