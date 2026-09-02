@@ -431,7 +431,26 @@ impl RedemptionJournal {
         if legacy == self.path || !legacy.exists() {
             return Ok(());
         }
-        if !self.load().unwrap_or_default().is_empty() {
+        // AN UNREADABLE CURRENT JOURNAL MUST NOT READ AS AN EMPTY ONE. This was
+        // `self.load().unwrap_or_default()`, so a corrupt or unreadable file at
+        // the new path became an empty record set -- which falls through to the
+        // adoption below and OVERWRITES it with the legacy contents via `save`.
+        // A failed reading is not evidence that there is nothing to lose, and
+        // this is the double-spend fence for irreversible credit redemptions:
+        // pending records are what stop a reused request id being spent twice.
+        //
+        // Same defect CEREBELLUM found in their session reader, where a failed
+        // lookup filled an OS error code with 0: a reading that was never taken
+        // must not become a value that authorises an action.
+        let current = self.load().map_err(|error| {
+            JournalError::new(format!(
+                "{} exists and {} could not be read ({error}), so adoption was refused \
+                 rather than risk overwriting records that may still be pending",
+                legacy.display(),
+                self.path.display()
+            ))
+        })?;
+        if !current.is_empty() {
             // The current journal is authoritative. Leave the legacy file rather
             // than deleting it: this is the downgrade-then-upgrade case, and its
             // records may not all be in the new file.
@@ -1566,6 +1585,58 @@ mod tests {
     /// renamed segment finds no file, creates an empty journal, and an empty
     /// journal is indistinguishable from a migrated one -- while every pending
     /// redemption it fenced is free to be spent again. Money, no symptom.
+    /// An unreadable journal at the CURRENT path refuses adoption rather than
+    /// being overwritten.
+    ///
+    /// This was `self.load().unwrap_or_default()`, so a corrupt file at the new
+    /// path decoded to an empty record set, fell through the "already holds
+    /// records" guard, and was OVERWRITTEN by the legacy contents. The records
+    /// destroyed that way are the double-spend fence for irreversible credit
+    /// redemptions: a pending record is what stops a reused request id being
+    /// spent a second time.
+    ///
+    /// A FAILED READING IS NOT EVIDENCE THAT THERE IS NOTHING TO LOSE. The
+    /// corrupt file is left exactly where it is, so an operator can look at it.
+    #[test]
+    fn an_unreadable_current_journal_refuses_adoption_rather_than_being_overwritten() {
+        let dir = scratch_dir("adopt-unreadable");
+        let legacy_dir = dir.join("cortexkit/ck-quota");
+        let current_dir = dir.join("cortexkit/insula");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::create_dir_all(&current_dir).expect("current dir");
+
+        let legacy = legacy_dir.join("redemptions.json");
+        RedemptionJournal::new(legacy.clone())
+            .save(&[pending_record("acct-legacy", "req-legacy")])
+            .expect("seed the legacy journal");
+
+        // Not valid JSON, which is what a torn write or a truncated file looks
+        // like -- the realistic corruption, rather than a permission error that
+        // would need a mode change the test harness may not survive.
+        let current_path = current_dir.join("redemptions.json");
+        std::fs::write(&current_path, b"{ this is not json").expect("seed a corrupt journal");
+
+        let journal = RedemptionJournal::new(current_path.clone());
+        let error = journal
+            .adopt_from(&legacy)
+            .expect_err("an unreadable current journal must refuse adoption");
+        assert!(
+            error.to_string().contains("adoption was refused"),
+            "the refusal must say why it refused, got {error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&current_path).expect("the corrupt file must still be there"),
+            b"{ this is not json",
+            "the unreadable journal must be left untouched for an operator to inspect"
+        );
+        assert!(
+            legacy.exists(),
+            "the legacy journal must survive a refused adoption, or its records are \
+             lost with nothing holding them"
+        );
+    }
+
     #[test]
     fn a_journal_at_the_old_location_is_adopted_and_the_old_file_removed() {
         let dir = scratch_dir("adopt");
