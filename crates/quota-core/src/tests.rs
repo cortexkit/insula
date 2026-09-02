@@ -269,6 +269,72 @@ fn no_provider_builds_its_own_http_client() {
     );
 }
 
+/// No cookie provider reports an auth failure to the vault.
+///
+/// Reporting marks a credential stale so the NEXT get buys a refresh, and
+/// recovery is automatic. That is the whole value, and it depends on the
+/// credential being refreshable. A session cookie is not: the vault holds bytes
+/// a human pasted, there is no refresh adapter and no intent behind it, so a
+/// report would latch `needs_reauth` with no path out except a re-deposit the
+/// operator is ALREADY being told to make by the wire error.
+///
+/// So the cost is one-sided -- a stored verdict that adds nothing to the live
+/// diagnosis and has to be cleared with `reactivate` or a re-deposit before the
+/// record serves again. Confirmed against the vault's own audit chain after
+/// driving a real deposit to a rejected upstream request: `auth_events` for
+/// `cookie:%` was zero, which is the intended behaviour and not an accident of
+/// that response's shape.
+///
+/// TRUE TODAY BY CONSTRUCTION AND UNDEFENDED UNTIL NOW: zero of the nine cookie
+/// providers call it, and all six that do are refreshable or re-issuable
+/// families. Nothing stopped the tenth from copying a reporting call out of one
+/// of those six, and the damage would be invisible here -- the wire would look
+/// identical while the vault quietly held a latched record.
+///
+/// The cohort is derived from `is_cookie_based` rather than listed, so a new
+/// cookie provider is covered without anyone remembering to add it.
+#[test]
+fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
+    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+
+    for provider in &registry.providers {
+        if !provider.fetcher.is_cookie_based() {
+            continue;
+        }
+        // The module file is the provider name with `-` mapped to `_`, which is
+        // how this crate names them (`qwen-cloud` -> `qwen_cloud.rs`).
+        let path = dir.join(format!("{}.rs", provider.name.replace('-', "_")));
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Production only, matching the walk above: a reference inside a
+        // provider's own test module is not a call on the fetch path.
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        examined += 1;
+        if production.contains("report_auth_failure") {
+            offenders.push(provider.name.clone());
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these cookie providers report auth failures to the vault, which latches \
+         needs_reauth on a credential that cannot be refreshed -- the operator must \
+         then clear it by hand on top of the re-deposit the wire already asked for: \
+         {offenders:?}"
+    );
+    // Not vacuous: a broken name mapping or an unreadable directory would leave
+    // this passing while inspecting nothing.
+    assert!(
+        examined >= 9,
+        "expected to read every cookie provider's source; read only {examined}"
+    );
+}
+
 /// No vault lane hand-rolls the auth report or the payload scrub.
 ///
 /// Both were byte-identical in four providers until 2026-08-22, and neither is
