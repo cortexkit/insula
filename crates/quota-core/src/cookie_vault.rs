@@ -48,6 +48,31 @@ pub(crate) struct CookieVault {
 /// read Chrome's cookie store at all (App-Bound Encryption hands the key only to
 /// chrome.exe), so "in browser" there names a lane that cannot work, about a
 /// credential the operator pasted in by hand.
+/// NOT THREADED INTO UPSTREAM-FAILURE MESSAGES, deliberately, and this is where
+/// the next person will weigh that.
+///
+/// A rejected cookie reports "<provider> session expired" from a pure parse
+/// function with no source in scope, and a degraded entry publishes no `source`
+/// field either -- so on a host where BOTH lanes work, an operator cannot tell
+/// whether to re-login in Chrome or re-capture and re-deposit.
+///
+/// The cheap implementation exists: `FetchError::stage()` prefixes a message
+/// while preserving the variant, so `.map_err(|e| e.stage(source_phrase(src)))`
+/// at the call site where `source` is already bound would do it in one line per
+/// provider with no signature changes.
+///
+/// It is not built because the ambiguity is narrow. Where the deposit lane is
+/// the ONLY lane -- Windows, headless -- there is nothing to confuse it with, and
+/// those are the hosts this lane exists for. On macOS and Linux the local store
+/// takes precedence unless an account-suffixed deposit exists, so the ambiguous
+/// case is specifically: bare deposit, no browser session, fallback fires, and
+/// the deposit later expires. An operator there settles it by asking whether
+/// they have a browser session at all.
+///
+/// Measured before deciding, rather than reasoned about: a deposited cookie with
+/// a recognised name reaches a real upstream request and returns
+/// `credential_rejected` -- "amp session expired (settings page served a login)"
+/// -- which is correct, and silent about which lane carried it.
 pub(crate) fn source_phrase(source: &str) -> &'static str {
     match source {
         "vault" => "in the deposited cookie",
