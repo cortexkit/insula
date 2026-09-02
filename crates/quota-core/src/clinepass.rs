@@ -11,6 +11,13 @@
 //!
 //! The test payload mirrors that shape. The shared HTTP transport it rides
 //! (`http.rs`) is itself live-proven.
+//!
+//! These upstream paths were verified at CodexBar v0.45.0 and NO LONGER EXIST
+//! upstream: the QuickJS plugin-engine migration replaced this provider's
+//! Swift fetcher with plugin JS. The citation is kept with its tag rather
+//! than deleted -- it is the provenance for a fixture-verified port, and a
+//! tagged path is still openable while a bare one sends a reader hunting.
+//! Flagged by scripts/parity-citations.py.
 
 use async_trait::async_trait;
 use serde::Deserialize;

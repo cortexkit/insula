@@ -5,6 +5,13 @@
 //! SYNTHETIC_API_KEY available. Endpoint, headers, and response shape ported from
 //! CodexBar (SyntheticUsageStats.swift:95,102-106,189-201,242-292,306-321,624-643,672-698
 //! and SyntheticSettingsReader.swift:4,7). Rides the live-proven http.rs.
+//!
+//! These upstream paths were verified at CodexBar v0.37.2 and NO LONGER EXIST
+//! upstream: the QuickJS plugin-engine migration replaced this provider's
+//! Swift fetcher with plugin JS. The citation is kept with its tag rather
+//! than deleted -- it is the provenance for a fixture-verified port, and a
+//! tagged path is still openable while a bare one sends a reader hunting.
+//! Flagged by scripts/parity-citations.py.
 
 use async_trait::async_trait;
 

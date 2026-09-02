@@ -34,7 +34,18 @@ import re
 import subprocess
 import sys
 
-CITATION = re.compile(r"([A-Za-z_][A-Za-z0-9_]*\.swift)")
+# `+` is here because Swift extension files are named
+# `MiniMaxUsageFetcher+ModelMapping.swift`, and digits because of
+# `Sub2APIUsageFetcher.swift`. BOTH WERE MISSING FROM EARLIER VERSIONS OF THIS
+# PATTERN AND BOTH FAILED THE SAME WAY: the regex matched a SUFFIX of the real
+# filename, yielding a name that looks entirely plausible, is absent upstream,
+# and is therefore reported as a finding.
+#
+# So a too-narrow class here does not under-report, it INVENTS -- the worst
+# direction for a checker, because a phantom is indistinguishable from a real hit
+# and costs someone a hunt through a repository they do not own. The digits
+# omission was caught within the hour; the `+` omission shipped.
+CITATION = re.compile(r"([A-Za-z_][A-Za-z0-9_+]*\.swift)")
 
 
 def anchored_tag(repo_root: pathlib.Path) -> str | None:
@@ -93,7 +104,32 @@ def main() -> int:
     present = {name for name in cited if any(entry.endswith("/" + name) for entry in tree)}
     gone = {name: sorted(where) for name, where in cited.items() if name not in present}
 
-    print(f"anchor: {tag}   cited upstream files: {len(cited)}   present: {len(present)}")
+    # A module that NAMES THIS SCRIPT has been through the annotation: its dead
+    # citations carry the tag they were verified at, or an explanation of what
+    # replaced them upstream. Those are answered, not outstanding.
+    #
+    # WITHOUT THIS SPLIT THE INSTRUMENT IS PERMANENTLY RED, and a check that
+    # cannot reach zero under healthy operation is one its reader learns to skip
+    # -- the same cry-wolf shape that rules out a standing alarm here. It also
+    # makes the script find its OWN explanations: the note recording that
+    # `LLMProxyUsageSnapshot.swift` never existed necessarily contains that name,
+    # so documenting a dead citation re-reported it as a live one.
+    acknowledged = {}
+    for name in list(gone):
+        citers = gone[name]
+        if all(
+            "parity-citations.py" in (repo_root / "crates" / "quota-core" / "src" / c).read_text()
+            for c in citers
+            if (repo_root / "crates" / "quota-core" / "src" / c).is_file()
+        ):
+            acknowledged[name] = gone.pop(name)
+
+    print(
+        f"anchor: {tag}   cited upstream files: {len(cited)}   "
+        f"present: {len(present)}   answered: {len(acknowledged)}"
+    )
+    for name, where in sorted(acknowledged.items()):
+        print(f"  answered: {name}  ({', '.join(where)} carries its verification tag)")
     if not gone:
         print("findings: none")
         return 0

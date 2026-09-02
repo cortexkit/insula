@@ -7,6 +7,13 @@
 //! Sources/CodexBarCore/Providers/Zai/ZaiSettingsReader.swift:6-10,12-31,
 //! Sources/CodexBarCore/Providers/Zai/ZaiAPIRegion.swift:3-35, and fixture
 //! Tests/CodexBarTests/ZaiProviderTests.swift:406-454,457-527). Rides the live-proven http.rs.
+//!
+//! These upstream paths were verified at CodexBar v0.37.2 and NO LONGER EXIST
+//! upstream: the QuickJS plugin-engine migration replaced this provider's
+//! Swift fetcher with plugin JS. The citation is kept with its tag rather
+//! than deleted -- it is the provenance for a fixture-verified port, and a
+//! tagged path is still openable while a bare one sends a reader hunting.
+//! Flagged by scripts/parity-citations.py.
 
 use async_trait::async_trait;
 use serde::Deserialize;

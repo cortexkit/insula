@@ -13,8 +13,19 @@
 //! `LLM_PROXY_API_KEY` available. Endpoint, bearer auth, and the
 //! `providers[].quota_groups[].{remaining_percent, reset_time}` response shape +
 //! worst-group aggregation are ported from CodexBar
-//! (`Providers/LLMProxy/LLMProxyUsageFetcher.swift:133-159, 215-218` and
-//! `LLMProxyUsageSnapshot.swift:62-66`). Rides the live-proven `http.rs`.
+//! (`Providers/LLMProxy/LLMProxyUsageFetcher.swift:133-159, 215-218`, verified
+//! against CodexBar v0.37.2). Rides the live-proven `http.rs`.
+//!
+//! A second citation here named a Snapshot file for this provider, which HAS
+//! NEVER EXISTED upstream under any tag -- a plausible name, since several other
+//! providers really do have a Snapshot file, for one that does not. Removed
+//! rather than corrected: the response shape it was cited for is in the fetcher
+//! above. Flagged by scripts/parity-citations.py.
+//!
+//! The dead name is described here rather than quoted, deliberately: that script
+//! scans this prose too, so writing it out would have re-reported the phantom as
+//! a live citation forever -- documenting a bad value makes your own sweep find
+//! it.
 
 use std::collections::BTreeMap;
 

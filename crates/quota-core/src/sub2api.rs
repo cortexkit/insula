@@ -26,6 +26,13 @@
 //! subscription periods (CodexBar descriptor at
 //! `Sources/CodexBarCore/Providers/Sub2API/Sub2APIProviderDescriptor.swift:3-18`);
 //! those USD values stay off the rate axis.
+//!
+//! These upstream paths were verified at CodexBar v0.43.0 and NO LONGER EXIST
+//! upstream: the QuickJS plugin-engine migration replaced this provider's
+//! Swift fetcher with plugin JS. The citation is kept with its tag rather
+//! than deleted -- it is the provenance for a fixture-verified port, and a
+//! tagged path is still openable while a bare one sends a reader hunting.
+//! Flagged by scripts/parity-citations.py.
 
 use std::{net::IpAddr, time::Duration};
 
