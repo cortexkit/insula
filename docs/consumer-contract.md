@@ -1446,6 +1446,24 @@ model rather than a fit: it predicts the next one. The same applies to how quick
 detected: that gap can never exceed the fetch interval, so it records when the
 next fetch landed rather than anything about the revocation.
 
+**That whole model assumes the slot survives the repair, and a re-minted vault
+handle does not.** The capability is a field of `CredentialHandle`, which derives
+`PartialEq`/`Hash`, and the handle *is* the slot key — so a repair that mints a
+new capability produces a DIFFERENT slot. The scheduler re-reads the handle file
+every turn and treats it as authoritative: keys it no longer names are reaped,
+keys it names for the first time are created due-now. A new slot has no backoff
+to inherit, so recovery is the next turn rather than a draw on `[0, 300)`.
+
+| repair | recovery |
+|---|---|
+| re-seal the record, capability unchanged | the model above: `[0, 300)`, expected ~150 s |
+| re-seal **and** re-mint the handle | next scheduler turn |
+
+Worth stating because it is invisible from either side alone: the operator action
+that looks like *more* work is also the one that recovers an order of magnitude
+faster, and the reason lives in a `derive` two modules away from anything about
+backoff. Answered on insula#8.
+
 ## `usage.drops` — recently observed decreases
 
 A second operation on the same route. `usage.get` is a statement of **current
