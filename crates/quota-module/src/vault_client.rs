@@ -875,49 +875,92 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
     }
 }
 
+/// Map a control-plane error frame onto a retry policy.
+///
+/// THE CODES ARE READ FROM `subc_protocol::error_codes` RATHER THAN SPELLED AS
+/// literals. A literal agrees only with itself: when the daemon added
+/// `module_warming` it became a code this match had never heard of, and nothing
+/// here or upstream could notice, because a string that no arm matches is
+/// indistinguishable from a string that does not exist.
+///
+/// THE FALLTHROUGH IS THE DANGEROUS ARM, not the matched ones. An unrecognised
+/// code lands on `Protocol` -> `FailClosed` -> `FetchError::Decode`, which is
+/// non-transient: a flat 300s before the lane is asked again, and an
+/// `errorClass` of `decode_failed` on the wire, which tells a reader the vault
+/// sent an unparseable payload and sends them to this repo hunting a parse bug.
+/// That is how a router's "try again in a moment" became a five-minute outage
+/// with a misleading cause, reported as insula#14.
 fn classify_error_frame(body: &[u8]) -> ClientFailure {
+    use subc_protocol::error_codes as codes;
+
     let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
     match value.get("code").and_then(Value::as_str) {
-        Some(code @ ("unknown_channel" | "unknown_module" | "module_reloading")) => {
-            // `unknown_module` is ambiguous in a way the retry cannot see: the
-            // daemon answers it both for a module that is restarting and for a
-            // name that has never been registered. Retrying is right for the
-            // first and futile for the second.
-            //
-            // The per-call retry is bounded, but the refresher's is not: a
-            // transient failure with a prior healthy window serves that window
-            // and tries again next tick, indefinitely. So a wrong id publishes a
-            // healthy-looking wire forever. This client hand-rolls its frame
-            // loop rather than using an SDK, and the SDKs are where the
-            // retry-budget-exhausted error that names the target lives -- so
-            // without this line the id is printed nowhere in this process.
-            if code == "unknown_module" {
-                eprintln!(
-                    "[ck-quota] warning: daemon does not recognise module id \
-                     {CREDENTIALS_MODULE_ID:?} -- restarting, or renamed?"
-                );
+        // The target is not there. Retrying is right for a module that is coming
+        // back and futile for a name that will never resolve, and this arm cannot
+        // tell them apart -- so it retries and NAMES THE ID, because the futile
+        // case is otherwise silent forever.
+        //
+        // The per-call retry is bounded; the refresher's is not. A transient
+        // failure with a prior healthy window serves that window and tries again
+        // next tick, indefinitely -- so a wrong or retired id publishes a
+        // healthy-looking wire forever. This client hand-rolls its frame loop
+        // rather than using an SDK, and the SDKs are where the
+        // retry-budget-exhausted error that names the target lives, so without
+        // this warning the id is printed nowhere in this process.
+        Some(code @ ("unknown_channel" | codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
+            eprintln!(
+                "[ck-quota] warning: daemon answered {code:?} for module id \
+                 {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
+            );
+            ClientFailure::RouteGone
+        }
+        // The target exists and is not ready yet. `module_warming` is emphatically
+        // NOT a failure: the daemon is telling us the module is mid-handshake and
+        // to come back. On a daemon restart the lanes race the vault's own
+        // registration, and whichever fires first can lose it by a millisecond --
+        // so treating this as anything but a next-tick retry converts routine
+        // startup ordering into a per-lane outage.
+        Some(codes::MODULE_RELOADING | codes::MODULE_WARMING) => ClientFailure::RouteGone,
+        Some(codes::TARGET_UNAVAILABLE | codes::MODULE_TIMEOUT | "backend_error") => {
+            ClientFailure::Transport
+        }
+        _ => {
+            // The code sits beside the class wherever the VAULT sends one, so it
+            // is read from the same object rather than defaulted -- otherwise a
+            // quarantined record reaching this path would render as an absent one.
+            let code = value
+                .get("code")
+                .or_else(|| value.pointer("/error/code"))
+                .and_then(Value::as_str);
+            match value
+                .get("class")
+                .or_else(|| value.pointer("/error/class"))
+                .and_then(Value::as_str)
+            {
+                Some(class) => ClientFailure::Classified(read_error_to_outcome(class, code)),
+                None => {
+                    // NAME THE CODE WE ARE ABOUT TO DISCARD. The frame carried a
+                    // distinction and this arm destroys it; without this line the
+                    // only trace is the word `FailClosed`, and reconstructing
+                    // insula#14 took the daemon's journal plus the vault module's
+                    // audit log as a negative control. One line here would have
+                    // made it a one-line read.
+                    //
+                    // A code with no vault `class` is a ROUTE-LAYER reply this
+                    // match has not been taught, which in practice means the
+                    // daemon grew a code since this was written.
+                    eprintln!(
+                        "[ck-quota] warning: unclassified control error code {:?} from the \
+                         daemon -- treating as fail-closed, which costs this lane a \
+                         non-transient backoff. If this is a retryable condition it needs \
+                         an arm in classify_error_frame.",
+                        code.unwrap_or("<absent>")
+                    );
+                    ClientFailure::Protocol
+                }
             }
-            return ClientFailure::RouteGone;
         }
-        Some("target_unavailable" | "module_timeout" | "backend_error") => {
-            return ClientFailure::Transport;
-        }
-        _ => {}
     }
-    // The code sits beside the class wherever the vault sends one, so it is read
-    // from the same object rather than defaulted -- otherwise a quarantined
-    // record reaching this path would render as an absent one.
-    let code = value
-        .get("code")
-        .or_else(|| value.pointer("/error/code"))
-        .and_then(Value::as_str);
-    value
-        .get("class")
-        .or_else(|| value.pointer("/error/class"))
-        .and_then(Value::as_str)
-        .map(|class| read_error_to_outcome(class, code))
-        .map(ClientFailure::Classified)
-        .unwrap_or(ClientFailure::Protocol)
 }
 
 /// Decode a `credential.get` reply.
@@ -1104,6 +1147,85 @@ impl CredentialSource for VaultClient {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    fn classify(code: &str) -> ClientFailure {
+        classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes())
+    }
+
+    /// A daemon restart must not cost a vault lane a non-transient backoff.
+    ///
+    /// On restart the lanes race the vault module's own registration, and the
+    /// first to fire can lose by a millisecond. The daemon answers
+    /// `module_warming` -- "it exists, it is mid-handshake, come back" -- which
+    /// this classifier did not recognise, so it fell through to fail-closed and
+    /// became `FetchError::Decode`: 300 seconds before the lane was asked again,
+    /// published as `decode_failed`, which accuses the vault of sending an
+    /// unparseable payload. Measured at 10 consecutive samples over 5 minutes on
+    /// the `claude` lane, insula#14.
+    ///
+    /// Asserted through `vault_error()` rather than on the ClientFailure variant,
+    /// because the variant is not what costs the 300s -- the mapping onto
+    /// `Transient` is, and a refactor that renamed the variant while changing
+    /// that mapping would keep a variant-level assertion green.
+    #[test]
+    fn a_warming_module_is_retried_rather_than_failed_closed() {
+        assert_eq!(
+            classify(subc_protocol::error_codes::MODULE_WARMING).vault_error(),
+            VaultGetError::Transient,
+            "a warming target is the textbook retry-next-tick case; failing closed \
+             converts routine startup ordering into a 300s per-lane outage"
+        );
+    }
+
+    /// Every control error code the protocol crate exports is classified here.
+    ///
+    /// THE FALLTHROUGH IS SILENT AND EXPENSIVE: an unrecognised code lands on
+    /// fail-closed, which is non-transient, so a code this match has not been
+    /// taught costs a lane 300 seconds and publishes `decode_failed` -- a cause
+    /// that sends a reader to this repository looking for a parse bug. That is
+    /// exactly how `module_warming` cost five minutes per daemon restart while
+    /// every surface here read as a vault problem.
+    ///
+    /// WHAT THIS TEST CANNOT DO, stated because the gap is the reason the
+    /// fallthrough now logs: Rust has no reflection over a module's constants, so
+    /// this list is written by hand and pins the six that exist today. A SEVENTH
+    /// CODE ADDED UPSTREAM STILL FALLS THROUGH SILENTLY and this test still
+    /// passes. The mitigation is not here -- it is the warning line in the
+    /// fallthrough arm, which turns the next one from a five-minute mystery
+    /// requiring the daemon journal into a single line naming the code.
+    #[test]
+    fn every_exported_control_error_code_has_an_arm() {
+        use subc_protocol::error_codes as codes;
+        let exported = [
+            codes::UNKNOWN_MODULE,
+            codes::MODULE_REMOVED,
+            codes::MODULE_RELOADING,
+            codes::MODULE_WARMING,
+            codes::TARGET_UNAVAILABLE,
+            codes::MODULE_TIMEOUT,
+        ];
+
+        let unclassified: Vec<&str> = exported
+            .iter()
+            .copied()
+            .filter(|code| classify(code) == ClientFailure::Protocol)
+            .collect();
+
+        assert!(
+            unclassified.is_empty(),
+            "these daemon error codes fall through to fail-closed, costing a lane a \
+             300s backoff and publishing decode_failed: {unclassified:?}"
+        );
+
+        // The control. Without it, deleting every arm above leaves this test
+        // green the moment the fallthrough stops returning Protocol.
+        assert_eq!(
+            classify("a_code_no_daemon_sends"),
+            ClientFailure::Protocol,
+            "an unknown code must still fail closed -- refusing to trust a reply \
+             this client cannot interpret is the correct half of the old behaviour"
+        );
+    }
 
     async fn loopback_listener(label: &str) -> (TcpListener, PathBuf, Vec<u8>, [u8; 16]) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
