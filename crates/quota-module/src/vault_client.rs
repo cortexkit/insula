@@ -48,6 +48,14 @@ enum ClientFailure {
     Transport,
     RouteGone,
     Classified(VaultGetError),
+    /// A route-layer error frame carrying a code this client has not been taught.
+    ///
+    /// SEPARATE FROM `Protocol` BECAUSE THE TWO ARE DIFFERENT CLAIMS. `Protocol`
+    /// means this client could not read the reply at all -- a body that does not
+    /// decode, a field that is missing. This means the reply was well-formed and
+    /// the daemon told us something about ROUTING that we do not recognise, which
+    /// is a statement about the route rather than about the credential.
+    UnknownRouteCode,
     Protocol,
 }
 
@@ -56,6 +64,27 @@ impl ClientFailure {
         match self {
             Self::Transport | Self::RouteGone => VaultGetError::Transient,
             Self::Classified(error) => error,
+            // TRANSIENT, THOUGH UNRECOGNISED. The vault states its verdict in
+            // `class`; a frame without one is the ROUTE speaking, and no route
+            // condition is evidence that a credential is bad. Failing closed here
+            // spends 300 seconds and replaces a healthy cached window with
+            // `decode_failed` on the strength of a code we simply have not read
+            // yet -- which is precisely how `module_warming` cost five minutes a
+            // restart (insula#14), and the exhaustiveness test cannot stop the
+            // next one: Rust has no reflection over the daemon's constants, so a
+            // new code falls through here silently.
+            //
+            // This is the vault's own TypeScript client's default, arrived at
+            // independently from the other side of the wire
+            // (packages/client/src/errors.ts:57-66): unrecognised or absent class
+            // is transient, and the discarded value is logged. Retrying costs one
+            // tick; failing closed costs an outage with a misattributed cause.
+            //
+            // The accepted risk is the same one the `unknown_module` arm takes: a
+            // permanently unrecognised code stale-serves a healthy-looking window
+            // indefinitely. That is why this path logs the code -- the wire looks
+            // fine, so stderr has to be where it does not.
+            Self::UnknownRouteCode => VaultGetError::Transient,
             Self::Protocol => VaultGetError::FailClosed,
         }
     }
@@ -938,6 +967,12 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
                 .and_then(Value::as_str)
             {
                 Some(class) => ClientFailure::Classified(read_error_to_outcome(class, code)),
+                // NEITHER a class NOR a code: this is not an error frame this
+                // client can read at all, which is a different claim from one it
+                // reads and does not recognise. Fail closed -- refusing to trust
+                // an unreadable reply is right, and there is no route condition
+                // here to be lenient about.
+                None if code.is_none() => ClientFailure::Protocol,
                 None => {
                     // NAME THE CODE WE ARE ABOUT TO DISCARD. The frame carried a
                     // distinction and this arm destroys it; without this line the
@@ -951,12 +986,12 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
                     // daemon grew a code since this was written.
                     eprintln!(
                         "[ck-quota] warning: unclassified control error code {:?} from the \
-                         daemon -- treating as fail-closed, which costs this lane a \
-                         non-transient backoff. If this is a retryable condition it needs \
-                         an arm in classify_error_frame.",
+                         daemon -- retrying next tick and serving the cached window. If \
+                         this condition is permanent it will repeat forever while the wire \
+                         reads healthy; give it an arm in classify_error_frame.",
                         code.unwrap_or("<absent>")
                     );
-                    ClientFailure::Protocol
+                    ClientFailure::UnknownRouteCode
                 }
             }
         }
@@ -1177,6 +1212,42 @@ mod tests {
         );
     }
 
+    /// An unrecognised route-layer reply is retried, not treated as a bad credential.
+    ///
+    /// The vault states its verdict in `class`. A frame carrying a code and no
+    /// class is the ROUTE speaking, and no route condition is evidence that a
+    /// credential is bad -- so failing closed on one spends 300 seconds and
+    /// replaces a healthy cached window with `decode_failed`, accusing the vault
+    /// of sending an unparseable payload, on the strength of a code this client
+    /// has merely not read yet.
+    ///
+    /// That is `module_warming` exactly (insula#14), and naming that one code did
+    /// not fix the class: the exhaustiveness test above cannot see a seventh code
+    /// added upstream, so the next one lands here. This is the vault's own
+    /// TypeScript client's default, reached independently from the other side of
+    /// the wire.
+    ///
+    /// A frame this client cannot READ at all is still fail-closed -- that is a
+    /// different claim, and `ClientFailure::Protocol` keeps it.
+    #[test]
+    fn an_unrecognised_route_code_is_retried_rather_than_blamed_on_the_credential() {
+        assert_eq!(
+            classify("a_code_the_daemon_grew_last_week").vault_error(),
+            VaultGetError::Transient,
+            "a route-layer code we have not been taught must cost one tick, not an outage"
+        );
+
+        // The other half, and the reason this is a new variant rather than a
+        // widened `Protocol`: an unreadable body is not a route condition, and
+        // must still refuse to trust the reply.
+        assert_eq!(
+            classify_error_frame(b"not json at all").vault_error(),
+            VaultGetError::FailClosed,
+            "a reply this client cannot read is a different claim from one it can \
+             read and does not recognise"
+        );
+    }
+
     /// Every control error code the protocol crate exports is classified here.
     ///
     /// THE FALLTHROUGH IS SILENT AND EXPENSIVE: an unrecognised code lands on
@@ -1186,13 +1257,14 @@ mod tests {
     /// exactly how `module_warming` cost five minutes per daemon restart while
     /// every surface here read as a vault problem.
     ///
-    /// WHAT THIS TEST CANNOT DO, stated because the gap is the reason the
-    /// fallthrough now logs: Rust has no reflection over a module's constants, so
-    /// this list is written by hand and pins the six that exist today. A SEVENTH
-    /// CODE ADDED UPSTREAM STILL FALLS THROUGH SILENTLY and this test still
-    /// passes. The mitigation is not here -- it is the warning line in the
-    /// fallthrough arm, which turns the next one from a five-minute mystery
-    /// requiring the daemon journal into a single line naming the code.
+    /// WHAT THIS TEST CANNOT DO, stated because the gap is why the fallthrough's
+    /// own behaviour had to change: Rust has no reflection over a module's
+    /// constants, so this list is written by hand and pins the six that exist
+    /// today. A SEVENTH CODE ADDED UPSTREAM STILL REACHES THE FALLTHROUGH and
+    /// this test still passes. The mitigations are both there rather than here --
+    /// the fallthrough retries instead of failing closed, so an unknown code
+    /// costs one tick rather than an outage, and it logs the code, so the next
+    /// one is a single line rather than a reconstruction from the daemon journal.
     #[test]
     fn every_exported_control_error_code_has_an_arm() {
         use subc_protocol::error_codes as codes;
@@ -1208,22 +1280,24 @@ mod tests {
         let unclassified: Vec<&str> = exported
             .iter()
             .copied()
-            .filter(|code| classify(code) == ClientFailure::Protocol)
+            .filter(|code| classify(code) == ClientFailure::UnknownRouteCode)
             .collect();
 
         assert!(
             unclassified.is_empty(),
-            "these daemon error codes fall through to fail-closed, costing a lane a \
-             300s backoff and publishing decode_failed: {unclassified:?}"
+            "these daemon error codes reach the fallthrough rather than a named arm, \
+             so this client is guessing at their retry policy: {unclassified:?}"
         );
 
-        // The control. Without it, deleting every arm above leaves this test
-        // green the moment the fallthrough stops returning Protocol.
+        // THE CONTROL, and it is what keeps the filter above from being vacuous.
+        // The filter looks for codes landing on `UnknownRouteCode`; if the
+        // fallthrough ever stopped producing that variant, every code would pass
+        // trivially and this test would certify a classifier that classifies
+        // nothing. This pins the fallthrough it measures against.
         assert_eq!(
             classify("a_code_no_daemon_sends"),
-            ClientFailure::Protocol,
-            "an unknown code must still fail closed -- refusing to trust a reply \
-             this client cannot interpret is the correct half of the old behaviour"
+            ClientFailure::UnknownRouteCode,
+            "an unrecognised code must reach the fallthrough for the filter above to mean anything"
         );
     }
 
@@ -1467,6 +1541,29 @@ mod tests {
                 "availability code {code} became fail-closed"
             );
         }
+        // THIS EXPECTATION WAS DELIBERATELY REVERSED, and the reason is not
+        // that the old one was thoughtless. It pinned a real judgement: a code
+        // that is not a known availability code might be an AUTHORIZATION
+        // condition, and retrying one of those forever is futile.
+        //
+        // What changed is the visibility of forever. When this was written, a
+        // transient failure with a prior healthy window stale-served it with
+        // nothing on the wire to say so, and "retry indefinitely" really did
+        // mean a healthy-looking wire hiding a permanent condition. Since then
+        // this module publishes `stale: { since, class }` on exactly those
+        // entries, plus `staleEpisodesByProvider` -- so a code retried forever
+        // now shows as a `since` that keeps receding and an episode count that
+        // climbs. The wire is no longer silent, and the argument for failing
+        // closed rested on it being silent.
+        //
+        // Against that, failing closed costs a real outage on the retryable
+        // case with a cause that names the wrong subsystem, which is what
+        // `module_warming` did for five minutes a restart (insula#14). The
+        // reporter's vault TypeScript client reaches the same default from the
+        // other side of the wire -- though the transfer is not automatic, since
+        // a request/response client surfaces a repeated failure to its caller
+        // while a background refresher does not, and only the staleness
+        // disclosure closes that gap here.
         let unknown = serde_json::to_vec(&serde_json::json!({
             "code": "future_authorization_error",
             "message": "not an availability class"
@@ -1474,7 +1571,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             classify_error_frame(&unknown).vault_error(),
-            VaultGetError::FailClosed
+            VaultGetError::Transient,
+            "a route-layer code with no vault class is the ROUTE speaking, and no \
+                 route condition is evidence a credential is bad"
         );
     }
 
