@@ -114,6 +114,18 @@ def main(argv):
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
         restored = run(["git", "checkout", "--", rel])
+        # BUMP THE MTIME AFTER RESTORING. `git checkout --` writes the original
+        # bytes back, and a build system keying on mtime can then leave the
+        # MUTANT's compiled artefacts in place: the source is correct, the binary
+        # is not, and every later run in this session describes code that is no
+        # longer on disk. Hit for real on 2026-09-02, where a restored build.rs
+        # did not re-run its build script.
+        #
+        # Unconditional rather than gated on a comparison: a spurious rebuild
+        # costs seconds, and a skipped one costs a wrong verdict that looks
+        # exactly like a right one.
+        if path.exists():
+            path.touch()
         if restored.returncode != 0 or path.read_text() != source:
             # Louder than a failed proof: the tree is now wrong, and every later
             # result in this session would describe mutated code.
