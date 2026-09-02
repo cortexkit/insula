@@ -197,6 +197,7 @@ indistinguishable from a real pass, and that failure is silent.
 # token in the request body -- so a host that drifts does not fail, it receives
 # a working credential:
 python3 scripts/endpoint-hosts.py
+`scripts/parity-citations.py` — reports provider source citations whose upstream CodexBar file no longer exists at the anchored parity tag. A parity-round instrument, not a gate: the ports stay correct, but their provenance stops being followable.
 
 # providers reporting an absent credential while a key they could read sits in
 # the shared opencode auth store. That combination reads to an operator as
