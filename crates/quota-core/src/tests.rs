@@ -278,12 +278,27 @@ fn no_provider_builds_its_own_http_client() {
 /// report would latch `needs_reauth` with no path out except a re-deposit the
 /// operator is ALREADY being told to make by the wire error.
 ///
-/// So the cost is one-sided -- a stored verdict that adds nothing to the live
-/// diagnosis and has to be cleared with `reactivate` or a re-deposit before the
-/// record serves again. Confirmed against the vault's own audit chain after
-/// driving a real deposit to a rejected upstream request: `auth_events` for
-/// `cookie:%` was zero, which is the intended behaviour and not an accident of
-/// that response's shape.
+/// THE ARGUMENT IS THAT THE CALL CANNOT CHANGE ANY OUTCOME, not that it is
+/// expensive. On a refreshable record a report is an INSTRUCTION: mark stale,
+/// the next get exchanges, recovery is automatic and the operator never sees it.
+/// On a cookie the identical call is only a LABEL, because the repair is a human
+/// re-deposit either way.
+///
+/// An earlier version of this comment said the latch "has to be cleared" and
+/// that the cost was therefore one-sided. THAT WAS FALSE, checked at the vault's
+/// source: an overwrite sets `state = 'active', stale_pending = 0`, so the
+/// re-deposit the operator is already making clears the latch itself. A latched
+/// cookie is mislabelled until the next deposit, not stranded.
+///
+/// Recorded because a fence resting on an overstated cost is one someone later
+/// dismantles by discovering the cost is small. The residual harm is real but
+/// modest -- an inventory reading `needs_reauth` where the honest word is
+/// "expired, re-deposit" trains the wrong reflex -- and the no-outcome-change
+/// argument carries this on its own.
+///
+/// Confirmed against the vault's own audit chain after driving a real deposit to
+/// a rejected upstream request: `auth_events` for `cookie:%` was zero, which is
+/// the intended behaviour and not an accident of that response's shape.
 ///
 /// TRUE TODAY BY CONSTRUCTION AND UNDEFENDED UNTIL NOW: zero of the nine cookie
 /// providers call it, and all six that do are refreshable or re-issuable
