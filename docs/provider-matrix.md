@@ -28,8 +28,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.56.0** (37 providers registered; verified
-2026-08-25). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.56.3** (37 providers registered; verified
+2026-09-03). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -264,6 +264,41 @@ endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
 
 ### v0.55.0 -> v0.55.1 (checked 2026-08-26)
+
+### Round: v0.56.0 -> v0.56.3 (2026-09-03) — one port, measured before porting
+
+Constants first, all five PRESENT at v0.56.3, verified by taking each value from
+OUR source and running `git grep -l -F <value> v0.56.3`. Twenty-one provider files
+changed; counting `credential|usedPercent|windowMinutes|resetsAt|...` lines picked
+the reading order and ollama came top on combined signal and size.
+
+**Ported: the `Monthly usage` label (`crates/quota-core/src/ollama.rs`).** Upstream
+made it the primary block for accounts on monthly credits, retaining `Session
+usage` and `Hourly usage` "for older pages", and stamps a month sentinel it
+resolves downstream from the reset date.
+
+MEASURED FIRST: this host's page carries only the legacy pair, and neither plan
+heading. So nothing was being dropped here, and the port is precautionary rather
+than corrective. It is still worth making, because the failure is asymmetric — an
+HTML scrape names the page's own strings, so an unrecognised label skips the block
+silently and an unpublished window reads downstream as unconsumed capacity, which
+is the 2026-07-25 outage. Recognising a label that never appears costs nothing.
+
+The cadence stays `None`. We have never observed the block, so its length is not
+ours to state; the percent is load-bearing and publishes.
+
+**The probe is committed** as `crates/quota-core/examples/ollama-labels.rs`. This
+page has now moved twice, so "which labels does it render" is a question to ask
+the page rather than re-derive from a diff. Run it on any round touching ollama.
+
+**Declined: the `Cloud Usage` -> `Included usage <plan>` heading rename.** Both
+spellings are absent from this page, so there is nothing here to match, and
+`planType` is display metadata this module omits rather than guesses.
+
+**Declined: `GrokWebBillingFetcher`** (26 signal lines, the highest count in the
+delta). Read whole in both tags per the standing rule that a Grok fragment has
+inverted the meaning of a change three times: it is web-billing plumbing behind
+the manual-cookie path, which has no counterpart in our programmatic lane.
 
 ### Round: v0.55.1 -> v0.56.0 (2026-08-29) — null, with one decline worth recording
 
