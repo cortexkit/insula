@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::credential_source::CredentialStatus;
 use crate::model::{AccountInfo, ProviderUsage, SavedResets};
-use crate::provider::{AccountObservation, CredentialResolution, FetchAttempt, FetchError};
+use crate::provider::{
+    AccountObservation, CredentialHandle, CredentialResolution, FetchAttempt, FetchError,
+};
 
 /// Nominal refresh cadence for a healthy fetch unit.
 ///
@@ -252,6 +255,17 @@ pub struct ProviderSlot {
     pub error_class: Option<&'static str>,
     pub next_due_at: Instant,
     pub retry_count: u32,
+    /// Class of the most recent completed fetch, when it failed.
+    ///
+    /// Status is polled only while this is [`FetchClass::NonTransient`]. A
+    /// degraded slot can also be a transient failure with nothing to stale-serve,
+    /// and those retry on their own ladder -- they must not pick up this poll.
+    pub last_failure_class: Option<FetchClass>,
+    /// When this slot last asked the vault for `credential.status`.
+    ///
+    /// Cadence bookkeeping for the poll, not serving state. A failed poll still
+    /// stamps it so a vault that cannot answer is not asked every tick.
+    pub last_status_poll_at: Option<Instant>,
 }
 
 impl ProviderSlot {
@@ -273,6 +287,8 @@ impl ProviderSlot {
             status: SlotStatus::Pending,
             next_due_at: now,
             retry_count: 0,
+            last_failure_class: None,
+            last_status_poll_at: None,
         }
     }
 
@@ -492,6 +508,8 @@ fn next_slot_after_attempt_inner(
             status: prev.status,
             next_due_at: completed + BASE_INTERVAL,
             retry_count: prev.retry_count,
+            last_failure_class: prev.last_failure_class,
+            last_status_poll_at: None,
         };
     }
 
@@ -531,6 +549,8 @@ fn next_slot_after_attempt_inner(
             status: SlotStatus::Fresh,
             next_due_at: completed + BASE_INTERVAL,
             retry_count: 0,
+            last_failure_class: None,
+            last_status_poll_at: None,
         },
         Err(error) => {
             let retry_base = if account_changed {
@@ -627,15 +647,86 @@ fn next_slot_after_attempt_inner(
                 status,
                 next_due_at: completed + backoff(class, retry_count),
                 retry_count,
+                last_failure_class: Some(class),
+                last_status_poll_at: None,
             }
         }
+    }
+}
+
+/// Whether this slot should ask the vault for `credential.status` on this turn.
+///
+/// Only a vault-backed slot in non-transient backoff, and only once per
+/// [`BASE_INTERVAL`]. Healthy lanes and local-lane slots issue no extra calls.
+/// Once the 300s backstop is due, the ordinary fetch runs instead -- the poll
+/// accelerates a retry, it does not replace it.
+pub fn should_poll_credential_status(
+    slot: &ProviderSlot,
+    handle: &CredentialHandle,
+    now: Instant,
+) -> bool {
+    if handle.vault_capability().is_none() {
+        return false;
+    }
+    if slot.last_failure_class != Some(FetchClass::NonTransient) {
+        return false;
+    }
+    if now >= slot.next_due_at {
+        return false;
+    }
+    let origin = slot
+        .last_status_poll_at
+        .or(slot.last_attempt_at)
+        .unwrap_or(now);
+    now.saturating_duration_since(origin) >= BASE_INTERVAL
+}
+
+/// Apply a successful status reading to a slot in non-transient backoff.
+///
+/// Clears the backoff only when the vault record has been REPLACED: a monotonic
+/// version advance past the last observation, or `ready` when neither side has a
+/// version. An unchanged, backwards, or absent version leaves the 300s floor in
+/// place. A slot that has never observed a credential has no basis for "advanced
+/// past" and waits the full backoff.
+pub fn apply_credential_status(
+    slot: &ProviderSlot,
+    status: &CredentialStatus,
+    now: Instant,
+) -> ProviderSlot {
+    let mut next = slot.clone();
+    next.last_status_poll_at = Some(now);
+    if credential_was_replaced(slot, status) {
+        next.next_due_at = now;
+    }
+    next
+}
+
+/// A status poll that failed must not condemn, accelerate, or change serving state.
+///
+/// The poll timestamp is still stamped so a vault that cannot answer is not
+/// asked every tick. That is cadence bookkeeping, not a verdict about the
+/// credential.
+pub fn slot_after_status_error(slot: &ProviderSlot, now: Instant) -> ProviderSlot {
+    let mut next = slot.clone();
+    next.last_status_poll_at = Some(now);
+    next
+}
+
+fn credential_was_replaced(slot: &ProviderSlot, status: &CredentialStatus) -> bool {
+    let Some(observed) = slot.observation.as_ref() else {
+        return false;
+    };
+    match (observed.record_version, status.record_version) {
+        (Some(previous), Some(current)) => current > previous,
+        (None, None) => status.ready,
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential_source::VaultGetError;
+    use crate::credential_source::{CredentialStatus, VaultCapability, VaultGetError};
     use crate::model::Usage;
 
     fn incarnation() -> Incarnation {
@@ -1178,5 +1269,190 @@ mod tests {
             "an unversioned local slot keeps serving stale"
         );
         assert!(!after.label_in_flux);
+    }
+
+    fn vault_handle() -> CredentialHandle {
+        CredentialHandle::vault("oauth:codex", VaultCapability::new("ckh_test"))
+    }
+
+    fn local_handle() -> CredentialHandle {
+        CredentialHandle::implicit()
+    }
+
+    fn vault_status(ready: bool, version: Option<u64>) -> CredentialStatus {
+        CredentialStatus {
+            ready,
+            record_version: version,
+            stale_pending: None,
+        }
+    }
+
+    fn non_transient_slot(now: Instant, version: Option<u64>) -> ProviderSlot {
+        let cold = ProviderSlot::due_now(now, incarnation());
+        let good = next_slot_after_attempt(
+            &cold,
+            "codex",
+            FetchAttempt::success(
+                Some(AccountObservation::new(Some("A".to_string()), version)),
+                "vault",
+                Usage::default(),
+            ),
+            now,
+            now,
+        );
+        next_slot_after_attempt(
+            &good,
+            "codex",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(Some("A".to_string()), version)),
+                None,
+                FetchError::ProviderStatus(401),
+            ),
+            now,
+            now,
+        )
+    }
+
+    /// A vault record whose version advanced past the one this slot last served
+    /// has been replaced. Clear the 300s backoff so the next turn fetches it.
+    #[test]
+    fn an_advanced_record_version_clears_non_transient_backoff() {
+        let t0 = Instant::now();
+        let slot = non_transient_slot(t0, Some(7));
+        assert_eq!(slot.next_due_at, t0 + NON_TRANSIENT_BACKOFF);
+        assert_eq!(slot.last_failure_class, Some(FetchClass::NonTransient));
+
+        let t1 = t0 + BASE_INTERVAL;
+        assert!(
+            should_poll_credential_status(&slot, &vault_handle(), t1),
+            "a vault slot in non-transient backoff is due to poll at BASE_INTERVAL"
+        );
+        let next = apply_credential_status(&slot, &vault_status(true, Some(8)), t1);
+        assert_eq!(
+            next.next_due_at, t1,
+            "an advanced version must make the slot due now"
+        );
+        assert_eq!(
+            next.status,
+            SlotStatus::Degraded,
+            "clearing backoff is not a fetch: the slot stays degraded until one runs"
+        );
+        assert_eq!(next.observation, slot.observation);
+        assert_eq!(next.error_class, slot.error_class);
+    }
+
+    /// The 300s floor exists for a record that has not changed. An identical
+    /// version is that case, even if `ready` flipped true between two polls.
+    #[test]
+    fn an_unchanged_record_version_leaves_the_backoff_in_place() {
+        let t0 = Instant::now();
+        let slot = non_transient_slot(t0, Some(7));
+        let t1 = t0 + BASE_INTERVAL;
+        let next = apply_credential_status(&slot, &vault_status(true, Some(7)), t1);
+        assert_eq!(next.next_due_at, slot.next_due_at);
+        assert_eq!(next.status, slot.status);
+    }
+
+    /// A version that went backwards, or a status that carries none, is not a
+    /// replacement. Do not invent an acceleration from either.
+    #[test]
+    fn a_backwards_or_absent_version_does_not_accelerate() {
+        let t0 = Instant::now();
+        let slot = non_transient_slot(t0, Some(7));
+        let t1 = t0 + BASE_INTERVAL;
+
+        let backwards = apply_credential_status(&slot, &vault_status(true, Some(6)), t1);
+        assert_eq!(backwards.next_due_at, slot.next_due_at);
+
+        let absent = apply_credential_status(&slot, &vault_status(true, None), t1);
+        assert_eq!(absent.next_due_at, slot.next_due_at);
+    }
+
+    /// A slot that has never succeeded holds no observation, so it has no basis
+    /// for "advanced past". The backoff exists precisely for a credential that
+    /// may never have worked; accelerating it would hammer a record that has
+    /// produced nothing.
+    #[test]
+    fn no_prior_observation_does_not_accelerate() {
+        let t0 = Instant::now();
+        let mut slot = non_transient_slot(t0, Some(7));
+        slot.observation = None;
+        let t1 = t0 + BASE_INTERVAL;
+        let next = apply_credential_status(&slot, &vault_status(true, Some(99)), t1);
+        assert_eq!(
+            next.next_due_at, slot.next_due_at,
+            "whatever status says, a never-succeeded slot waits the full backoff"
+        );
+    }
+
+    /// A status call that errors must not condemn the credential or clear the
+    /// backoff. The poll is an accelerator; an accelerator that can make things
+    /// worse is a defect.
+    #[test]
+    fn a_status_error_leaves_the_slot_unaccelerated() {
+        let t0 = Instant::now();
+        let slot = non_transient_slot(t0, Some(7));
+        let t1 = t0 + BASE_INTERVAL;
+        let next = slot_after_status_error(&slot, t1);
+
+        assert_eq!(next.next_due_at, slot.next_due_at);
+        assert_eq!(next.status, slot.status);
+        assert_eq!(next.error_class, slot.error_class);
+        assert_eq!(next.entry, slot.entry);
+        assert_eq!(next.observation, slot.observation);
+        assert_eq!(next.last_failure_class, slot.last_failure_class);
+        assert_eq!(
+            next.last_status_poll_at,
+            Some(t1),
+            "cadence is still stamped so a mute vault is not asked every tick"
+        );
+    }
+
+    /// Healthy lanes and local-lane slots issue no status calls at all.
+    ///
+    /// The positive control is load-bearing: without a vault slot in
+    /// non-transient backoff that DOES poll, a predicate that never returned
+    /// true would satisfy the absences and look correct.
+    #[test]
+    fn healthy_and_local_slots_are_not_polled() {
+        let t0 = Instant::now();
+        let t1 = t0 + BASE_INTERVAL;
+        let handle = vault_handle();
+
+        let mut healthy = next_slot_after_attempt(
+            &ProviderSlot::due_now(t0, incarnation()),
+            "codex",
+            FetchAttempt::success(
+                Some(AccountObservation::new(Some("A".to_string()), Some(7))),
+                "vault",
+                Usage::default(),
+            ),
+            t0,
+            t0,
+        );
+        // Keep it inside the poll window so the only reason not to ask is that
+        // the last fetch succeeded. A healthy slot's natural next due is also
+        // BASE_INTERVAL, which would refuse the poll for a different reason and
+        // leave the failure-class guard untested.
+        healthy.next_due_at = t1 + Duration::from_secs(1);
+        assert!(
+            !should_poll_credential_status(&healthy, &handle, t1),
+            "a healthy vault slot must issue no status call"
+        );
+
+        let local = non_transient_slot(t0, Some(7));
+        assert!(
+            !should_poll_credential_status(&local, &local_handle(), t1),
+            "a local-lane slot has no capability and must not be polled"
+        );
+
+        assert!(
+            should_poll_credential_status(&local, &handle, t1),
+            "control: the same non-transient slot IS polled when it is vault-backed"
+        );
+        assert!(
+            !should_poll_credential_status(&local, &handle, t0 + Duration::from_secs(59)),
+            "control: the poll waits a full BASE_INTERVAL, not every tick"
+        );
     }
 }

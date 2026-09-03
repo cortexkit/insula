@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use quota_core::credential_source::{
-    CredentialSource, VaultCapability, VaultCredential, VaultGetError,
+    CredentialSource, CredentialStatus, VaultCapability, VaultCredential, VaultGetError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -840,6 +840,17 @@ struct ReportParams<'a> {
     record_version: u64,
 }
 
+#[derive(Serialize)]
+struct StatusRequest<'a> {
+    method: &'static str,
+    params: StatusParams<'a>,
+}
+
+#[derive(Serialize)]
+struct StatusParams<'a> {
+    handle: &'a str,
+}
+
 #[derive(Deserialize)]
 struct VaultSuccessResult {
     payload: Vec<u8>,
@@ -854,6 +865,15 @@ struct VaultSuccessResult {
     email: Option<String>,
     #[serde(default)]
     org_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VaultStatusResult {
+    ready: bool,
+    #[serde(default)]
+    record_version: Option<u64>,
+    #[serde(default)]
+    stale_pending: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1105,6 +1125,48 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
     }
 }
 
+/// Decode a `credential.status` reply.
+///
+/// Same two-level shape as [`decode_get_response`]: a `result` object is either
+/// a success body or an `error` body, never both, never neither. Extra wire
+/// fields (`last_error_code`, `lease_held`) are ignored -- this poll only acts
+/// on `ready` / `record_version` / `stale_pending`.
+///
+/// A decode failure here is returned to the caller. It must not be fed into
+/// slot transition: status is an accelerator, and an accelerator that can
+/// condemn a credential is a defect.
+fn decode_status_response(body: &[u8]) -> Result<CredentialStatus, VaultGetError> {
+    let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or(VaultGetError::FailClosed)?;
+    let has_error = result.contains_key("error");
+    let has_success = ["ready", "record_version", "stale_pending"]
+        .iter()
+        .any(|field| result.contains_key(*field));
+    match (has_success, has_error) {
+        (true, false) => {
+            let success: VaultStatusResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Ok(CredentialStatus {
+                ready: success.ready,
+                record_version: success.record_version,
+                stale_pending: success.stale_pending,
+            })
+        }
+        (false, true) => {
+            let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Err(read_error_to_outcome(
+                &failure.error.class,
+                failure.error.code.as_deref(),
+            ))
+        }
+        (true, true) | (false, false) => Err(VaultGetError::FailClosed),
+    }
+}
+
 #[async_trait]
 impl CredentialSource for VaultClient {
     async fn get(
@@ -1189,6 +1251,25 @@ impl CredentialSource for VaultClient {
         if let Err(error) = result {
             eprintln!("[ck-quota] warning: vault auth-failure report failed class={error:?}");
         }
+    }
+
+    async fn status(
+        &self,
+        capability: &VaultCapability,
+    ) -> Result<CredentialStatus, VaultGetError> {
+        let body = serde_json::to_vec(&StatusRequest {
+            method: "credential.status",
+            params: StatusParams {
+                handle: capability.expose_secret(),
+            },
+        })
+        .map_err(|_| VaultGetError::FailClosed)?;
+        let frame = self
+            .state
+            .call(body)
+            .await
+            .map_err(ClientFailure::vault_error)?;
+        decode_status_response(&frame.body)
     }
 }
 
@@ -1531,6 +1612,68 @@ mod tests {
         });
         assert_eq!(
             decode_get_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            VaultGetError::FailClosed
+        );
+    }
+
+    #[test]
+    fn status_decode_reads_ready_version_and_stale_pending() {
+        let body = serde_json::json!({
+            "result": {
+                "ready": true,
+                "record_version": 12,
+                "stale_pending": false,
+                "last_error_code": null,
+                "lease_held": true
+            }
+        });
+        assert_eq!(
+            decode_status_response(&serde_json::to_vec(&body).unwrap()).unwrap(),
+            CredentialStatus {
+                ready: true,
+                record_version: Some(12),
+                stale_pending: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn status_decode_omitted_version_is_absent_not_zero() {
+        let body = serde_json::json!({
+            "result": {
+                "ready": false,
+                "last_error_code": null,
+                "lease_held": false
+            }
+        });
+        let status = decode_status_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.record_version, None);
+        assert_eq!(status.stale_pending, None);
+    }
+
+    #[test]
+    fn status_decode_classifies_errors_the_same_way_as_get() {
+        let body = serde_json::json!({
+            "result": { "error": { "class": "permanent", "code": "not_found" } }
+        });
+        assert_eq!(
+            decode_status_response(&serde_json::to_vec(&body).unwrap()),
+            Err(VaultGetError::NotFound)
+        );
+    }
+
+    #[test]
+    fn status_decode_mixed_success_and_error_fails_closed() {
+        let body = serde_json::json!({
+            "result": {
+                "ready": true,
+                "record_version": 4,
+                "error": { "class": "permanent", "code": "not_found" }
+            }
+        });
+        assert_eq!(
+            decode_status_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             VaultGetError::FailClosed
         );
     }
