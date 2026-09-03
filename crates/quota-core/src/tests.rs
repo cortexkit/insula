@@ -16,9 +16,11 @@ use crate::codex_resets::{
     ConsumeOutcome, CreditsHttpResponse, RedemptionJournal, ReqwestResetTransport, Reservation,
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
-use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential, VaultGetError};
+use crate::credential_source::{
+    CredentialSource, CredentialStatus, VaultCapability, VaultCredential, VaultGetError,
+};
 use crate::model::{AccountInfo, ExtraWindow, RateWindow, Usage};
-use crate::provider::{AccountObservation, FetchError, HandlesError};
+use crate::provider::{AccountObservation, CredentialHandle, FetchError, HandlesError};
 use crate::refresh::{
     BASE_INTERVAL, FETCH_BLACKOUT_HORIZON, FETCH_DEADLINE, FRESH_HORIZON, MAX_TRANSIENT_BACKOFF,
 };
@@ -7100,5 +7102,206 @@ fn every_doc_reference_between_documents_resolves() {
     assert!(
         checked >= 20,
         "expected the doc set to cross-reference itself; only found {checked}"
+    );
+}
+
+struct RecordingStatusSource {
+    calls: Mutex<Vec<String>>,
+    result: Mutex<Result<CredentialStatus, VaultGetError>>,
+}
+
+#[async_trait]
+impl CredentialSource for RecordingStatusSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::Permanent)
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+
+    async fn status(
+        &self,
+        capability: &VaultCapability,
+    ) -> Result<CredentialStatus, VaultGetError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(capability.expose_secret().to_string());
+        self.result.lock().unwrap().clone()
+    }
+}
+
+struct StatusPollProvider {
+    healthy_vault: CredentialHandle,
+    degraded_vault: CredentialHandle,
+    local: CredentialHandle,
+}
+
+impl StatusPollProvider {
+    fn new() -> Self {
+        Self {
+            healthy_vault: CredentialHandle::vault(
+                "oauth:codex:healthy",
+                VaultCapability::new("ckh_healthy"),
+            ),
+            degraded_vault: CredentialHandle::vault(
+                "oauth:codex:degraded",
+                VaultCapability::new("ckh_degraded"),
+            ),
+            local: CredentialHandle::implicit(),
+        }
+    }
+}
+
+#[async_trait]
+impl UsageProvider for StatusPollProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![
+            self.healthy_vault.clone(),
+            self.degraded_vault.clone(),
+            self.local.clone(),
+        ])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if handle == &self.local {
+            return FetchAttempt::failure(None, None, FetchError::NoSession("no local".into()));
+        }
+        if handle == &self.degraded_vault {
+            return FetchAttempt::failure(
+                Some(AccountObservation::new(Some("A".to_string()), Some(7))),
+                None,
+                FetchError::ProviderStatus(401),
+            );
+        }
+        FetchAttempt::success(
+            Some(AccountObservation::new(Some("A".to_string()), Some(7))),
+            "vault",
+            Usage::default(),
+        )
+    }
+}
+
+fn status_poll_fixture(
+    result: Result<CredentialStatus, VaultGetError>,
+) -> (Registry, Arc<RecordingStatusSource>, StatusPollProvider) {
+    let provider = StatusPollProvider::new();
+    let source = Arc::new(RecordingStatusSource {
+        calls: Mutex::new(Vec::new()),
+        result: Mutex::new(result),
+    });
+    let mut registry = Registry::new(vec![Box::new(StatusPollProvider::new())]);
+    registry.attach_credential_source(Arc::clone(&source) as Arc<dyn CredentialSource>);
+    (registry, source, provider)
+}
+
+fn age_slot_into_status_poll(registry: &Registry, handle: &CredentialHandle) {
+    let origin = Instant::now()
+        .checked_sub(BASE_INTERVAL)
+        .expect("monotonic clock has been up for a minute");
+    let mut store = registry.store.lock().unwrap();
+    for (key, mut slot) in store.snapshot() {
+        if &key.handle != handle {
+            continue;
+        }
+        slot.last_attempt_at = Some(origin);
+        slot.last_status_poll_at = None;
+        slot.next_due_at = Instant::now() + Duration::from_secs(240);
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+}
+
+fn slot_for(registry: &Registry, handle: &CredentialHandle) -> ProviderSlot {
+    registry
+        .store
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .find(|(key, _)| &key.handle == handle)
+        .map(|(_, slot)| slot)
+        .expect("handle must have a slot")
+}
+
+/// A status poll that errors must not condemn the credential or clear backoff.
+///
+/// Permanent is the class that would replace a 401's `credential_rejected` if
+/// the error were fed into slot transition. The poll is an accelerator; an
+/// accelerator that can make things worse is a defect.
+#[tokio::test]
+async fn a_status_call_that_errors_does_not_condemn_the_slot() {
+    let (registry, source, provider) = status_poll_fixture(Err(VaultGetError::Permanent));
+    tick(&registry).await;
+    assert!(
+        source.calls.lock().unwrap().is_empty(),
+        "the opening fetch is not a status poll"
+    );
+
+    let before = slot_for(&registry, &provider.degraded_vault);
+    assert_eq!(before.error_class, Some("credential_rejected"));
+
+    age_slot_into_status_poll(&registry, &provider.degraded_vault);
+    age_slot_into_status_poll(&registry, &provider.healthy_vault);
+    age_slot_into_status_poll(&registry, &provider.local);
+    let due_before = slot_for(&registry, &provider.degraded_vault).next_due_at;
+    tick(&registry).await;
+
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["ckh_degraded"],
+        "the erroring poll must still have been issued, or this would not be testing it"
+    );
+    let after = slot_for(&registry, &provider.degraded_vault);
+    assert_eq!(
+        after.error_class,
+        Some("credential_rejected"),
+        "a status error must not condemn the credential under a different class"
+    );
+    assert_eq!(after.status, before.status);
+    assert_eq!(
+        after.next_due_at, due_before,
+        "a status error must not accelerate the backoff"
+    );
+    assert_eq!(after.observation, before.observation);
+}
+
+/// Healthy lanes and local-lane slots issue no status calls at all.
+///
+/// The degraded vault slot is the control: without a call that DOES fire, a
+/// wiring that never polled anyone would satisfy the absences and look correct.
+#[tokio::test]
+async fn healthy_and_local_slots_issue_no_status_call() {
+    let (registry, source, provider) = status_poll_fixture(Ok(CredentialStatus {
+        ready: true,
+        record_version: Some(8),
+        stale_pending: None,
+    }));
+    tick(&registry).await;
+    source.calls.lock().unwrap().clear();
+
+    age_slot_into_status_poll(&registry, &provider.degraded_vault);
+    age_slot_into_status_poll(&registry, &provider.healthy_vault);
+    age_slot_into_status_poll(&registry, &provider.local);
+    tick(&registry).await;
+
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["ckh_degraded"],
+        "only the vault-backed non-transient slot may be polled"
     );
 }

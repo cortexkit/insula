@@ -1419,7 +1419,7 @@ mod tests {
         let t1 = t0 + BASE_INTERVAL;
         let handle = vault_handle();
 
-        let healthy = next_slot_after_attempt(
+        let mut healthy = next_slot_after_attempt(
             &ProviderSlot::due_now(t0, incarnation()),
             "codex",
             FetchAttempt::success(
@@ -1430,6 +1430,11 @@ mod tests {
             t0,
             t0,
         );
+        // Keep it inside the poll window so the only reason not to ask is that
+        // the last fetch succeeded. A healthy slot's natural next due is also
+        // BASE_INTERVAL, which would refuse the poll for a different reason and
+        // leave the failure-class guard untested.
+        healthy.next_due_at = t1 + Duration::from_secs(1);
         assert!(
             !should_poll_credential_status(&healthy, &handle, t1),
             "a healthy vault slot must issue no status call"

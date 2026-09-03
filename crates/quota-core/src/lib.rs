@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use futures_util::{stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use credential_source::CredentialSource;
+use credential_source::{CredentialSource, VaultCapability};
 use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
@@ -522,6 +522,11 @@ impl Registry {
         self.credential_source.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn attach_credential_source(&mut self, source: Arc<dyn CredentialSource>) {
+        self.credential_source = Some(source);
+    }
+
     /// The slot store, for diagnostics that must stage a specific slot state.
     ///
     /// A few states this module must answer for are reachable only through a
@@ -861,6 +866,44 @@ impl Registry {
         store.drop_page(since)
     }
 
+    /// Ask the vault whether a replaced record can end a non-transient backoff.
+    ///
+    /// Only vault-backed slots already waiting out the 300s floor are polled, and
+    /// only at [`refresh::BASE_INTERVAL`]. A successful version advance makes the
+    /// slot due for the fetch that follows in this turn. Any status failure leaves
+    /// serving state untouched -- the poll is an accelerator, not a verdict.
+    async fn poll_replaced_credentials(&self, now: Instant) {
+        let Some(source) = self.credential_source.as_ref() else {
+            return;
+        };
+        let eligible: Vec<(SlotKey, ProviderSlot, VaultCapability)> = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            store
+                .snapshot()
+                .into_iter()
+                .filter_map(|(key, slot)| {
+                    let capability = key.handle.vault_capability()?.clone();
+                    refresh::should_poll_credential_status(&slot, &key.handle, now)
+                        .then_some((key, slot, capability))
+                })
+                .collect()
+        };
+        for (key, slot, capability) in eligible {
+            let next = match source.status(&capability).await {
+                Ok(status) => refresh::apply_credential_status(&slot, &status, now),
+                Err(_) => refresh::slot_after_status_error(&slot, now),
+            };
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            store.publish_if_current(&key, slot.incarnation, slot.attempt_sequence, next);
+        }
+    }
+
     /// Run one bounded scheduler turn using the production fetch deadline.
     pub async fn refresh_tick(&self, cancel: &CancellationToken) {
         self.refresh_tick_with_deadline(cancel, refresh::FETCH_DEADLINE)
@@ -896,13 +939,20 @@ impl Registry {
                         .map(|handles| (provider.name.as_str(), handles))
                 },
             ));
-        let snapshot = {
+        {
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.reconcile_batch(&authoritative, turn_start);
             store.mark_tick(turn_start);
+        }
+        self.poll_replaced_credentials(turn_start).await;
+        let snapshot = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.snapshot()
         };
         let candidates = {
