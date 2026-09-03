@@ -153,6 +153,19 @@ impl std::fmt::Display for VaultGetError {
 
 impl std::error::Error for VaultGetError {}
 
+/// Non-secret health of one vault record. Never carries credential bytes.
+///
+/// `record_version` is the change cursor: every import, replace, and refresh
+/// commit bumps it, monotonically per record. `ready` is whether the record is
+/// usable now, and is consulted only when neither side has a version to compare.
+/// `stale_pending` is a latency predictor for the next get, not a health signal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialStatus {
+    pub ready: bool,
+    pub record_version: Option<u64>,
+    pub stale_pending: Option<bool>,
+}
+
 /// Vault access supplied by the subc-aware module crate.
 #[async_trait]
 pub trait CredentialSource: Send + Sync {
@@ -169,6 +182,20 @@ pub trait CredentialSource: Send + Sync {
         provider_status: u16,
         record_version: u64,
     );
+
+    /// Handle resolution plus plaintext metadata. No decrypt, no refresh, no audit.
+    ///
+    /// A source that has not grown this method cannot accelerate a backoff: the
+    /// default refuses, and a refused status poll leaves the slot exactly as it
+    /// was. Implementors that can answer must not let a failure here condemn a
+    /// credential -- the poll is an accelerator, and an accelerator that can make
+    /// things worse is a defect.
+    async fn status(
+        &self,
+        _capability: &VaultCapability,
+    ) -> Result<CredentialStatus, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
 }
 
 /// Report a rejected vault credential to the store that issued it, if anyone is
