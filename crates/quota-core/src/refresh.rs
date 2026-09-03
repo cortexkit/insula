@@ -718,7 +718,26 @@ fn credential_was_replaced(slot: &ProviderSlot, status: &CredentialStatus) -> bo
     };
     match (observed.record_version, status.record_version) {
         (Some(previous), Some(current)) => current > previous,
-        (None, None) => status.ready,
+        // NO VERSION IS NO BASIS, and `ready` is not a substitute for one.
+        //
+        // This arm returned `status.ready` on the strength of an instruction I
+        // wrote, which contradicted the rule three paragraphs above it in the same
+        // brief: a slot with no prior observation gets no acceleration, because
+        // inventing a basis means hammering a record that has produced nothing.
+        // `ready` with no version to compare IS an invented basis.
+        //
+        // The failure it caused is the one the backoff exists to prevent. `ready`
+        // means the vault can serve the record, NOT that the upstream accepts it --
+        // a key that is intact in custody and revoked at the provider is ready and
+        // rejected at the same time. So a permanently dead credential would poll
+        // ready every BASE_INTERVAL, accelerate every BASE_INTERVAL, and retry at
+        // 60s instead of 300s forever: a fivefold increase in 401s against a
+        // credential already convicted, arriving as an optimisation.
+        //
+        // Reachable rather than theoretical: `record_version` is `Option` on the
+        // wire, so any record type that omits it lands here. Nothing pinned this
+        // arm, which is its own signal -- it was never exercised in either
+        // direction.
         _ => false,
     }
 }
@@ -1366,6 +1385,43 @@ mod tests {
 
         let absent = apply_credential_status(&slot, &vault_status(true, None), t1);
         assert_eq!(absent.next_due_at, slot.next_due_at);
+    }
+
+    /// A ready record with NO version on either side still does not accelerate.
+    ///
+    /// This pins the arm that shipped as `status.ready` and was wrong. `ready`
+    /// says the vault can serve the record, not that the upstream accepts it --
+    /// those disagree for exactly the credential this backoff is about, one
+    /// intact in custody and revoked at the provider. Accelerating on it would
+    /// retry a convicted credential every BASE_INTERVAL instead of every 300s,
+    /// forever, as a fivefold increase in 401s wearing the shape of an
+    /// optimisation.
+    ///
+    /// Reachable rather than theoretical: `record_version` is optional on the
+    /// wire, so a record type that omits it lands here.
+    #[test]
+    fn a_ready_record_with_no_version_on_either_side_does_not_accelerate() {
+        let t0 = Instant::now();
+        let mut slot = non_transient_slot(t0, None);
+        // Both sides versionless: the slot observed a record that reported no
+        // version, and status reports none either.
+        assert!(
+            slot.observation.is_some(),
+            "the basis under test is the version, not the observation"
+        );
+        slot.observation = Some(AccountObservation::new(None, None));
+        let t1 = t0 + BASE_INTERVAL;
+
+        let after = apply_credential_status(&slot, &vault_status(true, None), t1);
+        assert_eq!(
+            after.next_due_at, slot.next_due_at,
+            "ready is not a basis for replacement; only an advanced version is"
+        );
+        assert_eq!(
+            after.last_status_poll_at,
+            Some(t1),
+            "the poll still happened, so it must not be retried before the next interval"
+        );
     }
 
     /// A slot that has never succeeded holds no observation, so it has no basis
