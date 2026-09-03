@@ -441,7 +441,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(deepseek::DeepSeekProvider::new()),
+            Box::new(deepseek::DeepSeekProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
             Box::new(factory::FactoryProvider::new_with_handle_loader(
@@ -482,7 +485,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(openrouter::OpenRouterProvider::new()),
+            Box::new(openrouter::OpenRouterProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(qoder::QoderProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
@@ -495,7 +501,10 @@ impl Registry {
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(sub2api::Sub2ApiProvider::new()),
             Box::new(warp::WarpProvider::new()),
-            Box::new(synthetic::SyntheticProvider::new()),
+            Box::new(synthetic::SyntheticProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(zai::ZaiProvider::new()),
             Box::new(zenmux::ZenMuxProvider::new()),
             Box::new(kilo::KiloProvider::new()),

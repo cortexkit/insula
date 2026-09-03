@@ -194,6 +194,9 @@ async fn main() {
         loader.ollama_handles(),
         loader.opencode_handles(),
         loader.opencodego_handles(),
+        loader.deepseek_handles(),
+        loader.synthetic_handles(),
+        loader.openrouter_handles(),
     ]
     .iter()
     .any(|result| result.as_ref().is_ok_and(|handles| !handles.is_empty()));
