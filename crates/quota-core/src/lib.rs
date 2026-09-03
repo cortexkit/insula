@@ -441,7 +441,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(deepseek::DeepSeekProvider::new()),
+            Box::new(deepseek::DeepSeekProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
             Box::new(factory::FactoryProvider::new_with_handle_loader(
