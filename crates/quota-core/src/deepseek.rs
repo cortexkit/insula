@@ -566,7 +566,9 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = DeepSeekProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
+                path.clone(),
+            ))),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 1);
@@ -582,7 +584,9 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = DeepSeekProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
+                path.clone(),
+            ))),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
@@ -648,7 +652,10 @@ mod tests {
                 VaultCapability::new("ckh_deepseek"),
             ))
             .await;
-        assert!(matches!(attempt.usage, Err(FetchError::ProviderStatus(401))));
+        assert!(matches!(
+            attempt.usage,
+            Err(FetchError::ProviderStatus(401))
+        ));
         for _ in 0..20 {
             if !reports.lock().unwrap().is_empty() {
                 break;

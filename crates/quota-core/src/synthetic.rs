@@ -531,9 +531,9 @@ impl SyntheticProvider {
     }
 
     fn base(&self) -> String {
-        self.base_url
-            .clone()
-            .unwrap_or_else(|| env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string()))
+        self.base_url.clone().unwrap_or_else(|| {
+            env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string())
+        })
     }
 
     fn report_auth_failure(
@@ -1125,7 +1125,9 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = SyntheticProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
+                path.clone(),
+            ))),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 1);
@@ -1141,7 +1143,9 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = SyntheticProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
+                path.clone(),
+            ))),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
@@ -1178,10 +1182,7 @@ mod tests {
             ))
             .await;
         assert_eq!(attempt.source.as_deref(), Some("vault"));
-        assert_eq!(
-            attempt.usage.unwrap().primary.unwrap().used_percent,
-            20.0
-        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 20.0);
         assert!(request
             .await
             .unwrap()
@@ -1206,7 +1207,10 @@ mod tests {
                 VaultCapability::new("ckh_synthetic"),
             ))
             .await;
-        assert!(matches!(attempt.usage, Err(FetchError::ProviderStatus(401))));
+        assert!(matches!(
+            attempt.usage,
+            Err(FetchError::ProviderStatus(401))
+        ));
         for _ in 0..20 {
             if !reports.lock().unwrap().is_empty() {
                 break;
