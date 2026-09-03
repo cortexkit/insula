@@ -485,7 +485,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(openrouter::OpenRouterProvider::new()),
+            Box::new(openrouter::OpenRouterProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(qoder::QoderProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
