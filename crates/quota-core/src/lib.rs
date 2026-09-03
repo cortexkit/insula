@@ -498,7 +498,10 @@ impl Registry {
             Box::new(stepfun::StepFunProvider::new()),
             Box::new(sub2api::Sub2ApiProvider::new()),
             Box::new(warp::WarpProvider::new()),
-            Box::new(synthetic::SyntheticProvider::new()),
+            Box::new(synthetic::SyntheticProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(zai::ZaiProvider::new()),
             Box::new(zenmux::ZenMuxProvider::new()),
             Box::new(kilo::KiloProvider::new()),

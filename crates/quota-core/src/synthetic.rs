@@ -14,8 +14,11 @@
 //! Flagged by scripts/parity-citations.py.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
+use crate::vault_handles::VaultHandleLoader;
 use crate::{
     env,
     http::JsonRequest,
@@ -504,12 +507,92 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
 pub struct SyntheticProvider {
     http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    /// Overrides the `SYNTHETIC_API_URL` environment variable, for tests.
+    base_url: Option<String>,
 }
 
 impl SyntheticProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            credential_source,
+            handle_loader,
+            base_url: None,
+        }
+    }
+
+    fn base(&self) -> String {
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string()))
+    }
+
+    fn report_auth_failure(
+        &self,
+        capability: &VaultCapability,
+        record_version: u64,
+        error: &FetchError,
+    ) {
+        crate::credential_source::report_vault_auth_failure(
+            self.credential_source.as_ref(),
+            capability,
+            record_version,
+            error,
+        );
+    }
+
+    async fn fetch_with_key(&self, key: &str) -> Result<ProviderUsage, FetchError> {
+        let body = JsonRequest::get(self.base())
+            .bearer(key)
+            .send(&self.http)
+            .await?;
+        let usage = normalize_usage(&body)?;
+        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+    }
+
+    async fn fetch_vault(&self, handle_id: &str, capability: &VaultCapability) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match credential_source.get(capability, 120_000).await {
+            Ok(credential) => credential,
+            Err(error) => {
+                eprintln!(
+                    "[ck-quota] warning: synthetic vault credential.get failed ({handle_id}): {error:?}"
+                );
+                return FetchAttempt::unverified_vault_failure(error);
+            }
+        };
+        let record_version = credential.record_version;
+        let key = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(value) => value,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+
+        let result = JsonRequest::get(self.base())
+            .bearer(&key)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+            .map(|response| response.body)
+            .and_then(|body| normalize_usage(&body))
+            .map(|usage| ProviderUsage::healthy(PROVIDER_NAME, None, "vault", usage));
+        if let Err(error) = &result {
+            self.report_auth_failure(capability, record_version, error);
+        }
+        match result {
+            Ok(entry) => FetchAttempt::from_provider_usage(Ok(entry)),
+            Err(error) => FetchAttempt::failure(None, Some("vault".to_string()), error),
         }
     }
 }
@@ -582,18 +665,30 @@ impl UsageProvider for SyntheticProvider {
         PROVIDER_NAME
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        if self.credential_source.is_some() {
+            let vault = self.handle_loader.synthetic_handles()?;
+            if !vault.is_empty() {
+                // Vault-only custody once an apikey handle exists: a static API
+                // key carries no inline account identity, so keeping the local
+                // lane alongside a vault lane would force the emission gate to
+                // collapse both into one unlabelled row with an arbitrary
+                // winner. And the migration case is precisely that the key has
+                // LEFT the file and been replaced by a pointer, so there is no
+                // competing local value -- only garbage that produces a 401.
+                return Ok(vault);
+            }
+        }
+        Ok(vec![CredentialHandle::implicit()])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if let Some(capability) = handle.vault_capability() {
+            return self.fetch_vault(handle.stable_id(), capability).await;
+        }
         let result: Result<ProviderUsage, FetchError> = async {
             let api_key = resolve_api_key()?;
-            let base = env::first_env(BASE_URL_ENV).unwrap_or_else(|| DEFAULT_BASE.to_string());
-
-            let body = JsonRequest::get(base)
-                .bearer(&api_key)
-                .send(&self.http)
-                .await?;
-
-            let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            self.fetch_with_key(&api_key).await
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -930,5 +1025,194 @@ mod tests {
                 "{field} was not published"
             );
         }
+    }
+
+    use std::sync::Mutex;
+
+    use crate::credential_source::{VaultCredential, VaultGetError};
+
+    type Reports = Arc<Mutex<Vec<(u16, u64)>>>;
+
+    struct MockCredentialSource {
+        get_result: Result<VaultCredential, VaultGetError>,
+        reports: Reports,
+    }
+
+    #[async_trait]
+    impl CredentialSource for MockCredentialSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            assert_eq!(min_ttl_ms, 120_000);
+            self.get_result.clone()
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            provider_status: u16,
+            record_version: u64,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((provider_status, record_version));
+        }
+    }
+
+    fn source(
+        get_result: Result<VaultCredential, VaultGetError>,
+    ) -> (Arc<dyn CredentialSource>, Reports) {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(MockCredentialSource {
+                get_result,
+                reports: Arc::clone(&reports),
+            }),
+            reports,
+        )
+    }
+
+    fn credential(payload: &[u8], record_version: u64) -> VaultCredential {
+        VaultCredential {
+            payload: payload.to_vec(),
+            expires_at_ms: None,
+            record_version,
+            account_id: None,
+            email: None,
+            org_name: None,
+            project_id: None,
+        }
+    }
+
+    fn write_handles(body: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ck-quota-synthetic-handles-{}-{}.json",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).unwrap();
+        std::io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+        path
+    }
+
+    /// An `apikey:synthetic` handle routes to the synthetic provider.
+    #[test]
+    fn an_apikey_handle_routes_to_the_synthetic_provider() {
+        let path = write_handles(r#"{"handles":{"apikey:synthetic":"ckh_synthetic"}}"#);
+        let loader = crate::vault_handles::VaultHandleLoader::new(Some(path.clone()));
+        let handles = loader.synthetic_handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].stable_id(), "apikey:synthetic");
+        assert!(handles[0].vault_capability().is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Vault configured for the family: the local lane is absent.
+    #[test]
+    fn vault_handles_replace_the_implicit_local_lane() {
+        let path = write_handles(r#"{"handles":{"apikey:synthetic":"ckh_synthetic"}}"#);
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = SyntheticProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(handles[0].vault_capability().is_some());
+        assert_eq!(handles[0].stable_id(), "apikey:synthetic");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// No vault handle configured: the local lane is present.
+    #[test]
+    fn implicit_local_lane_survives_when_no_vault_handles_are_mapped() {
+        let path = write_handles(r#"{"handles":{"oauth:xai":"ckh_grok"}}"#);
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = SyntheticProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two handles for one api-key family are refused at load time.
+    #[test]
+    fn two_handles_for_one_apikey_family_are_refused() {
+        let path = write_handles(
+            r#"{"handles":{"apikey:synthetic":"ckh_a","apikey:synthetic:second":"ckh_b"}}"#,
+        );
+        let loader = crate::vault_handles::VaultHandleLoader::new(Some(path.clone()));
+        assert!(loader.synthetic_handles().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The vault lane serves the key and reports a 401 to the store.
+    #[tokio::test]
+    async fn vault_lane_serves_the_key_and_reports_a_401() {
+        let body = br#"{"rollingFiveHourLimit":{"used":20,"limit":100,"resetAt":"2026-06-22T15:00:00Z","window":"5hr"}}"#
+            .to_vec();
+        let (base, request) = crate::loopback::serve_once(200, body).await;
+        let (source, reports) = source(Ok(credential(b"synthetic-vault-key", 9)));
+        let mut provider = SyntheticProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        provider.base_url = Some(format!("{base}/v2/quotas"));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "apikey:synthetic",
+                VaultCapability::new("ckh_synthetic"),
+            ))
+            .await;
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt.usage.unwrap().primary.unwrap().used_percent,
+            20.0
+        );
+        assert!(request
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer synthetic-vault-key"));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// A 401 on the vault lane is reported to the credential store.
+    #[tokio::test]
+    async fn vault_401_reports_the_served_version() {
+        let (base, _) = crate::loopback::serve_once(401, Vec::new()).await;
+        let (source, reports) = source(Ok(credential(b"synthetic-vault-key", 44)));
+        let mut provider = SyntheticProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        provider.base_url = Some(format!("{base}/v2/quotas"));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "apikey:synthetic",
+                VaultCapability::new("ckh_synthetic"),
+            ))
+            .await;
+        assert!(matches!(attempt.usage, Err(FetchError::ProviderStatus(401))));
+        for _ in 0..20 {
+            if !reports.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
     }
 }
