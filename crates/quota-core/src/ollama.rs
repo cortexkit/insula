@@ -218,9 +218,38 @@ fn session_block_reports_weekly_limit(html: &str) -> bool {
 
 /// "Session usage" is the 5-hour window; "Hourly usage" is a distinct shorter
 /// window with no fixed length on the wire (CodexBar leaves it nil).
+///
+/// `Monthly usage` is here for a label we have NOT observed on this host. Upstream
+/// added it at v0.56.x as the primary label for accounts on monthly credits,
+/// keeping the two above "for older pages", and a probe of the live page found
+/// only the legacy pair — so this is a label the page can carry rather than one
+/// it does. `crates/quota-core/examples/ollama-labels.rs` is that probe; re-run
+/// it rather than re-deriving whether the page has moved.
+///
+/// LISTED ANYWAY, and the asymmetry is the whole reason. This provider is an HTML
+/// scrape, so a label we do not recognise is not an error — the block is simply
+/// not published, and an unpublished window reads downstream as capacity nobody
+/// is consuming. That is exactly the failure that took the fleet down on
+/// 2026-07-25. Recognising a label that never appears costs nothing; failing to
+/// recognise one that does costs a silent overstatement of headroom.
+///
+/// Its cadence is `None` rather than 30 days. Upstream stamps a month sentinel
+/// and resolves the real calendar month downstream from the reset date; we have
+/// never seen the block, so its length is not ours to state. The percent is
+/// load-bearing and publishes; the cadence is metadata and is omitted, which is
+/// the standing rule for every reset-optional window here.
+///
+/// BOUND WORTH KNOWING: [`window_for`] takes the FIRST label that yields a
+/// percent, so a page rendering both a session and a monthly block publishes only
+/// the session one. That is the honest reading of what is observable — upstream
+/// keeps the legacy labels "for older pages", which says the two are alternatives
+/// rather than siblings, and they are ALSO the tighter window when present. If a
+/// page ever carries both, this needs a second slot rather than a reordering, and
+/// the probe is what would show it.
 const SESSION_LABELS: &[(&str, Option<i64>)] = &[
     ("Session usage", Some(SESSION_WINDOW_MINUTES)),
     ("Hourly usage", None),
+    ("Monthly usage", None),
 ];
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
@@ -650,6 +679,65 @@ mod tests {
         assert_eq!(session.used_percent, 2.5);
         assert_eq!(session.window_minutes, None, "hourly has no fixed length");
         assert_eq!(usage.secondary.unwrap().window_minutes, Some(10080));
+    }
+
+    /// A page on monthly credits publishes its percent rather than nothing.
+    ///
+    /// SYNTHETIC FIXTURE, and deliberately labelled as one: this host's page
+    /// carries only the legacy `Session usage` / `Weekly usage` pair, verified by
+    /// `examples/ollama-labels.rs`, so the block below is built from upstream's
+    /// v0.56.x label rather than from an observed capture. The percent shape is
+    /// the page's own, which is what makes the fixture worth anything.
+    ///
+    /// The failure this defends is silent in the dangerous direction. An
+    /// unrecognised label is not an error here — the block is skipped, no window
+    /// is published, and a consumer reads absent capacity pressure as headroom.
+    /// So the assertion is that SOMETHING is published, not that its cadence is
+    /// known: `window_minutes` stays `None` because a month is upstream's
+    /// sentinel to resolve and not a length we have observed.
+    #[test]
+    fn a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence() {
+        let html = r#"
+          <span>Monthly usage</span><span>61.5% used</span>
+          <div data-time="2026-10-01T00:00:00Z">Resets in 28 days</div>
+        "#;
+        let usage = normalize_usage(html).expect("a monthly block is a usable page");
+        let monthly = usage
+            .primary
+            .expect("the monthly block must publish -- an unpublished window reads as headroom");
+        assert_eq!(monthly.used_percent, 61.5);
+        assert_eq!(
+            monthly.window_minutes, None,
+            "a month is upstream's sentinel to resolve, not a cadence we have observed"
+        );
+        assert_eq!(
+            monthly.resets_at.as_deref(),
+            Some("2026-10-01T00:00:00Z"),
+            "the reset is stated by the page, so it is carried"
+        );
+    }
+
+    /// The tighter legacy window still wins when a page carries both.
+    ///
+    /// Paired with the test above so the ORDER in `SESSION_LABELS` is load-bearing
+    /// rather than incidental: reversing it would publish a monthly percent while a
+    /// five-hour window was the binding constraint, which understates pressure on
+    /// the window that actually refuses requests.
+    #[test]
+    fn a_session_block_outranks_a_monthly_one_when_both_are_present() {
+        let html = r#"
+          <span>Session usage</span><span>88.0% used</span>
+          <div data-time="2026-09-03T04:00:00Z">Resets in 2 hours</div>
+          <span>Monthly usage</span><span>12.0% used</span>
+          <div data-time="2026-10-01T00:00:00Z">Resets in 28 days</div>
+        "#;
+        let usage = normalize_usage(html).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(
+            primary.used_percent, 88.0,
+            "the session block is the tighter window"
+        );
+        assert_eq!(primary.window_minutes, Some(SESSION_WINDOW_MINUTES));
     }
 
     #[test]

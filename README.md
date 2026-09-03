@@ -159,6 +159,16 @@ cargo run -p quota-core --example sweep-probe
 # pinning its account reconciliation against real producer output:
 cargo run -p quota-core --example completeness-envelopes
 
+# ask the live ollama settings page WHICH usage labels it renders. This provider
+# is an HTML scrape, so its parser names the page's own strings, and a label that
+# changes is silent in the dangerous direction: the block is skipped, no window
+# is published, and absent capacity pressure reads downstream as headroom. Run it
+# on any upstream parity round that touches ollama, rather than re-deriving
+# whether the page moved. Exits non-zero when the page carries a label this
+# module does not parse, and refuses when there is no cookie or the page is too
+# small to be the settings page:
+cargo run -p quota-core --example ollama-labels
+
 # run opencode's server-function calls one at a time, when its published error
 # says only that something returned 500. The provider makes three calls and any
 # of them can fail that way, so the entry alone cannot say which -- this reports
