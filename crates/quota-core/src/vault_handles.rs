@@ -676,6 +676,26 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
     // Two deposits for one such family would therefore collapse into one
     // unlabelled row with an arbitrary survivor, so reject only those families
     // while leaving unrelated vault lanes up.
+    //
+    // THE PREDICATE NAMES THE TWO PREFIXES THAT EXIST RATHER THAN THE PROPERTY IT
+    // MEANS, which is the part to fix if a third identity-less family is ever
+    // added: it would not be refused here, and the failure is silent -- two
+    // handles serve, one wins on ordering, and the wire shows a single unlabelled
+    // row that looks like a correctly deduplicated account.
+    //
+    // The honest predicate is "families whose providers resolve no account
+    // identity". It is not written that way because no such predicate exists:
+    // identity resolution is a property of what an upstream returns at fetch
+    // time, and nothing here can ask that question of a provider without
+    // fetching. Adding a declared `resolves_identity()` to `UsageProvider` would
+    // give it a home -- and would need a fence proving the declaration matches
+    // what each provider actually publishes, or it becomes a second list that
+    // disagrees with the first.
+    //
+    // Left as a prefix test deliberately: the shape above is more machinery than
+    // two string comparisons deserve while the population is two. Recorded here
+    // rather than in a review note so the third family arrives with the reasoning
+    // already in front of whoever adds it.
     let mut refused_families: Vec<(&str, Vec<String>)> = CREDENTIAL_FAMILIES
         .iter()
         .filter(|(prefix, _)| prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
