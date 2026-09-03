@@ -51,6 +51,13 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:ollama.com", "ollama"),
     ("cookie:opencode.ai", "opencode"),
     ("cookie:opencode.ai", "opencodego"),
+    // Static API keys, resolved from the environment or opencode's auth store.
+    // When the credential vault's migration tool moves such a key into custody
+    // it leaves a POINTER STRING in the file's `key` field, so these providers
+    // need a vault lane that serves the key the vault actually holds.
+    ("apikey:deepseek", "deepseek"),
+    ("apikey:synthetic", "synthetic"),
+    ("apikey:openrouter", "openrouter"),
 ];
 /// The `ck-quota` segment is a literal and is deliberately not derived from the
 /// binary or module name, both of which have since been renamed. Beside a binary
@@ -160,6 +167,9 @@ enum ProviderKind {
     Ollama,
     OpenCode,
     OpenCodeGo,
+    DeepSeek,
+    Synthetic,
+    OpenRouter,
 }
 
 #[derive(Clone, Default)]
@@ -179,6 +189,9 @@ struct ProviderHandleSnapshot {
     ollama: Vec<CredentialHandle>,
     opencode: Vec<CredentialHandle>,
     opencodego: Vec<CredentialHandle>,
+    deepseek: Vec<CredentialHandle>,
+    synthetic: Vec<CredentialHandle>,
+    openrouter: Vec<CredentialHandle>,
 }
 
 impl ProviderHandleSnapshot {
@@ -199,6 +212,9 @@ impl ProviderHandleSnapshot {
             ProviderKind::Ollama => &self.ollama,
             ProviderKind::OpenCode => &self.opencode,
             ProviderKind::OpenCodeGo => &self.opencodego,
+            ProviderKind::DeepSeek => &self.deepseek,
+            ProviderKind::Synthetic => &self.synthetic,
+            ProviderKind::OpenRouter => &self.openrouter,
         }
     }
 
@@ -219,6 +235,9 @@ impl ProviderHandleSnapshot {
             ProviderKind::Ollama => self.ollama.push(handle),
             ProviderKind::OpenCode => self.opencode.push(handle),
             ProviderKind::OpenCodeGo => self.opencodego.push(handle),
+            ProviderKind::DeepSeek => self.deepseek.push(handle),
+            ProviderKind::Synthetic => self.synthetic.push(handle),
+            ProviderKind::OpenRouter => self.openrouter.push(handle),
         }
     }
 }
@@ -306,6 +325,21 @@ impl VaultHandleLoader {
     }
     pub fn opencodego_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::OpenCodeGo)
+    }
+
+    /// Return the authoritative DeepSeek vault handle snapshot for this scheduler turn.
+    pub fn deepseek_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::DeepSeek)
+    }
+
+    /// Return the authoritative Synthetic vault handle snapshot for this scheduler turn.
+    pub fn synthetic_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Synthetic)
+    }
+
+    /// Return the authoritative OpenRouter vault handle snapshot for this scheduler turn.
+    pub fn openrouter_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::OpenRouter)
     }
 
     /// Deposits under one cookie family, by its bare credential id.
@@ -595,6 +629,9 @@ fn providers_for_id(id: &str) -> Vec<ProviderKind> {
             "ollama" => Some(ProviderKind::Ollama),
             "opencode" => Some(ProviderKind::OpenCode),
             "opencodego" => Some(ProviderKind::OpenCodeGo),
+            "deepseek" => Some(ProviderKind::DeepSeek),
+            "synthetic" => Some(ProviderKind::Synthetic),
+            "openrouter" => Some(ProviderKind::OpenRouter),
             _ => None,
         })
         .collect()
@@ -635,12 +672,13 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
     let mut entries: Vec<_> = handles.into_iter().collect();
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    // Cookie sessions deliberately have no account identity. Two deposits for one
-    // domain would therefore collapse into one unlabelled row with an arbitrary
-    // survivor, so reject only that family while leaving unrelated vault lanes up.
-    let mut refused_cookie_families: Vec<(&str, Vec<String>)> = CREDENTIAL_FAMILIES
+    // Cookie sessions and static API keys deliberately have no account identity.
+    // Two deposits for one such family would therefore collapse into one
+    // unlabelled row with an arbitrary survivor, so reject only those families
+    // while leaving unrelated vault lanes up.
+    let mut refused_families: Vec<(&str, Vec<String>)> = CREDENTIAL_FAMILIES
         .iter()
-        .filter(|(prefix, _)| prefix.starts_with("cookie:"))
+        .filter(|(prefix, _)| prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
         .filter_map(|(prefix, _)| {
             let ids: Vec<_> = entries
                 .iter()
@@ -650,8 +688,8 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             (ids.len() > 1).then_some((*prefix, ids))
         })
         .collect();
-    refused_cookie_families.dedup_by(|left, right| left.0 == right.0);
-    let refused_cookie_ids: HashSet<String> = refused_cookie_families
+    refused_families.dedup_by(|left, right| left.0 == right.0);
+    let refused_ids: HashSet<String> = refused_families
         .iter()
         .flat_map(|(_, ids)| ids.iter().cloned())
         .collect();
@@ -659,7 +697,7 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
     let mut unsupported = Vec::new();
     let mut by_capability: HashMap<String, Vec<(String, Vec<ProviderKind>)>> = HashMap::new();
     for (credential_id, capability) in entries {
-        if refused_cookie_ids.contains(&credential_id) {
+        if refused_ids.contains(&credential_id) {
             continue;
         }
         let providers = providers_for_id(&credential_id);
@@ -701,10 +739,15 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
             duplicate_groups.join("; ")
         ));
     }
-    for (family, mut ids) in refused_cookie_families {
+    for (family, mut ids) in refused_families {
         ids.sort();
+        let reason = if family.starts_with("cookie:") {
+            "a cookie session discloses no account"
+        } else {
+            "a static API key carries no inline account identity"
+        };
         warnings.push(format!(
-            "two vault handles name the cookie family `{family}` ({}) ; a cookie session discloses no account, so both would publish as one unlabelled row with an invisible winner -- keep the one whose account should be reported",
+            "two vault handles name the family `{family}` ({}) ; {reason}, so both would publish as one unlabelled row with an invisible winner -- keep the one whose account should be reported",
             ids.join(", ")
         ));
     }
@@ -936,6 +979,27 @@ mod tests {
         let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
         assert!(warning.contains("qwencloud.com"));
         assert!(warning.contains("whose account should be reported"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two handles for one api-key family are refused at load time.
+    ///
+    /// A static API key carries no inline account identity, so two handles for
+    /// one family would collapse into one unlabelled row with an arbitrary
+    /// winner. Refusing at configuration time with a stated reason beats serving
+    /// one of two credentials chosen by ordering.
+    #[test]
+    fn multiple_apikey_handles_are_refused_without_reaping_other_families() {
+        let path = write_file(
+            "apikey-conflict",
+            r#"{"handles":{"apikey:deepseek":"ckh_a","apikey:deepseek:second":"ckh_b","oauth:anthropic":"ckh_claude"}}"#,
+        );
+        let loader = VaultHandleLoader::new(Some(path.clone()));
+        assert!(loader.deepseek_handles().unwrap().is_empty());
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+        let warning = loader.state.lock().unwrap().last_warning.clone().unwrap();
+        assert!(warning.contains("apikey:deepseek"));
+        assert!(warning.contains("no inline account identity"));
         let _ = std::fs::remove_file(path);
     }
 
