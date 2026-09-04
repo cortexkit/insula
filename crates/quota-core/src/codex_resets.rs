@@ -1008,6 +1008,55 @@ impl ResetTransport for ReqwestResetTransport {
     }
 }
 
+/// Emits the reset heartbeat only when an account's rendered state changes.
+///
+/// The logger is process-local by design. A new process starts with no previous
+/// state, so its first observation is emitted for readers opening a fresh log.
+#[derive(Default)]
+pub(crate) struct ResetTickLogger {
+    previous_by_account: Mutex<HashMap<Option<String>, String>>,
+}
+
+impl ResetTickLogger {
+    pub(crate) fn emit(
+        &self,
+        account_id: Option<&str>,
+        facts: Option<&UsageFacts>,
+        credits: Option<&CreditsSnapshot>,
+        earliest_expiry: Option<DateTime<Utc>>,
+        armed: bool,
+        relax_eligible: bool,
+    ) -> bool {
+        let raw_percents = facts
+            .map(|facts| format!("{:?}", facts.raw_percents))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let credit_count = credits
+            .map(|credits| credits.available.len().to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        let earliest_expiry = earliest_expiry
+            .map(|expiry| expiry.to_rfc3339())
+            .unwrap_or_else(|| "none".to_string());
+        let content = format!(
+            "raw_percents={raw_percents} credit_count={credit_count} earliest_expiry={earliest_expiry} armed={armed} relax_eligible={relax_eligible}"
+        );
+        let key = account_id.map(str::to_owned);
+        let mut previous_by_account = self
+            .previous_by_account
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if previous_by_account
+            .get(&key)
+            .is_some_and(|previous| previous == &content)
+        {
+            return false;
+        }
+
+        eprintln!("{LOG_TAG} codex reset tick {content}");
+        previous_by_account.insert(key, content);
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResetTickInput {
     pub armed: bool,
@@ -1440,6 +1489,225 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    fn tick_credits(count: usize, expiry: DateTime<Utc>) -> CreditsSnapshot {
+        CreditsSnapshot {
+            available: (0..count)
+                .map(|index| ResetCredit {
+                    id: format!("credit-{index}"),
+                    expires_at: expiry,
+                })
+                .collect(),
+            reported_available_count: count as u64,
+            available_expiries: vec![expiry; count],
+        }
+    }
+
+    fn tick_facts(percent: f64) -> UsageFacts {
+        UsageFacts {
+            raw_percents: vec![percent],
+            any_used_floor: true,
+            at_wall: false,
+            wall_clear: true,
+        }
+    }
+
+    #[test]
+    fn identical_reset_ticks_emit_only_once() {
+        let logger = ResetTickLogger::default();
+        let now = Utc::now();
+        let facts = tick_facts(45.0);
+        let credits = tick_credits(2, now);
+
+        assert!(logger.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true,
+        ));
+        assert!(!logger.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn every_reset_tick_field_change_emits() {
+        let now = Utc::now();
+        let facts = tick_facts(45.0);
+        let changed_facts = tick_facts(46.0);
+        let credits = tick_credits(2, now);
+        let changed_credits = tick_credits(1, now);
+
+        {
+            let logger = ResetTickLogger::default();
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true
+            ));
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&changed_facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true,
+            ));
+        }
+        {
+            let logger = ResetTickLogger::default();
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true
+            ));
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&changed_credits),
+                Some(now),
+                true,
+                true,
+            ));
+        }
+        {
+            let logger = ResetTickLogger::default();
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true
+            ));
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now + chrono::Duration::seconds(1)),
+                true,
+                true,
+            ));
+        }
+        {
+            let logger = ResetTickLogger::default();
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true
+            ));
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                false,
+                true
+            ));
+        }
+        {
+            let logger = ResetTickLogger::default();
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                true
+            ));
+            assert!(logger.emit(
+                Some("account-a"),
+                Some(&facts),
+                Some(&credits),
+                Some(now),
+                true,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn identical_ticks_for_different_accounts_are_independent() {
+        let logger = ResetTickLogger::default();
+        let now = Utc::now();
+        let facts = tick_facts(45.0);
+        let credits = tick_credits(2, now);
+
+        assert!(logger.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
+        assert!(logger.emit(
+            Some("account-b"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
+        assert!(!logger.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
+        assert!(!logger.emit(
+            Some("account-b"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn first_reset_tick_after_restart_emits_again() {
+        let now = Utc::now();
+        let facts = tick_facts(45.0);
+        let credits = tick_credits(2, now);
+        let running_process = ResetTickLogger::default();
+        let restarted_process = ResetTickLogger::default();
+
+        assert!(running_process.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
+        assert!(restarted_process.emit(
+            Some("account-a"),
+            Some(&facts),
+            Some(&credits),
+            Some(now),
+            true,
+            true
+        ));
     }
 
     /// A pending record, the state whose loss costs money.

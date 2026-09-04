@@ -50,7 +50,7 @@ use serde::Deserialize;
 
 use crate::codex_resets::{
     normalize_credits, response_now, CreditsHttpResponse, CreditsSnapshot, ReqwestResetTransport,
-    ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, UsageFacts,
+    ResetCoordinator, ResetRequest, ResetTickInput, ResetTickLogger, ResetTransport, UsageFacts,
 };
 use crate::config::CodexConfig;
 use crate::credential_source::{CredentialSource, VaultCapability, VaultCredential};
@@ -670,27 +670,6 @@ fn reset_credentials_eligible(config: &CodexConfig, credentials: &CodexCredentia
             .is_some_and(|account_id| !account_id.trim().is_empty())
 }
 
-fn log_reset_tick(
-    facts: Option<&UsageFacts>,
-    credits: Option<&CreditsSnapshot>,
-    earliest_expiry: Option<chrono::DateTime<Utc>>,
-    armed: bool,
-    relax_eligible: bool,
-) {
-    let raw_percents = facts
-        .map(|facts| format!("{:?}", facts.raw_percents))
-        .unwrap_or_else(|| "unavailable".to_string());
-    let credit_count = credits
-        .map(|credits| credits.available.len().to_string())
-        .unwrap_or_else(|| "unavailable".to_string());
-    let earliest_expiry = earliest_expiry
-        .map(|expiry| expiry.to_rfc3339())
-        .unwrap_or_else(|| "none".to_string());
-    eprintln!(
-        "{LOG_TAG} codex reset tick raw_percents={raw_percents} credit_count={credit_count} earliest_expiry={earliest_expiry} armed={armed} relax_eligible={relax_eligible}"
-    );
-}
-
 /// The codex usage provider.
 pub struct CodexProvider {
     http: reqwest::Client,
@@ -700,6 +679,7 @@ pub struct CodexProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     codex_home_override: Option<PathBuf>,
+    reset_tick_logger: ResetTickLogger,
 }
 
 impl CodexProvider {
@@ -735,6 +715,7 @@ impl CodexProvider {
             credential_source,
             handle_loader,
             codex_home_override: None,
+            reset_tick_logger: ResetTickLogger::default(),
         }
     }
 
@@ -755,6 +736,7 @@ impl CodexProvider {
             credential_source,
             handle_loader: Arc::new(handle_loader),
             codex_home_override: Some(codex_home_override),
+            reset_tick_logger: ResetTickLogger::default(),
         }
     }
 
@@ -814,7 +796,8 @@ impl CodexProvider {
                 let facts = usage.as_ref().ok().map(|snapshot| {
                     UsageFacts::from_usage(&snapshot.usage, snapshot.limit_reached)
                 });
-                log_reset_tick(facts.as_ref(), None, None, false, false);
+                self.reset_tick_logger
+                    .emit(None, facts.as_ref(), None, None, false, false);
             }
             return match usage {
                 Ok(snapshot) => {
@@ -874,7 +857,14 @@ impl CodexProvider {
                 self.report_auth_failure(&context, &error);
                 let credits = credits_snapshot.as_ref().ok().map(|(credits, _)| credits);
                 let earliest_expiry = credits.and_then(CreditsSnapshot::earliest_available_expiry);
-                log_reset_tick(None, credits, earliest_expiry, false, false);
+                self.reset_tick_logger.emit(
+                    Some(account_id),
+                    None,
+                    credits,
+                    earliest_expiry,
+                    false,
+                    false,
+                );
                 return FetchAttempt::failure(observed, Some(source.to_string()), error);
             }
         };
@@ -885,7 +875,14 @@ impl CodexProvider {
                 eprintln!(
                     "{LOG_TAG} warning: codex credits GET failed account_id={account_id}: {error}; usage metadata unavailable"
                 );
-                log_reset_tick(Some(&facts), None, None, false, false);
+                self.reset_tick_logger.emit(
+                    Some(account_id),
+                    Some(&facts),
+                    None,
+                    None,
+                    false,
+                    false,
+                );
                 let account_info = context.account_info(usage_snapshot.plan_type.clone());
                 return usage_attempt(observed, source, usage_snapshot)
                     .with_account_info(account_info);
@@ -894,14 +891,22 @@ impl CodexProvider {
         let saved_resets = Some(credits.saved_resets());
         let account_info = context.account_info(usage_snapshot.plan_type.clone());
         let Some(earliest_expiry) = reset_trigger_expiry(&credits, now) else {
-            log_reset_tick(Some(&facts), Some(&credits), None, false, false);
+            self.reset_tick_logger.emit(
+                Some(account_id),
+                Some(&facts),
+                Some(&credits),
+                None,
+                false,
+                false,
+            );
             return usage_attempt(observed, source, usage_snapshot)
                 .with_account_info(account_info)
                 .with_saved_resets(saved_resets);
         };
 
         if !reset_eligible {
-            log_reset_tick(
+            self.reset_tick_logger.emit(
+                Some(account_id),
                 Some(&facts),
                 Some(&credits),
                 Some(earliest_expiry),
@@ -919,7 +924,8 @@ impl CodexProvider {
                 eprintln!(
                     "{LOG_TAG} warning: codex reset journal path unavailable: {error}; tick disarmed"
                 );
-                log_reset_tick(
+                self.reset_tick_logger.emit(
+                    Some(account_id),
                     Some(&facts),
                     Some(&credits),
                     Some(earliest_expiry),
@@ -946,7 +952,8 @@ impl CodexProvider {
                 &reset_request,
             )
             .await;
-        log_reset_tick(
+        self.reset_tick_logger.emit(
+            Some(account_id),
             Some(&facts),
             Some(&credits),
             Some(earliest_expiry),
@@ -1031,13 +1038,15 @@ impl UsageProvider for CodexProvider {
                     Ok(Ok(resolved)) => resolved,
                     Ok(Err(error)) => {
                         if self.reset_config.is_enabled() {
-                            log_reset_tick(None, None, None, false, false);
+                            self.reset_tick_logger
+                                .emit(None, None, None, None, false, false);
                         }
                         return FetchAttempt::failure(None, None, error);
                     }
                     Err(_) => {
                         if self.reset_config.is_enabled() {
-                            log_reset_tick(None, None, None, false, false);
+                            self.reset_tick_logger
+                                .emit(None, None, None, None, false, false);
                         }
                         return FetchAttempt::failure(
                             None,
