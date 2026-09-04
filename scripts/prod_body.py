@@ -16,11 +16,30 @@ away -- and a real gap in the same run is indistinguishable from that noise. The
 scan does not fail loudly; it produces exactly the sort of output a sweep is
 supposed to produce.
 
-So this cuts at the test MODULE (`#[cfg(test)] mod tests`), and reports how much
-of each file it read. The coverage line is the load-bearing half: an anchor fix
-alone is silent, and the next person to write an extractor gets no warning that
-theirs is wrong. A scan that says it read 5% of a file cannot be mistaken for
-one that read all of it.
+So this cuts at the test MODULE, and reports how much of each file it read. The
+coverage line is the load-bearing half: an anchor fix alone is silent, and the
+next person to write an extractor gets no warning that theirs is wrong. A scan
+that says it read 5% of a file cannot be mistaken for one that read all of it.
+
+THE ANCHOR SAID `mod tests` UNTIL 2026-09-04 AND THAT WAS THE SECOND HALF OF THE
+SAME BUG. Six test modules in this workspace are named something else --
+`stage_tests`, `wallet_tests`, `credit_pool_tests`, `plugin_lane_tests`,
+`pool_bound_tests`, `drop_counter_tests` -- so the anchor missed them and their
+contents were emitted as production. Measured: `opencode.rs` leaked 7 test
+attributes, `model.rs` 1.
+
+The two failures point OPPOSITE WAYS, which is why fixing one feels like finishing
+and is not. Anchoring on the attribute cuts EARLY and hides production; anchoring
+on `mod tests` fails to cut at all and admits tests as production. The first makes
+a sweep look clean, the second makes it report scaffolding -- and a reader who
+dismisses one false hit dismisses the true one beside it.
+
+SELF-CHECK THAT CATCHES BOTH IN ONE ASSERTION, and the reason it is here rather
+than in a comment: after stripping, the body must contain no `#[test]` or
+`#[tokio::test]`. Truncation leaves those downstream of the cut; a missed module
+leaves them in place. Neither mode is visible from the coverage percentage alone,
+which is what let this survive weeks of use while the docstring claimed the
+opposite.
 
     # every provider missing a call, with coverage printed to stderr
     ./scripts/prod_body.py --grep-missing report_auth_failure crates/quota-core/src/*.rs
@@ -36,10 +55,12 @@ import re
 import sys
 from pathlib import Path
 
-# `#[cfg(test)]`, any whitespace or comments, then `mod tests`. Anchoring on the
-# module rather than the attribute is the whole point: the attribute alone
-# appears on production items.
-TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+tests\b")
+# `#[cfg(test)]`, any whitespace or comments, then `mod <any identifier>`.
+# Anchoring on the module rather than the attribute is half the point: the
+# attribute alone appears on production items. Accepting ANY module name is the
+# other half -- six modules here are not called `tests`, and requiring that name
+# silently emitted their bodies as production.
+TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+\w+\s*\{")
 
 # `#[cfg(test)]` on something that is not a module: a test-only constructor
 # beside the real one, an injection hook, a helper accessor. These sit ABOVE the
@@ -94,9 +115,35 @@ def whole_file_is_test_only(path: pathlib.Path) -> str | None:
 
 
 def production_body(source: str) -> tuple[str, float]:
-    """Return the source up to the test module, and the fraction that is."""
-    match = TEST_MODULE.search(source)
-    body = source[: match.start()] if match else source
+    """Return the source with every test module removed, and the fraction kept.
+
+    REMOVES BLOCKS RATHER THAN CUTTING AT THE FIRST ONE, which is a third way to
+    get this wrong and the one that survives both obvious fixes. Eight files here
+    carry top-level items AFTER a test module -- `model.rs` defines
+    `pub fn windows_mut` there -- so cutting drops production code while reporting
+    the file as examined, which is the same silent under-read the attribute anchor
+    caused. Fixing the anchor and keeping the cut trades one direction for another
+    and feels like finishing.
+
+    Line-based rather than brace-matched deliberately: several files embed raw
+    strings full of JS and XML braces, so counting braces needs a lexer to be
+    correct and fails silently when it is not. A top-level module closes with `}`
+    at column zero, which rustfmt guarantees.
+    """
+    lines = source.split("\n")
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        window = "\n".join(lines[index : index + 4])
+        if TEST_MODULE.match(window):
+            index += 1
+            while index < len(lines) and lines[index] != "}":
+                index += 1
+            index += 1  # step past the closing brace
+            continue
+        kept.append(lines[index])
+        index += 1
+    body = "\n".join(kept)
     fraction = len(body) / len(source) if source else 1.0
     return body, fraction
 
