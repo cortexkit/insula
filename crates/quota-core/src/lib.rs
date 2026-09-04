@@ -71,9 +71,28 @@ pub mod zenmux;
 
 /// The one prefix used for every production stderr emission.
 ///
-/// Supervised modules share one log file, so the only consumer is a grep over
-/// that file and every line needs one stable tag. This drifted into two
-/// spellings because nothing reads a log tag to disagree with it.
+/// This drifted into two spellings -- 27 sites saying `[ck-quota]` and 2 saying
+/// `[insula]`, the majority naming a binary that had not existed since the
+/// rename -- because nothing reads a log tag to disagree with it.
+///
+/// NOT LOAD-BEARING FOR TOOLING, and the note it replaces said it was. When this
+/// was unified on 2026-09-04, supervised modules shared one log file and
+/// `ck module logs <id>` was expected to select on this string; the same day the
+/// daemon owner ruled the opposite, because two lanes disagreeing about what a
+/// module's output IS is the fault rather than the inconvenience. The supervisor
+/// already pipes each child's stderr, so it will own a per-module file and a line
+/// is attributed by the pipe it arrived on -- which cannot disagree with itself,
+/// where a tag can and did.
+///
+/// So the tag is now a courtesy to a human grepping the legacy shared file, and
+/// that is reason enough to keep it consistent: a tag naming a dead binary sends
+/// someone looking for output that is there under another name. It is NOT reason
+/// to build anything on it, and the id fence in `quota-module` exists to keep it
+/// honest rather than because a tool depends on it.
+///
+/// Recorded because the previous sentence here was true when written and false
+/// within the day, and a justification that quietly stops holding is how a rule
+/// outlives its reason.
 pub const LOG_TAG: &str = "[insula]";
 
 use std::collections::{HashMap, VecDeque};

@@ -1292,12 +1292,25 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
 
+    /// The stderr tag names this module, not a binary it used to be called.
+    ///
+    /// NOT BECAUSE A TOOL SELECTS ON IT. `ck module logs` attributes by the pipe a
+    /// line arrived on rather than by what the line says, which is the design that
+    /// makes a tag unable to lie. This fence exists for the human who greps the
+    /// legacy shared file by hand: a tag naming something the module is no longer
+    /// called sends them looking for output that is there under another name.
+    ///
+    /// That is exactly what happened here -- 27 of 29 emission sites said
+    /// `[ck-quota]` for weeks after the rename, and nothing failed, because a log
+    /// tag has no reader that can disagree with it. The id is the one string that
+    /// cannot drift silently, since the daemon registers under it.
     #[test]
     fn log_tag_matches_the_daemon_module_id() {
         let expected = format!("[{DEFAULT_MODULE_ID}]");
         assert_eq!(
             LOG_TAG, expected,
-            "stderr must carry the exact id operators use to select this module's logs"
+            "the stderr tag must name this module, or a hand grep of the shared log \
+             finds output under a name nobody would think to search for"
         );
     }
 
