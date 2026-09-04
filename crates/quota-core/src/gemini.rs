@@ -1292,7 +1292,8 @@ mod tests {
             // cached token, so the refresh is never reached and the 401 comes
             // from the quota call. The two stages are exactly what this
             // assertion now distinguishes.
-            Err(FetchError::Unauthorized(message)) if message == "quota: HTTP 401"
+            Err(FetchError::Unauthorized(message))
+                if message == "quota: HTTP 401 (no response body)"
         ));
         tokio::task::yield_now().await;
         assert!(reports.lock().unwrap().is_empty());

@@ -1007,7 +1007,7 @@ mod tests {
         let local = provider.fetch_local_bearer("kimi-coding-local-token").await;
         assert!(matches!(
             local.usage,
-            Err(FetchError::Unauthorized(message)) if message == "HTTP 401"
+            Err(FetchError::Unauthorized(message)) if message == "HTTP 401 (no response body)"
         ));
         tokio::task::yield_now().await;
         assert!(reports.lock().unwrap().is_empty());

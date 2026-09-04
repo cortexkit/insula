@@ -336,7 +336,44 @@ impl JsonRequest {
     pub async fn send_full(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
         let raw = self.send_raw(client).await?;
         if raw.status == 401 || raw.status == 403 {
-            return Err(FetchError::Unauthorized(format!("HTTP {}", raw.status)));
+            // EXCERPTED LIKE EVERY OTHER NON-2XX, which it was not until now, and
+            // the omission was exactly backwards. Every other refusal carried 200
+            // characters of the upstream's own words; the one class whose remedy is
+            // an OPERATOR ACTION carried `HTTP 403` and nothing else.
+            //
+            // A 403 is not reliably an auth verdict. Two live rows on this host say
+            // so: `gemini` answers `unauthorized: quota: HTTP 403` because Google
+            // sunset Code Assist for individual accounts, where re-authenticating
+            // cannot help, and upstream CodexBar hit the same shape from a different
+            // direction at v0.56.4 -- claude.ai returning 403 for a Cloudflare
+            // challenge, which they had to add a distinct class for because the
+            // remedy is a network change rather than a login.
+            //
+            // The class stays `Unauthorized` rather than growing a sibling. A
+            // challenge-versus-expiry predicate would be a guess about pages we have
+            // never observed, and the honest fix is to carry the evidence rather
+            // than to classify it: an operator reading a Cloudflare interstitial or
+            // Google's own sunset text in `ProviderUsage.error` can tell what
+            // happened, and no wire change is needed for them to do it.
+            //
+            // THIS EXTENDS THE UNREDACTED-EXCERPT REVIEW POINT BELOW TO 401/403
+            // BODIES. Refusal bodies are the likeliest place for a provider to echo
+            // the rejected credential back, so the obligation stated there -- check
+            // what a new provider's non-2xx bodies contain -- now covers the auth
+            // statuses too, and matters more there.
+            let excerpt: String = String::from_utf8_lossy(&raw.body)
+                .chars()
+                .take(200)
+                .collect();
+            let detail = if excerpt.trim().is_empty() {
+                // An empty refusal body is a FACT worth stating rather than a blank
+                // to hide: it tells a reader the upstream said nothing, which is
+                // different from nobody having looked.
+                format!("HTTP {} (no response body)", raw.status)
+            } else {
+                format!("HTTP {}: {excerpt}", raw.status)
+            };
+            return Err(FetchError::Unauthorized(detail));
         }
         if !(200..300).contains(&raw.status) {
             // THE EXCERPT IS UNREDACTED BY CONSTRUCTION, and it reaches the wire
@@ -639,6 +676,73 @@ mod tests {
         assert!(
             matches!(result, Err(FetchError::Decode(_))),
             "expected Decode, got {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// A refusal carries the upstream's own words, not just its number.
+    ///
+    /// 401/403 used to be the ONE non-2xx class stripped of its body, which was
+    /// exactly backwards: every status whose remedy is "wait" carried 200
+    /// characters of explanation, and the status whose remedy is an OPERATOR
+    /// ACTION carried `HTTP 403`.
+    ///
+    /// A 403 is not reliably an auth verdict, and both known counterexamples cost
+    /// someone real time. `gemini` answers 403 on this host because Google sunset
+    /// Code Assist for individual accounts -- re-authenticating cannot fix it --
+    /// and upstream CodexBar found claude.ai answering 403 for a Cloudflare
+    /// challenge, where the remedy is a network change. Neither is distinguishable
+    /// from an expired session by the status alone, and the wire published nothing
+    /// else.
+    ///
+    /// The class deliberately stays `Unauthorized`: a challenge-versus-expiry
+    /// predicate would be a guess about pages nobody here has observed, and
+    /// carrying the evidence lets a reader decide without one.
+    #[tokio::test]
+    async fn an_auth_refusal_carries_its_body_so_a_challenge_is_distinguishable() {
+        let body = b"<html><title>Just a moment...</title>cf-challenge</html>".to_vec();
+        let (url, server) = serve_fixed(403, body).await;
+
+        let error = JsonRequest::get(url)
+            .send(&reqwest::Client::new())
+            .await
+            .unwrap_err();
+
+        match error {
+            FetchError::Unauthorized(message) => {
+                assert!(
+                    message.contains("cf-challenge"),
+                    "the upstream's own words are what separate a challenge from an \
+                     expired session; got {message:?}"
+                );
+                assert!(
+                    message.contains("HTTP 403"),
+                    "the status is still stated: got {message:?}"
+                );
+            }
+            other => panic!("a 403 must stay an auth refusal, not become {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    /// An empty refusal body says so rather than reading as unexamined.
+    ///
+    /// The pair to the test above, and the reason the message is not just a bare
+    /// status: "the upstream sent nothing" and "nobody looked" are different facts,
+    /// and a reader who has learned that a 403 usually explains itself needs to see
+    /// which one this was.
+    #[tokio::test]
+    async fn an_empty_auth_refusal_states_that_the_body_was_empty() {
+        let (url, server) = serve_fixed(401, Vec::new()).await;
+
+        let error = JsonRequest::get(url)
+            .send(&reqwest::Client::new())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, FetchError::Unauthorized(m) if m == "HTTP 401 (no response body)"),
+            "an absent body is a stated fact, not a blank: got {error:?}"
         );
         server.await.unwrap();
     }
