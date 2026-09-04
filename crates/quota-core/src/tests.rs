@@ -247,11 +247,7 @@ fn no_provider_builds_its_own_http_client() {
         let source = std::fs::read_to_string(&path).expect("a readable source file");
         // Production only: a bare client inside a provider's own test module is
         // fine, and counting it would push authors toward weakening this test.
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let production = production_body(&source).to_string();
         examined += 1;
         if production.contains("reqwest::Client::new()") {
             offenders.push(name);
@@ -271,46 +267,180 @@ fn no_provider_builds_its_own_http_client() {
     );
 }
 
+/// The parts of a source file that ship, with every test module removed.
+///
+/// EVERY SOURCE WALK HERE USED `split("#[cfg(test)]")` AND EVERY ONE OF THEM WAS
+/// READING A TRUNCATED FILE. That attribute appears on production items too --
+/// a `thread_local!` used only under test, a constructor like `new_for_test`, a
+/// helper gated for one platform -- so splitting on it stops at the FIRST such
+/// item rather than at a test module. Measured across both crates on 2026-09-04,
+/// ten files were cut short:
+///
+///   lib.rs           saw   1.9% of its production body
+///   refresh.rs       saw  26.9%
+///   vault_client.rs  saw  60.7%   -- and hid 3 of its stderr emissions
+///   codex.rs         saw  66.5%   -- and hid 2 more
+///
+/// So a fence over "every production module" was examining 23 of 29 emission
+/// sites and reporting a clean pass. The failure is silent in the direction that
+/// matters: a walk that sees less finds fewer offenders and looks healthier.
+///
+/// REMOVING BLOCKS RATHER THAN CUTTING AT THE FIRST ONE, which is the second
+/// defect and the less obvious one. Six files name their test module something
+/// other than `tests` (`stage_tests`, `wallet_tests`, `credit_pool_tests`), and
+/// eight carry top-level items AFTER their first test module -- `model.rs` puts
+/// `pub fn windows_mut` there, which a cut-at-the-first rule would drop while
+/// claiming to examine the file. Cutting trades one blind spot for another.
+///
+/// Line-based rather than brace-matched ON PURPOSE: several files embed raw
+/// strings full of JS and XML braces, so counting braces would need a lexer to be
+/// correct and would fail silently when it was not. A top-level module's closing
+/// brace is `}` at column zero, which rustfmt guarantees and no embedded literal
+/// in this workspace produces. `the_production_boundary_removes_test_modules`
+/// pins that this leaks no test code.
+///
+/// `scripts/prod_body.py` has cut correctly for weeks. The rule existed in the
+/// tooling and not in the tests, which is why five checks here shared one defect.
+fn production_body(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        let opens_test_module = lines[index].trim_end() == "#[cfg(test)]"
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'));
+        if opens_test_module {
+            index += 2;
+            while index < lines.len() && lines[index] != "}" {
+                index += 1;
+            }
+            // Step past the closing brace. An unterminated module (only possible
+            // in a file that does not compile) consumes the rest, which is the
+            // safe direction: it cannot admit test code as production.
+            index += 1;
+            continue;
+        }
+        kept.push(lines[index]);
+        index += 1;
+    }
+
+    kept.join("\n")
+}
+
+/// The boundary helper removes test modules and keeps everything else.
+///
+/// Pinned against REAL FILES rather than synthetic strings, because both defects
+/// this replaces were invisible on synthetic ones: a fixture with a single
+/// `#[cfg(test)] mod tests` at the end passes under the naive split, the
+/// cut-at-first rule, and this one. Only files carrying an early attribute on a
+/// production item, or production code after a test module, separate them.
+///
+/// Three properties, and each corresponds to a way this has been got wrong:
+/// it must see far more than the naive split (the truncation defect), it must
+/// keep a production item that sits after a test module (the cutting defect),
+/// and it must leak no test code (the reason a cheap rule is tempting at all).
+#[test]
+fn the_production_boundary_removes_test_modules() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let refresh = std::fs::read_to_string(src.join("refresh.rs")).expect("refresh.rs is readable");
+    let naive = refresh.split("#[cfg(test)]").next().unwrap_or_default();
+    let real = production_body(&refresh);
+    assert!(
+        real.len() > naive.len() * 2,
+        "refresh.rs carries #[cfg(test)] on a production item, so the naive split \
+         sees dramatically less: naive {} bytes, real {} bytes",
+        naive.len(),
+        real.len()
+    );
+
+    // model.rs defines `windows_mut` AFTER its first test module. A rule that
+    // cuts rather than removes drops it while reporting the file as examined.
+    let model = std::fs::read_to_string(src.join("model.rs")).expect("model.rs is readable");
+    assert!(
+        production_body(&model).contains("pub fn windows_mut"),
+        "a production item after a test module must survive"
+    );
+
+    // And nothing test-shaped may survive anywhere, or a walk would flag test
+    // scaffolding as a production violation and push authors to weaken it.
+    for entry in std::fs::read_dir(&src).expect("the source directory is readable") {
+        let path = entry.expect("a readable entry").path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        // tests.rs is this file: top-level test functions with no module wrapper,
+        // and every walk skips it by name for that reason.
+        if path.file_name().is_some_and(|name| name == "tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let production = production_body(&source);
+        assert!(
+            !production.contains("#[test]") && !production.contains("#[tokio::test]"),
+            "test code leaked into the production body of {}",
+            path.display()
+        );
+    }
+}
+
 /// Every production stderr tag must come from the shared crate constant.
 ///
 /// Supervised modules write to one shared log, so a literal prefix in a new
 /// emission would make that line invisible to a reader selecting this module.
 /// Test-only diagnostics are excluded because they do not reach a supervised
 /// process and may intentionally describe test scaffolding.
+///
+/// BOTH CRATES, and the second one is why this is not just the obvious walk.
+/// `quota-core` holds 23 of the emission sites and `quota-module` holds 6 --
+/// including the startup line an operator sees first. A walk rooted at this
+/// crate's `CARGO_MANIFEST_DIR` covers only its own, so a literal reintroduced in
+/// the module crate would pass a fence that reports itself as covering "every
+/// production module". The sibling path is relative because the two crates are
+/// fixed in one workspace; if that stops being true this fails loudly on a
+/// missing directory rather than silently examining fewer files.
 #[test]
 fn production_stderr_emissions_do_not_hard_code_ck_tags() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../quota-module/src")
+        .canonicalize()
+        .expect("the sibling module crate must be present in this workspace");
     let mut offenders = Vec::new();
     let mut examined = 0usize;
 
-    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
-        let path = entry.expect("a readable directory entry").path();
-        if path.extension().is_none_or(|extension| extension != "rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if name == "tests.rs" {
-            continue;
-        }
-
-        let source = std::fs::read_to_string(&path).expect("a readable source file");
-        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
-        examined += 1;
-        let mut remainder = production;
-        while let Some(start) = remainder.find("eprintln!(") {
-            let invocation = &remainder[start..];
-            let Some(end) = invocation.find(");") else {
-                break;
-            };
-            if invocation[..end].contains("[ck-") {
-                offenders.push(name.clone());
-                break;
+    for dir in [core, module] {
+        for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
             }
-            remainder = &invocation[end + 2..];
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if name == "tests.rs" {
+                continue;
+            }
+
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            let production = production_body(&source);
+            examined += 1;
+            let mut remainder = production.as_str();
+            while let Some(start) = remainder.find("eprintln!(") {
+                let invocation = &remainder[start..];
+                let Some(end) = invocation.find(");") else {
+                    break;
+                };
+                if invocation[..end].contains("[ck-") {
+                    offenders.push(name.clone());
+                    break;
+                }
+                remainder = &invocation[end + 2..];
+            }
         }
     }
 
@@ -318,9 +448,11 @@ fn production_stderr_emissions_do_not_hard_code_ck_tags() {
         offenders.is_empty(),
         "production stderr emissions must use LOG_TAG, not hard-coded prefixes: {offenders:?}"
     );
+    // Floor covers BOTH crates, so a walk that silently lost one of them fails
+    // here rather than reporting a clean pass over half the population.
     assert!(
-        examined > 50,
-        "expected to examine every production module; examined only {examined}"
+        examined > 55,
+        "expected to examine both crates' production modules; examined only {examined}"
     );
 }
 
