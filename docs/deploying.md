@@ -120,6 +120,33 @@ binaries an integration test spawns. A stale `ck-insula` fails registration with
 no error output at all, which reads as a hang rather than a build problem. Build
 the bins before running the e2e suites.
 
+### Absorbing a lock wave: do NOT reach for a hash comparison here
+
+This is the step where the retired pinned-stamp check gets reinvented, and it was
+reinvented HERE on 2026-09-04 by the author of the section that retires it -- see
+"The pinned-stamp hash comparison is BROKEN" below, which already names every
+reason it cannot work AND already says not to substitute the lock digest.
+
+The pull is specific to this step. A wave notice says "no code change", the
+question "then does my binary change?" is exactly the right one to ask, and a
+hash comparison looks like the way to answer it. It is not: two embedded stamps
+move on their own. `CK_QUOTA_PROVENANCE_SHA` differs between a dirty tree and a
+clean one -- and swapping `Cargo.lock` to compare makes one build dirty and the
+other clean, so the two arms differ by construction before any dependency is
+considered. `build_lock_digest` is sha256 of `Cargo.lock`, so it differs whenever
+the lock differs, which is the premise of the comparison.
+
+SO A LOCK BUMP ALWAYS CHANGES THE BINARY, trivially and by construction, and that
+fact carries no information about whether behaviour changed.
+
+The question a lock wave actually poses is whether anything that SHIPS moved:
+
+    cargo tree -p quota-module -e normal | grep <crate>   # zero edges = it does not ship
+    git diff <deployed>..HEAD -- crates/                  # did our own runtime code move
+
+A dev-only bump with zero normal edges warrants a deploy for stamp currency, not
+for behaviour -- and saying which is the whole point.
+
 
 ## Do not kill the process
 
