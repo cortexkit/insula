@@ -28,7 +28,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.56.3** (37 providers registered; verified
+**Current parity: CodexBar v0.56.4** (37 providers registered; verified
 2026-09-03). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
@@ -264,6 +264,45 @@ endpoint: the account state is real and currently invisible, and only the
 *surface* is missing.
 
 ### v0.55.0 -> v0.55.1 (checked 2026-08-26)
+
+### Round: v0.56.3 -> v0.56.4 (2026-09-03) — a correction to us, not a port
+
+Constants first, all five PRESENT, same 2/4/4/2/1 distribution as the previous
+round. 13 provider files changed; only one carried any signal.
+
+**The finding is upstream's, the defect was ours.** `ClaudeWebAPIFetcher` split its
+403 handling: a Cloudflare challenge now maps to a distinct class whose message
+says re-authenticating will not help and to change network or switch to OAuth.
+That endpoint is the claude.ai web path, which this module does not use, so there
+is nothing to port.
+
+What it exposed here is that **401/403 was the one non-2xx class we stripped of its
+response body**. Every status whose remedy is "wait" carried a 200-character
+excerpt; the status whose remedy is an operator action carried `HTTP 403` alone.
+
+Two live rows on this host made it concrete, and the fix paid on the first deploy:
+
+```
+before  gemini  unauthorized: quota: HTTP 403
+        qoder   unauthorized: HTTP 401
+
+after   gemini  ... 403: "You do not have a valid license of this product.
+                          Please contact your administrator"      <- entitlement
+        qoder   ... 401: {"errorMessage":"User not authenticated"} <- real expiry
+```
+
+Same class, opposite remedies, and until now indistinguishable on the wire. The
+gemini sunset was recorded only in a doc comment that no consumer can read.
+
+We did NOT mint a challenge class. A challenge-versus-expiry predicate would be a
+guess about pages nobody here has observed; carrying the evidence lets a reader
+decide without one. Cost recorded at the site: the unredacted-excerpt review point
+now extends to 401/403 bodies, which are the likeliest place for a provider to
+echo a rejected credential back.
+
+**Declined: everything else.** `CodexAccountReconciliation` (+85) and the
+Antigravity SQLite/proto readers (+114) are the local-statistics family already
+declined on axis — consumption, not capacity. Zero signal lines between them.
 
 ### Round: v0.56.0 -> v0.56.3 (2026-09-03) — one port, measured before porting
 
