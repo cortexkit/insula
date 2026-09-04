@@ -260,14 +260,32 @@ impl Default for QoderProvider {
 ///   cna     7 other domains        isg     4 other domains
 ///   tfstk   6 other domains        xlly_s  2 other domains
 ///
-/// Two names in the same jar were NOT admitted, and the reason is the point:
-/// `_c_WBKFRo` and `_nb_ioWEgULi` appear on qoder.com and nowhere else. They
-/// have tracker-shaped randomised suffixes, but this test cannot separate a
-/// per-site tracker from a session cookie, so they stay off. They are also why
-/// this list does not change Qoder's verdict today -- the jar still holds
-/// unattributable cookies, the guard still declines to fire, and the upstream
-/// still decides. Recorded so the next reader does not re-run the same probe.
-const TRACKING_ONLY_COOKIES: &[&str] = &["cna", "isg", "tfstk", "xlly_s"];
+/// Two names in the same jar were NOT admitted on that evidence, and one of them
+/// has since been admitted on DIFFERENT evidence, which is the more useful half
+/// of this note. `_c_WBKFRo` and `_nb_ioWEgULi` appear on qoder.com and nowhere
+/// else, so the cross-domain test cannot separate a per-site tracker from a
+/// session cookie and both stayed off.
+///
+/// THE SECOND ADMISSION ROUTE (2026-09-04), and it is not a measurement I could
+/// have taken. The operator stated they have never logged in to Qoder, while this
+/// browser holds `_c_WBKFRo` for qoder.com. A cookie that exists on a host with no
+/// login is set WITHOUT one, so its presence is not evidence of a session -- and
+/// that is a fact about the cookie, established by an observation the code cannot
+/// make about itself. `_nb_ioWEgULi` stays off: it is absent from this browser
+/// entirely, so the same statement says nothing about it.
+///
+/// This is what made Qoder publish `credential_rejected` on a host that never
+/// configured it: three shared trackers plus one unattributable cookie meant the
+/// guard declined, the jar was sent, and the upstream answered 401 -- which reads
+/// as "your login expired", pointing an operator at a login they never had.
+///
+/// RESIDUAL RISK, stated rather than argued away: a site may set a cookie name
+/// before login and fill it with a session value after. If Qoder does that with
+/// this name, a signed-in jar consisting ONLY of these four would now report as
+/// unconfigured. That requires a login to set no other cookie at all, which no
+/// session mechanism does -- and the guard needs EVERY cookie to be listed, so a
+/// single additional cookie puts the jar back in play.
+const TRACKING_ONLY_COOKIES: &[&str] = &["_c_WBKFRo", "cna", "isg", "tfstk", "xlly_s"];
 
 /// Whether every cookie present is one that proves nothing.
 ///
@@ -393,17 +411,39 @@ mod tests {
         ])));
     }
 
-    /// A qoder-only cookie keeps the jar in play, which is why the real jar
-    /// still reaches the upstream.
+    /// The jar this browser actually holds reports an absent credential.
     ///
-    /// THE CONTROL FOR THE TEST ABOVE, and the reason this provider still
-    /// reports a rejected credential rather than an absent one. `_c_WBKFRo` and
-    /// `_nb_ioWEgULi` sit in the live jar and appear on no other domain, so the
-    /// shared-name test cannot tell a per-site tracker from a session. Without
-    /// this case, widening the list until the guard fired would look like
-    /// progress -- and would report a signed-in account as never configured.
+    /// LIVE-OBSERVED FIXTURE, 2026-09-04: `.qoder.com` carries exactly these four
+    /// cookies on a host whose operator has never logged in to Qoder. Before
+    /// `_c_WBKFRo` was admitted, this jar was sent to the upstream, answered 401,
+    /// and published `credential_rejected` -- telling an operator their login had
+    /// expired when they had never had one.
+    ///
+    /// The two classes are not interchangeable: `credential_absent` puts the
+    /// provider in the unconfigured bucket where nobody is asked to act, while
+    /// `credential_rejected` asks for a repair. Getting this backwards is cheap to
+    /// do and expensive to read.
     #[test]
-    fn a_cookie_seen_only_on_this_domain_is_not_assumed_to_be_tracking() {
+    fn the_live_jar_on_a_host_that_never_logged_in_reports_absent() {
+        assert!(jar_is_tracking_only(&jar_of(&[
+            "_c_WBKFRo",
+            "cna",
+            "isg",
+            "tfstk"
+        ])));
+    }
+
+    /// A cookie seen only on this domain and never observed without a login stays
+    /// off the list.
+    ///
+    /// THE CONTROL, and the reason the list did not simply widen until the guard
+    /// fired. `_nb_ioWEgULi` has the same qoder-only shape `_c_WBKFRo` has, and is
+    /// NOT admitted, because the evidence that admitted the other one -- observed
+    /// present on a host with no login -- does not exist for this name. Widening on
+    /// resemblance would look like progress and would report a signed-in account as
+    /// never configured.
+    #[test]
+    fn a_cookie_with_no_evidence_behind_it_keeps_the_jar_in_play() {
         assert!(!jar_is_tracking_only(&jar_of(&[
             "cna",
             "isg",
