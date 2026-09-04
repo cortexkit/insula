@@ -919,7 +919,54 @@ impl Registry {
         };
         for (key, slot, capability) in eligible {
             let next = match source.status(&capability).await {
-                Ok(status) => refresh::apply_credential_status(&slot, &status, now),
+                Ok(status) => {
+                    let applied = refresh::apply_credential_status(&slot, &status, now);
+                    // ANNOUNCED ONLY WHEN THE BACKOFF ACTUALLY ENDS, which is what
+                    // makes this an event rather than the heartbeat that was removed
+                    // from the reset tick: a poll that changes nothing says nothing.
+                    //
+                    // Without it this mechanism is unwitnessable from here. The
+                    // filer of insula#16 measured a recovery at 183s against a
+                    // 360s baseline, and could only attribute it by reading the
+                    // VAULT's audit chain -- from this module's own output the
+                    // accelerated fetch is indistinguishable from a coincidence,
+                    // because the only trace is a fetch happening earlier than a
+                    // reader can prove it should have.
+                    //
+                    // The discarded figure is the load-bearing one. It is the
+                    // difference between what the flat 300s floor would have cost
+                    // and what this slot actually waited, so a reader can tell a
+                    // working accelerator from one that fires and saves nothing.
+                    //
+                    // NOT DEFENDED BY A TEST, stated because a log line is the
+                    // exact thing that drifts unnoticed -- 27 of 29 sites in this
+                    // module carried a stale tag for weeks for want of a reader.
+                    // The CONDITION is defended: it is `next_due_at` moving, which
+                    // `apply_credential_status`'s own tests pin in both directions.
+                    // The message CONTENT is not, and the check that would catch a
+                    // wrong field is the next observed rotation.
+                    if applied.next_due_at != slot.next_due_at {
+                        let discarded = slot.next_due_at.saturating_duration_since(now);
+                        let previous = slot
+                            .observation
+                            .as_ref()
+                            .and_then(|observed| observed.record_version);
+                        eprintln!(
+                            "{LOG_TAG} {} vault record replaced, backoff cleared: {} \
+                             record_version {:?} -> {:?}, discarded {:.1}s of backoff",
+                            key.provider,
+                            // Formatting a handle exposes the credential id only.
+                            // The capability is a secret and is redacted by its own
+                            // Debug/Display, which is why this line can name the
+                            // lane at all.
+                            key.handle,
+                            previous,
+                            status.record_version,
+                            discarded.as_secs_f64()
+                        );
+                    }
+                    applied
+                }
                 Err(_) => refresh::slot_after_status_error(&slot, now),
             };
             let mut store = self
