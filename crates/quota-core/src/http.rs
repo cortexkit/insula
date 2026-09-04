@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use crate::provider::FetchError;
+use crate::LOG_TAG;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -433,7 +434,7 @@ impl JsonRequest {
         if !(200..300).contains(&status) {
             if read_error_body_prefix(response).await.is_err() {
                 eprintln!(
-                    "[ck-quota] warning: {provider} rejected-response body was incomplete status={status}"
+                    "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
                 );
             }
             return Err(FetchError::ProviderStatus(status));

@@ -18,6 +18,7 @@ use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
 use crate::provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider};
 use crate::vault_handles::VaultHandleLoader;
+use crate::LOG_TAG;
 
 const PROVIDER_NAME: &str = "openrouter";
 const CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
@@ -221,7 +222,7 @@ impl OpenRouterProvider {
             Ok(credential) => credential,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: openrouter vault credential.get failed ({handle_id}): {error:?}"
+                    "{LOG_TAG} warning: openrouter vault credential.get failed ({handle_id}): {error:?}"
                 );
                 return FetchAttempt::unverified_vault_failure(error);
             }

@@ -22,6 +22,7 @@ use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::http::{Header, JsonRequest};
 use crate::model::{CreditExpiry, SavedResets, Usage};
 use crate::provider::FetchError;
+use crate::LOG_TAG;
 
 pub const CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
 pub const CONSUME_PATH: &str = "/wham/rate-limit-reset-credits/consume";
@@ -455,7 +456,7 @@ impl RedemptionJournal {
             // than deleting it: this is the downgrade-then-upgrade case, and its
             // records may not all be in the new file.
             eprintln!(
-                "[insula] codex reset journal: {} also exists and was NOT adopted, because {} already holds records",
+                "{LOG_TAG} codex reset journal: {} also exists and was NOT adopted, because {} already holds records",
                 legacy.display(),
                 self.path.display()
             );
@@ -494,7 +495,7 @@ impl RedemptionJournal {
             ))
         })?;
         eprintln!(
-            "[insula] codex reset journal: adopted {} record(s) from {}",
+            "{LOG_TAG} codex reset journal: adopted {} record(s) from {}",
             carried.len(),
             legacy.display()
         );
@@ -504,7 +505,7 @@ impl RedemptionJournal {
     fn probe_atomic_write(&self) -> Result<(), JournalError> {
         let records = self.load()?;
         eprintln!(
-            "[ck-quota] codex reset journal: {} ({} record(s))",
+            "{LOG_TAG} codex reset journal: {} ({} record(s))",
             self.path.display(),
             records.len()
         );
@@ -530,7 +531,7 @@ impl RedemptionJournal {
             let latest = parse_record_latest_time(record)?;
             if now.signed_duration_since(latest).num_seconds() > PENDING_OLD_AFTER_SECS {
                 eprintln!(
-                    "[ck-quota] codex reset journal pending-old account_id={} redeem_request_id={} attempt_count={}",
+                    "{LOG_TAG} codex reset journal pending-old account_id={} redeem_request_id={} attempt_count={}",
                     account_id, record.redeem_request_id, record.attempt_count
                 );
             }
@@ -592,7 +593,7 @@ impl RedemptionJournal {
         });
         self.save(&records)?;
         eprintln!(
-            "[ck-quota] codex reset journal reserve account_id={account_id} redeem_request_id={id}"
+            "{LOG_TAG} codex reset journal reserve account_id={account_id} redeem_request_id={id}"
         );
         Ok(Reservation::New(id))
     }
@@ -622,7 +623,7 @@ impl RedemptionJournal {
         let attempt_count = record.attempt_count;
         self.save(&records)?;
         eprintln!(
-            "[ck-quota] codex reset journal attempt account_id={account_id} redeem_request_id={redeem_request_id} attempt_count={attempt_count}"
+            "{LOG_TAG} codex reset journal attempt account_id={account_id} redeem_request_id={redeem_request_id} attempt_count={attempt_count}"
         );
         Ok(())
     }
@@ -650,7 +651,7 @@ impl RedemptionJournal {
         record.outcome = Some(outcome);
         self.save(&records)?;
         eprintln!(
-            "[ck-quota] codex reset journal resolve account_id={account_id} redeem_request_id={redeem_request_id} outcome={}",
+            "{LOG_TAG} codex reset journal resolve account_id={account_id} redeem_request_id={redeem_request_id} outcome={}",
             outcome.as_code()
         );
         Ok(())
@@ -1177,7 +1178,7 @@ impl ResetCoordinator {
                 Ok(state) => state,
                 Err(error) => {
                     eprintln!(
-                    "[ck-quota] warning: codex reset journal unavailable for account_id={account_id}: {error}; tick disarmed"
+                    "{LOG_TAG} warning: codex reset journal unavailable for account_id={account_id}: {error}; tick disarmed"
                 );
                     return ResetTickResult::disarmed(&input);
                 }
@@ -1229,7 +1230,7 @@ impl ResetCoordinator {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     eprintln!(
-                    "[ck-quota] warning: codex reset reserve failed for account_id={account_id}: {error}; tick disarmed"
+                    "{LOG_TAG} warning: codex reset reserve failed for account_id={account_id}: {error}; tick disarmed"
                 );
                     return ResetTickResult::disarmed(&input);
                 }
@@ -1275,7 +1276,7 @@ impl ResetCoordinator {
                 };
                 if let Err(error) = attempt_recorded {
                     eprintln!(
-                        "[ck-quota] warning: codex reset attempt record failed for account_id={account_id}: {error}; tick disarmed"
+                        "{LOG_TAG} warning: codex reset attempt record failed for account_id={account_id}: {error}; tick disarmed"
                     );
                     return ResetTickResult::disarmed(&input);
                 }
@@ -1300,7 +1301,7 @@ impl ResetCoordinator {
                 Ok(outcome) => Some(outcome),
                 Err(error) => {
                     eprintln!(
-                        "[ck-quota] warning: codex reset response invalid account_id={account_id} redeem_request_id={request_id}: {error}"
+                        "{LOG_TAG} warning: codex reset response invalid account_id={account_id} redeem_request_id={request_id}: {error}"
                     );
                     None
                 }
@@ -1308,13 +1309,13 @@ impl ResetCoordinator {
             Ok(Err(error)) => {
                 request.report_auth_failure(&error);
                 eprintln!(
-                    "[ck-quota] warning: codex reset POST failed account_id={account_id} redeem_request_id={request_id}: {error}"
+                    "{LOG_TAG} warning: codex reset POST failed account_id={account_id} redeem_request_id={request_id}: {error}"
                 );
                 None
             }
             Err(_) => {
                 eprintln!(
-                    "[ck-quota] warning: codex reset POST timed out account_id={account_id} redeem_request_id={request_id}"
+                    "{LOG_TAG} warning: codex reset POST timed out account_id={account_id} redeem_request_id={request_id}"
                 );
                 None
             }
@@ -1335,7 +1336,7 @@ impl ResetCoordinator {
                 if let Err(error) = self.journal.resolve(account_id, &request_id, outcome) {
                     journal_ok = false;
                     eprintln!(
-                        "[ck-quota] warning: codex reset resolve failed account_id={account_id} redeem_request_id={request_id}: {error}; tick disarmed"
+                        "{LOG_TAG} warning: codex reset resolve failed account_id={account_id} redeem_request_id={request_id}: {error}; tick disarmed"
                     );
                 } else {
                     pending = false;

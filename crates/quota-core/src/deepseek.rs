@@ -23,6 +23,7 @@ use crate::model::{Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
 use crate::provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider};
 use crate::vault_handles::VaultHandleLoader;
+use crate::LOG_TAG;
 
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 const ENV_KEYS: &[&str] = &["DEEPSEEK_API_KEY", "DEEPSEEK_TOKEN"];
@@ -240,7 +241,7 @@ impl DeepSeekProvider {
             Ok(credential) => credential,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: deepseek vault credential.get failed ({handle_id}): {error:?}"
+                    "{LOG_TAG} warning: deepseek vault credential.get failed ({handle_id}): {error:?}"
                 );
                 return FetchAttempt::unverified_vault_failure(error);
             }

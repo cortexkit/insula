@@ -62,6 +62,7 @@ use crate::{
     http::{Header, JsonRequest},
     model::{AccountInfo, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
+    LOG_TAG,
 };
 
 pub const PROVIDER_NAME: &str = "codex";
@@ -686,7 +687,7 @@ fn log_reset_tick(
         .map(|expiry| expiry.to_rfc3339())
         .unwrap_or_else(|| "none".to_string());
     eprintln!(
-        "[ck-quota] codex reset tick raw_percents={raw_percents} credit_count={credit_count} earliest_expiry={earliest_expiry} armed={armed} relax_eligible={relax_eligible}"
+        "{LOG_TAG} codex reset tick raw_percents={raw_percents} credit_count={credit_count} earliest_expiry={earliest_expiry} armed={armed} relax_eligible={relax_eligible}"
     );
 }
 
@@ -882,7 +883,7 @@ impl CodexProvider {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: codex credits GET failed account_id={account_id}: {error}; usage metadata unavailable"
+                    "{LOG_TAG} warning: codex credits GET failed account_id={account_id}: {error}; usage metadata unavailable"
                 );
                 log_reset_tick(Some(&facts), None, None, false, false);
                 let account_info = context.account_info(usage_snapshot.plan_type.clone());
@@ -916,7 +917,7 @@ impl CodexProvider {
             Ok(coordinator) => coordinator,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: codex reset journal path unavailable: {error}; tick disarmed"
+                    "{LOG_TAG} warning: codex reset journal path unavailable: {error}; tick disarmed"
                 );
                 log_reset_tick(
                     Some(&facts),

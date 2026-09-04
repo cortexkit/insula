@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
 use crate::vault_handles::VaultHandleLoader;
+use crate::LOG_TAG;
 use crate::{
     env,
     http::JsonRequest,
@@ -569,7 +570,7 @@ impl SyntheticProvider {
             Ok(credential) => credential,
             Err(error) => {
                 eprintln!(
-                    "[ck-quota] warning: synthetic vault credential.get failed ({handle_id}): {error:?}"
+                    "{LOG_TAG} warning: synthetic vault credential.get failed ({handle_id}): {error:?}"
                 );
                 return FetchAttempt::unverified_vault_failure(error);
             }

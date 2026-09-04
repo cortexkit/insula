@@ -69,6 +69,13 @@ pub mod wire_sanity;
 pub mod zai;
 pub mod zenmux;
 
+/// The one prefix used for every production stderr emission.
+///
+/// Supervised modules share one log file, so the only consumer is a grep over
+/// that file and every line needs one stable tag. This drifted into two
+/// spellings because nothing reads a log tag to disagree with it.
+pub const LOG_TAG: &str = "[insula]";
+
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};

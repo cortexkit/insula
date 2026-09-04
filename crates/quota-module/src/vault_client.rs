@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use quota_core::credential_source::{
     CredentialSource, CredentialStatus, VaultCapability, VaultCredential, VaultGetError,
 };
+use quota_core::LOG_TAG;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{Flags, Frame, FrameType, Priority};
@@ -972,7 +973,7 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
         // this warning the id is printed nowhere in this process.
         Some(code @ ("unknown_channel" | codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
             eprintln!(
-                "[ck-quota] warning: daemon answered {code:?} for module id \
+                "{LOG_TAG} warning: daemon answered {code:?} for module id \
                  {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
             );
             ClientFailure::RouteGone
@@ -1019,7 +1020,7 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
                     // match has not been taught, which in practice means the
                     // daemon grew a code since this was written.
                     eprintln!(
-                        "[ck-quota] warning: unclassified control error code {:?} from the \
+                        "{LOG_TAG} warning: unclassified control error code {:?} from the \
                          daemon -- retrying next tick and serving the cached window. If \
                          this condition is permanent it will repeat forever while the wire \
                          reads healthy; give it an arm in classify_error_frame.",
@@ -1249,7 +1250,7 @@ impl CredentialSource for VaultClient {
         }
         .await;
         if let Err(error) = result {
-            eprintln!("[ck-quota] warning: vault auth-failure report failed class={error:?}");
+            eprintln!("{LOG_TAG} warning: vault auth-failure report failed class={error:?}");
         }
     }
 

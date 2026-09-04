@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::credential_source::{CredentialSource, VaultCapability};
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
+use crate::LOG_TAG;
 use crate::{
     http::{Header, JsonRequest},
     model::{RateWindow, Usage},
@@ -298,7 +299,7 @@ impl AnthropicProvider {
                 // "unverified", so without this the cause (dead handle vs transient
                 // vs fail-closed timeout) is invisible when a lane goes dark.
                 eprintln!(
-                    "[ck-quota] warning: anthropic vault credential.get failed ({handle_id}): {error:?}"
+                    "{LOG_TAG} warning: anthropic vault credential.get failed ({handle_id}): {error:?}"
                 );
                 return FetchAttempt::unverified_vault_failure(error);
             }

@@ -271,6 +271,59 @@ fn no_provider_builds_its_own_http_client() {
     );
 }
 
+/// Every production stderr tag must come from the shared crate constant.
+///
+/// Supervised modules write to one shared log, so a literal prefix in a new
+/// emission would make that line invisible to a reader selecting this module.
+/// Test-only diagnostics are excluded because they do not reach a supervised
+/// process and may intentionally describe test scaffolding.
+#[test]
+fn production_stderr_emissions_do_not_hard_code_ck_tags() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name == "tests.rs" {
+            continue;
+        }
+
+        let source = std::fs::read_to_string(&path).expect("a readable source file");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        examined += 1;
+        let mut remainder = production;
+        while let Some(start) = remainder.find("eprintln!(") {
+            let invocation = &remainder[start..];
+            let Some(end) = invocation.find(");") else {
+                break;
+            };
+            if invocation[..end].contains("[ck-") {
+                offenders.push(name.clone());
+                break;
+            }
+            remainder = &invocation[end + 2..];
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "production stderr emissions must use LOG_TAG, not hard-coded prefixes: {offenders:?}"
+    );
+    assert!(
+        examined > 50,
+        "expected to examine every production module; examined only {examined}"
+    );
+}
+
 /// No cookie provider reports an auth failure to the vault.
 ///
 /// Reporting marks a credential stale so the NEXT get buys a refresh, and

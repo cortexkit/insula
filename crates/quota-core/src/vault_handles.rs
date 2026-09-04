@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::credential_source::VaultCapability;
 use crate::provider::{CredentialHandle, HandlesError};
+use crate::LOG_TAG;
 
 pub const HANDLES_PATH_ENV: &str = "CK_QUOTA_VAULT_HANDLES_PATH";
 
@@ -417,7 +418,7 @@ impl VaultHandleLoader {
             return;
         }
         if let Some(message) = warning.as_deref() {
-            eprintln!("[ck-quota] warning: vault handles {message}");
+            eprintln!("{LOG_TAG} warning: vault handles {message}");
         }
         state.last_warning = warning;
     }

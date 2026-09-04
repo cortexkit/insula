@@ -30,7 +30,7 @@ use std::{
     time::Instant,
 };
 
-use quota_core::{config::QuotaConfig, credential_source::CredentialSource, Registry};
+use quota_core::{config::QuotaConfig, credential_source::CredentialSource, Registry, LOG_TAG};
 use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
@@ -143,7 +143,7 @@ async fn main() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
     let quota_config = load_quota_config();
     eprintln!(
-        "[ck-quota] codex banked resets armed={} auto_use_resets={}s (startup-only; arm one host per account)",
+        "{LOG_TAG} codex banked resets armed={} auto_use_resets={}s (startup-only; arm one host per account)",
         quota_config.codex.is_enabled(),
         quota_config.codex.auto_use_resets
     );
@@ -225,7 +225,7 @@ fn load_quota_config_file(path: &std::path::Path) -> QuotaConfig {
         Ok(config) => config,
         Err(error) => {
             eprintln!(
-                "[ck-quota] warning: {} unavailable or malformed ({error}); codex banked resets default OFF",
+                "{LOG_TAG} warning: {} unavailable or malformed ({error}); codex banked resets default OFF",
                 path.display()
             );
             QuotaConfig::default()
@@ -236,7 +236,7 @@ fn load_quota_config_file(path: &std::path::Path) -> QuotaConfig {
 fn load_quota_config() -> QuotaConfig {
     let Some(path) = quota_config_path() else {
         eprintln!(
-            "[ck-quota] warning: cannot resolve the quota config path; codex banked resets default OFF"
+            "{LOG_TAG} warning: cannot resolve the quota config path; codex banked resets default OFF"
         );
         return QuotaConfig::default();
     };
@@ -1291,6 +1291,15 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn log_tag_matches_the_daemon_module_id() {
+        let expected = format!("[{DEFAULT_MODULE_ID}]");
+        assert_eq!(
+            LOG_TAG, expected,
+            "stderr must carry the exact id operators use to select this module's logs"
+        );
+    }
 
     /// The manifest states provenance, and states ONLY what it can source.
     ///
