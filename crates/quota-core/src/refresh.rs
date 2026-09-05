@@ -24,6 +24,20 @@ use crate::provider::{
 /// would grow beyond this value.
 ///
 /// See [`FRESH_HORIZON`] for the relationship that must hold between them.
+///
+/// A CHANGE HERE MOVES A CONSUMER'S ALARM, which is not visible from this file.
+/// The credential-status poll runs at this cadence, so a lane recovering from a
+/// non-transient failure comes back at `2 x BASE_INTERVAL + execution`: one
+/// interval for the failing fetch to fall due, one for the poll that clears the
+/// backoff. That floor was measured to the millisecond across seven live
+/// rotations on a consumer's host (insula#16) and is now the low edge of their
+/// out-of-band alarm.
+///
+/// So halving this would put every healthy recovery under their floor and read as
+/// a scheduling defect on their side, with nothing in either repository
+/// connecting the two. Their standing rule is that a reading below the floor
+/// means this constant changed rather than that scheduling broke -- which is
+/// correct, and only works if someone tells them. Say so in the same commit.
 pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
 /// A served window is `fresh` while its last success is within this horizon.
 ///
