@@ -130,6 +130,25 @@ pub struct HttpResponse {
     pub status: u16,
     headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The URL that finally answered, after any redirects.
+    ///
+    /// CARRIED BECAUSE REDIRECTS ARE FOLLOWED SILENTLY, and for a page-scraping
+    /// provider that turns a moved login into a parse failure. A dead browser
+    /// session gets 303'd to an auth host, the client follows it, and a perfectly
+    /// valid sign-in page arrives with a 200 -- so the body is well-formed, the
+    /// labels are missing, and the honest-looking verdict is `decode_failed`,
+    /// which accuses this repository of a parser bug when the remedy is for a
+    /// human to sign in again.
+    ///
+    /// That is not hypothetical: ollama moved its sign-in to `signin.ollama.com`
+    /// and this module published `decode error: no usage windows in settings
+    /// HTML` on a host whose only problem was an expired cookie (2026-09-05).
+    ///
+    /// IN-BAND, which is what makes it worth a field rather than a heuristic. The
+    /// destination rides the same response as the body, so the two cannot
+    /// disagree, and no markup grammar can be fooled by a page that happens to
+    /// mention signing in. Every cookie-scrape provider has this hazard.
+    pub final_url: String,
 }
 
 impl HttpResponse {
@@ -431,6 +450,7 @@ impl JsonRequest {
 
         let response = builder.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
+        let final_url = response.url().to_string();
         if !(200..300).contains(&status) {
             if read_error_body_prefix(response).await.is_err() {
                 eprintln!(
@@ -454,6 +474,7 @@ impl JsonRequest {
             status,
             headers,
             body,
+            final_url,
         };
         // Applied here as well as in `send_full`: this helper builds its own
         // response rather than routing through that one, so a rule added there
@@ -487,6 +508,7 @@ impl JsonRequest {
 
         let response = builder.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
+        let final_url = response.url().to_string();
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
@@ -502,6 +524,7 @@ impl JsonRequest {
             status,
             headers,
             body,
+            final_url,
         })
     }
 }
@@ -842,6 +865,7 @@ mod tests {
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
+            final_url: String::new(),
         };
 
         let error = response
@@ -860,6 +884,7 @@ mod tests {
             status: 200,
             headers: Vec::new(),
             body: b"{}".to_vec(),
+            final_url: String::new(),
         };
         assert_eq!(ok.body_for_parsing().unwrap(), b"{}");
     }
@@ -876,6 +901,7 @@ mod tests {
             status: 503,
             headers: Vec::new(),
             body: Vec::new(),
+            final_url: String::new(),
         };
 
         assert_eq!(response.body_for_parsing().unwrap(), b"");

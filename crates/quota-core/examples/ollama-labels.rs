@@ -56,19 +56,23 @@ async fn main() {
     // forbids a bare client covers provider modules, which is where those
     // invariants must hold.
     let client = quota_core::http::provider_client();
+    let final_url;
     let html = match client
         .get(SETTINGS_URL)
         .header("Cookie", jar.header())
         .send()
         .await
     {
-        Ok(response) => match response.text().await {
-            Ok(body) => body,
-            Err(error) => {
-                eprintln!("  cannot check: body unreadable ({error})");
-                std::process::exit(2);
+        Ok(response) => {
+            final_url = response.url().to_string();
+            match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    eprintln!("  cannot check: body unreadable ({error})");
+                    std::process::exit(2);
+                }
             }
-        },
+        }
         Err(error) => {
             // Printed without the URL, matching the production rule: a reqwest
             // error's Display appends the request URL, and this one carries no
@@ -80,6 +84,16 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    // WHICH PAGE ANSWERED, not just how big it was. reqwest follows redirects by
+    // default, so a moved settings page is fetched, parsed and reported against
+    // silently -- and "the labels changed" and "the page moved" are different
+    // findings with different fixes. The anonymous fetch of this URL answers 303
+    // today, which is what made the question worth printing.
+    println!("  final url: {final_url}");
+    if final_url != SETTINGS_URL {
+        println!("  NOTE: redirected -- the labels below are from that page, not {SETTINGS_URL}");
+    }
 
     // A refused or redirected page parses as "no labels present", which would
     // read exactly like a page that dropped them all. Bound that before
@@ -109,8 +123,69 @@ async fn main() {
         println!("      {:<16} {}", heading, mark(html.contains(heading)));
     }
 
+    // RECOGNISING NOTHING IS A FINDING, and this probe reported "findings: none"
+    // for it until 2026-09-05. The original rule only asked whether the page
+    // carried a label we IGNORE, so a page carrying none of our labels at all --
+    // the total-drift case this tool exists to catch -- rendered identically to a
+    // healthy page. It printed a clean verdict on the morning ollama went dark.
+    //
+    // The two states are opposite and the distinction cannot come from the label
+    // list: "no labels I ignore" and "no labels at all" are the same emptiness
+    // counted differently. So the denominator is checked explicitly.
+    let recognised = OUR_LABELS.iter().filter(|l| html.contains(**l)).count();
+    if recognised == 0 {
+        eprintln!("  FINDING: the page carries NONE of the labels this module parses.");
+        eprintln!("  That is total drift, not a healthy page -- every window this");
+        eprintln!("  provider publishes comes from one of them, so the fetch fails");
+        eprintln!("  with `no usage windows in settings HTML`.");
+        let candidates = candidate_labels(&html);
+        if candidates.is_empty() {
+            // NO USAGE-SHAPED TEXT AT ALL is a different diagnosis from a renamed
+            // label, and it is the one that says re-anchoring cannot work. A page
+            // that renders its numbers client-side carries none of them in the
+            // HTML, so no label list can reach them -- the lane needs whatever
+            // endpoint the browser calls, not a better string.
+            // NO USAGE-SHAPED TEXT AT ALL has two causes with opposite remedies,
+            // and the page's OTHER furniture is what separates them. A settings
+            // page still carrying its own controls is a real page whose usage
+            // section is gone -- an account with no cloud plan, which is
+            // `no_quota_reported` and nothing to fix here. A page carrying none of
+            // its furniture either is a client-rendered shell, where the numbers
+            // are fetched by script and no label list can ever reach them.
+            //
+            // Printed as a table rather than a verdict because this probe cannot
+            // adjudicate: it reports which shape the page has and lets a reader
+            // conclude. Guessing here would produce a confident wrong diagnosis in
+            // exactly the case where the two remedies differ most.
+            eprintln!("  and NO usage-shaped text at all, which is not a rename.");
+            eprintln!("  page furniture, which separates a shell from a plan-less account:");
+            for marker in [
+                "Settings",
+                "Sign out",
+                "API keys",
+                "Upgrade",
+                "Subscription",
+                "__NEXT_DATA__",
+            ] {
+                eprintln!("      {:<16} {}", marker, mark(html.contains(marker)));
+            }
+            eprintln!("  script tags: {}", html.matches("<script").count());
+            eprintln!("  '% used' occurrences: {}", html.matches("% used").count());
+        } else {
+            eprintln!("  Candidate labels on the page, for re-anchoring:");
+            for candidate in candidates {
+                eprintln!("      {candidate}");
+            }
+        }
+        std::process::exit(1);
+    }
+
     if dropped.is_empty() {
-        println!("  findings: none -- the page carries no label this module ignores");
+        println!(
+            "  findings: none -- {recognised} of {} labels present, and the page",
+            OUR_LABELS.len()
+        );
+        println!("  carries no label this module ignores");
         return;
     }
     println!(
@@ -118,6 +193,34 @@ async fn main() {
          so that window is not published at all"
     );
     std::process::exit(1);
+}
+
+/// Short usage-shaped strings on the page, for re-anchoring after a drift.
+///
+/// Deliberately crude: any text node containing "usage" or "limit", bounded to
+/// something label-sized. This exists so the probe ANSWERS the question it just
+/// raised rather than sending a reader to open the page by hand -- which is the
+/// step where account identifiers get pasted into a terminal.
+///
+/// Bounded to 60 characters and deduplicated, because an unbounded dump of a
+/// 117 KB page is not a report.
+fn candidate_labels(html: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for chunk in html.split('>') {
+        let text = chunk.split('<').next().unwrap_or_default().trim();
+        if text.is_empty() || text.len() > 60 {
+            continue;
+        }
+        let lower = text.to_lowercase();
+        if !(lower.contains("usage") || lower.contains("limit")) {
+            continue;
+        }
+        let owned = text.to_string();
+        if !seen.contains(&owned) {
+            seen.push(owned);
+        }
+    }
+    seen
 }
 
 fn mark(present: bool) -> &'static str {

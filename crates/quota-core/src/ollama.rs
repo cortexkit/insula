@@ -158,6 +158,29 @@ fn parse_reset(block: &str) -> Option<String> {
     }
 }
 
+/// The host part of a URL, for reporting where a redirect landed.
+///
+/// String-sliced rather than parsed because the only consumer is an error
+/// message: a malformed URL yields `None` and the caller says "another host",
+/// which is still true and still actionable.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let host = after_scheme.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Whether the settings request was answered by somewhere else entirely.
+///
+/// An empty final URL is NOT a redirect. It means no transport recorded one --
+/// every test fixture constructs a response that way -- and treating absence as
+/// evidence would report every unit test's page as a sign-in redirect.
+fn redirected_off_settings(final_url: &str) -> bool {
+    match (host_of(final_url), host_of(SETTINGS_URL)) {
+        (Some(actual), Some(expected)) => actual != expected,
+        _ => false,
+    }
+}
+
 /// Heuristic: the settings page was replaced by a sign-in page (dead cookie).
 fn looks_signed_out(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
@@ -376,10 +399,41 @@ impl UsageProvider for OllamaProvider {
                     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 ))
                 .header(Header::new("Referer", SETTINGS_URL))
-                .send(&self.http)
+                .send_full(&self.http)
                 .await?;
 
-            let html = String::from_utf8_lossy(&html_bytes);
+            // WHERE THE RESPONSE CAME FROM, CHECKED BEFORE WHAT IT SAYS.
+            //
+            // A dead browser session is 303'd to an auth host and the client
+            // follows it, so a valid sign-in page arrives with a 200 and a
+            // well-formed body that simply has no usage labels in it. Parsing
+            // first turns that into `decode_failed` -- a verdict accusing THIS
+            // REPOSITORY of a parser bug, when the remedy is for a human to sign
+            // in again. That is what this provider published on 2026-09-05 after
+            // ollama moved its sign-in to `signin.ollama.com`.
+            //
+            // The destination is in-band: it rides the same response as the body,
+            // so the two cannot disagree. `looks_signed_out` below is a markup
+            // heuristic over the body and stays as the fallback for a login served
+            // WITHOUT a redirect -- but it could not see this one, because the new
+            // page carries no `<form>` and no `/auth/signin` route.
+            //
+            // Host comparison rather than prefix matching: a redirect to any host
+            // that is not the one we asked is a redirect away from the settings
+            // page, and enumerating auth hostnames would need updating every time
+            // an upstream changes identity provider -- which is the event this
+            // exists to survive.
+            if redirected_off_settings(&html_bytes.final_url) {
+                return Err(FetchError::Unauthorized(format!(
+                    "ollama session expired (settings redirected to {})",
+                    // Host only. The full URL carries an authorization session id
+                    // and a client id, which are per-attempt but still identifiers
+                    // this module has no reason to publish.
+                    host_of(&html_bytes.final_url).unwrap_or_else(|| "another host".to_string())
+                )));
+            }
+
+            let html = String::from_utf8_lossy(&html_bytes.body);
             let usage = normalize_usage(&html)?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
@@ -429,6 +483,53 @@ mod tests {
         assert_eq!(weekly.used_percent, 30.8);
         assert_eq!(weekly.resets_at.as_deref(), Some("2026-06-29T00:00:00Z"));
         assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    /// A redirect off the settings host is an expired session, not a parse bug.
+    ///
+    /// THE DEFECT THIS PINS COST A LIVE PROVIDER. On 2026-09-05 ollama moved its
+    /// sign-in to `signin.ollama.com`; a dead cookie was 303'd there, the client
+    /// followed it, and a 117 KB sign-in page arrived with a 200. The body was
+    /// well-formed and carried no usage labels, so this module published
+    /// `decode error: no usage windows in settings HTML` -- which accuses this
+    /// repository of a parser bug when the remedy is to sign in again.
+    ///
+    /// `looks_signed_out` could not catch it: the new page has no `<form>` and no
+    /// `/auth/signin` route, so every conjunct of that heuristic was false ON A
+    /// SIGN-IN PAGE. The redirect is the signal that cannot be fooled by markup.
+    #[test]
+    fn a_redirect_off_the_settings_host_is_an_expired_session() {
+        assert!(redirected_off_settings(
+            "https://signin.ollama.com/?client_id=abc&authorization_session_id=def"
+        ));
+        assert_eq!(
+            host_of("https://signin.ollama.com/?client_id=abc"),
+            Some("signin.ollama.com".to_string()),
+            "the message names the host and never the session identifiers"
+        );
+    }
+
+    /// The settings host itself, and an unrecorded URL, are not redirects.
+    ///
+    /// THE CONTROL, and the empty case is the one that matters: every fixture in
+    /// this file constructs a response with no final URL, so treating absence as a
+    /// redirect would make every parser test report a sign-in page. A guard that
+    /// fires on missing evidence is worse than no guard -- it would take a healthy
+    /// provider dark the moment a transport stopped recording the URL.
+    #[test]
+    fn the_settings_host_and_an_absent_url_are_not_redirects() {
+        assert!(!redirected_off_settings("https://ollama.com/settings"));
+        assert!(!redirected_off_settings(
+            "https://ollama.com/settings?tab=usage"
+        ));
+        assert!(
+            !redirected_off_settings(""),
+            "an unrecorded URL is not evidence of a redirect"
+        );
+        assert!(
+            !redirected_off_settings("not a url"),
+            "an unparseable URL is not evidence of a redirect"
+        );
     }
 
     #[test]
