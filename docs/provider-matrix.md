@@ -28,8 +28,8 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-**Current parity: CodexBar v0.56.4** (37 providers registered; verified
-2026-09-03). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
+**Current parity: CodexBar v0.56.6** (37 providers registered; verified
+2026-09-05). The v0.49.3 round is a NULL: the entire provider delta from v0.49.2
 is one line in `AzureOpenAIUsageFetcher`, raising a validation probe's
 `max_completion_tokens` from 1 to 64 and naming the constant. AzureOpenAI is
 excluded here as a validation probe with no usage payload, so nothing to port. CodexBar is a moving upstream; parity is re-checked whenever it
@@ -303,6 +303,45 @@ echo a rejected credential back.
 **Declined: everything else.** `CodexAccountReconciliation` (+85) and the
 Antigravity SQLite/proto readers (+114) are the local-statistics family already
 declined on axis — consumption, not capacity. Zero signal lines between them.
+
+### Round: v0.56.4 -> v0.56.6 (2026-09-05) — null, with one item promoted to a named unblock
+
+All five opaque constants PRESENT at v0.56.6, values read from our source with
+`grep -A 1` and grepped against the tagged tree. Distribution 2/4/4/2/1 files,
+unchanged across the last three rounds — the stability of that shape is itself
+part of the check, since an all-or-nothing result means a broken instrument
+rather than a release.
+
+Twelve provider files changed. Ranked by signal, only four scored above zero and
+none was a window-mapping change.
+
+**Declined: `CodexExtraUsageCost` (123 new lines, the round's largest addition).**
+Models Team/Business monthly credit caps as `codexCreditLimit { limit, used }`.
+Declined ON LANE rather than on detail: the field is populated from
+`OpenAIDashboardModels`, an authorized WEB DASHBOARD surface, and this module
+reads the programmatic `wham/usage` endpoint. Our own unread-field sweep over the
+codex credits object found `unlimited` as the only unread member, which is
+evidence the API payload carries no equivalent cap. Same standing shape as the
+grok web-billing decline.
+
+**Declined: `KiloUsageFetcher` (4/4).** Read whole: the Kilo CLI's login command
+became `kilo auth login`, changing four remediation strings. Checked our side --
+`kilo.rs` quotes no CLI command in any error, so there is nothing here to go
+stale. A genuine null rather than an unexamined one, and worth recording because
+the defect it WOULD have caused (telling an operator to run a command that no
+longer exists) is the ollama class: a correct-looking message sending someone to
+the wrong remedy.
+
+**Declined: `KimiProviderDescriptor` (78/37).** No window-mapping, percent, reset
+or limit lines added; presentation only.
+
+**Promoted to a named unblock: Kiro.** `KiroStatusProbe` gained a real usage
+snapshot -- `usedPercent`, `resetsAt`, a credits percent. The matrix has carried
+Kiro as "not implemented here" since the original survey, and this is the first
+round where it publishes a window rather than a status. It stays unbuilt because
+its source is a `kiro-cli` stdout parse and the CLI is not installed on this host
+(`~/.kiro/settings` exists; no binary). UNBLOCK: one captured `kiro-cli` usage
+output, the same shape as the Bailian item below.
 
 ### Round: v0.56.0 -> v0.56.3 (2026-09-03) — one port, measured before porting
 
