@@ -249,10 +249,32 @@ pub fn provider_client() -> reqwest::Client {
         .build()
         // A builder failure means the TLS backend could not initialise, which no
         // provider can do anything about. Falling back keeps the process serving
-        // rather than turning every lane into a startup panic -- it loses the
-        // pool bound, and a bounded outage that heals on restart beats a module
-        // that will not start.
-        .unwrap_or_else(|_| reqwest::Client::new())
+        // rather than turning every lane into a startup panic -- a bounded outage
+        // that heals on restart beats a module that will not start.
+        //
+        // BUT THE FALLBACK IS NOT EQUIVALENT AND SAYS SO ON THE WAY PAST. It
+        // drops the pool bound above, and that bound is not a tuning nicety: it
+        // is the fix for a measured 10-hour blackout where host sleep severed
+        // every socket, the 90s default idle timeout exceeded the 60s poll
+        // interval, and each tick reused a dead connection before it could age
+        // out. Silently degrading to that configuration would reintroduce the
+        // outage with nothing on any surface naming the cause.
+        //
+        // This is the substituted-value class where the value is a BEHAVIOUR
+        // rather than a datum: it does not travel on the wire, and it changes
+        // what every later request does. So the line is the only evidence, and
+        // it is worth more than the ceremony of returning a Result nobody can
+        // act on -- every caller of this is a provider fetch that would have to
+        // fail closed on a condition that heals only by restart.
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "{LOG_TAG} warning: the pooled HTTP client could not be built \
+                     ({error}); falling back to an UNPOOLED client, which drops the \
+                     {POOL_IDLE_TIMEOUT:?} idle bound that keeps sockets from \
+                     outliving a host sleep. Restart to recover."
+            );
+            reqwest::Client::new()
+        })
 }
 
 /// A small request spec the helper executes and maps to [`FetchError`].

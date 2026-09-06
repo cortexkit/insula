@@ -339,13 +339,35 @@ fn resolve_quota_url(region: &RegionConfig) -> String {
     quota_url_from_host(region.gateway, region).expect("static gateway URL")
 }
 
-fn request_body(region: &RegionConfig) -> Vec<u8> {
+/// The query body naming the commodity whose plan we are asking about.
+///
+/// REFUSES RATHER THAN SUBSTITUTING, and the difference is what the upstream is
+/// asked. The previous fallback shipped a body with `"commodityCode": ""` on a
+/// serialisation failure -- a well-formed request making a SPECIFIC claim, that
+/// we are asking about the empty commodity. Alibaba answers something to that,
+/// and whatever it answers gets normalised and published as this account's quota.
+///
+/// Unreachable today: the only field is a `&str`, and `to_vec` over a `Value`
+/// with string keys and no non-finite floats does not fail. That is exactly why
+/// it was worth changing rather than leaving -- the fallback is invisible while
+/// it cannot fire, and the person who adds a numeric or optional field here
+/// inherits a fabricated request instead of a compile error or an honest failure.
+///
+/// A substituted value is harmless where it dies locally and a defect where it
+/// LEAVES THE PROCESS. This one leaves outbound, and no true value is obtainable
+/// when serialisation fails, so absence is the honest answer and refusal is the
+/// honest action.
+fn request_body(region: &RegionConfig) -> Result<Vec<u8>, FetchError> {
     serde_json::to_vec(&json!({
         "queryCodingPlanInstanceInfoRequest": {
             "commodityCode": region.commodity_code,
         }
     }))
-    .unwrap_or_else(|_| br#"{"queryCodingPlanInstanceInfoRequest":{"commodityCode":""}}"#.to_vec())
+    .map_err(|error| {
+        FetchError::Internal(format!(
+            "alibaba: could not build the quota request body: {error}"
+        ))
+    })
 }
 
 fn should_retry_alternate_region(err: &FetchError) -> bool {
@@ -374,7 +396,7 @@ async fn fetch_once(
     region: &RegionConfig,
 ) -> Result<Vec<u8>, FetchError> {
     let url = resolve_quota_url(region);
-    let body = request_body(region);
+    let body = request_body(region)?;
     JsonRequest::post_json(url, body)
         .bearer(api_key)
         .header(Header::new("x-api-key", api_key))
