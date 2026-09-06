@@ -15,6 +15,26 @@ on:
     # ruling, so nothing would trigger.
     branches: [master, 'train/**']
   pull_request:
+  # A DAILY RUN ASKS A QUESTION NO PUSH GATE CAN ASK.
+  #
+  # The push gate asks "is this change good". This asks "is what already landed
+  # still good against the world as it is now" -- and only the second has an
+  # answer that changes on its own. This workflow checks out `cortexkit/subconscious`
+  # with NO `ref:`, so every run resolves that sibling's default branch at the
+  # moment it runs, and `--locked` refuses when the committed lock no longer
+  # matches. A green sha therefore means green AGAINST THE SIBLINGS AT RUN TIME,
+  # which is a narrower guarantee than "this sha is good".
+  #
+  # Not hypothetical here: four lock waves landed in a single day, and each one is
+  # a window in which master goes red with no commit of mine responsible. Without
+  # this, that red first appears on my NEXT push, attached to an unrelated change,
+  # and reads as that change having broken something.
+  #
+  # Evidence from a peer on the same fleet: identical sha, push run success at
+  # 07:59 and scheduled run failure at 11:14, nothing in their repository moved.
+  # The scheduled run is the only thing that re-asks the question.
+  schedule:
+    - cron: '17 6 * * *'
   workflow_call:
   # Manual re-run without a dummy commit. Added when the repo went public: a
   # contributor whose run failed on infrastructure rather than on their change
