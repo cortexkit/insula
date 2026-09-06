@@ -866,6 +866,28 @@ fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
+    // COPYING THE MAIN FILE ALONE IS CORRECT ONLY WHILE CHROME USES
+    // `journal_mode=delete`, and that is an upstream choice rather than ours.
+    //
+    // Measured on this host 2026-09-06: `PRAGMA journal_mode` reports `delete`,
+    // and the profile carries a zero-byte `Cookies-journal` with no `-wal`
+    // sidecar. Under that mode every committed row is in the file being copied,
+    // so a single-file snapshot is a complete read.
+    //
+    // IF CHROME EVER SWITCHES TO WAL, THIS GOES QUIET RATHER THAN LOUD. Recent
+    // commits would live in a `Cookies-wal` sidecar until checkpoint, so this
+    // copy would return an older-but-valid database: the query succeeds, the jar
+    // parses, and the newest session cookie is simply missing. Downstream that
+    // reads as `credential_absent` -- nobody is signed in -- on a host where
+    // somebody just signed in, which is the same misreport the v11 keyring case
+    // produced through a different door.
+    //
+    // Not built for today, because building for a mode the upstream does not use
+    // means shipping an untestable path. Recorded because the dependency is
+    // invisible from this line and nothing in this repository observes it: no
+    // test asserts the mode, and the failure produces no error to notice. The
+    // check is one `PRAGMA journal_mode` against a live profile, and the fix
+    // would be to copy the `-wal` and `-shm` sidecars alongside.
     std::fs::copy(store, &tmp).map_err(|e| CookieError::Extract(format!("copy store: {e}")))?;
     Ok(tmp)
 }
