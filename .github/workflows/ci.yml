@@ -180,6 +180,28 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # NOTHING ELSE HERE VERIFIES THE COMMITTED LOCK, which was invisible until
+      # someone asked where the lock check lives in CI. Every cargo invocation
+      # below runs WITHOUT `--locked`, so each one silently RESOLVES a fresh
+      # dependency graph -- a green run is evidence that some graph builds, not
+      # that the graph this repository pins builds.
+      #
+      # The gap has two halves and neither was covered. A lock left behind by an
+      # unabsorbed sibling bump passes; and a lock the local gate REWROTE and a
+      # commit swept in (ten times in this history) also passes, because CI
+      # re-resolves to the same answer the sweep produced.
+      #
+      # Its own step rather than `--locked` on the test job, deliberately. A
+      # stale lock is a LOCK-BEHIND fact, which is not the same as the code being
+      # wrong -- folding it into the test run would report a dependency-freshness
+      # condition as a test failure and send a reader to the wrong place.
+      #
+      # Measured before adding: over the last twelve commits here, exactly one
+      # was pushed with a lock behind its sibling. So this fires rarely enough to
+      # mean something when it does, and the fix is one `cargo update -p <crate>`.
+      - name: Committed lock resolves
+        run: cargo check --locked --workspace --all-targets
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
