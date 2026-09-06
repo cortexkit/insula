@@ -36,6 +36,36 @@ done
 step() { printf '\n  == %s\n' "$1"; }
 fail() { printf '\n  GATE FAILED: %s\n' "$1" >&2; exit 1; }
 
+# THE GATE CAN REWRITE Cargo.lock, AND HAS.
+#
+# `cargo` without `--locked` is a WRITER: when a path-dependency sibling moves,
+# any build or test command updates the lock in place as a side effect. That is
+# fine on its own -- and then `git add -A` sweeps it into whatever commit is being
+# made, so a lock bump lands under a subject line about something else entirely.
+#
+# It happened here at c2b45c8, a comment-only change to kimi.rs whose diff
+# silently carried subc-transport 0.5.2 -> 0.6.0 and subc-core 0.17.17 -> 0.17.18.
+# The versions were CORRECT, which is why nothing complained and why it would have
+# gone unnoticed: the audit trail says a comment commit, and a later reader
+# bisecting a dependency change lands on a message that never mentions one.
+#
+# So the lock's digest is taken before the gates run and compared after. This does
+# not prevent the write -- forbidding it would break the ordinary absorb path --
+# it makes the write ANNOUNCE ITSELF while the operator is still looking, which is
+# the difference between an absorb and an accident.
+LOCK_BEFORE="$(shasum -a 256 Cargo.lock 2>/dev/null | cut -d' ' -f1)"
+
+announce_lock_write() {
+    local after
+    after="$(shasum -a 256 Cargo.lock 2>/dev/null | cut -d' ' -f1)"
+    [ "$after" = "$LOCK_BEFORE" ] && return 0
+    printf '\n  NOTE: the gates rewrote Cargo.lock (a sibling moved).\n' >&2
+    printf '  Commit it as its own lock change, or restore it -- do NOT let it\n' >&2
+    printf '  ride along in a commit about something else:\n' >&2
+    git --no-pager diff --stat -- Cargo.lock >&2
+}
+trap announce_lock_write EXIT
+
 step "sibling freshness"
 python3 scripts/sibling-freshness.py
 freshness=$?
