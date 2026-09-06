@@ -1414,6 +1414,47 @@ mod tests {
         );
     }
 
+    /// The trust tier survives a migration, and the storage binding stays absent.
+    ///
+    /// BOTH HALVES ARE HERE BECAUSE THE MIGRATION THAT PROMPTED THEM GOT ONE OF
+    /// EACH WRONG. subc-protocol 0.19.0 moved `trust_tier` and `bindings` off the
+    /// builder's positional signature and onto optional setters; at 3af16ad I
+    /// dropped both, and only one of those drops was correct.
+    ///
+    /// `FirstParty` is TRUE of this module and had been declared since the walking
+    /// skeleton in June. It went out because it left the signature in the same
+    /// upstream change as the binding, so a refactor's grouping stood in for an
+    /// argument about content. Restored at 1452f38.
+    ///
+    /// The storage binding is the opposite: this module owns one JSON file written
+    /// by temp-file-and-rename and reads Chrome's SQLite store READ-ONLY, so there
+    /// is no database of ours to bind. `StorageKind` has a single variant, so the
+    /// old required field forced a false claim for months.
+    ///
+    /// NEITHER FIELD IS READ BY THE DAEMON on any production path, which is why
+    /// nothing failed in either direction and why a test is the only thing that
+    /// can notice. Asserting absence as well as presence is the load-bearing part:
+    /// a future author restoring "consistency" by declaring a binding would be
+    /// reintroducing the false claim, and without the second assertion the suite
+    /// would agree with them.
+    #[test]
+    fn manifest_states_a_true_trust_tier_and_no_storage_it_does_not_own() {
+        let m = manifest("insula");
+
+        assert_eq!(
+            m.trust_tier,
+            Some(TrustTier::FirstParty),
+            "this module ships in the CortexKit fleet from its own release workflow, \
+             so FirstParty is a true claim and dropping it understates the manifest"
+        );
+
+        assert!(
+            m.bindings.is_none(),
+            "insula owns no SQLite database -- one JSON journal, and Chrome's cookie \
+             store read-only -- so any storage binding here is a fabricated claim"
+        );
+    }
+
     #[test]
     fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
         let m = manifest("insula");
