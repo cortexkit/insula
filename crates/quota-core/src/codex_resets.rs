@@ -1793,6 +1793,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A PENDING record outlives the retention horizon; only RESOLVED ones age out.
+    ///
+    /// THE SCRUB MUST NOT DELETE THE EVIDENCE OF THE THING IT EXISTS FOR. Pending
+    /// means a consume was sent and its outcome was never confirmed -- a crash
+    /// between the request and the reply. That record carries the `redeem_request_id`
+    /// the next attempt REUSES, which is what makes the server's idempotency answer
+    /// `already_redeemed` instead of spending a second credit. Prune it and the
+    /// retry mints a fresh id, which the server has never seen.
+    ///
+    /// The guard is one conjunct -- `status == Resolved &&` -- and until 2026-09-06
+    /// nothing asserted it. Dropping that clause so age alone decides leaves the
+    /// whole suite GREEN: every other test seeds records that are either resolved
+    /// or young, so no fixture distinguishes "old" from "old and unresolved".
+    ///
+    /// The fixture is deliberately BOTH old and pending, and the age is derived
+    /// from the constant rather than picked: it is the only shape that separates
+    /// the two rules, and a hand-chosen margin stops covering the moment the
+    /// constant moves.
+    #[test]
+    fn a_pending_record_survives_the_resolved_retention_horizon() {
+        let dir = scratch_dir("pending-survives-retention");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let journal = RedemptionJournal::new(dir.join("redemptions.json"));
+        let now = Utc::now();
+        let ancient = now - chrono::Duration::seconds(RESOLVED_RETENTION_SECS + 1);
+
+        let mut record = pending_record("acct-pending", "req-unconfirmed");
+        record.created_at = ancient.to_rfc3339();
+        record.last_attempt_at = Some(ancient.to_rfc3339());
+        journal.save(&[record]).expect("seed the journal");
+
+        let state = journal
+            .inspect_account("acct-pending", now)
+            .expect("inspect the seeded account");
+        assert_eq!(
+            state.pending_id.as_deref(),
+            Some("req-unconfirmed"),
+            "an unconfirmed redemption must keep its request id past the retention \
+             horizon -- pruning it makes the next attempt mint a fresh id, and a \
+             fresh id is a second spend the server cannot recognise as a retry"
+        );
+
+        // THE CONTROL, AND MY FIRST ATTEMPT AT IT WAS VACUOUS. It asserted
+        // `spend_bound_allows` on an aged RESOLVED record -- which is true whether
+        // or not the prune ran, because the record is 7 days old and the spend
+        // bound is 30 minutes, so the bound has released either way. Deleting the
+        // entire prune reddened nothing.
+        //
+        // The prune's effect is only observable in the FILE, so read it: seed both
+        // records together, inspect once, and see which survived. Without this arm
+        // the assertion above would pass just as well against a prune that removes
+        // nothing at all.
+        let mut resolved = pending_record("acct-resolved", "req-done");
+        resolved.status = JournalStatus::Resolved;
+        resolved.outcome = Some(ConsumeOutcome::NothingToReset);
+        resolved.created_at = ancient.to_rfc3339();
+        resolved.last_attempt_at = Some(ancient.to_rfc3339());
+
+        let mut still_pending = pending_record("acct-pending", "req-unconfirmed");
+        still_pending.created_at = ancient.to_rfc3339();
+        still_pending.last_attempt_at = Some(ancient.to_rfc3339());
+
+        journal
+            .save(&[resolved, still_pending])
+            .expect("seed both records");
+        journal
+            .inspect_account("acct-pending", now)
+            .expect("inspect, which prunes as a side effect");
+
+        let surviving: Vec<String> = journal
+            .load()
+            .expect("read the journal back")
+            .into_iter()
+            .map(|r| r.account_id)
+            .collect();
+        assert_eq!(
+            surviving,
+            vec!["acct-pending".to_string()],
+            "the aged RESOLVED record must be gone and the aged PENDING one must \
+             remain -- if both survive the retention rule does nothing, and if \
+             both vanish the unconfirmed request id is lost"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Only the environment-resolving constructor may migrate.
     ///
     /// THE BUG THIS PINS WAS SHIPPED AND OBSERVED. The migration was briefly run
