@@ -515,10 +515,6 @@ pub struct SyntheticProvider {
 }
 
 impl SyntheticProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -595,12 +591,6 @@ impl SyntheticProvider {
             Ok(entry) => FetchAttempt::from_provider_usage(Ok(entry)),
             Err(error) => FetchAttempt::failure(None, Some("vault".to_string()), error),
         }
-    }
-}
-
-impl Default for SyntheticProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

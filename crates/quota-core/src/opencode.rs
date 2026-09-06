@@ -822,10 +822,6 @@ pub struct OpenCodeProvider {
 }
 
 impl OpenCodeProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -838,12 +834,6 @@ impl OpenCodeProvider {
                 COOKIE_FAMILY,
             ),
         }
-    }
-}
-
-impl Default for OpenCodeProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

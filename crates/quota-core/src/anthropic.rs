@@ -243,10 +243,6 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -329,12 +325,6 @@ impl AnthropicProvider {
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
-    }
-}
-
-impl Default for AnthropicProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
