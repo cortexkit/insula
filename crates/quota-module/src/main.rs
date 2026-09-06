@@ -35,9 +35,9 @@ use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
-        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
-        SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence,
-        TrustTier,
+        Concurrency, ConsumerRole, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
+        SignalCadence, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1180,7 +1180,30 @@ fn manifest(module_id: &str) -> ModuleManifest {
             concurrency: Concurrency::StatelessParallel,
         }]
     )
-    .consumes(Vec::new())
+    // THIS MODULE DIALS ANOTHER, AND SAID OTHERWISE UNTIL 2026-09-06. Every vault
+    // lane here opens a route to the credential vault and calls `credential.get`
+    // (crates/quota-module/src/vault_client.rs), so an empty `consumes` was a
+    // false claim of independence -- and unlike the storage binding, this one had
+    // an honest value available the whole time.
+    //
+    // It survived for the reason the other two did: nothing evaluates it. The
+    // daemon reads `consumes` on no production path, so an empty vector cost
+    // nothing and produced no symptom. Found by taking a peer's manifest
+    // correction ONE FIELD DOWN rather than treating my own two fixes as the end
+    // of the class.
+    //
+    // `ServiceClient` rather than `ToolClient`: the vault is a service this module
+    // calls for credentials, not a tool surface exposed to a model. The one fleet
+    // precedent (astrocyte, naming broca and fusiform) uses the same variant for
+    // the same relationship.
+    //
+    // Named by MODULE ID rather than by capability, and the id lives in ids.rs
+    // where the dialling code reads it -- so a rename cannot leave this declaration
+    // pointing at a module that no longer exists, which is exactly what the
+    // ai-provider-quota -> insula flip did to three other call sites.
+    .consumes(vec![ConsumerRole::ServiceClient {
+        of: vec![ids::CREDENTIALS_MODULE_ID.to_string()],
+    }])
     .self_signals(Some(vec![
     // What this module does to the surfaces it reports on, so an analyst
     // measuring provider quota can subtract our own contribution.
@@ -1452,6 +1475,43 @@ mod tests {
             m.bindings.is_none(),
             "insula owns no SQLite database -- one JSON journal, and Chrome's cookie \
              store read-only -- so any storage binding here is a fabricated claim"
+        );
+    }
+
+    /// The vault dependency is declared, and names the module the code dials.
+    ///
+    /// Empty until 2026-09-06, which was a claim of independence this module has
+    /// never been able to make: every vault lane opens a route to the credential
+    /// vault and calls `credential.get`. Unlike the storage binding -- where the
+    /// enum offered no honest value -- an accurate declaration was available the
+    /// whole time and simply was not written.
+    ///
+    /// THE ASSERTION READS THE SAME CONSTANT THE DIALLING CODE READS. Comparing
+    /// against a literal "claustrum" would pass while the manifest pointed at a
+    /// module nobody dials, which is precisely what the ai-provider-quota ->
+    /// insula rename did to three call sites that each held their own copy of an
+    /// id. Reading `ids::CREDENTIALS_MODULE_ID` makes the test a check on
+    /// AGREEMENT rather than on a remembered spelling.
+    #[test]
+    fn manifest_declares_the_credential_vault_it_actually_dials() {
+        let m = manifest("insula");
+
+        let named: Vec<&str> = m
+            .consumes
+            .iter()
+            .flat_map(|role| match role {
+                ConsumerRole::ServiceClient { of } | ConsumerRole::ToolClient { of } => {
+                    of.iter().map(String::as_str).collect::<Vec<_>>()
+                }
+                ConsumerRole::LlmClient { .. } => Vec::new(),
+            })
+            .collect();
+
+        assert_eq!(
+            named,
+            vec![ids::CREDENTIALS_MODULE_ID],
+            "this module calls credential.get on the vault, so an empty or \
+             differently-named consumes is a false claim about what it depends on"
         );
     }
 
