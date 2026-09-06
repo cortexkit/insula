@@ -134,10 +134,22 @@ impl Drop for VaultStub {
 fn vault_manifest() -> ModuleManifest {
     // Builder, not a literal: ModuleManifest is #[non_exhaustive] upstream, so
     // a new field is a compile error here rather than a silent default.
-    // Trust tier and bindings omitted, matching the module under test. This stub
-    // stands in for the credential vault, and inventing a storage binding for
-    // ANOTHER module would put a claim in its manifest that nothing here can
-    // check -- the same reason its operations carry no descriptions below.
+    //
+    // TRUST TIER AND BINDINGS STAY OMITTED, and this is the one place in this
+    // repository where omitting them is right for a reason OTHER than truth.
+    //
+    // The real credential vault declares both, and truthfully -- it is first-party
+    // and it does own a project-scoped SQLite schema. So a stub that mirrored it
+    // would state `FirstParty` correctly. The reason not to is that this fixture
+    // cannot VERIFY either claim: nothing here reads claustrum's manifest, so a
+    // value copied from it today becomes a stale assertion about another module
+    // the moment that module changes, and the copy would look like a check while
+    // being a guess. Same reason its operations carry no descriptions below.
+    //
+    // Distinct from the production manifest in main.rs, where I dropped a TRUE
+    // trust tier by association at 3af16ad and restored it at 1452f38. There the
+    // question was whether an honest value existed; here an honest value exists
+    // and is not MINE TO STATE.
     ModuleManifest::builder(VAULT_MODULE_ID.to_string(), "test-stub".to_string())
         .protocol_ver(PROTOCOL_VERSION)
         .provides(vec![ProviderRole::ManagementSurface {
