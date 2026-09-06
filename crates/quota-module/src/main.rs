@@ -37,6 +37,7 @@ use subc_protocol::{
     manifest::{
         Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
         SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence,
+        TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1110,8 +1111,8 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // opposite facts about the author.
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
         .protocol_ver(PROTOCOL_VERSION)
-        // TRUST TIER AND BINDINGS ARE DELIBERATELY OMITTED, and the omission is a
-        // correction rather than a migration shortcut.
+        // BINDINGS OMITTED, TRUST TIER KEPT -- two decisions, and they were made as
+        // one until 2026-09-06, which was the error.
         //
         // Until subc-protocol 0.19.0 both were REQUIRED positional arguments, so
         // this module had to state a storage binding whether or not it had storage.
@@ -1119,18 +1120,29 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // insula owns exactly one file, `redemptions.json`, written by temp-file
         // and rename, and reads Chrome's SQLite cookie store READ-ONLY as somebody
         // else's database. There has never been a SQLite database of ours to bind.
+        // `StorageKind` has one variant, so under the old signature there was no
+        // honest value available. Now that the field is optional, ABSENT is the
+        // true answer and it is stated by omission.
         //
-        // The declaration was invisible because the daemon evaluates neither field
-        // on any production path (documented at their setters), so a false value
-        // cost nothing and produced no symptom. It is discovery metadata a human
-        // reads in a catalog listing, which makes it exactly the kind of claim that
-        // stays wrong indefinitely: no consumer branches on it, so no consumer
-        // notices.
+        // TRUST TIER IS DIFFERENT AND I DROPPED IT BY ASSOCIATION. `FirstParty` is
+        // TRUE of this module -- it ships in the CortexKit fleet, from this
+        // organisation, built by its release workflow. Both fields moved out of the
+        // signature in the same upstream change, so they arrived at my editor
+        // together and left together; the argument that justified dropping one (no
+        // honest value exists) never applied to the other (an honest value exists
+        // and it was already there).
         //
-        // `StorageKind` has one variant, `Sqlite`, so there is no honest value to
-        // state -- and now that the field is optional, ABSENT is the true answer.
-        // Stating a storage kind we do not have would be worse than saying nothing,
-        // in the same way a plausible sentinel is worse than a refusal.
+        // Restored, and the general shape is worth naming: WHEN A REFACTOR MOVES
+        // SEVERAL THINGS AT ONCE, THE REFACTOR'S GROUPING IS NOT AN ARGUMENT ABOUT
+        // THEIR CONTENT. Deciding them as a batch imports the upstream's reason for
+        // grouping them, which was signature ergonomics rather than truth.
+        //
+        // Neither field is evaluated by the daemon on any production path
+        // (documented at their setters, and the only `trust_tier` reads in
+        // subc-core are test fixtures). That is exactly why a wrong value survives
+        // here indefinitely -- no consumer branches on it, so no consumer notices --
+        // and why the fix is to make each one true rather than to make both absent.
+        .trust_tier(Some(TrustTier::FirstParty))
     .provides(
         vec![ProviderRole::ManagementSurface {
             operations: vec![
