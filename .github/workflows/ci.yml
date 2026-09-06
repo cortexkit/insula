@@ -2,7 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # TRAIN BRANCHES ARE PART OF THE GATE, NOT A CONVENIENCE.
+    #
+    # Pushes to master land only after a green run on all platforms, so the run
+    # has to exist on the branch BEFORE the fast-forward. With `[master]` alone a
+    # train branch gets no run at all -- and once branch protection requires a
+    # status check, master becomes unpushable from this repository, because no
+    # check will ever exist for the sha being pushed. That reads as a broken key
+    # or a permissions fault; it is this line.
+    #
+    # `pull_request` does not cover it: our own commits land without a PR by
+    # ruling, so nothing would trigger.
+    branches: [master, 'train/**']
   pull_request:
   workflow_call:
   # Manual re-run without a dummy commit. Added when the repo went public: a
