@@ -68,6 +68,10 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
 /// the loss shows up as accounts quietly losing their labels rather than as a
 /// failure. If it ever moves, move the file first.
 const DEFAULT_RELATIVE_PATH: &str = ".config/cortexkit/ck-quota/vault-handles.json";
+/// The same file relative to an explicit `XDG_CONFIG_HOME`, which already
+/// contains the `.config` level. Kept beside its sibling so the two cannot drift
+/// into naming different files.
+const XDG_RELATIVE_PATH: &str = "cortexkit/ck-quota/vault-handles.json";
 
 struct UniqueHandles(HashMap<String, String>);
 
@@ -424,11 +428,50 @@ impl VaultHandleLoader {
     }
 }
 
+/// Where the vault handle file lives.
+///
+/// **`XDG_CONFIG_HOME` IS CONSULTED, and was not until 2026-09-06.** This file
+/// sits beside `ck-quota.jsonc` under `cortexkit/`, and that one has honoured
+/// XDG since it was written -- so an operator exporting `XDG_CONFIG_HOME`, which
+/// is an ordinary variable rather than an exotic one, moved the config and NOT
+/// the handles beside it. One directory, two resolvers in this tree, disagreeing
+/// about how to find it.
+///
+/// The consequence is the quiet kind. An absent handle file is a LEGITIMATE
+/// state meaning "no vault credentials configured": every provider falls back to
+/// its local lane, labelled accounts lose their labels, vault-only lanes go dark,
+/// and the module reports healthy throughout. The operator is looking at a file
+/// they just edited.
+///
+/// Found by a peer's audit of the adjacent class -- theirs was a rung ABSENT
+/// where mine had been a rung present with a missing platform guard, and a
+/// set-difference over rung names finds the first while missing the second. The
+/// generalisation that catches both is to diff `(rung, guard)` pairs and to run
+/// the audit over EVERY path this module resolves rather than the one that
+/// prompted it.
+///
+/// The explicit env override stays EXCLUSIVE and outranks XDG: a value that is
+/// set and wrong must fail rather than fall through, or honouring it is
+/// indistinguishable from ignoring it.
 pub fn vault_handles_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(HANDLES_PATH_ENV).filter(|value| !value.is_empty()) {
+    vault_handles_path_from(|key| std::env::var_os(key))
+}
+
+/// The resolution order, over an arbitrary environment, so both rungs are
+/// exercisable without mutating the process environment mid-suite.
+pub(crate) fn vault_handles_path_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(path) = lookup(HANDLES_PATH_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    crate::env::home_dir().map(|home| home.join(DEFAULT_RELATIVE_PATH))
+    if let Some(config_home) = lookup("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(config_home).join(XDG_RELATIVE_PATH));
+    }
+    // Threaded rather than calling `home_dir()` so the LAST rung is exercisable
+    // too. A ladder whose bottom rung can only be tested by mutating the real
+    // process environment is one whose bottom rung does not get tested.
+    crate::env::home_dir_from(lookup).map(|home| home.join(DEFAULT_RELATIVE_PATH))
 }
 
 enum LoadResult {
@@ -784,6 +827,70 @@ fn map_handles(handles: HashMap<String, String>) -> (ProviderHandleSnapshot, Opt
 
 #[cfg(test)]
 mod tests {
+    use super::{vault_handles_path_from, HANDLES_PATH_ENV};
+
+    /// The handle file follows XDG_CONFIG_HOME, like the config beside it.
+    ///
+    /// THE DIVERGENCE THIS PINS WAS LIVE UNTIL 2026-09-06 and was internal: this
+    /// module's own config resolver has honoured `XDG_CONFIG_HOME` since it was
+    /// written, while this one went straight to `$HOME/.config`. Two files in one
+    /// directory, two resolvers in one tree, disagreeing about how to find it --
+    /// so an operator exporting an ordinary variable moved one and not the other.
+    ///
+    /// Silent in the direction that costs most: an absent handle file legitimately
+    /// means "no vault credentials configured", so every provider drops to its
+    /// local lane, labelled accounts lose their labels, vault-only lanes go dark,
+    /// and health stays green while the operator looks at a file they just edited.
+    #[test]
+    fn the_handle_file_follows_the_same_config_home_as_the_config_beside_it() {
+        let os = std::ffi::OsString::from;
+
+        let xdg = vault_handles_path_from(|key| match key {
+            "XDG_CONFIG_HOME" => Some(os("/tmp/xdg")),
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        })
+        .expect("XDG_CONFIG_HOME must resolve a path");
+        assert_eq!(
+            xdg,
+            std::path::PathBuf::from("/tmp/xdg/cortexkit/ck-quota/vault-handles.json"),
+            "the handle file must follow XDG_CONFIG_HOME, or it is orphaned from \
+             the config it sits beside"
+        );
+
+        // Without it, the home-relative default is unchanged.
+        let home = vault_handles_path_from(|key| match key {
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        })
+        .expect("HOME must resolve a path");
+        assert_eq!(
+            home,
+            std::path::PathBuf::from("/home/qta/.config/cortexkit/ck-quota/vault-handles.json")
+        );
+    }
+
+    /// The explicit override is exclusive and outranks XDG.
+    ///
+    /// A value that is set and wrong must FAIL rather than fall through, or
+    /// honouring it is indistinguishable from ignoring it -- the property a peer's
+    /// missing rung destroyed on their own CLI, where an operator naming a rig
+    /// silently reached production instead.
+    #[test]
+    fn the_explicit_override_outranks_every_other_rung() {
+        let os = std::ffi::OsString::from;
+        let path = vault_handles_path_from(|key| match key {
+            HANDLES_PATH_ENV => Some(os("/rig/handles.json")),
+            "XDG_CONFIG_HOME" => Some(os("/tmp/xdg")),
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        });
+        assert_eq!(
+            path,
+            Some(std::path::PathBuf::from("/rig/handles.json")),
+            "an explicitly named file must win, even when it does not exist"
+        );
+    }
 
     /// A capability rewritten on disk is picked up without restarting the module.
     ///

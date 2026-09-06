@@ -40,7 +40,9 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Reading the process environment directly would leave them testable only on
 /// the platform they exist for -- and a rule that cannot be tested where it is
 /// written is one nobody checks until a user reports that nothing resolves.
-fn home_dir_from(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+pub(crate) fn home_dir_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     if let Some(home) = lookup("HOME") {
         return Some(PathBuf::from(home));
     }
