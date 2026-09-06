@@ -128,7 +128,25 @@ jobs:
       # being edited, and a narrowed trigger goes unnoticed until the day branch
       # protection is enabled -- when the symptom is main becoming unpushable and
       # it reads as a protection fault rather than a workflow one.
+      # ONE LEG, because this asserts facts about a FILE -- its answer cannot
+      # differ by platform, so a second run buys nothing and costs a portability
+      # surface.
+      #
+      # And it cost one: without this guard the Windows leg reported SUCCESS and
+      # produced ZERO OUTPUT. GitHub runs steps under pwsh there, which sourced
+      # the shell script rather than executing it, and exited 0 having done
+      # nothing. A green check for a gate that never ran.
+      #
+      # Only the denominator line caught it -- `train preconditions: <file>, push
+      # branches [...]` appeared ONCE across a two-leg run instead of twice. The
+      # conclusion said success on both. That is the whole argument for printing
+      # what was examined rather than a verdict.
+      #
+      # A platform guard is not the path-dependent condition the checker itself
+      # forbids: `matrix.os` is identical between a train push and a master push,
+      # where `github.ref` is not.
       - name: Train preconditions
+        if: matrix.os == 'ubuntu'
         working-directory: insula
         run: ./scripts/check-train-preconditions.sh
 
