@@ -170,7 +170,7 @@ impl ModuleConfig {
 }
 
 fn quota_config_path() -> Option<PathBuf> {
-    quota_config_path_from(|key| std::env::var_os(key))
+    quota_config_path_from(|key| std::env::var_os(key), cfg!(windows))
 }
 
 /// Resolve the config path over an arbitrary environment.
@@ -191,20 +191,48 @@ fn quota_config_path() -> Option<PathBuf> {
 /// branch testable only where it runs is one nobody checks until someone reports
 /// that a setting has no effect -- and the report would be about the feature,
 /// not about the path.
-fn quota_config_path_from(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+///
+/// **THE WINDOWS ARMS ARE PLATFORM-GATED, and were not until 2026-09-06.** The
+/// daemon wraps both in `#[cfg(windows)]`; this copy applied them on every host,
+/// so any POSIX environment with `APPDATA` or `USERPROFILE` set -- WSL interop,
+/// a Wine prefix, some CI images, an operator who exported one -- resolved a
+/// Windows-shaped path while the daemon resolved `$HOME/.config`. Two files, both
+/// internally consistent, and the module reads the one nobody edits.
+///
+/// The symptom is the worst available here and is the reason this is gated rather
+/// than documented: an absent config is a LEGITIMATE state meaning "no
+/// overrides", so banked-reset auto-consume simply stays off, the module reports
+/// healthy, and no wire field says the feature was configured and not read.
+///
+/// Found by set-difference against `subc-core/src/daemon_config.rs`
+/// `default_config_path` -- enumerate the rungs each side consults and diff the
+/// sets, rather than reading the two ladders side by side. A missing or ungated
+/// rung has nothing at its position to notice, which is where a read-through
+/// fails. Re-derived 2026-09-06; the daemon's order was otherwise identical.
+///
+/// `windows` is a parameter rather than `cfg!` inside, so both platforms' arms
+/// stay exercisable from any host. Gating with `cfg` directly would make the
+/// Windows path untestable on the machine where it is most likely to be got
+/// wrong.
+fn quota_config_path_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
     if let Some(config_home) = lookup("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(config_home).join(QUOTA_CONFIG_RELATIVE_PATH));
     }
-    if let Some(app_data) = lookup("APPDATA").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(app_data).join(QUOTA_CONFIG_RELATIVE_PATH));
-    }
-    if let Some(profile) = lookup("USERPROFILE").filter(|value| !value.is_empty()) {
-        return Some(
-            PathBuf::from(profile)
-                .join("AppData")
-                .join("Roaming")
-                .join(QUOTA_CONFIG_RELATIVE_PATH),
-        );
+    if windows {
+        if let Some(app_data) = lookup("APPDATA").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(app_data).join(QUOTA_CONFIG_RELATIVE_PATH));
+        }
+        if let Some(profile) = lookup("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Some(
+                PathBuf::from(profile)
+                    .join("AppData")
+                    .join("Roaming")
+                    .join(QUOTA_CONFIG_RELATIVE_PATH),
+            );
+        }
     }
     lookup("HOME")
         .filter(|value| !value.is_empty())
@@ -1515,22 +1543,28 @@ mod tests {
         let os = std::ffi::OsString::from;
 
         // XDG wins wherever it is set, on every platform.
-        let xdg = quota_config_path_from(|key| match key {
-            "XDG_CONFIG_HOME" => Some(os("/tmp/xdg")),
-            "APPDATA" => Some(os(r"C:\roaming")),
-            "HOME" => Some(os("/home/qta")),
-            _ => None,
-        });
+        let xdg = quota_config_path_from(
+            |key| match key {
+                "XDG_CONFIG_HOME" => Some(os("/tmp/xdg")),
+                "APPDATA" => Some(os(r"C:\roaming")),
+                "HOME" => Some(os("/home/qta")),
+                _ => None,
+            },
+            true,
+        );
         assert_eq!(
             xdg,
             Some(PathBuf::from("/tmp/xdg/cortexkit/ck-quota.jsonc"))
         );
 
         // Windows without XDG: the roaming directory, not HOME.
-        let roaming = quota_config_path_from(|key| match key {
-            "APPDATA" => Some(os(r"C:\roaming")),
-            _ => None,
-        })
+        let roaming = quota_config_path_from(
+            |key| match key {
+                "APPDATA" => Some(os(r"C:\roaming")),
+                _ => None,
+            },
+            true,
+        )
         .expect("APPDATA must resolve a path");
         assert!(
             roaming
@@ -1541,10 +1575,13 @@ mod tests {
         );
 
         // Stripped Windows environment: reconstruct what APPDATA would hold.
-        let profile = quota_config_path_from(|key| match key {
-            "USERPROFILE" => Some(os(r"C:\Users\qta")),
-            _ => None,
-        })
+        let profile = quota_config_path_from(
+            |key| match key {
+                "USERPROFILE" => Some(os(r"C:\Users\qta")),
+                _ => None,
+            },
+            true,
+        )
         .expect("USERPROFILE must resolve a path");
         assert!(
             profile
@@ -1555,10 +1592,13 @@ mod tests {
         );
 
         // Unix stays exactly as it was.
-        let unix = quota_config_path_from(|key| match key {
-            "HOME" => Some(os("/home/qta")),
-            _ => None,
-        });
+        let unix = quota_config_path_from(
+            |key| match key {
+                "HOME" => Some(os("/home/qta")),
+                _ => None,
+            },
+            false,
+        );
         assert_eq!(
             unix,
             Some(PathBuf::from("/home/qta/.config/cortexkit/ck-quota.jsonc"))
@@ -1566,7 +1606,50 @@ mod tests {
 
         // Nothing set at all: no path rather than a relative one, which would
         // resolve against the working directory of whoever spawned the module.
-        assert_eq!(quota_config_path_from(|_| None), None);
+        assert_eq!(quota_config_path_from(|_| None, false), None);
+    }
+
+    /// A POSIX host with a Windows variable set reads the daemon's file.
+    ///
+    /// THE DIVERGENCE THIS PINS WAS LIVE UNTIL 2026-09-06. The daemon wraps its
+    /// `APPDATA` and `USERPROFILE` arms in `#[cfg(windows)]`; this copy applied
+    /// them everywhere, so a POSIX environment carrying either -- WSL interop, a
+    /// Wine prefix, some CI images, an operator who exported one -- resolved a
+    /// Windows-shaped path while the daemon resolved `$HOME/.config`.
+    ///
+    /// Two files, both internally consistent, and the module reads the one nobody
+    /// edits. Nothing fails: an absent config legitimately means "no overrides",
+    /// so banked-reset auto-consume stays off and the module reports healthy.
+    ///
+    /// Found by set-differencing the rungs against the daemon rather than reading
+    /// the two ladders side by side -- an ungated rung has nothing at its position
+    /// to notice.
+    #[test]
+    fn a_posix_host_with_appdata_set_still_reads_the_daemons_file() {
+        let os = std::ffi::OsString::from;
+        let lookup = |key: &str| match key {
+            "APPDATA" => Some(os(r"C:\roaming")),
+            "USERPROFILE" => Some(os(r"C:\Users\qta")),
+            "HOME" => Some(os("/home/qta")),
+            _ => None,
+        };
+
+        assert_eq!(
+            quota_config_path_from(lookup, false),
+            Some(PathBuf::from("/home/qta/.config/cortexkit/ck-quota.jsonc")),
+            "a POSIX host must ignore Windows variables, or it reads a file the \
+             daemon never writes and banked resets stay silently off"
+        );
+        // The same environment on Windows takes the roaming arm, so this pins the
+        // gate rather than the arm's removal.
+        assert_eq!(
+            quota_config_path_from(lookup, true),
+            Some(
+                PathBuf::from(r"C:\roaming")
+                    .join("cortexkit")
+                    .join("ck-quota.jsonc")
+            )
+        );
     }
 
     /// A Windows environment must not fall through to the Unix arm.
@@ -1576,10 +1659,13 @@ mod tests {
     /// banked-reset auto-consume stays off with nothing reporting why.
     #[test]
     fn a_windows_environment_never_returns_a_unix_path() {
-        let path = quota_config_path_from(|key| match key {
-            "APPDATA" => Some(std::ffi::OsString::from(r"C:\roaming")),
-            _ => None,
-        })
+        let path = quota_config_path_from(
+            |key| match key {
+                "APPDATA" => Some(std::ffi::OsString::from(r"C:\roaming")),
+                _ => None,
+            },
+            true,
+        )
         .expect("a windows environment must resolve a path");
 
         assert!(
