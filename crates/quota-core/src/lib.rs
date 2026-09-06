@@ -544,10 +544,6 @@ impl Registry {
         registry
     }
 
-    pub fn credential_source_wired(&self) -> bool {
-        self.credential_source.is_some()
-    }
-
     #[cfg(test)]
     pub(crate) fn attach_credential_source(&mut self, source: Arc<dyn CredentialSource>) {
         self.credential_source = Some(source);
