@@ -160,17 +160,7 @@ pub struct DeepSeekProvider {
     handle_loader: Arc<VaultHandleLoader>,
 }
 
-impl Default for DeepSeekProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DeepSeekProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,

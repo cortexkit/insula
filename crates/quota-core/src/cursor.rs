@@ -479,13 +479,6 @@ pub struct CursorProvider {
 }
 
 impl CursorProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
-        )
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
         handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
@@ -498,12 +491,6 @@ impl CursorProvider {
                 COOKIE_FAMILY,
             ),
         }
-    }
-}
-
-impl Default for CursorProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

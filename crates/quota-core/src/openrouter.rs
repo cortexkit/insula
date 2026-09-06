@@ -170,10 +170,6 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -260,12 +256,6 @@ impl OpenRouterProvider {
             credential_source: None,
             handle_loader: Arc::new(VaultHandleLoader::new(None)),
         }
-    }
-}
-
-impl Default for OpenRouterProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
