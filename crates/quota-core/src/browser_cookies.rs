@@ -67,6 +67,26 @@ pub enum CookieError {
     /// fault -- but reporting it as an absent session would send someone to log
     /// in again, which cannot help.
     UnreadableScheme(&'static str),
+    /// Every cookie is `v11` and the Secret Service offered no key.
+    ///
+    /// SEPARATE FROM [`Self::UnreadableScheme`] BECAUSE IT IS NOT PERMANENT and
+    /// separate from [`Self::NoCookie`] BECAUSE SOMEBODY IS SIGNED IN. `v20` is
+    /// sealed by design and no restart changes that; a `v11` jar becomes readable
+    /// the moment the keyring is reachable again, which on Linux can be a D-Bus
+    /// hiccup, a locked login keyring, or a desktop session that has not started
+    /// its agent yet.
+    ///
+    /// The state exists because `secret_service_key` answers `Option`: a host with
+    /// no Chrome entry and a host whose Secret Service could not be reached both
+    /// arrive as `None`, the error having been dropped by an `.ok()?`. That is
+    /// deliberate there -- propagating a D-Bus failure would take a working cohort
+    /// dark over a scheme the profile may not contain -- so the discrimination has
+    /// to happen here, where the refused SCHEMES say whether v11 was the whole jar.
+    ///
+    /// Maps to `local_source_unavailable`: transient, keeps serving the last
+    /// healthy window, and names a condition on this machine rather than an absent
+    /// login the operator would otherwise be told to go and repeat.
+    UnreadableKeyring,
     /// Reading the store or decrypting failed.
     Extract(String),
     /// The store exists but this process is not permitted to read it.
@@ -195,7 +215,11 @@ impl From<CookieError> for crate::provider::FetchError {
             // that class says and what an operator can act on. Not `Upstream`:
             // the provider's servers are fine and nine of them saying otherwise
             // at once is a machine-level fact wearing a provider-level costume.
-            CookieError::PermissionDenied(_) => {
+            // Same class and the same reasoning one scheme over: the keyring is a
+            // local source this lane needs, the provider is fine, and the operator
+            // acts on their own machine. Transient, unlike UnreadableScheme above,
+            // because a keyring comes back and App-Bound Encryption does not.
+            CookieError::PermissionDenied(_) | CookieError::UnreadableKeyring => {
                 crate::provider::FetchError::LocalSourceUnavailable(detail)
             }
         }
@@ -210,6 +234,12 @@ impl std::fmt::Display for CookieError {
                 write!(f, "Chrome Safe Storage keychain key unavailable: {m}")
             }
             Self::NoCookie => write!(f, "no matching cookie for domain"),
+            Self::UnreadableKeyring => write!(
+                f,
+                "the browser session for this domain is encrypted with v11 and the \
+                 Secret Service offered no key: the login is intact and the keyring \
+                 is unreachable or locked on this machine"
+            ),
             Self::UnreadableScheme(scheme) => write!(
                 f,
                 "the browser session for this domain is encrypted with {scheme}, \
@@ -503,7 +533,7 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
         }
     }
     if cookies.is_empty() {
-        return Err(unreadable_or_absent(&refused));
+        return Err(unreadable_or_absent(&refused, v11_key.is_some()));
     }
     Ok(CookieJar { cookies })
 }
@@ -521,12 +551,34 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
 /// as absent, which is the conservative direction: naming a scheme is a claim
 /// that the scheme is the reason, and that claim is only safe when every refused
 /// row agrees on it.
+///
+/// V11 WITH NO KEY IS A THIRD ANSWER, and it was reported as the first until
+/// 2026-09-06. `secret_service_key` returns `Option`, so "this host has no Chrome
+/// entry in its keyring" and "the Secret Service could not be reached just now"
+/// arrive here as the same `None` -- the error is discarded two functions away by
+/// an `.ok()?`, and the consequence lands in this match. On a host whose Chrome
+/// has always used `gnome-libsecret`, EVERY row is v11, so a momentary D-Bus
+/// failure reported all nine cookie providers as `credential_absent`: nobody is
+/// signed in, on a machine where somebody is.
+///
+/// That is the wrong direction on this wire. `credential_absent` is the class a
+/// consumer may prune an account on, and it tells an operator to log in -- which
+/// cannot help, because the session is fine and the KEYRING is what was missing.
+///
+/// So a v11-only refusal with no v11 key in hand is `UnreadableKeyring`, which
+/// maps to `local_source_unavailable`: transient, stale-serves the last healthy
+/// window, and names a local condition rather than an absent login. A v11 row
+/// refused WHILE HOLDING a key is a genuine decryption failure and stays absent,
+/// since then the key is not the reason.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn unreadable_or_absent(refused: &[Scheme]) -> CookieError {
+fn unreadable_or_absent(refused: &[Scheme], have_v11_key: bool) -> CookieError {
     let sealed = |scheme: &Scheme| matches!(scheme, Scheme::V12 | Scheme::V20);
     match refused.first() {
         Some(first) if sealed(first) && refused.iter().all(|s| s == first) => {
             CookieError::UnreadableScheme(first.label())
+        }
+        Some(Scheme::V11) if !have_v11_key && refused.iter().all(|s| matches!(s, Scheme::V11)) => {
+            CookieError::UnreadableKeyring
         }
         _ => CookieError::NoCookie,
     }
@@ -1110,6 +1162,7 @@ mod tests {
             CookieError::NoKeychainKey("locked".into()),
             CookieError::Extract("mid-write".into()),
             CookieError::PermissionDenied("Operation not permitted".into()),
+            CookieError::UnreadableKeyring,
         ];
 
         for case in &all {
@@ -1120,7 +1173,8 @@ mod tests {
                 | CookieError::UnreadableScheme(_)
                 | CookieError::NoKeychainKey(_)
                 | CookieError::Extract(_)
-                | CookieError::PermissionDenied(_) => {}
+                | CookieError::PermissionDenied(_)
+                | CookieError::UnreadableKeyring => {}
             }
         }
 
@@ -1173,16 +1227,19 @@ mod tests {
     #[test]
     fn a_sealed_session_is_reported_differently_from_an_absent_one() {
         // Nothing was refused because nothing was there.
-        assert!(matches!(unreadable_or_absent(&[]), CookieError::NoCookie));
+        assert!(matches!(
+            unreadable_or_absent(&[], true),
+            CookieError::NoCookie
+        ));
 
         // Every row sealed by the same scheme: nameable, and named.
-        let sealed = unreadable_or_absent(&[Scheme::V20, Scheme::V20]);
+        let sealed = unreadable_or_absent(&[Scheme::V20, Scheme::V20], true);
         assert!(
             matches!(sealed, CookieError::UnreadableScheme("v20")),
             "expected a named v20 refusal, got {sealed:?}"
         );
         assert!(matches!(
-            unreadable_or_absent(&[Scheme::V12]),
+            unreadable_or_absent(&[Scheme::V12], true),
             CookieError::UnreadableScheme("v12")
         ));
 
@@ -1190,14 +1247,62 @@ mod tests {
         // may simply be wrong, and blaming the scheme would send the reader
         // somewhere there is nothing to find.
         assert!(matches!(
-            unreadable_or_absent(&[Scheme::V10]),
+            unreadable_or_absent(&[Scheme::V10], true),
             CookieError::NoCookie
         ));
 
         // Mixed rows: one sealed, one failed for its own reason. Naming a
         // scheme claims it is THE reason, which is only true when they agree.
         assert!(matches!(
-            unreadable_or_absent(&[Scheme::V20, Scheme::V10]),
+            unreadable_or_absent(&[Scheme::V20, Scheme::V10], true),
+            CookieError::NoCookie
+        ));
+    }
+
+    /// A v11 jar with no keyring key is an unreachable keyring, not an empty one.
+    ///
+    /// THE FAILURE THIS PINS REPORTED A SIGNED-IN HOST AS UNCONFIGURED. On a Linux
+    /// desktop whose Chrome has always used `gnome-libsecret`, every stored value
+    /// is `v11`; a momentary Secret Service failure yields no key, every row
+    /// refuses, and the old rule reported `NoCookie` -> `credential_absent` for all
+    /// nine cookie providers at once. That is the class a consumer may prune an
+    /// account on, and it tells the operator to log in again -- which cannot help,
+    /// because the login is intact and the KEYRING was missing.
+    ///
+    /// The key's absence cannot be diagnosed where it happens: `secret_service_key`
+    /// deliberately answers `Option`, so a host with no Chrome entry and a host
+    /// whose D-Bus call failed arrive identically. The refused SCHEMES are what
+    /// separate them, two functions later.
+    ///
+    /// Both directions asserted, and the second is the load-bearing one: holding a
+    /// key means the key is not the reason a row refused, so that stays absent.
+    #[test]
+    fn a_v11_jar_without_a_keyring_key_is_not_an_absent_session() {
+        let unreachable = unreadable_or_absent(&[Scheme::V11, Scheme::V11], false);
+        assert!(
+            matches!(unreachable, CookieError::UnreadableKeyring),
+            "expected an unreachable keyring, got {unreachable:?}"
+        );
+        assert!(
+            matches!(
+                crate::provider::FetchError::from(CookieError::UnreadableKeyring),
+                crate::provider::FetchError::LocalSourceUnavailable(_)
+            ),
+            "it must report as a local condition, which is transient and stale-serves"
+        );
+
+        // WITH a key in hand, a refused v11 row is a real decryption failure and
+        // the keyring is not the reason. Without this the rule could widen to
+        // "any v11 refusal is a keyring problem" and hide a genuine one.
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::V11], true),
+            CookieError::NoCookie
+        ));
+
+        // And a mixed jar says nothing about the keyring: the v10 row refused for
+        // its own reason, so no single cause can be named.
+        assert!(matches!(
+            unreadable_or_absent(&[Scheme::V11, Scheme::V10], false),
             CookieError::NoCookie
         ));
     }
@@ -1221,7 +1326,7 @@ mod tests {
         assert_eq!(Scheme::of(b"v99future"), Scheme::Unknown);
         assert_eq!(Scheme::of(b""), Scheme::Unknown);
         assert!(matches!(
-            unreadable_or_absent(&[Scheme::Unknown]),
+            unreadable_or_absent(&[Scheme::Unknown], true),
             CookieError::NoCookie
         ));
 
