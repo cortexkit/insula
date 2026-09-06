@@ -330,23 +330,14 @@ impl NeuralWattProvider {
             http: crate::http::provider_client(),
         }
     }
-}
 
-impl Default for NeuralWattProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl UsageProvider for NeuralWattProvider {
-    fn name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    async fn fetch_handle_from(
+        &self,
+        _handle: &CredentialHandle,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let api_key_raw = env::first_env(API_KEY_ENV)
+            let api_key_raw = env::first_env_from(API_KEY_ENV, &lookup)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
             // The variable is set but holds nothing usable, which is a
             // configuration mistake rather than an absent credential.
@@ -354,7 +345,7 @@ impl UsageProvider for NeuralWattProvider {
                 FetchError::CredentialUnusable("NEURALWATT_API_KEY is empty".to_string())
             })?;
 
-            let base_url_raw = env::first_env(BASE_URL_ENV);
+            let base_url_raw = env::first_env_from(BASE_URL_ENV, lookup);
             let base_url = if let Some(raw) = base_url_raw {
                 let cleaned = clean_env_value(&raw).ok_or_else(|| {
                     FetchError::CredentialUnusable("NEURALWATT_API_URL is empty".to_string())
@@ -382,6 +373,24 @@ impl UsageProvider for NeuralWattProvider {
         }
         .await;
         FetchAttempt::from_provider_usage(result)
+    }
+}
+
+impl Default for NeuralWattProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl UsageProvider for NeuralWattProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        self.fetch_handle_from(handle, |key| std::env::var_os(key))
+            .await
     }
 }
 
@@ -563,17 +572,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_key_no_session() {
-        let old_val = std::env::var("NEURALWATT_API_KEY").ok();
-        std::env::remove_var("NEURALWATT_API_KEY");
-
         let provider = NeuralWattProvider::new();
         let handle = CredentialHandle::implicit();
-        let attempt = provider.fetch_handle(&handle).await;
+        let attempt = provider.fetch_handle_from(&handle, |_| None).await;
 
         assert!(matches!(attempt.usage, Err(FetchError::NoSession(_))));
-
-        if let Some(val) = old_val {
-            std::env::set_var("NEURALWATT_API_KEY", val);
-        }
     }
 }

@@ -58,7 +58,13 @@ fn normalize_cookie_header(raw: &str) -> Option<String> {
 }
 
 fn load_cookie_header() -> Result<String, FetchError> {
-    env::first_env(COOKIE_ENV)
+    load_cookie_header_from(|key| std::env::var_os(key))
+}
+
+fn load_cookie_header_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<String, FetchError> {
+    env::first_env_from(COOKIE_ENV, lookup)
         .and_then(|raw| normalize_cookie_header(&raw))
         .ok_or_else(|| FetchError::NoSession("SAKANA_COOKIE is not set or empty".to_string()))
 }
@@ -382,11 +388,7 @@ impl UsageProvider for SakanaProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, sync::Mutex};
-
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Every condition on the redirect guard must be load-bearing.
     ///
@@ -506,15 +508,7 @@ mod tests {
 
     #[test]
     fn missing_cookie_environment_is_no_session() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous: Option<OsString> = std::env::var_os("SAKANA_COOKIE");
-        std::env::remove_var("SAKANA_COOKIE");
-        let result = load_cookie_header();
-        if let Some(value) = previous {
-            std::env::set_var("SAKANA_COOKIE", value);
-        }
+        let result = load_cookie_header_from(|_| None);
 
         assert!(matches!(result, Err(FetchError::NoSession(_))));
     }

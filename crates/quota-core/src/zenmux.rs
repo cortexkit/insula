@@ -76,7 +76,13 @@ fn clean_setting(value: Option<String>) -> Option<String> {
 }
 
 fn settings_from_env() -> Result<String, FetchError> {
-    clean_setting(env::first_env(API_KEY_ENV))
+    settings_from(|key| std::env::var_os(key))
+}
+
+fn settings_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<String, FetchError> {
+    clean_setting(env::first_env_from(API_KEY_ENV, lookup))
         .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))
 }
 
@@ -386,7 +392,9 @@ mod tests {
 
     #[test]
     fn missing_environment_settings_return_no_session() {
-        std::env::remove_var("ZENMUX_MANAGEMENT_API_KEY");
-        assert!(matches!(settings_from_env(), Err(FetchError::NoSession(_))));
+        assert!(matches!(
+            settings_from(|_| None),
+            Err(FetchError::NoSession(_))
+        ));
     }
 }

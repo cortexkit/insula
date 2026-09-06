@@ -72,8 +72,16 @@ fn non_empty(name: &str) -> Option<std::ffi::OsString> {
 
 /// Return the value of the first non-empty env var in `names`, trimmed.
 pub fn first_env(names: &[&str]) -> Option<String> {
+    first_env_from(names, |key| std::env::var_os(key))
+}
+
+/// Resolve the first non-empty value over an arbitrary environment.
+pub(crate) fn first_env_from(
+    names: &[&str],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
     for name in names {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = lookup(name) {
             let value = value.to_string_lossy().trim().to_string();
             if !value.is_empty() {
                 return Some(value);
@@ -145,22 +153,24 @@ mod tests {
 
     #[test]
     fn first_env_picks_first_non_empty() {
-        // Use unique names to avoid cross-test env pollution.
-        std::env::set_var("QUOTA_TEST_A", "");
-        std::env::set_var("QUOTA_TEST_B", "  bee  ");
-        std::env::set_var("QUOTA_TEST_C", "see");
+        let values = |name: &str| match name {
+            "QUOTA_TEST_A" => Some(std::ffi::OsString::from("")),
+            "QUOTA_TEST_B" => Some(std::ffi::OsString::from("  bee  ")),
+            "QUOTA_TEST_C" => Some(std::ffi::OsString::from("see")),
+            _ => None,
+        };
         assert_eq!(
-            first_env(&["QUOTA_TEST_A", "QUOTA_TEST_B", "QUOTA_TEST_C"]).as_deref(),
+            first_env_from(&["QUOTA_TEST_A", "QUOTA_TEST_B", "QUOTA_TEST_C"], values).as_deref(),
             Some("bee")
         );
-        std::env::remove_var("QUOTA_TEST_A");
-        std::env::remove_var("QUOTA_TEST_B");
-        std::env::remove_var("QUOTA_TEST_C");
     }
 
     #[test]
     fn first_env_none_when_all_absent() {
-        assert_eq!(first_env(&["QUOTA_TEST_DEFINITELY_UNSET_XYZ"]), None);
+        assert_eq!(
+            first_env_from(&["QUOTA_TEST_DEFINITELY_UNSET_XYZ"], |_| None),
+            None
+        );
     }
 
     /// A missing credential file and an unreadable one are different states,

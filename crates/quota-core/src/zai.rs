@@ -299,9 +299,15 @@ fn resolve_quota_url() -> String {
 }
 
 fn team_context_from_env() -> Option<ZaiTeamContext> {
+    team_context_from(|key| std::env::var_os(key))
+}
+
+fn team_context_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<ZaiTeamContext> {
     Some(ZaiTeamContext {
-        organization: env::first_env(&[BIGMODEL_ORGANIZATION_ENV])?,
-        project: env::first_env(&[BIGMODEL_PROJECT_ENV])?,
+        organization: env::first_env_from(&[BIGMODEL_ORGANIZATION_ENV], &lookup)?,
+        project: env::first_env_from(&[BIGMODEL_PROJECT_ENV], lookup)?,
     })
 }
 
@@ -384,40 +390,7 @@ impl UsageProvider for ZaiProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, sync::Mutex};
-
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
 
     #[test]
     fn normalizes_quota_limit_payload() {
@@ -534,21 +507,24 @@ mod tests {
 
     #[test]
     fn team_env_builds_scoped_request_with_bigmodel_headers() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _organization = EnvGuard::set(BIGMODEL_ORGANIZATION_ENV, "org-test");
-        let _project = EnvGuard::remove(BIGMODEL_PROJECT_ENV);
         let base_url = format!("{DEFAULT_BASE}/api/monitor/usage/quota/limit");
+        let personal_context = team_context_from(|key| match key {
+            BIGMODEL_ORGANIZATION_ENV => Some(std::ffi::OsString::from("org-test")),
+            _ => None,
+        });
 
         let personal =
-            build_quota_request("zai-test-token", base_url.clone(), team_context_from_env())
-                .unwrap();
+            build_quota_request("zai-test-token", base_url.clone(), personal_context).unwrap();
         assert_eq!(personal.url, base_url);
         assert!(personal.header("Bigmodel-Organization").is_none());
         assert!(personal.header("Bigmodel-Project").is_none());
 
-        std::env::set_var(BIGMODEL_PROJECT_ENV, "proj-test");
-        let team =
-            build_quota_request("zai-test-token", base_url, team_context_from_env()).unwrap();
+        let team_context = team_context_from(|key| match key {
+            BIGMODEL_ORGANIZATION_ENV => Some(std::ffi::OsString::from("org-test")),
+            BIGMODEL_PROJECT_ENV => Some(std::ffi::OsString::from("proj-test")),
+            _ => None,
+        });
+        let team = build_quota_request("zai-test-token", base_url, team_context).unwrap();
 
         assert_eq!(
             team.url,

@@ -161,23 +161,14 @@ impl ClinePassProvider {
             http: crate::http::provider_client(),
         }
     }
-}
 
-impl Default for ClinePassProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl UsageProvider for ClinePassProvider {
-    fn name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    async fn fetch_handle_from(
+        &self,
+        _handle: &CredentialHandle,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let raw_key = env::first_env(API_KEY_ENV)
+            let raw_key = env::first_env_from(API_KEY_ENV, lookup)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
             // Set but empty: configured wrong rather than not configured.
             let api_key = clean_key(raw_key).ok_or_else(|| {
@@ -194,6 +185,24 @@ impl UsageProvider for ClinePassProvider {
         }
         .await;
         FetchAttempt::from_provider_usage(result)
+    }
+}
+
+impl Default for ClinePassProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl UsageProvider for ClinePassProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        self.fetch_handle_from(handle, |key| std::env::var_os(key))
+            .await
     }
 }
 
@@ -421,21 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_handle_missing_key_returns_no_session() {
-        let prev_cline = std::env::var("CLINE_API_KEY").ok();
-        let prev_clinepass = std::env::var("CLINEPASS_API_KEY").ok();
-        std::env::remove_var("CLINE_API_KEY");
-        std::env::remove_var("CLINEPASS_API_KEY");
-
         let provider = ClinePassProvider::new();
-        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
-        assert!(matches!(attempt.usage, Err(FetchError::NoSession(_))));
+        let attempt = provider
+            .fetch_handle_from(&CredentialHandle::implicit(), |_| None)
+            .await;
 
-        if let Some(val) = prev_cline {
-            std::env::set_var("CLINE_API_KEY", val);
-        }
-        if let Some(val) = prev_clinepass {
-            std::env::set_var("CLINEPASS_API_KEY", val);
-        }
+        assert!(matches!(attempt.usage, Err(FetchError::NoSession(_))));
     }
 
     #[test]
