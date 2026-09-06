@@ -335,6 +335,29 @@ fn normalize_subscription_stats(body: &[u8]) -> Result<Option<Vec<ExtraWindow>>,
     Ok((!windows.is_empty()).then_some(windows))
 }
 
+/// The timezone this module claims when asking Kimi for usage.
+///
+/// **`TZ` IS ABSENT IN THE SUPERVISED PROCESS**, measured on the running pid
+/// rather than in a shell (2026-09-06). launchd sets it for nobody, so this
+/// header has always read `UTC` in production while every interactive check from
+/// a terminal — where `TZ` is often set — showed the operator's real zone. A
+/// value correct where the author looks and absent where the process runs.
+///
+/// KEPT AS-IS, and the reason is what makes it safe rather than lucky. Upstream
+/// treats `r-timezone` as a rendering hint for the console's own display; the
+/// quota figures this module reads are absolute counts and epoch-stamped resets,
+/// neither of which is zone-relative. So a wrong zone changes nothing we parse.
+///
+/// That is a claim about a header whose effect we cannot see from here, so it is
+/// stated as the reason rather than assumed: if a future payload ever carries a
+/// zone-relative field — a local-midnight boundary, a day-partitioned count —
+/// this becomes a live defect and the fix is to read the host zone from the OS
+/// rather than from the environment, the way a peer replaced `$HOSTNAME` with
+/// `gethostname` on exactly this class.
+///
+/// `UTC` is deliberately not a sentinel in the dangerous sense: it is a real
+/// zone that makes the request well-formed, and the alternative — omitting the
+/// header — would diverge from the upstream client this lane mirrors.
 fn request_timezone() -> String {
     std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string())
 }
