@@ -98,6 +98,17 @@ step "endpoint host manifest"
 # manufacture an entry -- the failure mode that broke a fleet census the same day.
 python3 scripts/endpoint-hosts.py || fail "endpoint host manifest is out of date"
 
+step "train preconditions"
+# Same reasoning as the endpoint manifest above: RUN rather than trusted. These
+# three facts about ci.yml were each verified by hand once and then relied on
+# indefinitely, and a narrowed trigger or a newly path-dependent job stays
+# invisible until branch protection is enabled -- at which point main becomes
+# unpushable and it presents as a protection fault.
+#
+# Here as well as in CI because a workflow edit should fail before the push that
+# carries it, not on the run it breaks.
+./scripts/check-train-preconditions.sh || fail "train preconditions drifted"
+
 step "cargo fmt --check"
 cargo fmt --check || fail "formatting"
 

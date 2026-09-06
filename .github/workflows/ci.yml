@@ -120,6 +120,18 @@ jobs:
         with:
           path: insula
 
+      # BEFORE THE SIBLING CHECKOUT, so a sibling failure cannot mask it and so
+      # drift fails in seconds rather than after the full matrix.
+      #
+      # The three facts the CI-gated push shape rests on were each verified by
+      # hand once and then trusted. They are facts about THIS FILE, which keeps
+      # being edited, and a narrowed trigger goes unnoticed until the day branch
+      # protection is enabled -- when the symptom is main becoming unpushable and
+      # it reads as a protection fault rather than a workflow one.
+      - name: Train preconditions
+        working-directory: insula
+        run: ./scripts/check-train-preconditions.sh
+
       # quota-module path-deps the private cortexkit/subconscious sibling
       # (subc-protocol/subc-transport, plus subc-core as a dev-dep). The default
       # GITHUB_TOKEN is scoped to this repo only, so mint a short-lived token from the
