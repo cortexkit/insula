@@ -35,9 +35,8 @@ use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind,
-        SignalAnchor, SignalCadence, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+        SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1109,24 +1108,29 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // as "not reached yet" when it is a decision with a paragraph behind it. A
     // deliberate None and an unwritten one are identical on the wire and
     // opposite facts about the author.
-    ModuleManifest::builder(
-        module_id.to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: Vec::new(),
-            },
-        },
-    )
-    .protocol_ver(PROTOCOL_VERSION)
+    ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .protocol_ver(PROTOCOL_VERSION)
+        // TRUST TIER AND BINDINGS ARE DELIBERATELY OMITTED, and the omission is a
+        // correction rather than a migration shortcut.
+        //
+        // Until subc-protocol 0.19.0 both were REQUIRED positional arguments, so
+        // this module had to state a storage binding whether or not it had storage.
+        // It declared `StorageKind::Sqlite` with `scope: Project`. That was FALSE:
+        // insula owns exactly one file, `redemptions.json`, written by temp-file
+        // and rename, and reads Chrome's SQLite cookie store READ-ONLY as somebody
+        // else's database. There has never been a SQLite database of ours to bind.
+        //
+        // The declaration was invisible because the daemon evaluates neither field
+        // on any production path (documented at their setters), so a false value
+        // cost nothing and produced no symptom. It is discovery metadata a human
+        // reads in a catalog listing, which makes it exactly the kind of claim that
+        // stays wrong indefinitely: no consumer branches on it, so no consumer
+        // notices.
+        //
+        // `StorageKind` has one variant, `Sqlite`, so there is no honest value to
+        // state -- and now that the field is optional, ABSENT is the true answer.
+        // Stating a storage kind we do not have would be worse than saying nothing,
+        // in the same way a plausible sentinel is worse than a refusal.
     .provides(
         vec![ProviderRole::ManagementSurface {
             operations: vec![

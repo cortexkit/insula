@@ -36,8 +36,7 @@ use subc_core::{
 };
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
     },
     session::{ModuleControlRequest, ModuleControlResponse},
     Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION,
@@ -135,75 +134,63 @@ impl Drop for VaultStub {
 fn vault_manifest() -> ModuleManifest {
     // Builder, not a literal: ModuleManifest is #[non_exhaustive] upstream, so
     // a new field is a compile error here rather than a silent default.
-    ModuleManifest::builder(
-        VAULT_MODULE_ID.to_string(),
-        "test-stub".to_string(),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: false,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: Vec::new(),
-            },
-        },
-    )
-    .protocol_ver(PROTOCOL_VERSION)
-    .provides(vec![ProviderRole::ManagementSurface {
-        operations: vec![
-            // No description on either: the stub mirrors what the real vault
-            // declares, and inventing copy for another module's operations
-            // would put words in its manifest that nothing here can check.
-            ManagementOperation {
-                name: "credential.get".to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: "credential.report_auth_failure".to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-        ],
-        config_schema: serde_json::json!({"type":"object"}),
-        observability: Vec::new(),
-        identity_scope: Vec::new(),
-        // The stub mirrors the module's own declaration; a vault stub that
-        // claimed different ordering would test a manifest nothing ships.
-        concurrency: Concurrency::StatelessParallel,
-    }])
-    .consumes(Vec::new())
-    .self_signals(
-        // An empty list, not None. The two are wire-distinct as of subc-protocol
-        // 0.14.0: None means the module has not adopted the vocabulary, an empty
-        // list is an affirmative "examined, and there are none".
-        //
-        // This stub was examined -- it drives frames and nothing else, running no
-        // refresher and spending nothing -- so the affirmative zero is the true
-        // statement. Declaring None would say the question had not been asked,
-        // which is false for a manifest edited in the same commit that asked it.
-        Some(Vec::new()),
-    )
-    .provenance(
-        // None, for the same reason the operations carry no description: this
-        // stub stands in for ANOTHER module, and provenance is a claim about
-        // which source built a binary. Stamping this test's own build stamp here
-        // would attribute our provenance to the credential vault; inventing a
-        // plausible one would put an unmeasured fact in a field that exists to
-        // carry measured ones. A stub that cannot source it should say so.
-        None,
-    )
-    .capabilities(
-        // Mirrors the module's own `None`, for the reason on the line above about
-        // ordering: a stub declaring capabilities the real vault does not would
-        // exercise a handshake nothing ships.
-        None,
-    )
-    .build()
+    // Trust tier and bindings omitted, matching the module under test. This stub
+    // stands in for the credential vault, and inventing a storage binding for
+    // ANOTHER module would put a claim in its manifest that nothing here can
+    // check -- the same reason its operations carry no descriptions below.
+    ModuleManifest::builder(VAULT_MODULE_ID.to_string(), "test-stub".to_string())
+        .protocol_ver(PROTOCOL_VERSION)
+        .provides(vec![ProviderRole::ManagementSurface {
+            operations: vec![
+                // No description on either: the stub mirrors what the real vault
+                // declares, and inventing copy for another module's operations
+                // would put words in its manifest that nothing here can check.
+                ManagementOperation {
+                    name: "credential.get".to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+                ManagementOperation {
+                    name: "credential.report_auth_failure".to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+            ],
+            config_schema: serde_json::json!({"type":"object"}),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+            // The stub mirrors the module's own declaration; a vault stub that
+            // claimed different ordering would test a manifest nothing ships.
+            concurrency: Concurrency::StatelessParallel,
+        }])
+        .consumes(Vec::new())
+        .self_signals(
+            // An empty list, not None. The two are wire-distinct as of subc-protocol
+            // 0.14.0: None means the module has not adopted the vocabulary, an empty
+            // list is an affirmative "examined, and there are none".
+            //
+            // This stub was examined -- it drives frames and nothing else, running no
+            // refresher and spending nothing -- so the affirmative zero is the true
+            // statement. Declaring None would say the question had not been asked,
+            // which is false for a manifest edited in the same commit that asked it.
+            Some(Vec::new()),
+        )
+        .provenance(
+            // None, for the same reason the operations carry no description: this
+            // stub stands in for ANOTHER module, and provenance is a claim about
+            // which source built a binary. Stamping this test's own build stamp here
+            // would attribute our provenance to the credential vault; inventing a
+            // plausible one would put an unmeasured fact in a field that exists to
+            // carry measured ones. A stub that cannot source it should say so.
+            None,
+        )
+        .capabilities(
+            // Mirrors the module's own `None`, for the reason on the line above about
+            // ordering: a stub declaring capabilities the real vault does not would
+            // exercise a handshake nothing ships.
+            None,
+        )
+        .build()
 }
 
 async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
