@@ -1515,6 +1515,55 @@ mod tests {
         );
     }
 
+    /// Everything the manifest advertises is something the router will answer.
+    ///
+    /// I CLOSED THIS CLASS ONCE ON A HALF-TRUE REASON. Having fenced trust_tier,
+    /// bindings and consumes, I declared the remaining manifest fields safe
+    /// because they are either derived from the build or "exercised by the e2e".
+    /// `provides` is exercised only in ONE DIRECTION: the round-trip calls
+    /// `usage.get` and `usage.drops`, so an operation MISSING from the manifest
+    /// would fail loudly, while an operation ADVERTISED and not routed fails
+    /// nothing at all. Renaming the declared `usage.drops` to a method the
+    /// dispatcher has never heard of left the whole suite green.
+    ///
+    /// The consequence lands on a consumer rather than here. `provides` is what
+    /// `catalog.list` shows, so an over-declaration invites a call this module
+    /// answers with `unknown method` -- a contract failure the caller cannot
+    /// distinguish from a bug on their own side, and one no test of mine notices
+    /// because nothing of mine makes that call.
+    ///
+    /// Both sides are read from the same two constants, so a SPELLING cannot
+    /// drift. What this pins is the SET: exactly the operations the frame loop
+    /// dispatches on, no more.
+    #[test]
+    fn every_advertised_operation_is_one_the_router_answers() {
+        let m = manifest("insula");
+
+        let advertised: Vec<&str> = m
+            .provides
+            .iter()
+            .flat_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => operations
+                    .iter()
+                    .map(|op| op.name.as_str())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+
+        // The dispatcher's own accept set, as `handle_usage_request` branches on
+        // it. Kept as a literal list rather than derived, because deriving it from
+        // the same constants the manifest uses would make the two sides agree by
+        // construction and assert nothing.
+        assert_eq!(
+            advertised,
+            vec!["usage.get", "usage.drops"],
+            "the manifest advertises what catalog.list shows a consumer; an \
+             operation listed here and not dispatched answers `unknown method` \
+             to a caller who read the catalog and did nothing wrong"
+        );
+    }
+
     #[test]
     fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
         let m = manifest("insula");
