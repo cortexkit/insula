@@ -177,6 +177,78 @@ fn unmask(masked: &[u8]) -> String {
         .collect()
 }
 
+/// Diagnostic access to the cloud quota call, for the live probe example.
+///
+/// EXISTS BECAUSE THE QUESTION IS ABOUT THE REQUEST, NOT THE NORMALISER. Our
+/// cloud lane and the editor's own language server disagree about one of the two
+/// pools on the same account in the same second, and the only difference between
+/// the two requests is the `project` field. Answering that needs the raw upstream
+/// body for both spellings of the request, which no public path exposes.
+///
+/// `doc(hidden)` rather than private because an example is a separate crate: the
+/// alternative is copying the token exchange and the request shape into the
+/// example, where they would drift from the lane they are supposed to be
+/// measuring, and a probe that measures a copy of the request answers nothing.
+#[doc(hidden)]
+impl AntigravityProvider {
+    /// The plugin account store as the lane reads it, reduced to the three
+    /// fields the probe needs: email, project, refresh token.
+    pub fn probe_plugin_accounts(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        stored_accounts()
+            .into_iter()
+            .map(|a| (a.email, a.managed_project_id, a.refresh_token))
+            .collect()
+    }
+
+    /// Exchange a refresh token, exactly as the lane does.
+    ///
+    /// Safe to call repeatedly: Google's refresh tokens do not rotate on
+    /// exchange, which is the invariant the whole plugin lane rests on and is
+    /// re-verified at its call sites.
+    pub async fn probe_access_token(&self, refresh_token: &str) -> Result<String, FetchError> {
+        self.exchange_refresh_token(refresh_token).await
+    }
+
+    /// The raw summary body for an arbitrary request body.
+    ///
+    /// Takes the whole body rather than a project string because the question
+    /// outgrew the project: the endpoint answers with a DIFFERENT pool depending
+    /// on request context we may not be sending, and finding which field carries
+    /// that means trying several spellings against the live endpoint.
+    ///
+    /// Returns the body UNPARSED so the comparison is against what the endpoint
+    /// said rather than against our reading of it.
+    pub async fn probe_quota_summary(
+        &self,
+        access_token: &str,
+        request_body: serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<String, FetchError> {
+        let body =
+            serde_json::to_vec(&request_body).map_err(|e| FetchError::Decode(e.to_string()))?;
+        let response = if extra_headers.is_empty() {
+            self.post_quota(&self.quota_summary_url, body, access_token)
+                .await?
+        } else {
+            // Vary headers against the shipped request. The body was ruled out --
+            // the project changes nothing and every tier spelling is refused --
+            // so what remains different from the editor is CALLER IDENTITY, which
+            // this endpoint is known to resolve entitlement from.
+            let mut request = JsonRequest::post_json(&self.quota_summary_url, body)
+                .bearer(access_token)
+                .header(Header::new("User-Agent", REMOTE_USER_AGENT));
+            for (name, value) in extra_headers {
+                request = request.header(Header::new(name, value.clone()));
+            }
+            request
+                .timeout(REQUEST_TIMEOUT)
+                .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
+                .await?
+        };
+        Ok(String::from_utf8_lossy(&response.body).into_owned())
+    }
+}
+
 fn oauth_client_id() -> String {
     crate::env::first_env(CLIENT_ID_ENV).unwrap_or_else(|| unmask(ANTIGRAVITY_CLIENT_ID_MASKED))
 }
