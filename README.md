@@ -175,6 +175,13 @@ cargo run -p quota-core --example ollama-labels
 # each stage separately and asks the billing function whether it answers on the
 # same cookie:
 cargo run -p quota-core --example opencode-stage
+
+# vary request context against the cloud Code Assist endpoint to establish why
+# it reports a different Gemini pool than the local editor. It prints the raw
+# response across variations (project field, tier id, caller headers) and
+# confirmed that Code Assist resolves tier entitlement from the OAuth client id
+# rather than from any request parameter:
+cargo run -p quota-core --example antigravity-project-scope
 ```
 
 ### Repository sweeps

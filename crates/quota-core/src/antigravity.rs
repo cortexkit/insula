@@ -260,18 +260,18 @@ fn oauth_client_secret() -> String {
 
 /// One logged-in account as the plugin stores it.
 #[derive(Debug, Clone, Deserialize)]
-struct StoredAccount {
+pub struct StoredAccount {
     #[serde(default)]
-    email: Option<String>,
+    pub email: Option<String>,
     #[serde(default, rename = "refreshToken")]
-    refresh_token: Option<String>,
+    pub refresh_token: Option<String>,
     #[serde(default, rename = "managedProjectId")]
-    managed_project_id: Option<String>,
+    pub managed_project_id: Option<String>,
     /// The plugin's own switch. A disabled account is one the user turned off,
     /// so reporting its quota would describe capacity they have chosen not to
     /// use -- and absent is treated as enabled, matching the plugin's default.
     #[serde(default)]
-    enabled: Option<bool>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,16 +330,81 @@ fn account_handle_name(account: &StoredAccount, index: usize) -> String {
 const QUOTA_SUMMARY_PATH: &str =
     "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 
+/// Query the editor's signed-in account email to guard against attributing a local
+/// session to the wrong account when multiple Google accounts exist.
+const USER_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+
+#[derive(Deserialize)]
+struct UserStatusEnvelope {
+    #[serde(default)]
+    response: Option<UserStatusBody>,
+    #[serde(default, rename = "userStatus")]
+    user_status: Option<UserStatus>,
+}
+
+#[derive(Deserialize)]
+struct UserStatusBody {
+    #[serde(default, rename = "userStatus")]
+    user_status: Option<UserStatus>,
+}
+
+#[derive(Deserialize)]
+struct UserStatus {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Extract the signed-in account email from a GetUserStatus JSON RPC response.
+///
+/// Returns None if the payload is malformed, the call was refused, or the email
+/// field is absent or empty. An unattributable snapshot must never be attributed
+/// to a named account.
+fn parse_user_status_email(body: &str) -> Option<String> {
+    let envelope: UserStatusEnvelope = serde_json::from_str(body).ok()?;
+    let status = envelope
+        .response
+        .and_then(|r| r.user_status)
+        .or(envelope.user_status)?;
+    status
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+}
+
+/// Case-insensitive trimmed email comparison for the Antigravity account guard.
+///
+/// Returns true only when both expected and local emails are present, non-empty,
+/// and match case-insensitively after trimming. An absent or blank email never matches.
+fn emails_match(expected: Option<&str>, local: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    let Some(local) = local.map(str::trim).filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    expected.eq_ignore_ascii_case(local)
+}
+
 const SESSION_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
 
 // ---- process + port discovery (macOS) ---------------------------------------
 
 /// A discovered Antigravity language-server process and how to talk to it.
-struct LocalServer {
-    pid: i32,
+#[derive(Clone, Debug)]
+pub struct LocalServer {
+    pub pid: i32,
     /// CSRF token for the request header. Empty for the CLI (which needs none).
-    csrf_token: String,
+    pub csrf_token: String,
+}
+
+/// A parsed local quota snapshot paired with the signed-in account email if available.
+#[derive(Clone, Debug)]
+struct LocalSnapshot {
+    usage: Usage,
+    email: Option<String>,
 }
 
 /// Whether a command line is an Antigravity language server or `agy` CLI, and the
@@ -992,6 +1057,9 @@ pub struct AntigravityProvider {
     quota_url: String,
     quota_summary_url: String,
     token_url: String,
+    local_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<LocalSnapshot>)>>,
+    local_endpoints: Option<Vec<(LocalServer, u16)>>,
+    override_accounts: Option<Vec<StoredAccount>>,
 }
 
 impl AntigravityProvider {
@@ -1015,7 +1083,30 @@ impl AntigravityProvider {
             quota_url: REMOTE_QUOTA_URL.to_string(),
             quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
+            local_cache: std::sync::Mutex::new(None),
+            local_endpoints: None,
+            override_accounts: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_local_endpoints(&mut self, endpoints: Vec<(LocalServer, u16)>) {
+        self.local_endpoints = Some(endpoints);
+        if let Ok(mut guard) = self.local_cache.lock() {
+            *guard = None;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_override_accounts(&mut self, accounts: Vec<StoredAccount>) {
+        self.override_accounts = Some(accounts);
+    }
+
+    fn stored_accounts(&self) -> Vec<StoredAccount> {
+        if let Some(accounts) = &self.override_accounts {
+            return accounts.clone();
+        }
+        stored_accounts()
     }
 
     /// Fetch one plugin-stored account's quota.
@@ -1026,7 +1117,7 @@ impl AntigravityProvider {
     /// longer than the hour these tokens live, so a cache would be a miss with
     /// extra state.
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
-        let accounts = stored_accounts();
+        let accounts = self.stored_accounts();
         let found = accounts
             .iter()
             .enumerate()
@@ -1050,6 +1141,34 @@ impl AntigravityProvider {
             .map(str::trim)
             .filter(|email| !email.is_empty())
             .map(|email| AccountObservation::new(Some(email.to_string()), None));
+
+        // 1. Probe the local agy / language-server lane first.
+        //
+        // WHY THE LOCAL LANE OUTRANKS A CREDENTIALED ONE:
+        // Normally, a stored cloud credential would take precedence over an ambient
+        // local desktop probe. Here the ordering is reversed because Google resolves
+        // Code Assist tier entitlement from the OAuth CLIENT the token was issued to:
+        // our cloud token comes from the opencode plugin client, which is only entitled
+        // to standard tier (~7% pool that never moves on a paid plan), whereas the local
+        // editor's own server sees the user's actual paid subscription tier (e.g. Google
+        // AI Ultra / ~58% pool).
+        //
+        // THE ACCOUNT GUARD:
+        // The local probe reports whichever account is signed into the running editor.
+        // If the user has multiple accounts, an unverified local probe would silently
+        // publish another account's quota under this handle's row. We therefore query
+        // GetUserStatus on the loopback server and require the email to match this
+        // handle's email case-insensitively. A mismatch, missing email, or absent local
+        // server falls through to the cloud lane.
+        if let Some(expected_email) = account.email.as_deref() {
+            let snapshots = self.probe_local_snapshots().await;
+            if let Some(matching) = snapshots
+                .into_iter()
+                .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
+            {
+                return FetchAttempt::success(observed, PLUGIN_SOURCE, matching.usage);
+            }
+        }
 
         let refresh_token = account.refresh_token.clone().unwrap_or_default();
         let access_token = match self.exchange_refresh_token(&refresh_token).await {
@@ -1234,6 +1353,13 @@ impl AntigravityProvider {
         };
         let record_version = credential.record_version;
         let account_info = credential.account_info();
+        let observed_email = credential
+            .email
+            .as_deref()
+            .or(credential.account_id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
         let observed = Some(AccountObservation::new(
             credential
                 .account_id
@@ -1242,6 +1368,22 @@ impl AntigravityProvider {
                 .filter(|id| !id.is_empty()),
             Some(record_version),
         ));
+
+        // 1. Probe the local lane first if this vault handle's identity is known.
+        // A local editor outranks the cloud credential because the cloud credential is
+        // entitled to a different tier. If the local session matches this vault handle's
+        // identity, serve local usage.
+        if let Some(expected_email) = &observed_email {
+            let snapshots = self.probe_local_snapshots().await;
+            if let Some(matching) = snapshots
+                .into_iter()
+                .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
+            {
+                return FetchAttempt::success(observed, "vault", matching.usage)
+                    .with_account_info(account_info);
+            }
+        }
+
         let project = credential
             .project_id
             .clone()
@@ -1278,11 +1420,40 @@ impl AntigravityProvider {
         }
     }
 
+    /// Query GetUserStatus on the loopback server for the signed-in account email.
+    async fn probe_user_status(
+        &self,
+        server: &LocalServer,
+        scheme: &str,
+        port: u16,
+    ) -> Option<String> {
+        let url = format!("{scheme}://127.0.0.1:{port}{USER_STATUS_PATH}");
+        if !is_loopback_url(&url) {
+            return None;
+        }
+        let mut req = JsonRequest::post_json(url, b"{}".to_vec())
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Content-Type", "application/json"))
+            .header(Header::new("Connect-Protocol-Version", "1"));
+        if !server.csrf_token.is_empty() {
+            req = req.header(Header::new(
+                "X-Codeium-Csrf-Token",
+                server.csrf_token.clone(),
+            ));
+        }
+        let response = req.send(&self.http).await.ok()?;
+        parse_user_status_email(&String::from_utf8_lossy(&response))
+    }
+
     /// POST the quota-summary RPC to one discovered server/port. Returns the parsed
-    /// usage, or an error to try the next candidate. The local server may speak http
-    /// (the `agy` CLI, confirmed on the wire) or https-with-self-signed (the app
-    /// language server); try both loopback schemes.
-    async fn probe(&self, server: &LocalServer, port: u16) -> Result<Usage, FetchError> {
+    /// usage and the signed-in account email (if available), or an error to try the
+    /// next candidate. The local server may speak http (the `agy` CLI, confirmed on the wire)
+    /// or https-with-self-signed (the app language server); try both loopback schemes.
+    async fn probe(
+        &self,
+        server: &LocalServer,
+        port: u16,
+    ) -> Result<(Usage, Option<String>), FetchError> {
         let mut last_err =
             FetchError::Upstream(format!("no loopback scheme served quota on port {port}"));
         for scheme in ["http", "https"] {
@@ -1307,11 +1478,60 @@ impl AntigravityProvider {
             }
 
             match req.send(&self.http).await {
-                Ok(body) => return parse_quota_summary(&String::from_utf8_lossy(&body)),
+                Ok(body) => {
+                    let usage = parse_quota_summary(&String::from_utf8_lossy(&body))?;
+                    let email = self.probe_user_status(server, scheme, port).await;
+                    return Ok((usage, email));
+                }
                 Err(e) => last_err = e,
             }
         }
         Err(last_err)
+    }
+
+    /// Discover and probe running Antigravity servers on loopback, caching the
+    /// snapshot for 2 seconds to share discovery across concurrent handle fetches within a tick.
+    async fn probe_local_snapshots(&self) -> Vec<LocalSnapshot> {
+        let now = std::time::Instant::now();
+        if let Ok(guard) = self.local_cache.lock() {
+            if let Some((taken_at, snapshots)) = guard.as_ref() {
+                if now.duration_since(*taken_at) < Duration::from_secs(2) {
+                    return snapshots.clone();
+                }
+            }
+        }
+
+        let candidates = if let Some(endpoints) = &self.local_endpoints {
+            endpoints.clone()
+        } else {
+            let servers = tokio::task::spawn_blocking(discover_servers)
+                .await
+                .unwrap_or_else(|_join_error| Vec::new());
+            let mut list = Vec::new();
+            for server in servers {
+                let pid = server.pid;
+                let ports = tokio::task::spawn_blocking(move || discover_ports(pid))
+                    .await
+                    .unwrap_or_else(|_join_error| Vec::new());
+                for port in ports {
+                    list.push((server.clone(), port));
+                }
+            }
+            list
+        };
+
+        let mut snapshots = Vec::new();
+        for (server, port) in &candidates {
+            if let Ok((usage, email)) = self.probe(server, *port).await {
+                snapshots.push(LocalSnapshot { usage, email });
+            }
+        }
+
+        if let Ok(mut guard) = self.local_cache.lock() {
+            *guard = Some((now, snapshots.clone()));
+        }
+
+        snapshots
     }
 }
 
@@ -1393,7 +1613,7 @@ impl UsageProvider for AntigravityProvider {
         // ordinary install has, and the only one that can see more than one
         // account: the local probe reports whichever account the running editor
         // happens to be using, and a vault credential is minted per fleet host.
-        for (index, account) in stored_accounts().iter().enumerate() {
+        for (index, account) in self.stored_accounts().iter().enumerate() {
             credentialed.push(CredentialHandle::new(account_handle_name(account, index)));
         }
 
@@ -1412,38 +1632,31 @@ impl UsageProvider for AntigravityProvider {
         }
 
         let result: Result<ProviderUsage, FetchError> = async {
-            let servers = tokio::task::spawn_blocking(discover_servers)
-                .await
-                .unwrap_or_else(|_join_error| Vec::new());
+            let snapshots = self.probe_local_snapshots().await;
+            if let Some(snapshot) = snapshots.into_iter().next() {
+                return Ok(ProviderUsage::healthy(
+                    PROVIDER_NAME,
+                    None,
+                    "oauth",
+                    snapshot.usage,
+                ));
+            }
+
+            let servers = if let Some(endpoints) = &self.local_endpoints {
+                endpoints.iter().map(|(s, _)| s.clone()).collect()
+            } else {
+                tokio::task::spawn_blocking(discover_servers)
+                    .await
+                    .unwrap_or_else(|_join_error| Vec::new())
+            };
             if servers.is_empty() {
-                // Not "no credential here": this lane reads usage from the
-                // running editor, so its absence tracks whether someone has the
-                // application open, not whether the provider is configured.
                 return Err(FetchError::LocalSourceUnavailable(
                     "no Antigravity language server or agy CLI process running".to_string(),
                 ));
             }
-
-            // Processes were found but none answered -- one may be starting up
-            // or shutting down, which resolves on its own like the absent case.
-            let mut last_err = FetchError::LocalSourceUnavailable(
+            Err(FetchError::LocalSourceUnavailable(
                 "no Antigravity loopback port served quota".to_string(),
-            );
-            for server in &servers {
-                let pid = server.pid;
-                let ports = tokio::task::spawn_blocking(move || discover_ports(pid))
-                    .await
-                    .unwrap_or_else(|_join_error| Vec::new());
-                for port in ports {
-                    match self.probe(server, port).await {
-                        Ok(usage) => {
-                            return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "oauth", usage));
-                        }
-                        Err(e) => last_err = e,
-                    }
-                }
-            }
-            Err(last_err)
+            ))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -2166,5 +2379,367 @@ mod plugin_lane_tests {
     #[test]
     fn the_plugin_lane_uses_the_existing_oauth_source() {
         assert_eq!(PLUGIN_SOURCE, "oauth");
+    }
+
+    const LOCAL_MOCK_QUOTA: &str = r#"{
+      "response": {
+        "groups": [
+          {
+            "displayName": "Gemini Models",
+            "buckets": [
+              {
+                "bucketId": "gemini-weekly",
+                "displayName": "Weekly Limit",
+                "window": "weekly",
+                "remainingFraction": 0.416,
+                "resetTime": "2026-09-10T18:41:37Z"
+              }
+            ]
+          }
+        ]
+      }
+    }"#;
+
+    const CLOUD_MOCK_QUOTA: &str = r#"{
+      "response": {
+        "groups": [
+          {
+            "displayName": "Gemini Models",
+            "buckets": [
+              {
+                "bucketId": "gemini-weekly",
+                "displayName": "Weekly Limit",
+                "window": "weekly",
+                "remainingFraction": 0.9285,
+                "resetTime": "2026-09-08T18:02:09Z"
+              }
+            ]
+          }
+        ]
+      }
+    }"#;
+
+    async fn spawn_mock_server<F>(handler: F) -> (u16, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(&str) -> (u16, Vec<u8>) + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = std::sync::Arc::new(handler);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                if request.is_empty() {
+                    break;
+                }
+                let first_line = request.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let (status, body) = handler(path);
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let headers = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, headers.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &body).await;
+            }
+        });
+        (port, task)
+    }
+
+    #[test]
+    fn parse_user_status_extracts_email_and_handles_absent_or_malformed() {
+        assert_eq!(
+            parse_user_status_email(r#"{"userStatus":{"email":"beatricelau0414@gmail.com"}}"#),
+            Some("beatricelau0414@gmail.com".to_string())
+        );
+        assert_eq!(
+            parse_user_status_email(
+                r#"{"response":{"userStatus":{"email":"beatricelau0414@gmail.com"}}}"#
+            ),
+            Some("beatricelau0414@gmail.com".to_string())
+        );
+        assert_eq!(
+            parse_user_status_email(r#"{"userStatus":{"email":"   "}}"#),
+            None
+        );
+        assert_eq!(parse_user_status_email(r#"{"userStatus":{}}"#), None);
+        assert_eq!(parse_user_status_email(r#"{}"#), None);
+        assert_eq!(parse_user_status_email("not json"), None);
+    }
+
+    #[test]
+    fn emails_match_is_case_insensitive_and_handles_whitespace_and_absence() {
+        assert!(emails_match(
+            Some("foo@example.com"),
+            Some("FOO@EXAMPLE.COM")
+        ));
+        assert!(emails_match(
+            Some("  foo@example.com "),
+            Some("foo@example.com")
+        ));
+        assert!(!emails_match(
+            Some("foo@example.com"),
+            Some("bar@example.com")
+        ));
+        assert!(!emails_match(Some("foo@example.com"), Some("   ")));
+        assert!(!emails_match(Some("foo@example.com"), None));
+        assert!(!emails_match(None, Some("foo@example.com")));
+        assert!(!emails_match(None, None));
+    }
+
+    /// 1. Local lane serves a credentialed handle when the identity matches.
+    #[tokio::test]
+    async fn local_lane_serves_a_credentialed_handle_when_the_identity_matches() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == QUOTA_SUMMARY_PATH {
+                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
+            } else if path == USER_STATUS_PATH {
+                (
+                    200,
+                    br#"{"userStatus":{"email":"beatricelau0414@gmail.com"}}"#.to_vec(),
+                )
+            } else if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(vec![(
+            LocalServer {
+                pid: 100,
+                csrf_token: String::new(),
+            },
+            port,
+        )]);
+        provider.set_override_accounts(vec![account(
+            Some("beatricelau0414@gmail.com"),
+            Some("refresh-tok"),
+            Some(true),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt.usage.expect("usage must be present");
+        let primary = usage.primary.as_ref().expect("primary window");
+
+        // Asserts LOCAL lane served (58.4% used, 2026-09-10 reset) rather than cloud (7.15%, 2026-09-08).
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-10T18:41:37Z"));
+        assert_eq!(primary.used_percent, 58.4);
+        assert_eq!(primary.window_minutes, Some(10080));
+        assert_eq!(
+            attempt
+                .observed
+                .as_ref()
+                .and_then(|o| o.account_id.as_deref()),
+            Some("beatricelau0414@gmail.com")
+        );
+        assert_eq!(attempt.source.as_deref(), Some("oauth"));
+    }
+
+    /// 2. Identity MISMATCH falls through to the cloud lane.
+    /// Asserts WHICH lane served: the cloud lane, not merely that some usage returned.
+    #[tokio::test]
+    async fn identity_mismatch_falls_through_to_the_cloud_lane() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == QUOTA_SUMMARY_PATH {
+                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
+            } else if path == USER_STATUS_PATH {
+                // Local editor is signed into a DIFFERENT account than the handle.
+                (
+                    200,
+                    br#"{"userStatus":{"email":"different_user@gmail.com"}}"#.to_vec(),
+                )
+            } else if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(vec![(
+            LocalServer {
+                pid: 100,
+                csrf_token: String::new(),
+            },
+            port,
+        )]);
+        provider.set_override_accounts(vec![account(
+            Some("beatricelau0414@gmail.com"),
+            Some("refresh-tok"),
+            Some(true),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt.usage.expect("usage must be present");
+        let primary = usage.primary.as_ref().expect("primary window");
+
+        // Asserts CLOUD lane served (7.15%, 2026-09-08 reset) because identity mismatched.
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-09-08T18:02:09Z"),
+            "mismatch must fall through to the cloud lane"
+        );
+        assert_eq!(
+            primary.used_percent, 7.15,
+            "mismatch must fall through to the cloud lane"
+        );
+    }
+
+    /// 3. Local snapshot with NO email does not serve a named handle.
+    /// Asserts WHICH lane served: the cloud lane, not the unattributable local lane.
+    #[tokio::test]
+    async fn local_snapshot_with_no_email_does_not_serve_a_named_handle() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == QUOTA_SUMMARY_PATH {
+                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
+            } else if path == USER_STATUS_PATH {
+                // GetUserStatus call fails or omits email.
+                (200, br#"{"userStatus":{}}"#.to_vec())
+            } else if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(vec![(
+            LocalServer {
+                pid: 100,
+                csrf_token: String::new(),
+            },
+            port,
+        )]);
+        provider.set_override_accounts(vec![account(
+            Some("beatricelau0414@gmail.com"),
+            Some("refresh-tok"),
+            Some(true),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt.usage.expect("usage must be present");
+        let primary = usage.primary.as_ref().expect("primary window");
+
+        // Asserts CLOUD lane served because the local snapshot carried no email to attribute.
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-09-08T18:02:09Z"),
+            "snapshot with no email must not serve a named handle"
+        );
+        assert_eq!(
+            primary.used_percent, 7.15,
+            "snapshot with no email must not serve a named handle"
+        );
+    }
+
+    /// 4. Local lane absent on a credentialed handle still reaches the cloud lane.
+    #[tokio::test]
+    async fn local_lane_absent_on_a_credentialed_handle_still_reaches_the_cloud_lane() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        // No local servers running at all.
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![account(
+            Some("beatricelau0414@gmail.com"),
+            Some("refresh-tok"),
+            Some(true),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt.usage.expect("usage must be present");
+        let primary = usage.primary.as_ref().expect("primary window");
+
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
+        assert_eq!(primary.used_percent, 7.15);
+    }
+
+    /// 5. Implicit handle still serves the local lane with no identity to match.
+    #[tokio::test]
+    async fn implicit_handle_still_serves_the_local_lane_with_no_identity_to_match() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == QUOTA_SUMMARY_PATH {
+                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
+            } else if path == USER_STATUS_PATH {
+                (200, br#"{"userStatus":{}}"#.to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(vec![(
+            LocalServer {
+                pid: 100,
+                csrf_token: String::new(),
+            },
+            port,
+        )]);
+        provider.set_override_accounts(Vec::new());
+
+        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        let usage = attempt.usage.expect("usage must be present");
+        let primary = usage.primary.as_ref().expect("primary window");
+
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-10T18:41:37Z"));
+        assert_eq!(primary.used_percent, 58.4);
+        assert_eq!(
+            attempt
+                .observed
+                .as_ref()
+                .and_then(|o| o.account_id.as_deref()),
+            None
+        );
     }
 }
