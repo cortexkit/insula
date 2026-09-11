@@ -598,13 +598,13 @@ impl ClientState {
             .await
             .map_err(|_| ClientFailure::Transport)??;
         if response.header.ty == FrameType::Error {
-                return Err(classify_error_frame(
-                    &response.body,
-                    &self.route_warming_retries,
-                ));
-            }
-            let value: Value =
-                serde_json::from_slice(&response.body).map_err(|_| ClientFailure::Protocol)?;
+            return Err(classify_error_frame(
+                &response.body,
+                &self.route_warming_retries,
+            ));
+        }
+        let value: Value =
+            serde_json::from_slice(&response.body).map_err(|_| ClientFailure::Protocol)?;
         let channel = value
             .get("route_channel")
             .and_then(Value::as_u64)
@@ -681,9 +681,8 @@ impl ClientState {
         .map_err(|_| ClientFailure::Protocol)?;
         let response = self.request(&connection, frame).await?;
         if response.header.ty == FrameType::Error {
-                let error =
-                    classify_error_frame(&response.body, &self.route_warming_retries);
-                if error == ClientFailure::RouteGone {
+            let error = classify_error_frame(&response.body, &self.route_warming_retries);
+            if error == ClientFailure::RouteGone {
                 self.invalidate_route(route).await;
             }
             return Err(error);
@@ -1342,7 +1341,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn classify(code: &str) -> ClientFailure {
-        classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes(), &AtomicU64::new(0))
+        classify_error_frame(
+            format!(r#"{{"code":"{code}"}}"#).as_bytes(),
+            &AtomicU64::new(0),
+        )
     }
 
     /// A daemon restart must not cost a vault lane a non-transient backoff.
@@ -2349,7 +2351,10 @@ mod tests {
             "unknown channel 7",
         ))
         .unwrap();
-        assert_eq!(classify_error_frame(&body, &AtomicU64::new(0)), ClientFailure::RouteGone);
+        assert_eq!(
+            classify_error_frame(&body, &AtomicU64::new(0)),
+            ClientFailure::RouteGone
+        );
     }
 
     #[test]
