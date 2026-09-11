@@ -166,9 +166,17 @@ genuinely broken.
 
 ## Freshness comes from the producer, never from the poll
 
-Each entry carries its own `fetchedAt`: the wall-clock time of that slot's last
-**successful** fetch, unchanged by failed attempts. Anchor per-entry freshness
-on it.
+Each entry carries its own `fetchedAt`: the wall-clock time at which the served
+reading was **obtained from its source**, unchanged by failed attempts. Anchor
+per-entry freshness on it.
+
+Usually that is the moment this module fetched. It is not always: where a
+provider's real figure lives in a source this module does not poll, `fetchedAt`
+is when **that** source produced the value. `antigravity` served from the editor
+plugin's cache is the live instance, and
+[sizing a staleness threshold](#sizing-a-staleness-threshold) has the bound and
+the reasoning. The field's meaning is unchanged either way, which is the point of
+spelling it this way round: it dates the READING, not the request.
 
 Do not stamp poll time. On a transient failure this module keeps serving the
 last healthy window, so an entry can legitimately be much older than the
@@ -1122,6 +1130,26 @@ seconds and average 32. A consumer calling anything older than 30 seconds stale
 sees a live signal on **45%** of reads; at 60 seconds, 97%; at 90 seconds and
 beyond, 100%. Under 120 seconds — the same figure this module uses internally,
 for this reason — a healthy provider never reads stale.
+
+**One lane publishes an age this arithmetic does not bound, deliberately.** A
+provider whose real figure lives in a source *it* does not poll stamps the time
+that source was read, not the time we read the source. `antigravity` does this:
+for an account holding a paid tier, the correct pool is visible only to the local
+editor, so with the editor closed the entry is served from the editor plugin's
+own cache and carries **the cache's** timestamp. Such an entry can legitimately
+reach one hour, which is the bound past which it is withheld instead.
+
+The alternative was stamping the read time, which would have asserted a freshness
+we cannot support — the same objection that keeps `windsurf` deferred. So the
+older timestamp is the honest one, and a consumer applying its own threshold gets
+an accurate answer rather than a confident one.
+
+What this means for a threshold: **an entry aging past your bound is a reason to
+DISCOUNT a reading, never to conclude the producer is failing.** Health is the
+surface that answers the second question, and it reads `ok` throughout. If you
+need the distinction per-entry, `stale` is present exactly when a reading is
+being preserved through failures and absent on a cache-served entry, which is
+healthy and simply older than a poll.
 
 This is a floor rather than a period: it is time since the last *success*, so a
 provider retrying through failures legitimately ages past it. That is the
