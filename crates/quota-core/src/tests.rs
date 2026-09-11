@@ -6849,6 +6849,79 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
         "and it is serving, so the control is not vacuous"
     );
 
+    // NAMED when a vault handle SERVES while resolving nothing and a sibling
+    // resolves fine. This arm was missing until an antigravity record lost its
+    // identity: the metric stayed empty through that whole incident, because it
+    // required a FAILURE and the handle was serving perfectly.
+    //
+    // Serving is the more damaging half. An identity-less handle that carries
+    // usage trips the emission gate, which collapses every sibling for the
+    // provider into ONE UNLABELLED ROW so that two handles cannot publish the
+    // same account twice. One record without an account id therefore strips the
+    // label off a sibling that resolved its own identity, and withholds the
+    // provider from `complete_providers` so no consumer may prune its accounts.
+    // Nothing else on the snapshot says so: the provider is fresh, degraded is
+    // empty, and the wire looks like a provider that simply has one account.
+    let anonymising = CompletenessProvider::new(&["V1", "H2"], &[("V1", None), ("H2", Some("B"))]);
+    *anonymising.handles.lock().unwrap() = Ok(vec![
+        CredentialHandle::vault(
+            "V1",
+            crate::credential_source::VaultCapability::new("ckh_v1"),
+        ),
+        handle("H2"),
+    ]);
+    let collapsing = Registry::new(vec![Box::new(anonymising)]);
+    tick(&collapsing).await;
+    let collapsing_health = collapsing.health();
+    assert_eq!(
+        collapsing_health.handles_without_account,
+        vec!["complete".to_string()],
+        "a serving handle that anonymises a labelled sibling must be named"
+    );
+    assert_eq!(
+        collapsing_health.fresh, 1,
+        "and the provider is serving, so nothing else on the snapshot reports it"
+    );
+    assert!(
+        collapsing_health.degraded.is_empty(),
+        "and it is not a fault, which is why it needs its own line"
+    );
+
+    // Silent for a VAULT handle that serves while resolving nothing when NO
+    // sibling resolves either. This is the control for the serving arm above,
+    // and it is the load-bearing one: it proves the arm does not fire on the
+    // ordinary permanent state of a lane whose upstream has no account to name.
+    //
+    // The `anonymous` control below cannot do this job. `is_local()` is true for
+    // every handle except a vault one, so a plain named handle returns false
+    // before the arm is reached -- it is vacuous here, which is why widening the
+    // arm to fire unconditionally reddened nothing until this case existed.
+    //
+    // Without the sibling gate this fires forever on every such lane, and a
+    // number that is never zero when nothing is wrong stops being read.
+    let all_anonymous = CompletenessProvider::new(&["V1", "V2"], &[("V1", None), ("V2", None)]);
+    *all_anonymous.handles.lock().unwrap() = Ok(vec![
+        CredentialHandle::vault(
+            "V1",
+            crate::credential_source::VaultCapability::new("ckh_v1"),
+        ),
+        CredentialHandle::vault(
+            "V2",
+            crate::credential_source::VaultCapability::new("ckh_v2"),
+        ),
+    ]);
+    let anonymous_vault = Registry::new(vec![Box::new(all_anonymous)]);
+    tick(&anonymous_vault).await;
+    let anonymous_vault_health = anonymous_vault.health();
+    assert!(
+        anonymous_vault_health.handles_without_account.is_empty(),
+        "a provider whose handles all resolve nothing destroys no label, so it must not be named"
+    );
+    assert_eq!(
+        anonymous_vault_health.fresh, 1,
+        "and it is serving, so the control is not vacuous"
+    );
+
     // Silent when NO account resolves, which is a different fault with its own
     // line. Without this the metric would repeat every provider already named
     // by `unconfigured` or `degraded` — on a host where most adapters have no

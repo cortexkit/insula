@@ -1308,6 +1308,15 @@ impl Registry {
             // Reported separately from the buckets rather than as one of them,
             // so the conservation identity is untouched: a provider counted here
             // is still counted in exactly one bucket.
+            // Does any handle here resolve an identity? Load-bearing for the
+            // serving arm below, and computed over the same set the arm walks.
+            let has_identified_handle = keyed.iter().any(|(_, slot)| {
+                slot.observation
+                    .as_ref()
+                    .and_then(|observation| observation.account_id.as_deref())
+                    .is_some()
+            });
+
             if (has_fresh || has_stale)
                 && keyed.iter().any(|(key, slot)| {
                     // Vault handles only. One exists because somebody minted it,
@@ -1319,16 +1328,44 @@ impl Registry {
                     // identity while the vault lane beside it serves perfectly.
                     // Counting those named a provider whose only fault was
                     // shipping a lane nobody configured.
-                    !key.handle.is_local()
-                        && slot
-                            .observation
-                            .as_ref()
-                            .and_then(|observation| observation.account_id.as_deref())
-                            .is_none()
-                        && slot
-                            .entry
-                            .as_ref()
-                            .is_some_and(|entry| entry.error.is_some())
+                    if key.handle.is_local() {
+                        return false;
+                    }
+                    if slot
+                        .observation
+                        .as_ref()
+                        .and_then(|observation| observation.account_id.as_deref())
+                        .is_some()
+                    {
+                        return false;
+                    }
+                    let failing = slot
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.error.is_some());
+
+                    // THE SERVING ARM, ADDED AFTER THIS METRIC READ EMPTY THROUGH
+                    // THE INCIDENT IT EXISTS FOR. Requiring a failure missed the
+                    // more damaging half: an identity-less handle that is SERVING
+                    // trips the emission gate, which collapses every sibling for
+                    // the provider into one unlabelled row so that two handles
+                    // cannot publish the same account twice. One vault record
+                    // without an `account_id` therefore strips the label off a
+                    // sibling that resolved its identity perfectly, and withholds
+                    // the provider from `complete_providers` so no consumer may
+                    // prune its accounts. Seen on antigravity: one unlabelled row
+                    // where two labelled ones belonged, this metric empty
+                    // throughout, and the cause found by hand.
+                    //
+                    // Gated on a sibling that DID resolve, which is what keeps the
+                    // arm silent on a healthy host: a provider whose handles are
+                    // all identity-less destroys no label, because there was never
+                    // one to destroy -- the ordinary permanent state of a lane
+                    // whose credential carries no account. Without that gate this
+                    // fires forever on those, and a number that is never zero when
+                    // nothing is wrong stops being read within a week, taking the
+                    // real signal with it.
+                    failing || has_identified_handle
                 })
             {
                 handles_without_account.push(name.to_string());
