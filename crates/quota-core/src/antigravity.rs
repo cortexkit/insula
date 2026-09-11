@@ -272,6 +272,64 @@ pub struct StoredAccount {
     /// use -- and absent is treated as enabled, matching the plugin's default.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// The paid tier this account holds, as the plugin captured it at login.
+    ///
+    /// LOAD-BEARING FOR WHICH POOL WE MAY PUBLISH, not display. Google resolves
+    /// Code Assist entitlement from the OAuth client a token was issued to, and
+    /// the cloud lane's token -- ours or the vault's -- is only ever entitled to
+    /// the standard tier. Measured 2026-09-11 with `loadCodeAssist`: our
+    /// credential answers `allowedTiers: ["standard-tier"]` for an account the
+    /// editor reports as Google AI Ultra.
+    ///
+    /// So for an account that HOLDS a paid tier, the cloud lane answers about a
+    /// pool the user does not consume. This field is the free, local, no-network
+    /// way to know that before publishing it. `free-tier` here means the account
+    /// has no paid tier and the cloud lane is reporting its real pool.
+    #[serde(default, rename = "capturedPaidTierId")]
+    pub captured_paid_tier_id: Option<String>,
+}
+
+/// Does this account hold a paid tier the cloud lane cannot see?
+///
+/// Answered from the plugin store by email, so BOTH lanes can ask it: the vault
+/// lane resolves an email too, and the hazard is identical whichever credential
+/// dialled the cloud.
+///
+/// FALSE WHEN WE SIMPLY DO NOT KNOW -- no store, no matching account, no captured
+/// tier. A fleet host with a vault credential and no plugin install has no way to
+/// learn the tier, and withholding usage there would take a working lane dark on
+/// a suspicion. Positive evidence of a paid tier is required to withhold.
+fn account_holds_paid_tier(email: Option<&str>) -> bool {
+    let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    stored_accounts().iter().any(|account| {
+        account
+            .email
+            .as_deref()
+            .is_some_and(|stored| stored.trim().eq_ignore_ascii_case(email))
+            && account
+                .captured_paid_tier_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
+    })
+}
+
+/// Why a paid-tier account with no live editor session publishes nothing.
+///
+/// Deliberately `LocalSourceUnavailable` rather than a degraded entry: it is
+/// classified transient, so the last correct reading keeps serving while the
+/// editor is closed. Publishing the cloud number instead would replace a true
+/// figure with a confident wrong one -- a different pool, not a stale one -- and
+/// a router cannot tell those apart.
+fn paid_tier_needs_local_session() -> FetchError {
+    FetchError::LocalSourceUnavailable(
+        "this account holds a paid Antigravity tier, which only the local editor \
+         session can report: the cloud credential is entitled to the standard tier \
+         and would describe a pool this account does not use"
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1170,6 +1228,23 @@ impl AntigravityProvider {
             }
         }
 
+        // No live session for this account. Falling back to the cloud is right
+        // ONLY when the cloud answers about the pool this account actually uses.
+        // For an account holding a paid tier it does not, so publish nothing and
+        // let the last correct reading stand.
+        if account
+            .captured_paid_tier_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
+        {
+            return FetchAttempt::failure(
+                observed,
+                Some(PLUGIN_SOURCE.to_string()),
+                paid_tier_needs_local_session(),
+            );
+        }
+
         let refresh_token = account.refresh_token.clone().unwrap_or_default();
         let access_token = match self.exchange_refresh_token(&refresh_token).await {
             Ok(token) => token,
@@ -1382,6 +1457,21 @@ impl AntigravityProvider {
                 return FetchAttempt::success(observed, "vault", matching.usage)
                     .with_account_info(account_info);
             }
+        }
+
+        // Same rule as the plugin lane, and for the same reason: the vault's
+        // token is issued to the same OAuth client, so it reaches the same
+        // standard-tier pool. The tier is read from the plugin store by email
+        // because that is the only place on this host that records it; a host
+        // without the store answers false and keeps serving, which is the honest
+        // default when the tier is unknown rather than known-absent.
+        if account_holds_paid_tier(observed_email.as_deref()) {
+            return FetchAttempt::failure(
+                observed,
+                Some("vault".to_string()),
+                paid_tier_needs_local_session(),
+            )
+            .with_account_info(account_info);
         }
 
         let project = credential
@@ -2221,6 +2311,17 @@ mod plugin_lane_tests {
             refresh_token: token.map(str::to_string),
             managed_project_id: Some("proj-1".to_string()),
             enabled,
+            // Free tier by default so the existing cases keep exercising the
+            // cloud fallback. The paid-tier arm has its own fixtures below.
+            captured_paid_tier_id: Some("free-tier".to_string()),
+        }
+    }
+
+    /// The same account, holding a paid tier the cloud lane cannot see.
+    fn paid_account(email: Option<&str>, token: Option<&str>) -> StoredAccount {
+        StoredAccount {
+            captured_paid_tier_id: Some("g1-ultra-lite-tier".to_string()),
+            ..account(email, token, Some(true))
         }
     }
 
@@ -2702,6 +2803,103 @@ mod plugin_lane_tests {
 
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
         assert_eq!(primary.used_percent, 7.15);
+    }
+
+    /// A PAID-TIER account with no live editor session publishes NOTHING.
+    ///
+    /// The cloud lane is entitled to the standard tier, so for an account holding
+    /// a paid one it answers about a pool the user does not consume. Measured on
+    /// this host: the same account read 7.15% through the cloud and 58.41% in the
+    /// editor, and the 7.15% figure never moved because nothing spends it.
+    ///
+    /// Publishing that would replace a true reading with a confident wrong one --
+    /// a DIFFERENT POOL rather than a stale number, which a consumer cannot tell
+    /// from a real one. `LocalSourceUnavailable` is transient, so the last correct
+    /// reading keeps serving until the editor is open again.
+    ///
+    /// The paired free-tier case below is the control: it must still reach the
+    /// cloud, or this guard has taken a working lane dark.
+    #[tokio::test]
+    async fn a_paid_tier_account_without_a_local_session_publishes_nothing() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![paid_account(
+            Some("beatricelau0414@gmail.com"),
+            Some("refresh-tok"),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+
+        let error = attempt
+            .usage
+            .expect_err("a paid-tier account must not publish the standard-tier pool");
+        assert!(
+            matches!(error, FetchError::LocalSourceUnavailable(_)),
+            "must be the transient local class so the last good reading survives, got {error:?}"
+        );
+        assert_eq!(
+            classify(&error),
+            FetchClass::Transient,
+            "a closed editor is not a broken credential"
+        );
+    }
+
+    /// A FREE-TIER account with no live session still reaches the cloud.
+    ///
+    /// The control for the guard above, and the load-bearing half: for an account
+    /// with no paid tier the cloud lane reports the pool it really uses, so
+    /// withholding would take a correct lane dark. Measured on this host, the
+    /// second account reads 100% through the cloud and that figure is true.
+    #[tokio::test]
+    async fn a_free_tier_account_without_a_local_session_still_reaches_the_cloud() {
+        let (port, _server) = spawn_mock_server(move |path| {
+            if path == "/token" {
+                (200, br#"{"access_token":"mock-token"}"#.to_vec())
+            } else if path == "/cloud-quota" {
+                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+            } else {
+                (404, b"not found".to_vec())
+            }
+        })
+        .await;
+
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![account(
+            Some("ufukaltinok@gmail.com"),
+            Some("refresh-tok"),
+            Some(true),
+        )]);
+        provider.token_url = format!("http://127.0.0.1:{port}/token");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:ufukaltinok@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt
+            .usage
+            .expect("a free-tier account must still reach the cloud lane");
+        let primary = usage.primary.as_ref().expect("primary window");
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
     }
 
     /// 5. Implicit handle still serves the local lane with no identity to match.
