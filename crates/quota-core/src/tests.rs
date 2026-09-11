@@ -1914,7 +1914,12 @@ impl UsageProvider for CompletenessProvider {
                 FetchError::Unauthorized("token rejected".to_string()),
             );
         }
-        FetchAttempt::success(observed(account.as_deref()), "test", Usage::default())
+        // The source names the HANDLE, not the provider, so a test can observe
+        // which slot won a dedup. A constant here made a stable-label assertion
+        // compare one literal against itself and pass however the winner was
+        // chosen -- the vacuity that let the insula#17 label flap through.
+        let source: &'static str = if id.contains("H2") { "vault" } else { "oauth" };
+        FetchAttempt::success(observed(account.as_deref()), source, Usage::default())
     }
 }
 
@@ -2382,6 +2387,72 @@ async fn the_newest_reading_wins_the_dedup_not_the_latest_fetch() {
         "expected the 3-minute-old reading {newest_reading}, got {published}: \
              ordering on fetch completion serves whichever slot polled last, which \
              is how a published timestamp walks backwards"
+    );
+}
+
+/// Two slots holding the SAME reading publish the same `source` every tick.
+///
+/// The other half of insula#17, and the symptom that led the filer to the bug:
+/// one reading -- identical value, identical timestamp -- published alternately
+/// as `oauth` and `vault`, so a routine sweep counted 6 vault-backed lanes and
+/// then 5 twenty seconds later with nothing having changed.
+///
+/// When the readings agree, either slot is an equally correct answer, so the
+/// choice is free. A free choice RE-MADE each cycle is not neutral: the winner
+/// flips, and its provenance label rides along. Stability is the whole property
+/// here; which slot wins does not matter.
+///
+/// Driven through two full ticks with the monotonic clock advanced between them
+/// on the slot that would otherwise take the lead, because a single snapshot
+/// cannot observe a flip and that advance is exactly what the refresher does on
+/// every poll.
+#[tokio::test]
+async fn identical_readings_publish_a_stable_source_label() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("A"))],
+    ))]);
+    tick(&registry).await;
+
+    // One reading, held by both slots: the state a shared upstream cache leaves.
+    let shared = Utc::now() - chrono::Duration::minutes(4);
+    let base_instant = Instant::now();
+    let mut published = Vec::new();
+
+    for round in 0..2 {
+        {
+            let mut store = registry.store.lock().unwrap();
+            for (key, mut slot) in store.snapshot() {
+                slot.last_success_wall = Some(shared);
+                // Alternate which slot polled most recently, which is what the
+                // refresher produces and what used to decide the winner.
+                //
+                // Set ABSOLUTELY rather than incremented: incrementing the
+                // leader each round makes the two converge to the same value by
+                // round two, so the winner never flips and the test passes
+                // whether or not the stable key exists. That vacuity was real
+                // and was caught by the mutation below reddening nothing.
+                let leads =
+                    format!("{:?}", key.handle).contains(if round == 0 { "H1" } else { "H2" });
+                slot.last_success_at =
+                    Some(base_instant + Duration::from_secs(if leads { 120 } else { 60 }));
+                let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+                assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+            }
+        }
+        let entry = registry
+            .get_usage(None)
+            .await
+            .into_iter()
+            .find(|entry| entry.account.as_deref() == Some("A"))
+            .expect("the account serves");
+        published.push(entry.source.clone());
+    }
+
+    assert_eq!(
+        published[0], published[1],
+        "the same reading must publish the same source both times: a label that \
+             flips under an unchanged reading reads as a lane appearing and vanishing"
     );
 }
 

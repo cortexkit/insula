@@ -318,6 +318,27 @@ fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now
     }
 }
 
+/// A constant, arbitrary ordering key for a credential handle.
+///
+/// Exists only to make the dedup's LAST resort deterministic, where two slots
+/// carry readings that agree and the choice between them is therefore free. The
+/// requirement is stability across ticks, not meaning: a free choice re-made
+/// every cycle flips the published `source` label under an unchanged reading,
+/// which a consumer counting lanes reads as a lane appearing and vanishing.
+///
+/// `CredentialHandle` is deliberately not `Ord` -- these values have no natural
+/// order and inventing one on the type would invite sorting by it somewhere it
+/// would look meaningful. Keyed on the vault credential id rather than the
+/// capability, so RE-MINTING a handle for the same credential does not change
+/// the winner: the capability rotates, the id does not.
+fn stable_handle_key(key: &SlotKey) -> (u8, &str) {
+    match &key.handle {
+        CredentialHandle::ImplicitLocal => (0, ""),
+        CredentialHandle::Named(name) => (1, name.as_str()),
+        CredentialHandle::Vault { credential_id, .. } => (2, credential_id.as_str()),
+    }
+}
+
 /// Map a CodexBar provider name to its canonical models.dev slug, when one
 /// exists. Returns `None` for providers with no exact models.dev counterpart —
 /// including `kimi`, whose www.kimi.com consumer subscription is distinct from
@@ -853,15 +874,38 @@ impl Registry {
                 // else re-opens exactly this gap the moment another lane's value
                 // time stops tracking its fetch time.
                 //
-                // Monotonic `last_success_at` stays as the tiebreak beneath it. It
-                // cannot be the primary key for the reason above, and it is still
-                // the right decider when two readings are stamped identically,
-                // where it is immune to a wall clock that steps.
+                // WHEN THE READINGS ARE IDENTICAL THE CHOICE MUST BE STABLE, NOT
+                // RECENT. Two slots holding the same cache snapshot carry the same
+                // value and the same timestamp, so neither is a better answer --
+                // but deciding by who polled last makes the winner flip every
+                // cycle, and the winner's `source` label rides along. That is the
+                // other half of insula#17: one reading published alternately as
+                // `oauth` and `vault`, so a consumer counting vault-backed lanes
+                // watched the count flap with nothing changing. It is how the
+                // filer found the bug in the first place.
+                //
+                // So the final decider is the handle, which is arbitrary and
+                // CONSTANT. Picking the same slot every tick is the whole property;
+                // which slot it picks does not matter, because the readings agree.
+                //
+                // MONOTONIC FETCH TIME IS NOT A TIER HERE AT ALL, and having it as
+                // one was the first fix's own bug. Reasoning that it could still
+                // separate "two different readings sharing a wall stamp", I left it
+                // above the stable key -- where it fired on exactly the case the
+                // stable key exists for and flipped the winner anyway. Wall stamps
+                // carry nanoseconds: two readings sharing one ARE one reading, and
+                // there is nothing left for fetch time to separate. Caught only
+                // because the test observed the flip through a fixture that gives
+                // the two handles different source labels.
                 let should_replace = match candidates.get(account_id) {
-                    Some((_, current)) => {
+                    Some((current_key, current)) => {
                         let rank = service_rank(slot.status).cmp(&service_rank(current.status));
                         rank.then_with(|| current.last_success_wall.cmp(&slot.last_success_wall))
-                            .then_with(|| current.last_success_at.cmp(&slot.last_success_at))
+                            .then_with(|| {
+                                stable_handle_key(current_key)
+                                    .cmp(&stable_handle_key(key))
+                                    .reverse()
+                            })
                             .is_lt()
                     }
                     None => true,
