@@ -832,10 +832,36 @@ impl Registry {
                 // one to serve. Choosing by the figure instead would pin the
                 // account at its pre-reset percent until the older handle
                 // succeeded again.
+                // ORDERED BY WHEN THE READING WAS TAKEN, NOT WHEN WE FETCHED IT.
+                // Those were the same thing for every lane until a provider began
+                // serving a value from a source it does not poll, and the comment
+                // above -- "describes the account more recently" -- is the rule;
+                // fetch completion was merely a proxy for it that used to hold.
+                //
+                // It broke loudly. Two slots resolving one account (a vault handle
+                // and a plugin account of the same identity) each captured a
+                // different snapshot of antigravity's editor cache, then alternated
+                // as winner by whichever had fetched most recently -- publishing
+                // four readings in rotation, a 19-point swing with no consumption
+                // behind it, and a `fetchedAt` that stepped BACKWARDS by 56
+                // minutes. Reported from outside as insula#17 across 100 snapshots.
+                //
+                // `last_success_wall` is the field we PUBLISH as `fetchedAt`, so
+                // ordering on it makes the winner and its timestamp agree by
+                // construction: the served entry is the newest reading, and a
+                // stable account set cannot go backwards. Ordering on anything
+                // else re-opens exactly this gap the moment another lane's value
+                // time stops tracking its fetch time.
+                //
+                // Monotonic `last_success_at` stays as the tiebreak beneath it. It
+                // cannot be the primary key for the reason above, and it is still
+                // the right decider when two readings are stamped identically,
+                // where it is immune to a wall clock that steps.
                 let should_replace = match candidates.get(account_id) {
                     Some((_, current)) => {
                         let rank = service_rank(slot.status).cmp(&service_rank(current.status));
-                        rank.then_with(|| current.last_success_at.cmp(&slot.last_success_at))
+                        rank.then_with(|| current.last_success_wall.cmp(&slot.last_success_wall))
+                            .then_with(|| current.last_success_at.cmp(&slot.last_success_at))
                             .is_lt()
                     }
                     None => true,

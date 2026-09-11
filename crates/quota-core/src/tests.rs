@@ -2309,6 +2309,82 @@ async fn duplicate_handles_resolving_one_account_stay_complete() {
     );
 }
 
+/// The newest READING wins the dedup, not the slot that fetched most recently.
+///
+/// THE BUG THIS PINS PUBLISHED FOUR READINGS IN ROTATION AND A `fetchedAt` THAT
+/// STEPPED BACKWARDS BY 56 MINUTES. Two handles resolving one account each hold
+/// their own last-good value. While every lane fetched its value at the moment
+/// it polled, ordering by fetch completion and ordering by reading age were the
+/// same question, so fetch completion was used as the proxy.
+///
+/// A lane that serves a value from a source it does NOT poll -- antigravity
+/// reading the editor plugin's cache -- broke that equivalence. Each slot
+/// captured a different snapshot of that cache, then alternated as winner by
+/// whichever had polled last, publishing whichever cache snapshot it happened
+/// to be holding. A router saw a 19-point headroom swing with no consumption
+/// behind it. Reported from outside across 100 snapshots as insula#17.
+///
+/// So the slot that fetched LATER is given the OLDER reading here, which is the
+/// configuration the proxy gets wrong and the only one that distinguishes the
+/// two orderings. Asserting on `fetchedAt` rather than on the percent because
+/// the timestamp is what a consumer dedups and orders on, and the report's
+/// sharpest finding was that one percent appeared against two different
+/// timestamps -- so the value alone does not identify a reading.
+#[tokio::test]
+async fn the_newest_reading_wins_the_dedup_not_the_latest_fetch() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("A"))],
+    ))]);
+    tick(&registry).await;
+
+    let newest_reading = Utc::now() - chrono::Duration::minutes(3);
+    let stale_reading = Utc::now() - chrono::Duration::minutes(59);
+
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            let handle = format!("{:?}", key.handle);
+            // H2 polled MORE recently and holds the OLDER reading: the shape a
+            // cache-backed lane produces, and the one the old ordering inverts.
+            let (wall, monotonic) = if handle.contains("H2") {
+                (
+                    stale_reading,
+                    slot.last_success_at.map(|at| at + Duration::from_secs(30)),
+                )
+            } else {
+                (newest_reading, slot.last_success_at)
+            };
+            slot.last_success_wall = Some(wall);
+            slot.last_success_at = monotonic;
+            let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+            assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+        }
+    }
+
+    let entry = registry
+        .get_usage(None)
+        .await
+        .into_iter()
+        .find(|entry| entry.account.as_deref() == Some("A"))
+        .expect("the account serves");
+    let published = chrono::DateTime::parse_from_rfc3339(
+        entry
+            .fetched_at
+            .as_deref()
+            .expect("a served entry stamps it"),
+    )
+    .expect("canonical RFC3339")
+    .with_timezone(&Utc);
+
+    assert!(
+        (published - newest_reading).num_seconds().abs() < 2,
+        "expected the 3-minute-old reading {newest_reading}, got {published}: \
+             ordering on fetch completion serves whichever slot polled last, which \
+             is how a published timestamp walks backwards"
+    );
+}
+
 /// A successful enumeration returning no handles is complete with no entries.
 ///
 /// This is the only way a consumer is ever authorised to clear a provider
