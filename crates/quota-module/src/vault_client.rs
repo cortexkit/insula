@@ -199,6 +199,13 @@ struct ClientState {
     /// Frames the reader loop discarded, by class. See [`Self::dispatch`].
     unmatched_terminal_drops: AtomicU64,
     stale_generation_drops: AtomicU64,
+    /// Route opens refused because the credential module was still coming up.
+    ///
+    /// Published because the retry that follows is SILENT ON SUCCESS: the lane
+    /// recovers on the next tick and leaves no trace, so a working fix and a code
+    /// path that never executed are the same observable from outside. Those have
+    /// opposite investigations.
+    route_warming_retries: AtomicU64,
     next_corr: AtomicU64,
     request_timeout: Duration,
 }
@@ -216,6 +223,7 @@ impl ClientState {
             pending: Mutex::new(HashMap::new()),
             next_connection_generation: AtomicU64::new(1),
             next_route_generation: AtomicU64::new(1),
+            route_warming_retries: AtomicU64::new(0),
             unmatched_terminal_drops: AtomicU64::new(0),
             stale_generation_drops: AtomicU64::new(0),
             next_corr: AtomicU64::new(1),
@@ -436,6 +444,15 @@ impl ClientState {
         self.unmatched_terminal_drops.load(Ordering::Relaxed)
     }
 
+    /// Route opens refused because the credential module was still warming.
+    ///
+    /// Rising during a daemon restart is the mechanism working. Rising while
+    /// nothing is restarting is the interesting reading, and a flat zero across a
+    /// restart says the race did not happen rather than that the retry failed.
+    pub fn route_warming_retries(&self) -> u64 {
+        self.route_warming_retries.load(Ordering::Relaxed)
+    }
+
     /// Frames discarded because their caller belonged to an older connection.
     pub fn stale_generation_drops(&self) -> u64 {
         self.stale_generation_drops.load(Ordering::Relaxed)
@@ -581,10 +598,13 @@ impl ClientState {
             .await
             .map_err(|_| ClientFailure::Transport)??;
         if response.header.ty == FrameType::Error {
-            return Err(classify_error_frame(&response.body));
-        }
-        let value: Value =
-            serde_json::from_slice(&response.body).map_err(|_| ClientFailure::Protocol)?;
+                return Err(classify_error_frame(
+                    &response.body,
+                    &self.route_warming_retries,
+                ));
+            }
+            let value: Value =
+                serde_json::from_slice(&response.body).map_err(|_| ClientFailure::Protocol)?;
         let channel = value
             .get("route_channel")
             .and_then(Value::as_u64)
@@ -661,8 +681,9 @@ impl ClientState {
         .map_err(|_| ClientFailure::Protocol)?;
         let response = self.request(&connection, frame).await?;
         if response.header.ty == FrameType::Error {
-            let error = classify_error_frame(&response.body);
-            if error == ClientFailure::RouteGone {
+                let error =
+                    classify_error_frame(&response.body, &self.route_warming_retries);
+                if error == ClientFailure::RouteGone {
                 self.invalidate_route(route).await;
             }
             return Err(error);
@@ -778,6 +799,12 @@ impl VaultClient {
     /// rather than merely being correct.
     pub fn unmatched_terminal_drops(&self) -> u64 {
         self.state.unmatched_terminal_drops()
+    }
+
+    /// Route opens refused because the credential module was still warming.
+    /// See [`ClientState::route_warming_retries`] for why this is counted.
+    pub fn route_warming_retries(&self) -> u64 {
+        self.state.route_warming_retries()
     }
 
     /// Frames discarded because their caller belonged to an older connection.
@@ -954,7 +981,7 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
 /// sent an unparseable payload and sends them to this repo hunting a parse bug.
 /// That is how a router's "try again in a moment" became a five-minute outage
 /// with a misleading cause, reported as insula#14.
-fn classify_error_frame(body: &[u8]) -> ClientFailure {
+fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailure {
     use subc_protocol::error_codes as codes;
 
     let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
@@ -984,7 +1011,42 @@ fn classify_error_frame(body: &[u8]) -> ClientFailure {
         // registration, and whichever fires first can lose it by a millisecond --
         // so treating this as anything but a next-tick retry converts routine
         // startup ordering into a per-lane outage.
-        Some(codes::MODULE_RELOADING | codes::MODULE_WARMING) => ClientFailure::RouteGone,
+        //
+        // COUNTED, BECAUSE A SILENT SUCCESS AND A PATH NEVER TAKEN LOOK THE SAME.
+        // This arm was added to stop a daemon restart costing a lane 300 seconds,
+        // and it then produced no observable at all: "the retry worked" and "the
+        // arm was never entered" are both nothing, and they send a reader in
+        // opposite directions. The filer watched five restarts trying to witness
+        // it from outside and could not tell a clean miss from a silent hit.
+        //
+        // The same argument the `vaultUnmatchedDrops` comment makes on this
+        // surface, which is why the treatment now matches it: a COUNTER rather
+        // than a log line, because the recovery is per-lane per-restart and log
+        // lines at that cadence are noise, while the journal on a busy host is
+        // size-capped to hours and loses them anyway. A monotonic count read off
+        // the health surface has neither problem.
+        Some(code @ (codes::MODULE_RELOADING | codes::MODULE_WARMING)) => {
+            warming_retries.fetch_add(1, Ordering::Relaxed);
+            // The daemon's detail string is the half worth keeping, and it is
+            // already in hand here rather than needing to be plumbed: `state=`
+            // separates a restart mid-handshake from a module that is enabled and
+            // not coming back. Emitted only when the DETAIL is present, so the
+            // bare-code case stays silent and the line cannot become the noise the
+            // counter exists to avoid.
+            if let Some(detail) = value
+                .get("detail")
+                .or_else(|| value.pointer("/error/detail"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())
+            {
+                eprintln!(
+                    "{LOG_TAG} {CREDENTIALS_MODULE_ID} not ready ({code}), retrying: {}",
+                    quota_core::text::truncate_for_wire(detail, 200)
+                );
+            }
+            ClientFailure::RouteGone
+        }
         Some(codes::TARGET_UNAVAILABLE | codes::MODULE_TIMEOUT | "backend_error") => {
             ClientFailure::Transport
         }
@@ -1280,7 +1342,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn classify(code: &str) -> ClientFailure {
-        classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes())
+        classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes(), &AtomicU64::new(0))
     }
 
     /// A daemon restart must not cost a vault lane a non-transient backoff.
@@ -1305,6 +1367,55 @@ mod tests {
             VaultGetError::Transient,
             "a warming target is the textbook retry-next-tick case; failing closed \
              converts routine startup ordering into a 300s per-lane outage"
+        );
+    }
+
+    /// The warming retry is COUNTED, so a silent recovery is distinguishable from
+    /// a path that never ran.
+    ///
+    /// Without this the fix above has no observable at all: the lane retries on
+    /// the next tick and succeeds, leaving "it worked" and "the arm was never
+    /// entered" as the same nothing. The filer of insula#14 watched five daemon
+    /// restarts trying to witness it from outside and could not separate a clean
+    /// miss from a silent hit, which is what a counter is for.
+    ///
+    /// The must-not-fire half is the load-bearing one. A counter that also ticks
+    /// on unrelated route errors would rise on a healthy host, and a number that
+    /// is never zero when nothing is wrong stops being read within a week --
+    /// taking the real signal with it.
+    #[test]
+    fn a_warming_retry_is_counted_and_nothing_else_is() {
+        let warming = AtomicU64::new(0);
+        for code in [
+            subc_protocol::error_codes::MODULE_WARMING,
+            subc_protocol::error_codes::MODULE_RELOADING,
+        ] {
+            classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes(), &warming);
+        }
+        assert_eq!(
+            warming.load(Ordering::Relaxed),
+            2,
+            "both warming spellings must count, or a restart reads as no race"
+        );
+
+        // Every other route condition this client classifies. None is a warming
+        // retry, and counting one would put the metric permanently above zero.
+        let quiet = AtomicU64::new(0);
+        for code in [
+            "unknown_channel",
+            subc_protocol::error_codes::UNKNOWN_MODULE,
+            subc_protocol::error_codes::MODULE_REMOVED,
+            subc_protocol::error_codes::TARGET_UNAVAILABLE,
+            subc_protocol::error_codes::MODULE_TIMEOUT,
+            "backend_error",
+            "a_code_this_client_has_never_been_taught",
+        ] {
+            classify_error_frame(format!(r#"{{"code":"{code}"}}"#).as_bytes(), &quiet);
+        }
+        assert_eq!(
+            quiet.load(Ordering::Relaxed),
+            0,
+            "only a warming refusal may move this counter"
         );
     }
 
@@ -1337,7 +1448,7 @@ mod tests {
         // widened `Protocol`: an unreadable body is not a route condition, and
         // must still refuse to trust the reply.
         assert_eq!(
-            classify_error_frame(b"not json at all").vault_error(),
+            classify_error_frame(b"not json at all", &AtomicU64::new(0)).vault_error(),
             VaultGetError::FailClosed,
             "a reply this client cannot read is a different claim from one it can \
              read and does not recognise"
@@ -1694,7 +1805,7 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(
-                classify_error_frame(&body).vault_error(),
+                classify_error_frame(&body, &AtomicU64::new(0)).vault_error(),
                 VaultGetError::Transient,
                 "availability code {code} became fail-closed"
             );
@@ -1728,7 +1839,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            classify_error_frame(&unknown).vault_error(),
+            classify_error_frame(&unknown, &AtomicU64::new(0)).vault_error(),
             VaultGetError::Transient,
             "a route-layer code with no vault class is the ROUTE speaking, and no \
                  route condition is evidence a credential is bad"
@@ -2227,7 +2338,7 @@ mod tests {
             "class": "future_unknown"
         }))
         .unwrap();
-        let error = classify_error_frame(&body);
+        let error = classify_error_frame(&body, &AtomicU64::new(0));
         assert!(!format!("{error:?}").contains(secret));
     }
 
@@ -2238,7 +2349,7 @@ mod tests {
             "unknown channel 7",
         ))
         .unwrap();
-        assert_eq!(classify_error_frame(&body), ClientFailure::RouteGone);
+        assert_eq!(classify_error_frame(&body, &AtomicU64::new(0)), ClientFailure::RouteGone);
     }
 
     #[test]

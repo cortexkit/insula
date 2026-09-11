@@ -327,6 +327,21 @@ added after a re-sealed vault credential kept being served with its pre-re-seal
 verdict until a module restart, where a restart is the one event in such a
 timeline that guarantees a new connection.
 
+`vaultRouteWarmingRetries` counts route opens the credential module refused
+because it was still coming up, each of which this client retried on the next
+tick rather than treating as a dead credential.
+
+**Do not alert on it either.** Rising during a daemon restart is the mechanism
+working: the lanes race the vault's own registration and whichever fires first
+can lose by a millisecond. Rising while nothing is restarting is the reading
+worth asking about.
+
+It exists because the retry is **silent on success**. The lane recovers and
+leaves no trace, so "the retry worked" and "that path has never executed" were
+the same observable from outside — and they send a reader in opposite
+directions. A flat zero across a restart now says the race did not happen,
+rather than saying nothing at all.
+
 `lastFetchSuccessAgeSecs` and `fetchBlackout` answer a question
 `refresherStalled` cannot: whether the refresher is accomplishing anything.
 

@@ -822,6 +822,22 @@ fn health_report(
         // is the one event in such a timeline that establishes a NEW connection.
         // "Did the connection change?" previously required reading the source.
         "vaultConnectionsEstablished": vault.connections_established(),
+        // Route opens refused because the credential module was still warming,
+        // each of which the client retried on the next tick rather than treating
+        // as a dead credential.
+        //
+        // PUBLISHED BECAUSE THE RETRY IS SILENT ON SUCCESS. The lane recovers and
+        // leaves no trace, so "the retry worked" and "that code path has never
+        // executed" are the same observable from outside, and they send a reader
+        // in opposite directions. An issue filer watched five daemon restarts
+        // trying to witness this from the outside and could not separate a clean
+        // miss from a silent hit.
+        //
+        // Rising during a daemon restart is the mechanism working. Rising while
+        // nothing is restarting is the reading worth asking about. Flat zero
+        // across a restart says the race did not occur -- not that the retry
+        // failed, which is the distinction the silence used to erase.
+        "vaultRouteWarmingRetries": vault.route_warming_retries(),
         "cookieCohortTotal": snapshot.cookie_cohort_total,
         "cookieLoginsStale": snapshot.cookie_logins_stale,
         // Providers holding a credential that reaches no account while their
@@ -2365,6 +2381,7 @@ mod tests {
             "vaultUnmatchedDrops",
             "vaultStaleGenerationDrops",
             "vaultConnectionsEstablished",
+            "vaultRouteWarmingRetries",
             "usageRequestsServed",
             "usageRequestsRefused",
             "lastServedAgeSecs",
