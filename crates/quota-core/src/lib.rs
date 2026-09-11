@@ -1233,6 +1233,9 @@ impl Registry {
                 Some(usage) => quota_drop::detect(
                     &unit.prev,
                     usage,
+                    // The time the NEW reading describes, which for a
+                    // cache-backed lane is not the time we fetched it.
+                    next.last_success_wall,
                     refresh::observations_differ(
                         unit.prev.observation.as_ref(),
                         next.observation.as_ref(),

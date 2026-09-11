@@ -186,6 +186,7 @@ impl NotComparable {
 pub fn detect(
     prev: &ProviderSlot,
     next: &Usage,
+    next_wall: Option<chrono::DateTime<chrono::Utc>>,
     account_changed: bool,
     completed: Instant,
     base_interval: Duration,
@@ -246,12 +247,33 @@ pub fn detect(
     let monotonic_gap = prev
         .last_success_at
         .map(|previous| completed.duration_since(previous));
-    let wall_gap = prev
+    // BETWEEN THE TWO READINGS, not between the previous reading and now. Those
+    // are the same question only while a lane reads its value at the moment it
+    // polls, which stopped being true when a provider began serving a value from
+    // a source it does not poll -- antigravity reading the editor plugin's cache
+    // when the editor is closed.
+    //
+    // The unsafe case is a lane SWITCHING between them, which happens whenever
+    // the editor closes between two polls: a live reading, then a cached one an
+    // hour older. Measured against `now` both gaps look like one poll interval,
+    // so a lower cached percent was recorded as a drop and stamped
+    // `observed_continuously` -- a reset event that nobody watched happen, which
+    // is the one claim a consumer acts on.
+    let reading_gap = prev
         .last_success_wall
-        .and_then(|previous| (chrono::Utc::now() - previous).to_std().ok());
-    let observed_continuously = match (monotonic_gap, wall_gap) {
-        (Some(monotonic), Some(wall)) => monotonic.max(wall) <= horizon,
-        (Some(gap), None) | (None, Some(gap)) => gap <= horizon,
+        .and_then(|previous| next_wall.map(|current| current - previous));
+    let observed_continuously = match (monotonic_gap, reading_gap) {
+        // The newer reading describes an EARLIER moment than the older one, so the
+        // two are not ordered and no interval between them means anything. Falling
+        // back to the monotonic gap here would answer with the poll cadence, which
+        // is precisely the wrong number.
+        (_, Some(gap)) if gap < chrono::Duration::zero() => false,
+        (Some(monotonic), Some(wall)) => {
+            let wall = wall.to_std().unwrap_or(Duration::ZERO);
+            monotonic.max(wall) <= horizon
+        }
+        (Some(gap), None) => gap <= horizon,
+        (None, Some(gap)) => gap.to_std().unwrap_or(Duration::ZERO) <= horizon,
         // Nothing to measure the interval with. Not continuous by default: an
         // unmeasurable gap is exactly the case the flag exists to disclose.
         (None, None) => false,
@@ -388,12 +410,63 @@ mod tests {
         slot
     }
 
+    /// A lane that switches from a live source to a cached one is NOT continuous.
+    ///
+    /// THE CASE THAT BROKE THE OLD MEASUREMENT, and it happens whenever a user
+    /// closes the editor: antigravity serves a live reading, the editor closes,
+    /// and the next poll 60s later serves the editor plugin's cache -- which may
+    /// describe an hour earlier. Two readings an hour apart in the thing they
+    /// describe, taken one poll interval apart.
+    ///
+    /// The gap used to be measured from the previous reading to NOW, so both
+    /// clocks read one interval and a lower cached percent was recorded as a drop
+    /// stamped `observed_continuously` -- a reset event nobody watched happen.
+    /// That is the only unsafe direction here, because it is the claim a consumer
+    /// acts on.
+    ///
+    /// Both arms asserted: the drop is still RECORDED (a real decrease was seen
+    /// and hiding it would understate pressure), and its confidence is false.
+    #[test]
+    fn a_switch_to_an_older_source_is_a_drop_without_confidence() {
+        let now = Instant::now();
+        // Polled one interval ago, and its reading was live at that moment.
+        let prev = slot_at(now, usage(Some(window(92.0))), BASE);
+        // This poll is one interval later, but its reading is an hour old.
+        let cached_reading = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let found = expect_drop(detect(
+            &prev,
+            &usage(Some(window(10.0))),
+            Some(cached_reading),
+            false,
+            now,
+            BASE,
+        ));
+
+        assert!(
+            !found.observed_continuously,
+            "readings an hour apart were not watched continuously, however close \
+             together the two polls were"
+        );
+        assert!(
+            (found.magnitude - 82.0).abs() < 0.001,
+            "the decrease is still real and still recorded; only the confidence changes"
+        );
+    }
+
     /// A decrease past the floor, seen one interval apart, is a drop.
     #[test]
     fn a_decrease_across_one_interval_is_an_observed_drop() {
         let now = Instant::now();
         let prev = slot_at(now, usage(Some(window(92.0))), BASE);
-        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        let found = expect_drop(detect(
+            &prev,
+            &usage(Some(window(0.0))),
+            Some(chrono::Utc::now()),
+            false,
+            now,
+            BASE,
+        ));
 
         assert!((found.magnitude - 92.0).abs() < 0.001);
         assert!(
@@ -417,7 +490,14 @@ mod tests {
             usage(Some(window(92.0))),
             Duration::from_secs(9 * 3600),
         );
-        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        let found = expect_drop(detect(
+            &prev,
+            &usage(Some(window(0.0))),
+            Some(chrono::Utc::now()),
+            false,
+            now,
+            BASE,
+        ));
 
         assert!((found.magnitude - 92.0).abs() < 0.001);
         assert!(
@@ -444,7 +524,14 @@ mod tests {
         // Monotonic says one interval; the wall says ten hours.
         prev.last_success_wall = Some(chrono::Utc::now() - chrono::Duration::hours(10));
 
-        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        let found = expect_drop(detect(
+            &prev,
+            &usage(Some(window(0.0))),
+            Some(chrono::Utc::now()),
+            false,
+            now,
+            BASE,
+        ));
         assert!(
             !found.observed_continuously,
             "ten hours of wall time is a gap, whatever the monotonic clock counted"
@@ -470,7 +557,14 @@ mod tests {
         // clock still records nine hours.
         prev.last_success_wall = Some(chrono::Utc::now());
 
-        let found = expect_drop(detect(&prev, &usage(Some(window(0.0))), false, now, BASE));
+        let found = expect_drop(detect(
+            &prev,
+            &usage(Some(window(0.0))),
+            Some(chrono::Utc::now()),
+            false,
+            now,
+            BASE,
+        ));
         assert!(
             !found.observed_continuously,
             "a clock step must not turn a nine-hour outage into a continuous series"
@@ -489,7 +583,14 @@ mod tests {
         let now = Instant::now();
         let prev = slot_at(now, usage(Some(window(92.0))), BASE);
         assert_eq!(
-            detect(&prev, &usage(Some(window(0.0))), true, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(window(0.0))),
+                Some(chrono::Utc::now()),
+                true,
+                now,
+                BASE
+            ),
             DropObservation::NotComparable(NotComparable::AccountChanged),
             "two accounts are not one series"
         );
@@ -511,7 +612,14 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(90.0))), BASE);
 
         assert_eq!(
-            detect(&prev, &usage(Some(after)), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(after)),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NoDrop,
             "a pool that refills continuously reads lower as a matter of course"
         );
@@ -534,7 +642,14 @@ mod tests {
 
         assert!(
             matches!(
-                detect(&prev, &usage(Some(after)), false, now, BASE),
+                detect(
+                    &prev,
+                    &usage(Some(after)),
+                    Some(chrono::Utc::now()),
+                    false,
+                    now,
+                    BASE
+                ),
                 DropObservation::Drop(_)
             ),
             "a cliff window dropping IS the event this counts"
@@ -547,7 +662,14 @@ mod tests {
         let now = Instant::now();
         let prev = slot_at(now, usage(Some(window(50.5))), BASE);
         assert_eq!(
-            detect(&prev, &usage(Some(window(50.0))), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(window(50.0))),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NoDrop,
             "half a point is upstream arithmetic, not capacity returning"
         );
@@ -567,7 +689,14 @@ mod tests {
         let prev = slot_at(now, usage(Some(window(92.0))), BASE);
 
         assert_eq!(
-            detect(&prev, &usage(Some(relaxed)), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(relaxed)),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NoDrop,
             "the account did not change; only which number is effective did"
         );
@@ -601,7 +730,7 @@ mod tests {
         let prev = slot_at(now, before, BASE);
 
         assert_eq!(
-            detect(&prev, &after, false, now, BASE),
+            detect(&prev, &after, Some(chrono::Utc::now()), false, now, BASE),
             DropObservation::NoDrop,
             "a pool that did not exist before has nothing to have decreased from"
         );
@@ -619,7 +748,14 @@ mod tests {
         let now = Instant::now();
         let prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
         assert_eq!(
-            detect(&prev, &usage(Some(window(0.0))), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(window(0.0))),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NotComparable(NotComparable::NoPriorReading)
         );
     }
@@ -641,7 +777,14 @@ mod tests {
         prev.last_success_at = Some(now - BASE);
 
         assert_eq!(
-            detect(&prev, &usage(Some(window(0.0))), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(window(0.0))),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NotComparable(NotComparable::PriorReadingWasAnError),
             "a latched credential must not read as a quiet account"
         );
@@ -653,7 +796,14 @@ mod tests {
         let now = Instant::now();
         let prev = slot_at(now, usage(Some(window(10.0))), BASE);
         assert_eq!(
-            detect(&prev, &usage(Some(window(40.0))), false, now, BASE),
+            detect(
+                &prev,
+                &usage(Some(window(40.0))),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
             DropObservation::NoDrop
         );
     }
