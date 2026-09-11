@@ -327,6 +327,25 @@ fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now
 /// joins key on this). Populated onto the wire as `apiProvider` so every
 /// consumer keys on one canonical name instead of maintaining its own
 /// CodexBar→canonical map.
+///
+/// ADDING A SLUG HERE IS A CONSUMER-VISIBLE CHANGE, AND FOR ONE PROVIDER IT IS
+/// LOAD-BEARING IN A WAY NOTHING HERE SHOWS. `antigravity` deliberately has no
+/// entry: it has no models.dev counterpart, so it joins to nothing in the model
+/// catalog. A routing consumer relies on that absence today — its optimistic
+/// path (swapping a selection to a `-fast` sibling on a low-pressure reading) is
+/// gated on a catalog join, and antigravity is the one lane here whose reading
+/// can legitimately be an HOUR old, because a paid-tier account with the editor
+/// closed is served from that editor's plugin cache and carries the cache's own
+/// timestamp.
+///
+/// So giving `antigravity` a slug would silently make that path live for a lane
+/// it was never sized for. If a counterpart ever appears, say so to the routing
+/// consumer in the same change — their fix is one line (take the older of their
+/// observation time and `fetchedAt` for that gate) and they cannot know to apply
+/// it from anything they can see.
+///
+/// Recorded here rather than in a runbook because this line is what someone edits
+/// to break it. Verified with the routing seat 2026-09-11.
 fn api_provider_name(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some("openai"),
