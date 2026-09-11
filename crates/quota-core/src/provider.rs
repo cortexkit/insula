@@ -163,6 +163,13 @@ pub struct FetchAttempt {
     pub observed: Option<AccountObservation>,
     pub source: Option<String>,
     pub usage: Result<Usage, FetchError>,
+    /// Wall time when the returned value was read from its authoritative source.
+    ///
+    /// Normally absent because the refresher records completion time itself. A
+    /// provider serving an upstream-owned cache sets this so published
+    /// `fetchedAt` does not pretend the cached value was observed during this
+    /// fetch attempt.
+    pub value_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional provider/account labels attached to a successful usage fetch.
     pub account_info: Option<AccountInfo>,
     /// Optional read-only reset inventory attached to a successful usage fetch.
@@ -196,6 +203,7 @@ impl FetchAttempt {
             observed,
             source: Some(source.into()),
             usage: Ok(usage),
+            value_observed_at: None,
             account_info: None,
             saved_resets: None,
             pools: None,
@@ -213,6 +221,7 @@ impl FetchAttempt {
             observed,
             source,
             usage: Err(error),
+            value_observed_at: None,
             account_info: None,
             saved_resets: None,
             pools: None,
@@ -269,12 +278,19 @@ impl FetchAttempt {
             observed: None,
             source: None,
             usage: Err(fetch_error),
+            value_observed_at: None,
             account_info: None,
             saved_resets: None,
             pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Unverified,
         }
+    }
+
+    /// Preserve the source's wall timestamp when serving its cached value.
+    pub fn with_value_observed_at(mut self, observed_at: chrono::DateTime<chrono::Utc>) -> Self {
+        self.value_observed_at = Some(observed_at);
+        self
     }
 
     /// Attach account labels discovered while resolving the credential.
@@ -331,6 +347,7 @@ impl FetchAttempt {
                     observed,
                     source,
                     usage,
+                    value_observed_at: None,
                     account_info,
                     saved_resets,
                     pools: entry.spend,

@@ -1,11 +1,10 @@
 //! Antigravity usage — LOCAL PROBE of the running Antigravity editor.
 //!
-//! Unlike the OAuth providers, Antigravity's primary usage path is not a cloud call
-//! and needs no stored credential: the Antigravity editor (its `language_server`, or
-//! the `agy` CLI) runs a local server on a loopback port, and CodexBar reads quota
-//! straight off it. We replicate that: find the running process, learn its loopback
-//! port, and POST the same Connect-protocol JSON RPC the editor's own UI uses. This
-//! is why a user who has Antigravity open sees quota without ever "logging in" to us.
+//! Unlike the OAuth providers, Antigravity's authoritative paid-tier usage is not a
+//! cloud call: the Antigravity editor (its `language_server`, or the `agy` CLI) runs a
+//! local server on a loopback port, and the opencode plugin preserves that same pool
+//! in its account-local cache. We prefer the live server, then a recent plugin cache;
+//! only free-tier accounts fall through to the cloud client's standard-tier pool.
 //!
 //! Flow:
 //!  1. `ps -ax -o pid=,command=` → find the Antigravity `language_server` (app/IDE) or
@@ -27,10 +26,10 @@
 //! 127.0.0.1 (validating a loopback self-signed cert is meaningless; the peer is the
 //! user's own machine). Every request URL is guarded to be loopback before sending.
 //!
-//! DESKTOP-COUPLED: needs Antigravity (app or `agy` CLI) running locally — the same
-//! coupling class as the browser-cookie cohort, not headless-server-portable. When no
-//! Antigravity process is found (or it serves no usable quota), this degrades to a
-//! degraded entry — NEVER a stale or fabricated window.
+//! PAID-TIER AUTHORITY REMAINS DESKTOP-COUPLED: a live editor is authoritative, and
+//! the plugin cache extends that reading for at most one hour. Beyond that, withholding
+//! is safer than replacing the paid pool with the cloud client's different standard
+//! pool. Free-tier accounts use that cloud lane because it is their real pool.
 //!
 //! VERIFICATION: LIVE-verified — the real local-probe chain (discover `agy` →
 //! loopback port → POST quota summary → parse) returns real windows on a machine
@@ -53,6 +52,7 @@ use crate::provider::AccountObservation;
 use crate::vault_handles::VaultHandleLoader;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -103,6 +103,12 @@ const REMOTE_USER_AGENT: &str = "antigravity";
 /// signed in through the plugin has neither, and the provider went dark for
 /// them with `local_source_unavailable` — correct and useless.
 const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
+
+/// A cached pool older than this is more than 20% of the five-hour window's
+/// period old, so it has stopped describing the window it claims to describe.
+/// The weekly window would tolerate longer, but one cache entry carries both
+/// cadences and the tighter window governs.
+const CACHED_QUOTA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Why reading another tool's refresh token is safe HERE and not in general.
 ///
@@ -287,6 +293,52 @@ pub struct StoredAccount {
     /// has no paid tier and the cloud lane is reporting its real pool.
     #[serde(default, rename = "capturedPaidTierId")]
     pub captured_paid_tier_id: Option<String>,
+    /// When the plugin last read `cachedQuota`, as Unix epoch milliseconds.
+    #[serde(default, rename = "cachedQuotaUpdatedAt")]
+    pub cached_quota_updated_at: Option<i64>,
+    /// The paid-pool snapshot maintained by the plugin for this account.
+    #[serde(default, rename = "cachedQuota")]
+    pub cached_quota: Option<CachedQuota>,
+}
+
+/// One plugin-cached Antigravity quota snapshot.
+#[doc(hidden)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedQuota {
+    #[serde(default)]
+    pub gemini: Option<CachedQuotaPool>,
+    #[serde(default, rename = "non-gemini")]
+    pub non_gemini: Option<CachedQuotaPool>,
+}
+
+/// One model pool inside the plugin cache.
+#[doc(hidden)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedQuotaPool {
+    #[serde(default)]
+    pub windows: Vec<CachedQuotaWindow>,
+}
+
+/// One cadence reading inside a plugin-cached model pool.
+#[doc(hidden)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedQuotaWindow {
+    #[serde(default)]
+    pub window: String,
+    #[serde(default, rename = "remainingFraction")]
+    pub remaining_fraction: Option<f64>,
+    #[serde(default, rename = "resetTime")]
+    pub reset_time: Option<Value>,
+}
+
+/// Find this identity's plugin-store row without introducing a second account key.
+fn stored_account_for_email<'a>(
+    accounts: &'a [StoredAccount],
+    email: Option<&str>,
+) -> Option<&'a StoredAccount> {
+    accounts
+        .iter()
+        .find(|account| emails_match(email, account.email.as_deref()))
 }
 
 /// Does this account hold a paid tier the cloud lane cannot see?
@@ -299,35 +351,30 @@ pub struct StoredAccount {
 /// tier. A fleet host with a vault credential and no plugin install has no way to
 /// learn the tier, and withholding usage there would take a working lane dark on
 /// a suspicion. Positive evidence of a paid tier is required to withhold.
-fn account_holds_paid_tier(email: Option<&str>) -> bool {
-    let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
-        return false;
-    };
-    stored_accounts().iter().any(|account| {
+fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
+    account.is_some_and(|account| {
         account
-            .email
+            .captured_paid_tier_id
             .as_deref()
-            .is_some_and(|stored| stored.trim().eq_ignore_ascii_case(email))
-            && account
-                .captured_paid_tier_id
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
+            .map(str::trim)
+            .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
     })
 }
 
-/// Why a paid-tier account with no live editor session publishes nothing.
+/// Why a paid-tier account with neither an authoritative source nor a fresh cache
+/// publishes nothing.
 ///
 /// Deliberately `LocalSourceUnavailable` rather than a degraded entry: it is
 /// classified transient, so the last correct reading keeps serving while the
 /// editor is closed. Publishing the cloud number instead would replace a true
 /// figure with a confident wrong one -- a different pool, not a stale one -- and
 /// a router cannot tell those apart.
-fn paid_tier_needs_local_session() -> FetchError {
+fn paid_tier_usage_unavailable() -> FetchError {
     FetchError::LocalSourceUnavailable(
-        "this account holds a paid Antigravity tier, which only the local editor \
-         session can report: the cloud credential is entitled to the standard tier \
-         and would describe a pool this account does not use"
+        "this account holds a paid Antigravity tier, but neither a matching local \
+         editor session nor a fresh plugin cache is available: the cloud credential \
+         is entitled to the standard tier and would describe a pool this account \
+         does not use"
             .to_string(),
     )
 }
@@ -824,7 +871,10 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
         None => serde_json::from_str::<QuotaSummary>(body)
             .map_err(|e| FetchError::Decode(format!("antigravity quota summary not JSON: {e}")))?,
     };
+    normalize_quota_summary(summary)
+}
 
+fn normalize_quota_summary(summary: QuotaSummary) -> Result<Usage, FetchError> {
     let mut resolved: Vec<ResolvedWindow> = Vec::new();
     for group in &summary.groups {
         for bucket in &group.buckets {
@@ -879,6 +929,58 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
         tertiary: None,
         extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
     })
+}
+
+/// Normalize the plugin's account-local cache into the same named pools as the
+/// live editor. The cache's `gemini` and `non-gemini` keys are pool labels, while
+/// each child `window` is the cadence that completes the public bucket id.
+fn parse_cached_quota(cache: &CachedQuota) -> Result<Usage, FetchError> {
+    let groups = [
+        (cache.gemini.as_ref(), "Gemini Models", "gemini"),
+        (cache.non_gemini.as_ref(), "Claude and GPT models", "3p"),
+    ]
+    .into_iter()
+    .filter_map(|(pool, display_name, id_prefix)| {
+        let pool = pool?;
+        let buckets = pool
+            .windows
+            .iter()
+            .map(|window| {
+                let cadence = window.window.trim().to_ascii_lowercase().replace('_', "-");
+                QuotaBucket {
+                    bucket_id: format!("{id_prefix}-{cadence}"),
+                    display_name: window.window.clone(),
+                    window: Some(window.window.clone()),
+                    disabled: false,
+                    remaining_fraction: window.remaining_fraction,
+                    remaining: None,
+                    reset_time: window.reset_time.clone(),
+                }
+            })
+            .collect();
+        Some(QuotaGroup {
+            display_name: display_name.to_string(),
+            buckets,
+        })
+    })
+    .collect();
+    normalize_quota_summary(QuotaSummary { groups })
+}
+
+/// Return a paid account's usable cache and the wall time its value was read.
+/// Free-tier accounts deliberately keep using their live cloud lane.
+fn fresh_paid_cached_quota(
+    account: Option<&StoredAccount>,
+    now: DateTime<Utc>,
+) -> Option<(Usage, DateTime<Utc>)> {
+    let account = account.filter(|account| account_holds_paid_tier(Some(account)))?;
+    let updated_at = DateTime::<Utc>::from_timestamp_millis(account.cached_quota_updated_at?)?;
+    let age = now.signed_duration_since(updated_at).to_std().ok()?;
+    if age > CACHED_QUOTA_MAX_AGE {
+        return None;
+    }
+    let usage = parse_cached_quota(account.cached_quota.as_ref()?).ok()?;
+    Some((usage, updated_at))
 }
 
 // ---- remote lane (cloud, no local process) -----------------------------------
@@ -1169,11 +1271,10 @@ impl AntigravityProvider {
 
     /// Fetch one plugin-stored account's quota.
     ///
-    /// Same cloud endpoint as the vault lane; only the credential differs. The
-    /// plugin stores a refresh token, so this exchanges it for an access token
-    /// on every fetch rather than caching one -- the refresher's own interval is
-    /// longer than the hour these tokens live, so a cache would be a miss with
-    /// extra state.
+    /// The account row supports both offline paths: a recent paid-pool cache, or
+    /// the cloud endpoint for free-tier accounts. The latter exchanges the
+    /// plugin's refresh token on every fetch rather than caching an access token
+    /// whose lifetime is shorter than the refresher's own interval.
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
         let accounts = self.stored_accounts();
         let found = accounts
@@ -1228,20 +1329,25 @@ impl AntigravityProvider {
             }
         }
 
-        // No live session for this account. Falling back to the cloud is right
-        // ONLY when the cloud answers about the pool this account actually uses.
-        // For an account holding a paid tier it does not, so publish nothing and
-        // let the last correct reading stand.
-        if account
-            .captured_paid_tier_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
-        {
+        // 2. The plugin cache outranks a live cloud request because the cloud
+        // token is entitled to a different tier and therefore answers a different
+        // question. The row is selected by email; `cachedQuotaAccountId` is not an
+        // account identity and must never create or repoint a published row.
+        let cache_account = stored_account_for_email(&accounts, account.email.as_deref());
+        if let Some((usage, updated_at)) = fresh_paid_cached_quota(cache_account, Utc::now()) {
+            return FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
+                .with_value_observed_at(updated_at);
+        }
+
+        // No live session or fresh cache for this account. Falling back to the
+        // cloud is right ONLY when the cloud answers about the pool this account
+        // actually uses. For a paid tier it does not, so publish nothing and let
+        // the last correct reading stand.
+        if account_holds_paid_tier(Some(account)) {
             return FetchAttempt::failure(
                 observed,
                 Some(PLUGIN_SOURCE.to_string()),
-                paid_tier_needs_local_session(),
+                paid_tier_usage_unavailable(),
             );
         }
 
@@ -1459,17 +1565,29 @@ impl AntigravityProvider {
             }
         }
 
+        let accounts = self.stored_accounts();
+        let plugin_account = stored_account_for_email(&accounts, observed_email.as_deref());
+
+        // The account-local plugin cache outranks this live network call because
+        // the token below is entitled to the standard tier, while the cache was
+        // read from the pool the signed-in account actually spends.
+        if let Some((usage, updated_at)) = fresh_paid_cached_quota(plugin_account, Utc::now()) {
+            return FetchAttempt::success(observed, "vault", usage)
+                .with_value_observed_at(updated_at)
+                .with_account_info(account_info);
+        }
+
         // Same rule as the plugin lane, and for the same reason: the vault's
         // token is issued to the same OAuth client, so it reaches the same
         // standard-tier pool. The tier is read from the plugin store by email
         // because that is the only place on this host that records it; a host
         // without the store answers false and keeps serving, which is the honest
         // default when the tier is unknown rather than known-absent.
-        if account_holds_paid_tier(observed_email.as_deref()) {
+        if account_holds_paid_tier(plugin_account) {
             return FetchAttempt::failure(
                 observed,
                 Some("vault".to_string()),
-                paid_tier_needs_local_session(),
+                paid_tier_usage_unavailable(),
             )
             .with_account_info(account_info);
         }
@@ -2314,6 +2432,8 @@ mod plugin_lane_tests {
             // Free tier by default so the existing cases keep exercising the
             // cloud fallback. The paid-tier arm has its own fixtures below.
             captured_paid_tier_id: Some("free-tier".to_string()),
+            cached_quota_updated_at: None,
+            cached_quota: None,
         }
     }
 
@@ -2322,6 +2442,52 @@ mod plugin_lane_tests {
         StoredAccount {
             captured_paid_tier_id: Some("g1-ultra-lite-tier".to_string()),
             ..account(email, token, Some(true))
+        }
+    }
+
+    fn cached_paid_account(email: &str, updated_at: DateTime<Utc>) -> StoredAccount {
+        serde_json::from_value(serde_json::json!({
+            "email": email,
+            "refreshToken": "refresh-tok",
+            "managedProjectId": "proj-1",
+            "enabled": true,
+            "capturedPaidTierId": "g1-ultra-lite-tier",
+            // Deliberately present and ignored: the cache belongs to the email
+            // row and this plugin-private hex id is not an account identity.
+            "cachedQuotaAccountId": "290d564a294e12a3",
+            "cachedQuotaUpdatedAt": updated_at.timestamp_millis(),
+            "cachedQuota": {
+                "gemini": {
+                    "remainingFraction": 0.938304,
+                    "resetTime": "2026-09-17T18:41:37Z",
+                    "modelCount": 2,
+                    "windows": [
+                        { "window": "5h", "remainingFraction": 1.0,
+                          "resetTime": "2026-09-11T17:08:40Z" },
+                        { "window": "weekly", "remainingFraction": 0.938304,
+                          "resetTime": "2026-09-17T18:41:37Z" }
+                    ]
+                },
+                "non-gemini": {
+                    "remainingFraction": 1.0,
+                    "resetTime": "2026-09-11T17:08:40Z",
+                    "modelCount": 3,
+                    "windows": [
+                        { "window": "5h", "remainingFraction": 1.0,
+                          "resetTime": "2026-09-11T17:08:40Z" },
+                        { "window": "weekly", "remainingFraction": 1.0,
+                          "resetTime": "2026-09-17T18:41:37Z" }
+                    ]
+                }
+            }
+        }))
+        .expect("cached account fixture")
+    }
+
+    fn cached_free_account(email: &str, updated_at: DateTime<Utc>) -> StoredAccount {
+        StoredAccount {
+            captured_paid_tier_id: Some("free-tier".to_string()),
+            ..cached_paid_account(email, updated_at)
         }
     }
 
@@ -2594,9 +2760,9 @@ mod plugin_lane_tests {
         assert!(!emails_match(None, None));
     }
 
-    /// 1. Local lane serves a credentialed handle when the identity matches.
+    /// A matching live local session still outranks a fresh plugin cache.
     #[tokio::test]
-    async fn local_lane_serves_a_credentialed_handle_when_the_identity_matches() {
+    async fn a_live_local_session_still_wins_over_a_fresh_cache() {
         let (port, _server) = spawn_mock_server(move |path| {
             if path == QUOTA_SUMMARY_PATH {
                 (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
@@ -2623,10 +2789,9 @@ mod plugin_lane_tests {
             },
             port,
         )]);
-        provider.set_override_accounts(vec![account(
-            Some("beatricelau0414@gmail.com"),
-            Some("refresh-tok"),
-            Some(true),
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            Utc::now() - chrono::Duration::minutes(5),
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
@@ -2651,6 +2816,10 @@ mod plugin_lane_tests {
             Some("beatricelau0414@gmail.com")
         );
         assert_eq!(attempt.source.as_deref(), Some("oauth"));
+        assert_eq!(
+            attempt.value_observed_at, None,
+            "a cache response would carry the cache's earlier value-time"
+        );
     }
 
     /// 2. Identity MISMATCH falls through to the cloud lane.
@@ -2861,6 +3030,127 @@ mod plugin_lane_tests {
         );
     }
 
+    /// A paid account with no local session serves its fresh plugin cache.
+    #[tokio::test]
+    async fn a_paid_tier_account_without_a_local_session_serves_the_fresh_cache() {
+        let cache_time = Utc::now() - chrono::Duration::minutes(5);
+        let cache_time = DateTime::<Utc>::from_timestamp_millis(cache_time.timestamp_millis())
+            .expect("fixture timestamp");
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            cache_time,
+        )]);
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let usage = attempt.usage.as_ref().expect("fresh cache must serve");
+        let weekly = usage
+            .extra_rate_windows
+            .as_ref()
+            .and_then(|windows| {
+                windows
+                    .iter()
+                    .find(|window| window.id.as_deref() == Some("gemini-weekly"))
+            })
+            .and_then(|window| window.window.as_ref())
+            .expect("gemini weekly cache window");
+
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
+        assert_eq!(
+            attempt.value_observed_at,
+            Some(cache_time),
+            "the cache lane is the only lane carrying the plugin's value-time"
+        );
+    }
+
+    /// A cache-served value keeps the cache's own read time on the published entry.
+    #[tokio::test]
+    async fn a_cache_served_entry_publishes_the_cache_timestamp_as_fetched_at() {
+        let cache_time = Utc::now() - chrono::Duration::minutes(5);
+        let cache_time = DateTime::<Utc>::from_timestamp_millis(cache_time.timestamp_millis())
+            .expect("fixture timestamp");
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            cache_time,
+        )]);
+        let registry = crate::Registry::new(vec![Box::new(provider)]);
+
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
+        let entry = entries.first().expect("cache-served entry");
+
+        assert_eq!(
+            entry.fetched_at.as_deref(),
+            Some(
+                cache_time
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+                    .as_str()
+            ),
+            "fetchedAt must say when the plugin read the value, not when we read its cache"
+        );
+    }
+
+    /// A cache older than the bound is ignored and a paid account stays withheld.
+    #[tokio::test]
+    async fn a_cache_older_than_one_hour_is_not_served_for_a_paid_tier_account() {
+        let stale_time = Utc::now()
+            - chrono::Duration::from_std(CACHED_QUOTA_MAX_AGE).expect("cache age")
+            - chrono::Duration::seconds(1);
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            stale_time,
+        )]);
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:beatricelau0414@gmail.com".into(),
+            ))
+            .await;
+        let error = attempt
+            .usage
+            .expect_err("a stale cache must fall through to paid-tier withholding");
+
+        assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
+        assert_eq!(attempt.value_observed_at, None);
+    }
+
+    /// One account's fresh cache is never served under another email's row.
+    #[tokio::test]
+    async fn the_cached_quota_is_matched_to_the_handle_by_email() {
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(vec![
+            cached_paid_account(
+                "account-a@example.com",
+                Utc::now() - chrono::Duration::minutes(5),
+            ),
+            paid_account(Some("account-b@example.com"), Some("refresh-tok")),
+        ]);
+
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::Named(
+                "plugin:account-b@example.com".into(),
+            ))
+            .await;
+        let error = attempt
+            .usage
+            .expect_err("account A's cache must not be published for account B");
+
+        assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
+        assert_eq!(attempt.value_observed_at, None);
+    }
+
     /// A FREE-TIER account with no live session still reaches the cloud.
     ///
     /// The control for the guard above, and the load-bearing half: for an account
@@ -2882,10 +3172,9 @@ mod plugin_lane_tests {
 
         let mut provider = AntigravityProvider::new();
         provider.set_local_endpoints(Vec::new());
-        provider.set_override_accounts(vec![account(
-            Some("ufukaltinok@gmail.com"),
-            Some("refresh-tok"),
-            Some(true),
+        provider.set_override_accounts(vec![cached_free_account(
+            "ufukaltinok@gmail.com",
+            Utc::now() - chrono::Duration::minutes(5),
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
@@ -2900,6 +3189,10 @@ mod plugin_lane_tests {
             .expect("a free-tier account must still reach the cloud lane");
         let primary = usage.primary.as_ref().expect("primary window");
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
+        assert_eq!(
+            attempt.value_observed_at, None,
+            "the paid-cache lane must not fire for a free-tier account"
+        );
     }
 
     /// 5. Implicit handle still serves the local lane with no identity to match.

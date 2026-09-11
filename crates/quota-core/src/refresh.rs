@@ -535,6 +535,7 @@ fn next_slot_after_attempt_inner(
         .observed
         .clone()
         .or_else(|| prev.observation.clone());
+    let value_observed_at = attempt.value_observed_at;
 
     match attempt.usage {
         Ok(usage) => ProviderSlot {
@@ -556,9 +557,12 @@ fn next_slot_after_attempt_inner(
             observation,
             label_in_flux: false,
             relax_eligible: attempt.relax_eligible,
+            // Scheduling records this fetch's completion even when the value
+            // came from an upstream-owned cache observed at an earlier wall time.
             last_success_at: Some(completed),
-            // Read now rather than derived, so a suspend cannot shift it.
-            last_success_wall: Some(Utc::now()),
+            // Read now rather than derived, so a suspend cannot shift it. Only
+            // the published wall timestamp may inherit the source's value-time.
+            last_success_wall: Some(value_observed_at.unwrap_or_else(Utc::now)),
             last_attempt_at: Some(attempt_start),
             status: SlotStatus::Fresh,
             next_due_at: completed + BASE_INTERVAL,
@@ -774,6 +778,7 @@ mod tests {
             )),
             source: Some("test".to_string()),
             usage,
+            value_observed_at: None,
             account_info: None,
             saved_resets: None,
             pools: None,
@@ -933,6 +938,25 @@ mod tests {
         assert_eq!(slot.last_success_at, Some(done));
         assert_eq!(slot.next_due_at, done + BASE_INTERVAL);
         assert_eq!(slot.account_id(), Some("A"));
+    }
+
+    #[test]
+    fn a_source_value_time_overrides_only_the_published_wall_timestamp() {
+        let start = Instant::now();
+        let done = start + Duration::from_secs(2);
+        let value_time = Utc::now() - chrono::Duration::minutes(5);
+        let cold = ProviderSlot::due_now(start, incarnation());
+        let slot = next_slot_after_attempt(
+            &cold,
+            "antigravity",
+            attempt(Some("A"), Ok(Usage::default())).with_value_observed_at(value_time),
+            start,
+            done,
+        );
+
+        assert_eq!(slot.last_success_wall, Some(value_time));
+        assert_eq!(slot.last_success_at, Some(done));
+        assert_eq!(slot.next_due_at, done + BASE_INTERVAL);
     }
 
     #[test]
