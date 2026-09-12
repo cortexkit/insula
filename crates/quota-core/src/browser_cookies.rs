@@ -87,6 +87,14 @@ pub enum CookieError {
     /// healthy window, and names a condition on this machine rather than an absent
     /// login the operator would otherwise be told to go and repeat.
     UnreadableKeyring,
+    /// A local source this lane needs cannot be read COMPLETELY, so the read is
+    /// refused rather than served partially.
+    ///
+    /// Distinct from `Extract` (the read failed) and from `NoCookie` (the read
+    /// succeeded and found nothing): here the read WOULD succeed and return a
+    /// plausible, stale answer. Serving that publishes a wrong verdict, which is
+    /// worse than publishing none.
+    Unavailable(String),
     /// Reading the store or decrypting failed.
     Extract(String),
     /// The store exists but this process is not permitted to read it.
@@ -219,7 +227,12 @@ impl From<CookieError> for crate::provider::FetchError {
             // local source this lane needs, the provider is fine, and the operator
             // acts on their own machine. Transient, unlike UnreadableScheme above,
             // because a keyring comes back and App-Bound Encryption does not.
-            CookieError::PermissionDenied(_) | CookieError::UnreadableKeyring => {
+            // And the same class for a source that can be read but not read
+            // WHOLE: transient, because the condition clears on the upstream's
+            // own checkpoint, and the last healthy reading keeps serving.
+            CookieError::PermissionDenied(_)
+            | CookieError::UnreadableKeyring
+            | CookieError::Unavailable(_) => {
                 crate::provider::FetchError::LocalSourceUnavailable(detail)
             }
         }
@@ -229,6 +242,7 @@ impl From<CookieError> for crate::provider::FetchError {
 impl std::fmt::Display for CookieError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unavailable(detail) => write!(f, "{detail}"),
             Self::NoStore => write!(f, "no Chrome cookie store found"),
             Self::NoKeychainKey(m) => {
                 write!(f, "Chrome Safe Storage keychain key unavailable: {m}")
@@ -882,12 +896,31 @@ fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
     // somebody just signed in, which is the same misreport the v11 keyring case
     // produced through a different door.
     //
-    // Not built for today, because building for a mode the upstream does not use
-    // means shipping an untestable path. Recorded because the dependency is
-    // invisible from this line and nothing in this repository observes it: no
-    // test asserts the mode, and the failure produces no error to notice. The
-    // check is one `PRAGMA journal_mode` against a live profile, and the fix
-    // would be to copy the `-wal` and `-shm` sidecars alongside.
+    // SO THE SIDECAR IS CHECKED, WHICH IS THE CHEAP HALF. A `-wal` beside the
+    // store is positive evidence that committed rows are missing from the file
+    // about to be copied -- not a suspicion -- and the cost of proceeding is a
+    // WRONG VERDICT rather than a missing one: a session cookie refreshed
+    // moments ago would be absent, the stale one would be sent, and the 401 it
+    // earns publishes `credential_rejected` ("session expired") against a live
+    // session.
+    //
+    // Refusing is `local_source_unavailable`, which is classified transient, so
+    // the last healthy reading keeps serving while an operator sees the reason.
+    // Copying the `-wal` and `-shm` sidecars WOULD be the complete fix and is
+    // deliberately not built: the three files must be mutually consistent, and
+    // copying them one at a time while Chrome writes is racy -- so it would
+    // trade a stated failure for an unstated one.
+    let sidecar = store.with_file_name(format!(
+        "{}-wal",
+        store.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if sidecar.exists() {
+        return Err(CookieError::Unavailable(format!(
+            "the browser cookie store is in WAL mode ({} exists), so a copy of \
+                 the main file alone would omit recent sign-ins",
+            sidecar.file_name().unwrap_or_default().to_string_lossy()
+        )));
+    }
     std::fs::copy(store, &tmp).map_err(|e| CookieError::Extract(format!("copy store: {e}")))?;
     Ok(tmp)
 }
@@ -1008,6 +1041,61 @@ fn decrypt_cbc(encrypted: &[u8], prefix: &[u8], host_key: &str, key: &[u8]) -> O
 
 #[cfg(test)]
 mod tests {
+
+    /// A store in WAL mode is refused rather than copied.
+    ///
+    /// Copying the main file alone is a complete read only under
+    /// `journal_mode=delete`, which is what Chrome uses today and is an upstream
+    /// choice rather than ours. Under WAL, committed rows live in a `-wal` sidecar
+    /// until checkpoint, so the copy would return an OLDER-BUT-VALID database: the
+    /// query succeeds, the jar parses, and the newest session cookie is simply
+    /// missing. The stale cookie then earns a 401, published as
+    /// `credential_rejected` -- "session expired" against a live session.
+    ///
+    /// The sidecar's existence is positive evidence of that, not a suspicion, which
+    /// is why refusing is right here where a guess would not be. Transient class,
+    /// so the last healthy reading keeps serving until the upstream checkpoints.
+    ///
+    /// The must-not-fire half is asserted first and is the load-bearing one: with
+    /// no sidecar the copy must still happen, or this guard takes all nine
+    /// cookie-backed providers dark on every host.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_wal_mode_cookie_store_is_refused_rather_than_read_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "insula-wal-probe-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let store = dir.join("Cookies");
+        std::fs::write(&store, b"not a real sqlite file").expect("store");
+
+        // No sidecar: the copy proceeds.
+        let copied = copy_cookie_store(&store).expect("a delete-mode store is copied");
+        assert!(copied.exists(), "the snapshot must exist");
+        let _ = std::fs::remove_file(&copied);
+
+        // Sidecar present: refused, and the reason names the file.
+        std::fs::write(dir.join("Cookies-wal"), b"wal").expect("sidecar");
+        let refusal = copy_cookie_store(&store).expect_err("a WAL-mode store is refused");
+        assert!(
+            matches!(refusal, CookieError::Unavailable(_)),
+            "must be the incomplete-source class, got {refusal:?}"
+        );
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains("Cookies-wal"),
+            "the refusal must name the sidecar an operator would look for: {rendered}"
+        );
+        assert_eq!(
+            crate::refresh::classify(&crate::provider::FetchError::from(refusal)),
+            crate::refresh::FetchClass::Transient,
+            "a pending checkpoint is not a dead credential"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A pasted header round-trips to the same jar the browser store yields.
     ///
@@ -1185,6 +1273,7 @@ mod tests {
             CookieError::Extract("mid-write".into()),
             CookieError::PermissionDenied("Operation not permitted".into()),
             CookieError::UnreadableKeyring,
+            CookieError::Unavailable("Cookies-wal exists".into()),
         ];
 
         for case in &all {
@@ -1196,7 +1285,8 @@ mod tests {
                 | CookieError::NoKeychainKey(_)
                 | CookieError::Extract(_)
                 | CookieError::PermissionDenied(_)
-                | CookieError::UnreadableKeyring => {}
+                | CookieError::UnreadableKeyring
+                | CookieError::Unavailable(_) => {}
             }
         }
 
