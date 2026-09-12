@@ -29,6 +29,27 @@ use cortexkit_provider_usage::{ProviderUsage, RateWindow};
 /// future ages backwards.
 const FUTURE_TOLERANCE_SECS: i64 = 120;
 
+/// How old an UNDISCLOSED reading may be before it stops being current data.
+///
+/// An entry serving usage with no `stale` disclosure is claiming the reading is
+/// current. That claim used to be self-enforcing: every lane read its value at
+/// the moment it polled, so an old `fetchedAt` could only mean stale-serving,
+/// which always carries a disclosure. A lane serving a value from a source it
+/// does not poll broke that, and the shape -- old reading, no disclosure, real
+/// usage -- became legal for the first time.
+///
+/// Legal within a bound, which lives in the lane that produces it: antigravity
+/// refuses a plugin cache older than an hour. Nothing outside that provider
+/// checked the bound was still enforced, so this is the check. Set at twice it
+/// so an ordinary reading never approaches the rule -- measured live at 527s
+/// against this 7200 -- and a lane that stopped bounding itself still trips it.
+///
+/// Deliberately NOT applied to entries carrying a `stale` disclosure: a transient
+/// failure serves its last healthy window with no upper age bound BY DESIGN, and
+/// the disclosure is how a consumer learns the age is unbounded. Firing on those
+/// would report the contract working as a violation.
+const UNDISCLOSED_AGE_LIMIT_SECS: i64 = 7200;
+
 /// How far past a window's own length its reset may sit before the reset is
 /// treated as belonging to a different window.
 ///
@@ -398,6 +419,21 @@ fn check_entry_shape(
         findings.push(format!(
             "{where_}: fetchedAt is {}s in the future",
             ahead.num_seconds()
+        ));
+    }
+
+    // An undisclosed reading claims to be current. Past the bound it is not, and
+    // no consumer can tell: there is no field on a healthy entry that discloses
+    // age other than this timestamp, which is exactly why the age has to be
+    // bounded rather than merely published.
+    let age = now.signed_duration_since(fetched_at.with_timezone(&Utc));
+    if entry.stale.is_none()
+        && entry.usage.is_some()
+        && age > chrono::Duration::seconds(UNDISCLOSED_AGE_LIMIT_SECS)
+    {
+        findings.push(format!(
+            "{where_}: serving a {}s-old reading with no stale disclosure",
+            age.num_seconds()
         ));
     }
 
@@ -1785,7 +1821,11 @@ mod tests {
                 labelled("claude", "acct-2"),
                 broken,
             ],
-            at("2026-08-16T10:00:00Z"),
+            // The instant the helpers stamp against. A hardcoded date drifted
+            // from it here, so every fixture entry read nineteen days old --
+            // harmless until a rule cared about age, then wrong for a reason
+            // unrelated to what the test asserts.
+            at(FIXTURE_NOW),
         );
         assert_eq!(
             report.findings,
@@ -1974,14 +2014,70 @@ mod tests {
         assert_eq!(report.windows_checked, 1);
     }
 
-    /// There is no upper bound on how stale a served entry may be: while
+    /// There is no upper bound on how stale a DISCLOSED entry may be: while
     /// failures stay transient this module keeps serving the last healthy
     /// window, so an old timestamp is honest reporting rather than a defect.
     /// Flagging it would turn a correct behaviour into a permanent finding.
+    ///
+    /// The disclosure is what makes it honest, and this fixture predated the
+    /// field -- it built a seven-day-old reading with no `stale`, a state the
+    /// module stopped producing when staleness disclosure shipped. Left alone
+    /// it would have been the must-not-fire control for a rule about
+    /// UNDISCLOSED age, while describing the disclosed case.
     #[test]
-    fn a_very_old_fetched_at_is_not_a_finding() {
+    fn a_very_old_but_disclosed_fetched_at_is_not_a_finding() {
         let mut e = entry(window(40.0));
-        e.fetched_at = Some((at(FIXTURE_NOW) - chrono::Duration::days(7)).to_rfc3339());
+        let reading = at(FIXTURE_NOW) - chrono::Duration::days(7);
+        e.fetched_at = Some(reading.to_rfc3339());
+        e.stale = Some(cortexkit_provider_usage::Stale {
+            // After the reading, as production sets it: the failure run begins
+            // once a fetch fails, which is necessarily after the last success.
+            since: (reading + chrono::Duration::minutes(1)).to_rfc3339(),
+            class: Some("upstream_failed".to_string()),
+        });
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.windows_checked, 1);
+    }
+
+    /// An old reading with NO disclosure is reported.
+    ///
+    /// The shape a cache-backed lane made possible: a value read from a source
+    /// this module does not poll, published with the source's own timestamp and
+    /// no failure to disclose. Legal within the bound the lane enforces --
+    /// antigravity refuses a plugin cache older than an hour -- and nothing
+    /// outside that provider checked the bound was still enforced.
+    ///
+    /// An entry in this shape claims to be current, and no field on a healthy
+    /// entry says otherwise.
+    #[test]
+    fn an_old_undisclosed_reading_is_reported() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some((at(FIXTURE_NOW) - chrono::Duration::hours(3)).to_rfc3339());
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("no stale disclosure"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A cache-served reading INSIDE the lane's bound is not a finding.
+    ///
+    /// The must-not-fire control, and the load-bearing one: this is the exact
+    /// shape antigravity publishes every minute on a host with the editor
+    /// closed. Measured live at 527 seconds. A rule that fired here would
+    /// report a working lane as broken on every sweep, and a checker that
+    /// always has a finding stops being read.
+    #[test]
+    fn a_cache_served_reading_inside_the_bound_is_not_a_finding() {
+        let mut e = entry(window(40.0));
+        e.fetched_at = Some((at(FIXTURE_NOW) - chrono::Duration::minutes(50)).to_rfc3339());
 
         let report = check_entries(&[e], at(FIXTURE_NOW));
 

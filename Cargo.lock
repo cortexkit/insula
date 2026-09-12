@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.34"
+version = "0.17.36"
 dependencies = [
  "base64",
  "cortexkit-paths",
