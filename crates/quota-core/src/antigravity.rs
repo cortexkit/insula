@@ -689,17 +689,6 @@ enum Pool {
     Other,
 }
 
-fn pool_of(group_title: &str) -> Pool {
-    let t = group_title.to_ascii_lowercase();
-    if t.contains("gemini") {
-        Pool::Gemini
-    } else if t.contains("claude") || t.contains("gpt") {
-        Pool::ClaudeGpt
-    } else {
-        Pool::Other
-    }
-}
-
 /// The pool a model belongs to, for the remote lane.
 ///
 /// The local server labels its groups ("Gemini Models", "Claude and GPT
@@ -805,7 +794,6 @@ fn parse_reset(value: &Value) -> Option<String> {
 
 /// A bucket that resolved to a usable window, tagged with its pool.
 struct ResolvedWindow {
-    pool: Pool,
     window: RateWindow,
     title: String,
     id: String,
@@ -828,7 +816,6 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
     .trim()
     .to_string();
     Some(ResolvedWindow {
-        pool: pool_of(&group.display_name),
         window: RateWindow {
             used_percent,
             raw_used_percent: None,
@@ -841,23 +828,6 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         title,
         id: bucket.bucket_id.clone(),
     })
-}
-
-/// The representative window for a pool: the MOST-USED (highest utilization) window in
-/// that pool — mirrors CodexBar's `quotaSummaryRepresentative` (`.max` by usedPercent,
-/// AntigravityStatusProbe.swift:231-244). This is what surfaces the binding limit (a
-/// user's 47%-used weekly, not an idle 0%-used 5-hour).
-fn representative(windows: &[ResolvedWindow], pool: Pool) -> Option<RateWindow> {
-    windows
-        .iter()
-        .filter(|w| w.pool == pool)
-        .max_by(|a, b| {
-            a.window
-                .used_percent
-                .partial_cmp(&b.window.used_percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|w| w.window.clone())
 }
 
 /// Normalize a RetrieveUserQuotaSummary JSON body to [`Usage`]. Pure — unit-testable.
@@ -890,15 +860,24 @@ fn normalize_quota_summary(summary: QuotaSummary) -> Result<Usage, FetchError> {
         ));
     }
 
-    // Antigravity meters two independent pools: the native Gemini models and the
-    // external Claude/GPT models. Only the native pool represents the product's
-    // own capacity, so only it may claim the unnamed `primary` slot — an unnamed
-    // slot reads as "this account's window", and a walled external pool in it
-    // would misreport the whole provider as exhausted while Gemini is free.
-    // Both pools stay fully visible as named extra windows below.
-    let primary = representative(&resolved, Pool::Gemini);
+    // NO UNNAMED `primary` FOR THIS PROVIDER. Antigravity meters two
+    // independent pools at two cadences, and every one of those four windows
+    // is named -- so anything in `primary` is necessarily a COPY of one of
+    // them. It was the native Gemini pool's representative, which made the
+    // provider publish five windows for four limits and rendered a fifth,
+    // unlabelled row beside the four labelled ones.
+    //
+    // The duplication was documented as a caveat every consumer had to handle
+    // (invisible to a maximum, double-counting under a sum or a mean). Removing
+    // the copy retires the caveat rather than adding another.
+    //
+    // A consumer reading `primary` alone gets nothing here, and that reading
+    // was already wrong: two pools cannot be summarised by one window, which is
+    // why the contract requires the maximum across slots AND extras. The one
+    // consumer known to have read `primary` alone had a defect from it and
+    // fixed it.
 
-    // Every resolved bucket is also surfaced as a per-pool extra window.
+    // Each resolved bucket is surfaced as a per-pool named extra window.
     let extra: Vec<ExtraWindow> = resolved
         .iter()
         .map(|w| ExtraWindow {
@@ -908,23 +887,8 @@ fn normalize_quota_summary(summary: QuotaSummary) -> Result<Usage, FetchError> {
         })
         .collect();
 
-    // If no Gemini-pool bucket resolved, fall back to the most-used resolved
-    // window so a non-Gemini account still reports something rather than
-    // degrading.
-    let primary = primary.or_else(|| {
-        resolved
-            .iter()
-            .max_by(|a, b| {
-                a.window
-                    .used_percent
-                    .partial_cmp(&b.window.used_percent)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|w| w.window.clone())
-    });
-
     Ok(Usage {
-        primary,
+        primary: None,
         secondary: None,
         tertiary: None,
         extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
@@ -1151,7 +1115,6 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
             Pool::Other => "Other models",
         };
         resolved.push(ResolvedWindow {
-            pool,
             window: RateWindow {
                 used_percent,
                 raw_used_percent: None,
@@ -1166,22 +1129,9 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
         });
     }
 
-    // Identical pool selection to the local lane: only the native Gemini pool may
-    // claim the unnamed slot, since an unnamed window reads as the account's own
-    // capacity and a walled external pool there would report the whole provider
-    // exhausted while Gemini is free.
-    let primary = representative(&resolved, Pool::Gemini).or_else(|| {
-        resolved
-            .iter()
-            .max_by(|a, b| {
-                a.window
-                    .used_percent
-                    .partial_cmp(&b.window.used_percent)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|w| w.window.clone())
-    });
-
+    // No unnamed slot, for the same reason as the local lane: every window this
+    // provider meters is named, so a slot could only hold a copy. Both lanes
+    // must agree on this or the same account changes shape when an editor opens.
     let extra: Vec<ExtraWindow> = resolved
         .iter()
         .map(|w| ExtraWindow {
@@ -1192,7 +1142,7 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
         .collect();
 
     Ok(Usage {
-        primary,
+        primary: None,
         secondary: None,
         tertiary: None,
         extra_rate_windows: if extra.is_empty() { None } else { Some(extra) },
@@ -1874,6 +1824,35 @@ impl UsageProvider for AntigravityProvider {
 #[cfg(test)]
 mod tests {
 
+    /// The named window for one pool-and-cadence, which is how this provider
+    /// publishes every limit it meters.
+    ///
+    /// Tests used to reach for `usage.primary` as a handle on "the Gemini pool",
+    /// which worked only because the unnamed slot held a COPY of one named
+    /// window. Asking by id says which limit is meant, so a test cannot silently
+    /// start reading a different one.
+    pub(super) fn pool_window<'a>(usage: &'a Usage, id: &str) -> &'a RateWindow {
+        usage
+            .extra_rate_windows
+            .as_ref()
+            .expect("the provider publishes named windows")
+            .iter()
+            .find(|extra| extra.id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("no named window {id}"))
+            .window
+            .as_ref()
+            .expect("a named window carries its rate window")
+    }
+
+    /// No unnamed slot is ever populated: every limit this provider meters is
+    /// named, so a slot could only ever hold a copy of one of them.
+    pub(super) fn assert_no_unnamed_slot(usage: &Usage) {
+        assert!(
+            usage.primary.is_none() && usage.secondary.is_none() && usage.tertiary.is_none(),
+            "antigravity publishes named windows only: {usage:?}"
+        );
+    }
+
     /// The token endpoint is pinned to Google's own host.
     ///
     /// This is the URL a live REFRESH TOKEN is posted to, in the request body,
@@ -1999,19 +1978,24 @@ mod tests {
     }
 
     #[test]
-    fn gemini_pool_owns_primary_and_no_secondary_is_emitted() {
+    fn every_bucket_is_published_as_its_own_named_window() {
         let usage = parse_quota_summary(SUMMARY_FIXTURE).unwrap();
-        // Gemini pool: 5h used 20% vs weekly used 47% → representative is the
-        // most-used (weekly), mirroring CodexBar.
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 47.0);
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
-        assert_eq!(primary.window_minutes, Some(10080));
-        // The external Claude/GPT pool never occupies an unnamed slot; it is
-        // visible only as its named extra window.
-        assert!(usage.secondary.is_none());
-        // All three buckets surfaced as extra windows.
-        assert_eq!(usage.extra_rate_windows.unwrap().len(), 3);
+
+        // Each bucket keeps its own figure rather than being folded into one
+        // headline: the Gemini pool meters 20% at five hours and 47% weekly, and
+        // collapsing those to the worse one loses the cadence a reader needs.
+        assert_eq!(pool_window(&usage, "gemini-5h").used_percent, 20.0);
+        let weekly = super::tests::pool_window(&usage, "gemini-weekly");
+        assert_eq!(weekly.used_percent, 47.0);
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
+        assert_eq!(weekly.window_minutes, Some(10080));
+
+        assert_eq!(usage.extra_rate_windows.as_ref().unwrap().len(), 3);
+
+        // The property the unnamed slot used to need policing: with no slot, a
+        // walled external pool CANNOT be mistaken for the account's own capacity,
+        // because there is nowhere unnamed for it to sit.
+        assert_no_unnamed_slot(&usage);
     }
 
     #[test]
@@ -2032,9 +2016,12 @@ mod tests {
     }
 
     #[test]
-    fn walled_external_pool_does_not_take_primary_from_a_healthy_gemini_pool() {
-        // The exact live shape that misled the headline: Gemini nearly free,
-        // Claude/GPT walled at 100%. Primary must stay the Gemini pool.
+    fn a_walled_external_pool_cannot_be_read_as_the_account_s_own_capacity() {
+        // The exact live shape that once misled the headline: Gemini nearly free,
+        // Claude/GPT walled at 100%. The headline slot used to have to be policed
+        // so the walled pool could not claim it; now there is no unnamed slot at
+        // all, so the hazard is structural rather than guarded -- and each pool
+        // keeps its own figure under its own name.
         let body = r#"{"response":{"groups":[
             {"displayName":"Gemini Models","buckets":[
                 {"bucketId":"gemini-weekly","displayName":"Weekly Limit","window":"weekly",
@@ -2046,19 +2033,22 @@ mod tests {
             ]}
         ]}}"#;
         let usage = parse_quota_summary(body).unwrap();
-        assert_eq!(usage.primary.unwrap().used_percent, 11.7);
-        assert!(usage.secondary.is_none());
-        let extras = usage.extra_rate_windows.unwrap();
-        assert_eq!(extras.len(), 2);
+        assert_no_unnamed_slot(&usage);
         assert_eq!(
-            extras[1].window.as_ref().unwrap().used_percent,
-            100.0,
-            "the walled external pool stays visible as a named extra"
+            super::tests::pool_window(&usage, "gemini-weekly").used_percent,
+            11.7,
+            "the native pool reports its own figure"
         );
+        assert_eq!(
+            pool_window(&usage, "3p-weekly").used_percent,
+            100.0,
+            "and the walled external pool stays visible without standing for the account"
+        );
+        assert_eq!(usage.extra_rate_windows.as_ref().unwrap().len(), 2);
     }
 
     #[test]
-    fn account_without_gemini_pool_falls_back_to_most_used_window() {
+    fn an_account_with_no_native_pool_still_publishes_what_it_has() {
         let body = r#"{"groups":[{"displayName":"Claude and GPT models","buckets":[
             {"bucketId":"3p-5h","displayName":"Five Hour Limit","window":"5h",
              "remainingFraction":0.95,"resetTime":"2026-06-24T08:00:00Z"},
@@ -2066,8 +2056,13 @@ mod tests {
              "remainingFraction":0.4,"resetTime":"2026-06-30T00:00:00Z"}
         ]}]}"#;
         let usage = parse_quota_summary(body).unwrap();
-        assert_eq!(usage.primary.unwrap().used_percent, 60.0);
-        assert!(usage.secondary.is_none());
+        // No Gemini pool at all. There used to be a fallback picking the most-used
+        // window for the headline so such an account reported SOMETHING rather
+        // than degrading; with every window named, it reports both directly and
+        // the fallback has nothing left to do.
+        assert_no_unnamed_slot(&usage);
+        assert_eq!(pool_window(&usage, "3p-5h").used_percent, 5.0);
+        assert_eq!(pool_window(&usage, "3p-weekly").used_percent, 60.0);
     }
 
     /// A window with usage but no reset is still published.
@@ -2081,10 +2076,8 @@ mod tests {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
             {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.5}
         ]}]}"#;
-        let primary = parse_quota_summary(body)
-            .unwrap()
-            .primary
-            .expect("usage data should emit a window");
+        let usage = parse_quota_summary(body).unwrap();
+        let primary = pool_window(&usage, "g-5h");
         assert_eq!(primary.used_percent, 50.0);
         assert_eq!(primary.resets_at, None);
     }
@@ -2098,10 +2091,8 @@ mod tests {
         let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
             {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.0}
         ]}]}"#;
-        let primary = parse_quota_summary(body)
-            .unwrap()
-            .primary
-            .expect("usage data should emit a window");
+        let usage = parse_quota_summary(body).unwrap();
+        let primary = pool_window(&usage, "g-5h");
         assert_eq!(primary.used_percent, 100.0);
         assert_eq!(primary.resets_at, None);
     }
@@ -2133,9 +2124,9 @@ mod tests {
              "resetTime":1788000000}
         ]}]}"#;
         let usage = parse_quota_summary(body).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 75.0);
-        assert_eq!(primary.window_minutes, Some(10080));
+        let window = pool_window(&usage, "g-weekly");
+        assert_eq!(window.used_percent, 75.0);
+        assert_eq!(window.window_minutes, Some(10080));
     }
 
     #[test]
@@ -2298,7 +2289,7 @@ mod tests {
         // The native Gemini pool owns the unnamed slot, as locally: an unnamed
         // window reads as the account's own capacity, and the external pool in
         // it would report the provider exhausted while Gemini is free.
-        let primary = usage.primary.expect("a gemini pool window");
+        let primary = pool_window(&usage, "Gemini Models");
         assert_eq!(primary.used_percent, 1.41);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-08-06T09:38:35Z"));
 
@@ -2402,7 +2393,7 @@ mod tests {
     fn the_remote_lane_publishes_no_cadence_it_cannot_know() {
         let usage = parse_remote_quota(REMOTE_FIXTURE).unwrap();
 
-        assert_eq!(usage.primary.as_ref().unwrap().window_minutes, None);
+        assert_eq!(pool_window(&usage, "Gemini Models").window_minutes, None);
         for extra in usage.extra_rate_windows.as_ref().unwrap() {
             let window = extra.window.as_ref().unwrap();
             assert_eq!(
@@ -2802,7 +2793,7 @@ mod plugin_lane_tests {
             ))
             .await;
         let usage = attempt.usage.expect("usage must be present");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
         // Asserts LOCAL lane served (58.4% used, 2026-09-10 reset) rather than cloud (7.15%, 2026-09-08).
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-10T18:41:37Z"));
@@ -2867,7 +2858,7 @@ mod plugin_lane_tests {
             ))
             .await;
         let usage = attempt.usage.expect("usage must be present");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
         // Asserts CLOUD lane served (7.15%, 2026-09-08 reset) because identity mismatched.
         assert_eq!(
@@ -2923,7 +2914,7 @@ mod plugin_lane_tests {
             ))
             .await;
         let usage = attempt.usage.expect("usage must be present");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
         // Asserts CLOUD lane served because the local snapshot carried no email to attribute.
         assert_eq!(
@@ -2968,7 +2959,7 @@ mod plugin_lane_tests {
             ))
             .await;
         let usage = attempt.usage.expect("usage must be present");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
         assert_eq!(primary.used_percent, 7.15);
@@ -3187,7 +3178,7 @@ mod plugin_lane_tests {
         let usage = attempt
             .usage
             .expect("a free-tier account must still reach the cloud lane");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
         assert_eq!(
             attempt.value_observed_at, None,
@@ -3221,7 +3212,7 @@ mod plugin_lane_tests {
 
         let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
         let usage = attempt.usage.expect("usage must be present");
-        let primary = usage.primary.as_ref().expect("primary window");
+        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-10T18:41:37Z"));
         assert_eq!(primary.used_percent, 58.4);
