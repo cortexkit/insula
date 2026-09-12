@@ -321,6 +321,36 @@ fn check_entry_shape(
         entry.account.as_deref().unwrap_or("unlabeled")
     );
 
+    // A RELAXED READING MUST NAME THE CREDITS THAT BOUGHT IT.
+    //
+    // `rawUsedPercent` is present only when this module zeroed a real percent
+    // because a banked reset credit is available -- so it is a claim about credits,
+    // and `savedResets` is where that claim is evidenced. The producer cannot emit
+    // one without the other: every path that marks a slot relax-eligible also
+    // attaches the credit inventory, and the path where the inventory is missing
+    // returns before eligibility is ever set.
+    //
+    // Which is exactly why it is worth checking here. The invariant holds by
+    // CONSTRUCTION, and construction is what a refactor changes: the two are set on
+    // adjacent lines today and nothing but this rule would notice them parting.
+    // A consumer that met a zeroed percent with no credits behind it would route
+    // work to an account that is actually full.
+    //
+    // Presence is asserted, not credit COUNT: a credit consumed in the same tick
+    // that produced the reading can legitimately leave the count at zero, and a
+    // checker that cries wolf on a real sequence stops being read.
+    if entry.saved_resets.is_none() {
+        if let Some(relaxed) = entry.usage.as_ref().and_then(|usage| {
+            crate::model::windows(usage).find(|window| window.raw_used_percent.is_some())
+        }) {
+            findings.push(format!(
+                "{where_}: usedPercent {} is relaxed (rawUsedPercent {:?}) but no \
+                 savedResets states the credits that bought it",
+                relaxed.used_percent, relaxed.raw_used_percent
+            ));
+        }
+    }
+
     // An entry is a capacity reading or a stated failure. Carrying neither says
     // nothing at all while still occupying a row, so a consumer counting
     // published providers counts it and a consumer reading capacity finds none:
@@ -1057,6 +1087,22 @@ mod tests {
             },
         );
         entry.fetched_at = Some(stamped_at());
+        // A relaxed window carries the credit inventory that bought it, because
+        // production cannot emit one without the other: the path that marks a slot
+        // relax-eligible attaches the inventory, and the path with no inventory
+        // returns before eligibility is set. Attaching it HERE rather than in each
+        // relaxation test keeps the fixture reachable by construction -- a helper
+        // that can build an impossible entry makes every test written on it a test
+        // of a state the program never reaches.
+        if crate::model::windows(entry.usage.as_ref().expect("a healthy entry has usage"))
+            .any(|window| window.raw_used_percent.is_some())
+        {
+            entry.saved_resets = Some(cortexkit_provider_usage::SavedResets {
+                available_count: 1,
+                soonest_expires_at: None,
+                credits: Vec::new(),
+            });
+        }
         entry
     }
 
@@ -1605,6 +1651,39 @@ mod tests {
         let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
 
         assert_eq!(report.findings, Vec::<String>::new());
+    }
+
+    /// A relaxed reading with no credit inventory behind it is reported.
+    ///
+    /// `rawUsedPercent` exists only because this module zeroed a real percent
+    /// against a banked reset credit, so it is a CLAIM ABOUT CREDITS and
+    /// `savedResets` is where that claim is evidenced. A consumer meeting a zeroed
+    /// percent with nothing behind it routes work to an account that is actually
+    /// 70% spent.
+    ///
+    /// The producer cannot currently emit this: every path that marks a slot
+    /// relax-eligible attaches the inventory on the adjacent line, and the path
+    /// without an inventory returns before eligibility is set. That is the reason
+    /// to check it rather than a reason not to -- an invariant held by construction
+    /// is held by whatever the next refactor does to those two lines, and nothing
+    /// else would notice them parting.
+    #[test]
+    fn a_relaxed_window_without_its_credits_is_reported() {
+        let mut w = window(0.0);
+        w.raw_used_percent = Some(70.0);
+        let mut e = entry(w);
+        // The helper attaches the inventory for exactly this shape, so strip it:
+        // the point of this test is the state the producer must never reach.
+        e.saved_resets = None;
+
+        let report = check_entries(&[e], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("no savedResets"),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// A degraded entry has no windows, so a sweep over nothing but degraded
