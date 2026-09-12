@@ -1377,6 +1377,98 @@ impl UsageProvider for LabelProvider {
     }
 }
 
+/// A provider whose two credentials resolve ONE account and whose usage falls
+/// between ticks: the shape that emits a pair of drop records.
+struct PairedDropProvider {
+    percent: Arc<Mutex<f64>>,
+}
+
+#[async_trait]
+impl UsageProvider for PairedDropProvider {
+    fn name(&self) -> &str {
+        "paired"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![handle("H1"), handle("H2")])
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let percent = *self.percent.lock().unwrap();
+        FetchAttempt::success(
+            // Both credentials reach the same account, which is what makes one
+            // reset produce two records.
+            Some(AccountObservation::new(Some("acct-1".to_string()), None)),
+            "test",
+            Usage {
+                primary: Some(RateWindow {
+                    used_percent: percent,
+                    raw_used_percent: None,
+                    resets_at: None,
+                    window_minutes: None,
+                    used_count: None,
+                    total_count: None,
+                    regeneration: None,
+                }),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: None,
+            },
+        )
+    }
+}
+
+/// The refresher passes the observed identity into the drop record.
+///
+/// THE JOIN, and it was undefended: a store-level test proves the record carries
+/// whatever it is handed, and nothing proved the refresher hands it the account
+/// rather than `None`. Substituting `None` at the call site left the whole suite
+/// green -- both halves tested, the join between them not.
+///
+/// Driven through two real ticks with a genuine decrease rather than by calling
+/// the store directly, because the value under test is produced by the refresher
+/// and a test that supplies it is testing itself.
+#[tokio::test]
+async fn the_refresher_attributes_a_drop_to_the_account_it_observed() {
+    let percent = Arc::new(Mutex::new(90.0));
+    let registry = Registry::new(vec![Box::new(PairedDropProvider {
+        percent: Arc::clone(&percent),
+    })]);
+
+    tick(&registry).await;
+    *percent.lock().unwrap() = 5.0;
+    force_due(&registry, "paired");
+    tick(&registry).await;
+
+    let page = registry.store.lock().unwrap().drop_page(None);
+    assert_eq!(
+        page.drops.len(),
+        2,
+        "two credentials on one account each observe the decrease: {:?}",
+        page.drops
+    );
+    assert!(
+        page.drops
+            .iter()
+            .all(|record| record.account.as_deref() == Some("acct-1")),
+        "every record must name the account the refresher observed: {:?}",
+        page.drops
+    );
+
+    // And the point of the field: a consumer collapsing by (provider, account)
+    // sees ONE reset, not two.
+    let events: std::collections::BTreeSet<(&str, Option<&str>)> = page
+        .drops
+        .iter()
+        .map(|record| (record.provider.as_str(), record.account.as_deref()))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "one reset, however many credentials saw it"
+    );
+}
+
 /// Every slot status must be classified into a health bucket deliberately.
 ///
 /// The identity `fresh + stale + pending + degraded + unconfigured +

@@ -34,6 +34,24 @@ pub struct DropRecord {
     /// Wall clock at the moment the drop was observed, RFC3339 with nanoseconds.
     pub at: String,
     pub provider: String,
+    /// Which account the decrease was observed on, when the credential resolves
+    /// one.
+    ///
+    /// WITHOUT THIS A CONSUMER COUNTING RESETS DOUBLE-COUNTS. Detection runs per
+    /// SLOT, and a provider can reach one account through several credentials --
+    /// a vault handle beside a plugin account, say -- so one underlying reset
+    /// produces one record per credential, milliseconds apart and identical on
+    /// the wire. Observed live: eight antigravity records in pairs where the real
+    /// event count was four.
+    ///
+    /// The same key `usage.get` entries carry, so drops join to entries without a
+    /// second mapping. Absent where the credential resolves no identity (browser
+    /// cookies, a token with no account claim), which is honest rather than
+    /// convenient: two identity-less credentials for one provider genuinely
+    /// cannot be told apart from here, and a consumer needs to know that rather
+    /// than be handed a fabricated discriminator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Whether the two readings either side were taken across a CONTINUOUS poll
     /// interval. False means the interval had a gap -- suspend, blackout, backoff
     /// -- and a gap hides magnitude: a drop plus later consumption reads smaller
@@ -438,8 +456,13 @@ impl SlotStore {
     ///
     /// Both figures move from the same call, so the continuous count can never
     /// exceed the total by construction rather than by discipline.
-    pub(crate) fn record_quota_drop(&mut self, provider: &str, observed_continuously: bool) {
-        self.push_drop_record(provider, observed_continuously);
+    pub(crate) fn record_quota_drop(
+        &mut self,
+        provider: &str,
+        account: Option<&str>,
+        observed_continuously: bool,
+    ) {
+        self.push_drop_record(provider, account, observed_continuously);
         *self
             .quota_drops_by_provider
             .entry(provider.to_string())
@@ -451,7 +474,12 @@ impl SlotStore {
     }
 
     /// Append one record to the ring, evicting the oldest when full.
-    fn push_drop_record(&mut self, provider: &str, observed_continuously: bool) {
+    fn push_drop_record(
+        &mut self,
+        provider: &str,
+        account: Option<&str>,
+        observed_continuously: bool,
+    ) {
         let record = DropRecord {
             seq: self.drop_log_next_seq,
             // BOTH a sequence and a timestamp, so a consumer that lost its cursor
@@ -461,6 +489,7 @@ impl SlotStore {
             // consumer to keep exactly the thing that does not survive.
             at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, false),
             provider: provider.to_string(),
+            account: account.map(str::to_string),
             observed_continuously,
         };
         self.drop_log_next_seq = self.drop_log_next_seq.saturating_add(1);
@@ -488,6 +517,65 @@ impl SlotStore {
 #[cfg(test)]
 mod tests {
 
+    /// A drop record names the account, so one reset counted twice is
+    /// distinguishable from two accounts resetting.
+    ///
+    /// Detection runs per SLOT, and a provider can reach one account through
+    /// several credentials, so one underlying reset emits one record per
+    /// credential -- milliseconds apart and, without this field, IDENTICAL on the
+    /// wire. Seen live: eight antigravity records arriving in pairs, where a
+    /// consumer reading them as reset events would count double.
+    ///
+    /// The absent case is asserted too, and it is the honest half: a credential
+    /// that resolves no identity (browser cookies, a token with no account claim)
+    /// genuinely cannot be attributed from here, so the field is omitted rather
+    /// than filled with a stand-in. A consumer that sees no account knows
+    /// attribution is unavailable; one handed a fabricated discriminator would not.
+    #[test]
+    fn a_drop_record_names_the_account_when_one_resolves() {
+        let mut store = SlotStore::new(Instant::now());
+        // Two credentials, one account: the shape that emits a pair.
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        // A different account of the same provider: genuinely two events.
+        store.record_quota_drop("antigravity", Some("acct-2"), false);
+        // And a lane with no identity at all.
+        store.record_quota_drop("ollama", None, true);
+
+        let page = store.drop_page(None);
+        let accounts: Vec<Option<&str>> = page
+            .drops
+            .iter()
+            .map(|record| record.account.as_deref())
+            .collect();
+        assert_eq!(
+            accounts,
+            vec![Some("acct-1"), Some("acct-1"), Some("acct-2"), None],
+            "each record must carry the identity it was observed on"
+        );
+
+        // The property a consumer needs: collapsing by (provider, account) turns
+        // the pair into one event and leaves the distinct ones alone.
+        let distinct: std::collections::BTreeSet<(&str, Option<&str>)> = page
+            .drops
+            .iter()
+            .map(|record| (record.provider.as_str(), record.account.as_deref()))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "four records, three real events: the pair collapses and the rest do not"
+        );
+
+        // An absent account must not appear as a key at all, so a consumer
+        // decoding into a typed struct does not meet a null it has to interpret.
+        let rendered = serde_json::to_string(&page.drops[3]).expect("serialises");
+        assert!(
+            !rendered.contains("account"),
+            "an unattributable drop omits the field: {rendered}"
+        );
+    }
+
     /// A cursor older than the ring reports its loss instead of reading empty.
     ///
     /// THE CONDITION A CONSUMER ASKED FOR FIRST, and the one worth defending
@@ -499,7 +587,7 @@ mod tests {
     fn a_cursor_that_fell_off_the_ring_is_distinguishable_from_a_quiet_interval() {
         let mut store = SlotStore::new(Instant::now());
         for _ in 0..(DROP_LOG_CAPACITY + 10) {
-            store.record_quota_drop("codex", true);
+            store.record_quota_drop("codex", None, true);
         }
 
         // A cursor from before the eviction.
@@ -529,7 +617,7 @@ mod tests {
     fn the_ring_is_bounded_by_its_capacity() {
         let mut store = SlotStore::new(Instant::now());
         for _ in 0..(DROP_LOG_CAPACITY * 3) {
-            store.record_quota_drop("claude", false);
+            store.record_quota_drop("claude", None, false);
         }
         let page = store.drop_page(None);
         assert_eq!(page.drops.len(), DROP_LOG_CAPACITY);
@@ -549,7 +637,7 @@ mod tests {
     #[test]
     fn a_record_carries_both_a_sequence_and_a_timestamp() {
         let mut store = SlotStore::new(Instant::now());
-        store.record_quota_drop("antigravity", true);
+        store.record_quota_drop("antigravity", None, true);
         let page = store.drop_page(None);
         let record = &page.drops[0];
 

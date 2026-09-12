@@ -1256,7 +1256,18 @@ impl Registry {
             }
             match observation {
                 quota_drop::DropObservation::Drop(drop) => {
-                    store.record_quota_drop(&unit.key.provider, drop.observed_continuously);
+                    // The identity of the reading that dropped, taken from
+                    // this attempt rather than the previous one: a drop is a
+                    // statement about the account observed NOW, and the two
+                    // agree here because an account change is rejected as
+                    // not-comparable before reaching this arm.
+                    store.record_quota_drop(
+                        &unit.key.provider,
+                        next.observation
+                            .as_ref()
+                            .and_then(|observation| observation.account_id.as_deref()),
+                        drop.observed_continuously,
+                    );
                 }
                 quota_drop::DropObservation::NoDrop => store.record_comparable_no_drop(),
                 quota_drop::DropObservation::NotComparable(reason) => {

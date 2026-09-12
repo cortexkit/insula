@@ -1519,13 +1519,30 @@ make one poll answer two questions with different retention rules.
   "oldestRetained": 41,       // absent when the ring is empty
   "next": 57,
   "drops": [
-    { "seq": 56, "at": "…", "provider": "codex", "observedContinuously": true }
+    { "seq": 56, "at": "…", "provider": "codex",
+      "account": "291f5165-…",   // absent when the credential resolves no identity
+      "observedContinuously": true }
   ]
 }
 ```
 
 Poll with `{"method": "usage.drops", "params": {"since": 56}}`. Omit `since` to
 get everything retained.
+
+**Collapse by `(provider, account)` before counting events.** Detection runs per
+CREDENTIAL, and a provider can reach one account through several — a vault handle
+beside a local one — so a single reset emits one record per credential,
+milliseconds apart and otherwise identical. Counting records rather than events
+doubles those. Measured here: eight `antigravity` records arriving in pairs where
+four events occurred.
+
+`account` is the same key `usage.get` entries carry, so drops join to entries
+without a second mapping. It is **absent** where the credential resolves no
+identity — browser-cookie lanes, a token with no account claim — and that absence
+is load-bearing rather than incidental: two identity-less credentials for one
+provider genuinely cannot be told apart here, so records that lack it cannot be
+collapsed, and treating them as one event would under-count in the same way
+counting records over-counts.
 
 **It is a gap-closer, not an archive.** The ring lives in memory, bounded, and
 its job is to ensure a drop occurring between two consecutive polls is not
