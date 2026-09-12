@@ -530,6 +530,40 @@ fn check_across_entries(entries: &[ProviderUsage], report: &mut SanityReport) {
     for (provider, siblings) in &by_provider {
         report.providers_compared += 1;
 
+        // TWO ACCOUNTS OF ONE PROVIDER MUST NOT SHARE A DISPLAY IDENTITY.
+        //
+        // `account` is a verified id and `accountInfo` is unverified display text,
+        // and their independence is the point: the wire carries both so a consumer
+        // can key on one and show the other. That independence is exactly what lets
+        // them CROSS -- an email resolved from one credential and attached to
+        // another's usage renders a row that is wrong in the one field a human
+        // reads, while every id-keyed check downstream stays green.
+        //
+        // Scoped per provider because one person legitimately holds the same email
+        // across products (beatricelau0414@ is a live codex AND claude account
+        // here), so a fleet-wide uniqueness rule would fire on the normal case.
+        let mut seen_emails: BTreeMap<&str, &str> = BTreeMap::new();
+        for sibling in siblings.iter() {
+            let (Some(account), Some(email)) = (
+                sibling.account.as_deref(),
+                sibling
+                    .account_info
+                    .as_ref()
+                    .and_then(|info| info.email.as_deref()),
+            ) else {
+                continue;
+            };
+            match seen_emails.get(email) {
+                Some(first) if *first != account => report.findings.push(format!(
+                    "{provider}: accounts {first} and {account} both display \
+                     {email} -- one account's identity is attached to another's usage"
+                )),
+                _ => {
+                    seen_emails.insert(email, account);
+                }
+            }
+        }
+
         let unlabelled = siblings.iter().filter(|e| e.account.is_none()).count();
         let labelled = siblings.len() - unlabelled;
 
@@ -1812,6 +1846,63 @@ mod tests {
         // silence is the rules declining to fire rather than the sweep skipping
         // the array.
         assert_eq!(report.windows_checked, 2);
+    }
+
+    /// Two accounts of one provider sharing a display email is reported.
+    ///
+    /// `account` is a verified id and `accountInfo` is unverified display text.
+    /// Their independence is deliberate -- a consumer keys on one and shows the
+    /// other -- and it is exactly what lets them CROSS: an email resolved from one
+    /// credential and attached to another's usage renders a row wrong in the one
+    /// field a human reads, while every id-keyed check downstream stays green.
+    ///
+    /// This is not hypothetical here. Twice in one day a lane answered about one
+    /// of two handles while I believed it spoke for both, and both times the
+    /// discriminating field was already in output I had quoted myself.
+    #[test]
+    fn two_accounts_of_one_provider_sharing_a_display_email_are_reported() {
+        let mut first = labelled("claude", "acct-1");
+        first.account_info = Some(cortexkit_provider_usage::AccountInfo {
+            email: Some("someone@example.test".into()),
+            org_name: None,
+            plan_type: None,
+        });
+        let mut second = labelled("claude", "acct-2");
+        second.account_info = first.account_info.clone();
+
+        let report = check_entries(&[first, second], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("another's usage"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// One person's email across DIFFERENT providers is not a finding.
+    ///
+    /// The load-bearing control, and the reason the rule is scoped per provider:
+    /// the same human legitimately holds accounts on several products, and this is
+    /// the live shape on this host rather than an invented one --
+    /// beatricelau0414@ is a real codex account and a real claude account at the
+    /// same time. A fleet-wide uniqueness rule would fire on every such host, and a
+    /// checker with a permanent finding stops being read.
+    #[test]
+    fn one_email_across_two_providers_is_not_a_finding() {
+        let info = Some(cortexkit_provider_usage::AccountInfo {
+            email: Some("someone@example.test".into()),
+            org_name: None,
+            plan_type: None,
+        });
+        let mut codex = labelled("codex", "acct-1");
+        codex.account_info = info.clone();
+        let mut claude = labelled("claude", "acct-2");
+        claude.account_info = info;
+
+        let report = check_entries(&[codex, claude], at(FIXTURE_NOW));
+
+        assert_eq!(report.findings, Vec::<String>::new());
     }
 
     fn labelled(provider: &str, account: &str) -> ProviderUsage {
