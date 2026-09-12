@@ -1239,6 +1239,15 @@ programmatic API we hold a key for, and the figures are spend rather than
 remaining balance — money spent with no denominator cannot answer "how much is
 left", which is the question the Balance axis exists for.
 
+**Declined — `AntigravityLocalReader`** (+188 lines in a provider we serve, so it
+draws the eye every round). It reads conversation turns out of the editor's local
+session databases and accounts tokens: `cacheRead`, `cacheWrite`, `newInput`,
+`systemPrompt`, `totalTokens`. Zero occurrences of `remainingFraction`,
+`resetTime` or `quota` in the file. That is CONSUMPTION, the same class declined
+at v0.56.0 when it was ~1,300 lines of local readers, and the reason is unchanged:
+tokens spent carry no denominator, so they cannot answer how much capacity is
+left. Only the WAL technique below was taken from it.
+
 **Ported — the WAL hazard, from `AntigravityLocalSQLite.swift`.** Upstream added
 a reader that refuses `immutable=1` when a `-wal` sidecar exists and verifies file
 identity across the read. The hazard was already written down at our own
