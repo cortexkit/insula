@@ -249,6 +249,13 @@ fn print_gemini_weekly(label: &str, raw: &str) {
         println!("  {label:<22}: no groups in the response");
         return;
     }
+    // EVERY bucket, not one. Filtering to `gemini-weekly` answered "does this
+    // request shape change the number", which was the question the probe was
+    // built for -- and made it silent on "which buckets come back at all",
+    // which is the question that arrived later. A one-bucket view cannot
+    // distinguish an account upstream reports four windows for from one it
+    // reports two for, and those need opposite work.
+    let mut seen = Vec::new();
     for group in groups {
         for bucket in group
             .get("buckets")
@@ -256,23 +263,27 @@ fn print_gemini_weekly(label: &str, raw: &str) {
             .cloned()
             .unwrap_or_default()
         {
-            if bucket.get("bucketId").and_then(|v| v.as_str()) != Some("gemini-weekly") {
-                continue;
-            }
+            let id = bucket
+                .get("bucketId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no bucketId>")
+                .to_string();
             let reset = bucket
                 .get("resetTime")
                 .and_then(|v| v.as_str())
                 .unwrap_or("<none>");
-            match bucket
+            let used = match bucket
                 .get("remainingFraction")
                 .and_then(serde_json::Value::as_f64)
             {
-                Some(fraction) => println!(
-                    "  {label:<22}: gemini-weekly used={:>6.2}%  reset={reset}",
-                    (1.0 - fraction) * 100.0
-                ),
-                None => println!("  {label:<22}: gemini-weekly used=<absent>"),
-            }
+                Some(fraction) => format!("{:>6.2}%", (1.0 - fraction) * 100.0),
+                None => "<absent>".to_string(),
+            };
+            seen.push(format!("{id}={used} reset={reset}"));
         }
+    }
+    println!("  {label:<22}: {} bucket(s)", seen.len());
+    for line in seen {
+        println!("      {line}");
     }
 }
