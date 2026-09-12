@@ -808,19 +808,37 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
     // Round to 2dp: the fraction→percent arithmetic exposes float noise
     // (e.g. (1 - 0.8) * 100 = 19.999999999999996), same cleanup grok applies.
     let used_percent = (((1.0 - remaining) * 100.0).clamp(0.0, 100.0) * 100.0).round() / 100.0;
-    let title = format!(
-        "{} {}",
-        group.display_name.trim(),
-        bucket.display_name.trim()
-    )
-    .trim()
-    .to_string();
+    // THE CADENCE THIS MODULE DERIVED, NOT THE WORDING THE LANE HAPPENED TO CARRY.
+    // Both lanes reach this function, and they arrive with different text for the
+    // same meter: the cloud lane brings upstream's `displayName` ("Weekly Limit
+    // Remaining"), while the cache lane has only the raw cadence key ("weekly").
+    // Concatenating whatever arrived gave one account "Gemini Models weekly" and
+    // its sibling "Gemini Models Weekly Limit Remaining" for the SAME window id --
+    // and made the same account change label when an editor opened.
+    //
+    // Upstream's own wording is not stable enough to key on even within one lane:
+    // "Weekly Limit", "Weekly Limit Remaining" and "Weekly_Limit" have all been
+    // observed for this field. Deriving from `window_minutes` makes the title a
+    // function of the same classification the id encodes, so the two cannot
+    // disagree and neither can two lanes.
+    let window_minutes = window_minutes_of(bucket);
+    let cadence = match window_minutes {
+        Some(300) => "5h".to_string(),
+        Some(10080) => "weekly".to_string(),
+        // An unclassified cadence keeps the upstream text rather than inventing
+        // one: a wrong cadence in a label is worse than an unfamiliar one, and
+        // this is the branch a new window shape arrives through.
+        _ => bucket.display_name.trim().to_string(),
+    };
+    let title = format!("{} {}", group.display_name.trim(), cadence)
+        .trim()
+        .to_string();
     Some(ResolvedWindow {
         window: RateWindow {
             used_percent,
             raw_used_percent: None,
             resets_at: reset,
-            window_minutes: window_minutes_of(bucket),
+            window_minutes,
             used_count: None,
             total_count: None,
             regeneration: None,
@@ -1850,6 +1868,71 @@ mod tests {
         assert!(
             usage.primary.is_none() && usage.secondary.is_none() && usage.tertiary.is_none(),
             "antigravity publishes named windows only: {usage:?}"
+        );
+    }
+
+    /// The two lanes publish the SAME title for the same meter.
+    ///
+    /// Both reach `normalize_quota_summary`, and they arrive carrying different
+    /// text for one window: the cloud lane brings upstream's `displayName`
+    /// ("Weekly Limit Remaining"), the plugin cache has only its cadence key
+    /// ("weekly"). Concatenating whatever arrived published one account as
+    /// "Gemini Models weekly" and its sibling as "Gemini Models Weekly Limit
+    /// Remaining" FOR THE SAME ID -- and made one account change label the moment
+    /// an editor opened, since that is the event that switches its lane.
+    ///
+    /// Reported from a renderer, where the two spellings looked like six meters
+    /// instead of four. Invisible from inside either lane: each is
+    /// self-consistent, and only a comparison between them shows it.
+    #[test]
+    fn both_lanes_title_the_same_meter_identically() {
+        let cloud = parse_quota_summary(
+            r#"{"groups":[{"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining",
+                 "window":"weekly","remainingFraction":0.5,
+                 "resetTime":"2026-09-17T18:41:37Z"}
+            ]}]}"#,
+        )
+        .expect("the cloud body parses");
+
+        let cached: CachedQuota = serde_json::from_str(
+            r#"{"gemini":{"windows":[
+                {"window":"weekly","remainingFraction":0.5,
+                 "resetTime":"2026-09-17T18:41:37Z"}
+            ]}}"#,
+        )
+        .expect("the cache payload parses");
+        let cache = parse_cached_quota(&cached).expect("the cache normalises");
+
+        let named = |usage: &Usage| -> Vec<(String, String)> {
+            usage
+                .extra_rate_windows
+                .as_ref()
+                .expect("named windows")
+                .iter()
+                .map(|extra| {
+                    (
+                        extra.id.clone().unwrap_or_default(),
+                        extra.title.clone().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            named(&cloud),
+            named(&cache),
+            "one meter must carry one id and one title however it was read; a lane \
+             switch is not a reason for an account to change what its window is called"
+        );
+        assert_eq!(
+            named(&cloud),
+            vec![(
+                "gemini-weekly".to_string(),
+                "Gemini Models weekly".to_string()
+            )],
+            "and the title follows the cadence this module derived, not the wording \
+             upstream happened to send"
         );
     }
 
