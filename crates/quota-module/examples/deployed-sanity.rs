@@ -128,6 +128,18 @@ async fn main() {
         None => entries,
     };
 
+    // The drop ring's records join to these entries by `(provider, account)`, and
+    // that join is the whole point of the account field: detection runs per
+    // CREDENTIAL, so one reset seen through two credentials writes two records, and
+    // collapsing them is the only way to count events. An id naming no account this
+    // provider publishes would be a stale or crossed identity -- the failure a
+    // non-empty-string check passes straight through.
+    //
+    // Deliberately AFTER the drops page is read and shape-checked, so the ordering
+    // property holds: a broken drops operation still fails before usage.get is
+    // consulted at all.
+    check_drop_account_join(&drops, &entries);
+
     if entries.is_empty() {
         match filter.as_deref() {
             Some(name) => println!("no entries for {name}: nothing was checked"),
@@ -389,6 +401,53 @@ async fn check_health_identity(stream: &mut tokio::net::TcpStream) -> Vec<String
 /// exactly the three that make an empty page readable, and an empty ring -- the
 /// ordinary state on a quiet host -- is when they are easiest to get wrong,
 /// because every assertion about the records themselves passes vacuously.
+/// Every attributed drop record must name an account `usage.get` publishes for the
+/// same provider.
+///
+/// Silent on records with no account: a browser-cookie lane resolves no identity,
+/// and those records genuinely cannot be attributed or collapsed. Silent too when
+/// the provider publishes no accounts at all right now -- the ring outlives the
+/// slots that wrote it, so a credential removed since a drop was recorded leaves a
+/// record nothing can join, which is a property of a ring rather than a defect.
+///
+/// What it does catch: an id that names SOMETHING, for a provider that is
+/// currently publishing accounts, and is not one of them.
+fn check_drop_account_join(page: &serde_json::Value, entries: &[ProviderUsage]) {
+    let Some(drops) = page["drops"].as_array() else {
+        return;
+    };
+    let mut joined = 0usize;
+    let mut unattributed = 0usize;
+    for drop in drops {
+        let Some(account) = drop["account"].as_str() else {
+            unattributed += 1;
+            continue;
+        };
+        let provider = drop["provider"].as_str().unwrap_or_default();
+        let known: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.provider == provider)
+            .filter_map(|entry| entry.account.as_deref())
+            .collect();
+        if known.is_empty() {
+            continue;
+        }
+        assert!(
+            known.contains(&account),
+            "drop record names account {account} for {provider}, but usage.get \
+             publishes {known:?} -- a drop that joins to no entry cannot be counted"
+        );
+        joined += 1;
+    }
+    // The denominators, so a clean line is readable: zero joined because nothing
+    // was attributable reads very differently from zero joined because the check
+    // never ran.
+    println!(
+        "  usage.drops join: {joined} record(s) joined to an entry, \
+         {unattributed} unattributable (no identity on that lane)"
+    );
+}
+
 fn check_drop_page(page: &serde_json::Value) {
     let epoch = page["epoch"].as_str().unwrap_or_else(|| {
         panic!("usage.drops must state an epoch, or a held cursor cannot be validated: {page}")
@@ -450,6 +509,32 @@ fn check_drop_page(page: &serde_json::Value) {
             drop["observedContinuously"].is_boolean(),
             "the confidence flag must be stated, never inferred from absence: {drop}"
         );
+
+        // `account` is what makes these records COUNTABLE: detection runs per
+        // credential, so a provider reached through several credentials emits one
+        // record per credential for a single reset, and only this field lets a
+        // consumer collapse them. Absent is legal and load-bearing -- a
+        // browser-cookie lane resolves no identity, and those records genuinely
+        // cannot be collapsed -- so the check is on the value when present, not on
+        // presence.
+        //
+        // The join is asserted rather than the shape: an id here that names no
+        // account `usage.get` publishes for the same provider would be a stale or
+        // crossed identity, which is the failure this field can have that a
+        // non-empty-string check would pass straight through.
+        if let Some(account) = drop.get("account") {
+            let account = account.as_str().unwrap_or_else(|| {
+                panic!("account must be a string when present, never null: {drop}")
+            });
+            assert!(
+                !account.trim().is_empty(),
+                "an empty account is worse than an absent one -- it claims an \
+                 attribution that cannot be joined: {drop}"
+            );
+            // The JOIN against `usage.get` is checked separately, after those
+            // entries exist: this page is read FIRST on purpose, so that a broken
+            // drops operation cannot hide behind clean usage reporting.
+        }
     }
 
     // Print the records, not only the count. This is the ONLY reader of
@@ -462,10 +547,14 @@ fn check_drop_page(page: &serde_json::Value) {
     // either way.
     for drop in drops {
         println!(
-            "    drop seq {} {} {} continuous={}",
+            "    drop seq {} {} {} account={} continuous={}",
             drop["seq"],
             drop["at"].as_str().unwrap_or("?"),
             drop["provider"].as_str().unwrap_or("?"),
+            // Printed as `-` rather than omitted: an unattributable record and an
+            // attributed one must be distinguishable at a glance, since only the
+            // second can be collapsed into an event count.
+            drop["account"].as_str().unwrap_or("-"),
             drop["observedContinuously"]
         );
     }
