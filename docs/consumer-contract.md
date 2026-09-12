@@ -995,14 +995,33 @@ throughout.
 
 **Nor is it guaranteed stable within a provider.** Where a provider reads one
 account through more than one lane, the lanes can publish different ids for the
-same limit, and which lane answers is decided per fetch. `antigravity` does this
-today: its cloud lane names pools (`Gemini Models`), while its local lane passes
-through the upstream's own bucket identifiers (`gemini-weekly`, `3p-5h`). The
-same account switches between those shapes depending on whether a local process
-happens to be running.
+same limit, and which lane answers is decided per fetch.
+
+`antigravity` reads one account through three, and they are no longer all
+different. Its live editor probe, and the cloud summary endpoint, and the editor
+plugin's cache all normalise through one path and publish the upstream bucket
+identifiers — `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` — with titles
+derived from the cadence rather than from whatever wording each lane carried.
+Those three agree by construction.
+
+The exception is a **fallback that runs only when the summary endpoint refuses**.
+It reads a per-model endpoint that reports one figure per pool with no window
+length, so it cannot produce the same ids: it publishes one window per pool named
+for the pool (`Gemini Models`), with `windowMinutes` absent because the upstream
+states no cadence. That is a genuinely different shape rather than a different
+spelling of the same one, which is why it is not normalised onto the others —
+forcing a match would assert a cadence nobody reported.
 
 So a consumer matching ids for a provider with more than one lane must enumerate
-every lane's form. Enumerate the ids you positively want rather than the ones you
+every lane's form — for `antigravity`, the four bucket ids plus the two pool
+names the fallback uses.
+
+**And match on `id`, not on `title`, even when the titles look stable.** Titles
+here are derived rather than passed through, so two lanes cannot spell one meter
+two ways — but that is a property this module maintains, not a guarantee the
+field carries. A consumer aggregating across accounts by title was silently
+unable to aggregate at all while two lanes disagreed, and the symptom was a
+missing roll-up rather than an error. Enumerate the ids you positively want rather than the ones you
 mean to skip: a skip-list fails **open** on every form nobody thought of, and
 those are exactly the forms that share no vocabulary with the ones that were.
 
