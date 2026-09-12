@@ -1217,3 +1217,31 @@ not parallel workers:
 - **Q-matrix-3 (credits signal):** should the router model a credits/balance signal at
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
+
+### Parity round: CodexBar v0.56.6 → v0.60.0
+
+Six releases had accumulated behind the anchor (`v0.56.7`, `v0.56.8`, `v0.57.0`,
+`v0.58.0`, `v0.59.0`, `v0.60.0`) because the tripwire fires on a tag and upstream
+ships several times a day. Check the tag list at the start of a round rather than
+waiting to be told.
+
+All five opaque constants present at `v0.60.0`, located by VALUE in the tagged
+tree rather than by our name for them — the names are ours and exist nowhere
+upstream, which is why a name-based sweep returned five false absences before the
+procedure was re-read.
+
+**Declined — DeepSeek** (+523 lines, the round's largest). Upstream added five
+`platform.deepseek.com` endpoints reporting `todayCost`, `currentMonthCost`,
+`todayTokens`, `apiKeyCount` and a daily chart. Declined on both axes that
+already settle this class: the lane is the authorized web console session
+(`"DeepSeek Platform session is missing or expired."`) rather than the
+programmatic API we hold a key for, and the figures are spend rather than
+remaining balance — money spent with no denominator cannot answer "how much is
+left", which is the question the Balance axis exists for.
+
+**Ported — the WAL hazard, from `AntigravityLocalSQLite.swift`.** Upstream added
+a reader that refuses `immutable=1` when a `-wal` sidecar exists and verifies file
+identity across the read. The hazard was already written down at our own
+`copy_cookie_store`, with a note saying nothing in this repository observed it;
+that note is now a guard and a test. The technique is theirs, the hazard was ours.
+
