@@ -306,7 +306,26 @@ impl ProviderSlot {
         }
     }
 
-    /// Whether the served window is fresh at read time.
+    /// Whether this slot FETCHED recently. Not whether its value is recent.
+    ///
+    /// Those were the same question until a lane began serving a value from a
+    /// source it does not poll, and the difference is now load-bearing: an
+    /// antigravity row served from the editor plugin's cache fetches every 60
+    /// seconds while carrying a reading that may be an hour old. This answers
+    /// TRUE for it, correctly -- the poll is healthy -- and a caller asking
+    /// "is the value recent" would get a wrong answer with no symptom.
+    ///
+    /// Both callers today want the polling question and are right to use this:
+    /// ranking which slot to serve, and counting fresh-versus-stale providers on
+    /// the health surface. The banked-reset relaxation gate also uses it, which
+    /// is safe while codex polls its own credits, and would need re-examining if
+    /// that ever changed -- zeroing a percent against an hour-old reading is
+    /// exactly the shape this doc exists to prevent.
+    ///
+    /// VALUE AGE IS `last_success_wall`, the field published as `fetchedAt`. Two
+    /// defects came from asking this one instead: a dedup that published four
+    /// readings in rotation, and a drop record stamped as continuously observed
+    /// across an hour-wide gap. Both looked correct in review.
     pub fn is_fresh(&self, now: Instant) -> bool {
         self.last_success_at
             .map(|t| now.saturating_duration_since(t) <= FRESH_HORIZON)
