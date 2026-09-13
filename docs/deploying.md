@@ -634,3 +634,29 @@ for a test-only dependency.
 The digest answers "did the lock change", which is the question it was added for
 (spotting a missed wave). It does not answer "did the binary change", and the two
 diverge on exactly the dependencies that never ship.
+
+### A runtime FILE is not a runtime PATH
+
+The line count above is a proxy, and it has one standing false positive worth
+knowing before it costs you a restart. `crates/quota-core/src/wire_sanity.rs` is
+a CHECKER: its rules are ordinary production code in a crate the binary links,
+so a change there counts as runtime lines — but nothing in the daemon's frame
+loop calls it. Measured 2026-09-12 with a call-graph trace from `main`:
+
+    trace_to_symbol  main -> wire_sanity::check_entries    No path
+
+So 64 changed "runtime" lines moved no behaviour at all. When the count is
+non-zero, ask WHETHER A PATH REACHES THE CHANGE before concluding a deploy is
+owed; the trace is a second, stronger instrument, and only the proxy is cheap
+enough to run every time.
+
+AND A RESTART IS NOT FREE, which is what makes the distinction matter rather than
+being pedantry. Restarting discards every process-lifetime observation: the
+`usage.drops` ring, `staleEpisodes` and its per-provider map,
+`usageRequestsServed`. When that evidence is the deliverable of an open
+investigation — the drop ring is, for issue #5 — a redeploy for unreachable code
+destroys the thing being measured to change nothing.
+
+Holding is then the correct call, and it is only correct while BOTH halves hold:
+no path reaches the change, and the ring holds evidence nobody has collected.
+Deploy at the next change that does reach a path.
