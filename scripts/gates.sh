@@ -115,6 +115,27 @@ print(f"  {len(scripts) - len(broken)}/{len(scripts)} compile")
 sys.exit(1 if broken else 0)
 PYGATE
 
+step "shell instruments parse"
+# Same question as the python gate one step up, for the other half of the toolbox.
+# `bash -n` proves the file will START -- it is the shell equivalent of a compile,
+# not a linter, and it catches the failure that actually happens: an incident tool
+# edited under pressure and never run, dying on a syntax error at the moment it is
+# needed. Added when scripts/train.sh landed, because the release and train
+# scripts had no such check at all while every python script did.
+broken_shell=0
+shell_scripts=$(find scripts -name '*.sh' -type f | sort)
+if [ -z "$shell_scripts" ]; then
+  fail "no shell instruments found -- refusing rather than passing"
+fi
+for script in $shell_scripts; do
+  if ! bash -n "$script" 2>/dev/null; then
+    echo "  $script does not parse"
+    broken_shell=$((broken_shell + 1))
+  fi
+done
+echo "  $(echo "$shell_scripts" | wc -l | tr -d ' ') shell instrument(s), $broken_shell broken"
+[ "$broken_shell" -eq 0 ] || fail "a shell instrument does not parse"
+
 step "endpoint host manifest"
 # RUN, not merely compiled. This checker existed for two weeks reporting a real
 # finding that nobody saw, because the gate only py_compile'd it: the openrouter
