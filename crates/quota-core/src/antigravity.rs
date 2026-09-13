@@ -361,6 +361,40 @@ fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
     })
 }
 
+/// Must the cloud lane withhold rather than publish what it can reach?
+///
+/// The cloud answers about the STANDARD-TIER pool whatever credential dialled it,
+/// so for an account holding a paid tier it describes capacity that account never
+/// spends. This decides whether we know enough to publish.
+///
+/// Extracted because it is a DECISION, and the plumbing around it needs a stub
+/// vault and a mock server to drive -- which is exactly why the missing half
+/// below shipped unguarded and was found on live data rather than in a test.
+///
+/// TWO IGNORANCES THAT USED TO READ AS ONE:
+///   - NO PAID ACCOUNT IS KNOWN ANYWHERE (no store, or no row carries a paid
+///     tier). There is no evidence of a paid tier to withhold against, so serve.
+///     This is the fleet host with a vault credential and no plugin install, and
+///     taking it dark on a suspicion would be the worse error.
+///   - A PAID ACCOUNT EXISTS AND THIS CREDENTIAL CANNOT BE MATCHED TO A ROW.
+///     Withhold. The lookup is by email and `emails_match(None, _)` is false, so a
+///     fetch where the vault supplied no identity found no row and read as "not
+///     paid" -- publishing the standard pool for an account that does not spend
+///     it. Nothing rules out that this credential IS the paid account, and the
+///     failure direction is a confident wrong number rather than a missing one.
+fn cloud_lane_must_withhold(
+    accounts: &[StoredAccount],
+    plugin_account: Option<&StoredAccount>,
+) -> bool {
+    if account_holds_paid_tier(plugin_account) {
+        return true;
+    }
+    plugin_account.is_none()
+        && accounts
+            .iter()
+            .any(|account| account_holds_paid_tier(Some(account)))
+}
+
 /// Why a paid-tier account with neither an authoritative source nor a fresh cache
 /// publishes nothing.
 ///
@@ -1548,10 +1582,28 @@ impl AntigravityProvider {
         // Same rule as the plugin lane, and for the same reason: the vault's
         // token is issued to the same OAuth client, so it reaches the same
         // standard-tier pool. The tier is read from the plugin store by email
-        // because that is the only place on this host that records it; a host
-        // without the store answers false and keeps serving, which is the honest
-        // default when the tier is unknown rather than known-absent.
-        if account_holds_paid_tier(plugin_account) {
+        // because that is the only place on this host that records it.
+        //
+        // AN UNRESOLVED IDENTITY MUST NOT ANSWER "NOT PAID". The lookup is by
+        // email, and `emails_match(None, _)` is false, so a fetch where the vault
+        // supplied no identity found no row and fell through to the cloud --
+        // publishing the standard-tier pool for an account that does not spend
+        // it. That is the exact wrong-pool reading this guard exists to prevent,
+        // arriving through the one door the guard did not cover, and it is
+        // intermittent: it happens only on the fetches where identity is missing,
+        // so the published percent alternates between two pools and each step
+        // down is recorded as a quota drop. Measured on this host: 28 false drops
+        // for one account in seventy minutes.
+        //
+        // So separate two ignorances that both used to read as false:
+        //   - NO PAID ACCOUNT IS KNOWN ANYWHERE (no store, or none paid) -- there
+        //     is no evidence of a paid tier to withhold against, so serve. This
+        //     keeps a fleet host with a vault credential and no plugin install
+        //     working, which is the case the original rule protected.
+        //   - A PAID ACCOUNT EXISTS AND WE CANNOT TELL WHETHER THIS IS IT --
+        //     refuse. Not a suspicion: the store states a paid tier, and nothing
+        //     rules out that this credential is that account.
+        if cloud_lane_must_withhold(&accounts, plugin_account) {
             return FetchAttempt::failure(
                 observed,
                 Some("vault".to_string()),
@@ -2496,6 +2548,62 @@ mod tests {
 mod plugin_lane_tests {
     use super::*;
     use crate::refresh::{classify, FetchClass};
+
+    /// An unidentifiable credential beside a known paid account must withhold.
+    ///
+    /// THE DEFECT THIS PINS, found on live data rather than by reading: the tier
+    /// lookup is by email, and `emails_match(None, _)` is false, so any fetch where
+    /// the vault supplied no identity found no row and answered "not paid". The
+    /// cloud then published the STANDARD-tier pool for an account that does not
+    /// spend it -- the exact wrong-pool reading the guard exists to prevent,
+    /// arriving through the one door it did not cover.
+    ///
+    /// It is intermittent, which is what made it expensive: it fires only on the
+    /// fetches that resolve no identity, so the published percent alternates
+    /// between two pools and every step down is recorded as a quota drop. Measured
+    /// here: 28 false drops for one account in seventy minutes, against a ring
+    /// whose entire purpose is reset detection.
+    ///
+    /// Both silent arms are asserted with it, because each is a way the fix could
+    /// be wrong in the opposite direction -- and the third is load-bearing: it is
+    /// the fleet host with a vault credential and no plugin install, which must
+    /// keep serving rather than go dark on a suspicion.
+    #[test]
+    fn an_unidentifiable_credential_withholds_only_when_a_paid_account_is_known() {
+        let paid = paid_account(Some("paid@example.test"), Some("tok"));
+        let free = account(Some("free@example.test"), Some("tok"), Some(true));
+
+        // The matched paid account: withheld, as before.
+        assert!(
+            cloud_lane_must_withhold(&[paid.clone(), free.clone()], Some(&paid)),
+            "a matched paid account must not be served the standard pool"
+        );
+
+        // THE DEFECT: no row matched, but the store states a paid account exists.
+        // Nothing rules out that this credential is that account.
+        assert!(
+            cloud_lane_must_withhold(&[paid.clone(), free.clone()], None),
+            "an unidentifiable credential beside a known paid account must withhold"
+        );
+
+        // Silent: the matched account is free, so the cloud reports its real pool.
+        assert!(
+            !cloud_lane_must_withhold(&[paid.clone(), free.clone()], Some(&free)),
+            "a free-tier account's real pool IS the cloud's, so serving it is correct"
+        );
+
+        // Silent, and load-bearing: no paid account is known anywhere, so there is
+        // no evidence to withhold against. A host with a vault credential and no
+        // plugin install lives here and must keep serving.
+        assert!(
+            !cloud_lane_must_withhold(std::slice::from_ref(&free), None),
+            "an unknown tier with no paid account anywhere must not take the lane dark"
+        );
+        assert!(
+            !cloud_lane_must_withhold(&[], None),
+            "a host with no plugin store at all must keep serving"
+        );
+    }
 
     fn account(email: Option<&str>, token: Option<&str>, enabled: Option<bool>) -> StoredAccount {
         StoredAccount {
