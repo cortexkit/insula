@@ -1078,6 +1078,65 @@ mod tests {
         assert_eq!(response.body_for_parsing().unwrap(), b"");
     }
 
+    /// Every send helper is either fenced by the agreement test above or named
+    /// here as deliberately exempt.
+    ///
+    /// The agreement test drives a HARDCODED pair. That is the weakest kind of
+    /// population guard -- it stays correct only while nobody adds a fifth helper,
+    /// and a helper added without joining the list is invisible in a green suite.
+    /// Derived from the source instead, so a new one must be classified on purpose.
+    ///
+    /// THE SCAN IS VISIBILITY-AGNOSTIC ON PURPOSE. A hand grep for `pub async fn
+    /// send` missed `send_provider_status_first` entirely, because it is
+    /// `pub(crate)` -- the enumeration under-reported by one and looked complete,
+    /// which is the exact failure this test exists to prevent one level up.
+    #[test]
+    fn every_send_helper_is_fenced_or_deliberately_exempt() {
+        let src = include_str!("http.rs");
+        let cut = src
+            .find("#[cfg(test)]")
+            .expect("this file has a test module");
+        let production = &src[..cut];
+
+        let mut found: Vec<String> = Vec::new();
+        for (index, _) in production.match_indices("async fn send") {
+            let rest = &production[index + "async fn ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+        found.sort();
+
+        // `send` delegates to `send_full`, so it inherits every rule rather than
+        // restating one. `send_raw` applies NO classification by design -- it is
+        // the escape hatch for providers whose status policy is bespoke (doubao
+        // reads rate-limit headers off a 429), and fencing it would be asserting a
+        // rule it deliberately does not have.
+        let exempt = ["send", "send_raw"];
+        // Driven together by `every_classifying_helper_treats_an_empty_success_body_alike`.
+        let fenced = ["send_full", "send_provider_status_first"];
+
+        let unclassified: Vec<&String> = found
+            .iter()
+            .filter(|name| !exempt.contains(&name.as_str()) && !fenced.contains(&name.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "send helper(s) {unclassified:?} are neither fenced by the agreement \
+             test nor named exempt -- decide which, rather than leaving a rule that \
+             applies to some callers and not others"
+        );
+        assert_eq!(
+            found.len(),
+            exempt.len() + fenced.len(),
+            "the helper population changed: found {found:?}"
+        );
+    }
+
     /// Every helper that classifies a response applies the empty-body rule.
     ///
     /// Two of them build a response themselves rather than routing through one
