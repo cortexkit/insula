@@ -1446,7 +1446,10 @@ mod tests {
                 Instant::now(),
             )
             .await;
-        assert!(matches!(vault.usage, Err(FetchError::ProviderStatus(401))));
+        assert!(matches!(
+            vault.usage,
+            Err(FetchError::ProviderStatus(401, _))
+        ));
     }
 
     #[tokio::test]
@@ -1477,7 +1480,7 @@ mod tests {
             .await;
         assert!(matches!(
             attempt.usage,
-            Err(FetchError::ProviderStatus(401))
+            Err(FetchError::ProviderStatus(401, _))
         ));
         for _ in 0..20 {
             if !reports.lock().unwrap().is_empty() {
@@ -1564,7 +1567,7 @@ mod tests {
             is_oauth: true,
             source: "vault",
         };
-        provider.report_auth_failure(&context, &FetchError::ProviderStatus(401));
+        provider.report_auth_failure(&context, &FetchError::ProviderStatus(401, String::new()));
         tokio::task::yield_now().await;
         assert_eq!(*reports.lock().unwrap(), vec![(401, 23)]);
     }

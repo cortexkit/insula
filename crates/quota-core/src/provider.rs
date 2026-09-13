@@ -429,8 +429,23 @@ pub enum FetchError {
     LocalSourceUnavailable(String),
     /// The session exists but is expired or rejected (401/403).
     Unauthorized(String),
-    /// Numeric provider HTTP status retained for auth-failure reporting.
-    ProviderStatus(u16),
+    /// Numeric provider HTTP status retained for auth-failure reporting, beside
+    /// whatever the refusal said for itself.
+    ///
+    /// THE CODE ALONE IS NOT A VERDICT, which is the whole reason this variant
+    /// keeps the number: a 403 is a challenge, an entitlement withdrawal, an
+    /// account suspension or an expired session, and only the upstream's own words
+    /// separate them. The body was already being read here to drain the connection
+    /// and then discarded, so the diagnosis was thrown away at the one point it
+    /// existed. Measured live: a `claude` account dark on `provider returned HTTP
+    /// 403` while the credential store reported that record active with hours of
+    /// access remaining -- a refusal of a healthy credential, with nothing on the
+    /// wire to say why.
+    ///
+    /// The excerpt is empty when the upstream sent no body, rendered as
+    /// `(no response body)` to match the `Unauthorized` phrasing, so "said nothing"
+    /// and "we did not look" stay distinguishable.
+    ProviderStatus(u16, String),
     /// Transport or upstream error.
     Upstream(String),
     /// The response was not the shape we expected.
@@ -465,9 +480,13 @@ impl FetchError {
     /// The variant is deliberately preserved rather than rebuilt: it decides
     /// transient versus non-transient, so a helper that "helpfully" normalised it
     /// would silently change whether a cached window survives the failure.
-    /// `ProviderStatus` is returned untouched because it carries a bare code with
-    /// no message to prefix, and widening it to a string would lose the numeric
-    /// status that auth-failure reporting reads.
+    ///
+    /// `ProviderStatus` used to be returned untouched, justified here by its
+    /// carrying "a bare code with no message to prefix". That reason was true of
+    /// the alternative considered -- replacing the code WITH a string, which would
+    /// have lost the number auth-failure reporting reads -- and false of the one
+    /// that was not: adding a field beside it, which loses nothing. It now carries
+    /// the refusal body and takes a stage prefix like every other variant.
     pub fn stage(self, stage: &str) -> Self {
         match self {
             Self::NoSession(m) => Self::NoSession(format!("{stage}: {m}")),
@@ -480,7 +499,9 @@ impl FetchError {
             Self::Upstream(m) => Self::Upstream(format!("{stage}: {m}")),
             Self::Decode(m) => Self::Decode(format!("{stage}: {m}")),
             Self::Internal(m) => Self::Internal(format!("{stage}: {m}")),
-            Self::ProviderStatus(code) => Self::ProviderStatus(code),
+            Self::ProviderStatus(code, body) => {
+                Self::ProviderStatus(code, format!("{stage}: {body}"))
+            }
         }
     }
 }
@@ -504,8 +525,8 @@ impl FetchError {
             Self::CredentialUnusable(_) => "credential_unusable",
             Self::NoQuotaReported(_) => "no_quota_reported",
             Self::LocalSourceUnavailable(_) => "local_source_unavailable",
-            Self::Unauthorized(_) | Self::ProviderStatus(401 | 403) => "credential_rejected",
-            Self::ProviderStatus(_) | Self::Upstream(_) => "upstream_failed",
+            Self::Unauthorized(_) | Self::ProviderStatus(401 | 403, _) => "credential_rejected",
+            Self::ProviderStatus(..) | Self::Upstream(_) => "upstream_failed",
             Self::Decode(_) => "decode_failed",
             Self::Internal(_) => "internal_error",
         }
@@ -634,7 +655,18 @@ impl std::fmt::Display for FetchError {
             // nothing did: the program this reads from is simply not running.
             Self::LocalSourceUnavailable(m) => write!(f, "local source unavailable: {}", detail(m)),
             Self::Unauthorized(m) => write!(f, "unauthorized: {}", detail(m)),
-            Self::ProviderStatus(status) => write!(f, "provider returned HTTP {status}"),
+            Self::ProviderStatus(status, body) => {
+                let body = body.trim();
+                if body.is_empty() {
+                    write!(f, "provider returned HTTP {status} (no response body)")
+                } else {
+                    write!(
+                        f,
+                        "provider returned HTTP {status}: {}",
+                        detail(&body.to_string())
+                    )
+                }
+            }
             Self::Upstream(m) => write!(f, "upstream error: {}", detail(m)),
             Self::Decode(m) => write!(f, "decode error: {}", detail(m)),
             Self::Internal(m) => write!(f, "internal error: {}", detail(m)),
@@ -703,8 +735,8 @@ mod tests {
             FetchError::LocalSourceUnavailable("x".into()),
             FetchError::Internal("x".into()),
             FetchError::Unauthorized("x".into()),
-            FetchError::ProviderStatus(401),
-            FetchError::ProviderStatus(500),
+            FetchError::ProviderStatus(401, String::new()),
+            FetchError::ProviderStatus(500, String::new()),
             FetchError::Upstream("x".into()),
             FetchError::Decode("x".into()),
         ];
@@ -717,10 +749,10 @@ mod tests {
                 FetchError::CredentialUnusable(_) => "credential_unusable",
                 FetchError::NoQuotaReported(_) => "no_quota_reported",
                 FetchError::LocalSourceUnavailable(_) => "local_source_unavailable",
-                FetchError::Unauthorized(_) | FetchError::ProviderStatus(401 | 403) => {
+                FetchError::Unauthorized(_) | FetchError::ProviderStatus(401 | 403, _) => {
                     "credential_rejected"
                 }
-                FetchError::ProviderStatus(_) | FetchError::Upstream(_) => "upstream_failed",
+                FetchError::ProviderStatus(..) | FetchError::Upstream(_) => "upstream_failed",
                 FetchError::Decode(_) => "decode_failed",
                 FetchError::Internal(_) => "internal_error",
             };
@@ -781,8 +813,8 @@ mod tests {
             FetchError::NoQuotaReported("x".into()),
             FetchError::LocalSourceUnavailable("x".into()),
             FetchError::Unauthorized("x".into()),
-            FetchError::ProviderStatus(401),
-            FetchError::ProviderStatus(500),
+            FetchError::ProviderStatus(401, String::new()),
+            FetchError::ProviderStatus(500, String::new()),
             FetchError::Upstream("x".into()),
             FetchError::Decode("x".into()),
             FetchError::Internal("x".into()),
@@ -797,7 +829,7 @@ mod tests {
                 | FetchError::NoQuotaReported(_)
                 | FetchError::LocalSourceUnavailable(_)
                 | FetchError::Unauthorized(_)
-                | FetchError::ProviderStatus(_)
+                | FetchError::ProviderStatus(..)
                 | FetchError::Upstream(_)
                 | FetchError::Decode(_)
                 | FetchError::Internal(_) => {}
@@ -857,8 +889,8 @@ mod tests {
             FetchError::NoQuotaReported("x".into()),
             FetchError::LocalSourceUnavailable("x".into()),
             FetchError::Unauthorized("x".into()),
-            FetchError::ProviderStatus(401),
-            FetchError::ProviderStatus(500),
+            FetchError::ProviderStatus(401, String::new()),
+            FetchError::ProviderStatus(500, String::new()),
             FetchError::Upstream("x".into()),
             FetchError::Decode("x".into()),
             FetchError::Internal("x".into()),
@@ -873,7 +905,7 @@ mod tests {
                 | FetchError::NoQuotaReported(_)
                 | FetchError::LocalSourceUnavailable(_)
                 | FetchError::Unauthorized(_)
-                | FetchError::ProviderStatus(_)
+                | FetchError::ProviderStatus(..)
                 | FetchError::Upstream(_)
                 | FetchError::Decode(_)
                 | FetchError::Internal(_) => {}

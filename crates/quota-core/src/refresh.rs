@@ -348,7 +348,7 @@ pub fn classify(err: &FetchError) -> FetchClass {
         // window keeps being served rather than being replaced by a degraded
         // entry every time someone closes an application.
         FetchError::LocalSourceUnavailable(_) => FetchClass::Transient,
-        FetchError::ProviderStatus(401 | 403)
+        FetchError::ProviderStatus(401 | 403, _)
         | FetchError::NoSession(_)
         | FetchError::CredentialUnusable(_)
         | FetchError::NoQuotaReported(_)
@@ -357,7 +357,7 @@ pub fn classify(err: &FetchError) -> FetchClass {
         // A defect here reproduces on the next fetch with the same input, so
         // retrying quickly buys nothing.
         | FetchError::Internal(_) => FetchClass::NonTransient,
-        FetchError::ProviderStatus(_) => FetchClass::Transient,
+        FetchError::ProviderStatus(..) => FetchClass::Transient,
     }
 }
 
@@ -844,11 +844,11 @@ mod tests {
             FetchClass::NonTransient
         );
         assert_eq!(
-            classify(&FetchError::ProviderStatus(401)),
+            classify(&FetchError::ProviderStatus(401, String::new())),
             FetchClass::NonTransient
         );
         assert_eq!(
-            classify(&FetchError::ProviderStatus(503)),
+            classify(&FetchError::ProviderStatus(503, String::new())),
             FetchClass::Transient
         );
     }
@@ -1465,7 +1465,7 @@ mod tests {
             FetchAttempt::failure(
                 Some(AccountObservation::new(Some("A".to_string()), version)),
                 None,
-                FetchError::ProviderStatus(401),
+                FetchError::ProviderStatus(401, String::new()),
             ),
             now,
             now,

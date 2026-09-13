@@ -474,12 +474,20 @@ impl JsonRequest {
         let status = response.status().as_u16();
         let final_url = response.url().to_string();
         if !(200..300).contains(&status) {
-            if read_error_body_prefix(response).await.is_err() {
-                eprintln!(
-                    "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
-                );
-            }
-            return Err(FetchError::ProviderStatus(status));
+            // The body was already read here to drain the connection and then
+            // thrown away, which discarded the diagnosis at the one point it
+            // existed. A bare code cannot separate a challenge from an
+            // entitlement withdrawal from an expired session.
+            let body = match read_error_body_prefix(response).await {
+                Ok(body) => String::from_utf8_lossy(&body).trim().to_string(),
+                Err(_) => {
+                    eprintln!(
+                        "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
+                    );
+                    String::new()
+                }
+            };
+            return Err(FetchError::ProviderStatus(status, body));
         }
         let headers: Vec<(String, String)> = response
             .headers()
@@ -848,6 +856,56 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A refusal carries the upstream's own words, and says so when it has none.
+    ///
+    /// THE CODE ALONE IS NOT A VERDICT: a 403 is a challenge, an entitlement
+    /// withdrawal, an account suspension or an expired session, and only the
+    /// body separates them. This path already read the body to drain the
+    /// connection and then discarded it, so the diagnosis was thrown away at the
+    /// one point it existed -- a `claude` account went dark on `provider
+    /// returned HTTP 403` while its credential record was active with hours of
+    /// access left, and nothing on the wire could say why.
+    ///
+    /// The empty case is asserted beside it because the two must stay
+    /// distinguishable: an upstream that said nothing reads as `(no response
+    /// body)`, never as a missing field that could equally mean nobody looked.
+    #[tokio::test]
+    async fn a_refusal_carries_the_upstream_words_and_names_their_absence() {
+        let (url, server) = serve_fixed(403, b"{\"error\":\"account suspended\"}".to_vec()).await;
+        let spoken = JsonRequest::get(url)
+            .send_provider_status_first(&reqwest::Client::new(), "test")
+            .await;
+        match spoken {
+            Err(error @ FetchError::ProviderStatus(403, _)) => {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("account suspended"),
+                    "the refusal must publish what the upstream said: {rendered}"
+                );
+            }
+            Err(other) => panic!("expected ProviderStatus(403, ..), got {other:?}"),
+            Ok(_) => panic!("a 403 must not be reported as success"),
+        }
+        server.await.unwrap();
+
+        let (url, server) = serve_fixed(403, Vec::new()).await;
+        let silent = JsonRequest::get(url)
+            .send_provider_status_first(&reqwest::Client::new(), "test")
+            .await;
+        match silent {
+            Err(error @ FetchError::ProviderStatus(403, _)) => {
+                assert_eq!(
+                    error.to_string(),
+                    "provider returned HTTP 403 (no response body)",
+                    "an upstream that said nothing must say so, not go quiet"
+                );
+            }
+            Err(other) => panic!("expected ProviderStatus(403, ..), got {other:?}"),
+            Ok(_) => panic!("a 403 must not be reported as success"),
+        }
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn provider_status_mapping_survives_bounded_error_drain() {
         let body = vec![b'x'; ERROR_BODY_PREFIX_BYTES * 2];
@@ -858,8 +916,8 @@ mod tests {
             .await;
 
         match result {
-            Err(FetchError::ProviderStatus(429)) => {}
-            Err(other) => panic!("expected ProviderStatus(429), got {other:?}"),
+            Err(FetchError::ProviderStatus(429, _)) => {}
+            Err(other) => panic!("expected ProviderStatus(429, _), got {other:?}"),
             Ok(_) => panic!("non-success response unexpectedly succeeded"),
         }
         server.await.unwrap();

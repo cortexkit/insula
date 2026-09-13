@@ -203,7 +203,7 @@ pub trait CredentialSource: Send + Sync {
 ///
 /// WHY THIS IS SHARED RATHER THAN A METHOD ON EACH PROVIDER. Seven vault lanes
 /// carried copies of this, and the gate inside it is subtle enough that an
-/// eighth would be written wrong: it matches ONLY `ProviderStatus(401)`, an
+/// eighth would be written wrong: it matches ONLY `ProviderStatus(401, _)`, an
 /// upstream status that survives to this point solely because the vault lane
 /// uses a send which PRESERVES it. The local lane maps 401 to `Unauthorized`,
 /// correctly, because a local credential has no custodian to tell.
@@ -285,7 +285,7 @@ pub fn report_vault_auth_failure(
     record_version: u64,
     error: &crate::provider::FetchError,
 ) {
-    let crate::provider::FetchError::ProviderStatus(status @ 401) = error else {
+    let crate::provider::FetchError::ProviderStatus(status @ 401, _) = error else {
         return;
     };
     let Some(source) = source else {
@@ -342,7 +342,7 @@ mod tests {
             Some(&source),
             &VaultCapability::new("ckh_test"),
             7,
-            &crate::provider::FetchError::ProviderStatus(401),
+            &crate::provider::FetchError::ProviderStatus(401, String::new()),
         );
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -375,7 +375,7 @@ mod tests {
             Some(&source),
             &VaultCapability::new("ckh_test"),
             7,
-            &crate::provider::FetchError::ProviderStatus(403),
+            &crate::provider::FetchError::ProviderStatus(403, String::new()),
         );
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -401,7 +401,7 @@ mod tests {
             Some(&source),
             &VaultCapability::new("ckh_test"),
             7,
-            &crate::provider::FetchError::ProviderStatus(500),
+            &crate::provider::FetchError::ProviderStatus(500, String::new()),
         );
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

@@ -1071,7 +1071,7 @@ struct RemoteQuotaBucket {
 fn summary_unavailable(error: &FetchError) -> bool {
     matches!(
         error,
-        FetchError::ProviderStatus(403 | 404) | FetchError::Unauthorized(_)
+        FetchError::ProviderStatus(403 | 404, _) | FetchError::Unauthorized(_)
     )
 }
 
@@ -1498,7 +1498,7 @@ impl AntigravityProvider {
                     "antigravity refresh token was rejected: invalid_grant".to_string(),
                 ))
             } else {
-                Err(FetchError::ProviderStatus(response.status))
+                Err(FetchError::ProviderStatus(response.status, String::new()))
             };
         }
 
@@ -2090,8 +2090,8 @@ mod tests {
     #[test]
     fn only_a_refusal_drops_to_the_per_model_lane() {
         for refusal in [
-            FetchError::ProviderStatus(403),
-            FetchError::ProviderStatus(404),
+            FetchError::ProviderStatus(403, String::new()),
+            FetchError::ProviderStatus(404, String::new()),
             FetchError::Unauthorized("not entitled".to_string()),
         ] {
             assert!(
@@ -2100,8 +2100,8 @@ mod tests {
             );
         }
         for transient in [
-            FetchError::ProviderStatus(500),
-            FetchError::ProviderStatus(429),
+            FetchError::ProviderStatus(500, String::new()),
+            FetchError::ProviderStatus(429, String::new()),
             FetchError::Upstream("timed out".to_string()),
             FetchError::Decode("bad json".to_string()),
         ] {

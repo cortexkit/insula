@@ -612,7 +612,7 @@ impl GeminiProvider {
             .await
         {
             Ok(response) => Ok(project_from_load_response(&response.body)),
-            Err(error @ FetchError::ProviderStatus(401 | 403 | 429)) => Err(error),
+            Err(error @ FetchError::ProviderStatus(401 | 403 | 429, _)) => Err(error),
             Err(_) => Ok(None),
         }
     }
@@ -627,7 +627,7 @@ impl GeminiProvider {
             .await
         {
             Ok(response) => Ok(project_from_resource_response(&response.body)),
-            Err(error @ FetchError::ProviderStatus(401 | 403 | 429)) => Err(error),
+            Err(error @ FetchError::ProviderStatus(401 | 403 | 429, _)) => Err(error),
             Err(_) => Ok(None),
         }
     }
@@ -1261,7 +1261,10 @@ mod tests {
                 VaultCapability::new("ckh_google"),
             ))
             .await;
-        assert!(matches!(&vault.usage, Err(FetchError::ProviderStatus(401))));
+        assert!(matches!(
+            &vault.usage,
+            Err(FetchError::ProviderStatus(401, _))
+        ));
         assert_eq!(
             classify(vault.usage.as_ref().unwrap_err()),
             FetchClass::NonTransient
@@ -1315,7 +1318,7 @@ mod tests {
             ))
             .await;
         let error = attempt.usage.unwrap_err();
-        assert!(matches!(error, FetchError::ProviderStatus(429)));
+        assert!(matches!(error, FetchError::ProviderStatus(429, _)));
         assert_eq!(classify(&error), FetchClass::Transient);
     }
 

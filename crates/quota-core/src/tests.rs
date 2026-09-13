@@ -2068,7 +2068,7 @@ fn every_wire_error_class_has_a_documented_row() {
         FetchError::NoQuotaReported(String::new()).error_class(),
         FetchError::LocalSourceUnavailable(String::new()).error_class(),
         FetchError::Unauthorized(String::new()).error_class(),
-        FetchError::ProviderStatus(500).error_class(),
+        FetchError::ProviderStatus(500, String::new()).error_class(),
         FetchError::Decode(String::new()).error_class(),
         FetchError::Internal(String::new()).error_class(),
     ];
@@ -4464,7 +4464,9 @@ impl ResetTransport for MockResetTransport {
         match self.behavior {
             MockConsumeBehavior::Outcome(outcome) => Ok(Self::body(outcome)),
             MockConsumeBehavior::Error => Err(FetchError::Upstream("mock HTTP 503".into())),
-            MockConsumeBehavior::Status(status) => Err(FetchError::ProviderStatus(status)),
+            MockConsumeBehavior::Status(status) => {
+                Err(FetchError::ProviderStatus(status, String::new()))
+            }
             MockConsumeBehavior::Hang => {
                 std::future::pending::<Result<Vec<u8>, FetchError>>().await
             }
@@ -4567,7 +4569,7 @@ async fn a_rejected_vault_credential_surfaces_as_a_reportable_status() {
     // The gate's own condition, asserted against what the transport actually
     // produced rather than against a value constructed here.
     assert!(
-        matches!(error, FetchError::ProviderStatus(401)),
+        matches!(error, FetchError::ProviderStatus(401, _)),
         "a rejected credential produced {error:?}, which the reporting gate drops"
     );
 
@@ -4584,7 +4586,7 @@ async fn credits_and_consume_auth_failures_report_served_version() {
     let source = Arc::new(MockReportingCredentialSource::default());
     let request = reporting_reset_request(Arc::clone(&source), "reset-bearer-secret");
 
-    request.report_auth_failure(&FetchError::ProviderStatus(401));
+    request.report_auth_failure(&FetchError::ProviderStatus(401, String::new()));
     tokio::task::yield_now().await;
 
     let temp = ResetTempDir::new("consume-auth-report");
@@ -7681,7 +7683,7 @@ impl UsageProvider for StatusPollProvider {
             return FetchAttempt::failure(
                 Some(AccountObservation::new(Some("A".to_string()), Some(7))),
                 None,
-                FetchError::ProviderStatus(401),
+                FetchError::ProviderStatus(401, String::new()),
             );
         }
         FetchAttempt::success(

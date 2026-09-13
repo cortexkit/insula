@@ -992,7 +992,10 @@ mod tests {
                 VaultCapability::new("ckh_kimi"),
             ))
             .await;
-        assert!(matches!(vault.usage, Err(FetchError::ProviderStatus(401))));
+        assert!(matches!(
+            vault.usage,
+            Err(FetchError::ProviderStatus(401, _))
+        ));
         for _ in 0..20 {
             if !reports.lock().unwrap().is_empty() {
                 break;

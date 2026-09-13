@@ -1038,8 +1038,8 @@ balance:0,monthlyLimit:null,monthlyUsage:null})(self.$R))";
         // A bare status has no message to prefix and must come back untouched:
         // widening it to a string would lose the code auth reporting reads.
         assert!(matches!(
-            FetchError::ProviderStatus(500).stage("s"),
-            FetchError::ProviderStatus(500)
+            FetchError::ProviderStatus(500, String::new()).stage("s"),
+            FetchError::ProviderStatus(500, _)
         ));
     }
 }
