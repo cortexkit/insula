@@ -520,7 +520,26 @@ fn next_slot_after_attempt_inner(
 ) -> ProviderSlot {
     // A successful usage response cannot validate a credential transition unless
     // the provider explicitly reports the identity used for that response.
-    if prev.label_in_flux && attempt.observed.is_none() && attempt.usage.is_ok() {
+    //
+    // THE SECOND CONDITION IS THE ONE THAT WAS MISSING, and it does not need a
+    // transition to already be suspected. `observations_differ(Some(A), None)` is
+    // false -- it reads as "no change" -- so a successful fetch carrying no
+    // observation used to inherit A's id and set `label_in_flux: false`, publishing
+    // the reading under A's label with full confidence. Where the credential behind
+    // the handle was replaced in place by one that resolves no identity, that is
+    // B's usage wearing A's name.
+    //
+    // Reachable exactly where today's antigravity defect lived: a vault record whose
+    // email is present on some fetches and absent on others, which is the live
+    // condition `handlesWithoutAccount` exists to surface. And the consequence is
+    // worse than a wrong figure, because `completeProviders` authorises a consumer
+    // to REPLACE a provider's account set from these labels.
+    //
+    // Providers that never resolve an identity are untouched: their previous
+    // observation is `None` too, so this cannot fire on them and cookie lanes keep
+    // serving unlabelled as before.
+    let cannot_confirm_this_reading = prev.label_in_flux || prev.observation.is_some();
+    if cannot_confirm_this_reading && attempt.observed.is_none() && attempt.usage.is_ok() {
         return ProviderSlot {
             // This attempt neither succeeded nor failed for our purposes -- the
             // usage came back but could not be attributed -- so whatever run of
@@ -1099,6 +1118,70 @@ mod tests {
         assert_eq!(next.account_id(), Some("B"));
         assert_eq!(next.retry_count, 1);
         assert_eq!(next.next_due_at, t1 + BASE_INTERVAL);
+    }
+
+    /// A SUCCESS that resolves no identity must not inherit the previous one.
+    ///
+    /// `observations_differ(Some(A), None)` is false -- "no change" -- so a
+    /// successful fetch carrying no observation used to inherit A's id AND set
+    /// `label_in_flux: false`, publishing this reading under A's label with full
+    /// confidence. If the credential behind the handle was replaced in place by
+    /// one that resolves no identity, that is B's usage wearing A's name.
+    ///
+    /// Reachable exactly where today's antigravity defect lived: a vault record
+    /// whose email is present on some fetches and absent on others, which is the
+    /// live condition `handlesWithoutAccount` was added to surface.
+    ///
+    /// The consequence is worse than a wrong number, because `completeProviders`
+    /// authorises a consumer to REPLACE a provider's account set from these
+    /// labels. Attribution is the one field a consumer is told to trust.
+    ///
+    /// Correct-or-quiet: an unattributable success is suppressed, not relabelled.
+    #[test]
+    fn a_success_that_resolves_no_identity_does_not_inherit_the_previous_one() {
+        let t0 = Instant::now();
+        let cold = ProviderSlot::due_now(t0, incarnation());
+        let labelled = next_slot_after_attempt(
+            &cold,
+            "antigravity",
+            attempt(Some("account-A"), Ok(Usage::default())),
+            t0,
+            t0,
+        );
+        assert_eq!(labelled.account_id(), Some("account-A"));
+
+        // The next fetch succeeds having made NO OBSERVATION AT ALL.
+        //
+        // Built by hand rather than through `attempt(None, ..)`, because that
+        // helper wraps every case in `Some(AccountObservation)` -- "an
+        // observation was made and carried no id", which is a DIFFERENT state
+        // and is already fenced: `observations_differ` sees `Some(A)` against a
+        // null id, reports a change, and fails closed. The unguarded state is
+        // the absent observation, and a helper that cannot build it is why no
+        // test reached this.
+        let mut unattributed = attempt(None, Ok(Usage::default()));
+        unattributed.observed = None;
+        let next = next_slot_after_attempt(
+            &labelled,
+            "antigravity",
+            unattributed,
+            t0 + BASE_INTERVAL,
+            t0 + BASE_INTERVAL,
+        );
+
+        let attributed = next
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.usage.is_some() && entry.account.is_some());
+        assert!(
+            !attributed,
+            "usage from an unidentified fetch must not be published under the \
+                 previously observed account"
+        );
+        assert!(
+            next.label_in_flux,
+            "and the slot must know its label is unconfirmed"
+        );
     }
 
     #[test]
