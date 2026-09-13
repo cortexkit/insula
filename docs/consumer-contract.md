@@ -1592,10 +1592,27 @@ does not survive the events worth recording.
 ### What a drop is, and is not
 
 `observedContinuously: false` means the two readings either side were taken
-across a **gap** — suspend, a fetch blackout, a long backoff. A gap hides
-magnitude: a drop followed by consumption reads smaller than it was, and a drop
-followed by a re-fill reads as nothing at all. Treat the magnitude as a lower
-bound and the record as weaker evidence.
+across a **gap** — suspend, a fetch blackout, a long backoff, or a **lane
+switch**. A gap hides magnitude: a drop followed by consumption reads smaller
+than it was, and a drop followed by a re-fill reads as nothing at all. Treat the
+magnitude as a lower bound and the record as weaker evidence.
+
+The lane switch is the one to plan for, because the other three are rare and it
+is not. Where a provider reads one account through several sources —
+`antigravity` uses a live editor probe, the editor plugin's cache, and a cloud
+endpoint — consecutive readings can come from sources whose values were observed
+at very different moments. The gap is then in the thing DESCRIBED rather than in
+the polling: two readings taken 60 seconds apart can describe moments an hour
+apart, and the later-fetched one can describe the earlier moment. A decrease
+between two such readings is not a decrease in the account.
+
+**So filter on `observedContinuously` before counting anything.** Measured here
+on a healthy, un-suspended host: 28 non-continuous records for a single account
+in seventy minutes, while the continuous records over the same window numbered in
+the low single digits. A consumer counting records rather than events would have
+read twenty-eight resets that never happened. The producer marked every one of
+them correctly — the flag did its job — and a consumer that ignores the flag
+still gets a wrong answer.
 
 **The record names an observation, not a cause.** A window rollover, a redeemed
 reset credit, a goodwill grant, a plan change and an upstream correction are
