@@ -76,6 +76,39 @@ async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, F
     Ok(body)
 }
 
+/// The upstream's own words from a refusal, bounded for the wire.
+///
+/// ONE PRODUCER, because there were three and they had already drifted. Two took
+/// 200 characters and then asked whether the result was blank; the third, written
+/// hours before this extraction, trimmed FIRST and then took 200 -- so a body with
+/// leading whitespace yielded a different excerpt depending on which path reached
+/// it. Nothing was wrong enough to notice, which is the point: a rule copied three
+/// times is three chances to answer differently, and the answers diverge quietly.
+///
+/// Trim-then-take is the kept order. Leading whitespace is not evidence, and
+/// spending the 200-character budget on it costs exactly the part of the message
+/// a reader needs.
+///
+/// THE EXCERPT IS UNREDACTED BY CONSTRUCTION and reaches `ProviderUsage.error`.
+/// That is the standing review point: when adding a provider, check what its
+/// non-2xx bodies contain before routing it through here. It bites hardest on the
+/// auth statuses, since a refusal is the likeliest place for a provider to echo
+/// the rejected credential back.
+fn refusal_excerpt(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .trim()
+        .chars()
+        .take(ERROR_EXCERPT_CHARS)
+        .collect()
+}
+
+/// Characters of an upstream refusal published for diagnosis.
+///
+/// Deliberately far below the 8 KiB drain: the drain exists for connection reuse,
+/// this exists for a human reading one line. Sizing the wire field to the drain
+/// would put kilobytes of someone else's markup into a status message.
+const ERROR_EXCERPT_CHARS: usize = 200;
+
 async fn read_error_body_prefix(mut response: reqwest::Response) -> Result<Vec<u8>, FetchError> {
     let capacity = response
         .content_length()
@@ -403,11 +436,8 @@ impl JsonRequest {
             // the rejected credential back, so the obligation stated there -- check
             // what a new provider's non-2xx bodies contain -- now covers the auth
             // statuses too, and matters more there.
-            let excerpt: String = String::from_utf8_lossy(&raw.body)
-                .chars()
-                .take(200)
-                .collect();
-            let detail = if excerpt.trim().is_empty() {
+            let excerpt = refusal_excerpt(&raw.body);
+            let detail = if excerpt.is_empty() {
                 // An empty refusal body is a FACT worth stating rather than a blank
                 // to hide: it tells a reader the upstream said nothing, which is
                 // different from nobody having looked.
@@ -440,10 +470,7 @@ impl JsonRequest {
             // people to distrust the field. The rule instead is a REVIEW POINT --
             // when adding a provider whose payload carries credentials, check
             // what its non-2xx bodies contain before routing it through here.
-            let excerpt: String = String::from_utf8_lossy(&raw.body)
-                .chars()
-                .take(200)
-                .collect();
+            let excerpt = refusal_excerpt(&raw.body);
             return Err(FetchError::Upstream(format!(
                 "HTTP {}: {excerpt}",
                 raw.status
@@ -492,11 +519,7 @@ impl JsonRequest {
             // (anthropic, antigravity, codex, gemini, grok, kimi-for-coding), so a
             // provider echoing the rejected credential back would echo it here.
             let body = match read_error_body_prefix(response).await {
-                Ok(body) => String::from_utf8_lossy(&body)
-                    .trim()
-                    .chars()
-                    .take(200)
-                    .collect(),
+                Ok(body) => refusal_excerpt(&body),
                 Err(_) => {
                     eprintln!(
                         "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
@@ -943,6 +966,35 @@ mod tests {
             Ok(_) => panic!("a 403 must not be reported as success"),
         }
         server.await.unwrap();
+    }
+
+    /// One excerpt rule, and the order within it is load-bearing.
+    ///
+    /// There were three copies before this helper existed, and they had already
+    /// drifted: two took 200 characters and then asked whether the result was
+    /// blank, the third trimmed first. On a body with leading whitespace those
+    /// answer differently -- take-then-trim spends the budget on the padding and
+    /// can report a real message as absent, which is the direction that costs a
+    /// reader the diagnosis.
+    ///
+    /// Nothing was broken enough to notice. That is what a drifted copy looks like
+    /// before it starts mattering.
+    #[test]
+    fn one_excerpt_rule_trims_before_it_counts() {
+        let padded = format!("{}{}", " ".repeat(220), r#"{"error":"suspended"}"#);
+        let excerpt = refusal_excerpt(padded.as_bytes());
+        assert!(
+            excerpt.starts_with(r#"{"error""#),
+            "padding must not consume the budget: {excerpt:?}"
+        );
+
+        // The bound still applies to the content itself.
+        let long = refusal_excerpt(&vec![b'x'; 8 * 1024]);
+        assert_eq!(long.chars().count(), ERROR_EXCERPT_CHARS);
+
+        // A body that is only whitespace is empty, so callers render it as
+        // "no response body" -- the upstream said nothing of substance.
+        assert!(refusal_excerpt(b"   \n\t ").is_empty());
     }
 
     #[tokio::test]
