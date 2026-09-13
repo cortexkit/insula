@@ -478,8 +478,25 @@ impl JsonRequest {
             // thrown away, which discarded the diagnosis at the one point it
             // existed. A bare code cannot separate a challenge from an
             // entitlement withdrawal from an expired session.
+            //
+            // EXCERPTED TO THE SAME 200 CHARACTERS AS EVERY OTHER NON-2XX PATH.
+            // The drain reads up to 8 KiB for connection reuse, and the first cut
+            // of this change put all of it on the wire -- the same class of data
+            // under two different bounds, with the tighter one bypassed. Later
+            // backstops (a 1 KiB cap on `Display`, 512-byte wire strings) would
+            // have hidden that, which is exactly why the bound belongs here where
+            // the decision is, rather than being left to whatever truncates last.
+            //
+            // The unredacted-excerpt obligation stated above applies to this path
+            // in full, and more sharply: every caller is a bearer-token lane
+            // (anthropic, antigravity, codex, gemini, grok, kimi-for-coding), so a
+            // provider echoing the rejected credential back would echo it here.
             let body = match read_error_body_prefix(response).await {
-                Ok(body) => String::from_utf8_lossy(&body).trim().to_string(),
+                Ok(body) => String::from_utf8_lossy(&body)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect(),
                 Err(_) => {
                     eprintln!(
                         "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
@@ -881,6 +898,28 @@ mod tests {
                 assert!(
                     rendered.contains("account suspended"),
                     "the refusal must publish what the upstream said: {rendered}"
+                );
+            }
+            Err(other) => panic!("expected ProviderStatus(403, ..), got {other:?}"),
+            Ok(_) => panic!("a 403 must not be reported as success"),
+        }
+        server.await.unwrap();
+
+        // Bounded to the same 200 characters as every other non-2xx path.
+        // The drain reads up to 8 KiB, so without an excerpt here the same
+        // class of data would ship under two different bounds -- and the
+        // later backstops would have hidden the divergence rather than
+        // preventing it.
+        let (url, server) = serve_fixed(403, vec![b'x'; ERROR_BODY_PREFIX_BYTES]).await;
+        let long = JsonRequest::get(url)
+            .send_provider_status_first(&reqwest::Client::new(), "test")
+            .await;
+        match long {
+            Err(FetchError::ProviderStatus(403, body)) => {
+                assert_eq!(
+                    body.chars().count(),
+                    200,
+                    "the excerpt must match the bound every other refusal uses"
                 );
             }
             Err(other) => panic!("expected ProviderStatus(403, ..), got {other:?}"),
