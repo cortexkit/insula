@@ -108,6 +108,19 @@ const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 /// period old, so it has stopped describing the window it claims to describe.
 /// The weekly window would tolerate longer, but one cache entry carries both
 /// cadences and the tighter window governs.
+///
+/// CHANGING THIS MOVES A FACT RECORDED IN ANOTHER REPOSITORY. A consumer store
+/// (astrocyte, `window_sample`) documents at its insert site that a published
+/// reading on this lane is bounded at 3,600s and that past the bound the row is
+/// ABSENT rather than older — which is what makes their observed lag a sample
+/// from a bounded distribution rather than evidence about a tail. Raising this
+/// silently makes that comment wrong, and nothing in either repository connects
+/// the two; tell them in the same change.
+///
+/// Calibration, such as it is: one host, one paid account, one afternoon
+/// (2026-09-13) measured a typical lag of ~1,546s against this 3,600s bound —
+/// the first evidence that the ordinary case sits well inside a number chosen
+/// from window-period reasoning alone. Not a distribution.
 const CACHED_QUOTA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Why reading another tool's refresh token is safe HERE and not in general.
