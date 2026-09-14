@@ -327,6 +327,22 @@ added after a re-sealed vault credential kept being served with its pre-re-seal
 verdict until a module restart, where a restart is the one event in such a
 timeline that guarantees a new connection.
 
+`vaultAuthFailuresReported` counts the auth failures this process has reported to
+the vault. Each one **latches** the credential record: the vault marks it
+`needs_reauth`, and nothing clears that state but a human logging in.
+
+**The zero is the load-bearing reading.** This is the only outbound effect the
+module has that is not a read, and it is fire-and-forget, so nothing else in the
+process records it. When an account is found dark, the first question is whether
+this module latched it or the credential died on its own — and a `0` answers that
+by ruling the module out. A non-zero count does not say which credential; the
+capability is a bearer secret and the credential id is not in scope at the gate.
+
+The gate is narrow on purpose: only an upstream `401` **with a bearer this module
+served** reports. A `403` is deliberately excluded, because a refused call is not
+a dead credential — an entitlement withdrawal, a suspension and a network
+challenge all arrive as `403` and none of them is fixed by logging in again.
+
 `vaultRouteWarmingRetries` counts route opens the credential module refused
 because it was still coming up, each of which this client retried on the next
 tick rather than treating as a dead credential.

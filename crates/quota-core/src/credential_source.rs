@@ -4,6 +4,7 @@
 //! deliberately redacted, and vault errors are fixed classes with no upstream
 //! text so provider degradation can never put secret material on the usage wire.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -197,6 +198,29 @@ pub trait CredentialSource: Send + Sync {
         Err(VaultGetError::FailClosed)
     }
 }
+/// Auth failures this process has reported to the vault.
+///
+/// THE MOST DESTRUCTIVE THING THIS MODULE DOES, and until now the least observed.
+/// A report latches the credential record: the vault marks it `needs_reauth`, and
+/// nothing clears that but a human logging in. Every other outbound effect here is
+/// a read.
+///
+/// It had no counter while transport niceties had four (connection drops, route
+/// warming retries, unmatched drops, stale generation drops). So when an account
+/// went dark overnight there was no way to answer the first question an operator
+/// asks -- did WE do this, or did the credential die on its own -- and the report
+/// is fire-and-forget, so nothing else records it either.
+///
+/// Deliberately a bare count rather than a per-credential map: the capability is a
+/// bearer secret and the credential id is not in scope at the gate. A count
+/// separates "this module latched something" from "this module has never reported
+/// anything", which is the distinction that decides where to look next.
+static AUTH_FAILURES_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many auth failures this process has reported to the vault.
+pub fn auth_failures_reported() -> u64 {
+    AUTH_FAILURES_REPORTED.load(Ordering::Relaxed)
+}
 
 /// Report a rejected vault credential to the store that issued it, if anyone is
 /// listening.
@@ -294,6 +318,10 @@ pub fn report_vault_auth_failure(
     let source = Arc::clone(source);
     let capability = capability.clone();
     let status = *status;
+    // Counted here rather than inside the task: this is the point where the
+    // decision to latch a credential is made, and a count taken inside a spawned
+    // future would silently miss reports lost to shutdown.
+    AUTH_FAILURES_REPORTED.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         source
             .report_auth_failure(&capability, status, record_version)
@@ -327,6 +355,81 @@ pub fn take_utf8_payload(payload: &mut Vec<u8>) -> Result<String, crate::provide
 #[cfg(test)]
 mod tests {
 
+    /// Serialises the tests that move the process-wide report counter.
+    ///
+    /// The counter is deliberately process-wide -- the gate is a free function with
+    /// nothing to hang state off -- and cargo runs these tests in parallel threads
+    /// of ONE process. Without this, a sibling test's 401 lands between another
+    /// test's read and its assertion, and the failure is a rare flake that reads
+    /// like a real defect in the gate.
+    ///
+    /// One lock in one module, covering every caller here. Two locks would be worse
+    /// than none: the pair would look like protection while guarding nothing
+    /// against each other.
+    /// A tokio mutex rather than a std one: these tests await, and holding a std
+    /// guard across an await point blocks the executor thread rather than the
+    /// task -- correct here only by luck, and a lint that would be silenced
+    /// rather than fixed.
+    static COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The counter moves with the decision, and only with it.
+    ///
+    /// The report is fire-and-forget, so nothing downstream records that a
+    /// credential was latched. This counter is the only trace, and the reading that
+    /// matters is the ZERO -- when an account is found dark, it rules this module
+    /// out as the cause.
+    ///
+    /// The 403 arm is the load-bearing half. A refused call is not a dead
+    /// credential: an entitlement withdrawal, a suspension and a network challenge
+    /// all arrive as 403, and none is fixed by logging in again. A counter that
+    /// moved on those would report this module as the cause of latches it never
+    /// performed, which is worse than no counter -- it would send an operator to
+    /// the wrong repository with evidence in hand.
+    #[tokio::test]
+    async fn the_counter_moves_only_when_a_credential_is_actually_latched() {
+        let _serial = COUNTER_LOCK.lock().await;
+        let source = RecordingSource::default();
+        let source: Arc<dyn CredentialSource> = Arc::new(source);
+        let capability = VaultCapability::new("ckh_counter");
+
+        let before = auth_failures_reported();
+
+        // A 403 must not move it, however many times it arrives.
+        for _ in 0..3 {
+            report_vault_auth_failure(
+                Some(&source),
+                &capability,
+                1,
+                &crate::provider::FetchError::ProviderStatus(403, String::new()),
+            );
+        }
+        // Nor an error that never reaches the gate at all.
+        report_vault_auth_failure(
+            Some(&source),
+            &capability,
+            1,
+            &crate::provider::FetchError::Upstream("timeout".into()),
+        );
+        assert_eq!(
+            auth_failures_reported(),
+            before,
+            "only a latch may move this counter, and none of those latched anything"
+        );
+
+        // A 401 with a served bearer does.
+        report_vault_auth_failure(
+            Some(&source),
+            &capability,
+            1,
+            &crate::provider::FetchError::ProviderStatus(401, String::new()),
+        );
+        assert_eq!(
+            auth_failures_reported(),
+            before + 1,
+            "a latch must leave a trace, because nothing else in the process does"
+        );
+    }
+
     /// A 401 from the usage endpoint is reported: it is the death proxy.
     ///
     /// This is the arm that detected revocation-on-rotation all month, and for a
@@ -334,6 +437,7 @@ mod tests {
     /// the system -- nothing else ever marks such a record dead.
     #[tokio::test]
     async fn a_401_is_reported_as_credential_death() {
+        let _serial = COUNTER_LOCK.lock().await;
         let source = RecordingSource::default();
         let reports = source.reports.clone();
         let source: Arc<dyn CredentialSource> = Arc::new(source);
@@ -367,6 +471,7 @@ mod tests {
     /// antigravity's vault lane rides the same API family.
     #[tokio::test]
     async fn a_403_is_not_reported_because_it_can_mean_a_live_credential() {
+        let _serial = COUNTER_LOCK.lock().await;
         let source = RecordingSource::default();
         let reports = source.reports.clone();
         let source: Arc<dyn CredentialSource> = Arc::new(source);

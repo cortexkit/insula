@@ -822,6 +822,17 @@ fn health_report(
         // is the one event in such a timeline that establishes a NEW connection.
         // "Did the connection change?" previously required reading the source.
         "vaultConnectionsEstablished": vault.connections_established(),
+        // Auth failures this process has reported to the vault, each of which
+        // LATCHES the credential record: the vault marks it needs_reauth, and
+        // nothing clears that but a human logging in.
+        //
+        // PUBLISHED BECAUSE IT IS THE ONLY OUTBOUND EFFECT HERE THAT IS NOT A READ,
+        // and it had no counter while four transport diagnostics did. When an
+        // account is found dark the first question is whether this module latched
+        // it or the credential died on its own -- and the report is
+        // fire-and-forget, so nothing else in the process records it either. A ZERO
+        // is the load-bearing reading: it rules this module out.
+        "vaultAuthFailuresReported": quota_core::credential_source::auth_failures_reported(),
         // Route opens refused because the credential module was still warming,
         // each of which the client retried on the next tick rather than treating
         // as a dead credential.
@@ -2381,6 +2392,7 @@ mod tests {
             "vaultUnmatchedDrops",
             "vaultStaleGenerationDrops",
             "vaultConnectionsEstablished",
+            "vaultAuthFailuresReported",
             "vaultRouteWarmingRetries",
             "usageRequestsServed",
             "usageRequestsRefused",
