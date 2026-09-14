@@ -26,6 +26,31 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 2
 fi
 
+# THE LAST MOMENT A DAMAGED COMMIT MESSAGE IS STILL FREE TO FIX.
+#
+# `git commit -m "...`ident`..."` runs each backticked word as command
+# substitution and replaces it with empty output, so the message lands with holes
+# where the identifiers were. Silent: git exits 0, the push succeeds, CI is
+# green. Once it reaches a protected branch there is no amend -- force-push is
+# refused and the record is permanent. Here the commit exists and the push has
+# not happened, which is the only point where `git commit --amend` still costs
+# nothing.
+#
+# The discriminator is GAP WIDTH, not gap count. A substitution leaves EXACTLY
+# the two spaces that surrounded the eaten word; a deliberately aligned table
+# pads to a width and uses three or more. Measured across 946 commits: this
+# separates the one real instance from seven aligned tables, and a gap-count
+# rule missed the two-identifier case entirely while returning the same total.
+if git log -1 --format=%B | grep -qE '[a-z,)]  [a-z(]' &&
+   ! git log -1 --format=%B | grep -qE '   +'; then
+  echo "  REFUSED: the commit message looks like it lost a backticked identifier" >&2
+  git log -1 --format=%B | grep -nE '[a-z,)]  [a-z(]' | sed 's/^/    /' >&2
+  echo "  Rewrite it with a QUOTED heredoc, which is still free before the push:" >&2
+  echo "      git commit --amend -F - <<'MSG'" >&2
+  echo "  The quotes on the delimiter are the point: <<'MSG' does not expand." >&2
+  exit 2
+fi
+
 # A re-push to an existing train branch leaves TWO runs on one sha, and the
 # cancelled one can be the newer. Delete first so the sha gets exactly one.
 git push -q --delete "origin" "$branch" 2>/dev/null
