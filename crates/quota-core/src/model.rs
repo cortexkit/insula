@@ -325,6 +325,51 @@ pub fn windows_mut(usage: &mut Usage) -> impl Iterator<Item = &mut RateWindow> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `accountInfo`'s emitted key set is CLOSED, in both directions.
+    ///
+    /// This type lives in the shared `cortexkit-provider-usage` crate, so a field
+    /// added there reaches this wire on a version bump with nothing in this
+    /// repository reddening. That is fine for most fields and NOT fine for this
+    /// one, because `accountInfo` is where personally-identifying values live.
+    ///
+    /// The consumer that makes it load-bearing: `ck quota --redact` strips email,
+    /// orgName and the account id so a quota screenshot can be published. Its
+    /// filter is a DENY-LIST -- it names the fields to remove -- so a NEW
+    /// identifying field defaults to VISIBLE, its tests stay green, and the only
+    /// symptom is a name in an image nobody can unpublish. A deny-list downstream
+    /// cannot defend against a field it has never heard of, so the producer's key
+    /// set has to be closed at the source. The credential store pinned its identity
+    /// block for the same reason on the same day.
+    ///
+    /// Both directions matter. A MISSING key breaks a renderer; an EXTRA one is the
+    /// privacy case above, and it is the direction a test written for schema
+    /// stability would usually forget.
+    ///
+    /// When this reddens: decide whether the new field identifies a person. If it
+    /// does, tell SUBC before it ships, then widen this list. If it does not, widen
+    /// the list. Never delete the assertion.
+    #[test]
+    fn the_account_info_key_set_is_closed() {
+        let info = AccountInfo {
+            email: Some("a@example.test".into()),
+            org_name: Some("Example Org".into()),
+            plan_type: Some("pro".into()),
+        };
+        let value = serde_json::to_value(&info).expect("serialises");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["email", "orgName", "planType"],
+            "accountInfo gained or lost a key; see this test's doc comment before widening"
+        );
+    }
     use super::*;
 
     fn window(used_percent: f64) -> RateWindow {
