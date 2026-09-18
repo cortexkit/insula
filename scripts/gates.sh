@@ -59,10 +59,28 @@ announce_lock_write() {
     local after
     after="$(shasum -a 256 Cargo.lock 2>/dev/null | cut -d' ' -f1)"
     [ "$after" = "$LOCK_BEFORE" ] && return 0
-    printf '\n  NOTE: the gates rewrote Cargo.lock (a sibling moved).\n' >&2
-    printf '  Commit it as its own lock change, or restore it -- do NOT let it\n' >&2
-    printf '  ride along in a commit about something else:\n' >&2
-    git --no-pager diff --stat -- Cargo.lock >&2
+        printf '\n  NOTE: the gates rewrote Cargo.lock (a sibling moved).\n' >&2
+        printf '  Commit it as its own lock change, or restore it -- do NOT let it\n' >&2
+        printf '  ride along in a commit about something else:\n' >&2
+        git --no-pager diff --stat -- Cargo.lock >&2
+        # The operator's next question is "should I absorb this?", and the answer
+        # is not in the diff. For a PATH dependency cargo records whatever the
+        # sibling's manifest says ON DISK, so an uncommitted version bump in
+        # someone's working tree rewrites this lock as a side effect -- and CI,
+        # which checks the sibling out at its committed ref, then refuses under
+        # --locked. Local green, CI red, invisible from either side alone.
+        #
+        # CHECK THE MANIFEST, NOT THE REPOSITORY. "Is the sibling dirty" is the
+        # wrong granularity: in a fleet this size someone is nearly always editing
+        # something, so a repo-level rule refuses every legitimate wave and gets
+        # switched off. The only question is whether the MANIFEST THAT MOVED is
+        # published.
+        printf '  Before absorbing, verify the version exists at the published ref:\n' >&2
+        printf '    (cd ../<sibling> && git fetch -q origin \\\n' >&2
+        printf '       && git show origin/master:crates/<pkg>/Cargo.toml | grep "^version")\n' >&2
+        printf '  Match: absorb. Mismatch: someone has an uncommitted bump -- restore\n' >&2
+        printf '  the lock and land without it. A dirty sibling is NOT the test; only\n' >&2
+        printf '  that package manifest is.\n' >&2
 }
 trap announce_lock_write EXIT
 
