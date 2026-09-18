@@ -263,10 +263,30 @@ impl std::fmt::Display for CookieError {
             // Names the remedy, because the reader of this string is deciding
             // where to look. "extraction failed" sends them to the provider; this
             // sends them to the machine, which is where the fix is.
+            //
+            // THE REMEDY IS PLATFORM-CONDITIONAL AND THE ORIGINAL WAS NOT. It said
+            // "grant it access to application data on this machine", which is the
+            // macOS TCC dialog -- written from the macOS incident that produced
+            // this variant, when all nine cookie providers degraded at once.
+            //
+            // These gates were widened to Linux during the cross-platform port, and
+            // Linux has no such grant: a denial there is ordinary filesystem
+            // ownership or mode on the profile directory. So on Linux the message
+            // named a remedy that does not exist, which is worse than naming none --
+            // it sends the reader looking for a setting rather than at a path.
+            //
+            // A message derived from one platform's cause does not merely omit the
+            // other, it misdirects toward the one it names, and the reader gets more
+            // confident the longer they fail to find it.
             Self::PermissionDenied(m) => write!(
                 f,
-                "this process is not permitted to read the browser profile \
-                 (grant it access to application data on this machine): {m}"
+                "this process is not permitted to read the browser profile ({}): {m}",
+                if cfg!(target_os = "macos") {
+                    "grant it access to application data in System Settings, \
+                     then restart it -- macOS binds this decision at launch"
+                } else {
+                    "check the profile directory's ownership and permissions"
+                }
             ),
             Self::Unsupported => write!(
                 f,
@@ -1249,6 +1269,50 @@ mod tests {
             "a genuinely transient extraction failure must stay Upstream, or the \
              assertion above passes by collapsing both cases: got {mid_write:?}"
         );
+    }
+
+    /// The remedy names THIS platform's cause, not the one that produced the code.
+    ///
+    /// The original text said "grant it access to application data on this
+    /// machine" everywhere, which is the macOS TCC dialog -- written from the
+    /// macOS incident that created this variant. These gates were later widened
+    /// to Linux, where no such grant exists: a denial there is ordinary
+    /// filesystem ownership or mode on the profile directory.
+    ///
+    /// So on Linux the message named a remedy that does not exist, which is worse
+    /// than naming none: a reader told to find a setting keeps looking for the
+    /// setting. A message derived from one cause MISDIRECTS toward the cause it
+    /// names rather than merely omitting the others.
+    ///
+    /// The macOS arm carries the restart clause because the grant alone does not
+    /// fix a running process: TCC binds the decision at launch, so a fresh shell
+    /// could read the profile while the supervised module kept being denied until
+    /// it was restarted. A remedy that leaves the reader still broken is the same
+    /// defect one step later.
+    #[test]
+    fn the_permission_remedy_names_this_platform() {
+        use crate::provider::FetchError;
+
+        let denied: FetchError =
+            CookieError::PermissionDenied("Operation not permitted".into()).into();
+        let text = denied.to_string();
+
+        if cfg!(target_os = "macos") {
+            assert!(
+                text.contains("System Settings") && text.contains("restart"),
+                "macOS needs the grant AND the restart, since TCC binds at launch: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("ownership and permissions"),
+                "off macOS a denial is filesystem permissions, not a privacy grant: {text}"
+            );
+            assert!(
+                !text.contains("System Settings"),
+                "naming a macOS-only remedy off macOS sends the reader hunting a \
+                 setting that does not exist: {text}"
+            );
+        }
     }
 
     /// interchangeable: `credential_absent` says nobody logged in, and the
