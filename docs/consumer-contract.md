@@ -1335,6 +1335,41 @@ A provider named there has had its **whole account set** published in that same
 response, so a consumer holding stored accounts for it may replace that set,
 including removing accounts the entries do not name.
 
+#### What "whole" is measured against, and where it can fall short
+
+The claim is over **the credentials this module could enumerate**, which is not
+always the same as the accounts you hold. Today a vault-backed provider's account
+set comes from a local handle mapping, and a credential with no mapped handle is
+not partially visible — it is *structurally invisible*. This module cannot report
+an account it has never been told exists, so the completeness claim is computed
+over a set that can silently be short, and it will still name the provider.
+
+**Measured on a live host, not hypothetical.** Four active Claude credentials in
+the credential store, three with mapped handles, three published — and `claude`
+named in `completeProviders` throughout. A consumer following this contract
+exactly would have pruned a live account sitting at 81% of its five-hour window.
+
+So the honest reading of the field is *"the enumeration I could reach is fully
+published here"*, which is what it has always computed. The name promises more
+than that, and the gap is invisible from the wire: a short enumeration and a
+complete one produce identical responses.
+
+**What this does not change:** completeness is still the only thing that
+authorises removal, and absence still means unfinished. A consumer that ignores
+it deletes on far weaker evidence. The correction is to the confidence, not to
+the rule — and where a consumer can cheaply keep a tombstone rather than a hard
+delete, the asymmetry is worth it, because a wrongly pruned account returns only
+when someone notices it is missing.
+
+The gap closes upstream rather than here. The credential store is adding an
+enumeration call a consumer makes at runtime, so the set this module can reach
+and the set the operator holds become one object; at that point the strong
+reading becomes true without this paragraph changing. The rule that arrives with
+it, and which is worth stating now because it is already true: if that
+enumeration fails, completeness must be **withheld** rather than fall back to a
+locally cached set — a stale local set is exactly the incomplete-but-confident
+case described above.
+
 ### Telling an identity transition from a broken handle
 
 A consumer holding account-keyed rows needs one distinction this wire does not
