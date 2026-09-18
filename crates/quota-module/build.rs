@@ -86,6 +86,45 @@ fn main() {
     // things, and reusing it read as obviously correct until someone checked.
     let worktree = locate_worktree_root();
     let clean = worktree.as_deref().and_then(tree_clean);
+
+    // WHAT GIT SAID, and SEPARATELY whether it may be attested.
+    //
+    // This build used to apply the attest-only-when-clean rule itself and emit a
+    // single value. subc-protocol now owns that rule (`attestable_commit`, reached
+    // through `build_provenance_from_source`), so applying it here too would be two
+    // producers of one decision -- free to disagree, and the disagreement would be
+    // invisible because both answers are well-formed.
+    //
+    // The classification is the part this build can source and the library cannot:
+    // only the build machine knows whether there was a git dir, whether the tree
+    // was dirty, or whether the question could not be answered at all.
+    println!(
+        "cargo:rustc-env=CK_QUOTA_PROVENANCE_SOURCE={}",
+        match (locate_git_dir(), clean) {
+            // No repository. A distinct, statable fact rather than a failure.
+            (None, _) => "no_git_dir",
+            (Some(_), Some(true)) => "clean",
+            (Some(_), Some(false)) => "dirty",
+            // WE COULD NOT LOOK: git missing, or the command failed. Deliberately
+            // its own value rather than folded into any of the above -- "it was
+            // dirty" and "we could not tell" are different facts, and the wire
+            // vocabulary has no variant for this one, so it must not borrow a
+            // neighbouring variant that asserts something untrue.
+            (Some(_), None) => "undeterminable",
+        }
+    );
+    println!(
+        "cargo:rustc-env=CK_QUOTA_PROVENANCE_HEAD={}",
+        // Whatever HEAD is, cleanliness aside. The library decides whether this may
+        // be attested; this line only reports what git answered. Emitting it for a
+        // dirty tree is not a leak -- CK_QUOTA_BUILD_COMMIT above already carries a
+        // sha from a dirty tree by design, and the health stamp and the identity
+        // claim are different questions.
+        locate_git_dir()
+            .as_deref()
+            .and_then(head_commit)
+            .unwrap_or_default()
+    );
     println!(
         "cargo:rustc-env=CK_QUOTA_PROVENANCE_SHA={}",
         // head_commit takes the GIT DIR (which for a worktree is not under the

@@ -1095,7 +1095,7 @@ fn control_flags() -> Flags {
 /// requires nothing. Storage is declared `owns_schema: false` — the module keeps
 /// only an in-memory TTL cache and owns no persistent schema (the manifest enum
 /// has no none/ephemeral storage kind yet, so this is the honest expression).
-/// The commit this binary was built from, or None when that cannot be claimed.
+/// The manifest's provenance, naming WHY a commit is absent when it can.
 ///
 /// SEPARATE FROM `health.metrics.buildCommit`, and the separation is the whole
 /// point. That stamp is HEAD and is documented as answering "is this build
@@ -1105,12 +1105,69 @@ fn control_flags() -> Flags {
 /// bytes is a precise-looking wrong answer, and the contract's own rule is that
 /// absence beats that at being believed.
 ///
-/// Empty means the build declined to claim one: dirty tree, no git binary, or no
-/// resolvable HEAD. All three map to None, because a sentinel must render as
-/// absence and never as a value.
-fn build_provenance_sha() -> Option<String> {
-    let raw = env!("CK_QUOTA_PROVENANCE_SHA");
-    (!raw.is_empty()).then(|| raw.to_string())
+/// THE ABSENCE NOW CARRIES ITS CAUSE. subc-protocol 0.21.0 added
+/// `build_git_sha_absence_reason`, and this build had already distinguished the
+/// causes internally -- `build.rs` has said since insula#12 that "it was dirty"
+/// and "we could not look" are different facts -- while the wire had one channel,
+/// so all of them arrived as the same silence.
+///
+/// THE RESIDUAL CASE IS DELIBERATELY UNSTATED, which is why this is a match
+/// rather than one call. `build_provenance_from_source` defaults an absent sha to
+/// `NeverDerived`, true of a build path that never derives one and FALSE of this
+/// one: insula derives a sha on every build and occasionally cannot. Borrowing
+/// the nearest variant would publish a confident wrong reason, which on an
+/// identity surface is worse than publishing none -- so that case takes the older
+/// constructor, which leaves the reason genuinely absent.
+///
+/// The attest-only-when-clean rule is NOT re-applied here. subc-protocol owns it
+/// (`attestable_commit`); this passes what git said plus how to read it. Applying
+/// it on both sides would be two producers of one decision, free to disagree in a
+/// way nothing observes, since both answers are well-formed.
+fn build_provenance(
+) -> Result<subc_protocol::manifest::ManifestProvenance, subc_protocol::manifest::ProvenanceFormError>
+{
+    let lock = build_lock_digest();
+    match git_sha_source(
+        env!("CK_QUOTA_PROVENANCE_SOURCE"),
+        env!("CK_QUOTA_PROVENANCE_HEAD"),
+    ) {
+        Some(source) => {
+            subc_protocol::manifest::build_provenance_from_source(source, lock.as_deref(), None)
+        }
+        None => subc_protocol::manifest::build_provenance(None, lock.as_deref(), None),
+    }
+}
+
+/// Map the build's classification onto the wire vocabulary.
+///
+/// SPLIT OUT SO IT CAN BE DRIVEN. `build_provenance` reads its inputs with
+/// `env!`, which is fixed at compile time, so a test of that function can only
+/// ever exercise the one classification this build happened to have. A test
+/// written against the library call instead proves subc-protocol works and says
+/// nothing about whether THIS module classifies correctly -- mutating the dirty
+/// arm to `None` reddened nothing until this split existed.
+///
+/// `None` means "state no reason". Reached by "undeterminable" and by any value a
+/// future `build.rs` adds: an unrecognised classification must not be forced into
+/// the nearest variant, because every variant here asserts something specific
+/// about the build machine.
+fn git_sha_source<'a>(
+    classification: &str,
+    head: &'a str,
+) -> Option<subc_protocol::manifest::BuildGitShaSource<'a>> {
+    use subc_protocol::manifest::{BuildGitShaSource, GitTreeState};
+    match classification {
+        "clean" => Some(BuildGitShaSource::Git {
+            revision: head,
+            tree_state: GitTreeState::Clean,
+        }),
+        "dirty" => Some(BuildGitShaSource::Git {
+            revision: head,
+            tree_state: GitTreeState::Dirty,
+        }),
+        "no_git_dir" => Some(BuildGitShaSource::NoGitDir),
+        _ => None,
+    }
 }
 
 /// A digest of the resolved lockfile, hashed at build time.
@@ -1316,12 +1373,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // blank: this module owns no persistent store. `wire_crate_version` is filled
     // by the constructor from the linked crate, so it is no longer ours to pass.
     .provenance(
-        subc_protocol::manifest::build_provenance(
-            build_provenance_sha().as_deref(),
-            build_lock_digest().as_deref(),
-            None,
-        )
-        .ok(),
+        build_provenance().ok(),
     )
     .capabilities(
         // No versioned capability grammar declared. `None` and an empty block are
@@ -1588,6 +1640,115 @@ mod tests {
             "the manifest advertises what catalog.list shows a consumer; an \
              operation listed here and not dispatched answers `unknown method` \
              to a caller who read the catalog and did nothing wrong"
+        );
+    }
+
+    /// Every classification this build can emit maps to the right statement.
+    ///
+    /// Drives THIS MODULE's mapping rather than the library's behaviour. The first
+    /// version of the test below asserted `build_provenance_from_source` directly,
+    /// which proves subc-protocol works and nothing about whether insula reaches it
+    /// correctly -- mutating the dirty arm away reddened nothing.
+    ///
+    /// The unrecognised arm is the load-bearing one. `build_provenance_from_source`
+    /// defaults an absent sha to `NeverDerived`, so routing an unknown
+    /// classification into it would publish "this build path never derives a sha"
+    /// about a build that derives one on every run and merely could not this time.
+    /// Returning None keeps that case on the older constructor, which states
+    /// nothing.
+    #[test]
+    fn every_build_classification_maps_to_what_it_actually_means() {
+        use subc_protocol::manifest::{BuildGitShaSource, GitTreeState};
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        assert!(
+            matches!(
+                git_sha_source("clean", sha),
+                Some(BuildGitShaSource::Git {
+                    tree_state: GitTreeState::Clean,
+                    revision,
+                }) if revision == sha
+            ),
+            "a clean tree attests its commit"
+        );
+        assert!(
+            matches!(
+                git_sha_source("dirty", sha),
+                Some(BuildGitShaSource::Git {
+                    tree_state: GitTreeState::Dirty,
+                    ..
+                })
+            ),
+            "a dirty tree must reach the library as Dirty, so the DECLINE is the \
+             library's and carries its reason"
+        );
+        assert!(
+            matches!(
+                git_sha_source("no_git_dir", sha),
+                Some(BuildGitShaSource::NoGitDir)
+            ),
+            "no repository is a statable fact, not a failure"
+        );
+
+        // We looked and could not tell. No variant means this, so none is claimed.
+        assert!(
+            git_sha_source("undeterminable", sha).is_none(),
+            "an undeterminable tree must not borrow a variant that asserts a cause"
+        );
+        assert!(
+            git_sha_source("something_a_future_build_emits", sha).is_none(),
+            "and neither must a classification this binary has never heard of"
+        );
+    }
+
+    /// A dirty tree names its reason rather than going silent.
+    ///
+    /// The absence used to be one empty string for three different causes, and the
+    /// wire could not tell "the build declined because the tree was dirty" from
+    /// "the build could not look". A reader of a bare absence has no way to know
+    /// which, and they lead to different actions: one is a build hygiene issue,
+    /// the other is a broken build environment.
+    ///
+    /// Both arms asserted. The clean arm is the load-bearing one -- a
+    /// classification that named a reason even when a sha WAS attested would be
+    /// stating a contradiction, and the library refuses that combination rather
+    /// than publishing both.
+    #[test]
+    fn a_declined_sha_names_why_it_was_declined() {
+        use subc_protocol::manifest::{
+            build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource, GitTreeState,
+        };
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let dirty = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: sha,
+                tree_state: GitTreeState::Dirty,
+            },
+            None,
+            None,
+        )
+        .expect("a dirty tree is a valid provenance");
+        assert_eq!(dirty.build_git_sha, None, "a dirty tree attests no commit");
+        assert_eq!(
+            dirty.build_git_sha_absence_reason,
+            Some(BuildGitShaAbsenceReason::DeclinedDirty),
+            "and it must say WHY, not merely go quiet"
+        );
+
+        let clean = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: sha,
+                tree_state: GitTreeState::Clean,
+            },
+            None,
+            None,
+        )
+        .expect("a clean tree is a valid provenance");
+        assert_eq!(clean.build_git_sha.as_deref(), Some(sha));
+        assert_eq!(
+            clean.build_git_sha_absence_reason, None,
+            "a stated commit must not also carry a reason for its absence"
         );
     }
 
