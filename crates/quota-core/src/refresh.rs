@@ -773,6 +773,28 @@ fn credential_was_replaced(slot: &ProviderSlot, status: &CredentialStatus) -> bo
         return false;
     };
     match (observed.record_version, status.record_version) {
+        // ONE REPAIR PATH IS NOT COVERED BY THIS, AND IT CANNOT BE. The vault's
+        // `reactivate` clears a `needs_reauth` verdict WITHOUT re-sealing the
+        // record, and deliberately does not bump the version: the repair for a
+        // verdict that was WRONG must not claim the material changed. Every other
+        // write -- create, overwrite, refresh commit, set_identity -- bumps
+        // unconditionally, byte-identical material included (verified with CKCRED
+        // at their store.rs, 2026-09-18).
+        //
+        // So a credential repaired that way waits the full 300s floor, which is
+        // the pre-acceleration baseline rather than a regression.
+        //
+        // NOT FIXED HERE, and the reason is that the signal does not exist on this
+        // surface. `ready` is the only field that moves, and the arm below explains
+        // at length why `ready` cannot mean "replaced" -- it says the vault can
+        // serve the record, never that the upstream accepts it. A LEVEL check would
+        // hammer a dead credential forever; a TRANSITION check would need this slot
+        // to persist the last polled `ready`, which is new state for one rare path.
+        //
+        // The real fix arrives without polling at all: the credential store's
+        // forthcoming enumeration carries `state` on every row, so a transition to
+        // `active` is observable in the same read that lists the credential, and
+        // covers reactivate along with every other repair. Build it there.
         (Some(previous), Some(current)) => current > previous,
         // NO VERSION IS NO BASIS, and `ready` is not a substitute for one.
         //
