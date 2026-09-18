@@ -18,6 +18,23 @@ Exit codes: 0 nothing reddened, 1 A NAMED TEST reddened (the usual proof), 2 no
 proof could be established -- the mutation would not build, the tree could not be
 restored, or the suite hung.
 
+FILTER THIS TOOL'S OUTPUT BY POSITION, NOT BY PATTERN -- `| tail -3`, never
+`| grep <verdict-words>`. Every run ends with exactly one verdict line, so a tail
+cannot miss it whatever that verdict turns out to be. A grep is an ALLOW-LIST OVER
+OUTCOMES: it shows only what matches, so an outcome you did not anticipate prints
+NOTHING, and nothing reads as quiet success rather than as a failure to classify.
+
+SUBC lost a real refusal to exactly this on their placement gate tonight -- their
+habitual grep returned empty against a refusal from a code path they had not met,
+because the tool carried TWO refusal vocabularies and their pattern knew one. No
+pattern could have been right there; the tool disagreed with itself.
+
+This tool avoids that at the source by classifying its own outcome and carrying it
+in the EXIT CODE, which is a closed set a caller cannot mis-spell. The positional
+filter is the second line, for the human reading along. Stated here rather than
+left to habit because the safe shape was originally chosen for being short, and
+nobody remembers that a property was luck.
+
 HUNG EXITS 2, NOT 1, and the reason is worth stating because the text and the exit
 code used to disagree. A hang IS evidence that the mutated thing is load-bearing,
 so reporting it as a finding is right in prose. But the proof this tool exists to
