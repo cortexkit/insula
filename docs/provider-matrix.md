@@ -1218,6 +1218,52 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.60.0 → v0.61.0
+
+Six tags accumulated (`v0.60.1` through `v0.61.0`). All five opaque constants
+present at `v0.61.0`, located by VALUE in the tagged tree, distribution
+**2/4/4/2/1** — unchanged across six rounds now.
+
+**One candidate found, and it is NOT declined — it is unverified.**
+`GrokRemainingResetsFetcher.swift` (+515, the round's largest addition) reads
+`POST grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets` over gRPC-web.
+This is grok's equivalent of the banked reset credits we already publish as
+`savedResets` for codex.
+
+It does **not** fall under the standing web-billing decline. The guard at line 212
+is `authorizationHeader != nil || cookieHeader non-empty` — **either** works, and
+the bearer form is `Bearer <accessToken>` from the same credential our `grok`
+lane already holds, on the same gRPC-web transport `grok.rs` already implements.
+
+**The probe was inconclusive and the reason is a methodology error worth
+recording.** Probing with the local `xai` token returned HTTP 200 with 0 bytes.
+The control — the same token against `GetGrokCreditsConfig`, the endpoint we
+serve from today — returned 0 bytes *as well*, which is what turned a negative
+result into an inconclusive one. Cause: that local token expired 2026-09-17,
+while grok serves fresh from the **vault** lane. So the probe answered about a
+dead credential, not about the endpoint.
+
+Generalises: *when two lanes can serve one provider, a probe built from the
+credential that is easiest to reach is not necessarily the one that is
+serving.* The live wire said `source` for grok resolves through dedup, and the
+local token's expiry was one field away the whole time.
+
+UNBLOCK: one call to that endpoint with a live bearer (a minted probe handle, as
+CKCRED did for the Anthropic profile measurement). If it returns credits, this is
+a port of the same shape as codex `savedResets`.
+
+**Everything else in the round is null for the served set:**
+
+- `OpenCodeWebParsing.swift` (+182) with matching reductions in the OpenCode and
+  OpenCodeGo fetchers is a pure **refactor** — shared parsing extracted, no window
+  or percent mapping changed.
+- `AntigravityProviderDescriptor.swift` (+273/-…) is CLI **session management** —
+  spawn, idle window, reset-after-fetch, account-match on a reused server. Our
+  local lane already matches on account email; nothing about quota shape moved.
+- `CursorStatusProbe.swift` (-247 net) is a status-probe simplification, not the
+  usage lane.
+- New providers: Nous, Venice, Mistral, Muse. Build decisions, not parity.
+
 ### Parity round: CodexBar v0.56.6 → v0.60.0
 
 Six releases had accumulated behind the anchor (`v0.56.7`, `v0.56.8`, `v0.57.0`,
