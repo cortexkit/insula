@@ -148,11 +148,18 @@ fn json_route_open(project_root: &Path) -> Value {
     let target = RouteTarget::ManagementSurface {
         module_id: MODULE_ID.to_string(),
     };
-    let identity = BindIdentity {
-        project_root: project_root.to_path_buf(),
-        harness: "quota-e2e".to_string(),
-        session: "session-1".to_string(),
-    };
+    // Constructed rather than written as a literal: upstream made this
+    // `#[non_exhaustive]` so an added identity field does not force every
+    // construction site in the fleet to migrate.
+    //
+    // `project_id` is deliberately left absent by the constructor, and that is the
+    // honest value here rather than a gap to fill in later. Absent means "no stable
+    // id, key on the triple" rather than "unknown", and the upstream contract is
+    // that a producer answers for a session consistently -- a driver that sometimes
+    // sent an id and sometimes did not would fork the consumer's lineage into
+    // separate stores with no error at either end. A test harness has no registered
+    // project, so consistently absent is both true and stable.
+    let identity = BindIdentity::new(project_root.to_path_buf(), "quota-e2e", "session-1");
     serde_json::json!({
         "op": "route.open",
         "target": target,

@@ -202,6 +202,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cortexkit-log"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "chrono",
+ "cortexkit-store-types",
+ "regex",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cortexkit-paths"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +224,14 @@ name = "cortexkit-provider-usage"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5084ce220f34ac2704f36c9c84a3fa3b9d74a44badeba57237bdada60dc4464f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cortexkit-store-types"
+version = "0.2.1"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
 dependencies = [
  "serde",
 ]
@@ -1287,6 +1307,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1640,7 +1672,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "subc-control"
-version = "0.11.2"
+version = "0.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1649,9 +1681,10 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.39"
+version = "0.18.3"
 dependencies = [
  "base64",
+ "cortexkit-log",
  "cortexkit-paths",
  "ed25519-dalek",
  "fs4",
@@ -1682,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.19.1"
+version = "0.21.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1690,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
