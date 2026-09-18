@@ -95,6 +95,49 @@ if [ "$conclusion" != "success" ]; then
   exit 1
 fi
 
+# EVERY REQUIRED CHECK MUST BE A NAME THIS SHA ACTUALLY PRODUCED.
+#
+# Branch protection matches required checks BY NAME. A matrix leg renamed in the
+# workflow produces a new name, the old one is never reported again, and the rule
+# keeps waiting for it -- so main becomes unpushable while CI is green. The push
+# fails with "Expected -- Waiting for status to be reported", which reads like CI
+# being slow rather than like a name nobody will ever send.
+#
+# Asked HERE because both facts are known and neither is guessed: the run has
+# finished, so its check names are observed rather than parsed out of YAML with
+# matrix expansion, and the required set is read from the API rather than assumed.
+#
+# One direction only. Every required name must have been produced; a workflow may
+# produce extra jobs that are not required, which is ordinary.
+required=$(gh api "repos/$REPO/branches/$(git rev-parse --abbrev-ref origin/HEAD | sed 's|^origin/||')/protection" \
+           --jq '.required_status_checks.contexts[]?' 2>/dev/null)
+if [ -z "$required" ]; then
+  # Unprotected, or this token cannot read protection. Both are fine and neither
+  # is a finding -- but say which question went unanswered rather than printing
+  # nothing, so a silent skip is not mistaken for a clean check.
+  echo "  (no required checks readable for the default branch -- protection off, or the token lacks admin)"
+else
+  produced=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+             --jq '.check_runs[].name' 2>/dev/null | sort -u)
+  missing=""
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    printf '%s\n' "$produced" | grep -qxF "$name" || missing="$missing$name\n"
+  done <<< "$required"
+  if [ -n "$missing" ]; then
+    echo "  REFUSED: a required check was never produced by this sha" >&2
+    printf "$missing" | sed 's/^/    missing: /' >&2
+    echo "  Produced names:" >&2
+    printf '%s\n' "$produced" | sed 's/^/      /' >&2
+    echo "  A renamed job is the usual cause. Fix the workflow name or the" >&2
+    echo "  protection rule BEFORE pushing -- the push would otherwise hang on a" >&2
+    echo "  status nobody will ever report." >&2
+    echo "  NOT LANDED: the branch is left at $branch for inspection" >&2
+    exit 1
+  fi
+  echo "  required checks produced: $(printf '%s\n' "$required" | grep -c .) of $(printf '%s\n' "$required" | grep -c .)"
+fi
+
 out=$(git push origin master 2>&1); push_rc=$?
 echo "$out" | grep -E '\->|GH006|required status' | sed 's/^/  /'
 
