@@ -138,17 +138,33 @@ else
   echo "  required checks produced: $(printf '%s\n' "$required" | grep -c .) of $(printf '%s\n' "$required" | grep -c .)"
 fi
 
-out=$(git push origin master 2>&1); push_rc=$?
+    before_push=$(git rev-parse origin/master)
+    out=$(git push origin master 2>&1); push_rc=$?
 echo "$out" | grep -E '\->|GH006|required status' | sed 's/^/  /'
 
 # DELETE THE BRANCH ONLY ON SUCCESS.
 # An unconditional delete on the failure path removed the run's own branch and
 # made `gh run list --branch` return nothing -- the evidence for the failure was
 # destroyed by the cleanup for it.
-if [ $push_rc -eq 0 ]; then
-  git push -q --delete origin "$branch" 2>/dev/null
-  git fetch -q origin master
-  echo "  landed: $(git rev-parse --short=8 origin/master)"
+    if [ $push_rc -eq 0 ]; then
+      git push -q --delete origin "$branch" 2>/dev/null
+      git fetch -q origin master
+      # NAME EVERY COMMIT THAT LANDED, NOT JUST THE TIP.
+      #
+      # This printed only `origin/master` after the push, which is a TRUE sha
+      # answering a question nobody asked. A train usually carries more than one
+      # commit -- a change plus a lock absorb is the common shape here -- and the
+      # tip is whichever went last, not the one the run was about.
+      #
+      # I quoted that tip to a peer as the sha carrying a wire pin. It was the lock
+      # absorb. They went looking for the pin, in the wrong repository, and found
+      # nothing -- which reads identically to an unpushed commit, so the next
+      # question was whether I had failed to push at all.
+      #
+      # A confirmation that prints a correct value for a different subject is worse
+      # than one that prints nothing, because it is quoted onward with confidence.
+      echo "  landed on origin/master:"
+      git --no-pager log --oneline "$before_push"..origin/master | sed 's/^/    /'
 else
   echo "  NOT LANDED: the branch is left at $branch for inspection" >&2
 fi
