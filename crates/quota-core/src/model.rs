@@ -346,6 +346,14 @@ mod tests {
     /// privacy case above, and it is the direction a test written for schema
     /// stability would usually forget.
     ///
+    /// WHAT THIS DOES NOT COVER, because the next reader will otherwise overestimate
+    /// it: every `AccountInfo` built here is a struct literal, so a field added in
+    /// commons breaks the BUILD at each construction site, loudly, before any test
+    /// runs. This pin is not the first line of defence. It catches the narrower
+    /// case where nothing fails to compile -- a field arriving through
+    /// `..Default::default()`, a builder, or `#[serde(flatten)]` -- and simply
+    /// appears on the wire. Two mechanisms, different populations.
+    ///
     /// When this reddens: decide whether the new field identifies a person. If it
     /// does, tell SUBC before it ships, then widen this list. If it does not, widen
     /// the list. Never delete the assertion.
@@ -367,7 +375,14 @@ mod tests {
         assert_eq!(
             keys,
             ["email", "orgName", "planType"],
-            "accountInfo gained or lost a key; see this test's doc comment before widening"
+            // NAMES THE CONSEQUENCE, not just the diff. A message saying "the key
+            // set changed" makes the reader go and find out why that matters, and
+            // the cheapest resolution is to widen the list and move on. SUBC's
+            // equivalent pin does this and theirs was the better message.
+            "accountInfo gained or lost a key. If the new field identifies a person \
+             it reaches `ck quota --redact`, whose filter removes fields BY NAME and \
+             will pass an unknown one straight through into a published screenshot. \
+             Classify it and notify SUBC before widening this list."
         );
     }
     use super::*;
