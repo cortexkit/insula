@@ -221,13 +221,44 @@ succeeded, which is the common case on a host lacking that credential.
 `fetchedAt` as part of a primary key, which is a stronger contract than a
 freshness hint, so the guarantees are stated rather than left to be discovered:
 
-- **Deterministic within a producer process.** The value derives from a
-  monotonic instant converted through a wall-clock anchor captured once at
-  startup, so the same success renders the same string on every read. Polling
-  twice never produces two timestamps for one reading.
+- **Deterministic within a producer process.** The value is recorded once, when
+  the reading is taken, and stored with it — so the same success renders the same
+  string on every read. Polling twice never produces two timestamps for one
+  reading.
 - **Nanosecond precision**, so two genuinely distinct successes cannot collide.
-- **Monotonic per slot within a process.** It comes from a monotonic clock, so
-  it cannot move backwards even if the host's wall clock is adjusted.
+  **This breaks some standard parsers** — see below.
+- **It dates the READING, not the poll.** For a cache-backed lane the two differ;
+  the field is the instant the value became true at its source.
+
+> **Corrected 2026-09-18.** This section previously said the value was computed
+> as a startup wall-clock anchor plus monotonic elapsed time. That mechanism was
+> DELETED in `9e4b3bf` because it was wrong in a way consumers could see: on
+> macOS `Instant` pauses during system suspend, so every sleep left published
+> timestamps permanently behind real time for the rest of the process lifetime.
+> The contract kept describing the deleted mechanism. Recorded rather than
+> silently replaced, because a consumer who reasoned about drift from the old
+> description was reasoning correctly about a real defect that no longer exists.
+
+**Nanosecond precision breaks common parsers, and the failure is loud rather
+than silent.** A timestamp here carries nine fractional digits:
+
+```
+2026-09-18T22:43:31.664189000+00:00
+```
+
+Python's `datetime.fromisoformat` accepts at most six and raises `ValueError:
+Invalid isoformat string` on this. JavaScript's `Date` truncates without
+complaint. Go's `time.Parse` with RFC3339 handles it. If you are writing an
+ad-hoc reader, truncate the fraction to six digits before parsing:
+
+```python
+re.sub(r"\.(\d{6})\d*", r".\1", stamp)   # keep the dot: r"\1" alone drops it
+```
+
+Stated because the producer hit it against its own wire while writing a
+throwaway diagnostic. A loud parse failure is the good case; the hazard is a
+reader that catches the exception and treats an unparseable timestamp as an
+absent one, which reads as *this entry never succeeded*.
 
 **What a producer restart does, because it is not a defect and will look like
 one.** A restart discards every slot and each provider re-fetches, so the same
