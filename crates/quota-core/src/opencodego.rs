@@ -35,7 +35,7 @@ async fn fetch_go_page_html(
     workspace_id: &str,
 ) -> Result<String, FetchError> {
     let url = format!("https://opencode.ai/workspace/{workspace_id}/go");
-    let bytes = JsonRequest::get(&url)
+    let response = JsonRequest::get(&url)
         .timeout(REQUEST_TIMEOUT)
         .header(Header::new("Cookie", cookie.to_string()))
         .header(Header::new("User-Agent", USER_AGENT.to_string()))
@@ -43,11 +43,48 @@ async fn fetch_go_page_html(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
         ))
-        .send(client)
+        .send_full(client)
         .await?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    classify_go_page(&text, chrono::Utc::now().timestamp())?;
+    let text = String::from_utf8_lossy(&response.body).into_owned();
+    classify_go_page(
+        &text,
+        &response.final_url,
+        workspace_id,
+        chrono::Utc::now().timestamp(),
+    )?;
     Ok(text)
+}
+
+/// Whether the `/go` request was answered by a different page.
+///
+/// Checks the PATH rather than the host, which is where this differs from the
+/// same defect in `ollama`: that redirect crosses to another host, while this one
+/// stays on `opencode.ai` and only moves from `/workspace/<id>/go` to
+/// `/console/login`. A host comparison would see no change at all.
+///
+/// Asks whether the answer still names the resource requested, rather than
+/// looking for "login" in the destination. A keyword test on the URL is the same
+/// heuristic that failed on the body, one layer up: it recognises only the
+/// sign-in spellings someone thought of, where this recognises ANY page that is
+/// not the one asked for.
+///
+/// An empty final URL is NOT a redirect. It means no transport recorded one --
+/// every unit fixture constructs a response that way -- and treating absence as
+/// evidence would report every test's page as a sign-in.
+fn redirected_off_go_page(final_url: &str, workspace_id: &str) -> bool {
+    if final_url.is_empty() {
+        return false;
+    }
+    let expected = format!("/workspace/{workspace_id}/go");
+    match final_url.split_once("://") {
+        Some((_, rest)) => match rest.split_once('/') {
+            Some((_, path)) => !format!("/{path}").starts_with(&expected),
+            // A bare origin with no path cannot be the go page.
+            None => true,
+        },
+        // Not a URL we can read: say nothing rather than guess.
+        None => false,
+    }
 }
 
 /// Decide what a fetched `/go` page means, before anything tries to read
@@ -66,7 +103,20 @@ async fn fetch_go_page_html(
 /// The order is load-bearing. A signed-out page can carry an unsubscribed-looking
 /// record, and a page with no plan does not parse, so each check must come before
 /// the ones it would otherwise be mistaken for.
-fn classify_go_page(text: &str, now_secs: i64) -> Result<(), FetchError> {
+fn classify_go_page(
+    text: &str,
+    final_url: &str,
+    workspace_id: &str,
+    now_secs: i64,
+) -> Result<(), FetchError> {
+    // FIRST, because it is the only check that does not depend on the body. A
+    // sign-in page arrives with a 200 and is parseable-looking nonsense, so every
+    // body test below it answers a question about the wrong page.
+    if redirected_off_go_page(final_url, workspace_id) {
+        return Err(FetchError::Unauthorized(
+            "opencodego session expired (the go page redirected to a sign-in)".to_string(),
+        ));
+    }
     if looks_signed_out(text) {
         return Err(FetchError::Unauthorized(
             "opencodego session expired (go page)".to_string(),
@@ -164,7 +214,79 @@ impl UsageProvider for OpenCodeGoProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_go_page, looks_unsubscribed};
+
+    /// A sign-in redirect is an expired session, not a parser defect.
+    ///
+    /// THE LIVE SHAPE, measured on this host 2026-09-19 while a session was
+    /// genuinely expired: the `/go` request is redirected to
+    /// `https://opencode.ai/console/login`, this client follows it, and the
+    /// sign-in page arrives with HTTP 200 and 1415 bytes. ALL FIVE of
+    /// `looks_signed_out`'s markers are absent -- the page is client-rendered and
+    /// the word "login" appears only in the URL -- so the parse failed and
+    /// published `decode_failed`, which sends a reader to hunt a parser bug when
+    /// the remedy is to sign in again.
+    ///
+    /// Both arms, because each survives the other's mutation. Widening the check
+    /// to fire on the real go page would take a healthy account dark; removing it
+    /// restores the misdiagnosis.
+    #[test]
+    fn a_redirect_to_a_sign_in_is_not_a_decode_failure() {
+        let ws = "ws_abc123";
+
+        assert!(
+            redirected_off_go_page("https://opencode.ai/console/login", ws),
+            "a redirect to the console login must be recognised, and it stays on \
+             the same host so only the path can say so"
+        );
+
+        assert!(
+            !redirected_off_go_page(&format!("https://opencode.ai/workspace/{ws}/go"), ws),
+            "the real go page must NOT be treated as a redirect, or a healthy \
+             account goes dark"
+        );
+
+        assert!(
+            !redirected_off_go_page("", ws),
+            "an empty final URL means no transport recorded one, which every unit \
+             fixture does: absence is not evidence of a redirect"
+        );
+
+        // THE PREDICATE BEING RIGHT IS HALF THE PROPERTY. The three assertions
+        // above all passed while the guard was not wired into the classifier at
+        // all -- proved by mutation: replacing the call with `if false` reddened
+        // NOTHING. So the classifier is asserted here too, which is what a caller
+        // actually reaches.
+        let signed_in_page = GO_FIXTURE;
+        let err = classify_go_page(
+            signed_in_page,
+            "https://opencode.ai/console/login",
+            ws,
+            1_700_000_000,
+        )
+        .expect_err("a sign-in redirect must not classify as a usable page");
+        assert!(
+            matches!(err, FetchError::Unauthorized(_)),
+            "a redirect to a sign-in is an expired session, not a parser defect: \
+             got {err:?}"
+        );
+
+        // And the body is only consulted for a page that IS the go page: this
+        // same fixture at its own URL parses, so the assertion above is about the
+        // redirect rather than about the fixture being unparseable.
+        assert!(
+            classify_go_page(
+                signed_in_page,
+                &format!("https://opencode.ai/workspace/{ws}/go"),
+                ws,
+                1_700_000_000
+            )
+            .is_ok(),
+            "the control: this fixture is a healthy go page when it comes from \
+             the go page"
+        );
+    }
+
+    use super::{classify_go_page, looks_unsubscribed, redirected_off_go_page};
     use crate::opencode::parse_windows;
     use crate::provider::FetchError;
 
@@ -203,7 +325,13 @@ mod tests {
     /// in again, which changes nothing.
     #[test]
     fn a_workspace_without_a_go_plan_reports_no_quota() {
-        let err = classify_go_page(LIVE_UNSUBSCRIBED_RECORD, 1_000_000).unwrap_err();
+        let err = classify_go_page(
+            LIVE_UNSUBSCRIBED_RECORD,
+            "https://opencode.ai/workspace/ws_test/go",
+            "ws_test",
+            1_000_000,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FetchError::NoQuotaReported(m) if m.contains("no Go subscription")),
             "expected the no-plan verdict, got: {err}"
@@ -217,13 +345,25 @@ mod tests {
     /// window with a no-quota report.
     #[test]
     fn a_page_with_windows_is_accepted() {
-        assert!(classify_go_page(GO_FIXTURE, 1_000_000).is_ok());
+        assert!(classify_go_page(
+            GO_FIXTURE,
+            "https://opencode.ai/workspace/ws_test/go",
+            "ws_test",
+            1_000_000
+        )
+        .is_ok());
     }
 
     /// A page with neither windows nor a no-plan record is our defect to fix.
     #[test]
     fn a_page_with_no_windows_and_no_verdict_is_a_decode_failure() {
-        let err = classify_go_page("<html>something else entirely</html>", 1_000_000).unwrap_err();
+        let err = classify_go_page(
+            "<html>something else entirely</html>",
+            "https://opencode.ai/workspace/ws_test/go",
+            "ws_test",
+            1_000_000,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, FetchError::Decode(m) if m.contains("usage fields missing")),
             "expected the decode failure, got: {err}"
