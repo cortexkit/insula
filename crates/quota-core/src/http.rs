@@ -94,6 +94,29 @@ async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, F
 /// non-2xx bodies contain before routing it through here. It bites hardest on the
 /// auth statuses, since a refusal is the likeliest place for a provider to echo
 /// the rejected credential back.
+/// How a non-2xx status reads, body or no body.
+///
+/// SHARED BY BOTH NON-2XX BRANCHES, because the reasoning belongs to neither.
+/// An empty body is a FACT worth stating rather than a blank to hide: it tells a
+/// reader the upstream said nothing, which is different from nobody having
+/// looked.
+///
+/// That reasoning was written on the auth branch and applied only there, so the
+/// sibling branch rendered `HTTP 503: ` — a trailing colon introducing nothing,
+/// which reads as a truncation rather than as silence.
+///
+/// It surfaced only under a loopback harness. No provider on this host had
+/// answered non-2xx with an empty body, so the live wire had never shown the
+/// string, and the two branches had no way to be seen disagreeing.
+fn status_detail(status: u16, body: &[u8]) -> String {
+    let excerpt = refusal_excerpt(body);
+    if excerpt.is_empty() {
+        format!("HTTP {status} (no response body)")
+    } else {
+        format!("HTTP {status}: {excerpt}")
+    }
+}
+
 fn refusal_excerpt(body: &[u8]) -> String {
     String::from_utf8_lossy(body)
         .trim()
@@ -436,16 +459,9 @@ impl JsonRequest {
             // the rejected credential back, so the obligation stated there -- check
             // what a new provider's non-2xx bodies contain -- now covers the auth
             // statuses too, and matters more there.
-            let excerpt = refusal_excerpt(&raw.body);
-            let detail = if excerpt.is_empty() {
-                // An empty refusal body is a FACT worth stating rather than a blank
-                // to hide: it tells a reader the upstream said nothing, which is
-                // different from nobody having looked.
-                format!("HTTP {} (no response body)", raw.status)
-            } else {
-                format!("HTTP {}: {excerpt}", raw.status)
-            };
-            return Err(FetchError::Unauthorized(detail));
+            return Err(FetchError::Unauthorized(status_detail(
+                raw.status, &raw.body,
+            )));
         }
         if !(200..300).contains(&raw.status) {
             // THE EXCERPT IS UNREDACTED BY CONSTRUCTION, and it reaches the wire
@@ -470,11 +486,7 @@ impl JsonRequest {
             // people to distrust the field. The rule instead is a REVIEW POINT --
             // when adding a provider whose payload carries credentials, check
             // what its non-2xx bodies contain before routing it through here.
-            let excerpt = refusal_excerpt(&raw.body);
-            return Err(FetchError::Upstream(format!(
-                "HTTP {}: {excerpt}",
-                raw.status
-            )));
+            return Err(FetchError::Upstream(status_detail(raw.status, &raw.body)));
         }
         raw.body_for_parsing()?;
         Ok(raw)
@@ -839,6 +851,36 @@ mod tests {
             "an absent body is a stated fact, not a blank: got {error:?}"
         );
         server.await.unwrap();
+    }
+
+    /// An empty non-auth body says so, exactly as an empty auth body does.
+    ///
+    /// The two non-2xx branches rendered this differently: the auth branch said
+    /// "no response body" and its sibling said `HTTP 503: ` — a trailing colon
+    /// introducing nothing, which reads as a truncated excerpt rather than as an
+    /// upstream that sent nothing.
+    ///
+    /// WITNESSED RATHER THAN REVIEWED. No provider on this host answers non-2xx
+    /// with an empty body, so the live wire had never produced the string; it took
+    /// a loopback harness returning a bare 503 to show it. Both branches are
+    /// asserted here so the next edit to either cannot re-split them.
+    #[test]
+    fn an_empty_body_reads_the_same_on_both_non_2xx_branches() {
+        assert_eq!(
+            status_detail(503, b""),
+            "HTTP 503 (no response body)",
+            "an upstream that sent nothing must say so, not trail a colon"
+        );
+        assert_eq!(
+            status_detail(401, b""),
+            "HTTP 401 (no response body)",
+            "the auth branch's wording is the one being shared, unchanged"
+        );
+        assert_eq!(
+            status_detail(503, b"upstream is draining"),
+            "HTTP 503: upstream is draining",
+            "a body that exists is still echoed for diagnosis"
+        );
     }
 
     #[tokio::test]
