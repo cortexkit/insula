@@ -73,10 +73,36 @@ pub fn now_ms() -> i64 {
 
 /// Resolve the opencode auth.json path (`$XDG_DATA_HOME` or `~/.local/share`).
 pub fn auth_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+    auth_path_from(|name| std::env::var_os(name))
+}
+
+/// The same resolution against an injected environment.
+///
+/// Exists so the ABSENT case is testable. Reading the process environment
+/// directly would leave the unresolvable-home arm reachable only by unsetting
+/// every home variable in a live process, and this crate deliberately has no
+/// env-mutating tests -- twenty such sites were removed for the flakiness they
+/// caused across a shared thread pool. Mirrors `env::home_dir_from`, which exists
+/// for the same reason.
+pub(crate) fn auth_path_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString> + Copy,
+) -> Option<PathBuf> {
+    if let Some(xdg) = lookup("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("opencode/auth.json"));
     }
-    crate::env::home_dir().map(|home| home.join(".local/share/opencode/auth.json"))
+    crate::env::home_dir_from(lookup).map(|home| home.join(".local/share/opencode/auth.json"))
+}
+
+/// Classify a resolved-or-not auth path, so the refusal is testable apart from
+/// the environment that produces it.
+pub(crate) fn path_or_refusal(path: Option<PathBuf>) -> Result<PathBuf, FetchError> {
+    path.ok_or_else(|| {
+        FetchError::LocalSourceUnavailable(
+            "cannot locate opencode's auth file: neither XDG_DATA_HOME nor a home \
+             directory could be resolved for this process"
+                .to_string(),
+        )
+    })
 }
 
 /// Read one provider's credential entry from opencode's auth.json.
@@ -93,9 +119,22 @@ pub fn auth_path() -> Option<PathBuf> {
 /// surface leave it out of the count it watches. Classifying here means a new
 /// caller cannot make that choice again.
 pub fn read_provider(provider: &str) -> Result<Option<OpencodeAuth>, FetchError> {
-    let Some(path) = auth_path() else {
-        return Ok(None);
-    };
+    // NOT `Ok(None)` when the path does not resolve. `auth_path` returns None
+    // when the HOME DIRECTORY cannot be resolved -- neither `XDG_DATA_HOME` nor
+    // any home variable is set -- which says nothing about whether a credential
+    // exists. The file was never looked for.
+    //
+    // This is the defect the paragraph above records, surviving on the sibling
+    // path of the same function: that fix moved classification here so a caller
+    // could not choose `NoSession` for an unreadable file, and left the
+    // unresolvable-path arm returning the value that MEANS "nothing is
+    // configured". Reported on insula#18.
+    //
+    // `LocalSourceUnavailable` rather than a credential class, because the
+    // subject is this machine's environment rather than the account: the remedy
+    // is fixing the process environment, the same shape as the macOS
+    // profile-permission denial that already uses it.
+    let path = path_or_refusal(auth_path())?;
     read_provider_at(&path, provider)
 }
 
@@ -136,6 +175,53 @@ pub fn parse_provider(data: &[u8], provider: &str) -> Result<Option<OpencodeAuth
 
 #[cfg(test)]
 mod tests {
+
+    /// An unresolvable home is "I could not look", never "nothing is configured".
+    ///
+    /// insula#18. `Ok(None)` from this function is a CONTRACT VALUE meaning the
+    /// user never logged in, and it publishes `credential_absent` -- the class
+    /// that authorises a consumer to prune the account. Returning it because the
+    /// process has no home directory reports an account state on evidence nobody
+    /// gathered.
+    ///
+    /// The doc comment on `read_provider` records the SAME defect being fixed for
+    /// unreadable files, and the unresolvable-path arm three lines below it kept
+    /// returning `Ok(None)`. Fixing an instance is not closing a class.
+    ///
+    /// Injected rather than env-mutating: this crate removed twenty env-mutating
+    /// test sites for the cross-test flakiness they caused, so the absent case is
+    /// reached through `auth_path_from` instead of by unsetting HOME in a live
+    /// process.
+    #[test]
+    fn an_unresolvable_home_refuses_rather_than_reporting_no_account() {
+        let nothing_set = |_: &str| None;
+        assert!(
+            auth_path_from(nothing_set).is_none(),
+            "precondition: with no home variables there is no path to read"
+        );
+
+        let error = path_or_refusal(auth_path_from(nothing_set))
+            .expect_err("an unresolvable path must refuse, not report an absence");
+        assert_eq!(
+            error.error_class(),
+            "local_source_unavailable",
+            "the subject is this machine's environment, not the account: \
+             `credential_absent` would tell a consumer to prune an account nobody \
+             looked for"
+        );
+
+        // THE CONTROL: a resolvable home still yields a path, or the refusal
+        // above would fire on every healthy host and take five providers dark.
+        let home_set =
+            |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/someone"));
+        let path = auth_path_from(home_set).expect("a resolvable home yields a path");
+        assert!(
+            path.ends_with(".local/share/opencode/auth.json"),
+            "and it is opencode's auth file: {path:?}"
+        );
+        assert!(path_or_refusal(Some(path)).is_ok());
+    }
+
     use super::*;
 
     #[test]
