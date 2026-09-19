@@ -2482,6 +2482,131 @@ async fn the_newest_reading_wins_the_dedup_not_the_latest_fetch() {
     );
 }
 
+/// A momentary failure on the fresher lane must not publish an older reading.
+///
+/// insula#17: a paid antigravity row rotated among three readings with
+/// `fetchedAt` STEPPING BACKWARDS 25 minutes, source flipping vault -> oauth.
+/// An earlier fix ordered equal readings by a stable handle key, and the filer's
+/// 100-snapshot witness showed the rotation surviving it -- correctly, because
+/// that fix addressed a different tie.
+///
+/// THE CAUSE IS THE ORDER OF THE TWO KEYS. The dedup ranked slot STATUS first and
+/// value time second, so a lane that blipped to stale-serving lost to a lane that
+/// had polled successfully more recently -- EVEN WHERE THE BLIPPING LANE HELD THE
+/// NEWER READING. Stale-serving preserves `last_success_wall`, so the value was
+/// still there; it was outranked.
+///
+/// Those are two different axes and this module documents them as such: status is
+/// FETCH recency, `last_success_wall` is VALUE age. For an ordinary lane they move
+/// together, which is why this went unnoticed. For a CACHE-BACKED lane they come
+/// apart by up to an hour -- antigravity's plugin lane is "fresh" the moment it
+/// reads the cache file, whatever age the cache's own contents are.
+///
+/// The consumer question is which READING to publish, so value age decides among
+/// slots that are serving, and status only separates serving from not.
+#[tokio::test]
+async fn a_blip_on_the_fresher_lane_does_not_republish_an_older_reading() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("A"))],
+    ))]);
+    tick(&registry).await;
+
+    let older = Utc::now() - chrono::Duration::minutes(30);
+    let newer = Utc::now() - chrono::Duration::minutes(2);
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            let is_h2 = format!("{:?}", key.handle).contains("H2");
+            // H2 holds the NEWER reading and is stale-serving it through a
+            // transient failure. H1 polled successfully but its reading is
+            // half an hour old -- the cache-backed lane's normal state.
+            slot.status = if is_h2 {
+                SlotStatus::StaleTransient
+            } else {
+                SlotStatus::Fresh
+            };
+            slot.last_success_wall = Some(if is_h2 { newer } else { older });
+            let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+            assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+        }
+    }
+
+    let entry = registry
+        .get_usage(None)
+        .await
+        .into_iter()
+        .find(|entry| entry.account.as_deref() == Some("A"))
+        .expect("the account serves");
+
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("vault"),
+        "the lane holding the NEWER reading must win even while stale-serving it; \
+         ranking fetch recency first publishes the older reading and steps \
+         fetchedAt backwards, which is insula#17"
+    );
+    assert_eq!(
+        entry.fetched_at.as_deref(),
+        Some(rfc3339_canonical(newer)).as_deref(),
+        "the published fetchedAt must be the newer reading's"
+    );
+}
+
+/// A degraded lane must not win on value age alone.
+///
+/// THE CONTROL FOR THE TEST ABOVE, and it was undefended until this was written:
+/// collapsing Degraded into the serving rank reddened NOTHING. That matters
+/// precisely because the fix above collapses two ranks, so the next reader has a
+/// worked example of collapsing and no test saying where to stop.
+///
+/// A degraded slot can hold a NEWER `last_success_wall` than a serving one -- it
+/// keeps the timestamp of its last success while it fails -- so with ranks fully
+/// collapsed it would win on value age and publish an error in place of a lane
+/// that is still serving real windows.
+#[tokio::test]
+async fn a_degraded_lane_never_outranks_one_that_is_still_serving() {
+    let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
+        &["H1", "H2"],
+        &[("H1", Some("A")), ("H2", Some("A"))],
+    ))]);
+    tick(&registry).await;
+
+    let older = Utc::now() - chrono::Duration::minutes(30);
+    let newer = Utc::now() - chrono::Duration::minutes(2);
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            let is_h2 = format!("{:?}", key.handle).contains("H2");
+            // H2 is DEGRADED but holds the newer timestamp; H1 is serving an
+            // older reading. Value age alone would pick H2.
+            slot.status = if is_h2 {
+                SlotStatus::Degraded
+            } else {
+                SlotStatus::Fresh
+            };
+            slot.last_success_wall = Some(if is_h2 { newer } else { older });
+            let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+            assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+        }
+    }
+
+    let entry = registry
+        .get_usage(None)
+        .await
+        .into_iter()
+        .find(|entry| entry.account.as_deref() == Some("A"))
+        .expect("the account serves");
+
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("oauth"),
+        "the SERVING lane must win over a degraded one even though the degraded \
+         lane's timestamp is newer: status separates serving from not, and value \
+         age only decides among those that serve"
+    );
+}
+
 /// Two slots holding the SAME reading publish the same `source` every tick.
 ///
 /// The other half of insula#17, and the symptom that led the filer to the bug:

@@ -228,12 +228,33 @@ fn select_due_round_robin(
     (admitted, last_admitted)
 }
 
+/// How much a slot has to say, for choosing between two that name one account.
+///
+/// FRESH AND STALE-SERVING RANK EQUAL, and that is the whole point of this
+/// function rather than an incidental detail. Both carry a real reading; they
+/// differ only in whether the LAST POLL succeeded, which is a fact about our
+/// fetching rather than about the value a consumer receives.
+///
+/// Ranking them apart was insula#17. A lane that blipped to stale-serving lost
+/// to a lane that had polled more recently, even where the blipping lane held
+/// the NEWER reading -- stale-serving preserves `last_success_wall`, so the value
+/// was still there and was simply outranked. The row then rotated between the two
+/// lanes and its `fetchedAt` stepped backwards 25 minutes on a reporter's host.
+///
+/// This module keeps two separate axes and they come apart on cache-backed lanes:
+/// status is FETCH recency, `last_success_wall` is VALUE age. Antigravity's plugin
+/// lane is "fresh" the moment it reads the cache file, whatever age the cache's
+/// contents are -- up to an hour. For an ordinary lane the two move together,
+/// which is why ordering by the wrong one looked correct for months.
+///
+/// So this separates SERVING from NOT-SERVING, and value age decides the rest.
+/// Degraded still outranks Pending because a degraded slot has an entry to
+/// publish -- an error a consumer can act on -- where a pending one has nothing.
 fn service_rank(status: SlotStatus) -> u8 {
     match status {
-        SlotStatus::Fresh => 0,
-        SlotStatus::StaleTransient => 1,
-        SlotStatus::Degraded => 2,
-        SlotStatus::Pending => 3,
+        SlotStatus::Fresh | SlotStatus::StaleTransient => 0,
+        SlotStatus::Degraded => 1,
+        SlotStatus::Pending => 2,
     }
 }
 
