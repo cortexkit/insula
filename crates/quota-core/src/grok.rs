@@ -484,11 +484,37 @@ impl UsageProvider for GrokProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
+        // VAULT-ONLY CUSTODY, matching every sibling that reads the opencode auth
+        // store: anthropic, deepseek, openrouter and synthetic all return the
+        // vault set alone when it is non-empty. grok was the one outlier, and it
+        // APPENDED instead -- keeping an implicit local lane beside the vault one.
+        //
+        // That is the defect reported on insula#19. A custody migration empties
+        // the local secret and leaves the entry standing, so the implicit lane
+        // fails on every fetch forever. It stayed invisible while both slots were
+        // unlabelled -- they resolved the same absent identity and deduplicated,
+        // so the serving one won -- and labelling the vault sibling changed that
+        // row's identity, which stopped the dedup and published a dead lane
+        // beside a working account. It also took grok out of `completeProviders`,
+        // the opposite of what labelling is for.
+        //
+        // The local lane cannot carry a label of its own: the store's xai entry
+        // has keys access/expires/refresh/type and no account field, which is why
+        // labelling the vault side alone was the only available move and why the
+        // pair cannot be kept in step. Same reasoning as anthropic's opaque OAuth
+        // tokens.
+        //
+        // The cost is the one anthropic already accepted: a broken vault handle
+        // takes the lane dark rather than falling back to a local credential. The
+        // alternative hides a broken handle behind a working local token, which is
+        // its own silent failure and the harder one to notice.
         if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.grok_handles()?);
+            let vault = self.handle_loader.grok_handles()?;
+            if !vault.is_empty() {
+                return Ok(vault);
+            }
         }
-        Ok(handles)
+        Ok(vec![CredentialHandle::implicit()])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -625,8 +651,24 @@ mod tests {
     }
 
     fn write_handles(body: &str) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("ck-quota-grok-handles-{}.json", std::process::id()));
+        // PER-CALL PATH, not per-process. Keyed on the pid alone, every test in
+        // this module wrote the SAME file, and cargo runs them concurrently on one
+        // thread pool -- so two tests writing different bodies race and each may
+        // read the other's.
+        //
+        // Latent until it mattered: while every caller wrote the same body the
+        // collision was invisible, and it surfaced the moment a test needed a
+        // DIFFERENT handles file (the control for insula#19, which asserts the
+        // local lane survives when no vault handle is mapped). It failed only in
+        // the full suite and passed alone, which is the signature.
+        //
+        // Same counter pattern as the scratch paths in `codex_resets`.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ck-quota-grok-handles-{}-{unique}.json",
+            std::process::id()
+        ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -680,8 +722,21 @@ mod tests {
         out
     }
 
+    /// A mapped vault handle REPLACES the implicit local lane.
+    ///
+    /// This test previously asserted the opposite -- two handles, implicit first --
+    /// and was green while the behaviour it pinned was the defect reported on
+    /// insula#19: an implicit lane beside a vault one is a second slot for the same
+    /// account, which deduplicates only while both resolve the same absent
+    /// identity. Label the vault side and the pair splits, publishing whatever the
+    /// local lane has become. After a custody migration that is a tombstone, so the
+    /// wire gained a dead row beside a working one.
+    ///
+    /// Changed deliberately rather than deleted: the assertion was load-bearing for
+    /// the old shape, and its replacement is what makes grok agree with anthropic,
+    /// deepseek, openrouter and synthetic, which all return the vault set alone.
     #[test]
-    fn handles_include_mapped_vault_entries_when_source_is_wired() {
+    fn a_mapped_vault_handle_replaces_the_implicit_lane() {
         let path = write_handles(
             r#"{"handles":{"oauth:xai":"ckh_grok","oauth:anthropic":"ckh_anthropic"}}"#,
         );
@@ -691,9 +746,34 @@ mod tests {
             Arc::new(VaultHandleLoader::new(Some(path.clone()))),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "oauth:xai");
+        assert_eq!(
+            handles.len(),
+            1,
+            "a second slot for one account is what splits the row: {handles:?}"
+        );
+        assert_eq!(handles[0].stable_id(), "oauth:xai");
+        assert_ne!(
+            handles[0],
+            CredentialHandle::implicit(),
+            "and the survivor is the vault lane, not the local one"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// THE CONTROL: with no vault handle mapped, the local lane still serves.
+    ///
+    /// Without it, returning an empty vector would satisfy the test above and take
+    /// grok dark on every host that has not migrated custody.
+    #[test]
+    fn the_implicit_lane_survives_when_no_vault_handle_is_mapped() {
+        let path = write_handles(r#"{"handles":{"oauth:anthropic":"ckh_anthropic"}}"#);
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = GrokProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
         let _ = std::fs::remove_file(path);
     }
 
