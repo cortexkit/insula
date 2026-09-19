@@ -79,13 +79,26 @@ impl ClientFailure {
             // from the other side of the wire: unrecognised or absent class is
             // transient, and the discarded value is logged.
             //
-            // BORROWED, NOT VERIFIED HERE: that reading is the vault seat's report
-            // of their own code (packages/client/src/errors.ts:57-66, reported
-            // 2026-09-02), not something this repository can check. It is
-            // corroboration for a decision the paragraph above already justifies
-            // on its own, so if it has since drifted the argument does not move.
-            // The date is here because a cited source with no date reads as
-            // current forever.
+            // BORROWED, AND RE-DERIVED RATHER THAN RE-CITED. Reported by the vault
+            // seat 2026-09-02 (packages/client/src/errors.ts) and read back at
+            // their published tip 2026-09-19: `asCredentialError` still treats an
+            // unknown-or-absent class as transient. It is corroboration for a
+            // decision the paragraph above already justifies on its own, so if it
+            // drifts the argument does not move.
+            //
+            // THE RE-DERIVATION FOUND THE CLAIM HAD WIDENED, which is what a date
+            // alone would have hidden: they now require BOTH `class` and `code`,
+            // so a half-formed envelope carrying a valid `class` and no `code` is
+            // also transient -- a malicious or broken peer must not be able to
+            // drive a permanent verdict with `{ error: { class: 'permanent' } }`.
+            // My paraphrase stayed true and stopped being complete.
+            //
+            // A DATED PIN IS ONLY A MITIGATION WHERE THE SOURCE IS REACHABLE.
+            // Theirs is: the repository is on disk, so this is one command. A
+            // pin on an UNREACHABLE source is a fig leaf -- it carries a
+            // declaration's authority with no way to repeat the read, which is how
+            // a self-signal name in `docs/consumer-contract.md` came to be
+            // attributed to the wrong module for a day.
             //
             // Note their premise does NOT transfer automatically: a
             // request/response client surfaces a repeated failure to its caller,
