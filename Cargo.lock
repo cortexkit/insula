@@ -1236,6 +1236,7 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "quota-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1681,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.18.13"
+version = "0.18.14"
 dependencies = [
  "base64",
  "cortexkit-log",
