@@ -76,18 +76,55 @@ fn connection_file() -> PathBuf {
 /// stops being read — which costs more than the coverage it buys, because the
 /// failure this exists to catch takes down *every* stored lane at once and the
 /// remaining providers still prove it.
-const DUAL_LANE: &[(&str, &str)] = &[
-    (
-        "antigravity",
-        "a local editor process is probed first and wins when both are healthy",
-    ),
-    (
-        "grok",
-        "a local opencode oauth token reaches the same account, and grok resolves \
-no account identity, so both lanes dedup into one entry whose source names \
-whichever won",
-    ),
-];
+/// Providers that can serve from something other than a stored credential.
+///
+/// Requiring a `vault` source from these produces a false alarm whenever the
+/// other lane is healthy, and a checker that cries wolf on a working provider
+/// stops being read -- which costs more than the coverage it buys, because the
+/// failure this exists to catch takes down *every* stored lane at once and the
+/// remaining providers still prove it.
+///
+/// EVERY ENTRY IS CHECKED AGAINST THE PROVIDER IT DESCRIBES, by
+/// [`stale_exemptions`]. One entry here (grok) outlived its reason within hours:
+/// it said "a local opencode oauth token reaches the same account", which stopped
+/// being true when grok moved to vault-only custody the same day. The checker
+/// went on exempting a provider it could by then verify and printed
+/// `checked 4 of 6` -- a sentence that reads as a fact about the host rather than
+/// a fact about a table nobody re-read.
+///
+/// It failed SAFE, which is why it was invisible: under-reporting coverage raises
+/// no alarm, so nothing pressures anyone to re-read it. An operator caught it by
+/// reading this file against the commit that invalidated it.
+const DUAL_LANE: &[(&str, &str)] = &[(
+    "antigravity",
+    "a local editor process is probed first and wins when both are healthy",
+)];
+
+/// Entries in [`DUAL_LANE`] whose premise no longer holds.
+///
+/// Every reason there is a claim about one thing: the provider enumerates a lane
+/// BESIDE its vault handles, so the read-time dedup can publish the other lane's
+/// source. Ask the provider. If it enumerates only vault handles, the exemption
+/// is suppressing a check that would now pass, and that is a finding rather than
+/// a note -- the whole point is that a silent exemption is a lane which has
+/// quietly stopped being verified.
+///
+/// NOT A REPLACEMENT FOR THE TABLE, and the difference is load-bearing. Deriving
+/// the exemption outright ("two lanes exist, so skip") also catches codex, whose
+/// second lane is a DIFFERENT ACCOUNT rather than a competing lane for the same
+/// one -- measured on this host: codex publishes two rows with two identities,
+/// one `vault` and one `oauth`, so requiring a vault-sourced row is meaningful
+/// there and skipping it would lose a real check. Coexistence is necessary for
+/// the exemption and not sufficient; what antigravity's entry actually records is
+/// PRECEDENCE, which cannot be observed without re-running the dedup.
+fn stale_exemptions(registry: &quota_core::Registry) -> Vec<&'static str> {
+    let dual = registry.providers_with_a_lane_beside_vault();
+    DUAL_LANE
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !dual.contains(name))
+        .collect()
+}
 
 /// Maps a credential handle key to every provider that consumes it.
 ///
@@ -242,6 +279,18 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // The same client the module runs, so "which lanes does this provider
+    // enumerate" is answered by the code under test rather than by a copy of its
+    // conclusions. Enumeration never calls the source -- it only asks whether one
+    // is wired -- so this costs no vault round-trip.
+    let vault: std::sync::Arc<dyn quota_core::credential_source::CredentialSource> =
+        std::sync::Arc::new(quota_module::vault_client::VaultClient::new(path.clone()));
+    let registry = quota_core::Registry::with_defaults(
+        quota_core::config::QuotaConfig::default(),
+        Some(vault),
+    );
+    let stale_exempt = stale_exemptions(&registry);
+
     let mut stream = common::connect_consumer(&path).await;
     common::wait_for_catalog(&mut stream, common::MODULE_ID, Duration::from_secs(10)).await;
     let route = common::route_open(&mut stream, &std::env::temp_dir(), 1).await;
@@ -367,8 +416,26 @@ async fn main() {
         }
     }
 
+    // A STALE EXEMPTION IS A FINDING, NOT A NOTE. It suppresses a check that
+    // would now pass, so the lane it covers has quietly stopped being verified --
+    // and because under-reporting coverage raises no alarm, nothing else will ever
+    // surface it. Printed with the remedy so the next reader is not left deciding
+    // which of the exemptions is still load-bearing.
+    if !stale_exempt.is_empty() {
+        println!(
+            "  findings: {} stale exemption(s) in DUAL_LANE",
+            stale_exempt.len()
+        );
+        for provider in &stale_exempt {
+            println!(
+                "    {provider}: enumerates only vault handles now, so its exemption suppresses \
+                 a check that would pass; delete its DUAL_LANE entry"
+            );
+        }
+    }
+
     if dark.is_empty() {
-        if unmapped.is_empty() && incomplete.is_empty() {
+        if unmapped.is_empty() && incomplete.is_empty() && stale_exempt.is_empty() {
             println!("  findings: none");
             return;
         }

@@ -647,6 +647,48 @@ impl Registry {
             .collect()
     }
 
+    /// Providers that enumerate a NON-VAULT lane beside their vault handles, as
+    /// observed right now on this host.
+    ///
+    /// A checker asserting "a configured vault handle must produce a `vault`-sourced
+    /// row" is wrong about exactly these: a second lane can legitimately win the
+    /// read-time dedup, so the row carries the other lane's source and the check
+    /// cries wolf on a working provider.
+    ///
+    /// DERIVED, BECAUSE THE STORED VERSION WENT STALE THE DAY IT WAS WRITTEN AGAINST.
+    /// `vault-lanes` held this as a hardcoded table of provider names and prose
+    /// reasons. One entry (grok) described behaviour that a custody change removed
+    /// hours later, so the checker kept exempting a provider it could by then check
+    /// -- reported by an operator reading the checker's own output against the
+    /// commit that invalidated it. The exemption failed safe (it under-reported
+    /// coverage) and was therefore invisible: `checked 4 of 6` looks like a fact
+    /// about the host rather than a fact about a table nobody re-read.
+    ///
+    /// Asking the providers removes the premise entirely rather than correcting it.
+    /// Same reasoning as [`Self::cookie_based_provider_names`]: a caller and a
+    /// mechanism that disagree are worse than either alone.
+    ///
+    /// Enumeration reads local credential files and the vault handle map, so the
+    /// answer is specific to this host and this moment -- which is the point. A
+    /// provider whose handles cannot be enumerated is OMITTED rather than assumed
+    /// dual-lane: a checker that skips on an unreadable config is the failure this
+    /// exists to catch, wearing the costume of an exemption.
+    pub fn providers_with_a_lane_beside_vault(&self) -> Vec<&str> {
+        self.providers
+            .iter()
+            .filter(|provider| {
+                let Ok(handles) = provider.fetcher.handles() else {
+                    return false;
+                };
+                let (vault, other): (Vec<_>, Vec<_>) = handles
+                    .iter()
+                    .partition(|handle| handle.vault_capability().is_some());
+                !vault.is_empty() && !other.is_empty()
+            })
+            .map(|provider| provider.name.as_str())
+            .collect()
+    }
+
     /// Serve usage exclusively from active slot snapshots, discarding the
     /// completeness claim.
     ///

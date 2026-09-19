@@ -348,6 +348,90 @@ fn production_body(source: &str) -> String {
 /// store, so its local lane resolves an identity of its own and deduplicates
 /// against a labelled vault sibling correctly. The exemption is keyed on that
 /// property, so a change making codex's local lane identity-less should REMOVE
+/// `providers_with_a_lane_beside_vault` names exactly the coexisting providers.
+///
+/// This backs the falsifier in `vault-lanes`, which reports a DUAL_LANE exemption
+/// as STALE when the provider it names no longer enumerates a lane beside its
+/// vault handles. That checker runs only against a live daemon, so without this
+/// the predicate is verifiable on one host and nowhere else -- and the defect it
+/// exists to catch (an exemption outliving its reason) is invisible precisely
+/// because it raises no alarm.
+///
+/// All three arms matter and each fails differently: over-wide exempts a provider
+/// whose stored lane is then never verified, under-wide makes the checker cry
+/// wolf on a provider that is working, and treating an enumeration ERROR as
+/// coexistence would turn an unreadable config into a silent exemption -- the
+/// failure this whole checker exists to catch, wearing the costume of a skip.
+#[test]
+fn a_lane_beside_vault_is_named_only_when_both_kinds_are_enumerated() {
+    struct LaneStub {
+        name: &'static str,
+        handles: Vec<CredentialHandle>,
+        /// Enumeration fails, as it does when the handle map is unreadable.
+        refuses: bool,
+    }
+
+    #[async_trait]
+    impl UsageProvider for LaneStub {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+            if self.refuses {
+                return Err(crate::provider::HandlesError::new(
+                    "stub refuses to enumerate",
+                ));
+            }
+            Ok(self.handles.clone())
+        }
+
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            FetchAttempt::success(None, "test", Usage::default())
+        }
+    }
+
+    let vault = || CredentialHandle::vault("v:one", VaultCapability::new("ckh_one"));
+    let registry = Registry::new(vec![
+        Box::new(LaneStub {
+            name: "both",
+            handles: vec![CredentialHandle::implicit(), vault()],
+            refuses: false,
+        }),
+        Box::new(LaneStub {
+            name: "vault-only",
+            handles: vec![vault()],
+            refuses: false,
+        }),
+        Box::new(LaneStub {
+            name: "local-only",
+            handles: vec![CredentialHandle::implicit()],
+            refuses: false,
+        }),
+        Box::new(LaneStub {
+            name: "none",
+            handles: Vec::new(),
+            refuses: false,
+        }),
+        // THE ARM THAT WAS UNDEFENDED: an unreadable handle map must NOT be read
+        // as coexistence. Assuming it would turn a broken config into a silent
+        // exemption -- the failure the checker exists to catch, wearing the
+        // costume of a skip. Proved by mutation: returning `true` on the error
+        // path reddened nothing until this stub existed.
+        Box::new(LaneStub {
+            name: "unreadable",
+            handles: vec![CredentialHandle::implicit(), vault()],
+            refuses: true,
+        }),
+    ]);
+
+    assert_eq!(
+        registry.providers_with_a_lane_beside_vault(),
+        vec!["both"],
+        "only a provider enumerating BOTH kinds can publish the other lane's source"
+    );
+}
+
 /// the exemption rather than widen it.
 #[test]
 fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
