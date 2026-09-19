@@ -1281,6 +1281,7 @@ impl Registry {
                 store.record_stale_episode(
                     &unit.key.provider,
                     next.error_class,
+                    next.last_failure_message.as_deref(),
                     next.observation
                         .as_ref()
                         .and_then(|observed| observed.account_id.as_deref()),

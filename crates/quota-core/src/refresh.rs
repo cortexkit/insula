@@ -36,6 +36,13 @@ use crate::provider::{
 /// So halving this would put every healthy recovery under their floor and read as
 /// a scheduling defect on their side, with nothing in either repository
 /// connecting the two. Their standing rule is that a reading below the floor
+/// How much of a failure's own words a stale-serving episode keeps.
+///
+/// Shorter than the wire's 1 KiB cap because this rides a health metric read at
+/// a glance. Enough for an HTTP status and the first clause of an upstream's
+/// refusal, which is what separates a rate limit from a network fault.
+pub const STALE_MESSAGE_CHARS: usize = 160;
+
 /// means this constant changed rather than that scheduling broke -- which is
 /// correct, and only works if someone tells them. Say so in the same commit.
 pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
@@ -267,6 +274,19 @@ pub struct ProviderSlot {
     /// accurate on every path -- a field that is only right where someone happens
     /// to look becomes wrong the moment a second reader arrives.
     pub error_class: Option<&'static str>,
+    /// What the failing attempt SAID, bounded, beside the class that categorises
+    /// it.
+    ///
+    /// The class is deliberately coarse -- `upstream_failed` covers a 429, a 5xx
+    /// and a transport error alike -- and for a lane that is STALE-SERVING there
+    /// is nowhere else to recover the difference: the published entry is the last
+    /// healthy one and carries no error at all. Live case: four claude accounts
+    /// on one endpoint, three of them flapping in rotation, and rate limiting
+    /// versus a network fault want opposite responses.
+    ///
+    /// Already redacted, because `FetchError`'s Display is what produced it:
+    /// transport URLs stripped, credential paths omitted, length capped.
+    pub last_failure_message: Option<String>,
     pub next_due_at: Instant,
     pub retry_count: u32,
     /// Class of the most recent completed fetch, when it failed.
@@ -292,6 +312,7 @@ impl ProviderSlot {
             attempt_sequence: AttemptSequence::from_counter(0),
             entry: None,
             error_class: None,
+            last_failure_message: None,
             observation: None,
             label_in_flux: false,
             relax_eligible: false,
@@ -551,6 +572,7 @@ fn next_slot_after_attempt_inner(
             entry: None,
             // Suppressed rather than failed: there is no failure to classify.
             error_class: None,
+            last_failure_message: None,
             observation: prev.observation.clone(),
             label_in_flux: true,
             relax_eligible: false,
@@ -583,6 +605,7 @@ fn next_slot_after_attempt_inner(
             incarnation: prev.incarnation,
             attempt_sequence: prev.attempt_sequence,
             error_class: None,
+            last_failure_message: None,
             entry: Some(healthy_entry(
                 provider_name,
                 observation.as_ref(),
@@ -686,6 +709,12 @@ fn next_slot_after_attempt_inner(
                 // still being served: a caller asking why a provider is failing
                 // wants the current cause, not the one that produced the entry.
                 error_class: Some(error.error_class()),
+                // Bounded harder than the wire's 1 KiB: this rides a health
+                // metric an operator reads at a glance, not a diagnosis surface.
+                last_failure_message: Some(crate::text::truncate_for_wire(
+                    &error.to_string(),
+                    STALE_MESSAGE_CHARS,
+                )),
                 observation,
                 label_in_flux,
                 relax_eligible: false,

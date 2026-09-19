@@ -131,6 +131,11 @@ pub struct StaleEpisode {
     /// Absent when the failure carried no class, which the transient paths can
     /// legitimately do.
     pub class: Option<&'static str>,
+    /// What the failure SAID, bounded and already redacted. The class is coarse
+    /// on purpose -- `upstream_failed` is a 429, a 5xx and a transport error
+    /// alike -- and a stale-serving entry publishes no error of its own, so this
+    /// is the only place the difference survives.
+    pub message: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -545,6 +550,7 @@ impl SlotStore {
         &mut self,
         provider: &str,
         class: Option<&'static str>,
+        message: Option<&str>,
         account: Option<&str>,
     ) {
         self.stale_episodes = self.stale_episodes.saturating_add(1);
@@ -561,6 +567,7 @@ impl SlotStore {
             provider: provider.to_string(),
             account: account.map(str::to_string),
             class,
+            message: message.map(str::to_string),
             at: Utc::now(),
         });
     }

@@ -758,10 +758,14 @@ fn health_report(
         // the class on the line they are already looking at.
         "lastStaleEpisode": snapshot.last_stale_episode.as_ref().map(|episode| {
             format!(
-                "{} {} {} at {}",
+                "{} {} {} [{}] at {}",
                 episode.provider,
                 episode.account.as_deref().unwrap_or("<unattributed>"),
                 episode.class.unwrap_or("<no class>"),
+                // The class categorises, this says what the upstream actually
+                // answered. A 429 and a dropped connection are the same class and
+                // want opposite responses.
+                episode.message.as_deref().unwrap_or("<no message>"),
                 // The SAME formatter quota-core uses for every published
                 // timestamp, not a second one configured to match. One instant
                 // must have one spelling, and two formatters agreeing today is

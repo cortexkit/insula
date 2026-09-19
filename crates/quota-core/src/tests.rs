@@ -3837,6 +3837,21 @@ async fn a_stale_episode_records_the_account_and_the_class() {
          success still being served: got {:?}",
         episode.class
     );
+
+    // THE CLASS IS COARSE BY DESIGN and the message is what separates its
+    // members. `upstream_failed` covers a 429, a 5xx and a dropped connection,
+    // which want different responses from an operator -- and a stale-serving
+    // entry publishes no error of its own, so this record is the only place the
+    // difference survives the episode.
+    let message = episode
+        .message
+        .as_deref()
+        .expect("a failure that caused a transition said something");
+    assert!(
+        message.contains("503 from upstream"),
+        "the message must carry the upstream's own words, not a restatement of \
+         the class: got {message:?}"
+    );
 }
 
 /// The conservation identity still holds with the counter non-zero, so nobody
