@@ -624,14 +624,43 @@ fn next_slot_after_attempt_inner(
         _ => true,
     };
     if attempt.usage.is_ok() && !supersedes {
-        // Scheduling still advances: the fetch HAPPENED and the next one is due on
-        // the ordinary cadence. Only the published reading is left alone.
+        // DISCLOSED, because the consumer-facing situation is the one `stale`
+        // already describes: the reading served was not obtained by the latest
+        // fetch. That the fetch SUCCEEDED and was rejected as older is an internal
+        // detail -- from outside it is indistinguishable from serving through a
+        // failure, and `fetchedAt` stops advancing either way.
+        //
+        // Without this the row freezes SILENTLY. Reported on insula#17 by the
+        // filer, who read the path rather than observing it: `fetchedAt` is
+        // `last_success_wall` and `staleness_disclosure` fires only on
+        // `StaleTransient`, so a slot discarding older readings publishes a frozen
+        // timestamp with nothing saying why.
+        //
+        // BOUNDED, WHICH IS WHY THIS IS AN HOUR OF SILENCE RATHER THAN FOREVER:
+        // the antigravity cache lane withholds past `CACHED_QUOTA_MAX_AGE`, and a
+        // paid row then fails with `local_source_unavailable`, which discloses on
+        // its own. An hour of a row that has stopped moving with no disclosure is
+        // still the shape a consumer meets as "quota stopped and nothing said why".
+        //
+        // `class` is absent here and that is correct: there is no error. The wire
+        // type already makes it optional, so "preserved since X, no failure" is
+        // representable without a new variant.
         return ProviderSlot {
             last_success_at: Some(completed),
             last_attempt_at: Some(attempt_start),
             next_due_at: completed + BASE_INTERVAL,
             retry_count: 0,
-            status: SlotStatus::Fresh,
+            status: SlotStatus::StaleTransient,
+            // Set only if a preserved-serving run is not already open, so the
+            // disclosure dates the run rather than its most recent tick.
+            failing_since: prev.failing_since.or(Some(attempt_start)),
+            failing_since_wall: prev.failing_since_wall.or_else(|| Some(Utc::now())),
+            // No failure occurred, so nothing here may look like one: an error
+            // class would name a fault that did not happen, and a failure class
+            // would put the slot into a backoff it has not earned.
+            error_class: None,
+            last_failure_class: None,
+            last_failure_message: None,
             ..prev.clone()
         };
     }
@@ -961,6 +990,33 @@ mod tests {
             Some(newer),
             "a NEWER reading must still publish, or the lane freezes at its first \
              value"
+        );
+
+        // THE DISCARD DISCLOSES ITSELF. Reported on insula#17: `fetchedAt` is
+        // `last_success_wall` and `staleness_disclosure` fires only on
+        // `StaleTransient`, so a slot discarding older readings published a frozen
+        // timestamp with nothing saying why -- and the paid antigravity row is a
+        // lane whose cloud arm is refused by design, so no newer reading arrives to
+        // clear it until the cache ages past its hour bound.
+        assert_eq!(
+            stale.status,
+            SlotStatus::StaleTransient,
+            "a preserved reading must disclose: from outside, a discarded fetch is \
+         indistinguishable from serving through a failure"
+        );
+        assert!(
+            stale.failing_since_wall.is_some(),
+            "the disclosure needs a `since`, or it publishes nothing a consumer reads"
+        );
+        assert!(
+            stale.error_class.is_none() && stale.last_failure_class.is_none(),
+            "no failure occurred: an error class names a fault that did not happen, \
+         and a failure class earns a backoff this slot has not"
+        );
+        assert_eq!(
+            fresh.status,
+            SlotStatus::Fresh,
+            "the control: a lane taking newer readings is not stale-serving"
         );
     }
 
