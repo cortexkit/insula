@@ -907,6 +907,23 @@ struct VaultSuccessResult {
     org_name: Option<String>,
 }
 
+/// `credential.list_scoped` request.
+///
+/// EMPTY PARAMS ON PURPOSE. A supervised module is identified by its bus
+/// principal, so the enrollment token in the wire schema is not ours to send --
+/// it addresses host-launched consumers. The vault decodes this request with
+/// `deny_unknown_fields`, so sending one anyway would be REFUSED AT DECODE rather
+/// than answered from the wrong principal, which is the safe direction and the
+/// reason the field is omitted here rather than sent empty.
+#[derive(Serialize)]
+struct ListScopedRequest {
+    method: &'static str,
+    params: ListScopedParams,
+}
+
+#[derive(Serialize)]
+struct ListScopedParams {}
+
 #[derive(Deserialize)]
 struct VaultStatusResult {
     ready: bool,
@@ -914,6 +931,94 @@ struct VaultStatusResult {
     record_version: Option<u64>,
     #[serde(default)]
     stale_pending: Option<bool>,
+}
+
+/// What an operator probe may see of one scoped credential row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedRow {
+    pub id: String,
+    pub state: String,
+    pub record_version: u64,
+    pub account_id: Option<String>,
+    pub email: Option<String>,
+}
+
+/// What an operator probe may see of a `credential.list_scoped` reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedListing {
+    /// Length only. The digest itself says SOMETHING moved and never what, so
+    /// printing it invites treating a change as evidence of a specific one.
+    pub view_len: usize,
+    pub grants: usize,
+    pub credentials: Vec<ScopedRow>,
+}
+
+/// One credential row from `credential.list_scoped`.
+///
+/// DECODED PERMISSIVELY IN SHAPE AND STRICTLY IN MEANING. Unknown fields are
+/// ignored so an additive change on the vault's side cannot take every lane dark
+/// here; the fields we do read are typed, and anything malformed fails the whole
+/// decode rather than yielding a partial row.
+///
+/// THE THREE IDENTITY FIELDS ARE ABSENT RATHER THAN NULL when unknown, and they
+/// stay `Option` all the way through. Defaulting them would make an account whose
+/// identity is UNKNOWN compare equal to one whose provider genuinely supplies
+/// nothing -- a distinction already load-bearing on our own wire, where an absent
+/// `account` is how a consumer learns identity was unresolvable rather than
+/// empty.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+struct ScopedCredential {
+    id: String,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    serves: Vec<String>,
+    /// `active`, `needs_reauth`, and whatever the vault adds later.
+    ///
+    /// KEPT AS A STRING, NOT AN ENUM, and the direction of failure is why: an
+    /// unknown state must not be readable as `active`. Recovery keys on the
+    /// transition INTO `active` (a `reactivate` clears `needs_reauth` without
+    /// re-sealing, so `record_version` deliberately does not move and only the
+    /// state says the credential came back). An enum would either reject the row
+    /// -- taking a live account dark on a vocabulary change -- or need a fallback
+    /// variant, and every fallback here has to mean "not active" anyway.
+    state: String,
+    record_version: u64,
+    #[serde(default)]
+    operations: Vec<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
+}
+
+/// One grant tuple, as the vault sees our authority.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+struct ScopedGrant {
+    #[serde(default)]
+    selector_kind: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    operation: Option<String>,
+}
+
+/// The `credential.list_scoped` success payload.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+struct ScopedListResult {
+    /// Digest over the visible rows and our grant tuples. Says SOMETHING moved,
+    /// never what -- identity is inside it, so a changed `view` beside an
+    /// unchanged `record_version` is not evidence of a re-seal. Use it to skip
+    /// work, never to infer a transition.
+    view: String,
+    #[serde(default)]
+    grants: Vec<ScopedGrant>,
+    #[serde(default)]
+    credentials: Vec<ScopedCredential>,
 }
 
 #[derive(Deserialize)]
@@ -1210,6 +1315,40 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
 /// A decode failure here is returned to the caller. It must not be fed into
 /// slot transition: status is an accelerator, and an accelerator that can
 /// condemn a credential is a defect.
+/// Decode a `credential.list_scoped` reply.
+///
+/// Mirrors [`decode_status_response`]: a result object is either a success or an
+/// error, never both and never neither, and an ambiguous reply fails closed.
+///
+/// SUCCESS IS DISCRIMINATED ON `view`, NOT ON `credentials`. An authorised caller
+/// with zero visible rows is a legitimate success -- it is the "granted and
+/// genuinely empty" state -- so keying on a non-empty list would read that as a
+/// malformed reply and, worse, would make the empty case fail closed exactly
+/// where the wire is trying to tell us something specific. `view` is present on
+/// every success and on no error.
+fn decode_list_scoped_response(body: &[u8]) -> Result<ScopedListResult, VaultGetError> {
+    let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or(VaultGetError::FailClosed)?;
+    let has_error = result.contains_key("error");
+    let has_success = result.contains_key("view");
+    match (has_success, has_error) {
+        (true, false) => serde_json::from_value(Value::Object(result.clone()))
+            .map_err(|_| VaultGetError::FailClosed),
+        (false, true) => {
+            let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Err(read_error_to_outcome(
+                &failure.error.class,
+                failure.error.code.as_deref(),
+            ))
+        }
+        (true, true) | (false, false) => Err(VaultGetError::FailClosed),
+    }
+}
+
 fn decode_status_response(body: &[u8]) -> Result<CredentialStatus, VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
     let result = response
@@ -1239,6 +1378,65 @@ fn decode_status_response(body: &[u8]) -> Result<CredentialStatus, VaultGetError
             ))
         }
         (true, true) | (false, false) => Err(VaultGetError::FailClosed),
+    }
+}
+
+impl VaultClient {
+    /// Enumerate the credentials our grants cover.
+    ///
+    /// The read half of retiring the hand-maintained handle map: today a
+    /// credential reaches this module only if someone pastes a capability into
+    /// `vault-handles.json`, which is a step no tool owns and which has failed
+    /// three ways on this host in one day -- an active credential never mapped
+    /// (invisible account), a mapped credential later deleted from the vault (a
+    /// dead row that also suppressed `completeProviders` for four healthy
+    /// siblings), and a handle minted by an operator that no consumer claimed.
+    ///
+    /// ABSENCE FROM THE LIST MEANS UNGRANTED, NEVER BROKEN. A `needs_reauth`
+    /// credential is PRESENT with that state (verified at the vault's source: the
+    /// row selection carries no state predicate, and its only skip fires on zero
+    /// covered operations). So a degraded account can be published degraded while
+    /// completeness still holds over the set -- which is what stops one bad
+    /// sibling from costing four healthy accounts their completeness claim.
+    /// A non-secret view of [`Self::list_scoped`], for operator tooling.
+    ///
+    /// The wire types stay private: they are a decode contract with the vault, and
+    /// widening them to `pub` would make every additive field a semver surface
+    /// here. This carries only what a probe needs to report, and deliberately no
+    /// grant selectors -- those describe the authority rather than the
+    /// credentials, and a tool that prints them invites reading them as a list of
+    /// what someone may do.
+    pub async fn list_scoped_report(&self) -> Result<ScopedListing, VaultGetError> {
+        let result = self.list_scoped().await?;
+        Ok(ScopedListing {
+            view_len: result.view.len(),
+            grants: result.grants.len(),
+            credentials: result
+                .credentials
+                .into_iter()
+                .map(|row| ScopedRow {
+                    id: row.id,
+                    state: row.state,
+                    record_version: row.record_version,
+                    account_id: row.account_id,
+                    email: row.email,
+                })
+                .collect(),
+        })
+    }
+
+    async fn list_scoped(&self) -> Result<ScopedListResult, VaultGetError> {
+        let body = serde_json::to_vec(&ListScopedRequest {
+            method: "credential.list_scoped",
+            params: ListScopedParams {},
+        })
+        .map_err(|_| VaultGetError::FailClosed)?;
+        let frame = self
+            .state
+            .call(body)
+            .await
+            .map_err(ClientFailure::vault_error)?;
+        decode_list_scoped_response(&frame.body)
     }
 }
 

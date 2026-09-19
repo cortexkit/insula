@@ -186,6 +186,14 @@ cargo run -p quota-core --example opencode-stage
 # daemon running, since it dials it for the credential:
 cargo run -p quota-module --example grok-resets
 
+# exercise `credential.list_scoped`, the read half of retiring the hand-edited
+# vault handle map. RUN AS-IS IT REFUSES, AND THAT IS INFORMATIVE: scoped ops are
+# authorised by the caller's bus principal, and a standalone example is a Direct
+# caller rather than the supervised module. A control op over the same connection
+# separates that from "the vault has nothing for us", so the refusal cannot be
+# misfiled as a defect. Needs the daemon running:
+cargo run -p quota-module --example scoped-list
+
 # vary request context against the cloud Code Assist endpoint to establish why
 # it reports a different Gemini pool than the local editor. It prints the raw
 # response across variations (project field, tier id, caller headers) and
