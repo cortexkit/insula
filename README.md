@@ -194,6 +194,15 @@ cargo run -p quota-module --example grok-resets
 # misfiled as a defect. Needs the daemon running:
 cargo run -p quota-module --example scoped-list
 
+# build, place and verify the supervised module, REFUSING when what is on disk is
+# not what is on master. Two guards, because they catch different divergences: a
+# dirty tree (uncommitted work the build would include) and a non-master branch
+# (committed work a clean tree cannot reveal). Both refuse rather than warn --
+# this exists because a hand-typed deploy once staged a binary containing stashed
+# work while its author narrated "built from HEAD". Override with
+# CK_DEPLOY_ALLOW_DIRTY=1, loudly:
+./scripts/deploy.sh
+
 # vary request context against the cloud Code Assist endpoint to establish why
 # it reports a different Gemini pool than the local editor. It prints the raw
 # response across variations (project field, tier id, caller headers) and
