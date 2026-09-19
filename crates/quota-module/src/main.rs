@@ -288,6 +288,48 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     // process-lifetime metric here, which is why the AGES matter more than the
     // totals for an operator: a fresh process legitimately shows zero served.
     let serve = Arc::new(ServeCounters::default());
+    // A MEASUREMENT, NOT A DEPENDENCY. `credential.list_scoped` will replace the
+    // hand-edited handle map, so that `ck auth login` alone makes an account
+    // appear. Nothing here consumes it yet and nothing branches on it: this call
+    // exists to exercise the op once from the only place that CAN exercise it.
+    //
+    // Scoped ops are authorised by the caller's bus principal, so a probe binary
+    // is a Direct caller and is refused; the supervised module is the only tool
+    // on this host that can make the call at all. The op has also never served a
+    // real consumer -- its owner says its correctness today rests on tests written
+    // against imagined behaviour -- so the first reply is evidence neither side
+    // can obtain alone, including when it is unremarkable.
+    //
+    // Spawned rather than awaited: startup must not block on the vault, and a
+    // daemon still warming answers a transient refusal that means nothing about
+    // the grant. Removed once enumeration actually reads this.
+    let probe_vault = vault.clone();
+    tokio::spawn(async move {
+        match probe_vault.list_scoped_report().await {
+            Ok(listing) => {
+                let identified = listing
+                    .credentials
+                    .iter()
+                    .filter(|row| row.account_id.is_some())
+                    .count();
+                let inactive = listing
+                    .credentials
+                    .iter()
+                    .filter(|row| row.state != "active")
+                    .count();
+                eprintln!(
+                    "{LOG_TAG} list_scoped: {} credential(s), {} grant(s), {identified} with an \
+                     account id, {inactive} not active",
+                    listing.credentials.len(),
+                    listing.grants,
+                );
+            }
+            Err(error) => {
+                eprintln!("{LOG_TAG} list_scoped refused: {error:?} (nothing depends on this yet)");
+            }
+        }
+    });
+
     let credential_source: Arc<dyn CredentialSource> = vault.clone();
     let registry = Arc::new(Registry::with_defaults(
         quota_config,
