@@ -750,6 +750,23 @@ fn health_report(
         // Membership is since boot, so a provider here is usually healthy now.
         // Not part of the conservation identity.
         "staleEpisodesByProvider": snapshot.stale_episodes_by_provider,
+        // The counters say WHETHER and this says WHY. Flattened into one string
+        // rather than nested, because these metrics are read at a glance in a
+        // terminal and an operator chasing a climbing count wants the account and
+        // the class on the line they are already looking at.
+        "lastStaleEpisode": snapshot.last_stale_episode.as_ref().map(|episode| {
+            format!(
+                "{} {} {} at {}",
+                episode.provider,
+                episode.account.as_deref().unwrap_or("<unattributed>"),
+                episode.class.unwrap_or("<no class>"),
+                // The SAME formatter quota-core uses for every published
+                // timestamp, not a second one configured to match. One instant
+                // must have one spelling, and two formatters agreeing today is
+                // not the same as one formatter.
+                quota_core::rfc3339_canonical(episode.at)
+            )
+        }),
         // How many times an account's used percent went DOWN, per provider.
         //
         // NAMED FOR THE OBSERVATION, NOT THE INFERENCE. A window rollover, a
@@ -2051,6 +2068,7 @@ mod tests {
             stale: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            last_stale_episode: None,
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,
             quota_comparisons_no_drop: 0,
@@ -2534,6 +2552,7 @@ mod tests {
             "fresh",
             "stale",
             "staleEpisodesByProvider",
+            "lastStaleEpisode",
             "quotaDropsByProvider",
             "quotaDropsObservedContinuously",
             "quotaComparisonsNoDrop",

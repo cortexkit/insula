@@ -3665,6 +3665,55 @@ async fn a_non_transient_failure_does_not_count_an_episode() {
     assert_eq!(registry.health().stale_episodes, 0);
 }
 
+/// A stale episode records WHICH account failed and HOW, not just that one did.
+///
+/// The counters answer "whether" and could never answer "why": `stale: { since,
+/// class }` is published only WHILE an entry is stale-serving, and nothing is
+/// logged on that path, so once a run ends the reason is gone. Measured on this
+/// host before adding it: eighteen episodes on one provider, and the only way to
+/// learn the class was to poll `usage.get` for three minutes hoping to catch a
+/// window.
+///
+/// Both fields are asserted because they fail differently. A missing CLASS leaves
+/// an operator unable to tell a 429 from a transport error, which want different
+/// responses. A missing ACCOUNT leaves them unable to tell one failing credential
+/// from a provider-wide problem -- and on this host that distinction was the whole
+/// diagnosis: two of four claude accounts stale while the other two polled
+/// normally ruled out the endpoint, the network and the vault connection in one
+/// reading.
+#[tokio::test]
+async fn a_stale_episode_records_the_account_and_the_class() {
+    let registry = scripted(
+        "codex",
+        vec![
+            Ok(()),
+            Err(FetchError::Upstream("503 from upstream".into())),
+        ],
+    );
+    tick(&registry).await;
+    force_due(&registry, "codex");
+    tick(&registry).await;
+
+    let health = registry.health();
+    assert_eq!(
+        health.stale_episodes, 1,
+        "precondition: one episode occurred"
+    );
+
+    let episode = health
+        .last_stale_episode
+        .as_ref()
+        .expect("an episode occurred, so its detail must be recorded");
+    assert_eq!(episode.provider, "codex");
+    assert_eq!(
+        episode.class,
+        Some("upstream_failed"),
+        "the class must name the failure that CAUSED the transition, not the \
+         success still being served: got {:?}",
+        episode.class
+    );
+}
+
 /// The conservation identity still holds with the counter non-zero, so nobody
 /// later folds it into the sum.
 ///

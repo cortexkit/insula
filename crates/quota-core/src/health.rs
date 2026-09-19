@@ -75,6 +75,9 @@ pub struct HealthSnapshot {
     /// a partition of the current population. A provider named here may be
     /// perfectly healthy right now, and usually is.
     pub stale_episodes_by_provider: std::collections::BTreeMap<String, u64>,
+    /// The most recent stale-serving episode, carrying the class and account
+    /// the counters cannot. Absent until one occurs.
+    pub last_stale_episode: Option<crate::store::StaleEpisode>,
 
     /// Observed used-percent decreases per provider, since boot.
     ///
@@ -232,6 +235,7 @@ impl HealthSnapshot {
             pending: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            last_stale_episode: None,
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,
             quota_comparisons_no_drop: 0,

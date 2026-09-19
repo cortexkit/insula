@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::provider::CredentialHandle;
 
@@ -117,6 +117,23 @@ impl<'a> AuthoritativeHandles<'a> {
 }
 
 /// Refresher state protected by [`Registry`](crate::Registry)'s mutex.
+/// One stale-serving episode, kept so a climbing counter can be diagnosed.
+///
+/// `class` is the SAME `errorClass` vocabulary a degraded entry publishes, so a
+/// reader does not learn a second set of names: the difference is that a stale
+/// entry keeps serving its last healthy window while a degraded one does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleEpisode {
+    pub provider: String,
+    /// Absent where the credential resolves no identity, which is most cookie
+    /// lanes. Absent means unattributable, never "all accounts".
+    pub account: Option<String>,
+    /// Absent when the failure carried no class, which the transient paths can
+    /// legitimately do.
+    pub class: Option<&'static str>,
+    pub at: DateTime<Utc>,
+}
+
 pub struct SlotStore {
     slots: HashMap<SlotKey, ProviderSlot>,
     /// Providers whose most recent handle enumeration succeeded.
@@ -165,6 +182,9 @@ pub struct SlotStore {
     /// Still bounded by the registry (37 keys at most) however long the process
     /// runs or how often a lane flaps, which is what the set was chosen for.
     stale_episodes_by_provider: BTreeMap<String, u64>,
+    /// The most recent stale-serving episode, with the detail the counters
+    /// cannot carry. See `record_stale_episode` for why only the last one.
+    last_stale_episode: Option<StaleEpisode>,
 
     /// How many used-percent decreases have been observed per provider.
     ///
@@ -234,6 +254,7 @@ impl SlotStore {
             next_attempt_sequence: 1,
             stale_episodes: 0,
             stale_episodes_by_provider: BTreeMap::new(),
+            last_stale_episode: None,
             quota_drops_by_provider: BTreeMap::new(),
             quota_drops_observed_continuously: 0,
             quota_comparisons_no_drop: 0,
@@ -396,6 +417,11 @@ impl SlotStore {
         self.stale_episodes_by_provider.clone()
     }
 
+    /// The most recent stale-serving episode, or None if none has occurred.
+    pub fn last_stale_episode(&self) -> Option<StaleEpisode> {
+        self.last_stale_episode.clone()
+    }
+
     /// Per-provider counts of observed used-percent decreases, by provider name.
     pub fn quota_drops_by_provider(&self) -> BTreeMap<String, u64> {
         self.quota_drops_by_provider.clone()
@@ -502,7 +528,25 @@ impl SlotStore {
     /// Record one slot entering stale-serving. Called under the store lock at
     /// the transition site, so the increment is a cheap counter op consistent
     /// with everything else that lock guards.
-    pub(crate) fn record_stale_episode(&mut self, provider: &str) {
+    ///
+    /// THE COUNTERS ANSWER "WHETHER" AND THE DETAIL ANSWERS "WHY", and until
+    /// this carried the detail there was no way to get the second. Measured on
+    /// this host 2026-09-19: eighteen episodes, all on one provider, and the
+    /// only way to learn the class was to poll `usage.get` for three minutes
+    /// hoping to catch a window -- because `stale: { since, class }` is
+    /// published only WHILE an entry is stale-serving, and these runs end.
+    /// Nothing is logged on that path either.
+    ///
+    /// So the detail is kept where the counter already is. The LAST episode
+    /// only, deliberately: a ring is the heavier answer and buys per-episode
+    /// timing nobody has asked for, whereas "which account, failing how" is the
+    /// question an operator has when a count climbs on one provider.
+    pub(crate) fn record_stale_episode(
+        &mut self,
+        provider: &str,
+        class: Option<&'static str>,
+        account: Option<&str>,
+    ) {
         self.stale_episodes = self.stale_episodes.saturating_add(1);
         // Counted on every episode, so the per-provider figures always sum to
         // the total above. Two numbers describing one event must be produced
@@ -511,6 +555,14 @@ impl SlotStore {
             .stale_episodes_by_provider
             .entry(provider.to_string())
             .or_insert(0) += 1;
+        // Overwritten rather than accumulated, and the field name says "last"
+        // so a reader cannot take it for a summary of the run.
+        self.last_stale_episode = Some(StaleEpisode {
+            provider: provider.to_string(),
+            account: account.map(str::to_string),
+            class,
+            at: Utc::now(),
+        });
     }
 }
 

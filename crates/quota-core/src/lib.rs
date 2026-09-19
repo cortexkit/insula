@@ -250,7 +250,7 @@ fn service_rank(status: SlotStatus) -> u8 {
 /// string equality stops meaning instant equality, and a dedupe or cache key on
 /// the raw string admits duplicates a parsed comparison would have caught.
 /// Pinning the precision makes the string canonical.
-fn rfc3339_canonical(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+pub fn rfc3339_canonical(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
 
@@ -1252,7 +1252,18 @@ impl Registry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if enters_stale {
-                store.record_stale_episode(&unit.key.provider);
+                // The class and the identity come from the attempt that CAUSED
+                // the transition, not from the slot's serving state: the slot
+                // keeps publishing its last healthy window, so reading the
+                // detail off what it serves would name the success that is
+                // still on the wire rather than the failure that stalled it.
+                store.record_stale_episode(
+                    &unit.key.provider,
+                    next.error_class,
+                    next.observation
+                        .as_ref()
+                        .and_then(|observed| observed.account_id.as_deref()),
+                );
             }
             match observation {
                 quota_drop::DropObservation::Drop(drop) => {
@@ -1338,6 +1349,7 @@ impl Registry {
             created_at,
             stale_episodes,
             stale_episodes_by_provider,
+            last_stale_episode,
             quota_drops_by_provider,
             quota_drops_observed_continuously,
             quota_comparisons_no_drop,
@@ -1349,6 +1361,7 @@ impl Registry {
                 store.created_at(),
                 store.stale_episodes(),
                 store.stale_episodes_by_provider(),
+                store.last_stale_episode(),
                 store.quota_drops_by_provider(),
                 store.quota_drops_observed_continuously(),
                 store.quota_comparisons_no_drop(),
@@ -1550,6 +1563,7 @@ impl Registry {
             stale,
             stale_episodes,
             stale_episodes_by_provider,
+            last_stale_episode,
             quota_drops_by_provider,
             quota_drops_observed_continuously,
             quota_comparisons_no_drop,

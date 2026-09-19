@@ -418,12 +418,33 @@ preserved reading *right now*. `staleEpisodes` is a monotonic count of how many
 times any slot has ENTERED that state since the module started, so a slot stale
 across many refresh turns counts once.
 
-It counts episodes, not providers, and nothing on the wire records WHICH lane
-flapped once the episode resolves — `stale` has returned to zero and the entry
-looks ordinary. So a non-zero count answers *did a transient failure happen*, and
-leaves *to whom* unanswerable after the fact. Catch it while `stale` is non-zero
-if you need the name; the entry discloses `stale: { since, class }` for as long
-as the failure lasts.
+It counts episodes, not providers. Once an episode resolves the entry looks
+ordinary again and `stale` has returned to zero, so the count alone answers *did
+a transient failure happen* and not *to whom* or *why*.
+
+`lastStaleEpisode` answers those for the MOST RECENT one, and exists because the
+alternative was catching it live:
+
+```
+"lastStaleEpisode": "claude 57ce2cb7-… upstream_failed at 2026-09-19T00:14:22.…Z"
+```
+
+Provider, account, `errorClass`, and when. The account is `<unattributed>` where
+the credential resolves no identity — most cookie lanes — which means
+unattributable rather than *all accounts*. The class is the same vocabulary a
+degraded entry publishes; the difference is that a stale entry keeps serving its
+last healthy window and a degraded one does not.
+
+**Only the last one is kept**, and the field name says so. It is not a summary of
+a run: on a lane flapping repeatedly it tells you what the most recent failure
+was, which is the question an operator has when a count climbs, and it says
+nothing about whether the earlier ones matched.
+
+*Why it was added.* This host recorded eighteen episodes, all on one provider,
+and the only way to learn the class was to poll `usage.get` for three minutes
+hoping to catch a window — `stale: { since, class }` is published only WHILE an
+entry is stale-serving, and nothing is logged on that path. A metric that answers
+*whether* and can never answer *why* sends its reader to guess.
 
 `staleEpisodesByProvider` gives the distribution: a count per provider, summing
 to the total. The total says how many episodes; this says how they were SPREAD,
