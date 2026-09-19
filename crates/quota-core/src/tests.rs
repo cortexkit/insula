@@ -329,6 +329,80 @@ fn production_body(source: &str) -> String {
     kept.join("\n")
 }
 
+/// No provider offers an implicit local lane BESIDE vault handles, except one.
+///
+/// THE SHAPE, reported on insula#19 and then found a second time by sweep: an
+/// implicit lane enumerated alongside vault handles is a second slot for one
+/// account. The pair deduplicates only while BOTH resolve the same identity --
+/// and a local lane that resolves none deduplicates only while the vault side is
+/// unlabelled too. Label the vault record and the row splits, publishing whatever
+/// the local lane has become: a tombstone after a custody migration (grok), or a
+/// permanently refused credential after an upstream sunset (gemini).
+///
+/// Both were fixed by hand. This is the fence, because the defect is an ABSENCE
+/// -- a guard nobody wrote -- and a new provider written from the shape of an old
+/// one inherits it silently. Neither instance failed a test when it landed.
+///
+/// CODEX IS EXEMPT AND THE REASON IS VERIFIED AT SOURCE, not assumed:
+/// `ServedCodexContext::local` sets `canonical_account_id` from the credential
+/// store, so its local lane resolves an identity of its own and deduplicates
+/// against a labelled vault sibling correctly. The exemption is keyed on that
+/// property, so a change making codex's local lane identity-less should REMOVE
+/// the exemption rather than widen it.
+#[test]
+fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
+    // Verified at crates/quota-core/src/codex.rs `ServedCodexContext::local`.
+    const EXEMPT: &[&str] = &["codex"];
+
+    let mut mixers = Vec::new();
+    let mut examined = 0usize;
+
+    for entry in std::fs::read_dir("src").expect("the provider sources") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a file stem")
+            .to_string();
+        let source = production_body(&std::fs::read_to_string(&path).expect("readable"));
+        let Some(at) = source.find("fn handles(&self)") else {
+            continue;
+        };
+        examined += 1;
+        let body = &source[at..];
+        let body = &body[..body.find("\n    }").unwrap_or(body.len())];
+
+        let offers_local = body.contains("CredentialHandle::implicit()");
+        let extends_with_vault = body.contains("extend");
+        let has_vault_only_guard = body.contains("is_empty()");
+
+        if offers_local && extends_with_vault && !has_vault_only_guard {
+            mixers.push(name);
+        }
+    }
+
+    // NOT VACUOUS: if the walk found no handles() at all, or stopped reading the
+    // provider sources, an empty `mixers` would pass while checking nothing.
+    assert!(
+        examined >= 20,
+        "the walk examined only {examined} handles() bodies; it is not reading the \
+         provider sources"
+    );
+
+    mixers.retain(|name| !EXEMPT.contains(&name.as_str()));
+    assert!(
+        mixers.is_empty(),
+        "these providers offer an implicit local lane beside vault handles: \
+         {mixers:?}. Either return the vault set alone when it is non-empty (see \
+         anthropic, deepseek, gemini, grok, openrouter, synthetic), or add an \
+         exemption stating why this provider's LOCAL lane resolves an account \
+         identity of its own."
+    );
+}
+
 /// Every antigravity plugin-lane success publishes the email the lane selected on.
 ///
 /// THE DEFECT WAS AN OMISSION AT ONE OF THREE SITES, which is the shape a source

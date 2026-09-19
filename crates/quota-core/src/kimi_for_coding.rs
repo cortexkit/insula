@@ -515,11 +515,25 @@ impl UsageProvider for KimiForCodingProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
+        // VAULT-ONLY CUSTODY. Third member of the class reported on insula#19,
+        // and the one my hand sweep missed -- found by the fence written to stop
+        // a fourth, on its first run.
+        //
+        // The local lane resolves no identity: its success builds
+        // `AccountObservation::new(None, None)` explicitly. So an implicit lane
+        // beside a vault one is a second slot for the same account that
+        // deduplicates ONLY while the vault side is unlabelled too. Labelling the
+        // vault record splits the row and publishes the local lane beside it.
+        //
+        // Latent here rather than visible: the `kimi-for-coding` vault record on
+        // this host carries no label, so there is nothing yet to split.
         if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.kimi_for_coding_handles()?);
+            let vault = self.handle_loader.kimi_for_coding_handles()?;
+            if !vault.is_empty() {
+                return Ok(vault);
+            }
         }
-        Ok(handles)
+        Ok(vec![CredentialHandle::implicit()])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -869,32 +883,20 @@ mod tests {
             Arc::new(VaultHandleLoader::new(Some(path.clone()))),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "kimi-for-coding");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn both_lanes_enumerate_two_fetch_units() {
-        // env lane present + vault handle present → 2 fetch units
-        // (implicit-local + vault). The scheduler's emission gate dedups them
-        // to one unlabeled entry on read; this test just confirms the
-        // enumeration surfaces both.
-        let path = write_handles(r#"{"handles":{"kimi-for-coding":"ckh_kimi"}}"#);
-        let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = KimiForCodingProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
-        );
-        // The implicit-local lane is always emitted whether or not the env var
-        // is set (enumeration never reads the environment; only the fetch
-        // does, degrading to NoSession when the key is absent), so no env
-        // mutation is needed here.
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "kimi-for-coding");
+        // ONE HANDLE, NOT TWO. This asserted `len() == 2` with the implicit lane
+        // first until insula#19's class was swept; a second identity-less slot
+        // for one account splits the row once the vault side is labelled.
+        //
+        // Enumeration never reads the environment -- only the fetch does,
+        // degrading to NoSession when the key is absent -- so no env mutation is
+        // needed to exercise either lane here. (Kept from
+        // `both_lanes_enumerate_two_fetch_units`, removed with this change: it
+        // asserted the same three lines as this test, and its comment described
+        // the read-time dedup of the two lanes as the reason the pair was safe --
+        // which is the assumption insula#19 falsified. A duplicate test whose
+        // stated rationale is now known to be wrong is worth less than nothing.)
+        assert_eq!(handles.len(), 1, "{handles:?}");
+        assert_eq!(handles[0].stable_id(), "kimi-for-coding");
         let _ = std::fs::remove_file(path);
     }
 
