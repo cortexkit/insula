@@ -13,8 +13,10 @@
 //! (`~/.codex/auth.json`, ...) regardless of the relayed bind identity, so it
 //! declares an empty identity scope and ignores `project_root`.
 
-mod ids;
-mod vault_client;
+// From the library target rather than `mod`, so the binary and any example use
+// ONE compiled copy. Declaring `mod` here as well would build the same source
+// twice and let the two drift while both continue to compile.
+use quota_module::{ids, vault_client};
 
 use ids::DEFAULT_MODULE_ID;
 

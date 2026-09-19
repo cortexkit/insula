@@ -38,4 +38,6 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# For the diagnostic examples only: the module itself makes no HTTP calls.
+reqwest = { workspace = true }
 subc-core = { workspace = true }
