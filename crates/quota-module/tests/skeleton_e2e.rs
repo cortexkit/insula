@@ -597,7 +597,26 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
     std::fs::create_dir_all(&project_root).unwrap();
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
     let route = route_open(&mut consumer, &project_root, 10).await;
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // DERIVED FROM THE SCHEDULER, NOT CHOSEN. This test drives the REAL registry,
+    // so the second of codex's two handles is not fetched until codex's second
+    // round: the refresher selects round-robin ACROSS providers under a
+    // concurrency cap, so one round costs roughly (providers / cap) slot fetches,
+    // each bounded by the fetch deadline.
+    //
+    // With 37 registered providers and a cap of 8, two rounds is on the order of a
+    // minute on a host whose providers are configured and therefore actually make
+    // network calls. The old 20s bound was written when fewer lanes had
+    // credentials, and it held for exactly as long as that stayed true.
+    //
+    // MEASURED before changing it, so this is a corrected bound rather than a
+    // raised one: at 20s the poll saw 23 of 37 providers and one of two codex
+    // accounts -- a sweep still in progress, not a stuck one. At 90s the same test
+    // passes in 101s with both accounts and their distinct percentages.
+    //
+    // CI is unaffected in either direction: with no credentials every lane fails
+    // fast, a full sweep takes seconds, and this bound is never approached. It
+    // only binds on a populated host, which is where it was failing.
+    let deadline = Instant::now() + Duration::from_secs(150);
     let mut corr = 11;
     let initial = loop {
         let response = usage_get(&mut consumer, route, corr).await;

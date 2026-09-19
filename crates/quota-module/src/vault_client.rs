@@ -1529,11 +1529,27 @@ mod tests {
             .unwrap();
         let key = vec![0x5a; 32];
         let daemon_id = [0x31; 16];
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-vault-client-{label}-{}-{}.json",
+        // A PRIVATE DIRECTORY, NOT THE SHARED TEMP ROOT.
+        //
+        // `connection_file::write_atomic` sweeps its parent directory for stale
+        // temps on every write, so writing one small file costs O(entries in that
+        // directory). Pointed at the shared temp root that is O(everything every
+        // process on this host has ever left there) -- 3,829 entries when this was
+        // measured, and these three tests went from milliseconds to not finishing.
+        //
+        // Measured, not inferred: `sample` on the hung binary parked every frame in
+        // `__getdirentries64` under `sweep_stale_temps -> fs::read_dir`, nowhere
+        // near the client logic the tests exist to exercise.
+        //
+        // A private directory also lets the sweep do its job: it can only contain
+        // this test's own leftovers, which is the population it was written for.
+        let dir = std::env::temp_dir().join(format!(
+            "ck-quota-vault-client-{}-{}",
             std::process::id(),
             NEXT_LOOPBACK_ID.fetch_add(1, Ordering::Relaxed)
         ));
+        std::fs::create_dir_all(&dir).expect("private connection-file dir");
+        let path = dir.join(format!("{label}.json"));
         connection_file::write_atomic(
             &path,
             &connection_file::ConnectionInfo {
