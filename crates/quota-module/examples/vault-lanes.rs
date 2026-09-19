@@ -183,6 +183,26 @@ async fn main() {
         // Exit 2 rather than 0 in either case: a clean pass would claim every
         // configured lane is serving, which is vacuously true and
         // indistinguishable from a real one.
+        //
+        // *** THIS ARM GOES BLIND AT THE SCOPED-GRANT CUTOVER. ***
+        //
+        // The plan deletes this file: the module will enumerate credentials from
+        // `credential.list_scoped` instead, so `ck auth login` alone makes an
+        // account appear. On that day the file is absent while ten credentials
+        // are configured, and the NotFound arm below reports the ordinary state
+        // of a host that uses no vault credentials -- exit 2, "nothing to check",
+        // which is the quietest failure available. Not an alarm, not a finding:
+        // a checker that has silently stopped verifying the lanes it exists for.
+        //
+        // Same shape as the stale DUAL_LANE exemption fixed earlier today, and
+        // the same shape CKCRED hit in their own operator probe, which demanded a
+        // capability handle before it would exercise the handle-FREE path. A tool
+        // whose input is the thing being removed encodes the assumption it exists
+        // to remove.
+        //
+        // So the cutover has a step beyond deleting the file: repoint this reader
+        // at `list_scoped` in the SAME change. Landing the deletion first leaves a
+        // window where nothing verifies the vault lanes and nothing says so.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("no credential handle file: no vault credentials configured here");
             std::process::exit(2);
