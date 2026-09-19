@@ -60,7 +60,7 @@ fn subconscious_root() -> PathBuf {
 /// The `subc-core` crate builds a binary named `ck-subc`; a stale `subc-core`
 /// binary can linger in target/debug after the rename, so the build and the
 /// path must both use the current artifact name to avoid running an old daemon.
-fn build_subc_core() -> PathBuf {
+fn build_subc_daemon() -> PathBuf {
     let root = subconscious_root();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -76,7 +76,7 @@ fn build_subc_core() -> PathBuf {
 /// Launch a real ck-subc daemon with an isolated rig whose subc.jsonc supervises
 /// our freshly-built quota-module binary. Waits for the connection file.
 async fn start_real_daemon() -> RealDaemon {
-    let subc_core = build_subc_core();
+    let subc_daemon = build_subc_daemon();
     let quota_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-insula"));
     assert!(quota_module.exists());
 
@@ -101,7 +101,7 @@ async fn start_real_daemon() -> RealDaemon {
     )
     .unwrap();
 
-    let child = Command::new(&subc_core)
+    let child = Command::new(&subc_daemon)
         .env("XDG_CONFIG_HOME", rig.join("config"))
         .env("CK_QUOTA_STATE_DIR", rig.join("quota-state"))
         .env("XDG_RUNTIME_DIR", &runtime_dir)
@@ -135,7 +135,7 @@ async fn start_real_daemon() -> RealDaemon {
 /// real spawn + route, not live windows).
 #[tokio::test]
 #[ignore = "builds ck-subc in ../subconscious and binds loopback ports"]
-async fn real_subc_core_supervises_quota_module_and_routes_usage_get() {
+async fn real_subc_daemon_supervises_quota_module_and_routes_usage_get() {
     let daemon = start_real_daemon().await;
     let mut consumer = connect_consumer(&daemon.connection_file).await;
 

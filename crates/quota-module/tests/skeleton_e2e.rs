@@ -31,7 +31,7 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_core::{
+use subc_daemon::{
     read_frame, serve_listener, write_frame, ControlHandler, Registry, Router, ServerAuth,
 };
 use subc_protocol::{
@@ -62,7 +62,7 @@ struct TestDaemon {
     registry: std::sync::Arc<Registry>,
     connection_file_path: PathBuf,
     temp_dir: PathBuf,
-    task: tokio::task::JoinHandle<Result<(), subc_core::ServerError>>,
+    task: tokio::task::JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl Drop for TestDaemon {
