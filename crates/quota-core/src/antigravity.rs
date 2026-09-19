@@ -1316,6 +1316,36 @@ impl AntigravityProvider {
             .filter(|email| !email.is_empty())
             .map(|email| AccountObservation::new(Some(email.to_string()), None));
 
+        // THE SAME EMAIL, PUBLISHED AS DISPLAY METADATA AS WELL AS IDENTITY.
+        //
+        // This lane selects the account BY EMAIL -- it is the value `observed`
+        // above is built from, and the value the local probe is matched against --
+        // and it used to publish it only as the identity, leaving `accountInfo`
+        // absent. The vault lane for the same account DOES attach it, so a row
+        // whose two slots alternate showed the address, then nothing, then the
+        // address again.
+        //
+        // Measured on this host 2026-09-19, one account, consecutive reads:
+        //
+        //     src=oauth  email=None
+        //     src=vault  email=beatricelau0414@gmail.com
+        //     src=oauth  email=None
+        //
+        // Nothing joined wrongly -- `account` is stable across all of them and is
+        // what consumers key on -- but a surface rendering the address blinks, and
+        // the fix is not a dedup change: the lane simply was not publishing a value
+        // it already held.
+        let account_info = account
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+            .map(|email| crate::model::AccountInfo {
+                email: Some(email.to_string()),
+                org_name: None,
+                plan_type: None,
+            });
+
         // 1. Probe the local agy / language-server lane first.
         //
         // WHY THE LOCAL LANE OUTRANKS A CREDENTIALED ONE:
@@ -1340,7 +1370,8 @@ impl AntigravityProvider {
                 .into_iter()
                 .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
             {
-                return FetchAttempt::success(observed, PLUGIN_SOURCE, matching.usage);
+                return FetchAttempt::success(observed, PLUGIN_SOURCE, matching.usage)
+                    .with_account_info(account_info);
             }
         }
 
@@ -1351,7 +1382,8 @@ impl AntigravityProvider {
         let cache_account = stored_account_for_email(&accounts, account.email.as_deref());
         if let Some((usage, updated_at)) = fresh_paid_cached_quota(cache_account, Utc::now()) {
             return FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
-                .with_value_observed_at(updated_at);
+                .with_value_observed_at(updated_at)
+                .with_account_info(account_info);
         }
 
         // No live session or fresh cache for this account. Falling back to the
@@ -1385,7 +1417,8 @@ impl AntigravityProvider {
             .fetch_remote_quota(&access_token, project.as_deref())
             .await;
         match usage {
-            Ok(usage) => FetchAttempt::success(observed, PLUGIN_SOURCE, usage),
+            Ok(usage) => FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
+                .with_account_info(account_info),
             Err(error) => FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error),
         }
     }

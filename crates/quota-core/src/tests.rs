@@ -329,6 +329,61 @@ fn production_body(source: &str) -> String {
     kept.join("\n")
 }
 
+/// Every antigravity plugin-lane success publishes the email the lane selected on.
+///
+/// THE DEFECT WAS AN OMISSION AT ONE OF THREE SITES, which is the shape a source
+/// walk catches and an example-based test does not. `PLUGIN_SOURCE` is returned
+/// from three places -- the local editor probe, the on-disk cache, and the cloud
+/// -- each its own `FetchAttempt::success`. Two attached the account info and one
+/// did not, so a row whose two slots alternate showed the address, then nothing,
+/// then the address again.
+///
+/// Measured on this host 2026-09-19, one account, consecutive reads:
+///
+///     src=oauth  email=None
+///     src=vault  email=beatricelau0414@gmail.com
+///     src=oauth  email=None
+///
+/// The lane SELECTS the account by email, so the value is always in hand; the only
+/// way to get this wrong is to forget one return. Nothing joined wrongly --
+/// `account` is stable across all of them -- but a surface rendering the address
+/// blinks.
+///
+/// Uses `production_body` rather than a second stripper. The first draft of this
+/// test carried its own brace-matching copy, which counted SEVEN sites where three
+/// exist: it had eaten a production item's `#[cfg(test)]` and left the test module
+/// standing, so the walk matched its own source text. That is the first of the
+/// three test-stripping traps in docs/provider-invariants.md, reproduced while
+/// writing a test about a duplicated omission.
+#[test]
+fn every_antigravity_plugin_lane_publishes_the_account_email() {
+    let production = production_body(include_str!("antigravity.rs"));
+
+    let sites: Vec<&str> = production
+        .match_indices("FetchAttempt::success(observed, PLUGIN_SOURCE")
+        .map(|(at, _)| {
+            let tail = &production[at..];
+            &tail[..tail.len().min(220)]
+        })
+        .collect();
+
+    assert_eq!(
+        sites.len(),
+        3,
+        "expected exactly the three plugin lanes (local probe, cache, cloud); a \
+         lane added without account info is what this guards, and a lane removed \
+         should update this count deliberately"
+    );
+
+    for (index, site) in sites.iter().enumerate() {
+        assert!(
+            site.contains(".with_account_info("),
+            "plugin-lane success #{index} publishes no accountInfo, so this \
+             account's email disappears whenever this lane wins the dedup:\n{site}"
+        );
+    }
+}
+
 /// The boundary helper removes test modules and keeps everything else.
 ///
 /// Pinned against REAL FILES rather than synthetic strings, because both defects
