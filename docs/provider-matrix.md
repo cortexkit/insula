@@ -1248,9 +1248,35 @@ credential that is easiest to reach is not necessarily the one that is
 serving.* The live wire said `source` for grok resolves through dedup, and the
 local token's expiry was one field away the whole time.
 
-UNBLOCK: one call to that endpoint with a live bearer (a minted probe handle, as
-CKCRED did for the Anthropic profile measurement). If it returns credits, this is
-a port of the same shape as codex `savedResets`.
+**ANSWERED 2026-09-19, and the endpoint is usable.** Probed with the real vault
+credential via `cargo run -p quota-module --example grok-resets`:
+
+```
+control  GetGrokCreditsConfig   HTTP 200, 111 bytes: message 86 bytes, grpc-status:0
+subject  GetRemainingResets     HTTP 200,  25 bytes: message  0 bytes, grpc-status:0
+```
+
+So it accepts the same bearer the usage endpoint does and answers **success with
+an empty message** — an account with no banked resets, not a refusal. The service
+path is `grok_api_v2.GrokBuildBilling`, not the `prod_mc_billing.ConsumerUiSvc`
+spelling above, which is upstream's own; the control 404ed until it was read from
+`grok.rs`.
+
+STILL NOT BUILDABLE, for a reason that is not a blocker on access: a normalizer
+needs a POPULATED response to learn the field numbers, and an empty message shows
+none of them. The honest record is reachable and authorised, shape unobserved.
+The unblock is now an account that HAS a reset to report — a condition, not a
+credential.
+
+Two methodology notes from the probe itself, both corrected in it:
+
+- Its control URL was GUESSED from the subject's service path and 404ed, so the
+  run refused to conclude. That refusal is the control working: without it, a
+  404 on the subject would have read as "the endpoint rejects us".
+- It first reported the answer as "25 bytes", which invites the reading that
+  something was returned. All 25 are framing — a zero-length data frame plus a
+  15-byte `grpc-status:0` trailer. **A byte count is not a data count**, and an
+  empty grpc-web success is the case that separates them.
 
 **Everything else in the round is null for the served set:**
 

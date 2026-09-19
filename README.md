@@ -176,6 +176,16 @@ cargo run -p quota-core --example ollama-labels
 # same cookie:
 cargo run -p quota-core --example opencode-stage
 
+# ask grok's GetRemainingResets endpoint whether it answers our bearer, using the
+# VAULT credential the provider actually serves from rather than whatever token a
+# shell can reach. Runs a control against the endpoint we already serve first, so
+# an empty answer from the subject cannot be confused with a dead credential --
+# the earlier hand probe measured an expired local token and concluded nothing.
+# Reports the grpc-web framing separately from the message, because a successful
+# empty reply is still 25 bytes and a byte count is not a data count. Needs the
+# daemon running, since it dials it for the credential:
+cargo run -p quota-module --example grok-resets
+
 # vary request context against the cloud Code Assist endpoint to establish why
 # it reports a different Gemini pool than the local editor. It prints the raw
 # response across variations (project field, tier id, caller headers) and
