@@ -707,11 +707,31 @@ impl UsageProvider for GeminiProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
+        // VAULT-ONLY CUSTODY, for the reason grok adopted it on insula#19 and the
+        // other auth-store providers already had. Found by sweeping that class
+        // rather than reported: gemini had the same shape, and nobody has mapped a
+        // gemini vault handle on the host where the original was seen, so it was
+        // latent rather than visible.
+        //
+        // The shape: an implicit local lane beside a vault one is a second slot
+        // for the same account, and this provider's LOCAL path builds no
+        // `AccountObservation` at all -- every one in this file is inside
+        // `fetch_vault`. So the local lane can never carry a label, the pair
+        // deduplicates only while the vault side is unlabelled too, and labelling
+        // the vault record splits the row.
+        //
+        // WORSE HERE THAN IT WAS FOR GROK, which is why this is not deferred:
+        // Google sunset Code Assist for individual accounts, so the local lane
+        // fails permanently with `credential_rejected` on hosts that still have
+        // `~/.gemini/oauth_creds.json`. Splitting the pair would publish that dead
+        // row beside a working vault account, and no re-authentication clears it.
         if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.gemini_handles()?);
+            let vault = self.handle_loader.gemini_handles()?;
+            if !vault.is_empty() {
+                return Ok(vault);
+            }
         }
-        Ok(handles)
+        Ok(vec![CredentialHandle::implicit()])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -930,8 +950,13 @@ mod tests {
     }
 
     fn write_handles(body: &str) -> std::path::PathBuf {
+        // Per-call, not per-process: cargo runs this module's tests concurrently
+        // and a shared path means two bodies race. Same defect found in grok's
+        // helper while adding a control that needed a different handles file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ck-quota-gemini-handles-{}.json",
+            "ck-quota-gemini-handles-{}-{unique}.json",
             std::process::id()
         ));
         let mut options = std::fs::OpenOptions::new();
@@ -1087,14 +1112,44 @@ mod tests {
 
         // Not vacuous: the Gemini CLI credential is still offered, so this
         // cannot pass by dropping every vault handle.
-        assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0], CredentialHandle::implicit());
-        assert_eq!(handles[1].stable_id(), "oauth:google:cli");
+        //
+        // ONE HANDLE, NOT TWO. This asserted `len() == 2` with the implicit lane
+        // first until vault-only custody landed; the implicit lane is now replaced
+        // rather than accompanied, because a second identity-less slot for the
+        // same account splits the row the moment the vault side is labelled
+        // (insula#19, found in grok and swept to here). The subject of this test
+        // is unchanged: the Antigravity credential must not reach this lane.
+        assert_eq!(handles.len(), 1, "{handles:?}");
+        assert_eq!(handles[0].stable_id(), "oauth:google:cli");
         assert!(
             !handles
                 .iter()
                 .any(|handle| handle.stable_id() == "antigravity:google"),
             "the Antigravity credential reached the Gemini lane"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// THE CONTROL: with no gemini vault handle mapped, the local lane survives.
+    ///
+    /// Without it, returning an empty vector satisfies the test above -- it only
+    /// checks that the antigravity credential is absent -- and takes gemini dark
+    /// on every host that has not migrated custody, which is most of them.
+    #[test]
+    fn the_implicit_lane_survives_when_no_gemini_vault_handle_is_mapped() {
+        let path = write_handles(
+            r#"{"handles":{"antigravity:google":"ckh_antigravity","oauth:xai":"ckh_grok"}}"#,
+        );
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = GeminiProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(
+            handles,
+            vec![CredentialHandle::implicit()],
+            "no gemini credential in custody means the local lane is all there is"
         );
         let _ = std::fs::remove_file(path);
     }
