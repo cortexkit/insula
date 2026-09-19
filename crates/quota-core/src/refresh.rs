@@ -779,8 +779,25 @@ fn next_slot_after_attempt_inner(
                 error_class: Some(error.error_class()),
                 // Bounded harder than the wire's 1 KiB: this rides a health
                 // metric an operator reads at a glance, not a diagnosis surface.
+                //
+                // COLLAPSED TO ONE LINE FIRST, because upstreams pretty-print.
+                // The first organic episode to carry a message was Anthropic's
+                // 429, whose body arrives as indented JSON with embedded
+                // newlines, so the metric became multi-line and every
+                // line-oriented reader -- a log tail, a grep, a dashboard cell --
+                // saw `HTTP 429: {` and stopped. The useful half, `rate_limit_error`,
+                // was on line three.
+                //
+                // Collapsing before bounding also buys back the budget: the
+                // indentation was roughly a fifth of the 160 characters, spent on
+                // whitespace that carries nothing at a glance.
+                //
+                // Only here, not in `FetchError::Display`: the wire's `error`
+                // string is a diagnosis surface where a consumer renders the
+                // body, and reshaping an upstream's own words there would be
+                // editing evidence rather than formatting a gauge.
                 last_failure_message: Some(crate::text::truncate_for_wire(
-                    &error.to_string(),
+                    &crate::text::collapse_whitespace(&error.to_string()),
                     STALE_MESSAGE_CHARS,
                 )),
                 observation,
@@ -932,6 +949,60 @@ mod tests {
     ///
     /// Both arms, because each survives the other's mutation. Refusing everything
     /// would freeze a lane at its first reading; refusing nothing restores the
+    /// A stale episode's message is one line, whatever the upstream sent.
+    ///
+    /// The first organic episode to carry a message was Anthropic's 429, whose
+    /// body is indented JSON. The metric became multi-line, so a log tail or a
+    /// grep read `HTTP 429: {` and stopped -- the `rate_limit_error` that made it
+    /// actionable was on line three, and the indentation spent about a fifth of
+    /// the 160-character budget carrying nothing.
+    ///
+    /// Asserts the CONTENT survives as well as the shape: collapsing that dropped
+    /// the body would pass a newline check while destroying the reason the field
+    /// exists.
+    #[test]
+    fn a_stale_episode_message_is_a_single_line() {
+        let body = "provider returned HTTP 429: {\n  \"error\": {\n    \"type\": \
+                    \"rate_limit_error\"\n  }\n}";
+        // THROUGH THE SLOT, NOT THE HELPER. Asserting `collapse_whitespace`
+        // directly tests the helper and says nothing about whether the capture
+        // site calls it -- proved by mutation: removing the call reddened nothing
+        // while the helper's own assertions stayed green.
+        let now = Instant::now();
+        let prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        let slot = next_slot_after_attempt(
+            &prev,
+            "claude",
+            FetchAttempt::failure(
+                Some(AccountObservation::new(Some("acct".into()), Some(1))),
+                Some("vault".to_string()),
+                FetchError::ProviderStatus(429, body.to_string()),
+            ),
+            now,
+            now + Duration::from_secs(1),
+        );
+        let collapsed = slot
+            .last_failure_message
+            .expect("a failure records what the upstream said");
+
+        assert!(
+            !collapsed.contains('\n'),
+            "a metric read at a glance must not be multi-line: {collapsed:?}"
+        );
+        assert!(
+            collapsed.contains("rate_limit_error"),
+            "and the part that makes it actionable must survive: {collapsed:?}"
+        );
+        assert!(
+            collapsed.contains("429"),
+            "the status still leads: {collapsed:?}"
+        );
+        assert!(
+            collapsed.len() <= STALE_MESSAGE_CHARS,
+            "and it still respects the glance budget: {collapsed:?}"
+        );
+    }
+
     /// regression.
     #[test]
     fn a_reading_older_than_the_one_held_is_not_an_update() {

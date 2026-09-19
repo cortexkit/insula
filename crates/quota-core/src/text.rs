@@ -72,6 +72,20 @@ pub(crate) fn strip_wrapping_quotes(raw: &str) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.to_string())
 }
 
+/// Fold any run of whitespace into a single space, and trim the ends.
+///
+/// For values that ride a SINGLE-LINE surface -- a health metric, a log line, a
+/// dashboard cell -- where an embedded newline truncates the reader rather than
+/// the string. Anthropic's 429 body arrives as indented JSON, so an operator
+/// grepping the metric saw `HTTP 429: {` and the `rate_limit_error` that made it
+/// actionable was on line three.
+///
+/// Not for the wire's `error` field, which is a diagnosis surface: there the
+/// upstream's own formatting is evidence, and a consumer renders it.
+pub fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
