@@ -660,7 +660,25 @@ fn next_slot_after_attempt_inner(
             // would put the slot into a backoff it has not earned.
             error_class: None,
             last_failure_class: None,
-            last_failure_message: None,
+            // BUT THE REASON IS STILL OWED. This is the one stale-serving path
+            // with no error behind it, and leaving the message empty rendered the
+            // health metric as `<no class> [<no message>]` -- seen live on
+            // antigravity within hours of shipping it. An operator reading that
+            // learns only that something happened, which is what the metric exists
+            // to improve on.
+            //
+            // The reason is exact and knowable here, unlike a failure message that
+            // has to be quoted from an upstream: the fetch SUCCEEDED and its
+            // reading described an earlier moment than the one already held, so it
+            // was discarded. That is a lane serving a value it does not poll --
+            // antigravity reading the editor plugin's cache -- rather than any
+            // kind of fault, and saying so distinguishes it from the failures that
+            // share this status.
+            last_failure_message: Some(
+                "a successful fetch returned a reading older than the one held, so it was \
+                 discarded: the lane is serving a value it does not poll"
+                    .to_string(),
+            ),
             ..prev.clone()
         };
     }
@@ -1088,6 +1106,58 @@ mod tests {
             fresh.status,
             SlotStatus::Fresh,
             "the control: a lane taking newer readings is not stale-serving"
+        );
+    }
+
+    /// The discard path names its reason, because no error will.
+    ///
+    /// Every other route into stale-serving carries a failure whose message says
+    /// what went wrong. This one is a SUCCESS that was discarded, so the fields a
+    /// reader would consult are legitimately empty -- and the health metric
+    /// rendered `<no class> [<no message>]` on a live antigravity lane within
+    /// hours of shipping it, which tells an operator only that something happened.
+    ///
+    /// Asserts the CLASS STAYS ABSENT as well: inventing one here would name a
+    /// fault that did not occur and would put the slot into a backoff it has not
+    /// earned. The reason belongs in the message, not in the taxonomy.
+    #[test]
+    fn a_discarded_reading_records_why_it_was_discarded() {
+        let now = Instant::now();
+        let earlier = Utc::now() - chrono::Duration::hours(1);
+        let held = Utc::now();
+
+        let mut prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        prev.last_success_wall = Some(held);
+        prev.entry = Some(ProviderUsage::healthy(
+            "antigravity",
+            None,
+            "oauth",
+            Usage::default(),
+        ));
+
+        let slot = next_slot_after_attempt(
+            &prev,
+            "antigravity",
+            FetchAttempt::success(None, "oauth", Usage::default()).with_value_observed_at(earlier),
+            now,
+            now + Duration::from_secs(1),
+        );
+
+        assert_eq!(slot.status, SlotStatus::StaleTransient);
+        assert_eq!(
+            slot.last_failure_class, None,
+            "no failure occurred, so no class may be invented"
+        );
+        let message = slot
+            .last_failure_message
+            .expect("the one stale path with no error still owes a reason");
+        assert!(
+            message.contains("older than the one held"),
+            "the reason must name what happened: {message}"
+        );
+        assert!(
+            message.contains("does not poll"),
+            "and why it is not a fault: {message}"
         );
     }
 
