@@ -597,6 +597,45 @@ fn next_slot_after_attempt_inner(
         .or_else(|| prev.observation.clone());
     let value_observed_at = attempt.value_observed_at;
 
+    // A READING OLDER THAN THE ONE ALREADY SERVED IS NOT AN UPDATE.
+    //
+    // One slot can read several lanes across consecutive fetches -- antigravity's
+    // plugin handle tries the local editor probe, then the plugin's on-disk cache,
+    // then the cloud, and ALL THREE stamp the same `source` label. The cache
+    // publishes its own file timestamp (up to an hour old) while the cloud
+    // publishes now, so alternating between them walks `fetchedAt` backwards and
+    // forwards with the values following it.
+    //
+    // Witnessed on a reporter's host (insula#17) in a cold window: `fetchedAt`
+    // 06:53:09 -> 06:46:59, back 370s, `source` constant, `gemini-5h` 5.47 ->
+    // 3.31. After a restart the cache file still holds a pre-restart timestamp,
+    // which is why a cold start is where this shows.
+    //
+    // The fix is the dedup's rule one level down: VALUE AGE DECIDES. A fetch that
+    // succeeds but describes an EARLIER moment than the reading already held is
+    // discarded rather than published, so a slot's value time is monotonic and a
+    // consumer cannot see quota move backwards without a reset behind it.
+    //
+    // Scoped to the same account: an identity change legitimately resets the wall
+    // time to None, and a new account's first reading has nothing to be older
+    // than.
+    let supersedes = match (value_observed_at, prev.last_success_wall) {
+        (Some(incoming), Some(held)) if !account_changed => incoming >= held,
+        _ => true,
+    };
+    if attempt.usage.is_ok() && !supersedes {
+        // Scheduling still advances: the fetch HAPPENED and the next one is due on
+        // the ordinary cadence. Only the published reading is left alone.
+        return ProviderSlot {
+            last_success_at: Some(completed),
+            last_attempt_at: Some(attempt_start),
+            next_due_at: completed + BASE_INTERVAL,
+            retry_count: 0,
+            status: SlotStatus::Fresh,
+            ..prev.clone()
+        };
+    }
+
     match attempt.usage {
         Ok(usage) => ProviderSlot {
             // A success ends the run, so the next failure starts a new one.
@@ -851,6 +890,80 @@ fn credential_was_replaced(slot: &ProviderSlot, status: &CredentialStatus) -> bo
 
 #[cfg(test)]
 mod tests {
+
+    /// A fetch describing an EARLIER moment than the reading already held is
+    /// discarded, so a slot's value time never walks backwards.
+    ///
+    /// insula#17, cold window on a reporter's host: `fetchedAt` went 06:53:09 ->
+    /// 06:46:59, back 370 seconds, with `source` CONSTANT and `gemini-5h` 5.47 ->
+    /// 3.31. Not the dedup -- one slot, alternating between lanes that share a
+    /// source label. antigravity's plugin handle reads the local editor probe, the
+    /// plugin's on-disk cache and the cloud, all stamped "oauth"; the cache
+    /// publishes its own file timestamp while the cloud publishes now.
+    ///
+    /// Both arms, because each survives the other's mutation. Refusing everything
+    /// would freeze a lane at its first reading; refusing nothing restores the
+    /// regression.
+    #[test]
+    fn a_reading_older_than_the_one_held_is_not_an_update() {
+        let now = Instant::now();
+        let held_at = Utc::now();
+        let older = held_at - chrono::Duration::seconds(370);
+        let newer = held_at + chrono::Duration::seconds(370);
+
+        let mut prev = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        prev.last_success_wall = Some(held_at);
+        prev.observation = Some(AccountObservation::new(Some("A".into()), Some(1)));
+        prev.entry = Some(ProviderUsage::healthy(
+            "antigravity",
+            None,
+            "oauth",
+            Usage::default(),
+        ));
+
+        let attempt_with = |wall: chrono::DateTime<Utc>| {
+            FetchAttempt::success(
+                Some(AccountObservation::new(Some("A".into()), Some(1))),
+                "oauth",
+                Usage::default(),
+            )
+            .with_value_observed_at(wall)
+        };
+
+        let stale = next_slot_after_attempt(
+            &prev,
+            "antigravity",
+            attempt_with(older),
+            now,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            stale.last_success_wall,
+            Some(held_at),
+            "a reading 370s older than the one held must not replace it: that is \
+             the insula#17 backwards step"
+        );
+        assert!(
+            stale.next_due_at > now,
+            "scheduling still advances -- the fetch happened, only the reading was \
+             not an update"
+        );
+
+        let fresh = next_slot_after_attempt(
+            &prev,
+            "antigravity",
+            attempt_with(newer),
+            now,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            fresh.last_success_wall,
+            Some(newer),
+            "a NEWER reading must still publish, or the lane freezes at its first \
+             value"
+        );
+    }
+
     use super::*;
     use crate::credential_source::{CredentialStatus, VaultCapability, VaultGetError};
     use crate::model::Usage;
