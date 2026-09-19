@@ -44,8 +44,50 @@ const ERROR_BODY_PREFIX_BYTES: usize = 8 * 1024;
 /// property from depending on every provider keeping credentials out of its
 /// URLs.
 pub(crate) fn transport_error(error: reqwest::Error) -> FetchError {
-    FetchError::Upstream(error.without_url().to_string())
+    let stripped = error.without_url();
+    // THE CAUSE IS ENTIRELY IN THE SOURCE CHAIN. `reqwest::Error`'s own Display
+    // is "error sending request" for every transport failure there is, so the
+    // published string could not separate a DNS failure from a refused
+    // connection from a TLS fault -- all of which want different responses, and
+    // none of which this module can distinguish for an operator otherwise.
+    //
+    // Measured 2026-09-19 against a live resolver:
+    //
+    //   today  error sending request
+    //   chain  error sending request: client error (Connect): dns error: failed
+    //          to lookup address information: nodename nor servname provided
+    //   chain  error sending request: client error (Connect): tcp connect error:
+    //          Connection refused (os error 61)
+    //
+    // SAFE BECAUSE THE URL IS NOT IN THE CHAIN, verified rather than assumed: a
+    // request carrying a `?k=SECRET` query parameter produced neither the URL nor
+    // the parameter at any depth. `without_url` removes it from the reqwest error
+    // itself, and the sources beneath are transport-level errors that never held
+    // the URL string. A hostname can appear at this depth and is not a secret --
+    // every endpoint host this module dials is enumerated in
+    // `scripts/endpoint-hosts.py`.
+    //
+    // Depth-bounded independently of `FetchError`'s 1 KiB Display cap, because a
+    // cap truncates at the END and a pathological chain would push the useful
+    // first cause out through the front.
+    let mut parts = vec![stripped.to_string()];
+    let mut source = std::error::Error::source(&stripped);
+    while let Some(cause) = source {
+        if parts.len() >= TRANSPORT_CAUSE_DEPTH {
+            break;
+        }
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    FetchError::Upstream(parts.join(": "))
 }
+
+/// How far to walk a transport error's source chain.
+///
+/// Four covers the observed shapes with one to spare: reqwest's own message, the
+/// client-error layer, the connect layer, and the OS or resolver cause that is
+/// the one worth reading.
+const TRANSPORT_CAUSE_DEPTH: usize = 4;
 
 fn body_too_large() -> FetchError {
     FetchError::Decode(format!(
@@ -863,6 +905,49 @@ mod tests {
     /// WITNESSED RATHER THAN REVIEWED. No provider on this host answers non-2xx
     /// with an empty body, so the live wire had never produced the string; it took
     /// a loopback harness returning a bare 503 to show it. Both branches are
+    /// A transport failure names its cause, and does not name the URL.
+    ///
+    /// `reqwest::Error`'s own Display is "error sending request" for EVERY
+    /// transport failure, so a published entry could not separate a DNS failure
+    /// from a refused connection. Both arms matter and they fail differently: no
+    /// chain leaves an operator with nothing to act on, and a chain that carried
+    /// the request URL would publish any credential in its query string.
+    ///
+    /// Uses a real client against an unroutable address rather than a constructed
+    /// error, because `reqwest::Error` cannot be built by hand -- which is the
+    /// same reason this path had no test before.
+    #[tokio::test]
+    async fn a_transport_failure_names_its_cause_without_the_url() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("client");
+        // Port 9 is discard; nothing listens on loopback there.
+        let error = client
+            .get("http://127.0.0.1:9/v1?token=SHOULD_NOT_APPEAR")
+            .send()
+            .await
+            .expect_err("a connection to a closed port must fail");
+
+        let FetchError::Upstream(message) = transport_error(error) else {
+            panic!("a transport failure is transient, not a verdict on the credential");
+        };
+
+        assert!(
+            message.contains("tcp connect error") || message.contains("Connection refused"),
+            "the cause lives in the source chain and must reach the wire: {message:?}"
+        );
+        assert!(
+            !message.contains("SHOULD_NOT_APPEAR"),
+            "a query-string credential must never be published: {message:?}"
+        );
+        assert!(
+            !message.contains("127.0.0.1:9"),
+            "the request URL is stripped, and the chain must not reintroduce it: \
+             {message:?}"
+        );
+    }
+
     /// asserted here so the next edit to either cannot re-split them.
     #[test]
     fn an_empty_body_reads_the_same_on_both_non_2xx_branches() {
