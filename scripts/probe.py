@@ -81,6 +81,23 @@ def main(argv):
         return 2
 
     source = path.read_text()
+    if old == new:
+        # A NO-OP MUTATION IS INDISTINGUISHABLE FROM AN UNDEFENDED GUARD, and it
+        # is the one failure this script cannot detect after the fact: the write
+        # succeeds, the suite runs green, and the verdict printed is "NOTHING
+        # REDDENED -- no test asserts this" about code nobody changed.
+        #
+        # Reachable by ordinary means rather than by carelessness: a copy-paste
+        # where only one side was edited, or a rewrite that normalises whitespace
+        # the file already had. Verified on this repo 2026-09-19 -- passing one
+        # constant as both arguments printed the undefended verdict.
+        #
+        # Exit 2 rather than 0, because "could not check" is not "nothing
+        # defends it". (CKCRED hit the same shape from the other direction: a
+        # mutation that failed to APPLY left their arm reporting ok from
+        # unmutated code.)
+        print("  old and new are identical; nothing would be mutated", file=sys.stderr)
+        return 2
     if old not in source:
         print(f"  pattern not found in {rel}, nothing mutated", file=sys.stderr)
         return 2
