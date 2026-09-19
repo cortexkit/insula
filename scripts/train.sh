@@ -26,6 +26,43 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 2
 fi
 
+# A SECOND TRAIN STARTED BEFORE THE FIRST LANDS COSTS THE FIRST ITS CHECKS.
+#
+# Branch protection reads the checks for THE SHA BEING PUSHED TO MASTER. Commit
+# A, run a train, have its master push rejected; commit B and run another, and
+# B's branch contains A, so local master's tip is now B. A's completed run is on
+# a sha that is no longer the tip, and the retry asks protection about B -- whose
+# checks are still in progress. The rejection reads "2 of 2 required status
+# checks are in progress", which sounds like a timing flake and is actually a
+# second train having moved the target.
+#
+# Cost when it happened (2026-09-19): two rejected pushes and several minutes
+# spent deciding whether the first train had failed. It had not; it had been
+# superseded.
+#
+# THE TEST IS A PREVIOUS TRAIN'S SHA STRANDED BETWEEN THE TWO, not "is master
+# ahead" -- master is ALWAYS ahead here, since the commit precedes the train.
+# A remote train branch that is an ancestor of local master and NOT an ancestor
+# of origin/master is unlanded work from an earlier run.
+git fetch -q origin 2>/dev/null
+stranded=""
+while read -r ref; do
+  [ -z "$ref" ] && continue
+  [ "$ref" = "origin/$branch" ] && continue
+  if git merge-base --is-ancestor "$ref" HEAD 2>/dev/null &&
+     ! git merge-base --is-ancestor "$ref" origin/master 2>/dev/null; then
+    stranded="$stranded $ref"
+  fi
+done <<< "$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/train/*' 2>/dev/null)"
+
+if [ -n "$stranded" ]; then
+  echo "  REFUSED: an earlier train has not landed:$stranded" >&2
+  echo "  Land or abandon it first. Starting another moves master's tip and" >&2
+  echo "  invalidates the checks that train is waiting on." >&2
+  echo "  To land it:  gh run watch <its run> --exit-status && git push origin master" >&2
+  exit 2
+fi
+
 # THE LAST MOMENT A DAMAGED COMMIT MESSAGE IS STILL FREE TO FIX.
 #
 # `git commit -m "...`ident`..."` runs each backticked word as command
