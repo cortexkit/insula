@@ -1233,6 +1233,20 @@ pub struct AntigravityProvider {
     quota_summary_url: String,
     token_url: String,
     local_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<LocalSnapshot>)>>,
+    /// Which lane last answered for each handle, so a SWITCH can be logged.
+    ///
+    /// Three lanes stamp the same `source` on the wire (the local editor probe,
+    /// the editor plugin's on-disk cache, and the cloud API), which is correct --
+    /// `source` is per-lane-kind and consumers are told not to key on it flipping
+    /// -- but it leaves no way to ask WHICH ONE ANSWERED. That cost real time:
+    /// diagnosing a frozen reading took ten turns of elimination across three
+    /// lanes and ended without an answer, because every theory fitted the
+    /// observations equally well.
+    ///
+    /// A system with several indistinguishable producers cannot be diagnosed by
+    /// watching its output, however carefully. THE INSTRUMENT HAS TO NAME THE
+    /// PRODUCER.
+    served_lane: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
     local_endpoints: Option<Vec<(LocalServer, u16)>>,
     override_accounts: Option<Vec<StoredAccount>>,
 }
@@ -1259,6 +1273,7 @@ impl AntigravityProvider {
             quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
             local_cache: std::sync::Mutex::new(None),
+            served_lane: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_endpoints: None,
             override_accounts: None,
         }
@@ -1290,6 +1305,40 @@ impl AntigravityProvider {
     /// the cloud endpoint for free-tier accounts. The latter exchanges the
     /// plugin's refresh token on every fetch rather than caching an access token
     /// whose lifetime is shorter than the refresher's own interval.
+    /// Log which lane answered, and ONLY when it changes.
+    ///
+    /// Per-poll it would be one line a minute per account forever, which is the
+    /// cadence at which log lines stop being read -- the same reason the reset
+    /// tick prints on change rather than on every tick. A switch is rare and is
+    /// exactly the event that explains an apparent anomaly downstream: a reading
+    /// that steps backwards, or a quota drop flagged non-continuous, is a lane
+    /// switch seen from the other side.
+    ///
+    /// NOT A WIRE CHANGE, deliberately. `source` is documented as per-lane-kind
+    /// with consumers told not to key on flips, so widening its value set to
+    /// distinguish three lanes that share a credential kind would be a contract
+    /// change to buy a diagnostic. A log line costs nobody a decode.
+    ///
+    /// First answer for a handle is NOT logged: there is no switch, and printing
+    /// one would mean a line per account on every restart, which is noise that
+    /// looks like an event.
+    fn note_lane(&self, key: &str, lane: &'static str) {
+        let Ok(mut seen) = self.served_lane.lock() else {
+            return;
+        };
+        match seen.insert(key.to_string(), lane) {
+            Some(previous) if previous != lane => {
+                eprintln!(
+                    "{tag} antigravity lane switch for {key}: {previous} -> {lane} \
+                     (a reading whose value time steps backwards across this is the switch, \
+                     not a fault)",
+                    tag = crate::LOG_TAG
+                );
+            }
+            _ => {}
+        }
+    }
+
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
         let accounts = self.stored_accounts();
         let found = accounts
@@ -1370,6 +1419,7 @@ impl AntigravityProvider {
                 .into_iter()
                 .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
             {
+                self.note_lane(handle_name, "local-probe");
                 return FetchAttempt::success(observed, PLUGIN_SOURCE, matching.usage)
                     .with_account_info(account_info);
             }
@@ -1381,6 +1431,7 @@ impl AntigravityProvider {
         // account identity and must never create or repoint a published row.
         let cache_account = stored_account_for_email(&accounts, account.email.as_deref());
         if let Some((usage, updated_at)) = fresh_paid_cached_quota(cache_account, Utc::now()) {
+            self.note_lane(handle_name, "plugin-cache");
             return FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
                 .with_value_observed_at(updated_at)
                 .with_account_info(account_info);
@@ -1417,8 +1468,11 @@ impl AntigravityProvider {
             .fetch_remote_quota(&access_token, project.as_deref())
             .await;
         match usage {
-            Ok(usage) => FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
-                .with_account_info(account_info),
+            Ok(usage) => {
+                self.note_lane(handle_name, "cloud-api");
+                FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
+                    .with_account_info(account_info)
+            }
             Err(error) => FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error),
         }
     }
@@ -1598,6 +1652,13 @@ impl AntigravityProvider {
             Some(record_version),
         ));
 
+        // KEYED ON THE EMAIL, NEVER THE CAPABILITY. The capability is the bearer of
+        // vault authority and must not reach a log line; the email is already
+        // published as `accountInfo` on this entry, so it adds no exposure.
+        let lane_key = observed_email
+            .clone()
+            .unwrap_or_else(|| "vault-unidentified".to_string());
+
         // 1. Probe the local lane first if this vault handle's identity is known.
         // A local editor outranks the cloud credential because the cloud credential is
         // entitled to a different tier. If the local session matches this vault handle's
@@ -1608,6 +1669,7 @@ impl AntigravityProvider {
                 .into_iter()
                 .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
             {
+                self.note_lane(&lane_key, "local-probe");
                 return FetchAttempt::success(observed, "vault", matching.usage)
                     .with_account_info(account_info);
             }
@@ -1620,6 +1682,7 @@ impl AntigravityProvider {
         // the token below is entitled to the standard tier, while the cache was
         // read from the pool the signed-in account actually spends.
         if let Some((usage, updated_at)) = fresh_paid_cached_quota(plugin_account, Utc::now()) {
+            self.note_lane(&lane_key, "plugin-cache");
             return FetchAttempt::success(observed, "vault", usage)
                 .with_value_observed_at(updated_at)
                 .with_account_info(account_info);
@@ -1688,6 +1751,7 @@ impl AntigravityProvider {
 
         match result {
             Ok(usage) => {
+                self.note_lane(&lane_key, "cloud-api");
                 FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
@@ -3460,5 +3524,50 @@ mod plugin_lane_tests {
                 .and_then(|o| o.account_id.as_deref()),
             None
         );
+    }
+
+    /// A lane switch is announced; a steady lane is silent.
+    ///
+    /// The silent arm is the load-bearing one. Announcing every answer would be a
+    /// line a minute per account forever, which is the cadence at which logs stop
+    /// being read -- and the first answer after a restart is not a switch, so
+    /// logging it would put a line per account in every startup and make a real
+    /// switch harder to see rather than easier.
+    #[test]
+    fn a_lane_switch_is_noted_once_and_a_steady_lane_is_silent() {
+        let provider = AntigravityProvider::new();
+
+        // First answer: nothing to compare against, so no switch.
+        provider.note_lane("a@example.com", "plugin-cache");
+        assert_eq!(
+            provider.served_lane.lock().unwrap().get("a@example.com"),
+            Some(&"plugin-cache")
+        );
+
+        // Same lane again: still recorded, still not a switch.
+        provider.note_lane("a@example.com", "plugin-cache");
+        assert_eq!(
+            provider.served_lane.lock().unwrap().get("a@example.com"),
+            Some(&"plugin-cache")
+        );
+
+        // A switch updates the record. The log line itself is stderr and not
+        // asserted here; what is asserted is the state that decides whether one
+        // is emitted at all.
+        provider.note_lane("a@example.com", "local-probe");
+        assert_eq!(
+            provider.served_lane.lock().unwrap().get("a@example.com"),
+            Some(&"local-probe")
+        );
+
+        // PER ACCOUNT, NOT GLOBAL: one account switching must not make another
+        // account's next answer look like a switch. A single global slot would
+        // announce a switch on every poll of a two-account host.
+        provider.note_lane("b@example.com", "cloud-api");
+        assert_eq!(
+            provider.served_lane.lock().unwrap().get("a@example.com"),
+            Some(&"local-probe")
+        );
+        assert_eq!(provider.served_lane.lock().unwrap().len(), 2);
     }
 }
