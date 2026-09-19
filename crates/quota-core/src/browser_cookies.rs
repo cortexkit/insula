@@ -681,6 +681,21 @@ const fn chrome_data_subpath(os: &str) -> &'static str {
 fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> {
     // Chrome stores the cookie DB under each profile's "Network" dir (newer) or
     // directly in the profile dir (older). Prefer the most-recently-modified.
+    //
+    // ENUMERATES A DIRECTORY THIS PROCESS DOES NOT OWN, which is the shape that
+    // cost three seats an afternoon on 2026-09-19: a sweep that enumerates a
+    // shared directory and narrows afterwards pays for everything in it. One of
+    // those reached 290,697 entries and a bare listing took 870 seconds.
+    //
+    // SAFE HERE FOR A REASON, NOT BY LUCK, and the reason is falsifiable: this
+    // directory holds ONE ENTRY PER CHROME PROFILE plus a handful of siblings, so
+    // it is bounded by how many profiles the user has rather than by time. It does
+    // not accumulate the way a temp root does. Measured on this host 2026-09-19:
+    // 53 entries, against 20 in the JetBrains equivalent.
+    //
+    // What would falsify it: Chrome writing per-session or per-tab state as
+    // entries here. If that ever happens this becomes the same defect, on a path
+    // that runs once per refresh tick for the whole cookie cohort.
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
