@@ -8206,3 +8206,54 @@ async fn healthy_and_local_slots_issue_no_status_call() {
         "only the vault-backed non-transient slot may be polled"
     );
 }
+
+/// Every credential id the vault can hand us routes to a provider that reads it.
+///
+/// THE JOIN IS BETWEEN TWO SELF-CONSISTENT LISTS, which is why reading either
+/// one finds nothing. `CREDENTIAL_FAMILIES` is coherent; the vault's ids are
+/// coherent; only the mapping between them can be wrong, and it was wrong in a
+/// way nothing observed: the handle map is written BY HAND, so it holds whatever
+/// spelling its author used. Under scoped grants the ids arrive FROM the vault.
+///
+/// The measured instance: the vault canonicalises static keys under `apikey:`,
+/// so it holds `apikey:kimi-for-coding` while this table had only the bare
+/// `kimi-for-coding`. That lane is SERVING on this host, and at cutover it would
+/// have gone dark with no error -- present, granted, unrouted.
+///
+/// Literals rather than values derived from the table, because a test that asks
+/// the table whether it contains what the table contains cannot fail.
+#[test]
+fn the_vaults_canonical_credential_ids_route_to_a_provider() {
+    for id in [
+        "apikey:kimi-for-coding",
+        "kimi-for-coding",
+        "oauth:anthropic",
+        "oauth:anthropic:ufuk2",
+        "chatgpt:openai",
+        "antigravity:google",
+        "oauth:xai",
+        "apikey:deepseek",
+        "apikey:openrouter",
+    ] {
+        assert!(
+            crate::vault_handles::CREDENTIAL_FAMILIES
+                .iter()
+                .any(|(prefix, _)| crate::vault_handles::handle_id_names_family(id, prefix)),
+            "no family claims {id}, so a granted credential would be silently unrouted"
+        );
+    }
+
+    // THE CONTROL, and it carries the weight: a platform API key must NOT be
+    // claimed by the ChatGPT subscription family. Codex reads a subscription
+    // OAuth credential, and a table widened until everything matches has stopped
+    // discriminating -- which is the failure mode of fixing the case above
+    // carelessly.
+    for id in ["apikey:openai", "apikey:openai:astro", "apikey:cerebras"] {
+        assert!(
+            !crate::vault_handles::CREDENTIAL_FAMILIES
+                .iter()
+                .any(|(prefix, _)| crate::vault_handles::handle_id_names_family(id, prefix)),
+            "{id} must stay unclaimed: no provider here reads it"
+        );
+    }
+}

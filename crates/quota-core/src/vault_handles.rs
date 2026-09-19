@@ -43,6 +43,21 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("antigravity:google", "antigravity"),
     ("oauth:google", "gemini"),
     ("kimi-for-coding", "kimi-for-coding"),
+    // THE VAULT'S OWN SPELLING FOR THE SAME CREDENTIAL. Static keys are
+    // canonicalised there under `apikey:`, and the bare spelling above works today
+    // only because the handle map is written BY HAND and I wrote it to match this
+    // table rather than the vault's id. Under scoped grants the ids arrive FROM the
+    // vault, so the bare prefix would claim nothing and a serving lane would go
+    // dark at cutover with no error -- the credential is present, granted, and
+    // simply unrouted.
+    //
+    // Found by diffing every family prefix against every real vault id rather than
+    // by reading either list, because each is self-consistent and only the join is
+    // wrong. The same sweep flagged `apikey:openai` against `chatgpt:openai`: NOT a
+    // defect and deliberately left unclaimed, since a platform API key and a
+    // ChatGPT subscription are different planes and codex must never be handed the
+    // first.
+    ("apikey:kimi-for-coding", "kimi-for-coding"),
     ("cookie:ampcode.com", "amp"),
     ("cookie:cursor.com", "cursor"),
     ("cookie:qwencloud.com", "qwen-cloud"),
