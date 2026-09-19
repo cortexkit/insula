@@ -656,6 +656,29 @@ rolling window. Whether the next window anchors at the next first use or lands o
 a fixed grid is a different question, and the very activity that makes these
 accounts worth measuring is what keeps it unanswerable here.
 
+> **Self-signals considered: `claude-prime-keepalive`** (astrocyte, reported on
+> insula#9, 2026-08-22 — their declaration, not verified here).
+>
+> Naming it turns the paragraph above from a caveat into a checkable one. That
+> keepalive is reported to fire at window-expiry + ε on these lanes, which is
+> not *some* activity but precisely the activity that denies the measurement its
+> idle window — so the unanswerable half is unanswerable by a named mechanism
+> with a cadence, and a host without that signal could answer it.
+>
+> Carry this line on any measurement **of the usage series itself** — percents,
+> reset instants, window behaviour — drawn from lanes a registered self-signal
+> matches, or `self-signals considered: none-registered` where none does. The
+> statement is that the analysis knew what was feeding it. It is deliberately not
+> subtraction: nothing here compensates for the signal, and a reader who wants the
+> unshaped mechanics needs a host that does not run it.
+>
+> The scope is the series rather than every measurement taken on a matching lane,
+> and the boundary is mechanical rather than a judgement call: a self-signal shapes
+> a lane by CONSUMING QUOTA, so it can move a percent or an anchor and cannot touch
+> how many handles are mapped or which accounts enumerate. Annotating a
+> configuration measurement with a keepalive would attach a cause that could not
+> have produced the effect, which costs a later reader the time to rule it out.
+
 One live corroboration of the anchoring half, observable on any host with an
 unused account: on 2026-08-21 three accounts on this box read 16.0% with a reset
 instant, 0.0% with a reset instant, and **0.0% with no `resetsAt` at all**. The
