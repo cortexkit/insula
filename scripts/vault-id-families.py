@@ -120,24 +120,52 @@ def main():
                 f"records it as deliberately unclaimed ({reason}) -- one of the two is wrong"
             )
 
-    # THE DEFECT SHAPE: an id that NAMES a family without matching it. That is a
-    # spelling divergence between two coherent lists, which is exactly what no
-    # amount of reading either list reveals.
+    # THE DEFECT SHAPE: an id naming something this module serves, that routes
+    # nowhere. Two discriminators, because one of them missed a real row.
+    #
+    # FIRST, the prefix-tail match: an id that names a family without matching it,
+    # which is the spelling divergence that cost a serving lane.
+    #
+    # SECOND, and added after the first one missed `oauth:cursor`: an id whose
+    # PROVIDER SEGMENT is a provider this module serves. `cookie:cursor.com` has
+    # tail `cursor.com`, which shares no substring with `oauth:cursor`, so the
+    # tail test classified a credential for a provider we serve as "unrelated to
+    # any provider here" and buried it in a count. A heuristic keyed on the
+    # FAMILY's spelling cannot see an id that spells the same provider a different
+    # way -- which is the whole class this checker exists for.
+    providers = {name for _, name in fams}
     namelike = []
     for cid in unclaimed:
         if cid in DELIBERATELY_UNCLAIMED:
             continue
+        matched = None
         for prefix, provider in fams:
             tail = prefix.split(":")[-1]
             if tail and tail in cid:
-                namelike.append((cid, prefix, provider))
+                matched = (cid, prefix, provider)
                 break
+        if matched is None:
+            # `<method>:<provider>[:<account>]` -- the provider is segment two.
+            parts = cid.split(":")
+            if len(parts) >= 2 and parts[1] in providers:
+                matched = (cid, None, parts[1])
+        if matched:
+            namelike.append(matched)
 
     for cid, prefix, provider in namelike:
-        findings.append(
-            f"{cid} names the {provider} family (prefix {prefix!r}) but does not match it: "
-            f"a granted credential that no provider would read"
-        )
+        if prefix is None:
+            # No family covers this credential METHOD for a provider we serve.
+            findings.append(
+                f"{cid} is a credential for {provider}, which this module serves, but no "
+                f"family covers the {cid.split(':')[0]!r} method: it would route nowhere. "
+                f"Either add the family, or record it in DELIBERATELY_UNCLAIMED with the "
+                f"reason no lane can consume it"
+            )
+        else:
+            findings.append(
+                f"{cid} names the {provider} family (prefix {prefix!r}) but does not match "
+                f"it: a spelling divergence, so a granted credential routes nowhere"
+            )
 
     # Ids resembling nothing are ordinary -- the vault holds credentials for tools
     # that are not providers here. A COUNT, not findings, because listing them
