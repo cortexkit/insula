@@ -2048,6 +2048,56 @@ async fn unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_dedupli
     assert_eq!(deduplicated[0].account.as_deref(), Some("A"));
 }
 
+/// A contested identity records which slot won; an uncontested one records nothing.
+///
+/// WHY THIS EXISTS. When two credentials resolve one account, the row a consumer
+/// sees is whichever slot holds the newest reading, and that choice is invisible:
+/// same provider, same account, same `source`. A row alternating between two slots
+/// and a row whose single slot changed lane produce the SAME wire symptom -- a
+/// value time that steps backwards -- and separating them by elimination cost two
+/// multi-turn investigations in one evening, one of which ended without an answer.
+///
+/// THE SILENT ARM CARRIES THE WEIGHT. Recording a winner for an account only one
+/// slot serves would put a line per account on every read, and output produced on
+/// every poll stops being read long before the rare line anyone needs appears.
+/// That arm is what a careless widening breaks, and nothing else tests it.
+#[tokio::test]
+async fn a_contested_identity_names_its_winner_and_an_uncontested_one_stays_silent() {
+    // Two handles, two distinct identities: no contest anywhere.
+    let labels = Arc::new(Mutex::new(HashMap::from([
+        ("H1".to_string(), Some("A".to_string())),
+        ("H2".to_string(), Some("B".to_string())),
+    ])));
+    let registry = Registry::new(vec![Box::new(LabelProvider {
+        labels: Arc::clone(&labels),
+    })]);
+    tick(&registry).await;
+    let separate = registry.get_usage(None).await;
+    assert_eq!(separate.len(), 2, "two identities, two rows");
+    assert!(
+        registry.dedup_winner.lock().unwrap().is_empty(),
+        "an identity served by one slot has no contest to report"
+    );
+
+    // Now both handles resolve the same identity: one row, and a contest behind it.
+    labels.lock().unwrap().insert("H2".into(), Some("A".into()));
+    force_due(&registry, "multi");
+    tick(&registry).await;
+    let contested = registry.get_usage(None).await;
+    assert_eq!(contested.len(), 1, "one identity, one row");
+    let winners = registry.dedup_winner.lock().unwrap().clone();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly the contested identity is recorded: {winners:?}"
+    );
+    let winner = winners.get("A").expect("the contested identity");
+    assert!(
+        winner.contains("H1") || winner.contains("H2"),
+        "the winner names the handle that served the row, not a provider: {winner}"
+    );
+}
+
 #[tokio::test]
 async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
     // The mixed case: one handle resolves an account and the other cannot. The

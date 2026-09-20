@@ -471,6 +471,21 @@ pub struct Registry {
     providers: Vec<RegisteredProvider>,
     store: Mutex<SlotStore>,
     last_admitted_provider: Mutex<Option<usize>>,
+    /// Which slot last won the read-time dedup, for identities several slots
+    /// compete for. Diagnostic only: nothing branches on it.
+    ///
+    /// WHY HERE AND NOT IN A PROVIDER. When several credentials resolve the same
+    /// account, each is an independent slot fetched on its own schedule, and the
+    /// row a consumer sees is whichever slot wins HERE. A provider cannot see that
+    /// -- by the time one answers, the competition has not happened yet.
+    ///
+    /// This cost two multi-turn investigations in one evening. Both ended by
+    /// elimination across lanes rather than by reading anything, and one ended
+    /// with the mechanism still unverified, because a row alternating between two
+    /// slots and a row whose single slot changes lane are INDISTINGUISHABLE from
+    /// the wire: same provider, same account, same `source`, a value time that
+    /// steps backwards.
+    dedup_winner: Mutex<std::collections::HashMap<String, String>>,
     credential_source: Option<Arc<dyn CredentialSource>>,
 }
 
@@ -499,6 +514,7 @@ impl Registry {
             providers,
             store: Mutex::new(SlotStore::new(Instant::now())),
             last_admitted_provider: Mutex::new(None),
+            dedup_winner: Mutex::new(std::collections::HashMap::new()),
             credential_source: None,
         }
     }
@@ -852,6 +868,7 @@ impl Registry {
             }
 
             let mut candidates: HashMap<String, (&SlotKey, &ProviderSlot)> = HashMap::new();
+            let mut contenders: HashMap<String, usize> = HashMap::new();
             // Set by the emission walk itself. A slot that is skipped here is an
             // account this response does not mention, and a consumer cannot tell
             // that from the account having been removed -- so any skip forfeits
@@ -960,6 +977,7 @@ impl Registry {
                 // there is nothing left for fetch time to separate. Caught only
                 // because the test observed the flip through a fixture that gives
                 // the two handles different source labels.
+                *contenders.entry(account_id.to_string()).or_insert(0) += 1;
                 let should_replace = match candidates.get(account_id) {
                     Some((current_key, current)) => {
                         let rank = service_rank(slot.status).cmp(&service_rank(current.status));
@@ -976,6 +994,44 @@ impl Registry {
                 if should_replace {
                     candidates.insert(account_id.to_string(), (key, slot));
                 }
+            }
+            // ATTRIBUTE THE WINNER, for identities more than one slot competed for.
+            //
+            // Only where there was a contest: a single-slot account has no winner
+            // worth naming, and logging one would put a line per account on every
+            // poll, which is the cadence at which output stops being read.
+            //
+            // On change, for the same reason. The contest is re-run on every read
+            // and its outcome is usually the same slot; what explains a downstream
+            // anomaly is the moment it CHANGES -- a `fetchedAt` that steps
+            // backwards, or a drop flagged non-continuous, is this line's event
+            // seen from the other side.
+            for (account_id, (key, slot)) in &candidates {
+                if contenders.get(account_id).copied().unwrap_or(0) < 2 {
+                    continue;
+                }
+                let winner = format!("{} [{}]", key.handle.stable_id(), key.provider);
+                let Ok(mut seen) = self.dedup_winner.lock() else {
+                    break;
+                };
+                let changed = seen
+                    .get(account_id)
+                    .is_some_and(|previous| previous != &winner);
+                if changed {
+                    eprintln!(
+                        "{tag} {provider} dedup winner changed for {account_id}: \
+                         now {winner}, reading {reading} \
+                         (several credentials resolve this account; the row follows \
+                         whichever holds the newest reading)",
+                        tag = LOG_TAG,
+                        provider = name,
+                        reading = slot
+                            .last_success_wall
+                            .map(rfc3339_canonical)
+                            .unwrap_or_else(|| "none".to_string()),
+                    );
+                }
+                seen.insert(account_id.clone(), winner);
             }
             let mut selected: Vec<_> = candidates.into_iter().collect();
             selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.sort_cmp(&right.handle));
