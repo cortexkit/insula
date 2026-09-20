@@ -1600,7 +1600,79 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
 /// malformed reply and, worse, would make the empty case fail closed exactly
 /// where the wire is trying to tell us something specific. `view` is present on
 /// every success and on no error.
+/// Why a `list_scoped` body could not be read, for the log line only.
+///
+/// EVERY ARM HERE USED TO RENDER AS THE SAME WORD. That cost a whole evening: a
+/// deploy emptied the lane set on a cold process, the only artefact was
+/// `FailClosed`, and the credential owner's audit could say the call was NOT
+/// refused while this side could only say it could not be read. Six causes, one
+/// rendering, and no way to tell from either end which had happened.
+///
+/// The reasons are deliberately shaped so a reader can act on one without asking
+/// anybody: an empty body is a transport question, absent `view` is a producer
+/// shape question, a rejected row is a schema question naming the field.
+fn describe_list_scoped_failure(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "the frame carried no body at all".to_string();
+    }
+    let response: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return format!("the body is not JSON ({} bytes): {error}", body.len());
+        }
+    };
+    let Some(result) = response.get("result").and_then(Value::as_object) else {
+        return format!(
+            "no `result` object; top-level keys were [{}]",
+            response
+                .as_object()
+                .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| "<not an object>".to_string())
+        );
+    };
+    let keys = result.keys().cloned().collect::<Vec<_>>().join(", ");
+    match (result.contains_key("view"), result.contains_key("error")) {
+        // THE ONE I WOULD BET ON, and the reason this function exists. Success is
+        // detected by the presence of `view`, which the producer documents as a
+        // digest over the visible rows -- so a reply that omits it when nothing
+        // moved is neither success nor error to this decoder, and a perfectly good
+        // inventory is thrown away as unreadable.
+        (false, false) => format!(
+            "neither `view` nor `error` present, so the reply reads as neither \
+             success nor refusal; keys were [{keys}]"
+        ),
+        (true, true) => format!("both `view` and `error` present; keys were [{keys}]"),
+        (true, false) => {
+            match serde_json::from_value::<ScopedListResult>(Value::Object(result.clone())) {
+                Err(error) => format!("a success reply did not match the schema: {error}"),
+                Ok(decoded) if decoded.grants.is_none() => {
+                    format!("`grants` absent from a success reply; keys were [{keys}]")
+                }
+                Ok(decoded) if decoded.credentials.is_none() => {
+                    format!("`credentials` absent from a success reply; keys were [{keys}]")
+                }
+                Ok(_) => "the body decodes; this reason should be unreachable".to_string(),
+            }
+        }
+        (false, true) => "an error reply did not match the schema".to_string(),
+    }
+}
+
 fn decode_list_scoped_response(body: &[u8]) -> Result<CompleteScopedListResult, VaultGetError> {
+    let decoded = decode_list_scoped_inner(body);
+    if decoded.is_err() {
+        // NOT GATED ON A VERBOSITY FLAG. It fires only when an enumeration is
+        // already being thrown away, and the cost of that silence has been
+        // measured once.
+        eprintln!(
+            "{LOG_TAG} list_scoped body unreadable: {}",
+            describe_list_scoped_failure(body)
+        );
+    }
+    decoded
+}
+
+fn decode_list_scoped_inner(body: &[u8]) -> Result<CompleteScopedListResult, VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
     let result = response
         .get("result")
@@ -3485,6 +3557,63 @@ mod drop_counter_tests {
         let oauth = &decoded.credentials[0];
         assert_eq!(oauth.account_id.as_deref(), Some("acct-1"));
         assert_eq!(oauth.record_version, 1);
+    }
+
+    /// Every way a `list_scoped` body can be unreadable names itself.
+    ///
+    /// The point is DISCRIMINATION, not coverage: six causes rendered as the
+    /// single word `FailClosed`, and an evening was spent asking the credential
+    /// owner a question their audit structurally could not answer while the
+    /// discriminator sat in this frame the whole time.
+    ///
+    /// The absent-`view` arm is the one with a live suspect behind it. Success is
+    /// detected by that key alone, and the producer documents it as a digest over
+    /// visible rows -- so a reply omitting it when nothing moved reads as neither
+    /// success nor refusal and a good inventory is discarded.
+    #[test]
+    fn an_unreadable_scoped_body_names_which_way_it_was_unreadable() {
+        let reasons = [
+            (&b""[..], "no body at all"),
+            (&b"not json at all"[..], "not JSON"),
+            (&br#"{"oops":1}"#[..], "no `result` object"),
+            (
+                &br#"{"result":{"credentials":[],"grants":1}}"#[..],
+                "neither `view` nor `error`",
+            ),
+            (
+                &br#"{"result":{"view":"v","credentials":[]}}"#[..],
+                "`grants` absent",
+            ),
+            (
+                &br#"{"result":{"view":"v","grants":1}}"#[..],
+                "`credentials` absent",
+            ),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for (body, expected) in reasons {
+            let reason = describe_list_scoped_failure(body);
+            assert!(
+                reason.contains(expected),
+                "a body that is {expected} should say so, said: {reason}"
+            );
+            assert!(
+                decode_list_scoped_inner(body).is_err(),
+                "the describer must only ever explain a body the decoder rejects"
+            );
+            seen.push(reason);
+        }
+
+        // THE LOAD-BEARING HALF. Six distinct strings, not six calls that happen
+        // to pass: collapse any two arms into one message and this fails, which
+        // is exactly the defect being fixed rather than a restatement of it.
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "two causes share a rendering, which is the whole defect: {seen:#?}"
+        );
     }
 
     #[test]
