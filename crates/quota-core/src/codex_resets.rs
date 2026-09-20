@@ -1193,6 +1193,29 @@ impl ResetCoordinator {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // THIS IS A FAST PATH, NOT THE FENCE, and the difference is worth
+            // knowing before anyone rearranges either half.
+            //
+            // Measured 2026-09-20: replacing this condition with `false` -- so a
+            // second concurrent caller walks straight past it -- reddens NOTHING.
+            // The journal's durable 30-minute spend bound catches it one layer
+            // down, and forcing THAT open reddens four tests by name, including
+            // `registry_scheduler_two_codex_units_same_account_send_one_consume_post`
+            // and its real-provider twin.
+            //
+            // So the dangerous edit is the opposite of the one it looks like.
+            // Deleting this costs a little redundant journal I/O and a worse
+            // `pending` signal. Weakening the journal bound while trusting this to
+            // cover it SPENDS A CREDIT TWICE -- and the state mutex here is held
+            // only until the POST is awaited, so it cannot serialise anything
+            // across a restart, which is precisely the window the journal exists
+            // for.
+            //
+            // The condition that makes this live rather than theoretical: one
+            // account can be served by two slots (a local lane and a vault handle
+            // resolving the same identity), and the refresher fetches due slots
+            // concurrently. Confirmed on this host by the dedup census --
+            // codex 7b66addd is contested right now.
             if account_state.in_flight {
                 let trigger = evaluate_trigger(&TriggerInput {
                     armed: true,
