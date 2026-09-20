@@ -71,12 +71,18 @@ checker was a day older than the module and printed `findings: none`.
 If you want the binaries on disk, `cargo build --release --examples` is the form
 that actually produces them.
 
-The binary, the module id and this repository are all `insula` — but three paths
+The binary, the module id and this repository are all `insula` — but two paths
 on disk are still named `ck-quota` and are **not** leftovers: the redemption
-journal, the quota config, and the vault handle file. Each comes from its own
-hardcoded literal, none is derived from the binary or the module id, and each is
-load-bearing. Renaming any of them is a migration, not a tidy: see the note in
+journal and the quota config. Each comes from its own hardcoded literal, neither
+is derived from the binary or the module id, and each is load-bearing. Renaming
+either is a migration, not a tidy: see the note in
 `crates/quota-module/Cargo.toml` for what the journal one costs.
+
+Credential enrollment is not a deploy step. The module enumerates the scoped
+grant once per scheduler turn and installs that inventory itself. Adding an
+account is a login and nothing else: do not edit a handle file and do not run
+`ck auth mint-handle`. A new credential becomes visible to `ck quota` within two
+scheduler ticks when the grant covers it.
 
 Step 5 exists because steps 4 and 6 cannot see an absent lane. Both check that
 what is published is self-consistent, and a set that shrinks stays consistent —

@@ -1,474 +1,878 @@
-//! Check that every configured vault credential is actually serving usage.
+//! Check that every credential in the module's installed scoped snapshot reaches
+//! a serving vault lane.
 //!
-//! ## Why this exists
+//! The snapshot is read from the module's health report through the daemon. This
+//! process deliberately does not enumerate the vault: a standalone client has a
+//! direct principal, while `credential.list_scoped` is authorised only on the
+//! supervised module's `reserved:insula` route. It also runs no refresher of its
+//! own, so its configured set cannot drift from the snapshot the deployed module
+//! actually installed.
 //!
-//! The module's other checks all measure internal agreement — health buckets
-//! that sum, an envelope whose fields do not contradict each other, a build
-//! stamp matching a commit. None of them answers *did something stop being
-//! served*, because **a set that shrinks stays consistent**: providers that
-//! vanish move between buckets and every total still balances.
+//! Four counts describe different populations and are always printed separately:
+//! `enumerated` credential rows, routed `(credential_id, provider)` pairs,
+//! distinct expected providers after precedence suppression, and providers the
+//! checker actually examined.
 //!
-//! That gap has been reached in production. The credential vault's daemon module
-//! id changed, this module kept dialling the old one, and every vault-served
-//! account went dark for hours while the health status read `ok`, the
-//! conservation identity held exactly, and the wire-sanity checker found nothing
-//! to report. A wrong module id answers `unknown_module`, which is classified
-//! transient because a restarting module answers identically, so the refresher
-//! retried forever and never reached a verdict anyone could see.
-//!
-//! ## What it checks
-//!
-//! The credential handle file is the declared intent: each key is a credential
-//! this host is configured to use. This walks those keys, maps each to the
-//! provider that consumes it, and asserts the deployed module is serving usage
-//! on that provider's vault lane.
-//!
-//! It is deliberately **discriminating** rather than a health reading — it fails
-//! when a lane is dark, and it cannot pass for the wrong reason, because the
-//! evidence it requires (a `source` of `vault` on an entry carrying usage) is
-//! producible only by a live credential fetch.
-//!
-//! ## Scope, stated so a clean run is not over-read
-//!
-//! A provider is counted as serving when *any* of its vault handles resolved.
-//! Per-handle attribution is not always possible on the wire: several providers
-//! resolve no account identity, so their handles are indistinguishable once
-//! emitted. This therefore catches a lane that is entirely dark — which is the
-//! failure that has actually happened — and not the loss of one handle among
-//! several for the same provider.
-//!
-//! **A provider with a second, non-vault lane is not covered.** Where a provider
-//! can reach its upstream another way, that lane keeps the entry present and
-//! sourced to itself, so a dark vault lane is invisible here. Such providers are
-//! listed in [`DUAL_LANE`] with the reason, and they are reported rather than
-//! silently skipped — a checker that omits a member without saying so is
-//! indistinguishable from one that examined it.
+//! Exit 0 means checked and clean, 1 means checked with findings, and 2 means no
+//! defensible verdict was possible.
 //!
 //! Run against the deployed module through the daemon:
 //! `cargo run -p quota-module --example vault-lanes`
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-// Reached through `quota_core` rather than as a direct dependency, so this
-// decodes with the exact type the module serves. A separate dependency line
-// could drift to a different version of the shared crate and still compile.
 use quota_core::model::ProviderUsage;
+use serde_json::Value;
+use subc_daemon::Frame;
+use subc_protocol::{BindIdentity, FrameType, RouteTarget};
+use subc_transport::{authenticate_client, connection_file};
+use tokio::net::TcpStream;
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-/// Where the daemon writes its connection file. Overridable so this can be
-/// pointed at a non-default daemon.
-fn connection_file() -> PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").expect("HOME must be set");
-    PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
-
-/// Providers that can serve from something other than a stored credential.
+/// Providers where a non-vault lane takes precedence over a vault lane.
 ///
-/// Requiring a `vault` source from these produces a false alarm whenever the
-/// other lane is healthy, and a checker that cries wolf on a working provider
-/// stops being read — which costs more than the coverage it buys, because the
-/// failure this exists to catch takes down *every* stored lane at once and the
-/// remaining providers still prove it.
-/// Providers that can serve from something other than a stored credential.
-///
-/// Requiring a `vault` source from these produces a false alarm whenever the
-/// other lane is healthy, and a checker that cries wolf on a working provider
-/// stops being read -- which costs more than the coverage it buys, because the
-/// failure this exists to catch takes down *every* stored lane at once and the
-/// remaining providers still prove it.
-///
-/// EVERY ENTRY IS CHECKED AGAINST THE PROVIDER IT DESCRIBES, by
-/// [`stale_exemptions`]. One entry here (grok) outlived its reason within hours:
-/// it said "a local opencode oauth token reaches the same account", which stopped
-/// being true when grok moved to vault-only custody the same day. The checker
-/// went on exempting a provider it could by then verify and printed
-/// `checked 4 of 6` -- a sentence that reads as a fact about the host rather than
-/// a fact about a table nobody re-read.
-///
-/// It failed SAFE, which is why it was invisible: under-reporting coverage raises
-/// no alarm, so nothing pressures anyone to re-read it. An operator caught it by
-/// reading this file against the commit that invalidated it.
+/// These remain visible in the routed-pair count but are omitted from the
+/// expected-provider count because the published row can truthfully carry the
+/// winning non-vault source. The checker still verifies that the premise is
+/// visible on the wire; an exemption with no non-vault row is a finding.
 const DUAL_LANE: &[(&str, &str)] = &[(
     "antigravity",
     "a local editor process is probed first and wins when both are healthy",
 )];
 
-/// Entries in [`DUAL_LANE`] whose premise no longer holds.
+/// Enumerated ids intentionally unsupported by this module.
 ///
-/// Every reason there is a claim about one thing: the provider enumerates a lane
-/// BESIDE its vault handles, so the read-time dedup can publish the other lane's
-/// source. Ask the provider. If it enumerates only vault handles, the exemption
-/// is suppressing a check that would now pass, and that is a finding rather than
-/// a note -- the whole point is that a silent exemption is a lane which has
-/// quietly stopped being verified.
-///
-/// NOT A REPLACEMENT FOR THE TABLE, and the difference is load-bearing. Deriving
-/// the exemption outright ("two lanes exist, so skip") also catches codex, whose
-/// second lane is a DIFFERENT ACCOUNT rather than a competing lane for the same
-/// one -- measured on this host: codex publishes two rows with two identities,
-/// one `vault` and one `oauth`, so requiring a vault-sourced row is meaningful
-/// there and skipping it would lose a real check. Coexistence is necessary for
-/// the exemption and not sufficient; what antigravity's entry actually records is
-/// PRECEDENCE, which cannot be observed without re-running the dedup.
-fn stale_exemptions(registry: &quota_core::Registry) -> Vec<&'static str> {
-    let dual = registry.providers_with_a_lane_beside_vault();
-    DUAL_LANE
-        .iter()
-        .map(|(name, _)| *name)
-        .filter(|name| !dual.contains(name))
-        .collect()
+/// Exact ids only. A prefix exemption would hide a new routing-table defect for
+/// another credential in the same vendor family.
+const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[(
+    "apikey:openai",
+    "a platform API key cannot feed the ChatGPT-subscription Codex lane",
+)];
+
+fn connection_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
 }
 
-/// Maps a credential handle key to every provider that consumes it.
-///
-/// Keys are matched by prefix because the vault mints additional accounts for a
-/// family as `<base>:<label>` — `oauth:anthropic:ufuk2` alongside
-/// `oauth:anthropic`. Exact matching here would silently ignore every secondary
-/// account, which is the same defect this checker exists to catch.
-///
-/// The family list is the library's own, not a copy. A restated one would drift,
-/// and the drift is silent in the direction that matters: a family this checker
-/// lacked would be reported as "handles no provider here consumes", which reads
-/// like a stray credential rather than a gap in the checker, so the lane it
-/// should have examined goes unchecked and the run still ends in `findings:
-/// none`.
-///
-/// Sharing it does not weaken the check. What is compared is what this host is
-/// CONFIGURED for against what the wire is SERVING, and those two remain
-/// independent of each other — a family mapped to the wrong provider still
-/// leaves the right provider with no credential, so the lane goes dark and this
-/// fires anyway.
-fn providers_for_handle(key: &str) -> Vec<&'static str> {
-    // A cookie may deliberately feed both OpenCode plans. The list is therefore
-    // collected rather than first-matched; ordinary families still yield one.
-    quota_core::vault_handles::CREDENTIAL_FAMILIES
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstalledSnapshot {
+    credential_ids: Vec<String>,
+    mapping_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotReadback {
+    Granted(InstalledSnapshot),
+    NotGranted,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageReadback {
+    entries: Vec<ProviderUsage>,
+    complete_providers: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    enumerated: usize,
+    routed: usize,
+    expected: usize,
+    checked: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckReport {
+    exit_code: i32,
+    counts: Option<Counts>,
+    lines: Vec<String>,
+}
+
+impl CheckReport {
+    fn could_not_check(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            counts: None,
+            lines: vec![format!("error: {}", message.into())],
+        }
+    }
+
+    fn print(&self) {
+        for line in &self.lines {
+            println!("{line}");
+        }
+    }
+}
+
+fn providers_for_id<'a>(credential_id: &str, families: &'a [(&str, &str)]) -> Vec<&'a str> {
+    families
         .iter()
-        .filter(|(prefix, _)| quota_core::vault_handles::handle_id_names_family(key, prefix))
+        .filter(|(prefix, _)| {
+            quota_core::vault_handles::handle_id_names_family(credential_id, prefix)
+        })
         .map(|(_, provider)| *provider)
         .collect()
 }
 
-#[tokio::main]
-async fn main() {
-    let handles_path = match std::env::var_os("CK_QUOTA_VAULT_HANDLES_PATH") {
-        Some(path) => std::path::PathBuf::from(path),
-        None => match std::env::var_os("HOME") {
-            Some(home) => {
-                std::path::PathBuf::from(home).join(".config/cortexkit/ck-quota/vault-handles.json")
-            }
-            None => {
-                eprintln!("cannot resolve HOME to find the credential handle file");
-                std::process::exit(2);
-            }
-        },
-    };
-
-    let raw = match std::fs::read_to_string(&handles_path) {
-        Ok(raw) => raw,
-        // Both outcomes are exit 2 -- neither can support a verdict -- but they
-        // are opposite conditions for whoever runs this. An absent file means no
-        // vault credentials are configured, which is the ordinary state on a host
-        // that uses none. An unreadable one means credentials may well be
-        // configured and this check cannot see them, which is a fault to fix
-        // before the result means anything. Reporting both as "no handle file"
-        // sends the second case away as normal.
-        //
-        // Exit 2 rather than 0 in either case: a clean pass would claim every
-        // configured lane is serving, which is vacuously true and
-        // indistinguishable from a real one.
-        //
-        // *** THIS ARM GOES BLIND AT THE SCOPED-GRANT CUTOVER. ***
-        //
-        // The plan deletes this file: the module will enumerate credentials from
-        // `credential.list_scoped` instead, so `ck auth login` alone makes an
-        // account appear. On that day the file is absent while ten credentials
-        // are configured, and the NotFound arm below reports the ordinary state
-        // of a host that uses no vault credentials -- exit 2, "nothing to check",
-        // which is the quietest failure available. Not an alarm, not a finding:
-        // a checker that has silently stopped verifying the lanes it exists for.
-        //
-        // Same shape as the stale DUAL_LANE exemption fixed earlier today, and
-        // the same shape CKCRED hit in their own operator probe, which demanded a
-        // capability handle before it would exercise the handle-FREE path. A tool
-        // whose input is the thing being removed encodes the assumption it exists
-        // to remove.
-        //
-        // So the cutover has a step beyond deleting the file: repoint this reader
-        // at `list_scoped` in the SAME change. Landing the deletion first leaves a
-        // window where nothing verifies the vault lanes and nothing says so.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("no credential handle file: no vault credentials configured here");
-            std::process::exit(2);
-        }
-        Err(error) => {
-            eprintln!(
-                "credential handle file exists but could not be read ({error}); \
-                 configured lanes cannot be checked until that is fixed"
-            );
-            std::process::exit(2);
-        }
-    };
-
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("credential handle file is not readable JSON: {error}");
-            std::process::exit(2);
-        }
-    };
-
-    // The module refuses this file outright for reasons a plain read cannot see:
-    // a symbolic link, group- or world-accessible permissions, anything that is
-    // not a regular file. On refusal it serves ZERO vault handles and reaps every
-    // vault lane -- so a checker that parsed the same bytes successfully would
-    // report those lanes as configured and healthy while the module served none
-    // of them, which is a clean pass asserting the opposite of the truth.
-    //
-    // Asked through the module's own loader rather than by re-implementing its
-    // refusals here, because a second copy of that logic would drift from the
-    // first and the drift would be invisible in exactly this direction.
-    let loader = quota_core::vault_handles::VaultHandleLoader::new(Some(handles_path.clone()));
-    let module_sees_any = [
-        loader.codex_handles(),
-        loader.anthropic_handles(),
-        loader.grok_handles(),
-        loader.gemini_handles(),
-        loader.antigravity_handles(),
-        loader.kimi_for_coding_handles(),
-        loader.amp_handles(),
-        loader.cursor_handles(),
-        loader.qwen_cloud_handles(),
-        loader.qoder_handles(),
-        loader.factory_handles(),
-        loader.mimo_handles(),
-        loader.ollama_handles(),
-        loader.opencode_handles(),
-        loader.opencodego_handles(),
-        loader.deepseek_handles(),
-        loader.synthetic_handles(),
-        loader.openrouter_handles(),
-    ]
-    .iter()
-    .any(|result| result.as_ref().is_ok_and(|handles| !handles.is_empty()));
-
-    let mut expected: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    let mut unmapped: Vec<String> = Vec::new();
-    if let Some(handles) = parsed.get("handles").and_then(|h| h.as_object()) {
-        if !handles.is_empty() && !module_sees_any {
-            eprintln!(
-                "the handle file names {} credential(s) and the module accepts none of \
-                 them: it is refusing the file itself, most likely a symbolic link or \
-                 group/world-accessible permissions. Every vault lane is reaped, so no \
-                 lane can be checked.",
-                handles.len()
-            );
-            std::process::exit(2);
-        }
-        for key in handles.keys() {
-            let providers = providers_for_handle(key);
-            if providers.is_empty() {
-                // An unmapped key is reported rather than ignored: it means this
-                // host is configured for a credential no provider here consumes,
-                // which is a real configuration finding and would otherwise be
-                // invisible.
-                unmapped.push(key.clone());
-            } else {
-                for provider in providers {
-                    expected.entry(provider).or_default().push(key.clone());
+fn find_module_metrics<'a>(value: &'a Value, module_id: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            let is_target = map
+                .get("module_id")
+                .or_else(|| map.get("id"))
+                .and_then(Value::as_str)
+                == Some(module_id);
+            if is_target {
+                if let Some(metrics) = map.get("health").and_then(|health| health.get("metrics")) {
+                    return Some(metrics);
+                }
+                if let Some(metrics) = map.get("metrics") {
+                    return Some(metrics);
                 }
             }
+            map.values()
+                .find_map(|child| find_module_metrics(child, module_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| find_module_metrics(child, module_id)),
+        _ => None,
+    }
+}
+
+fn parse_snapshot_metrics(metrics: &Value) -> Result<SnapshotReadback, String> {
+    let metrics = metrics
+        .as_object()
+        .ok_or_else(|| "module health metrics are not a JSON object".to_string())?;
+
+    match metrics.get("vaultEnumerationFailure") {
+        Some(Value::String(failure)) if failure == "principal is not granted" => {
+            return Ok(SnapshotReadback::NotGranted);
+        }
+        Some(Value::String(failure)) => {
+            let age = metrics
+                .get("retainedVaultSnapshotAgeSecs")
+                .filter(|value| !value.is_null())
+                .map(|value| format!("; retained snapshot age {value}s"))
+                .unwrap_or_default();
+            return Err(format!(
+                "scoped credential enumeration failed: {failure}{age}"
+            ));
+        }
+        Some(Value::Null) => {}
+        Some(other) => {
+            return Err(format!(
+                "vaultEnumerationFailure has unexpected shape: {other}"
+            ));
+        }
+        None => return Err("health metrics omit vaultEnumerationFailure".to_string()),
+    }
+
+    let ids = metrics
+        .get("scopedCredentialIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "health metrics omit scopedCredentialIds[]".to_string())?;
+    let credential_ids = ids
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "scopedCredentialIds contains a non-string value".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mapping_warning = match metrics.get("vaultMappingWarning") {
+        Some(Value::String(warning)) => Some(warning.clone()),
+        Some(Value::Null) | None => None,
+        Some(other) => return Err(format!("vaultMappingWarning has unexpected shape: {other}")),
+    };
+
+    Ok(SnapshotReadback::Granted(InstalledSnapshot {
+        credential_ids,
+        mapping_warning,
+    }))
+}
+
+fn counts_lines(counts: Counts) -> Vec<String> {
+    vec![
+        format!("  enumerated rows: {}", counts.enumerated),
+        format!("  routed id-provider pairs: {}", counts.routed),
+        format!("  expected providers: {}", counts.expected),
+        format!("  checked providers: {}", counts.checked),
+    ]
+}
+
+fn evaluate(
+    readback: Result<SnapshotReadback, String>,
+    usage: Result<UsageReadback, String>,
+    families: &[(&str, &str)],
+    dual_lane: &[(&str, &str)],
+    unsupported: &[(&str, &str)],
+) -> CheckReport {
+    let installed = match readback {
+        Err(error) => return CheckReport::could_not_check(error),
+        Ok(SnapshotReadback::NotGranted) => {
+            return CheckReport::could_not_check("principal is not granted");
+        }
+        Ok(SnapshotReadback::Granted(installed)) => installed,
+    };
+
+    let cursor_oauth_present = installed
+        .credential_ids
+        .iter()
+        .any(|id| quota_core::vault_handles::handle_id_names_family(id, "oauth:cursor"));
+    let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (prefix, _) in families {
+        if prefix.starts_with("cookie:") || prefix.starts_with("apikey:") {
+            identityless_families.entry(prefix).or_default();
         }
     }
-
-    if expected.is_empty() {
-        eprintln!("credential handle file names no handles this module consumes");
-        std::process::exit(2);
+    for credential_id in &installed.credential_ids {
+        for (prefix, ids) in &mut identityless_families {
+            if quota_core::vault_handles::handle_id_names_family(credential_id, prefix) {
+                ids.push(credential_id);
+            }
+        }
     }
-
-    let path = connection_file();
-    if !path.exists() {
-        eprintln!("no daemon connection file at {}", path.display());
-        eprintln!("the daemon must be running: this checks the deployed module, not a local build");
-        std::process::exit(2);
-    }
-
-    // The same client the module runs, so "which lanes does this provider
-    // enumerate" is answered by the code under test rather than by a copy of its
-    // conclusions. Enumeration never calls the source -- it only asks whether one
-    // is wired -- so this costs no vault round-trip.
-    let vault: std::sync::Arc<dyn quota_core::credential_source::CredentialSource> =
-        std::sync::Arc::new(quota_module::vault_client::VaultClient::new(path.clone()));
-    let registry = quota_core::Registry::with_defaults(
-        quota_core::config::QuotaConfig::default(),
-        Some(vault),
-    );
-    let stale_exempt = stale_exemptions(&registry);
-
-    let mut stream = common::connect_consumer(&path).await;
-    common::wait_for_catalog(&mut stream, common::MODULE_ID, Duration::from_secs(10)).await;
-    let route = common::route_open(&mut stream, &std::env::temp_dir(), 1).await;
-    let body = common::usage_get(&mut stream, route, 2).await;
-
-    let entries: Vec<ProviderUsage> = serde_json::from_value(body["result"].clone())
-        .expect("usage.get result must decode as ProviderUsage[]");
-
-    // Providers whose account set the producer fully enumerated this tick. A
-    // provider ABSENT from this list published fewer accounts than it holds,
-    // which is the failure a per-provider "did it serve at all" reading cannot
-    // see: one handle that resolves no identity collapses every sibling into a
-    // single unlabeled entry, so a provider with four configured accounts serves
-    // one row and still looks alive.
-    //
-    // The case that motivated reading it: a handle left pointing at a credential
-    // the vault no longer holds. It can never resolve, so it suppresses the
-    // labels of every healthy account beside it, permanently and silently.
-    let complete: BTreeSet<String> = body
-        .get("completeProviders")
-        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
-        .unwrap_or_default()
-        .into_iter()
+    identityless_families.retain(|_, ids| ids.len() > 1);
+    let refused_ids: BTreeSet<&str> = identityless_families
+        .values()
+        .flat_map(|ids| ids.iter().copied())
         .collect();
 
-    let mut serving_vault: BTreeSet<String> = BTreeSet::new();
-    for entry in &entries {
-        if entry.source.as_deref() == Some("vault") && entry.usage.is_some() {
-            serving_vault.insert(entry.provider.clone());
-        }
-    }
+    let mut expected: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut routed_providers = BTreeSet::new();
+    let mut unmapped = Vec::new();
+    let mut deliberately_unsupported = Vec::new();
+    let mut routed = 0;
 
-    let mut dark: Vec<(&'static str, Vec<String>)> = Vec::new();
-    let mut uncovered: Vec<(&'static str, &'static str)> = Vec::new();
-    println!("  configured vault lanes: {}", expected.len());
-    for (provider, keys) in &expected {
-        if let Some((_, reason)) = DUAL_LANE.iter().find(|(name, _)| name == provider) {
-            println!(
-                "    {:16} {:9} {} handle(s): {}",
-                provider,
-                "uncovered",
-                keys.len(),
-                keys.join(", ")
-            );
-            uncovered.push((provider, reason));
+    for credential_id in &installed.credential_ids {
+        let providers = providers_for_id(credential_id, families);
+        if providers.is_empty() {
+            if let Some((_, reason)) = unsupported
+                .iter()
+                .find(|(unsupported_id, _)| credential_id == unsupported_id)
+            {
+                deliberately_unsupported.push((credential_id.clone(), *reason));
+            } else {
+                unmapped.push(credential_id.clone());
+            }
             continue;
         }
-        let ok = serving_vault.contains(*provider);
-        println!(
-            "    {:16} {:9} {} handle(s): {}",
-            provider,
-            if ok { "serving" } else { "DARK" },
-            keys.len(),
-            keys.join(", ")
-        );
-        if !ok {
-            dark.push((provider, keys.clone()));
+
+        routed += providers.len();
+        for provider in providers {
+            routed_providers.insert(provider);
+            let precedence_suppressed = cursor_oauth_present
+                && quota_core::vault_handles::handle_id_names_family(
+                    credential_id,
+                    "cookie:cursor.com",
+                );
+            if !dual_lane.iter().any(|(name, _)| *name == provider)
+                && !precedence_suppressed
+                && !refused_ids.contains(credential_id.as_str())
+            {
+                expected
+                    .entry(provider)
+                    .or_default()
+                    .push(credential_id.clone());
+            }
         }
     }
 
-    for (provider, reason) in &uncovered {
-        println!("  not checked - {provider}: {reason}");
+    let mut counts = Counts {
+        enumerated: installed.credential_ids.len(),
+        routed,
+        expected: expected.len(),
+        checked: 0,
+    };
+
+    if counts.enumerated == 0 {
+        let mut lines = counts_lines(counts);
+        lines.push("  findings: installed scoped snapshot contains zero rows".to_string());
+        return CheckReport {
+            exit_code: 1,
+            counts: Some(counts),
+            lines,
+        };
     }
 
-    let checked = expected.len() - uncovered.len();
-    println!("  checked {checked} of {} configured lanes", expected.len());
-    if checked == 0 {
-        eprintln!("no lane was actually checked; a clean result here would be vacuous");
-        std::process::exit(2);
-    }
+    let usage = match usage {
+        Ok(usage) => usage,
+        Err(error) => return CheckReport::could_not_check(error),
+    };
 
-    // An unmapped handle is a finding, not a note. This host holds a credential
-    // that no provider consumes, so it is being maintained and refreshed while
-    // reaching no upstream -- indistinguishable, from the wire, from a lane that
-    // was never configured. Printing it beside `findings: none` and exiting 0 is
-    // the exact shape this checker exists to refuse: the fact was on screen and
-    // the exit code said everything was fine.
-    if !unmapped.is_empty() {
-        println!(
-            "  findings: {} handle(s) no provider here consumes",
-            unmapped.len()
-        );
-        for key in &unmapped {
-            println!("    {key}: configured on this host and reaching no provider");
-        }
-    }
+    let serving_vault: BTreeSet<&str> = usage
+        .entries
+        .iter()
+        .filter(|entry| entry.source.as_deref() == Some("vault") && entry.usage.is_some())
+        .map(|entry| entry.provider.as_str())
+        .collect();
 
-    // A provider serving from the vault but absent from `completeProviders`
-    // published fewer accounts than it holds. Reported separately from a dark
-    // lane because the lane is UP: it serves real usage, and only the per-account
-    // breakdown is missing, so every other reading here says it is healthy.
-    // Absence from `completeProviders` is necessary but not sufficient: several
-    // providers resolve no account identity at all -- their upstream returns no
-    // account id -- so they are permanently absent from that list while being
-    // entirely healthy. Requiring FEWER PUBLISHED ENTRIES THAN CONFIGURED
-    // HANDLES separates the two without naming any provider, which matters
-    // because the null-identity set changes as upstreams add or drop the field.
-    let mut incomplete: Vec<(&'static str, usize, usize)> = Vec::new();
-    for (provider, keys) in &expected {
-        let is_dual = DUAL_LANE.iter().any(|(name, _)| name == provider);
-        if is_dual || !serving_vault.contains(*provider) || complete.contains(*provider) {
+    let mut dark = Vec::new();
+    let mut incomplete = Vec::new();
+    for (provider, credential_ids) in &expected {
+        counts.checked += 1;
+        if !serving_vault.contains(provider) {
+            dark.push((*provider, credential_ids.clone()));
             continue;
         }
-        let published = entries
+        if usage.complete_providers.contains(*provider) {
+            continue;
+        }
+        let published = usage
+            .entries
             .iter()
             .filter(|entry| entry.provider == *provider)
             .count();
-        if published < keys.len() {
-            incomplete.push((provider, published, keys.len()));
-        }
-    }
-    if !incomplete.is_empty() {
-        println!(
-            "  findings: {} provider(s) serving with an incomplete account set",
-            incomplete.len()
-        );
-        for (provider, published, configured) in &incomplete {
-            println!(
-                "    {provider}: {published} entr(ies) published against {configured} configured \
-                 handle(s); a handle that resolves no account identity collapses its healthy \
-                 siblings into one unlabeled row"
-            );
+        if published < credential_ids.len() {
+            incomplete.push((*provider, published, credential_ids.len()));
         }
     }
 
-    // A STALE EXEMPTION IS A FINDING, NOT A NOTE. It suppresses a check that
-    // would now pass, so the lane it covers has quietly stopped being verified --
-    // and because under-reporting coverage raises no alarm, nothing else will ever
-    // surface it. Printed with the remedy so the next reader is not left deciding
-    // which of the exemptions is still load-bearing.
-    if !stale_exempt.is_empty() {
-        println!(
-            "  findings: {} stale exemption(s) in DUAL_LANE",
-            stale_exempt.len()
-        );
-        for provider in &stale_exempt {
-            println!(
-                "    {provider}: enumerates only vault handles now, so its exemption suppresses \
-                 a check that would pass; delete its DUAL_LANE entry"
-            );
-        }
+    let stale_exemptions: Vec<(&str, &str)> = dual_lane
+        .iter()
+        .copied()
+        .filter(|(provider, _)| routed_providers.contains(provider))
+        .filter(|(provider, _)| {
+            !usage.entries.iter().any(|entry| {
+                entry.provider == *provider
+                    && entry
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source != "vault")
+            })
+        })
+        .collect();
+
+    let mut lines = counts_lines(counts);
+    for (credential_id, reason) in &deliberately_unsupported {
+        lines.push(format!(
+            "  unsupported: {credential_id}: {reason}; no lane is expected"
+        ));
+    }
+    for credential_id in &unmapped {
+        lines.push(format!(
+            "  finding: {credential_id}: enumerated but no credential family maps it"
+        ));
+    }
+    for (family, credential_ids) in &identityless_families {
+        lines.push(format!(
+            "  finding: {family}: multiple identity-less credential rows are refused: {}",
+            credential_ids.join(", ")
+        ));
+    }
+    if let Some(warning) = &installed.mapping_warning {
+        lines.push(format!("  snapshot mapping warning: {warning}"));
+    }
+    for (provider, credential_ids) in &dark {
+        lines.push(format!(
+            "  finding: {provider}: DARK with {} credential row(s): {}",
+            credential_ids.len(),
+            credential_ids.join(", ")
+        ));
+    }
+    for (provider, published, configured) in &incomplete {
+        lines.push(format!(
+            "  finding: {provider}: published {published} entr(ies) for {configured} credential row(s)"
+        ));
+    }
+    for (provider, reason) in &stale_exemptions {
+        lines.push(format!(
+            "  finding: stale DUAL_LANE exemption for {provider}: no non-vault row proves `{reason}`"
+        ));
     }
 
-    if dark.is_empty() {
-        if unmapped.is_empty() && incomplete.is_empty() && stale_exempt.is_empty() {
-            println!("  findings: none");
-            return;
-        }
-        std::process::exit(1);
+    let findings = unmapped.len()
+        + identityless_families.len()
+        + dark.len()
+        + incomplete.len()
+        + stale_exemptions.len();
+    if counts.checked == 0 && findings == 0 {
+        lines.push(
+            "error: no provider was actually checked; a clean result would be vacuous".into(),
+        );
+        return CheckReport {
+            exit_code: 2,
+            counts: Some(counts),
+            lines,
+        };
     }
 
-    println!("  findings: {} lane(s) dark", dark.len());
-    for (provider, keys) in &dark {
-        println!(
-            "    {provider}: configured with {} handle(s) and serving no vault usage \
-             — check the credential vault's module id against the daemon config",
-            keys.len()
-        );
+    if findings == 0 {
+        lines.push("  findings: none".to_string());
+        CheckReport {
+            exit_code: 0,
+            counts: Some(counts),
+            lines,
+        }
+    } else {
+        lines.push(format!("  findings: {findings}"));
+        CheckReport {
+            exit_code: 1,
+            counts: Some(counts),
+            lines,
+        }
     }
-    std::process::exit(1);
+}
+
+async fn connect_to_daemon(path: &Path) -> Result<TcpStream, String> {
+    let info = connection_file::read(path)
+        .map_err(|error| format!("could not read daemon connection file: {error}"))?;
+    let endpoint = info
+        .endpoints
+        .first()
+        .ok_or_else(|| "daemon connection file contains no endpoints".to_string())?;
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .map_err(|error| format!("could not connect to daemon: {error}"))?;
+    authenticate_client(&mut stream, &info, Duration::from_secs(2))
+        .await
+        .map_err(|error| format!("daemon authentication failed: {error}"))?;
+    Ok(stream)
+}
+
+fn frame_error(context: &str, frame: &Frame) -> String {
+    let detail = String::from_utf8_lossy(&frame.body);
+    format!("{context} returned a daemon route error: {detail}")
+}
+
+async fn read_installed_snapshot(stream: &mut TcpStream) -> Result<SnapshotReadback, String> {
+    let frame =
+        common::control_rpc(stream, 1, serde_json::json!({ "op": "supervisor.health" })).await;
+    if frame.header.ty == FrameType::Error {
+        return Err(frame_error("supervisor.health", &frame));
+    }
+    if frame.header.ty != FrameType::Response {
+        return Err(format!(
+            "supervisor.health returned unexpected frame {:?}",
+            frame.header.ty
+        ));
+    }
+    let body: Value = serde_json::from_slice(&frame.body)
+        .map_err(|error| format!("supervisor.health reply was not JSON: {error}"))?;
+    let metrics = find_module_metrics(&body, common::MODULE_ID).ok_or_else(|| {
+        format!(
+            "supervisor.health carried no metrics for {}",
+            common::MODULE_ID
+        )
+    })?;
+    parse_snapshot_metrics(metrics)
+}
+
+async fn open_usage_route(stream: &mut TcpStream) -> Result<common::Route, String> {
+    let project_root = std::env::current_dir()
+        .map_err(|error| format!("could not resolve checker working directory: {error}"))?;
+    let identity = BindIdentity::new(project_root, "vault-lanes", "readback-check");
+    let target = RouteTarget::ManagementSurface {
+        module_id: common::MODULE_ID.to_string(),
+    };
+    let frame = common::control_rpc(
+        stream,
+        2,
+        serde_json::json!({
+            "op": "route.open",
+            "target": target,
+            "identity": identity,
+        }),
+    )
+    .await;
+    if frame.header.ty == FrameType::Error {
+        return Err(frame_error("route.open", &frame));
+    }
+    if frame.header.ty != FrameType::Response {
+        return Err(format!(
+            "route.open returned unexpected frame {:?}",
+            frame.header.ty
+        ));
+    }
+    let body: Value = serde_json::from_slice(&frame.body)
+        .map_err(|error| format!("route.open reply was not JSON: {error}"))?;
+    let channel = body
+        .get("route_channel")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "route.open reply omitted route_channel".to_string())?;
+    let epoch = body
+        .get("route_epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "route.open reply omitted route_epoch".to_string())?;
+    Ok(common::Route {
+        channel: channel as u16,
+        epoch: epoch as u32,
+    })
+}
+
+async fn read_usage(stream: &mut TcpStream, route: common::Route) -> Result<UsageReadback, String> {
+    let frame = common::raw_route_frame(
+        stream,
+        route,
+        3,
+        serde_json::json!({ "method": "usage.get", "params": {} }),
+    )
+    .await;
+    if frame.header.ty == FrameType::Error {
+        return Err(frame_error("usage.get", &frame));
+    }
+    if frame.header.ty != FrameType::Response {
+        return Err(format!(
+            "usage.get returned unexpected frame {:?}",
+            frame.header.ty
+        ));
+    }
+    let body: Value = serde_json::from_slice(&frame.body)
+        .map_err(|error| format!("usage.get reply was not JSON: {error}"))?;
+    let entries = serde_json::from_value::<Vec<ProviderUsage>>(
+        body.get("result")
+            .cloned()
+            .ok_or_else(|| "usage.get reply omitted result[]".to_string())?,
+    )
+    .map_err(|error| format!("usage.get result did not decode: {error}"))?;
+    let complete_providers = body
+        .get("completeProviders")
+        .cloned()
+        .map(serde_json::from_value::<Vec<String>>)
+        .transpose()
+        .map_err(|error| format!("completeProviders did not decode: {error}"))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    Ok(UsageReadback {
+        entries,
+        complete_providers,
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let path = connection_file_path();
+    if !path.exists() {
+        eprintln!("error: no daemon connection file at {}", path.display());
+        std::process::exit(2);
+    }
+    let mut stream = match connect_to_daemon(&path).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let readback = read_installed_snapshot(&mut stream).await;
+    let usage = match &readback {
+        Ok(SnapshotReadback::Granted(snapshot)) if !snapshot.credential_ids.is_empty() => {
+            match open_usage_route(&mut stream).await {
+                Ok(route) => read_usage(&mut stream, route).await,
+                Err(error) => Err(error),
+            }
+        }
+        _ => Ok(UsageReadback::default()),
+    };
+
+    let report = evaluate(
+        readback,
+        usage,
+        quota_core::vault_handles::CREDENTIAL_FAMILIES,
+        DUAL_LANE,
+        ENUMERATED_UNSUPPORTED,
+    );
+    report.print();
+    if report.exit_code != 0 {
+        std::process::exit(report.exit_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quota_core::model::Usage;
+
+    fn healthy(provider: &str, source: &str) -> ProviderUsage {
+        ProviderUsage::healthy(provider, None, source, Usage::default())
+    }
+
+    fn granted(ids: &[&str]) -> Result<SnapshotReadback, String> {
+        Ok(SnapshotReadback::Granted(InstalledSnapshot {
+            credential_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+            mapping_warning: None,
+        }))
+    }
+
+    fn usage(entries: Vec<ProviderUsage>) -> Result<UsageReadback, String> {
+        Ok(UsageReadback {
+            entries,
+            complete_providers: BTreeSet::new(),
+        })
+    }
+
+    #[test]
+    fn installed_health_snapshot_drives_the_checker_without_a_local_refresher() {
+        let metrics = serde_json::json!({
+            "scopedCredentialIds": ["oauth:anthropic", "oauth:anthropic:second"],
+            "vaultEnumerationFailure": null,
+            "retainedVaultSnapshotAgeSecs": null,
+            "vaultMappingWarning": null,
+        });
+        let readback = parse_snapshot_metrics(&metrics);
+        let report = evaluate(
+            readback,
+            usage(vec![healthy("claude", "vault"), healthy("claude", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+
+        assert_eq!(report.exit_code, 0, "{report:?}");
+        assert_eq!(report.counts.unwrap().enumerated, 2);
+    }
+
+    #[test]
+    fn all_four_populations_are_counted_separately() {
+        let report = evaluate(
+            granted(&[
+                "cookie:opencode.ai",
+                "oauth:anthropic",
+                "oauth:anthropic:second",
+                "oauth:anthropic:third",
+                "antigravity:google",
+            ]),
+            usage(vec![
+                healthy("opencode", "vault"),
+                healthy("opencodego", "vault"),
+                healthy("claude", "vault"),
+                healthy("claude", "vault"),
+                healthy("claude", "vault"),
+                healthy("antigravity", "local"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        let counts = report.counts.expect("a checked report has counts");
+
+        assert_eq!(counts.enumerated, 5);
+        assert_eq!(counts.routed, 6);
+        assert_eq!(counts.expected, 3);
+        assert_eq!(counts.checked, 3);
+        assert_eq!(report.exit_code, 0, "{report:?}");
+    }
+
+    #[test]
+    fn readback_and_route_failures_exit_two_and_print_the_error() {
+        let readback_failure = evaluate(
+            parse_snapshot_metrics(&serde_json::json!({
+                "scopedCredentialIds": ["retained"],
+                "vaultEnumerationFailure": "health readback failed",
+                "retainedVaultSnapshotAgeSecs": 17,
+            })),
+            usage(Vec::new()),
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(readback_failure.exit_code, 2);
+        assert!(readback_failure
+            .lines
+            .join("\n")
+            .contains("health readback failed; retained snapshot age 17s"));
+
+        let route_failure = evaluate(
+            granted(&["oauth:anthropic"]),
+            Err("route.open returned unknown_module".into()),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(route_failure.exit_code, 2);
+        assert!(route_failure
+            .lines
+            .join("\n")
+            .contains("route.open returned unknown_module"));
+    }
+
+    #[test]
+    fn zero_grants_and_zero_rows_have_distinct_exit_contracts() {
+        let not_granted = evaluate(
+            parse_snapshot_metrics(&serde_json::json!({
+                "scopedCredentialIds": ["retained"],
+                "vaultEnumerationFailure": "principal is not granted",
+                "retainedVaultSnapshotAgeSecs": 17,
+            })),
+            usage(Vec::new()),
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(not_granted.exit_code, 2);
+        assert!(not_granted
+            .lines
+            .join("\n")
+            .contains("principal is not granted"));
+
+        let empty = evaluate(granted(&[]), usage(Vec::new()), &[], &[], &[]);
+        assert_eq!(empty.exit_code, 1);
+        assert_eq!(empty.counts.unwrap().enumerated, 0);
+    }
+
+    #[test]
+    fn unknown_ids_fail_but_the_exact_unsupported_id_is_reported_cleanly() {
+        let unknown = evaluate(
+            granted(&["oauth:anthropic", "oauth:unknown-vendor"]),
+            usage(vec![healthy("claude", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(unknown.exit_code, 1, "{unknown:?}");
+
+        let unsupported = evaluate(
+            Ok(SnapshotReadback::Granted(InstalledSnapshot {
+                credential_ids: vec!["oauth:anthropic".into(), "apikey:openai".into()],
+                mapping_warning: Some(
+                    "ignored ids outside supported vault mapping [apikey:openai]".into(),
+                ),
+            })),
+            usage(vec![healthy("claude", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(unsupported.exit_code, 0, "{unsupported:?}");
+
+        // THE EXEMPTION IS BY EXACT ID, AND THIS IS WHAT PROVES IT.
+        //
+        // A SECOND unmapped id in the SAME vendor family as the exempted one. Widen
+        // the match from equality to a `apikey:` prefix and this row is silently
+        // excused with the first, so a genuine routing gap exits 0 under a confident
+        // coverage count. Verified against the live vault before writing it: this
+        // host holds `apikey:amazon-bedrock` and `apikey:apns-alfonso` beside
+        // `apikey:openai`, so the widened match would hide real rows rather than a
+        // hypothetical one.
+        //
+        // Without this case the fixture holds exactly one `apikey:` id -- the
+        // exempted one -- so exact and prefix matching are indistinguishable and the
+        // constant's own doc comment ("Exact ids only") has no defender.
+        let sibling_in_the_same_family = evaluate(
+            Ok(SnapshotReadback::Granted(InstalledSnapshot {
+                credential_ids: vec![
+                    "oauth:anthropic".into(),
+                    "apikey:openai".into(),
+                    "apikey:amazon-bedrock".into(),
+                ],
+                mapping_warning: Some(
+                    "ignored ids outside supported vault mapping [apikey:amazon-bedrock, apikey:openai]"
+                        .into(),
+                ),
+            })),
+            usage(vec![healthy("claude", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(
+            sibling_in_the_same_family.exit_code, 1,
+            "an unmapped id sharing the exempted id's method segment is a routing \
+             finding, not an exemption: {sibling_in_the_same_family:?}"
+        );
+        assert!(unsupported
+            .lines
+            .join("\n")
+            .contains("unsupported: apikey:openai"));
+    }
+
+    #[test]
+    fn a_run_that_examines_no_provider_exits_two() {
+        let report = evaluate(
+            granted(&["antigravity:google"]),
+            usage(vec![healthy("antigravity", "local")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+
+        assert_eq!(report.exit_code, 2, "{report:?}");
+        assert_eq!(report.counts.unwrap().checked, 0);
+    }
+
+    #[test]
+    fn a_dark_lane_and_a_stale_exemption_are_each_findings() {
+        let dark = evaluate(
+            granted(&["oauth:anthropic"]),
+            usage(Vec::new()),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(dark.exit_code, 1, "{dark:?}");
+        assert!(dark.lines.join("\n").contains("DARK"));
+
+        let stale = evaluate(
+            granted(&["oauth:anthropic", "antigravity:google"]),
+            usage(vec![
+                healthy("claude", "vault"),
+                healthy("antigravity", "vault"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(stale.exit_code, 1, "{stale:?}");
+        assert!(stale.lines.join("\n").contains("stale DUAL_LANE exemption"));
+    }
+
+    #[test]
+    fn precedence_and_identityless_refusal_follow_the_installed_rows() {
+        let cursor = evaluate(
+            granted(&["oauth:cursor", "cookie:cursor.com"]),
+            usage(vec![healthy("cursor", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        let cursor_counts = cursor.counts.expect("cursor run has counts");
+        assert_eq!(cursor_counts.enumerated, 2);
+        assert_eq!(cursor_counts.routed, 2);
+        assert_eq!(cursor_counts.expected, 1);
+        assert_eq!(cursor.exit_code, 0, "{cursor:?}");
+
+        let duplicate_cookie = evaluate(
+            granted(&["cookie:opencode.ai", "cookie:opencode.ai:second"]),
+            usage(Vec::new()),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(duplicate_cookie.exit_code, 1, "{duplicate_cookie:?}");
+        assert!(duplicate_cookie
+            .lines
+            .join("\n")
+            .contains("multiple identity-less credential rows are refused"));
+    }
+
+    #[test]
+    fn removing_a_required_family_mapping_is_not_excused_as_unsupported() {
+        let families_without_anthropic: Vec<_> = quota_core::vault_handles::CREDENTIAL_FAMILIES
+            .iter()
+            .copied()
+            .filter(|(prefix, _)| *prefix != "oauth:anthropic")
+            .collect();
+        let report = evaluate(
+            granted(&["oauth:anthropic"]),
+            usage(vec![healthy("claude", "vault")]),
+            &families_without_anthropic,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+
+        assert_eq!(report.exit_code, 1, "{report:?}");
+        assert!(report
+            .lines
+            .join("\n")
+            .contains("no credential family maps it"));
+    }
 }

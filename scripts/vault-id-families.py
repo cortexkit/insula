@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Check that every credential the vault holds routes to a provider that reads it.
+"""Check that every installed scoped credential routes to a provider that reads it.
 
 WHY THIS EXISTS. `CREDENTIAL_FAMILIES` maps credential-id prefixes to providers.
-The vault holds credential ids. Both lists are internally coherent, so reading
-either one finds nothing wrong -- only the JOIN between them can be broken, and a
-broken join is silent: the credential is present, granted, and simply unrouted.
+The module's installed grant snapshot holds credential ids. Both lists are
+internally coherent, so reading either one finds nothing wrong -- only the JOIN
+between them can be broken, and a broken join is silent: the credential is
+present, granted, and simply unrouted.
 
 Found by hand on 2026-09-19: the vault canonicalises static keys under `apikey:`
 and holds `apikey:kimi-for-coding`, while the family table had only the bare
@@ -13,22 +14,35 @@ written by hand and its author matched the table rather than the vault. Under
 scoped grants the ids arrive FROM the vault, so at cutover the lane would have
 gone dark with no error anywhere.
 
+The inventory comes from `ck module status insula --json`, the same daemon
+health readback used by `vault-lanes`. This process never calls the vault: a
+standalone process has no reserved principal and cannot enumerate the grant.
+
 WHAT IT CANNOT DO, stated so a clean run is not over-read: it compares the
-CURRENT vault against the CURRENT table. It cannot know which unclaimed ids
-SHOULD be claimed -- that is a judgement about what each provider reads -- so it
+module's CURRENT installed snapshot against the CURRENT table. It cannot know
+which unclaimed ids SHOULD be claimed -- that is a judgement about what each
+provider reads -- so it
 flags ids that NAME a family without matching it and leaves the adjudication to a
 person. Ids that resemble nothing are reported as a count, not as findings.
 
 Exit 0 clean, 1 findings, 2 could not check.
 """
 
+import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FAMILIES_SRC = REPO / "crates" / "quota-core" / "src" / "vault_handles.rs"
+MODULE_ID = "insula"
+CALL_TIMEOUT_SECS = 45
+DAEMON_CLI_CANDIDATES = (
+    pathlib.Path.home() / "Work/Projects/CortexKit/subconscious/target/release/ck",
+    pathlib.Path.home() / ".local/share/cortexkit/bin/ck",
+)
 
 # Ids that name a family and are DELIBERATELY unclaimed, with the reason.
 #
@@ -61,27 +75,70 @@ def families():
     return found
 
 
-def vault_ids():
-    """Credential ids the vault currently holds."""
-    try:
-        out = subprocess.run(
-            ["ck", "auth", "list"], capture_output=True, text=True, timeout=30
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-        print(f"could not read the vault inventory: {error}", file=sys.stderr)
+def locate_cli():
+    """Find the daemon CLI without assuming the caller's PATH."""
+    for candidate in DAEMON_CLI_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    found = shutil.which("ck")
+    return pathlib.Path(found) if found else None
+
+
+def ids_from_status(payload):
+    """Read the exact inventory installed by the supervised module."""
+    health = payload.get("health")
+    if not isinstance(health, dict):
+        raise ValueError("status carried no health object")
+    metrics = health.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("health carried no metrics object")
+
+    if "vaultEnumerationFailure" not in metrics:
+        raise ValueError("health omitted vaultEnumerationFailure")
+    failure = metrics["vaultEnumerationFailure"]
+    if failure is not None:
+        age = metrics.get("retainedVaultSnapshotAgeSecs")
+        retained = f"; retained snapshot age {age}s" if age is not None else ""
+        raise ValueError(f"scoped credential enumeration failed: {failure}{retained}")
+
+    ids = metrics.get("scopedCredentialIds")
+    if not isinstance(ids, list) or not all(isinstance(cid, str) for cid in ids):
+        raise ValueError("health carried no scopedCredentialIds string array")
+    return ids
+
+
+def installed_snapshot_ids():
+    """Credential ids from the module health record retained by the daemon."""
+    cli = locate_cli()
+    if cli is None:
+        print("could not read the installed snapshot: no `ck` binary found", file=sys.stderr)
         print("exit 2: this needs a running daemon and the ck CLI", file=sys.stderr)
         sys.exit(2)
-    if out.returncode != 0:
-        print(f"`ck auth list` exited {out.returncode}", file=sys.stderr)
-        print("exit 2: no inventory to compare against", file=sys.stderr)
+    try:
+        out = subprocess.run(
+            [str(cli), "module", "status", MODULE_ID, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=CALL_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"could not read the installed snapshot: `ck module status` did not "
+            f"answer in {CALL_TIMEOUT_SECS}s",
+            file=sys.stderr,
+        )
         sys.exit(2)
-    ids = []
-    for line in out.stdout.splitlines()[1:]:
-        parts = line.split()
-        # STATE VER CREDENTIAL CATEGORIES
-        if len(parts) >= 3 and parts[1].startswith("v"):
-            ids.append(parts[2])
-    return ids
+    if out.returncode != 0:
+        detail = (out.stderr or out.stdout).strip().splitlines()
+        first = detail[0] if detail else f"exit {out.returncode}"
+        print(f"could not read the installed snapshot: {first}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        payload = json.loads(out.stdout)
+        return ids_from_status(payload)
+    except (json.JSONDecodeError, ValueError) as error:
+        print(f"could not read the installed snapshot: {error}", file=sys.stderr)
+        sys.exit(2)
 
 
 def claims(cid, fams):
@@ -91,18 +148,22 @@ def claims(cid, fams):
 
 def main():
     fams = families()
-    ids = vault_ids()
+    ids = installed_snapshot_ids()
 
     # REFUSE ON AN EMPTY POPULATION rather than reporting a clean run over
-    # nothing. A zero here means the inventory could not be read, and a clean
-    # verdict over zero credentials is indistinguishable from a clean verdict over
-    # all of them.
+    # nothing. The readback field is present, so zero is not a parse default; it
+    # means the supervised module installed an empty grant snapshot, which leaves
+    # no routing claim for this checker to verify.
     if not ids:
-        print("no credential ids parsed from `ck auth list`", file=sys.stderr)
-        print("exit 2: the inventory is empty or its format changed", file=sys.stderr)
+        print("installed scoped snapshot contains zero credential ids", file=sys.stderr)
+        print("exit 2: no routing population to compare", file=sys.stderr)
         sys.exit(2)
 
-    print(f"  vault credentials: {len(ids)}   family prefixes: {len(fams)}")
+    # This is the row-id set read from the module, not a second vault query. A
+    # caller can compare it byte-for-byte with scopedCredentialIds from the same
+    # health turn and know both checkers used the same population.
+    print(f"  installed snapshot row ids: {json.dumps(sorted(set(ids)))}")
+    print(f"  enumerated rows: {len(ids)}   family prefixes: {len(fams)}")
 
     routed = [c for c in ids if claims(c, fams)]
     unclaimed = [c for c in ids if not claims(c, fams)]
