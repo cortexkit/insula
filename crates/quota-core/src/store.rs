@@ -655,6 +655,69 @@ mod tests {
     /// genuinely cannot be attributed from here, so the field is omitted rather
     /// than filled with a stand-in. A consumer that sees no account knows
     /// attribution is unavailable; one handed a fabricated discriminator would not.
+    /// The fold window has two sides, and only one of them was defended.
+    ///
+    /// I told a reporter I could not test the over-fold risk here, because this
+    /// host has no account that resets twice inside a minute. That was wrong: the
+    /// risk is a CONSTANT, not a host condition, and a constant is constructible.
+    /// `SIBLING_FOLD_SECS` appeared in exactly two places -- its definition and its
+    /// one use -- so widening it to an hour would have passed every test while
+    /// silently swallowing real resets.
+    ///
+    /// Both sides in one fixture, because each survives the other's mutation:
+    /// shrinking the window folds nothing and doubles every reset, widening it eats
+    /// genuine events. The second is the expensive direction and it is the one
+    /// nothing was watching.
+    #[test]
+    fn the_fold_window_folds_siblings_and_spares_a_later_reset() {
+        let mut store = SlotStore::new(Instant::now());
+
+        // Two slots, one account, same instant: one event.
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        assert_eq!(store.drop_log.len(), 1, "siblings fold");
+
+        // Age that record past the window by rewriting ITS OWN STAMP -- the field
+        // the fold parses, so this drives the real comparison rather than a
+        // parallel clock the production path never reads.
+        // LITERAL SECONDS, NOT `SIBLING_FOLD_SECS + 1`. Deriving the fixture from
+        // the constant under test makes the test invariant to it: widening the
+        // window moves the fixture with it and nothing reddens. Measured -- my
+        // first version of this test passed with the window set to an hour.
+        //
+        // 90s comes from the requirement rather than from today's value: two
+        // credentials of one account are fetched within a poll cycle of each
+        // other, so anything separated by more than about a minute and a half is a
+        // second event whatever the constant currently says.
+        let aged = Utc::now() - chrono::Duration::seconds(90);
+        store.drop_log[0].at = aged.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false);
+
+        // A LATER reset on the same account is a second event, not a sibling.
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        assert_eq!(
+            store.drop_log.len(),
+            2,
+            "a decrease past the window is a new reset and must survive"
+        );
+        assert_eq!(
+            store.quota_drops_by_provider().get("antigravity").copied(),
+            Some(2),
+            "and it must count"
+        );
+
+        // The boundary itself: just inside still folds. Placed AFTER the survivor,
+        // so the fixture also proves the window moves with the newest record rather
+        // than with the first one ever written.
+        let just_inside = Utc::now() - chrono::Duration::seconds(5);
+        store.drop_log[1].at = just_inside.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false);
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        assert_eq!(
+            store.drop_log.len(),
+            2,
+            "inside the window is still one reset"
+        );
+    }
+
     #[test]
     fn a_drop_record_names_the_account_when_one_resolves() {
         let mut store = SlotStore::new(Instant::now());
