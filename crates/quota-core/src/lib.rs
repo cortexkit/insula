@@ -1014,17 +1014,27 @@ impl Registry {
                 let Ok(mut seen) = self.dedup_winner.lock() else {
                     break;
                 };
-                let changed = seen
-                    .get(account_id)
-                    .is_some_and(|previous| previous != &winner);
-                if changed {
+                // THE FIRST OBSERVATION IS ANNOUNCED TOO, unlike the per-lane
+                // logger in antigravity.rs, and the difference is what the silence
+                // would otherwise mean. There a first answer exists for EVERY
+                // account, so announcing it is a line per account per restart --
+                // noise shaped like an event. Here it exists only for an account
+                // SEVERAL SLOTS COMPETE FOR, and that a contest exists at all is
+                // the finding: without this, "no line" means EITHER nothing
+                // contested this account OR the same slot kept winning, and a
+                // diagnostic that merges those two readings is the defect this
+                // whole line was added to fix.
+                let previous_winner = seen.get(account_id);
+                let changed = previous_winner.is_some_and(|held| held != &winner);
+                if changed || previous_winner.is_none() {
                     eprintln!(
-                        "{tag} {provider} dedup winner changed for {account_id}: \
-                         now {winner}, reading {reading} \
+                        "{tag} {provider} dedup winner {verb} for {account_id}: \
+                         {winner}, reading {reading} \
                          (several credentials resolve this account; the row follows \
                          whichever holds the newest reading)",
                         tag = LOG_TAG,
                         provider = name,
+                        verb = if changed { "changed to" } else { "is" },
                         reading = slot
                             .last_success_wall
                             .map(rfc3339_canonical)
