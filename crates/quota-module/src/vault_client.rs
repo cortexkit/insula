@@ -47,6 +47,13 @@ struct Route {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClientFailure {
+    /// A route could not be OPENED: the route.open request would not build, or its
+    /// reply carried no usable `route_channel` / `route_epoch`.
+    ///
+    /// Distinct from `Protocol`, which means a reply arrived and could not be read.
+    /// Here nothing has been asked yet, so nothing can have been answered -- and in
+    /// particular the vault has said nothing about any credential.
+    RouteSetup,
     Transport,
     RouteGone,
     Classified(VaultGetError),
@@ -131,6 +138,34 @@ impl ClientFailure {
             // indefinitely. That is why this path logs the code -- the wire looks
             // fine, so stderr has to be where it does not.
             Self::UnknownRouteCode => VaultGetError::Transient,
+            // TRANSIENT, AND SPLIT OUT OF `Protocol` RATHER THAN WIDENING IT.
+            //
+            // Every site is `open_route`: building the route.open request, or
+            // reading `route_channel` / `route_epoch` back out of its reply. The
+            // vault has NOT BEEN REACHED when these fire -- there is no route yet
+            // to carry a question to it -- so none of them is the vault saying
+            // anything about a credential.
+            //
+            // They used to be `Protocol`, which is the one arm here that fails
+            // closed, and that contradicted the rule its siblings are justified by
+            // three lines below: a frame without a class is the ROUTE speaking,
+            // and no route condition is evidence that a credential is bad. It is
+            // also the arm that fires at PROCESS START, when a route is opened for
+            // the first time.
+            //
+            // WHAT THAT COST: `FailClosed` reaches enumeration as a failure, and a
+            // failed enumeration on a COLD process retains a snapshot that does
+            // not exist yet -- so every vault-backed lane enumerates nothing and
+            // falls back to a local lane, or goes dark where custody is
+            // vault-only. A hiccup opening one route took five labelled accounts
+            // down to one unlabelled row.
+            //
+            // WHY NOT JUST WIDEN `Protocol`: an existing test refused that, and it
+            // was right. A reply this client cannot READ AT ALL is a different
+            // claim from a route that could not be opened -- the first says the
+            // peer sent something untrustworthy, the second says nobody has spoken
+            // yet. Widening would have spent that distinction to fix this.
+            Self::RouteSetup => VaultGetError::Transient,
             Self::Protocol => VaultGetError::FailClosed,
         }
     }
@@ -692,7 +727,7 @@ impl ClientState {
                 None
             },
         }))
-        .map_err(|_| ClientFailure::Protocol)?;
+        .map_err(|_| ClientFailure::RouteSetup)?;
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Passive, false),
@@ -701,7 +736,7 @@ impl ClientState {
             corr,
             body,
         )
-        .map_err(|_| ClientFailure::Protocol)?;
+        .map_err(|_| ClientFailure::RouteSetup)?;
         let response = tokio::time::timeout(self.request_timeout, self.request(connection, frame))
             .await
             .map_err(|_| ClientFailure::Transport)??;
@@ -712,17 +747,17 @@ impl ClientState {
             ));
         }
         let value: Value =
-            serde_json::from_slice(&response.body).map_err(|_| ClientFailure::Protocol)?;
+            serde_json::from_slice(&response.body).map_err(|_| ClientFailure::RouteSetup)?;
         let channel = value
             .get("route_channel")
             .and_then(Value::as_u64)
             .and_then(|value| u16::try_from(value).ok())
-            .ok_or(ClientFailure::Protocol)?;
+            .ok_or(ClientFailure::RouteSetup)?;
         let epoch = value
             .get("route_epoch")
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
-            .ok_or(ClientFailure::Protocol)?;
+            .ok_or(ClientFailure::RouteSetup)?;
         Ok(RouteLease {
             route: Route { channel, epoch },
             connection_generation: connection.generation,
@@ -2236,6 +2271,39 @@ mod tests {
     ///
     /// A frame this client cannot READ at all is still fail-closed -- that is a
     /// different claim, and `ClientFailure::Protocol` keeps it.
+    /// A route that could not be OPENED costs a tick, not a credential.
+    ///
+    /// This is the arm that fired on a real host. Opening a route is what happens
+    /// at PROCESS START, and `open_route` failing to read `route_channel` out of a
+    /// reply used to map to `FailClosed` -- which reaches enumeration as a failure,
+    /// and a failed enumeration on a cold process has no previous snapshot to
+    /// retain. Every vault-backed lane then enumerates nothing: the ones with a
+    /// local lane quietly fall back to it, and the ones under vault-only custody go
+    /// dark. Five labelled accounts became one unlabelled row that way.
+    ///
+    /// The paired assertion below is the one that keeps this honest. Widening
+    /// `Protocol` itself would also have fixed the outage and would have spent a
+    /// real distinction doing it: a reply this client cannot READ is a peer sending
+    /// something untrustworthy, while a route that will not open is nobody having
+    /// spoken yet. Both directions are asserted here because each survives the
+    /// other's mutation.
+    #[test]
+    fn a_route_that_will_not_open_is_transient_while_an_unreadable_reply_is_not() {
+        assert_eq!(
+            ClientFailure::RouteSetup.vault_error(),
+            VaultGetError::Transient,
+            "a route that could not be opened must cost one tick: the vault has not \
+             been reached, so it has said nothing about any credential"
+        );
+
+        assert_eq!(
+            ClientFailure::Protocol.vault_error(),
+            VaultGetError::FailClosed,
+            "a reply that arrived and could not be read is a different claim, and \
+             must still refuse to trust the peer"
+        );
+    }
+
     #[test]
     fn an_unrecognised_route_code_is_retried_rather_than_blamed_on_the_credential() {
         assert_eq!(
