@@ -18,6 +18,17 @@ use crate::provider::CredentialHandle;
 /// has to survive the interval between two consecutive polls, because the durable
 /// record is the consumer's own log. Overflow is not silent: `oldest_retained`
 /// tells a consumer its cursor fell off.
+/// How close two drop records must be to be one reset seen by sibling slots.
+///
+/// One base interval: slots of the same account are fetched in the same tick or
+/// the next, so siblings land inside one poll cycle, while two REAL resets for
+/// one account within 60s would need two window boundaries in a minute.
+///
+/// Deliberately not tied to `refresh::BASE_INTERVAL` by import: this file is the
+/// store and that one is the scheduler, and a fold window that silently tracked a
+/// cadence change would widen without anyone deciding to widen it.
+const SIBLING_FOLD_SECS: i64 = 60;
+
 const DROP_LOG_CAPACITY: usize = 100;
 
 /// One observed decrease in an account's used percent.
@@ -493,6 +504,46 @@ impl SlotStore {
         account: Option<&str>,
         observed_continuously: bool,
     ) {
+        let now = Utc::now();
+        // ONE RESET IS ONE EVENT, EVEN WHEN SEVERAL SLOTS WATCH IT HAPPEN.
+        //
+        // Detection is per slot and that is correct -- each slot genuinely saw its
+        // own reading fall. But an account can be served by several slots (a vault
+        // handle beside a plugin-account handle, both resolving one identity), and
+        // they observe the same window reset within seconds of each other. Counting
+        // each observation makes every reset on such an account arrive twice.
+        //
+        // Reported on insula#5 with the sampling behind it: three drop pairs 8-30s
+        // apart, inside one 61s poll cycle, one of them caught mid-flip with the
+        // SAME `fetchedAt` on both sides of a source change -- two slots, one
+        // reading, one reset. Their structural argument is the stronger half and it
+        // checks out here: antigravity's `handles()` enumerates the vault handle AND
+        // one per stored plugin account, so a labelled account present in both is
+        // two slots BY CONSTRUCTION.
+        //
+        // I had recorded that stamping the account "collapses one reset reached
+        // through several credentials to one event". Attribution makes that
+        // collapse POSSIBLE for a consumer; it does not perform it, and the
+        // published counter never did. This is that claim made true.
+        //
+        // ONLY WHERE THE ACCOUNT IS KNOWN. An unidentified slot cannot be shown to
+        // be the same account as another unidentified slot, and collapsing two
+        // genuinely different accounts would hide a real reset -- the expensive
+        // direction. Cookie lanes resolve no identity, so they are never folded.
+        //
+        // The window is one base interval: siblings observe within one poll cycle,
+        // while two real resets for one account inside 60s would require two window
+        // boundaries in a minute.
+        if let Some(account) = account {
+            let already_seen = self.drop_log.iter().rev().any(|record| {
+                record.provider == provider
+                    && record.account.as_deref() == Some(account)
+                    && Self::within_sibling_window(&record.at, now)
+            });
+            if already_seen {
+                return;
+            }
+        }
         self.push_drop_record(provider, account, observed_continuously);
         *self
             .quota_drops_by_provider
@@ -502,6 +553,20 @@ impl SlotStore {
             self.quota_drops_observed_continuously =
                 self.quota_drops_observed_continuously.saturating_add(1);
         }
+    }
+
+    /// Is a recorded drop recent enough to be a sibling slot watching the same reset?
+    ///
+    /// Parsed from the record's own stamp rather than tracked separately, so the
+    /// window is measured against the thing a consumer reads. An unparseable stamp
+    /// answers NO: the fold is an optimisation over honesty, and a record that cannot
+    /// be dated must not silently swallow a real reset.
+    fn within_sibling_window(recorded_at: &str, now: chrono::DateTime<Utc>) -> bool {
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(recorded_at) else {
+            return false;
+        };
+        let age = now.signed_duration_since(parsed.with_timezone(&Utc));
+        age >= chrono::Duration::zero() && age < chrono::Duration::seconds(SIBLING_FOLD_SECS)
     }
 
     /// Append one record to the ring, evicting the oldest when full.
@@ -593,12 +658,20 @@ mod tests {
     #[test]
     fn a_drop_record_names_the_account_when_one_resolves() {
         let mut store = SlotStore::new(Instant::now());
-        // Two credentials, one account: the shape that emits a pair.
+        // Two credentials, one account, within one poll cycle: ONE reset seen
+        // twice. This test previously asserted the pair SURVIVED and left the
+        // collapse to the consumer -- which is what `quotaDropsByProvider`
+        // could not do, so every reset on such an account was published twice
+        // (insula#5, with the sampling behind it: pairs 8-30s apart, one caught
+        // mid-flip with identical `fetchedAt` on both sides).
         store.record_quota_drop("antigravity", Some("acct-1"), false);
         store.record_quota_drop("antigravity", Some("acct-1"), false);
         // A different account of the same provider: genuinely two events.
         store.record_quota_drop("antigravity", Some("acct-2"), false);
-        // And a lane with no identity at all.
+        // And a lane with no identity at all. NEVER FOLDED -- two unidentified
+        // slots cannot be shown to be one account, and collapsing two real
+        // accounts would hide a reset, which is the expensive direction.
+        store.record_quota_drop("ollama", None, true);
         store.record_quota_drop("ollama", None, true);
 
         let page = store.drop_page(None);
@@ -609,26 +682,22 @@ mod tests {
             .collect();
         assert_eq!(
             accounts,
-            vec![Some("acct-1"), Some("acct-1"), Some("acct-2"), None],
-            "each record must carry the identity it was observed on"
+            vec![Some("acct-1"), Some("acct-2"), None, None],
+            "one reset is one record; unidentified lanes stay separate"
         );
 
-        // The property a consumer needs: collapsing by (provider, account) turns
-        // the pair into one event and leaves the distinct ones alone.
-        let distinct: std::collections::BTreeSet<(&str, Option<&str>)> = page
-            .drops
-            .iter()
-            .map(|record| (record.provider.as_str(), record.account.as_deref()))
-            .collect();
+        // THE PUBLISHED COUNTER IS THE THING THAT WAS WRONG. Attribution made the
+        // collapse possible for a consumer; it never performed it, and the metric
+        // had no account to collapse on.
         assert_eq!(
-            distinct.len(),
-            3,
-            "four records, three real events: the pair collapses and the rest do not"
+            store.quota_drops_by_provider().get("antigravity").copied(),
+            Some(2),
+            "two accounts reset once each, not one account counted twice"
         );
 
         // An absent account must not appear as a key at all, so a consumer
         // decoding into a typed struct does not meet a null it has to interpret.
-        let rendered = serde_json::to_string(&page.drops[3]).expect("serialises");
+        let rendered = serde_json::to_string(&page.drops[2]).expect("serialises");
         assert!(
             !rendered.contains("account"),
             "an unattributable drop omits the field: {rendered}"

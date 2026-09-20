@@ -509,6 +509,20 @@ regeneration mechanic (a continuously refilling pool reads lower as a matter of
 course), and a decrease under one percentage point (upstream arithmetic rather
 than capacity returning).
 
+**One reset is one event, even when several credentials watch it happen.** An
+account can be served by more than one slot — a vault handle beside a local or
+plugin one, both resolving the same identity — and each slot observes the same
+window reset within one poll cycle. A second decrease for the same
+`(provider, account)` inside 60 seconds is folded: one record in `usage.drops`,
+one increment here. Without that fold the counter doubled on every reset of such
+an account, which a reader could not distinguish from a busier account.
+
+The fold needs an identity to key on, so it **never applies to lanes that resolve
+none** (the browser-cookie providers). Two unidentified slots cannot be shown to
+be the same account, and collapsing two genuinely different ones would hide a
+real reset — the expensive direction. Those records stay separate, as does any
+second decrease more than 60 seconds after the first.
+
 These exist to answer a design question before the reset events asked for in
 issue #5 are built: whether a 60-second poll observes these at all. Not part of
 the conservation identity.

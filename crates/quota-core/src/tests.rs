@@ -1654,31 +1654,39 @@ async fn the_refresher_attributes_a_drop_to_the_account_it_observed() {
     tick(&registry).await;
 
     let page = registry.store.lock().unwrap().drop_page(None);
+    // ONE RESET, ONE RECORD -- through the real refresher, two credentials, one
+    // account. This asserted 2 until insula#5 showed what that cost: the ring is
+    // what `quotaDropsByProvider` counts, so every reset on an account present in
+    // two lanes was published twice, and no consumer could tell an over-count from
+    // a busy account.
+    //
+    // The end-to-end arm matters more than the store-level one. The fold keys on
+    // the account, and the account is produced by the refresher -- a store test
+    // supplies that value itself and so cannot show the two slots agreeing on it.
     assert_eq!(
         page.drops.len(),
-        2,
-        "two credentials on one account each observe the decrease: {:?}",
+        1,
+        "two credentials watching one reset publish one event: {:?}",
         page.drops
     );
-    assert!(
-        page.drops
-            .iter()
-            .all(|record| record.account.as_deref() == Some("acct-1")),
-        "every record must name the account the refresher observed: {:?}",
-        page.drops
+    assert_eq!(
+        page.drops[0].account.as_deref(),
+        Some("acct-1"),
+        "the surviving record still names the account the refresher observed"
     );
 
-    // And the point of the field: a consumer collapsing by (provider, account)
-    // sees ONE reset, not two.
-    let events: std::collections::BTreeSet<(&str, Option<&str>)> = page
-        .drops
-        .iter()
-        .map(|record| (record.provider.as_str(), record.account.as_deref()))
-        .collect();
+    // AND THE COUNTER, which is the field that was wrong. The ring could always
+    // be collapsed by a consumer; this number could not.
     assert_eq!(
-        events.len(),
-        1,
-        "one reset, however many credentials saw it"
+        registry
+            .store
+            .lock()
+            .unwrap()
+            .quota_drops_by_provider()
+            .get("paired")
+            .copied(),
+        Some(1),
+        "one reset counts once"
     );
 }
 
