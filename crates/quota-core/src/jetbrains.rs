@@ -16,7 +16,14 @@
 //! models. Treat the shape below as what we PARSE, never as what JetBrains
 //! sends. A comment describing someone else's payload ages with no signal, and
 //! this one was read back as evidence in a wire-design argument. `next` is the
-//! reset. A `type` of `Unknown`/`Error` (no active AI quota) degrades to NoSession.
+//! reset. A `type` of `Unknown`/`Error` (no active AI quota) degrades to
+//! `NoQuotaReported`, NOT to `NoSession`. That distinction is the whole point of
+//! the class: `NoSession` publishes `credential_absent`, which tells a consumer
+//! nobody configured this provider and authorises pruning the account. Here the
+//! IDE is installed and its config was read successfully -- the credential is
+//! fine and the account simply has no AI quota, which is a state to report rather
+//! than something to fix. This line said `NoSession` until 2026-09-20 and the code
+//! has not agreed with it since the taxonomy split.
 //!
 //! VERIFICATION: HYBRID. The file-discovery + XML-extract + entity-decode + JSON
 //! parse + Unknown→degrade path is LIVE-verified (this machine has real
