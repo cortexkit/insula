@@ -994,27 +994,116 @@ struct GetParams<'a> {
 }
 
 #[derive(Serialize)]
-struct ReportRequest<'a> {
+struct GetScopedRequest {
     method: &'static str,
-    params: ReportParams<'a>,
+    params: GetScopedParams,
 }
 
 #[derive(Serialize)]
-struct ReportParams<'a> {
-    handle: &'a str,
+struct GetScopedParams {
+    credential_id: String,
+    min_ttl_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ReportRequest {
+    method: &'static str,
+    params: ReportParams,
+}
+
+#[derive(Serialize)]
+struct ReportParams {
+    handle: Option<String>,
+    credential_id: Option<String>,
     provider_status: u16,
     record_version: u64,
 }
 
 #[derive(Serialize)]
-struct StatusRequest<'a> {
+struct StatusRequest {
     method: &'static str,
-    params: StatusParams<'a>,
+    params: StatusParams,
 }
 
 #[derive(Serialize)]
-struct StatusParams<'a> {
-    handle: &'a str,
+struct StatusParams {
+    handle: Option<String>,
+    credential_id: Option<String>,
+}
+
+const INVALID_PARAMS: &str = "invalid_params";
+
+fn validate_address(
+    handle: &Option<String>,
+    credential_id: &Option<String>,
+) -> Result<(), &'static str> {
+    if handle.is_some() ^ credential_id.is_some() {
+        Ok(())
+    } else {
+        Err(INVALID_PARAMS)
+    }
+}
+
+impl StatusParams {
+    fn for_handle(handle: &str) -> Self {
+        Self {
+            handle: Some(handle.to_string()),
+            credential_id: None,
+        }
+    }
+
+    fn for_credential_id(credential_id: &str) -> Self {
+        Self {
+            handle: None,
+            credential_id: Some(credential_id.to_string()),
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_address(&self.handle, &self.credential_id)
+    }
+}
+
+impl ReportParams {
+    fn for_handle(handle: &str, provider_status: u16, record_version: u64) -> Self {
+        Self {
+            handle: Some(handle.to_string()),
+            credential_id: None,
+            provider_status,
+            record_version,
+        }
+    }
+
+    fn for_credential_id(credential_id: &str, provider_status: u16, record_version: u64) -> Self {
+        Self {
+            handle: None,
+            credential_id: Some(credential_id.to_string()),
+            provider_status,
+            record_version,
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_address(&self.handle, &self.credential_id)
+    }
+}
+
+fn encode_status_request(params: StatusParams) -> Result<Vec<u8>, VaultGetError> {
+    params.validate().map_err(|_| VaultGetError::FailClosed)?;
+    serde_json::to_vec(&StatusRequest {
+        method: "credential.status",
+        params,
+    })
+    .map_err(|_| VaultGetError::FailClosed)
+}
+
+fn encode_report_request(params: ReportParams) -> Result<Vec<u8>, VaultGetError> {
+    params.validate().map_err(|_| VaultGetError::FailClosed)?;
+    serde_json::to_vec(&ReportRequest {
+        method: "credential.report_auth_failure",
+        params,
+    })
+    .map_err(|_| VaultGetError::FailClosed)
 }
 
 #[derive(Deserialize)]
@@ -1059,12 +1148,35 @@ struct VaultStatusResult {
     stale_pending: Option<bool>,
 }
 
+/// The only recovery cursor exposed by scoped status.
+///
+/// The vault's `ready` bit is metadata-derived and can be true even when a read
+/// of the same credential is refused. Callers can therefore observe only the
+/// record version and may accelerate repair only when it advances monotonically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedCredentialStatus {
+    record_version: Option<u64>,
+}
+
+impl ScopedCredentialStatus {
+    pub fn record_version(&self) -> Option<u64> {
+        self.record_version
+    }
+
+    pub fn record_version_advanced_since(&self, observed: u64) -> bool {
+        self.record_version
+            .is_some_and(|current| current > observed)
+    }
+}
+
 /// What an operator probe may see of one scoped credential row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedRow {
-    pub id: String,
+    pub credential_id: String,
+    pub credential_type: String,
     pub state: String,
     pub record_version: u64,
+    pub id: String,
     pub account_id: Option<String>,
     pub email: Option<String>,
 }
@@ -1103,8 +1215,7 @@ struct ScopedCredential {
     id: String,
     #[serde(default)]
     categories: Vec<String>,
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
+    kind: String,
     #[serde(default)]
     serves: Vec<String>,
     /// `active`, `needs_reauth`, and whatever the vault adds later.
@@ -1126,6 +1237,19 @@ struct ScopedCredential {
     email: Option<String>,
     #[serde(default)]
     org_name: Option<String>,
+}
+
+fn scoped_row_from_wire(row: ScopedCredential) -> ScopedRow {
+    let credential_id = row.id;
+    ScopedRow {
+        id: credential_id.clone(),
+        credential_id,
+        credential_type: row.kind,
+        state: row.state,
+        record_version: row.record_version,
+        account_id: row.account_id,
+        email: row.email,
+    }
 }
 
 /// One grant tuple, as the vault sees our authority.
@@ -1160,12 +1284,18 @@ struct ScopedListResult {
     /// The shape I had was not invented: it is `grant_tuples`, one field over. Two
     /// fields whose names share a stem, one scalar and one array, and I bound the
     /// array to the scalar's name.
-    #[serde(default)]
-    grants: u64,
+    grants: Option<u64>,
     /// The selector tuples themselves, which is what `ScopedGrant` models.
     #[serde(default)]
     grant_tuples: Vec<ScopedGrant>,
-    #[serde(default)]
+    credentials: Option<Vec<ScopedCredential>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CompleteScopedListResult {
+    view: String,
+    grants: u64,
+    grant_tuples: Vec<ScopedGrant>,
     credentials: Vec<ScopedCredential>,
 }
 
@@ -1458,16 +1588,6 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
     }
 }
 
-/// Decode a `credential.status` reply.
-///
-/// Same two-level shape as [`decode_get_response`]: a `result` object is either
-/// a success body or an `error` body, never both, never neither. Extra wire
-/// fields (`last_error_code`, `lease_held`) are ignored -- this poll only acts
-/// on `ready` / `record_version` / `stale_pending`.
-///
-/// A decode failure here is returned to the caller. It must not be fed into
-/// slot transition: status is an accelerator, and an accelerator that can
-/// condemn a credential is a defect.
 /// Decode a `credential.list_scoped` reply.
 ///
 /// Mirrors [`decode_status_response`]: a result object is either a success or an
@@ -1479,7 +1599,7 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
 /// malformed reply and, worse, would make the empty case fail closed exactly
 /// where the wire is trying to tell us something specific. `view` is present on
 /// every success and on no error.
-fn decode_list_scoped_response(body: &[u8]) -> Result<ScopedListResult, VaultGetError> {
+fn decode_list_scoped_response(body: &[u8]) -> Result<CompleteScopedListResult, VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
     let result = response
         .get("result")
@@ -1487,6 +1607,50 @@ fn decode_list_scoped_response(body: &[u8]) -> Result<ScopedListResult, VaultGet
         .ok_or(VaultGetError::FailClosed)?;
     let has_error = result.contains_key("error");
     let has_success = result.contains_key("view");
+    match (has_success, has_error) {
+        (true, false) => {
+            let decoded: ScopedListResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Ok(CompleteScopedListResult {
+                view: decoded.view,
+                grants: decoded.grants.ok_or(VaultGetError::FailClosed)?,
+                grant_tuples: decoded.grant_tuples,
+                credentials: decoded.credentials.ok_or(VaultGetError::FailClosed)?,
+            })
+        }
+        (false, true) => {
+            let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
+                .map_err(|_| VaultGetError::FailClosed)?;
+            Err(read_error_to_outcome(
+                &failure.error.class,
+                failure.error.code.as_deref(),
+            ))
+        }
+        (true, true) | (false, false) => Err(VaultGetError::FailClosed),
+    }
+}
+
+/// Decode a `credential.status` reply.
+///
+/// Same two-level shape as [`decode_get_response`]: a `result` object is either
+/// a success body or an `error` body, never both, never neither. Extra wire
+/// fields (`last_error_code`, `lease_held`) are ignored. Handle-addressed status
+/// exposes the metadata fields it historically carried; scoped status projects
+/// only the monotonic record version.
+///
+/// A decode failure here is returned to the caller. It must not be fed into
+/// slot transition: status is an accelerator, and an accelerator that can
+/// condemn a credential is a defect.
+fn decode_status_result(body: &[u8]) -> Result<VaultStatusResult, VaultGetError> {
+    let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or(VaultGetError::FailClosed)?;
+    let has_error = result.contains_key("error");
+    let has_success = ["ready", "record_version", "stale_pending"]
+        .iter()
+        .any(|field| result.contains_key(*field));
     match (has_success, has_error) {
         (true, false) => serde_json::from_value(Value::Object(result.clone()))
             .map_err(|_| VaultGetError::FailClosed),
@@ -1503,35 +1667,37 @@ fn decode_list_scoped_response(body: &[u8]) -> Result<ScopedListResult, VaultGet
 }
 
 fn decode_status_response(body: &[u8]) -> Result<CredentialStatus, VaultGetError> {
+    let success = decode_status_result(body)?;
+    Ok(CredentialStatus {
+        ready: success.ready,
+        record_version: success.record_version,
+        stale_pending: success.stale_pending,
+    })
+}
+
+fn decode_scoped_status_response(body: &[u8]) -> Result<ScopedCredentialStatus, VaultGetError> {
+    let success = decode_status_result(body)?;
+    Ok(ScopedCredentialStatus {
+        record_version: success.record_version,
+    })
+}
+
+fn decode_report_response(body: &[u8]) -> Result<(), VaultGetError> {
     let response: Value = serde_json::from_slice(body).map_err(|_| VaultGetError::FailClosed)?;
-    let result = response
-        .get("result")
-        .and_then(Value::as_object)
-        .ok_or(VaultGetError::FailClosed)?;
-    let has_error = result.contains_key("error");
-    let has_success = ["ready", "record_version", "stale_pending"]
-        .iter()
-        .any(|field| result.contains_key(*field));
-    match (has_success, has_error) {
-        (true, false) => {
-            let success: VaultStatusResult = serde_json::from_value(Value::Object(result.clone()))
-                .map_err(|_| VaultGetError::FailClosed)?;
-            Ok(CredentialStatus {
-                ready: success.ready,
-                record_version: success.record_version,
-                stale_pending: success.stale_pending,
-            })
-        }
-        (false, true) => {
-            let failure: VaultErrorResult = serde_json::from_value(Value::Object(result.clone()))
-                .map_err(|_| VaultGetError::FailClosed)?;
-            Err(read_error_to_outcome(
-                &failure.error.class,
-                failure.error.code.as_deref(),
-            ))
-        }
-        (true, true) | (false, false) => Err(VaultGetError::FailClosed),
+    if let Some(class) = response
+        .pointer("/result/error/class")
+        .and_then(Value::as_str)
+    {
+        let code = response
+            .pointer("/result/error/code")
+            .and_then(Value::as_str);
+        return Err(read_error_to_outcome(class, code));
     }
+    response
+        .get("result")
+        .filter(|result| result.is_object())
+        .map(|_| ())
+        .ok_or(VaultGetError::FailClosed)
 }
 
 impl VaultClient {
@@ -1568,18 +1734,12 @@ impl VaultClient {
             credentials: result
                 .credentials
                 .into_iter()
-                .map(|row| ScopedRow {
-                    id: row.id,
-                    state: row.state,
-                    record_version: row.record_version,
-                    account_id: row.account_id,
-                    email: row.email,
-                })
+                .map(scoped_row_from_wire)
                 .collect(),
         })
     }
 
-    async fn list_scoped(&self) -> Result<ScopedListResult, VaultGetError> {
+    async fn list_scoped(&self) -> Result<CompleteScopedListResult, VaultGetError> {
         let body = serde_json::to_vec(&ListScopedRequest {
             method: "credential.list_scoped",
             params: ListScopedParams {},
@@ -1591,6 +1751,73 @@ impl VaultClient {
             .await
             .map_err(ClientFailure::vault_error)?;
         decode_list_scoped_response(&frame.body)
+    }
+
+    /// Fetch a scoped credential using only the caller's principal.
+    pub async fn get_scoped(
+        &self,
+        credential_id: &str,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        let body = serde_json::to_vec(&GetScopedRequest {
+            method: "credential.get_scoped",
+            params: GetScopedParams {
+                credential_id: credential_id.to_string(),
+                min_ttl_ms: Some(min_ttl_ms),
+            },
+        })
+        .map_err(|_| VaultGetError::FailClosed)?;
+        let frame = self
+            .state
+            .call(body)
+            .await
+            .map_err(ClientFailure::vault_error)?;
+        decode_get_response(&frame.body)
+    }
+
+    /// Read the scoped credential's monotonic record version so callers can detect a newer record.
+    pub async fn status_scoped(
+        &self,
+        credential_id: &str,
+    ) -> Result<ScopedCredentialStatus, VaultGetError> {
+        let body = encode_status_request(StatusParams::for_credential_id(credential_id))?;
+        let frame = self
+            .state
+            .call(body)
+            .await
+            .map_err(ClientFailure::vault_error)?;
+        decode_scoped_status_response(&frame.body)
+    }
+
+    /// Report that the exact scoped record version served was refused upstream.
+    pub async fn report_auth_failure_scoped(
+        &self,
+        credential_id: &str,
+        provider_status: u16,
+        record_version: u64,
+    ) {
+        self.send_auth_failure_report(ReportParams::for_credential_id(
+            credential_id,
+            provider_status,
+            record_version,
+        ))
+        .await;
+    }
+
+    async fn send_auth_failure_report(&self, params: ReportParams) {
+        let result: Result<(), VaultGetError> = async {
+            let body = encode_report_request(params)?;
+            let frame = self
+                .state
+                .call(body)
+                .await
+                .map_err(ClientFailure::vault_error)?;
+            decode_report_response(&frame.body)
+        }
+        .await;
+        if let Err(error) = result {
+            eprintln!("{LOG_TAG} warning: vault auth-failure report failed class={error:?}");
+        }
     }
 }
 
@@ -1642,55 +1869,19 @@ impl CredentialSource for VaultClient {
         provider_status: u16,
         record_version: u64,
     ) {
-        let result: Result<(), VaultGetError> = async {
-            let body = serde_json::to_vec(&ReportRequest {
-                method: "credential.report_auth_failure",
-                params: ReportParams {
-                    handle: capability.expose_secret(),
-                    provider_status,
-                    record_version,
-                },
-            })
-            .map_err(|_| VaultGetError::FailClosed)?;
-            let frame = self
-                .state
-                .call(body)
-                .await
-                .map_err(ClientFailure::vault_error)?;
-            let response: Value =
-                serde_json::from_slice(&frame.body).map_err(|_| VaultGetError::FailClosed)?;
-            if let Some(class) = response
-                .pointer("/result/error/class")
-                .and_then(Value::as_str)
-            {
-                let code = response
-                    .pointer("/result/error/code")
-                    .and_then(Value::as_str);
-                return Err(read_error_to_outcome(class, code));
-            }
-            response
-                .get("result")
-                .filter(|result| result.is_object())
-                .map(|_| ())
-                .ok_or(VaultGetError::FailClosed)
-        }
+        self.send_auth_failure_report(ReportParams::for_handle(
+            capability.expose_secret(),
+            provider_status,
+            record_version,
+        ))
         .await;
-        if let Err(error) = result {
-            eprintln!("{LOG_TAG} warning: vault auth-failure report failed class={error:?}");
-        }
     }
 
     async fn status(
         &self,
         capability: &VaultCapability,
     ) -> Result<CredentialStatus, VaultGetError> {
-        let body = serde_json::to_vec(&StatusRequest {
-            method: "credential.status",
-            params: StatusParams {
-                handle: capability.expose_secret(),
-            },
-        })
-        .map_err(|_| VaultGetError::FailClosed)?;
+        let body = encode_status_request(StatusParams::for_handle(capability.expose_secret()))?;
         let frame = self
             .state
             .call(body)
@@ -2083,6 +2274,117 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn get_scoped_serializes_the_120_second_floor() {
+        let (listener, path, key, daemon_id) = loopback_listener("get-scoped-floor").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            reply_route(&mut stream, 7, 3).await;
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "method": "credential.get_scoped",
+                    "params": {
+                        "credential_id": "oauth:anthropic:umutaday",
+                        "min_ttl_ms": 120_000
+                    }
+                }),
+                "the scoped fetch must carry the caller's floor and no capability"
+            );
+            let response = Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                request.header.channel,
+                request.header.epoch,
+                request.header.corr,
+                include_bytes!("../tests/fixtures/credential_get_scoped_success.json").to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &response).await.unwrap();
+        });
+        let client = VaultClient::new(&path);
+
+        let credential = client
+            .get_scoped("oauth:anthropic:umutaday", 120_000)
+            .await
+            .expect("the published get_scoped reply decodes");
+        assert_eq!(credential.payload, b"vault-token");
+        assert_eq!(credential.record_version, 41);
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn scoped_status_and_report_use_only_the_credential_id() {
+        let (listener, path, key, daemon_id) = loopback_listener("scoped-addresses").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            reply_route(&mut stream, 7, 3).await;
+
+            let status_request = read_frame(&mut stream).await.unwrap().unwrap();
+            let status_body: Value = serde_json::from_slice(&status_request.body).unwrap();
+            assert_eq!(
+                status_body,
+                serde_json::json!({
+                    "method": "credential.status",
+                    "params": {
+                        "handle": null,
+                        "credential_id": "apikey:deepseek"
+                    }
+                })
+            );
+            let status_response = Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                status_request.header.channel,
+                status_request.header.epoch,
+                status_request.header.corr,
+                include_bytes!("../tests/fixtures/credential_status_metadata_ready.json").to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &status_response).await.unwrap();
+
+            let report_request = read_frame(&mut stream).await.unwrap().unwrap();
+            let report_body: Value = serde_json::from_slice(&report_request.body).unwrap();
+            assert_eq!(
+                report_body,
+                serde_json::json!({
+                    "method": "credential.report_auth_failure",
+                    "params": {
+                        "handle": null,
+                        "credential_id": "apikey:deepseek",
+                        "provider_status": 401,
+                        "record_version": 41
+                    }
+                })
+            );
+            let report_response = Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                report_request.header.channel,
+                report_request.header.epoch,
+                report_request.header.corr,
+                include_bytes!("../tests/fixtures/credential_report_success.json").to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &report_response).await.unwrap();
+        });
+        let client = VaultClient::new(&path);
+
+        let status = client
+            .status_scoped("apikey:deepseek")
+            .await
+            .expect("the published status response decodes");
+        assert_eq!(status.record_version(), Some(41));
+        client
+            .report_auth_failure_scoped("apikey:deepseek", 401, 41)
+            .await;
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn class_mapping_is_exhaustive_and_unknown_fails_closed() {
         let map = |class| read_error_to_outcome(class, None);
@@ -2273,6 +2575,158 @@ mod tests {
         assert_eq!(
             decode_status_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             VaultGetError::FailClosed
+        );
+    }
+
+    #[test]
+    fn status_params_accept_exactly_one_address() {
+        let by_id = StatusParams::for_credential_id("oauth:anthropic:umutaday");
+        let by_id_body: Value =
+            serde_json::from_slice(&encode_status_request(by_id).unwrap()).unwrap();
+        assert_eq!(
+            by_id_body,
+            serde_json::json!({
+                "method": "credential.status",
+                "params": {
+                    "handle": null,
+                    "credential_id": "oauth:anthropic:umutaday"
+                }
+            })
+        );
+
+        let by_handle = StatusParams::for_handle("ckh_existing");
+        let by_handle_body: Value =
+            serde_json::from_slice(&encode_status_request(by_handle).unwrap()).unwrap();
+        assert_eq!(
+            by_handle_body,
+            serde_json::json!({
+                "method": "credential.status",
+                "params": {
+                    "handle": "ckh_existing",
+                    "credential_id": null
+                }
+            })
+        );
+
+        let both = StatusParams {
+            handle: Some("ckh_existing".to_string()),
+            credential_id: Some("oauth:anthropic:umutaday".to_string()),
+        };
+        assert_eq!(both.validate(), Err("invalid_params"));
+        let neither = StatusParams {
+            handle: None,
+            credential_id: None,
+        };
+        assert_eq!(neither.validate(), Err("invalid_params"));
+    }
+
+    #[test]
+    fn scoped_status_closes_the_unauthorized_nonexistent_oracle() {
+        let unauthorized =
+            include_bytes!("../tests/fixtures/credential_status_unavailable_unauthorized.json");
+        let nonexistent =
+            include_bytes!("../tests/fixtures/credential_status_unavailable_nonexistent.json");
+        assert_eq!(
+            unauthorized, nonexistent,
+            "the two published replies must remain byte-identical"
+        );
+
+        let published: Value = serde_json::from_slice(unauthorized).unwrap();
+        assert_eq!(
+            published["result"],
+            serde_json::json!({
+                "last_error_code": "not_found",
+                "lease_held": true,
+                "ready": false
+            })
+        );
+        let unauthorized = decode_scoped_status_response(unauthorized).unwrap();
+        let nonexistent = decode_scoped_status_response(nonexistent).unwrap();
+        assert_eq!(unauthorized, nonexistent);
+        assert_eq!(unauthorized.record_version(), None);
+    }
+
+    #[test]
+    fn scoped_status_repairs_only_after_a_monotonic_version_advance() {
+        let status = decode_scoped_status_response(include_bytes!(
+            "../tests/fixtures/credential_status_metadata_ready.json"
+        ))
+        .expect("the published status shape decodes");
+        assert_eq!(
+            decode_get_response(include_bytes!(
+                "../tests/fixtures/credential_get_scoped_refused.json"
+            )),
+            Err(VaultGetError::NotFound),
+            "the same address can report ready metadata while refusing the read"
+        );
+        assert_eq!(status.record_version(), Some(41));
+        assert!(status.record_version_advanced_since(40));
+        assert!(
+            !status.record_version_advanced_since(41),
+            "ready=true is not a repair signal when the version did not advance"
+        );
+        assert!(!status.record_version_advanced_since(42));
+    }
+
+    #[test]
+    fn auth_failure_params_are_xor_and_record_version_is_required() {
+        let by_id = ReportParams::for_credential_id("apikey:deepseek", 401, 17);
+        let body: Value = serde_json::from_slice(&encode_report_request(by_id).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "method": "credential.report_auth_failure",
+                "params": {
+                    "handle": null,
+                    "credential_id": "apikey:deepseek",
+                    "provider_status": 401,
+                    "record_version": 17
+                }
+            })
+        );
+        assert!(ReportParams::for_handle("ckh_existing", 401, 17)
+            .validate()
+            .is_ok());
+        assert_eq!(
+            ReportParams {
+                handle: Some("ckh_existing".to_string()),
+                credential_id: Some("apikey:deepseek".to_string()),
+                provider_status: 401,
+                record_version: 17,
+            }
+            .validate(),
+            Err("invalid_params")
+        );
+        assert_eq!(
+            ReportParams {
+                handle: None,
+                credential_id: None,
+                provider_status: 401,
+                record_version: 17,
+            }
+            .validate(),
+            Err("invalid_params")
+        );
+
+        let malformed_request = serde_json::json!({
+            "method": "credential.report_auth_failure",
+            "params": {
+                "credential_id": "apikey:deepseek",
+                "provider_status": 401
+            }
+        });
+        assert!(malformed_request["params"].get("record_version").is_none());
+        let published_reply =
+            include_bytes!("../tests/fixtures/credential_report_missing_record_version.json");
+        let reply: Value = serde_json::from_slice(published_reply).unwrap();
+        assert_eq!(
+            reply.pointer("/result/error/code").and_then(Value::as_str),
+            Some("invalid_params")
+        );
+        assert_eq!(
+            decode_report_response(published_reply),
+            Err(VaultGetError::Permanent),
+            "a missing CAS version must be refused, never accepted against the current record"
         );
     }
 
@@ -2946,72 +3400,33 @@ mod drop_counter_tests {
         assert_eq!(state.stale_generation_drops(), 0);
     }
 
-    /// The reply shape the vault actually sends, taken from the producer type.
-    ///
-    /// THIS DECODER HAD NO TEST AT ALL, which is how it shipped modelling `grants`
-    /// as an array when the vault sends a count. The first real reply -- authorised,
-    /// complete, seventeen rows -- failed to decode and was reported as a refusal.
-    /// From outside, a decoder that cannot parse a success is indistinguishable from
-    /// a surface that denied you, and it cost the vault owner a round trip reading
-    /// their audit log for a refusal row that was never written.
-    ///
-    /// `#[serde(default)]` does NOT save you here: it covers a MISSING field, never
-    /// a present one of the wrong type. The wrong type is the case that reaches
-    /// production, because the field is always there.
-    ///
-    /// The literal below is the published shape rather than one I generated from my
-    /// own structs. A fixture built by serialising the type under test asserts that
-    /// serde round-trips, which it does, and says nothing about whether the type
-    /// matches the producer -- the exact gap that let this through.
+    /// This fixture reproduces the success response published by the deployed vault.
+    /// It is not generated from this crate's decode structs, so it verifies the wire
+    /// format the vault actually sends.
     #[test]
     fn a_scoped_listing_decodes_the_shape_the_vault_publishes() {
-        // WRAPPED IN THE TRANSPORT ENVELOPE, which is what the decoder unwraps
-        // before it ever sees the payload. My first version of this fixture was the
-        // bare payload as published, and it failed for a reason that had nothing to
-        // do with the defect under test -- a fixture can be wrong in its own way
-        // and still look like the bug reproducing.
-        let body = br#"{ "result": {
-            "credentials": [
-                {
-                    "id": "oauth:anthropic:umutaday",
-                    "categories": ["anthropic-native", "llm-provider"],
-                    "type": "oauth",
-                    "serves": ["anthropic"],
-                    "refresh_adapter": "anthropic-oauth",
-                    "state": "active",
-                    "record_version": 1,
-                    "operations": ["read"],
-                    "account_id": "acct-1",
-                    "email": "umut@example.test",
-                    "org_name": "Umut's Organization"
-                },
-                {
-                    "id": "apikey:deepseek",
-                    "categories": ["llm-provider"],
-                    "type": "apikey",
-                    "serves": ["deepseek"],
-                    "state": "active",
-                    "record_version": 3,
-                    "operations": ["read"]
-                }
-            ],
-            "grants": 1,
-            "grant_tuples": [
-                {"selector_kind": "category", "selector": "llm-provider", "operation": "read"}
-            ],
-            "view": "sha256:0ea9b2a358d9f259"
-        } }"#;
-
-        let decoded = decode_list_scoped_response(body).expect("the published shape decodes");
+        let decoded = decode_list_scoped_response(include_bytes!(
+            "../tests/fixtures/credential_list_scoped_success.json"
+        ))
+        .expect("the published shape decodes");
         assert_eq!(decoded.grants, 1, "grants is a count, not a list");
         assert_eq!(decoded.grant_tuples.len(), 1, "the tuples are the array");
         assert_eq!(decoded.credentials.len(), 2);
         assert_eq!(decoded.view, "sha256:0ea9b2a358d9f259");
 
-        // ABSENT, NOT NULL, and it must stay that way through the decode. A static
-        // key has no refresh adapter and no identity; defaulting either would make
-        // an unidentified credential look like one whose identity is known to be
-        // empty, and the second row here is exactly that case.
+        let rows: Vec<ScopedRow> = decoded
+            .credentials
+            .clone()
+            .into_iter()
+            .map(scoped_row_from_wire)
+            .collect();
+        assert_eq!(rows[0].credential_id, "oauth:anthropic:umutaday");
+        assert_eq!(rows[0].credential_type, "oauth");
+        assert_eq!(rows[0].record_version, 1);
+        assert_eq!(rows[0].state, "active");
+        assert_eq!(rows[1].credential_id, "apikey:deepseek");
+        assert_eq!(rows[1].credential_type, "apikey");
+
         let apikey = &decoded.credentials[1];
         assert_eq!(apikey.id, "apikey:deepseek");
         assert!(apikey.account_id.is_none(), "absent identity stays absent");
@@ -3020,6 +3435,36 @@ mod drop_counter_tests {
         let oauth = &decoded.credentials[0];
         assert_eq!(oauth.account_id.as_deref(), Some("acct-1"));
         assert_eq!(oauth.record_version, 1);
+    }
+
+    #[test]
+    fn a_scoped_listing_missing_grants_is_rejected() {
+        assert_eq!(
+            decode_list_scoped_response(include_bytes!(
+                "../tests/fixtures/credential_list_scoped_missing_grants.json"
+            )),
+            Err(VaultGetError::FailClosed)
+        );
+    }
+
+    #[test]
+    fn a_scoped_listing_missing_credentials_is_rejected() {
+        assert_eq!(
+            decode_list_scoped_response(include_bytes!(
+                "../tests/fixtures/credential_list_scoped_missing_credentials.json"
+            )),
+            Err(VaultGetError::FailClosed)
+        );
+    }
+
+    #[test]
+    fn a_scoped_listing_with_explicit_empty_credentials_decodes() {
+        let decoded = decode_list_scoped_response(include_bytes!(
+            "../tests/fixtures/credential_list_scoped_empty.json"
+        ))
+        .expect("explicit empty credentials with a grant is authoritative");
+        assert_eq!(decoded.grants, 1);
+        assert!(decoded.credentials.is_empty());
     }
 
     /// An additive field on the vault's side must not take every lane dark.
