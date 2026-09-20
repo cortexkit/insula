@@ -1028,7 +1028,7 @@ impl Registry {
                 let changed = previous_winner.is_some_and(|held| held != &winner);
                 if changed || previous_winner.is_none() {
                     eprintln!(
-                        "{tag} {provider} dedup winner {verb} for {account_id}: \
+                        "{tag} {provider} dedup winner for {account_id} {verb} \
                          {winner}, reading {reading} \
                          (several credentials resolve this account; the row follows \
                          whichever holds the newest reading)",
