@@ -57,6 +57,16 @@ enum ClientFailure {
     /// the daemon told us something about ROUTING that we do not recognise, which
     /// is a statement about the route rather than about the credential.
     UnknownRouteCode,
+    /// The daemon refused this process's launch-identity claim on `route.open`.
+    ///
+    /// A claim is refused with an error frame and NO ROUTE rather than being
+    /// downgraded to `Direct`, so this is a statement about the CLAIM and never
+    /// about credentials or grants -- an operator who reads it as the latter will
+    /// find both in perfect order.
+    ///
+    /// Its own variant rather than folding into `UnknownRouteCode` because the
+    /// remedy differs and only this one has one: reopen without the claim.
+    IdentityRefused,
     Protocol,
 }
 
@@ -65,6 +75,13 @@ impl ClientFailure {
         match self {
             Self::Transport | Self::RouteGone => VaultGetError::Transient,
             Self::Classified(error) => error,
+            // TRANSIENT, AND IT SHOULD NEVER REACH HERE. `open_route` consumes
+            // this variant by reopening without the claim, so a caller seeing it
+            // means the reopen ALSO failed -- a route problem rather than a
+            // credential one, which is what transient says. Failing closed would
+            // replace healthy cached windows with `decode_failed` over a claim
+            // this client already chose to drop.
+            Self::IdentityRefused => VaultGetError::Transient,
             // TRANSIENT, THOUGH UNRECOGNISED. The vault states its verdict in
             // `class`; a frame without one is the ROUTE speaking, and no route
             // condition is evidence that a credential is bad. Failing closed here
@@ -579,10 +596,62 @@ impl ClientState {
         attempt.wait().await
     }
 
+    /// Open the route, retrying once WITHOUT the identity claim if it is refused.
+    ///
+    /// A refused claim is answered with an error frame and NO ROUTE -- it is not
+    /// downgraded to `Direct` (measured by the vault's maintainer against the live
+    /// daemon). That is the right behaviour on their side and it creates a failure
+    /// mode here that did not exist before the claim did: a nonce that has gone
+    /// stale, say because the daemon restarted without respawning this process,
+    /// refuses every `route.open` and takes EVERY vault lane dark at once.
+    ///
+    /// Without this arm that lands in the unknown-code default, which is transient,
+    /// so it would retry forever while the lanes serve stale and nothing names the
+    /// cause -- and an operator would go looking at credentials and grants, both of
+    /// which would be fine.
+    ///
+    /// SO THE RETRY IS A STRICT DE-ESCALATION, never a widening: presenting no
+    /// identity yields `Direct`, which is exactly what this client had before the
+    /// claim existed. It cannot grant more than the claim would have. Scoped ops
+    /// stop working; handle-addressed ops keep working, which today is all of them.
+    ///
+    /// AND IT IS LOUD, because a silent downgrade is precisely what the vault side
+    /// refused to do and it would be perverse to reintroduce it one layer down.
+    ///
+    /// RETIRE THIS ARM WHEN ENUMERATION MOVES TO `list_scoped`. At that point
+    /// `Direct` serves nothing, so degrading to it buys nothing and hides
+    /// everything; the honest behaviour then is to fail the open and let the lanes
+    /// go dark with a named cause.
     async fn open_route(
         self: &Arc<Self>,
         connection: &Arc<LiveConnection>,
         route_generation: u64,
+    ) -> Result<RouteLease, ClientFailure> {
+        match self
+            .open_route_inner(connection, route_generation, true)
+            .await
+        {
+            Err(ClientFailure::IdentityRefused) => {
+                eprintln!(
+                    "{LOG_TAG} warning: launch identity refused on route.open, continuing as \
+                     Direct. WHAT STOPS WORKING: grant-scoped credential reads. WHAT DOES NOT: \
+                     handle-addressed reads, which today is every lane. Usual cause is a stale \
+                     launch nonce after a daemon restart that did not respawn this process; a \
+                     module restart clears it. This is a statement about the identity claim and \
+                     NOT about credentials or grants, which will both look fine."
+                );
+                self.open_route_inner(connection, route_generation, false)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn open_route_inner(
+        self: &Arc<Self>,
+        connection: &Arc<LiveConnection>,
+        route_generation: u64,
+        claim_identity: bool,
     ) -> Result<RouteLease, ClientFailure> {
         let corr = self.next_corr();
         let body = serde_json::to_vec(&serde_json::json!({
@@ -595,6 +664,31 @@ impl ClientState {
                 "project_root": "/",
                 "harness": "ck-quota",
                 "session": "vault-consumer",
+            },
+            // WITHOUT THIS THE DAEMON STAMPS US `Direct`, AND SILENTLY.
+            //
+            // `route_open_principal` returns `Principal::Direct` when no consumer
+            // identity is present, and `Reserved { module_id }` when one is present
+            // and the supervisor validates its launch nonce. Being supervised is
+            // not enough and neither is the connection: the principal is a thing
+            // the CALLER SENDS.
+            //
+            // Measured before this existed: a grant on `reserved:insula` was live
+            // and correct, and `credential.list_scoped` still refused with
+            // `NotFound` -- the same answer the vault gives when it simply has
+            // nothing for you, which is why the cause took a source read rather
+            // than a log.
+            //
+            // The daemon does NOT `deny_unknown_fields` here, deliberately, so a
+            // misspelled key would parse to `None` and demote every call to
+            // `Direct` -- capability-safe and diagnostically awful, surfacing far
+            // from its cause. Their own test pins the spelling for that reason;
+            // `consumer_identity_fields_match_the_daemons_wire_names` below pins
+            // our side of the same join.
+            "consumer_identity": if claim_identity {
+                consumer_identity()
+            } else {
+                None
             },
         }))
         .map_err(|_| ClientFailure::Protocol)?;
@@ -802,6 +896,38 @@ impl Drop for PendingGuard {
 /// cannot stop ck-quota from registering and serving health.
 pub struct VaultClient {
     state: Arc<ClientState>,
+}
+
+/// The supervisor-issued identity that earns a `Reserved` principal, or `None`.
+///
+/// Both variables are injected at spawn (`SUBC_MODULE_ID`, `SUBC_LAUNCH_NONCE`)
+/// and are present on the running module; they are absent when the binary is run
+/// by hand, which is exactly when `Direct` is the honest answer. So an absent
+/// value is omitted rather than defaulted -- a fabricated nonce would be refused
+/// with `bad_consumer_identity`, turning "I am not supervised" into "I tried to
+/// forge an identity".
+///
+/// THE NONCE IS NEVER LOGGED. It is the proof of supervised launch, so it goes on
+/// the wire and nowhere else -- not into an error string, not into a Debug.
+fn consumer_identity() -> Option<serde_json::Value> {
+    consumer_identity_from(|key| std::env::var(key).ok())
+}
+
+/// Over an arbitrary environment, so both outcomes are testable without mutating
+/// the process environment mid-suite.
+///
+/// This workspace removed its last twenty env-mutating test sites today: cargo
+/// runs a crate's tests on one thread pool, so a `set_var` is visible to every
+/// concurrent test and nothing flakes only until two files touch the same name.
+/// Injection is the established shape here (`env::home_dir_from`,
+/// `opencode_auth::auth_path_from`).
+fn consumer_identity_from(lookup: impl Fn(&str) -> Option<String>) -> Option<serde_json::Value> {
+    let module_id = lookup("SUBC_MODULE_ID").filter(|value| !value.is_empty())?;
+    let launch_nonce = lookup("SUBC_LAUNCH_NONCE").filter(|value| !value.is_empty())?;
+    Some(serde_json::json!({
+        "module_id": module_id,
+        "launch_nonce": launch_nonce,
+    }))
 }
 
 impl VaultClient {
@@ -1115,6 +1241,11 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
         // rather than using an SDK, and the SDKs are where the
         // retry-budget-exhausted error that names the target lives, so without
         // this warning the id is printed nowhere in this process.
+        // The launch-identity claim was rejected. NOT a credential or grant
+        // problem, and not transient: retrying the same claim produces the same
+        // refusal forever. `open_route` reopens without it, which de-escalates to
+        // the `Direct` principal this client used before claims existed.
+        Some("bad_consumer_identity") => ClientFailure::IdentityRefused,
         Some(code @ ("unknown_channel" | codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
             eprintln!(
                 "{LOG_TAG} warning: daemon answered {code:?} for module id \
@@ -1550,6 +1681,109 @@ impl CredentialSource for VaultClient {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    /// A refused identity claim is its own outcome, not an unknown route code.
+    ///
+    /// The vault's maintainer measured this against the live daemon: a wrong nonce
+    /// is answered with an error frame and NO ROUTE, rather than being silently
+    /// downgraded to `Direct`. Good on their side, and it creates a failure mode
+    /// here that did not exist before the claim did -- a stale nonce refuses every
+    /// `route.open` and takes every vault lane dark at once.
+    ///
+    /// Without this arm the code lands in the unknown-code default, which is
+    /// transient, so it would retry the same doomed claim forever while the lanes
+    /// serve stale and nothing names the cause. An operator would go looking at
+    /// credentials and grants, and find both in order.
+    #[test]
+    fn a_refused_identity_claim_is_distinguished_from_an_unknown_route_code() {
+        assert_eq!(
+            classify("bad_consumer_identity"),
+            ClientFailure::IdentityRefused,
+            "the one route refusal with a remedy must be told apart from those without"
+        );
+
+        // NOT VACUOUS: an unrecognised code still reaches the default, so this
+        // cannot pass by classifying everything as an identity refusal.
+        assert_eq!(
+            classify("some_code_this_client_has_never_read"),
+            ClientFailure::UnknownRouteCode
+        );
+
+        // And it stays transient at the boundary: reaching a caller means the
+        // reopen without the claim ALSO failed, which is a route problem and must
+        // not degrade a healthy cached window.
+        assert_eq!(
+            ClientFailure::IdentityRefused.vault_error(),
+            VaultGetError::Transient
+        );
+    }
+
+    /// Our `consumer_identity` field names match the ones the daemon stamps from.
+    ///
+    /// THE JOIN IS A STRING AND IT FAILS QUIETLY. `route.open` is deliberately NOT
+    /// `deny_unknown_fields` on the daemon side -- refusing unknown keys would
+    /// break every client the moment they add a field -- so a misspelling here
+    /// parses to `None` and the daemon stamps `Direct`. Capability-wise that is the
+    /// safe direction; diagnostically it is the worst one, because the module keeps
+    /// working for everything handle-addressed and fails only on scoped ops, with
+    /// `NotFound` -- the same answer as "the vault has nothing for you".
+    ///
+    /// Not hypothetical: it is what this host did before the field existed, and it
+    /// took reading the daemon's source to tell the two apart.
+    #[test]
+    fn consumer_identity_fields_match_the_daemons_wire_names() {
+        let identity = consumer_identity_from(|key| match key {
+            "SUBC_MODULE_ID" => Some("insula".to_string()),
+            "SUBC_LAUNCH_NONCE" => Some("nonce-value".to_string()),
+            _ => None,
+        })
+        .expect("a supervised environment yields an identity");
+
+        assert_eq!(identity["module_id"], "insula");
+        assert_eq!(identity["launch_nonce"], "nonce-value");
+
+        let mut keys: Vec<&str> = identity
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["launch_nonce", "module_id"],
+            "a renamed or extra key demotes every scoped call to Direct, silently"
+        );
+    }
+
+    /// Unsupervised means NO identity, never a fabricated one.
+    ///
+    /// Running this binary by hand is exactly when `Direct` is the honest answer.
+    /// A made-up nonce would be refused as `bad_consumer_identity`, turning "I am
+    /// not supervised" into "I tried to forge an identity" -- a worse error about a
+    /// different thing.
+    #[test]
+    fn an_unsupervised_process_presents_no_identity() {
+        assert!(consumer_identity_from(|_| None).is_none());
+
+        // A HALF-SET ENVIRONMENT IS ALSO NO IDENTITY. A module id without a nonce
+        // cannot be validated, so presenting it earns a refusal rather than being
+        // ignored -- and this arm is the one a `?` on only the first lookup would
+        // miss.
+        assert!(consumer_identity_from(
+            |key| (key == "SUBC_MODULE_ID").then(|| "insula".to_string())
+        )
+        .is_none());
+        assert!(consumer_identity_from(
+            |key| (key == "SUBC_LAUNCH_NONCE").then(|| "nonce".to_string())
+        )
+        .is_none());
+
+        // An empty value is absence, not a value: the supervisor sets both, so a
+        // blank one means something upstream went wrong and forging past it would
+        // hide that.
+        assert!(consumer_identity_from(|_| Some(String::new())).is_none());
+    }
 
     fn classify(code: &str) -> ClientFailure {
         classify_error_frame(
