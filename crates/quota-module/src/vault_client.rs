@@ -1075,7 +1075,13 @@ pub struct ScopedListing {
     /// Length only. The digest itself says SOMETHING moved and never what, so
     /// printing it invites treating a change as evidence of a specific one.
     pub view_len: usize,
+    /// How many grants authorise these rows, as the vault counts them.
     pub grants: usize,
+    /// How many selector tuples came with them. Reported beside `grants` rather
+    /// than folded into it because they answer different questions -- one grant
+    /// can carry several selectors, so a probe that printed only one of these
+    /// would read as agreement whenever they happened to match.
+    pub grant_tuples: usize,
     pub credentials: Vec<ScopedRow>,
 }
 
@@ -1141,8 +1147,24 @@ struct ScopedListResult {
     /// unchanged `record_version` is not evidence of a re-seal. Use it to skip
     /// work, never to infer a transition.
     view: String,
+    /// A COUNT, NOT A LIST. The tuples live in `grant_tuples`; this is how many
+    /// grants authorise the rows above.
+    ///
+    /// I modelled it as `Vec<ScopedGrant>` and the whole decode failed on the first
+    /// real reply -- `#[serde(default)]` covers a MISSING field, never a present
+    /// one of the wrong type, so the reply arrived, authorised and complete, and
+    /// was thrown away. From outside that is indistinguishable from a refusal, and
+    /// it cost a peer a round trip reading their audit log for a refusal row that
+    /// was never written.
+    ///
+    /// The shape I had was not invented: it is `grant_tuples`, one field over. Two
+    /// fields whose names share a stem, one scalar and one array, and I bound the
+    /// array to the scalar's name.
     #[serde(default)]
-    grants: Vec<ScopedGrant>,
+    grants: u64,
+    /// The selector tuples themselves, which is what `ScopedGrant` models.
+    #[serde(default)]
+    grant_tuples: Vec<ScopedGrant>,
     #[serde(default)]
     credentials: Vec<ScopedCredential>,
 }
@@ -1541,7 +1563,8 @@ impl VaultClient {
         let result = self.list_scoped().await?;
         Ok(ScopedListing {
             view_len: result.view.len(),
-            grants: result.grants.len(),
+            grants: result.grants as usize,
+            grant_tuples: result.grant_tuples.len(),
             credentials: result
                 .credentials
                 .into_iter()
@@ -2921,5 +2944,100 @@ mod drop_counter_tests {
         assert!(receiver.blocking_recv().is_ok(), "caller must receive it");
         assert_eq!(state.unmatched_terminal_drops(), 0);
         assert_eq!(state.stale_generation_drops(), 0);
+    }
+
+    /// The reply shape the vault actually sends, taken from the producer type.
+    ///
+    /// THIS DECODER HAD NO TEST AT ALL, which is how it shipped modelling `grants`
+    /// as an array when the vault sends a count. The first real reply -- authorised,
+    /// complete, seventeen rows -- failed to decode and was reported as a refusal.
+    /// From outside, a decoder that cannot parse a success is indistinguishable from
+    /// a surface that denied you, and it cost the vault owner a round trip reading
+    /// their audit log for a refusal row that was never written.
+    ///
+    /// `#[serde(default)]` does NOT save you here: it covers a MISSING field, never
+    /// a present one of the wrong type. The wrong type is the case that reaches
+    /// production, because the field is always there.
+    ///
+    /// The literal below is the published shape rather than one I generated from my
+    /// own structs. A fixture built by serialising the type under test asserts that
+    /// serde round-trips, which it does, and says nothing about whether the type
+    /// matches the producer -- the exact gap that let this through.
+    #[test]
+    fn a_scoped_listing_decodes_the_shape_the_vault_publishes() {
+        // WRAPPED IN THE TRANSPORT ENVELOPE, which is what the decoder unwraps
+        // before it ever sees the payload. My first version of this fixture was the
+        // bare payload as published, and it failed for a reason that had nothing to
+        // do with the defect under test -- a fixture can be wrong in its own way
+        // and still look like the bug reproducing.
+        let body = br#"{ "result": {
+            "credentials": [
+                {
+                    "id": "oauth:anthropic:umutaday",
+                    "categories": ["anthropic-native", "llm-provider"],
+                    "type": "oauth",
+                    "serves": ["anthropic"],
+                    "refresh_adapter": "anthropic-oauth",
+                    "state": "active",
+                    "record_version": 1,
+                    "operations": ["read"],
+                    "account_id": "acct-1",
+                    "email": "umut@example.test",
+                    "org_name": "Umut's Organization"
+                },
+                {
+                    "id": "apikey:deepseek",
+                    "categories": ["llm-provider"],
+                    "type": "apikey",
+                    "serves": ["deepseek"],
+                    "state": "active",
+                    "record_version": 3,
+                    "operations": ["read"]
+                }
+            ],
+            "grants": 1,
+            "grant_tuples": [
+                {"selector_kind": "category", "selector": "llm-provider", "operation": "read"}
+            ],
+            "view": "sha256:0ea9b2a358d9f259"
+        } }"#;
+
+        let decoded = decode_list_scoped_response(body).expect("the published shape decodes");
+        assert_eq!(decoded.grants, 1, "grants is a count, not a list");
+        assert_eq!(decoded.grant_tuples.len(), 1, "the tuples are the array");
+        assert_eq!(decoded.credentials.len(), 2);
+        assert_eq!(decoded.view, "sha256:0ea9b2a358d9f259");
+
+        // ABSENT, NOT NULL, and it must stay that way through the decode. A static
+        // key has no refresh adapter and no identity; defaulting either would make
+        // an unidentified credential look like one whose identity is known to be
+        // empty, and the second row here is exactly that case.
+        let apikey = &decoded.credentials[1];
+        assert_eq!(apikey.id, "apikey:deepseek");
+        assert!(apikey.account_id.is_none(), "absent identity stays absent");
+        assert!(apikey.email.is_none());
+
+        let oauth = &decoded.credentials[0];
+        assert_eq!(oauth.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(oauth.record_version, 1);
+    }
+
+    /// An additive field on the vault's side must not take every lane dark.
+    ///
+    /// The opposite failure to the one above and just as expensive: a decoder that
+    /// refuses unknown fields turns any future vault release into a total outage
+    /// here. Permissive in SHAPE, strict in MEANING.
+    #[test]
+    fn a_scoped_listing_ignores_a_field_added_later() {
+        let body = br#"{ "result": {
+            "credentials": [],
+            "grants": 0,
+            "grant_tuples": [],
+            "view": "v1",
+            "something_added_next_quarter": {"nested": true}
+        } }"#;
+        let decoded = decode_list_scoped_response(body).expect("unknown fields are ignored");
+        assert_eq!(decoded.grants, 0);
+        assert!(decoded.credentials.is_empty());
     }
 }
