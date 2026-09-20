@@ -882,6 +882,22 @@ fn health_report(
         // handle enters when its credential is deleted and the handle is left
         // configured, and it does not clear on its own.
         "handlesWithoutAccount": snapshot.handles_without_account,
+        // The installed scoped inventory is the authority the refresher used for
+        // this process. External checkers read it back here because their direct
+        // daemon connection has no reserved principal and cannot enumerate the
+        // grant itself.
+        "scopedCredentialIds": snapshot.scoped_credential_ids,
+        // A failed list retains the preceding inventory. Publishing both the
+        // failure and that inventory's age prevents a retained set from looking
+        // like a current authoritative enumeration.
+        "vaultEnumerationFailure": snapshot.vault_enumeration_failure,
+        "retainedVaultSnapshotAgeSecs": snapshot
+            .retained_vault_snapshot_age
+            .map(|d| d.as_secs()),
+        // A refused credential-to-provider mapping can make a provider family
+        // unverifiable before any usage row exposes the problem, so the lane
+        // checker receives this warning alongside the inventory it evaluates.
+        "vaultMappingWarning": snapshot.vault_mapping_warning,
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
         // How long since ANY fetch last succeeded, and whether that has gone on
@@ -2576,6 +2592,10 @@ mod tests {
             "cookieCohortTotal",
             "cookieLoginsStale",
             "handlesWithoutAccount",
+            "scopedCredentialIds",
+            "vaultEnumerationFailure",
+            "retainedVaultSnapshotAgeSecs",
+            "vaultMappingWarning",
             "lastTickAgeSecs",
             "fetchBlackout",
             "lastFetchSuccessAgeSecs",
@@ -2604,7 +2624,47 @@ mod tests {
         assert!(obj["cookieCohortTotal"].as_u64().unwrap() >= 7);
         // Fresh registry: never ticked, nothing fetched yet.
         assert_eq!(obj["fresh"].as_u64().unwrap(), 0);
+        assert_eq!(obj["scopedCredentialIds"], serde_json::json!([]));
+        assert_eq!(obj["vaultEnumerationFailure"], serde_json::Value::Null);
         assert_eq!(obj["refresherStalled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn scoped_inventory_health_keeps_rows_failure_and_retained_age_distinct() {
+        let snapshot = quota_core::health::HealthSnapshot {
+            scoped_credential_ids: vec![
+                "cookie:opencode.ai".into(),
+                "oauth:anthropic:second".into(),
+            ],
+            vault_enumeration_failure: Some("vault route unavailable".into()),
+            retained_vault_snapshot_age: Some(std::time::Duration::from_secs(73)),
+            vault_mapping_warning: Some("cookie family has multiple deposits".into()),
+            ..healthy_snapshot()
+        };
+
+        let ModuleControlResponse::HealthCheck { metrics, .. } =
+            health_report(&snapshot, &test_vault(), &ServeCounters::default())
+        else {
+            panic!("health_report must produce a HealthCheck response");
+        };
+        let metrics = metrics.expect("health report carries metrics");
+
+        assert_eq!(
+            metrics["scopedCredentialIds"],
+            serde_json::json!(["cookie:opencode.ai", "oauth:anthropic:second"])
+        );
+        assert_eq!(
+            metrics["vaultEnumerationFailure"],
+            serde_json::json!("vault route unavailable")
+        );
+        assert_eq!(
+            metrics["retainedVaultSnapshotAgeSecs"],
+            serde_json::json!(73)
+        );
+        assert_eq!(
+            metrics["vaultMappingWarning"],
+            serde_json::json!("cookie family has multiple deposits")
+        );
     }
 
     /// The `route.bind` arm still acks unchanged after threading the registry in.

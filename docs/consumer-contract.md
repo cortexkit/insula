@@ -345,6 +345,25 @@ This is worth knowing precisely because the previous behaviour was invisible: a
 dead account kept publishing its last capacity reading with no upper age bound,
 never degraded, and went on counting as serving in the health snapshot.
 
+`scopedCredentialIds` is an array of strings naming every credential id in the
+scoped snapshot currently installed by this module. It is empty both before the
+first install and after an authoritative empty install. It is a readback of the
+inventory the refresher actually used, not a fresh vault query. External
+checkers must use this field because a standalone process has a direct principal
+and cannot call `credential.list_scoped` on the supervised module's reserved
+grant. Credential ids identify records; the field carries no credential bytes.
+
+Read it with `vaultEnumerationFailure` and `retainedVaultSnapshotAgeSecs`.
+`vaultEnumerationFailure` is `null` when no list failure is recorded and otherwise
+contains the latest failure, including `principal is not granted`. On failure,
+`scopedCredentialIds` remains the last installed snapshot and
+`retainedVaultSnapshotAgeSecs` is its age in whole seconds (or `null` when no
+snapshot has ever been installed). A consumer must not mistake retained rows for
+a current enumeration. `vaultMappingWarning` is `null` when every installed row
+mapped cleanly and otherwise carries the warning produced while mapping the
+snapshot. Family refusals can prevent usage rows; exact deliberately unsupported
+ids remain notes for a checker to classify rather than dark lanes.
+
 `vaultConnectionsEstablished` counts the vault connections this process has
 opened. `1` means the first one is still in use; every increment is a reconnect
 after a transport failure. There is no idle timeout and no maximum lifetime, and
