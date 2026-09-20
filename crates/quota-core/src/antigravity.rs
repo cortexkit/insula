@@ -47,7 +47,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use crate::credential_source::{CredentialSource, VaultCapability, VaultGetError};
+use crate::credential_source::{CredentialSource, VaultGetError};
 use crate::provider::AccountObservation;
 use crate::vault_handles::VaultHandleLoader;
 
@@ -1626,11 +1626,17 @@ impl AntigravityProvider {
     /// This is the same Code Assist endpoint the Gemini provider calls, and the
     /// account behind the token is what makes the answers differ: an Antigravity
     /// login's quota covers Antigravity's model pool, Claude and GPT included.
-    async fn fetch_remote(&self, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_remote(&self, handle: &CredentialHandle) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(VaultGetError::Permanent);
         };
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
@@ -1743,7 +1749,7 @@ impl AntigravityProvider {
         if let Err(error) = &result {
             crate::credential_source::report_vault_auth_failure(
                 self.credential_source.as_ref(),
-                capability,
+                handle,
                 record_version,
                 error,
             );
@@ -1965,8 +1971,8 @@ impl UsageProvider for AntigravityProvider {
         if let CredentialHandle::Named(name) = handle {
             return self.fetch_plugin_account(name).await;
         }
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_remote(capability).await;
+        if handle.is_vault() {
+            return self.fetch_remote(handle).await;
         }
 
         let result: Result<ProviderUsage, FetchError> = async {

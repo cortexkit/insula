@@ -30,7 +30,9 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
+#[cfg(test)]
+use crate::credential_source::VaultCapability;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::{
@@ -374,13 +376,13 @@ impl GrokProvider {
 
     fn report_auth_failure(
         &self,
-        capability: &VaultCapability,
+        handle: &CredentialHandle,
         record_version: u64,
         error: &FetchError,
     ) {
         crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            capability,
+            handle,
             record_version,
             error,
         );
@@ -399,13 +401,19 @@ impl GrokProvider {
         }
     }
 
-    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
             );
         };
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
@@ -426,7 +434,7 @@ impl GrokProvider {
             .map(|response| response.body)
             .and_then(|body| normalize_usage(&body));
         if let Err(error) = &result {
-            self.report_auth_failure(capability, record_version, error);
+            self.report_auth_failure(handle, record_version, error);
         }
         match result {
             Ok(usage) => {
@@ -518,8 +526,8 @@ impl UsageProvider for GrokProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(capability).await;
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
         }
 
         let entry = match opencode_auth::read_provider(OPENCODE_PROVIDER) {
@@ -547,7 +555,6 @@ impl UsageProvider for GrokProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::sync::Mutex;
 
     use crate::credential_source::{VaultCredential, VaultGetError};
@@ -650,37 +657,6 @@ mod tests {
         (format!("{base}/usage"), task)
     }
 
-    fn write_handles(body: &str) -> std::path::PathBuf {
-        // PER-CALL PATH, not per-process. Keyed on the pid alone, every test in
-        // this module wrote the SAME file, and cargo runs them concurrently on one
-        // thread pool -- so two tests writing different bodies race and each may
-        // read the other's.
-        //
-        // Latent until it mattered: while every caller wrote the same body the
-        // collision was invisible, and it surfaced the moment a test needed a
-        // DIFFERENT handles file (the control for insula#19, which asserts the
-        // local lane survives when no vault handle is mapped). It failed only in
-        // the full suite and passed alone, which is the signature.
-        //
-        // Same counter pattern as the scratch paths in `codex_resets`.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-grok-handles-{}-{unique}.json",
-            std::process::id()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-        path
-    }
-
     /// A REAL captured gRPC-web response from GetGrokCreditsConfig (live wire bytes,
     /// base64). Decodes to 76.57% used with a 2026-07-01 billing reset over a 30-day
     /// period (43200 min). This is a historical capture: the live wire later moved to
@@ -722,59 +698,29 @@ mod tests {
         out
     }
 
-    /// A mapped vault handle REPLACES the implicit local lane.
-    ///
-    /// This test previously asserted the opposite -- two handles, implicit first --
-    /// and was green while the behaviour it pinned was the defect reported on
-    /// insula#19: an implicit lane beside a vault one is a second slot for the same
-    /// account, which deduplicates only while both resolve the same absent
-    /// identity. Label the vault side and the pair splits, publishing whatever the
-    /// local lane has become. After a custody migration that is a tombstone, so the
-    /// wire gained a dead row beside a working one.
-    ///
-    /// Changed deliberately rather than deleted: the assertion was load-bearing for
-    /// the old shape, and its replacement is what makes grok agree with anthropic,
-    /// deepseek, openrouter and synthetic, which all return the vault set alone.
     #[test]
     fn a_mapped_vault_handle_replaces_the_implicit_lane() {
-        let path = write_handles(
-            r#"{"handles":{"oauth:xai":"ckh_grok","oauth:anthropic":"ckh_anthropic"}}"#,
-        );
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("oauth:xai", "oauth"), ("oauth:anthropic", "oauth")]);
         let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = GrokProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
-        );
+        let provider = GrokProvider::new_with_handle_loader(Some(source), loader);
         let handles = provider.handles().unwrap();
-        assert_eq!(
-            handles.len(),
-            1,
-            "a second slot for one account is what splits the row: {handles:?}"
-        );
+        assert_eq!(handles.len(), 1, "{handles:?}");
         assert_eq!(handles[0].stable_id(), "oauth:xai");
-        assert_ne!(
-            handles[0],
-            CredentialHandle::implicit(),
-            "and the survivor is the vault lane, not the local one"
-        );
-        let _ = std::fs::remove_file(path);
+        assert!(handles[0].is_vault());
     }
 
-    /// THE CONTROL: with no vault handle mapped, the local lane still serves.
-    ///
-    /// Without it, returning an empty vector would satisfy the test above and take
-    /// grok dark on every host that has not migrated custody.
     #[test]
     fn the_implicit_lane_survives_when_no_vault_handle_is_mapped() {
-        let path = write_handles(r#"{"handles":{"oauth:anthropic":"ckh_anthropic"}}"#);
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = GrokProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(VaultHandleLoader::default()),
         );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
     }
 
     #[tokio::test]

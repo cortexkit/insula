@@ -11,14 +11,18 @@ use crate::model::{AccountInfo, Pool, ProviderUsage, SavedResets, Usage};
 
 /// Stable identity for one credential fetch unit.
 ///
-/// A vault handle includes the exact capability snapshot used by the fetch. The
-/// capability participates in equality and hashing, while all formatting exposes
-/// only the non-secret credential id.
+/// Scoped handles are keyed by the vault's stable credential id and type. The
+/// legacy capability variant remains only for callers that already hold an
+/// opaque capability; scoped enumeration never manufactures one.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CredentialHandle {
     ImplicitLocal,
     Named(String),
     Vault {
+        credential_id: String,
+        credential_type: String,
+    },
+    LegacyVault {
         credential_id: String,
         capability: VaultCapability,
     },
@@ -39,10 +43,19 @@ impl CredentialHandle {
         Self::ImplicitLocal
     }
 
+    /// Build a legacy capability-addressed handle.
     pub fn vault(credential_id: impl Into<String>, capability: VaultCapability) -> Self {
-        Self::Vault {
+        Self::LegacyVault {
             credential_id: credential_id.into(),
             capability,
+        }
+    }
+
+    /// Build a scoped handle discovered through the caller's installed grant snapshot.
+    pub fn scoped(credential_id: impl Into<String>, credential_type: impl Into<String>) -> Self {
+        Self::Vault {
+            credential_id: credential_id.into(),
+            credential_type: credential_type.into(),
         }
     }
 
@@ -50,32 +63,48 @@ impl CredentialHandle {
         match self {
             Self::ImplicitLocal => "implicit-local",
             Self::Named(id) => id,
-            Self::Vault { credential_id, .. } => credential_id,
+            Self::Vault { credential_id, .. } | Self::LegacyVault { credential_id, .. } => {
+                credential_id
+            }
         }
     }
 
-    pub fn is_local(&self) -> bool {
-        !matches!(self, Self::Vault { .. })
+    pub fn is_vault(&self) -> bool {
+        matches!(self, Self::Vault { .. } | Self::LegacyVault { .. })
     }
 
-    /// The vault credential id this handle was minted from, if any.
+    pub fn is_local(&self) -> bool {
+        !self.is_vault()
+    }
+
+    /// The vault credential id this handle addresses, if any.
     ///
-    /// Needed because the id carries information the capability does not: the
-    /// vault grammar is `<method>:<provider>[:<account>]`, so whether an operator
-    /// NAMED an account is visible only here. The served payload and the vault's
-    /// own response carry no id, which is why a consumer cannot recover this from
-    /// the wire and must read it from the handle it already holds.
+    /// The id carries the vault grammar `<method>:<provider>[:<account>]`, so it
+    /// remains the routing identity for both scoped and legacy handles.
     pub fn vault_credential_id(&self) -> Option<&str> {
         match self {
-            Self::Vault { credential_id, .. } => Some(credential_id.as_str()),
+            Self::Vault { credential_id, .. } | Self::LegacyVault { credential_id, .. } => {
+                Some(credential_id.as_str())
+            }
             _ => None,
         }
     }
 
+    /// The address carried by a pre-scoped legacy handle.
     pub fn vault_capability(&self) -> Option<&VaultCapability> {
         match self {
-            Self::Vault { capability, .. } => Some(capability),
-            Self::ImplicitLocal | Self::Named(_) => None,
+            Self::LegacyVault { capability, .. } => Some(capability),
+            Self::ImplicitLocal | Self::Named(_) | Self::Vault { .. } => None,
+        }
+    }
+
+    /// The type carried by a scoped enumeration row.
+    pub fn vault_credential_type(&self) -> Option<&str> {
+        match self {
+            Self::Vault {
+                credential_type, ..
+            } => Some(credential_type.as_str()),
+            Self::ImplicitLocal | Self::Named(_) | Self::LegacyVault { .. } => None,
         }
     }
 
@@ -92,8 +121,16 @@ impl std::fmt::Debug for CredentialHandle {
                 .debug_tuple("CredentialHandle::Named")
                 .field(id)
                 .finish(),
-            Self::Vault { credential_id, .. } => formatter
+            Self::Vault {
+                credential_id,
+                credential_type,
+            } => formatter
                 .debug_struct("CredentialHandle::Vault")
+                .field("credential_id", credential_id)
+                .field("credential_type", credential_type)
+                .finish(),
+            Self::LegacyVault { credential_id, .. } => formatter
+                .debug_struct("CredentialHandle::LegacyVault")
                 .field("credential_id", credential_id)
                 .field("capability", &"<redacted>")
                 .finish(),

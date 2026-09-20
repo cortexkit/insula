@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use crate::{
-    credential_source::{CredentialSource, VaultCapability},
+    credential_source::CredentialSource,
     provider::{CredentialHandle, FetchError, HandlesError},
     vault_handles::{cookie_lane, CookieLane, VaultHandleLoader},
 };
@@ -145,13 +145,13 @@ impl CookieVault {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<String, FetchError>>,
     {
-        if let Some(capability) = handle.vault_capability() {
-            return Ok((self.fetch(capability).await?, "vault"));
+        if handle.is_vault() {
+            return Ok((self.fetch(handle).await?, "vault"));
         }
         match local().await {
             Ok(cookie) => Ok((cookie, crate::browser_cookies::SOURCE_LABEL)),
             Err(local_error) => match self.bare_deposit()? {
-                Some(capability) => Ok((self.fetch(&capability).await?, "vault")),
+                Some(handle) => Ok((self.fetch(&handle).await?, "vault")),
                 // No fallback configured: report what the live store said. The
                 // local failure is the true one and already carries the right
                 // class -- inventing a credential-absent verdict here would
@@ -184,8 +184,8 @@ impl CookieVault {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<crate::browser_cookies::CookieJar, FetchError>>,
     {
-        if let Some(capability) = handle.vault_capability() {
-            let header = self.fetch(capability).await?;
+        if handle.is_vault() {
+            let header = self.fetch(handle).await?;
             return Ok((
                 crate::browser_cookies::CookieJar::from_header(&header),
                 "vault",
@@ -194,8 +194,8 @@ impl CookieVault {
         match local().await {
             Ok(jar) => Ok((jar, crate::browser_cookies::SOURCE_LABEL)),
             Err(local_error) => match self.bare_deposit()? {
-                Some(capability) => {
-                    let header = self.fetch(&capability).await?;
+                Some(handle) => {
+                    let header = self.fetch(&handle).await?;
                     Ok((
                         crate::browser_cookies::CookieJar::from_header(&header),
                         "vault",
@@ -223,7 +223,7 @@ impl CookieVault {
         self.handle_loader.cookie_handles(self.family)
     }
 
-    fn bare_deposit(&self) -> Result<Option<VaultCapability>, FetchError> {
+    fn bare_deposit(&self) -> Result<Option<CredentialHandle>, FetchError> {
         if self.credential_source.is_none() {
             return Ok(None);
         }
@@ -231,22 +231,22 @@ impl CookieVault {
             .deposits()
             .map_err(|error| FetchError::Internal(error.to_string()))?;
         Ok(match cookie_lane(deposits, self.family) {
-            CookieLane::LocalWithFallback(Some(handle)) => handle.vault_capability().cloned(),
+            CookieLane::LocalWithFallback(Some(handle)) => Some(handle),
             _ => None,
         })
     }
 
-    async fn fetch(&self, capability: &VaultCapability) -> Result<String, FetchError> {
+    async fn fetch(&self, handle: &CredentialHandle) -> Result<String, FetchError> {
         let source = self
             .credential_source
             .as_ref()
             .ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
         // 120s matches the other vault providers; a bare literal here would be a
         // second answer to a question `kimi_for_coding` already answers.
-        let mut credential = source
-            .get(capability, 120_000)
-            .await
-            .map_err(|error| FetchError::Upstream(error.to_string()))?;
+        let mut credential =
+            crate::credential_source::get_vault_credential(source, handle, 120_000)
+                .await
+                .map_err(|error| FetchError::Upstream(error.to_string()))?;
         crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }

@@ -17,7 +17,8 @@ use crate::codex_resets::{
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
 use crate::credential_source::{
-    CredentialSource, CredentialStatus, VaultCapability, VaultCredential, VaultGetError,
+    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCapability,
+    VaultCredential, VaultGetError,
 };
 use crate::model::{AccountInfo, ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, CredentialHandle, FetchError, HandlesError};
@@ -367,7 +368,7 @@ fn a_lane_beside_vault_is_named_only_when_both_kinds_are_enumerated() {
     struct LaneStub {
         name: &'static str,
         handles: Vec<CredentialHandle>,
-        /// Enumeration fails, as it does when the handle map is unreadable.
+        /// Enumeration fails before it can produce an authoritative handle set.
         refuses: bool,
     }
 
@@ -391,7 +392,7 @@ fn a_lane_beside_vault_is_named_only_when_both_kinds_are_enumerated() {
         }
     }
 
-    let vault = || CredentialHandle::vault("v:one", VaultCapability::new("ckh_one"));
+    let vault = || CredentialHandle::scoped("oauth:test", "oauth");
     let registry = Registry::new(vec![
         Box::new(LaneStub {
             name: "both",
@@ -413,8 +414,8 @@ fn a_lane_beside_vault_is_named_only_when_both_kinds_are_enumerated() {
             handles: Vec::new(),
             refuses: false,
         }),
-        // THE ARM THAT WAS UNDEFENDED: an unreadable handle map must NOT be read
-        // as coexistence. Assuming it would turn a broken config into a silent
+        // THE ARM THAT WAS UNDEFENDED: an enumeration failure must NOT be read
+        // as coexistence. Assuming it would turn a broken source into a silent
         // exemption -- the failure the checker exists to catch, wearing the
         // costume of a skip. Proved by mutation: returning `true` on the error
         // path reddened nothing until this stub existed.
@@ -4978,7 +4979,10 @@ fn reporting_reset_request(
         account_id: "acct-reset".to_string(),
         auth_failure: Some(AuthFailureContext {
             source,
-            capability: VaultCapability::new("ckh_reporting_secret"),
+            handle: CredentialHandle::vault(
+                "chatgpt:openai",
+                VaultCapability::new("ckh_reporting_secret"),
+            ),
             record_version: 31,
         }),
     }
@@ -5081,13 +5085,8 @@ struct SameAccountVaultSource {
     gets: AtomicUsize,
 }
 
-#[async_trait]
-impl CredentialSource for SameAccountVaultSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
+impl SameAccountVaultSource {
+    fn serve(&self, min_ttl_ms: u64) -> Result<VaultCredential, VaultGetError> {
         assert_eq!(min_ttl_ms, 120_000);
         self.gets.fetch_add(1, Ordering::SeqCst);
         Ok(VaultCredential {
@@ -5099,6 +5098,26 @@ impl CredentialSource for SameAccountVaultSource {
             org_name: None,
             project_id: None,
         })
+    }
+}
+
+#[async_trait]
+impl CredentialSource for SameAccountVaultSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        self.serve(min_ttl_ms)
+    }
+
+    async fn get_scoped(
+        &self,
+        credential_id: &str,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        assert_eq!(credential_id, "chatgpt:openai");
+        self.serve(min_ttl_ms)
     }
 
     async fn report_auth_failure(
@@ -5289,11 +5308,8 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
         )
         .as_bytes(),
     );
-    let handles_path = temp.dir.join("vault-handles.json");
-    write_owner_only_test_file(
-        &handles_path,
-        br#"{"handles":{"chatgpt:openai":"ckh_real_provider"}}"#,
-    );
+    let handle_loader = VaultHandleLoader::default();
+    handle_loader.install_rows_for_test(&[("chatgpt:openai", "oauth")]);
 
     let source = Arc::new(SameAccountVaultSource {
         gets: AtomicUsize::new(0),
@@ -5311,7 +5327,7 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
         Some(credential_source),
         reset_transport,
         coordinator,
-        VaultHandleLoader::new(Some(handles_path)),
+        handle_loader,
         codex_home,
     );
     let registry = Registry::new(vec![Box::new(provider)]);
@@ -7448,20 +7464,14 @@ fn the_documented_provider_count_matches_the_registry() {
 /// changes on its own.
 #[tokio::test]
 async fn a_credential_reaching_no_account_is_named_in_health() {
-    // Vault handles: the metric is about a credential somebody minted, so a
-    // fixture built from implicit local lanes would exercise the wrong shape and
+    // Vault handles: the metric is about an enumerated credential, so a
+    // fixture built only from implicit local lanes would exercise the wrong shape and
     // pass for the wrong reason.
     let provider =
         CompletenessProvider::new(&["H1", "H2"], &[("H1", Some("A")), ("H2", Some("B"))]);
     *provider.handles.lock().unwrap() = Ok(vec![
-        CredentialHandle::vault(
-            "H1",
-            crate::credential_source::VaultCapability::new("ckh_h1"),
-        ),
-        CredentialHandle::vault(
-            "H2",
-            crate::credential_source::VaultCapability::new("ckh_h2"),
-        ),
+        CredentialHandle::new("H1"),
+        CredentialHandle::scoped("H2", "oauth"),
     ]);
     let fail = Arc::clone(&provider.fail);
     let labels = Arc::clone(&provider.labels);
@@ -7504,18 +7514,12 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
 
     // Silent for an implicit local lane that resolves nothing. Most providers
     // ship one -- an environment variable or a file path -- and it exists
-    // whether or not anyone uses it, so on a host that does not, it fails with
-    // an absent credential and no identity while a minted handle beside it
-    // serves. Naming that reports a provider whose only fault is offering a lane
-    // nobody configured.
+    // whether or not anyone uses it. An unconfigured local lane may fail without
+    // an identity while another enumerated handle from the provider still serves;
+    // that is not an account-identity fault.
     let mixed = CompletenessProvider::new(&["V1", "L1"], &[("V1", Some("A")), ("L1", None)]);
-    *mixed.handles.lock().unwrap() = Ok(vec![
-        CredentialHandle::vault(
-            "V1",
-            crate::credential_source::VaultCapability::new("ckh_v1"),
-        ),
-        handle("L1"),
-    ]);
+    *mixed.handles.lock().unwrap() =
+        Ok(vec![CredentialHandle::scoped("V1", "oauth"), handle("L1")]);
     mixed.fail.lock().unwrap().insert("L1".to_string());
     let with_local = Registry::new(vec![Box::new(mixed)]);
     tick(&with_local).await;
@@ -7564,13 +7568,8 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
     // Nothing else on the snapshot says so: the provider is fresh, degraded is
     // empty, and the wire looks like a provider that simply has one account.
     let anonymising = CompletenessProvider::new(&["V1", "H2"], &[("V1", None), ("H2", Some("B"))]);
-    *anonymising.handles.lock().unwrap() = Ok(vec![
-        CredentialHandle::vault(
-            "V1",
-            crate::credential_source::VaultCapability::new("ckh_v1"),
-        ),
-        handle("H2"),
-    ]);
+    *anonymising.handles.lock().unwrap() =
+        Ok(vec![CredentialHandle::scoped("V1", "oauth"), handle("H2")]);
     let collapsing = Registry::new(vec![Box::new(anonymising)]);
     tick(&collapsing).await;
     let collapsing_health = collapsing.health();
@@ -7602,14 +7601,8 @@ async fn a_credential_reaching_no_account_is_named_in_health() {
     // number that is never zero when nothing is wrong stops being read.
     let all_anonymous = CompletenessProvider::new(&["V1", "V2"], &[("V1", None), ("V2", None)]);
     *all_anonymous.handles.lock().unwrap() = Ok(vec![
-        CredentialHandle::vault(
-            "V1",
-            crate::credential_source::VaultCapability::new("ckh_v1"),
-        ),
-        CredentialHandle::vault(
-            "V2",
-            crate::credential_source::VaultCapability::new("ckh_v2"),
-        ),
+        CredentialHandle::scoped("V1", "oauth"),
+        CredentialHandle::scoped("V2", "oauth"),
     ]);
     let anonymous_vault = Registry::new(vec![Box::new(all_anonymous)]);
     tick(&anonymous_vault).await;
@@ -7887,7 +7880,7 @@ async fn a_slot_on_backoff_is_skipped_until_its_deadline() {
 
 /// The idle sleep is capped even when every handle is far from due.
 ///
-/// The cap is what keeps discovery running: newly minted credentials are found
+/// The cap is what keeps discovery running: newly granted credentials are found
 /// by the enumeration at the top of a tick, so the longest the loop may sleep is
 /// also the longest a new account can go unnoticed. With every handle on a
 /// fifteen-minute transient backoff, an uncapped sleep would wait the full
@@ -8097,6 +8090,11 @@ impl CredentialSource for RecordingStatusSource {
             .push(capability.expose_secret().to_string());
         self.result.lock().unwrap().clone()
     }
+
+    async fn status_scoped(&self, credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
+        self.calls.lock().unwrap().push(credential_id.to_string());
+        self.result.lock().unwrap().clone()
+    }
 }
 
 struct StatusPollProvider {
@@ -8108,14 +8106,8 @@ struct StatusPollProvider {
 impl StatusPollProvider {
     fn new() -> Self {
         Self {
-            healthy_vault: CredentialHandle::vault(
-                "oauth:codex:healthy",
-                VaultCapability::new("ckh_healthy"),
-            ),
-            degraded_vault: CredentialHandle::vault(
-                "oauth:codex:degraded",
-                VaultCapability::new("ckh_degraded"),
-            ),
+            healthy_vault: CredentialHandle::scoped("oauth:codex:healthy", "oauth"),
+            degraded_vault: CredentialHandle::scoped("oauth:codex:degraded", "oauth"),
             local: CredentialHandle::implicit(),
         }
     }
@@ -8222,7 +8214,7 @@ async fn a_status_call_that_errors_does_not_condemn_the_slot() {
 
     assert_eq!(
         source.calls.lock().unwrap().as_slice(),
-        &["ckh_degraded"],
+        &["oauth:codex:degraded"],
         "the erroring poll must still have been issued, or this would not be testing it"
     );
     let after = slot_for(&registry, &provider.degraded_vault);
@@ -8260,7 +8252,7 @@ async fn healthy_and_local_slots_issue_no_status_call() {
 
     assert_eq!(
         source.calls.lock().unwrap().as_slice(),
-        &["ckh_degraded"],
+        &["oauth:codex:degraded"],
         "only the vault-backed non-transient slot may be polled"
     );
 }
@@ -8270,8 +8262,8 @@ async fn healthy_and_local_slots_issue_no_status_call() {
 /// THE JOIN IS BETWEEN TWO SELF-CONSISTENT LISTS, which is why reading either
 /// one finds nothing. `CREDENTIAL_FAMILIES` is coherent; the vault's ids are
 /// coherent; only the mapping between them can be wrong, and it was wrong in a
-/// way nothing observed: the handle map is written BY HAND, so it holds whatever
-/// spelling its author used. Under scoped grants the ids arrive FROM the vault.
+/// way nothing observed: the retired handle map was written by hand, while scoped
+/// ids arrive from the vault and must match this table exactly.
 ///
 /// The measured instance: the vault canonicalises static keys under `apikey:`,
 /// so it holds `apikey:kimi-for-coding` while this table had only the bare
@@ -8314,4 +8306,594 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
             "{id} must stay unclaimed: no provider here reads it"
         );
     }
+}
+
+#[derive(Clone, Copy)]
+enum ScopedAccessor {
+    Anthropic,
+    Cookie(&'static str),
+    Grok,
+    DeepSeek,
+}
+
+struct ScopedLoaderProvider {
+    name: &'static str,
+    loader: Arc<VaultHandleLoader>,
+    accessor: ScopedAccessor,
+    enumerate_twice: bool,
+    enumerations: Arc<Mutex<Vec<Vec<CredentialHandle>>>>,
+    fetches: Arc<AtomicUsize>,
+    fetch_record_version: Arc<AtomicUsize>,
+    local_sibling: bool,
+    identify_vault: bool,
+}
+
+impl ScopedLoaderProvider {
+    fn installed_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        match self.accessor {
+            ScopedAccessor::Anthropic => self.loader.anthropic_handles(),
+            ScopedAccessor::Cookie(family) => self.loader.cookie_handles(family),
+            ScopedAccessor::Grok => self.loader.grok_handles(),
+            ScopedAccessor::DeepSeek => self.loader.deepseek_handles(),
+        }
+    }
+}
+
+#[async_trait]
+impl UsageProvider for ScopedLoaderProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        let first = self.installed_handles()?;
+        self.enumerations.lock().unwrap().push(first.clone());
+        if self.enumerate_twice {
+            let second = self.installed_handles()?;
+            assert_eq!(first, second, "one turn must expose one immutable snapshot");
+            self.enumerations.lock().unwrap().push(second);
+        }
+        let mut handles = first;
+        if self.local_sibling {
+            handles.push(CredentialHandle::new("local-sibling"));
+        }
+        Ok(handles)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        let account_id = if handle.is_local() || self.identify_vault {
+            Some(format!("account:{}", handle.stable_id()))
+        } else {
+            None
+        };
+        FetchAttempt::success(
+            Some(AccountObservation::new(
+                account_id,
+                handle
+                    .is_vault()
+                    .then(|| self.fetch_record_version.load(Ordering::SeqCst) as u64),
+            )),
+            if handle.is_vault() { "vault" } else { "local" },
+            Usage::default(),
+        )
+    }
+}
+
+struct ScriptedScopedSource {
+    replies: Mutex<VecDeque<Result<ScopedSnapshot, VaultGetError>>>,
+    list_calls: AtomicUsize,
+}
+
+impl ScriptedScopedSource {
+    fn new(replies: Vec<Result<ScopedSnapshot, VaultGetError>>) -> Self {
+        Self {
+            replies: Mutex::new(replies.into()),
+            list_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialSource for ScriptedScopedSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
+
+    async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Err(VaultGetError::Transient))
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+}
+
+fn scoped_row(
+    credential_id: &str,
+    credential_type: &str,
+    record_version: u64,
+    state: &str,
+) -> ScopedRowState {
+    ScopedRowState {
+        credential_id: credential_id.to_string(),
+        credential_type: credential_type.to_string(),
+        record_version,
+        state: state.to_string(),
+    }
+}
+
+fn scoped_snapshot(grants: u64, rows: Vec<ScopedRowState>) -> ScopedSnapshot {
+    ScopedSnapshot { grants, rows }
+}
+
+fn scoped_registry(
+    providers: Vec<Box<dyn UsageProvider>>,
+    loader: Arc<VaultHandleLoader>,
+    source: Arc<dyn CredentialSource>,
+) -> Registry {
+    let mut registry = Registry::new(providers);
+    registry.attach_vault_handle_loader(loader);
+    registry.attach_credential_source(source);
+    registry
+}
+
+fn defer_provider_slots(registry: &Registry, provider: &str, delay: Duration) {
+    let due = Instant::now() + delay;
+    let mut store = registry.store.lock().unwrap();
+    for (key, mut slot) in store.snapshot() {
+        if key.provider != provider {
+            continue;
+        }
+        slot.next_due_at = due;
+        let incarnation = slot.incarnation;
+        let attempt_sequence = slot.attempt_sequence;
+        assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+    }
+}
+
+fn provider_slot_ids(registry: &Registry, provider: &str) -> HashSet<String> {
+    registry
+        .store
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .filter(|(key, _)| key.provider == provider)
+        .map(|(key, _)| key.handle.stable_id().to_string())
+        .collect()
+}
+
+fn loader_provider(
+    name: &'static str,
+    loader: Arc<VaultHandleLoader>,
+    accessor: ScopedAccessor,
+) -> (Box<dyn UsageProvider>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let fetch_record_version = Arc::new(AtomicUsize::new(1));
+    (
+        Box::new(ScopedLoaderProvider {
+            name,
+            loader,
+            accessor,
+            enumerate_twice: false,
+            enumerations: Arc::new(Mutex::new(Vec::new())),
+            fetches: Arc::clone(&fetches),
+            fetch_record_version: Arc::clone(&fetch_record_version),
+            local_sibling: false,
+            identify_vault: true,
+        }),
+        fetches,
+        fetch_record_version,
+    )
+}
+
+#[tokio::test]
+async fn one_turn_lists_once_before_every_provider_reads_the_same_snapshot() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+        1,
+        vec![scoped_row("cookie:opencode.ai", "cookie", 1, "active")],
+    ))]));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let providers: Vec<Box<dyn UsageProvider>> = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            Box::new(ScopedLoaderProvider {
+                name,
+                loader: Arc::clone(&loader),
+                accessor: ScopedAccessor::Cookie("cookie:opencode.ai"),
+                enumerate_twice: true,
+                enumerations: Arc::clone(&observed),
+                fetches: Arc::new(AtomicUsize::new(0)),
+                fetch_record_version: Arc::new(AtomicUsize::new(1)),
+                local_sibling: false,
+                identify_vault: true,
+            }) as Box<dyn UsageProvider>
+        })
+        .collect();
+    let registry = scoped_registry(providers, loader, source.clone());
+
+    tick(&registry).await;
+
+    assert_eq!(source.list_calls.load(Ordering::SeqCst), 1);
+    let enumerations = observed.lock().unwrap();
+    assert_eq!(enumerations.len(), 4);
+    assert!(enumerations.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(enumerations[0].len(), 1);
+}
+
+#[tokio::test]
+async fn authoritative_rows_reap_ids_absent_from_the_next_snapshot() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Ok(scoped_snapshot(
+            1,
+            vec![
+                scoped_row("oauth:anthropic:first", "oauth", 1, "active"),
+                scoped_row("oauth:anthropic:second", "oauth", 1, "active"),
+            ],
+        )),
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic:second", "oauth", 1, "active")],
+        )),
+    ]));
+    let (provider, _, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    tick(&registry).await;
+    assert_eq!(provider_slot_ids(&registry, "claude").len(), 2);
+
+    tick(&registry).await;
+
+    assert_eq!(
+        provider_slot_ids(&registry, "claude"),
+        HashSet::from(["oauth:anthropic:second".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn explicit_empty_inventory_with_a_grant_reaps_every_vault_lane() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 1, "active")],
+        )),
+        Ok(scoped_snapshot(1, Vec::new())),
+    ]));
+    let (provider, _, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    tick(&registry).await;
+    assert_eq!(provider_slot_ids(&registry, "claude").len(), 1);
+
+    tick(&registry).await;
+
+    assert!(provider_slot_ids(&registry, "claude").is_empty());
+    assert_eq!(
+        registry.health().vault_mapping_warning.as_deref(),
+        Some("scoped grant is empty")
+    );
+}
+
+#[tokio::test]
+async fn zero_grants_retains_snapshot_reports_failure_and_does_not_reap() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 1, "active")],
+        )),
+        Ok(scoped_snapshot(0, Vec::new())),
+    ]));
+    let (provider, _, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    tick(&registry).await;
+    tick(&registry).await;
+
+    assert_eq!(provider_slot_ids(&registry, "claude").len(), 1);
+    let health = registry.health();
+    assert_eq!(
+        health.vault_enumeration_failure.as_deref(),
+        Some("principal is not granted")
+    );
+    assert!(health.retained_vault_snapshot_age.is_some());
+}
+
+#[tokio::test]
+async fn list_error_serves_due_vault_and_local_lanes_then_authoritative_empty_reaps_vault_only() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 1, "active")],
+        )),
+        Err(VaultGetError::Transient),
+        Ok(scoped_snapshot(1, Vec::new())),
+    ]));
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let versions = Arc::new(AtomicUsize::new(1));
+    let provider: Box<dyn UsageProvider> = Box::new(ScopedLoaderProvider {
+        name: "claude",
+        loader: Arc::clone(&loader),
+        accessor: ScopedAccessor::Anthropic,
+        enumerate_twice: false,
+        enumerations: Arc::new(Mutex::new(Vec::new())),
+        fetches: Arc::clone(&fetches),
+        fetch_record_version: Arc::clone(&versions),
+        local_sibling: true,
+        identify_vault: true,
+    });
+    let registry = scoped_registry(vec![provider], loader, source);
+    tick(&registry).await;
+    force_due(&registry, "claude");
+    versions.store(2, Ordering::SeqCst);
+
+    tick(&registry).await;
+
+    assert_eq!(fetches.load(Ordering::SeqCst), 4);
+    assert_eq!(provider_slot_ids(&registry, "claude").len(), 2);
+    let health = registry.health();
+    assert_eq!(
+        health.vault_enumeration_failure.as_deref(),
+        Some("Transient")
+    );
+    assert!(health.retained_vault_snapshot_age.is_some());
+    assert_eq!(
+        slot_for(
+            &registry,
+            &CredentialHandle::scoped("oauth:anthropic", "oauth"),
+        )
+        .observation
+        .and_then(|observation| observation.record_version),
+        Some(2)
+    );
+
+    tick(&registry).await;
+
+    assert_eq!(
+        provider_slot_ids(&registry, "claude"),
+        HashSet::from(["local-sibling".to_string()])
+    );
+    assert!(registry.health().vault_enumeration_failure.is_none());
+}
+
+#[tokio::test]
+async fn an_error_before_any_install_preserves_an_existing_vault_slot() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![Err(
+        VaultGetError::FailClosed,
+    )]));
+    let (provider, _, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    let existing = CredentialHandle::scoped("oauth:anthropic", "oauth");
+    registry.store.lock().unwrap().reconcile(
+        "claude",
+        std::slice::from_ref(&existing),
+        Instant::now(),
+    );
+
+    tick(&registry).await;
+
+    assert!(provider_slot_ids(&registry, "claude").contains("oauth:anthropic"));
+    assert_eq!(
+        registry.health().vault_enumeration_failure.as_deref(),
+        Some("FailClosed")
+    );
+}
+
+#[tokio::test]
+async fn enumeration_version_and_reactivation_accelerate_while_needs_reauth_suppresses_fetch() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 1, "active")],
+        )),
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 2, "active")],
+        )),
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 2, "needs_reauth")],
+        )),
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 2, "active")],
+        )),
+    ]));
+    let (provider, fetches, versions) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    defer_provider_slots(&registry, "claude", Duration::from_secs(240));
+    versions.store(2, Ordering::SeqCst);
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "record version change must fetch now"
+    );
+    defer_provider_slots(&registry, "claude", Duration::from_secs(240));
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "needs_reauth must suppress fetch"
+    );
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        3,
+        "reactivation must fetch now"
+    );
+}
+
+#[tokio::test]
+async fn handles_without_account_uses_scoped_type_and_registry_provider_names() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+        1,
+        vec![
+            scoped_row("oauth:xai", "oauth", 1, "active"),
+            scoped_row("apikey:deepseek", "apikey", 1, "active"),
+        ],
+    ))]));
+    let providers: Vec<Box<dyn UsageProvider>> = vec![
+        Box::new(ScopedLoaderProvider {
+            name: "grok",
+            loader: Arc::clone(&loader),
+            accessor: ScopedAccessor::Grok,
+            enumerate_twice: false,
+            enumerations: Arc::new(Mutex::new(Vec::new())),
+            fetches: Arc::new(AtomicUsize::new(0)),
+            fetch_record_version: Arc::new(AtomicUsize::new(1)),
+            local_sibling: true,
+            identify_vault: false,
+        }),
+        Box::new(ScopedLoaderProvider {
+            name: "deepseek",
+            loader: Arc::clone(&loader),
+            accessor: ScopedAccessor::DeepSeek,
+            enumerate_twice: false,
+            enumerations: Arc::new(Mutex::new(Vec::new())),
+            fetches: Arc::new(AtomicUsize::new(0)),
+            fetch_record_version: Arc::new(AtomicUsize::new(1)),
+            local_sibling: true,
+            identify_vault: false,
+        }),
+    ];
+    let registry = scoped_registry(providers, loader, source);
+
+    tick(&registry).await;
+
+    assert_eq!(registry.health().handles_without_account, vec!["grok"]);
+    let scoped_types: HashSet<_> = registry
+        .store
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(key, _)| key.handle.vault_credential_type().map(str::to_string))
+        .collect();
+    assert_eq!(
+        scoped_types,
+        HashSet::from(["oauth".to_string(), "apikey".to_string()])
+    );
+}
+
+struct DefaultListSource;
+
+#[async_trait]
+impl CredentialSource for DefaultListSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::Permanent)
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+}
+
+#[tokio::test]
+async fn default_fail_closed_list_does_not_condemn_or_reap_a_slot() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let (provider, _, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, Arc::new(DefaultListSource));
+    let existing = CredentialHandle::scoped("oauth:anthropic", "oauth");
+    registry.store.lock().unwrap().reconcile(
+        "claude",
+        std::slice::from_ref(&existing),
+        Instant::now(),
+    );
+
+    tick(&registry).await;
+
+    let retained = slot_for(&registry, &existing);
+    assert_ne!(retained.error_class, Some("credential_rejected"));
+    assert!(provider_slot_ids(&registry, "claude").contains("oauth:anthropic"));
+    assert_eq!(
+        registry.health().vault_enumeration_failure.as_deref(),
+        Some("FailClosed")
+    );
+}
+
+#[tokio::test]
+async fn identity_less_family_refusal_is_published_on_registry_health() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+        1,
+        vec![
+            scoped_row("cookie:ampcode.com", "cookie", 1, "active"),
+            scoped_row("cookie:ampcode.com:second", "cookie", 1, "active"),
+        ],
+    ))]));
+    let (provider, _, _) = loader_provider(
+        "amp",
+        Arc::clone(&loader),
+        ScopedAccessor::Cookie("cookie:ampcode.com"),
+    );
+    let registry = scoped_registry(vec![provider], loader, source);
+
+    tick(&registry).await;
+
+    assert!(registry
+        .health()
+        .vault_mapping_warning
+        .is_some_and(|warning| warning.contains("multiple identity-less credentials")));
+}
+
+#[tokio::test]
+async fn scoped_non_transient_backoff_polls_status_once_per_base_interval() {
+    let (registry, source, provider) = status_poll_fixture(Err(VaultGetError::FailClosed));
+    tick(&registry).await;
+    source.calls.lock().unwrap().clear();
+    age_slot_into_status_poll(&registry, &provider.degraded_vault);
+
+    tick(&registry).await;
+    tick(&registry).await;
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["oauth:codex:degraded"],
+        "a second scheduler turn inside BASE_INTERVAL must not poll again"
+    );
+
+    age_slot_into_status_poll(&registry, &provider.degraded_vault);
+    tick(&registry).await;
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["oauth:codex:degraded", "oauth:codex:degraded"],
+        "one more elapsed BASE_INTERVAL admits exactly one more poll"
+    );
 }

@@ -118,7 +118,7 @@ impl CursorCredential {
             Self::Browser { identity, .. } => {
                 identity.as_ref().map(|identity| identity.user_id.as_str())
             }
-            Self::App(auth) => auth.email.as_deref(),
+            Self::App(auth) => Some(auth.user_id.as_str()),
         }
     }
 
@@ -475,7 +475,10 @@ fn provider_usage_from_credential(
 /// The Cursor usage provider.
 pub struct CursorProvider {
     vault: crate::cookie_vault::CookieVault,
+    credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+    handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
     http: reqwest::Client,
+    usage_url: String,
 }
 
 impl CursorProvider {
@@ -486,10 +489,13 @@ impl CursorProvider {
         Self {
             http: crate::http::provider_client(),
             vault: crate::cookie_vault::CookieVault::new(
-                credential_source,
-                handle_loader,
+                credential_source.clone(),
+                std::sync::Arc::clone(&handle_loader),
                 COOKIE_FAMILY,
             ),
+            credential_source,
+            handle_loader,
+            usage_url: USAGE_URL.to_string(),
         }
     }
 }
@@ -505,10 +511,79 @@ impl UsageProvider for CursorProvider {
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+        if self.credential_source.is_some() {
+            let oauth: Vec<_> = self
+                .handle_loader
+                .cursor_handles()?
+                .into_iter()
+                .filter(|handle| {
+                    handle
+                        .vault_credential_id()
+                        .is_some_and(|id| id.starts_with("oauth:"))
+                })
+                .collect();
+            if !oauth.is_empty() {
+                return Ok(oauth);
+            }
+        }
         self.vault.handles()
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if handle.is_vault()
+            && handle
+                .vault_credential_id()
+                .is_some_and(|id| id.starts_with("oauth:"))
+        {
+            let Some(source) = self.credential_source.as_ref() else {
+                return FetchAttempt::unverified_vault_failure(
+                    crate::credential_source::VaultGetError::Permanent,
+                );
+            };
+            let mut credential =
+                match crate::credential_source::get_vault_credential(source, handle, 120_000).await
+                {
+                    Ok(credential) => credential,
+                    Err(error) => return FetchAttempt::unverified_vault_failure(error),
+                };
+            let record_version = credential.record_version;
+            let account_info = credential.account_info();
+            let token = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+                Ok(token) => token,
+                Err(error) => return FetchAttempt::failure(None, Some("vault".to_string()), error),
+            };
+            let user_id = match cursor_user_id_from_access_token(&token) {
+                Ok(user_id) => user_id,
+                Err(error) => return FetchAttempt::failure(None, Some("vault".to_string()), error),
+            };
+            let observed = Some(crate::provider::AccountObservation::new(
+                Some(user_id.clone()),
+                Some(record_version),
+            ));
+            let cookie = app_auth_cookie_header(&user_id, &token);
+            let result = JsonRequest::get(&self.usage_url)
+                .timeout(REQUEST_TIMEOUT)
+                .header(Header::new("Cookie", cookie))
+                .send(&self.http)
+                .await
+                .and_then(|body| normalize_usage(&body));
+            if let Err(error) = &result {
+                crate::credential_source::report_vault_auth_failure(
+                    self.credential_source.as_ref(),
+                    handle,
+                    record_version,
+                    error,
+                );
+            }
+            return match result {
+                Ok(usage) => {
+                    FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+                }
+                Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error)
+                    .with_account_info(account_info),
+            };
+        }
+
         let result: Result<ProviderUsage, FetchError> = async {
             let (jar, source) = self
                 .vault
@@ -897,10 +972,7 @@ mod tests {
         });
         let provider_usage =
             provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
-        assert_eq!(
-            provider_usage.account.as_deref(),
-            Some("account@example.test")
-        );
+        assert_eq!(provider_usage.account.as_deref(), Some("user-id"));
         assert_eq!(
             provider_usage
                 .account_info
@@ -975,5 +1047,121 @@ mod tests {
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
+    }
+
+    #[derive(Default)]
+    struct ScopedCursorSource {
+        calls: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    #[async_trait]
+    impl crate::credential_source::CredentialSource for ScopedCursorSource {
+        async fn get(
+            &self,
+            _capability: &crate::credential_source::VaultCapability,
+            _min_ttl_ms: u64,
+        ) -> Result<
+            crate::credential_source::VaultCredential,
+            crate::credential_source::VaultGetError,
+        > {
+            Err(crate::credential_source::VaultGetError::FailClosed)
+        }
+
+        async fn get_scoped(
+            &self,
+            credential_id: &str,
+            min_ttl_ms: u64,
+        ) -> Result<
+            crate::credential_source::VaultCredential,
+            crate::credential_source::VaultGetError,
+        > {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((credential_id.to_string(), min_ttl_ms));
+            Ok(crate::credential_source::VaultCredential {
+                payload: synthetic_jwt("auth0|cursor-user").into_bytes(),
+                expires_at_ms: None,
+                record_version: 17,
+                account_id: None,
+                project_id: None,
+                email: None,
+                org_name: None,
+            })
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &crate::credential_source::VaultCapability,
+            _provider_status: u16,
+            _record_version: u64,
+        ) {
+        }
+    }
+
+    async fn serve_cursor_usage() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let read = stream.read(&mut request).await.unwrap();
+            request.truncate(read);
+            let _ = sent.send(String::from_utf8_lossy(&request).to_string());
+            let body = br#"{
+                "billingCycleEnd":"2026-07-24T03:00:00Z",
+                "individualUsage":{"plan":{"totalPercentUsed":45.5}}
+            }"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        (format!("http://{address}/usage"), received)
+    }
+
+    #[tokio::test]
+    async fn oauth_cursor_fetches_scoped_jwt_and_records_sub_derived_account() {
+        let loader = std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("oauth:cursor", "oauth"), ("cookie:cursor.com", "cookie")]);
+        let source = std::sync::Arc::new(ScopedCursorSource::default());
+        let mut provider = CursorProvider::new_with_handle_loader(
+            Some(source.clone() as std::sync::Arc<dyn crate::credential_source::CredentialSource>),
+            loader,
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].vault_credential_id(), Some("oauth:cursor"));
+        let (url, request) = serve_cursor_usage().await;
+        provider.usage_url = url;
+
+        let attempt = provider.fetch_handle(&handles[0]).await;
+
+        assert!(attempt.usage.is_ok());
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt
+                .observed
+                .as_ref()
+                .and_then(|observed| observed.account_id.as_deref()),
+            Some("cursor-user")
+        );
+        assert_eq!(
+            attempt
+                .observed
+                .as_ref()
+                .and_then(|observed| observed.record_version),
+            Some(17)
+        );
+        assert_eq!(
+            source.calls.lock().unwrap().as_slice(),
+            &[("oauth:cursor".to_string(), 120_000)]
+        );
+        let request = request.await.unwrap();
+        assert!(request.contains("WorkosCursorSessionToken=cursor-user%3A%3Aheader."));
     }
 }

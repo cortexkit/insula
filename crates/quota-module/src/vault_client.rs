@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use quota_core::credential_source::{
-    CredentialSource, CredentialStatus, VaultCapability, VaultCredential, VaultGetError,
+    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCapability,
+    VaultCredential, VaultGetError,
 };
 use quota_core::LOG_TAG;
 use serde::{Deserialize, Serialize};
@@ -1823,6 +1824,55 @@ impl VaultClient {
 
 #[async_trait]
 impl CredentialSource for VaultClient {
+    async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
+        let result = VaultClient::list_scoped(self).await?;
+        Ok(ScopedSnapshot {
+            grants: result.grants,
+            rows: result
+                .credentials
+                .into_iter()
+                .map(|row| ScopedRowState {
+                    credential_id: row.id,
+                    credential_type: row.kind,
+                    record_version: row.record_version,
+                    state: row.state,
+                })
+                .collect(),
+        })
+    }
+
+    async fn get_scoped(
+        &self,
+        credential_id: &str,
+        min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        VaultClient::get_scoped(self, credential_id, min_ttl_ms).await
+    }
+
+    async fn status_scoped(&self, credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
+        let status = VaultClient::status_scoped(self, credential_id).await?;
+        Ok(CredentialStatus {
+            ready: false,
+            record_version: status.record_version(),
+            stale_pending: None,
+        })
+    }
+
+    async fn report_auth_failure_scoped(
+        &self,
+        credential_id: &str,
+        provider_status: u16,
+        record_version: u64,
+    ) {
+        VaultClient::report_auth_failure_scoped(
+            self,
+            credential_id,
+            provider_status,
+            record_version,
+        )
+        .await;
+    }
+
     async fn get(
         &self,
         capability: &VaultCapability,

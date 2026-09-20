@@ -853,7 +853,7 @@ pub fn should_poll_credential_status(
     handle: &CredentialHandle,
     now: Instant,
 ) -> bool {
-    if handle.vault_capability().is_none() {
+    if !handle.is_vault() {
         return false;
     }
     if slot.last_failure_class != Some(FetchClass::NonTransient) {
