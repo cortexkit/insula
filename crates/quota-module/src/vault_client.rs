@@ -1654,7 +1654,24 @@ fn describe_list_scoped_failure(body: &[u8]) -> String {
                 Ok(_) => "the body decodes; this reason should be unreachable".to_string(),
             }
         }
-        (false, true) => "an error reply did not match the schema".to_string(),
+        // NOT NECESSARILY A SCHEMA PROBLEM, and saying so would send a reader to
+        // the wrong repository. A refusal arrives as a SUCCESS FRAME carrying
+        // `result.error`, so a well-formed refusal reaches here too -- and only an
+        // UNRECOGNISED `class` maps to FailClosed, since `permanent`, `transient`
+        // and `auth_required` all map to verdicts of their own. So the interesting
+        // case is a class this client has never heard of, and the only useful thing
+        // to print is the pair the producer sent.
+        (false, true) => {
+            match serde_json::from_value::<VaultErrorResult>(Value::Object(result.clone())) {
+                Ok(failure) => format!(
+                    "a refusal this client cannot classify: class={:?} code={:?} -- \
+                 a class outside [permanent, transient, auth_required] is why this \
+                 reads as unreadable rather than as the verdict it is",
+                    failure.error.class, failure.error.code
+                ),
+                Err(error) => format!("an error reply did not match the schema: {error}"),
+            }
+        }
     }
 }
 
@@ -3587,6 +3604,17 @@ mod drop_counter_tests {
             (
                 &br#"{"result":{"view":"v","grants":1}}"#[..],
                 "`credentials` absent",
+            ),
+            // THE LIVE SUSPECT. A refusal is a SUCCESS FRAME carrying
+            // `result.error`, and only a class outside the three this client knows
+            // maps to FailClosed -- `permanent`, `transient` and `auth_required`
+            // each become a verdict of their own. So the body that produces this
+            // symptom is a well-formed refusal wearing a class nobody here has
+            // heard of, and calling that "a schema problem" would send a reader to
+            // the wrong repository entirely.
+            (
+                &br#"{"result":{"error":{"class":"invalid_request","code":"invalid_params"}}}"#[..],
+                "class=\"invalid_request\" code=Some(\"invalid_params\")",
             ),
         ];
         let mut seen: Vec<String> = Vec::new();
