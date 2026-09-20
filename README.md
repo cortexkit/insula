@@ -248,6 +248,11 @@ python3 scripts/endpoint-hosts.py
 # "never configured", so nobody investigates it:
 python3 scripts/unread-credentials.py
 
+# every credential the vault holds against the prefix table that routes it to a
+# provider. Both lists are internally coherent, so only the JOIN can be wrong --
+# and a broken join is silent: the credential is present, granted, and unrouted:
+python3 scripts/vault-id-families.py
+
 # read the production half of a Rust file, with the test module cut off. Any
 # sweep asking "does every provider do X" needs this, or assertions inside
 # run every gate in the order that makes them mean something:
