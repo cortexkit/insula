@@ -1218,6 +1218,46 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.61.0 → v0.62.0
+
+One tag. All five opaque constants present at `v0.62.0`, located by VALUE in the
+tagged tree, distribution **2/4/4/2/1** — unchanged across seven rounds.
+
+**Null for the served set.** `ClaudeUsageFetcher` is the only served provider in
+the delta (+45) and carries no window-mapping change: filtering the diff for
+window, limit, percent and reset terms leaves only two field pass-through lines
+in a copy constructor. Our five Claude accounts are unaffected.
+
+**Three declines, each on a stated axis or lane.**
+
+`MuseLocalUsageReader` + `MuseLocalUsageCache` (+817, the round's largest
+addition) read `~/.local/share/muse/sessions/<Y>/<M>/<D>/<session>/session.jsonl`
+for per-session token counts. The file's own header states why: *"The
+subscription quota response contains no historical token counts or billing
+amounts."* That is the CONSUMPTION axis with no denominator — tokens spent cannot
+answer how much is left — and it is the same class as the Antigravity local
+statistics family already in standing declines. Muse itself is already recorded
+above as a build decision rather than parity.
+
+`RemoteCodexCostFetcher` (+191) declines on BOTH tests, which is worth stating
+separately because either alone would be enough. Axis: cost is consumption.
+Lane: it is not an HTTP fetch at all — `guard let binary else throw unavailable`
+then a bounded subprocess whose stdout is decoded as `[CodexCostSummary]`, the
+same local-CLI-parse class as Kiro's `kiro-cli`, and that binary is not on this
+host.
+
+`ClaudeVerifiedAccountOwner` + `ClaudeUsageSnapshot.accountID` (+86) is the one
+worth a reason rather than a label, because it LOOKS like identity work we care
+about. It is not an endpoint: `ownerID` hashes a principal (`accountUUID`, or
+`email` when the UUID is absent) together with `organizationUUID` into one opaque
+key, returning nil without the organization. Every input is a field we already
+publish separately — `account`, `accountInfo.email`, `accountInfo.orgName` — so a
+consumer wanting that composite can derive it. Publishing our own hash of fields
+we also publish adds a value that can disagree with its own inputs, and the
+disagreement would be invisible: two rows differing in `orgName` but sharing a
+stale composite read as one account. Declined as derivable-by-the-consumer, which
+is a different reason from the axis and lane declines above.
+
 ### Parity round: CodexBar v0.60.0 → v0.61.0
 
 Six tags accumulated (`v0.60.1` through `v0.61.0`). All five opaque constants
