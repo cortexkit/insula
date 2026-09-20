@@ -205,7 +205,104 @@ fn vault_manifest() -> ModuleManifest {
         .build()
 }
 
+#[derive(Clone, Copy)]
+struct StubCredential {
+    id: &'static str,
+    kind: &'static str,
+    serves: &'static str,
+    payload: &'static [u8],
+    account_id: &'static str,
+    record_version: u64,
+    refresh_adapter: Option<&'static str>,
+}
+
+impl StubCredential {
+    const fn new(
+        id: &'static str,
+        kind: &'static str,
+        serves: &'static str,
+        payload: &'static [u8],
+        account_id: &'static str,
+        record_version: u64,
+        refresh_adapter: Option<&'static str>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            serves,
+            payload,
+            account_id,
+            record_version,
+            refresh_adapter,
+        }
+    }
+
+    fn published_row(self) -> Value {
+        let mut row = serde_json::json!({
+            "id": self.id,
+            "categories": ["llm-provider"],
+            "kind": self.kind,
+            "serves": [self.serves],
+            "state": "active",
+            "record_version": self.record_version,
+            "operations": ["read"],
+            "account_id": self.account_id,
+            "email": format!("{}@example.test", self.account_id),
+            "org_name": "Vault Stub",
+        });
+        if let Some(refresh_adapter) = self.refresh_adapter {
+            row["refresh_adapter"] = Value::String(refresh_adapter.to_string());
+        }
+        row
+    }
+}
+
+const DEFAULT_STUB_CREDENTIALS: [StubCredential; 2] = [
+    StubCredential::new(
+        "chatgpt:openai",
+        "oauth",
+        "openai",
+        b"vault-token-primary",
+        "account-primary",
+        7,
+        Some("openai-oauth"),
+    ),
+    StubCredential::new(
+        "chatgpt:openai:gmail",
+        "oauth",
+        "openai",
+        b"vault-token-second",
+        "account-second",
+        11,
+        Some("openai-oauth"),
+    ),
+];
+
+fn scoped_stub_credential(
+    id: &'static str,
+    kind: &'static str,
+    serves: &'static str,
+    record_version: u64,
+) -> StubCredential {
+    StubCredential::new(
+        id,
+        kind,
+        serves,
+        b"\xff",
+        id,
+        record_version,
+        (kind == "oauth").then_some("test-oauth"),
+    )
+}
+
 async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
+    start_vault_stub_with_credentials(connection_file_path, &DEFAULT_STUB_CREDENTIALS).await
+}
+
+async fn start_vault_stub_with_credentials(
+    connection_file_path: &Path,
+    stub_credentials: &[StubCredential],
+) -> VaultStub {
     let mut stream = connect_consumer(connection_file_path).await;
     let hello = Frame::build(
         FrameType::Hello,
@@ -226,16 +323,24 @@ async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
     let ack = read_frame(&mut stream).await.unwrap().unwrap();
     assert_eq!(ack.header.ty, FrameType::HelloAck);
 
-    let credentials: HashMap<&'static str, (&'static [u8], &'static str, u64)> = HashMap::from([
-        (
-            "chatgpt:openai",
-            (b"vault-token-primary".as_slice(), "account-primary", 7),
-        ),
-        (
-            "chatgpt:openai:gmail",
-            (b"vault-token-second".as_slice(), "account-second", 11),
-        ),
-    ]);
+    let credential_rows = stub_credentials
+        .iter()
+        .copied()
+        .map(StubCredential::published_row)
+        .collect::<Vec<_>>();
+    let credentials = stub_credentials
+        .iter()
+        .map(|credential| {
+            (
+                credential.id.to_string(),
+                (
+                    credential.payload.to_vec(),
+                    credential.account_id.to_string(),
+                    credential.record_version,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let task = tokio::spawn(async move {
         while let Ok(Some(frame)) = read_frame(&mut stream).await {
             let response = match frame.header.ty {
@@ -274,23 +379,14 @@ async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
                     let result = match request["method"].as_str() {
                         Some("credential.list_scoped") => serde_json::json!({
                             "result": {
-                                "view": "test-view",
+                                "view": "sha256:test-view",
                                 "grants": 1,
-                                "grant_tuples": [],
-                                "credentials": [
-                                    {
-                                        "id": "chatgpt:openai",
-                                        "kind": "oauth",
-                                        "state": "active",
-                                        "record_version": 7
-                                    },
-                                    {
-                                        "id": "chatgpt:openai:gmail",
-                                        "kind": "oauth",
-                                        "state": "active",
-                                        "record_version": 11
-                                    }
-                                ]
+                                "grant_tuples": [{
+                                    "selector_kind": "category",
+                                    "selector": "llm-provider",
+                                    "operation": "read"
+                                }],
+                                "credentials": credential_rows.clone()
                             }
                         }),
                         Some("credential.get_scoped") => {
@@ -583,6 +679,180 @@ async fn skeleton_round_trips_usage_get_over_the_wire() {
     assert!(
         healthy ^ degraded,
         "codex entry must be exactly one of healthy|degraded: {codex}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_inventory_routes_every_vault_backed_provider_family() {
+    let daemon = start_daemon().await;
+    let stub_credentials = [
+        scoped_stub_credential("oauth:anthropic", "oauth", "anthropic", 1),
+        scoped_stub_credential("oauth:anthropic:ufuk2", "oauth", "anthropic", 2),
+        scoped_stub_credential("oauth:anthropic:umutaday", "oauth", "anthropic", 3),
+        scoped_stub_credential("oauth:anthropic:wwaxgmail", "oauth", "anthropic", 4),
+        scoped_stub_credential("oauth:anthropic:yiyi", "oauth", "anthropic", 5),
+        scoped_stub_credential("chatgpt:openai", "oauth", "openai", 6),
+        scoped_stub_credential("chatgpt:openai:gmail", "oauth", "openai", 7),
+        scoped_stub_credential("antigravity:google", "oauth", "google", 8),
+        scoped_stub_credential("oauth:xai", "oauth", "xai", 9),
+        scoped_stub_credential("oauth:cursor", "oauth", "cursor", 10),
+        scoped_stub_credential("apikey:kimi-for-coding", "apikey", "kimi-for-coding", 11),
+        scoped_stub_credential("apikey:deepseek", "apikey", "deepseek", 12),
+        scoped_stub_credential("apikey:openrouter", "apikey", "openrouter", 13),
+        scoped_stub_credential("apikey:openai", "apikey", "openai", 14),
+        scoped_stub_credential("apikey:openai:astro", "apikey", "openai", 15),
+        scoped_stub_credential("apikey:cerebras", "apikey", "cerebras", 16),
+        scoped_stub_credential("apikey:fireworks-ai", "apikey", "fireworks-ai", 17),
+    ];
+    let _vault_stub =
+        start_vault_stub_with_credentials(&daemon.connection_file_path, &stub_credentials).await;
+    wait_for_registration(&daemon.registry, VAULT_MODULE_ID, SETUP_TIMEOUT).await;
+
+    let codex_home = daemon.temp_dir.join("isolated-codex-home");
+    write_owner_only(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"local-token","account_id":"chatgpt:openai"}}"#,
+    );
+    write_owner_only(
+        &codex_home.join("config.toml"),
+        b"chatgpt_base_url = \"http://127.0.0.1:0/backend-api\"\n",
+    );
+    let child = quota_module_command(&daemon.connection_file_path, &daemon.temp_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env_remove("KIMI_CODE_API_KEY")
+        .spawn()
+        .expect("spawn quota-module with the seventeen-row scoped inventory");
+    let _module = ModuleProcess { child };
+    wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
+
+    let project_root = daemon.temp_dir.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut consumer = connect_consumer(&daemon.connection_file_path).await;
+    let route = route_open(&mut consumer, &project_root, 20).await;
+
+    let deadline = Instant::now() + Duration::from_secs(80);
+    let mut corr = 21;
+    let response = loop {
+        let response = usage_get(&mut consumer, route, corr).await;
+        let entries = response["result"].as_array().cloned().unwrap_or_default();
+        let provider_settled = |provider: &str| {
+            let has_declared_handle = stub_credentials.iter().any(|credential| match provider {
+                "claude" => credential.id.starts_with("oauth:anthropic"),
+                "kimi-for-coding" => credential.id == "apikey:kimi-for-coding",
+                "codex" => credential.id.starts_with("chatgpt:openai"),
+                _ => false,
+            });
+            !has_declared_handle
+                || response["completeProviders"]
+                    .as_array()
+                    .is_some_and(|providers| providers.iter().any(|name| name == provider))
+                || entries.iter().any(|entry| {
+                    entry["provider"] == provider && entry["errorClass"] == "credential_absent"
+                })
+        };
+        if ["claude", "kimi-for-coding", "codex"]
+            .into_iter()
+            .all(provider_settled)
+        {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "vault-backed providers did not settle after scoped enumeration: {response:?}"
+        );
+        corr += 1;
+        sleep(Duration::from_millis(100)).await;
+    };
+    let result = response["result"].as_array().unwrap();
+
+    let expected_claude_accounts = [
+        "oauth:anthropic",
+        "oauth:anthropic:ufuk2",
+        "oauth:anthropic:umutaday",
+        "oauth:anthropic:wwaxgmail",
+        "oauth:anthropic:yiyi",
+    ];
+    let claude = result
+        .iter()
+        .filter(|entry| entry["provider"] == "claude")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        claude.len(),
+        expected_claude_accounts.len(),
+        "claude must publish one entry per scoped anthropic handle: {claude:?}"
+    );
+    let mut claude_accounts = claude
+        .iter()
+        .filter_map(|entry| entry["account"].as_str())
+        .collect::<Vec<_>>();
+    claude_accounts.sort_unstable();
+    assert_eq!(claude_accounts, expected_claude_accounts);
+    assert!(
+        claude
+            .iter()
+            .all(|entry| entry["errorClass"] == "decode_failed"),
+        "each fake anthropic credential must resolve its handle before failing: {claude:?}"
+    );
+
+    let kimi = result
+        .iter()
+        .filter(|entry| entry["provider"] == "kimi-for-coding")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kimi.len(),
+        1,
+        "kimi-for-coding must publish its scoped vault lane: {kimi:?}"
+    );
+    assert!(
+        kimi[0]["account"] == "apikey:kimi-for-coding"
+            && kimi[0]["errorClass"].is_string()
+            && kimi[0]["errorClass"] != "credential_absent"
+            && !kimi[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("KIMI_CODE_API_KEY")),
+        "kimi-for-coding must resolve its scoped handle instead of the environment lane: {:?}",
+        kimi[0]
+    );
+
+    let codex = result
+        .iter()
+        .filter(|entry| entry["provider"] == "codex")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        codex.len(),
+        2,
+        "codex must publish both scoped chatgpt handles: {codex:?}"
+    );
+    let mut codex_accounts = codex
+        .iter()
+        .filter_map(|entry| entry["account"].as_str())
+        .collect::<Vec<_>>();
+    codex_accounts.sort_unstable();
+    assert_eq!(codex_accounts, ["chatgpt:openai", "chatgpt:openai:gmail"]);
+    assert!(
+        codex.iter().all(|entry| {
+            entry["errorClass"].is_string() && entry["errorClass"] != "credential_absent"
+        }),
+        "each fake codex credential must resolve its handle before failing: {codex:?}"
+    );
+
+    let unrouted_ids = [
+        "apikey:openai",
+        "apikey:openai:astro",
+        "apikey:cerebras",
+        "apikey:fireworks-ai",
+    ];
+    let unrouted_entries = result
+        .iter()
+        .filter(|entry| {
+            entry["account"]
+                .as_str()
+                .is_some_and(|account| unrouted_ids.contains(&account))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        unrouted_entries.is_empty(),
+        "unsupported credential ids must not create provider lanes: {unrouted_entries:?}"
     );
 }
 
