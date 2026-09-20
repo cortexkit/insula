@@ -47,7 +47,31 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 const SESSION_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
-const MAX_BLOCK: usize = 4000;
+/// The longest cadence this page publishes, and the bound that replaced a byte cap.
+///
+/// The block used to stop after 4000 bytes when no further label followed. That
+/// number is a proxy for "still inside this window's section", and it is a BAD
+/// proxy because the section's length is DATA-DEPENDENT: the weekly block carries
+/// a per-model breakdown, so it grows with how many models the operator has used.
+/// Measured on this host 2026-09-20 -- the weekly `data-time` sat 4207 bytes after
+/// its label, 207 past the cap, so the weekly window published a real percent with
+/// no reset while the timestamp was on the page the whole time. Upstream carries
+/// the same 4000 at v0.62.0, so this is a deliberate divergence.
+///
+/// A byte distance cannot be made right by choosing a bigger number: the next
+/// operator with more models blows past whatever is chosen. The bound that does not
+/// rot is the window's OWN cadence -- a reset for a 7-day window is at most 7 days
+/// out, whatever the page's byte layout. That is what guards the last label now
+/// that its block runs to the end of the page.
+/// Sized to the LONGEST cadence this page can publish, which is the monthly block
+/// upstream added at v0.56.x -- not the weekly one. I set this to a week first and
+/// the suite rejected a legitimate monthly reset 11 days out, which is the guard
+/// working: a fallback horizon has to cover every window that can reach it, and
+/// the monthly block states no cadence of its own so it lands here.
+///
+/// Only windows with NO stated duration use this. A weekly window is bounded by
+/// its own 7 days, which is tighter and more honest than any shared number.
+const MAX_RESET_HORIZON_MINUTES: i64 = 31 * 24 * 60;
 
 /// A recognized session-cookie name (any of these → treat the jar as a real login).
 /// `wos-session` is Ollama's WorkOS session cookie, adopted when it moved auth to
@@ -65,13 +89,19 @@ fn is_session_cookie(name: &str) -> bool {
 /// All usage-block labels, used to bound one block's window at the next block.
 const ALL_LABELS: &[&str] = &["Session usage", "Hourly usage", "Weekly usage"];
 
-/// Slice from just after `label` to the next other-label (or `MAX_BLOCK`), so a
-/// percent/reset is attributed to the right window (mirrors CodexBar's bounding).
+/// Slice from just after `label` to the next other-label, or to the end of the
+/// page when no other label follows.
 ///
-/// `MAX_BLOCK` is a BYTE budget, and the page carries user-facing text that can
-/// hold any UTF-8, so the cutoff is rounded down to a character boundary before
-/// slicing. A label match is always on a boundary; only the fixed cap can land
-/// mid-character.
+/// NO BYTE CAP. There was one, and it silently dropped a real reset -- see
+/// `MAX_RESET_HORIZON_MINUTES` for the measurement. The next label is a true
+/// boundary; a byte distance only approximates one, and the approximation fails
+/// exactly when a section grows.
+///
+/// `floor_char_boundary` is retained though both bounds are now always on a
+/// character boundary (a label match and the string end both are). It costs
+/// nothing and it is the guard that would matter if a byte bound ever came back --
+/// slicing mid-character panics, and a panicking fetch is classified non-transient,
+/// so a working provider would read as absent rather than degraded.
 fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
     let start = html.find(label)? + label.len();
     let tail = &html[start..];
@@ -80,8 +110,7 @@ fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
         .filter(|l| **l != label)
         .filter_map(|l| tail.find(l))
         .min()
-        .unwrap_or(tail.len())
-        .min(MAX_BLOCK);
+        .unwrap_or(tail.len());
     Some(&tail[..crate::text::floor_char_boundary(tail, end)])
 }
 
@@ -191,6 +220,43 @@ fn looks_signed_out(html: &str) -> bool {
     has_form && ((has_heading && has_password) || has_auth_route)
 }
 
+/// A reset from this block, kept only when it could belong to THIS window.
+///
+/// The positional bound that used to do this job was a byte cap, and removing it
+/// lets the last label's block run to the end of the page -- which is what makes
+/// the real reset reachable, and also what would let an unrelated timestamp
+/// further down the page be attributed here. So the guard moved from WHERE the
+/// timestamp sits to WHETHER IT COULD BE THIS WINDOW'S.
+///
+/// A window of duration D resets at most D from now, by definition. A page-footer
+/// renewal date months out fails that for every window here; the genuine weekly
+/// reset (measured 11 hours out against a 7-day window) passes comfortably.
+///
+/// TWO DELIBERATE CHOICES IN THE BOUNDS:
+///
+/// A reset already in the PAST is kept, not dropped. It means the window has
+/// rolled and the page has not caught up, which is a real state with a real
+/// percent beside it -- dropping the timestamp there would turn a stale reading
+/// into a resetless one and hide that the page is behind.
+///
+/// A window with no stated duration (an "Hourly usage" block, which carries no
+/// fixed length) is bounded by the longest cadence the page publishes rather than
+/// waved through. Without a duration there is nothing tighter to say, and an
+/// unbounded last block is the case this guard exists for.
+fn plausible_reset(
+    block: &str,
+    window_minutes: Option<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let raw = parse_reset(block)?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(&raw).ok()?;
+    let horizon = window_minutes.unwrap_or(MAX_RESET_HORIZON_MINUTES);
+    let ahead = parsed
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(now);
+    (ahead <= chrono::Duration::minutes(horizon)).then_some(raw)
+}
+
 /// A window for the first matching label that carries a percent. The reset is
 /// carried through when the block has a `data-time` and OMITTED otherwise — a
 /// depleted window (e.g. a weekly quota at 100% used) shows no reset timestamp
@@ -200,14 +266,18 @@ fn looks_signed_out(html: &str) -> bool {
 /// "Hourly usage" block carries no fixed length (matching CodexBar, which stamps
 /// 5h only on "Session usage"), so a short hourly window is never mislabeled as
 /// the 5-hour session window.
-fn window_for(html: &str, labels: &[(&str, Option<i64>)]) -> Option<RateWindow> {
+fn window_for(
+    html: &str,
+    labels: &[(&str, Option<i64>)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<RateWindow> {
     for (label, window_minutes) in labels {
         if let Some(block) = block_after(html, label) {
             if let Some(used_percent) = parse_percent(block) {
                 return Some(RateWindow {
                     used_percent,
                     raw_used_percent: None,
-                    resets_at: parse_reset(block),
+                    resets_at: plausible_reset(block, *window_minutes, now),
                     window_minutes: *window_minutes,
                     used_count: None,
                     total_count: None,
@@ -277,8 +347,22 @@ const SESSION_LABELS: &[(&str, Option<i64>)] = &[
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
-    let mut session = window_for(html, SESSION_LABELS);
-    let mut weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))]);
+    normalize_usage_at(html, chrono::Utc::now())
+}
+
+/// The parser proper, with the clock injected.
+///
+/// Reset plausibility is measured against a horizon, so the parse depends on the
+/// time it runs at. Taking `now` as an argument keeps that dependency explicit and
+/// the function pure -- a test can place a page's timestamps either side of the
+/// bound instead of manufacturing one relative to the wall clock and hoping the
+/// margin holds.
+pub fn normalize_usage_at(
+    html: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Usage, FetchError> {
+    let mut session = window_for(html, SESSION_LABELS, now);
+    let mut weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))], now);
 
     // Re-attribute the reset when the weekly quota is exhausted. In that state
     // the page stops stating when the session window rolls and renders only the
@@ -721,27 +805,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_multibyte_character_straddling_the_block_cap_does_not_panic() {
-        // The block bound is a fixed BYTE budget, but the page carries user-facing
-        // text that can hold any UTF-8. When a multibyte character straddles that
-        // cutoff, slicing at the raw byte offset panics — and because a fetch panic
-        // is classified non-transient, a working provider would lose its cached
-        // window and read as absent rather than degraded. The percent sits before
-        // the cap, so it must still parse.
-        let mut html = String::from("Session usage");
-        html.push_str(" 42% used ");
-        let consumed = html.len() - "Session usage".len();
-        html.push_str(&"a".repeat(MAX_BLOCK - consumed - 1));
-        html.push('\u{e9}'); // straddles the cap: bytes (MAX_BLOCK - 1)..(MAX_BLOCK + 1)
-        html.push_str(" Weekly usage 50% used ");
+    /// A fixed clock for the reset-horizon tests.
+    ///
+    /// The parse now depends on the time it runs at, so these fixtures place
+    /// their timestamps against a STATED instant rather than an offset from the
+    /// wall clock. An offset-based fixture drifts: it passes when written and
+    /// fails at whatever margin the next change chooses.
+    fn at(stamp: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(stamp)
+            .expect("a valid fixture instant")
+            .with_timezone(&chrono::Utc)
+    }
 
-        let usage = normalize_usage(&html).expect("a valid page must still parse");
+    /// THE REGRESSION: a reset further from its label than the old byte cap.
+    ///
+    /// Reported by the operator as a weekly window showing a percent and no
+    /// countdown. The timestamp was on the page the whole time, 4207 bytes after
+    /// the label, because the weekly section carries a PER-MODEL BREAKDOWN whose
+    /// length grows with how many models the account has used. The old bound was
+    /// 4000 bytes, so the page outgrew it.
+    ///
+    /// The filler here is 6000 bytes: comfortably past the retired cap, and past
+    /// any cap that would have been chosen to replace it. That is the point --
+    /// the fixture is sized against the CLASS of bound, not against the number
+    /// that happened to be there, so it stays meaningful if someone reintroduces
+    /// a larger one.
+    #[test]
+    fn a_reset_far_below_its_label_is_still_attributed() {
+        let now = at("2026-09-20T12:00:00Z");
+        let mut html = String::from("<span>Weekly usage</span><span>80% used</span>");
+        // Stand-in for the per-model breakdown that pushed the real page over.
+        html.push_str(&"<div>model row</div>".repeat(300));
+        html.push_str(r#"<div data-time="2026-09-21T00:00:00Z">Resets in 12 hours.</div>"#);
+        assert!(html.len() > 6000, "the fixture must clear any byte cap");
+
+        let usage = normalize_usage_at(&html, now).expect("a valid page parses");
+        let weekly = usage.secondary.expect("weekly window");
+        assert_eq!(weekly.used_percent, 80.0);
         assert_eq!(
-            usage.primary.expect("session window").used_percent,
-            42.0,
-            "the percent precedes the cap, so truncation must not lose it"
+            weekly.resets_at.as_deref(),
+            Some("2026-09-21T00:00:00Z"),
+            "the reset is in the weekly section, however far down it sits"
         );
+    }
+
+    /// The guard that replaced the byte cap, and the reason removing it is safe.
+    ///
+    /// With the last label's block running to the end of the page, an unrelated
+    /// timestamp further down could be attributed to it. A renewal date months
+    /// out cannot be a 7-day window's reset, so the cadence refuses it while the
+    /// test above still passes -- each survives the other's mutation.
+    #[test]
+    fn a_timestamp_beyond_the_window_cadence_is_not_attributed() {
+        let now = at("2026-09-20T12:00:00Z");
+        let html = concat!(
+            "<span>Weekly usage</span><span>80% used</span>",
+            r#"<div data-time="2026-12-01T00:00:00Z">Renews December 1.</div>"#
+        );
+
+        let usage = normalize_usage_at(html, now).expect("a valid page parses");
+        let weekly = usage.secondary.expect("weekly window");
+        assert_eq!(weekly.used_percent, 80.0, "the percent is still real");
+        assert!(
+            weekly.resets_at.is_none(),
+            "a date 72 days out is not a 7-day window's reset: {:?}",
+            weekly.resets_at
+        );
+    }
+
+    /// A reset already PAST is kept rather than dropped.
+    ///
+    /// It means the window rolled and the page has not caught up. Dropping it
+    /// would turn a stale reading into a resetless one and hide that the page is
+    /// behind -- the same fabrication-by-omission the percent rule forbids.
+    #[test]
+    fn a_reset_in_the_past_is_kept() {
+        let now = at("2026-09-20T12:00:00Z");
+        let html = concat!(
+            "<span>Weekly usage</span><span>80% used</span>",
+            r#"<div data-time="2026-09-20T00:00:00Z">Reset earlier today.</div>"#
+        );
+
+        let usage = normalize_usage_at(html, now).expect("a valid page parses");
+        assert_eq!(
+            usage.secondary.expect("weekly").resets_at.as_deref(),
+            Some("2026-09-20T00:00:00Z"),
+            "a page that is behind still states when it last rolled"
+        );
+    }
+
+    /// Multibyte page text must not panic the slicer.
+    ///
+    /// Both bounds are now character boundaries by construction (a label match
+    /// and the string end), so this can no longer fail via the cap that used to
+    /// cause it. Kept because the page genuinely carries user text in any UTF-8
+    /// and a panicking fetch is classified non-transient -- a working provider
+    /// would read as absent rather than degraded.
+    #[test]
+    fn multibyte_page_text_parses_without_panicking() {
+        let now = at("2026-09-20T12:00:00Z");
+        let mut html = String::from("<span>Session usage</span><span>42% used</span>");
+        html.push_str(&"caf\u{e9} \u{1f600} ".repeat(400));
+        html.push_str("<span>Weekly usage</span><span>50% used</span>");
+
+        let usage = normalize_usage_at(&html, now).expect("a valid page must still parse");
+        assert_eq!(usage.primary.expect("session window").used_percent, 42.0);
     }
 
     #[test]

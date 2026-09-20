@@ -123,6 +123,48 @@ async fn main() {
         println!("      {:<16} {}", heading, mark(html.contains(heading)));
     }
 
+    // WHAT THE REAL PARSER MAKES OF IT, not a second reading of the same page.
+    //
+    // A label being PRESENT says a window will be published; it says nothing about
+    // whether that window carries a reset, which is a separate question with its own
+    // failure. The operator-visible symptom is a window rendering a percent and no
+    // countdown, and until this line existed the probe could report every label
+    // present while a window shipped resetless.
+    //
+    // Calling `normalize_usage` rather than re-slicing the blocks here is the point:
+    // a probe that reimplements the parser answers what the REPLICA would do, and
+    // the two drift silently. This prints the production answer.
+    println!("  windows the parser produces from this page:");
+    match quota_core::ollama::normalize_usage(&html) {
+        Ok(usage) => {
+            let mut seen = 0usize;
+            for window in quota_core::model::windows(&usage) {
+                seen += 1;
+                let reset = window
+                    .resets_at
+                    .as_deref()
+                    .map(|at| format!("resets {at}"))
+                    .unwrap_or_else(|| "NO RESET".to_string());
+                println!(
+                    "      {:<8} {:>6.1}% used   {}",
+                    window
+                        .window_minutes
+                        .map(|m| format!("{m}m"))
+                        .unwrap_or_else(|| "?".to_string()),
+                    window.used_percent,
+                    reset
+                );
+            }
+            if seen == 0 {
+                eprintln!("      FINDING: the parser produced NO windows from a page");
+                eprintln!("      that carries recognised labels.");
+            }
+        }
+        Err(error) => {
+            eprintln!("      FINDING: the parser refused this page: {error}");
+        }
+    }
+
     // RECOGNISING NOTHING IS A FINDING, and this probe reported "findings: none"
     // for it until 2026-09-05. The original rule only asked whether the page
     // carried a label we IGNORE, so a page carrying none of our labels at all --
