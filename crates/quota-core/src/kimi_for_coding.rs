@@ -45,7 +45,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::browser_cookies;
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
+#[cfg(test)]
+use crate::credential_source::VaultCapability;
 use crate::env;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
@@ -433,13 +435,13 @@ impl KimiForCodingProvider {
 
     fn report_auth_failure(
         &self,
-        capability: &VaultCapability,
+        handle: &CredentialHandle,
         record_version: u64,
         error: &FetchError,
     ) {
         crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            capability,
+            handle,
             record_version,
             error,
         );
@@ -459,13 +461,19 @@ impl KimiForCodingProvider {
         }
     }
 
-    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
             );
         };
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
@@ -490,7 +498,7 @@ impl KimiForCodingProvider {
             .map(|response| response.body)
             .and_then(|body| normalize_usage(&body));
         if let Err(error) = &result {
-            self.report_auth_failure(capability, record_version, error);
+            self.report_auth_failure(handle, record_version, error);
         }
         match result {
             Ok(mut usage) => {
@@ -537,8 +545,8 @@ impl UsageProvider for KimiForCodingProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(capability).await;
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
         }
 
         // Implicit-local lane: `KIMI_CODE_API_KEY` (CodexBar
@@ -563,7 +571,6 @@ impl UsageProvider for KimiForCodingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::sync::Mutex;
 
     use crate::credential_source::{VaultCredential, VaultGetError};
@@ -647,29 +654,6 @@ mod tests {
     async fn serve_once(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
         let (base, task) = crate::loopback::serve_once(status, body).await;
         (format!("{base}/usages"), task)
-    }
-
-    fn write_handles(body: &str) -> std::path::PathBuf {
-        // Unique per call, not just per process: tests in one binary run in
-        // parallel threads, and a shared path would let one test truncate or
-        // delete the file another test is reading.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-kimi-for-coding-handles-{}-{}.json",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-        path
     }
 
     #[test]
@@ -876,28 +860,14 @@ mod tests {
 
     #[test]
     fn handles_include_vault_entry_when_source_is_wired() {
-        let path = write_handles(r#"{"handles":{"kimi-for-coding":"ckh_kimi"}}"#);
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("kimi-for-coding", "oauth")]);
         let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = KimiForCodingProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
-        );
+        let provider = KimiForCodingProvider::new_with_handle_loader(Some(source), loader);
         let handles = provider.handles().unwrap();
-        // ONE HANDLE, NOT TWO. This asserted `len() == 2` with the implicit lane
-        // first until insula#19's class was swept; a second identity-less slot
-        // for one account splits the row once the vault side is labelled.
-        //
-        // Enumeration never reads the environment -- only the fetch does,
-        // degrading to NoSession when the key is absent -- so no env mutation is
-        // needed to exercise either lane here. (Kept from
-        // `both_lanes_enumerate_two_fetch_units`, removed with this change: it
-        // asserted the same three lines as this test, and its comment described
-        // the read-time dedup of the two lanes as the reason the pair was safe --
-        // which is the assumption insula#19 falsified. A duplicate test whose
-        // stated rationale is now known to be wrong is worth less than nothing.)
         assert_eq!(handles.len(), 1, "{handles:?}");
         assert_eq!(handles[0].stable_id(), "kimi-for-coding");
-        let _ = std::fs::remove_file(path);
+        assert!(handles[0].is_vault());
     }
 
     #[tokio::test]

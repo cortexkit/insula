@@ -972,29 +972,39 @@ mod tests {
     }
 
     #[test]
-    fn same_id_changed_capability_is_remove_add_with_new_incarnation() {
+    fn replacing_a_legacy_handle_with_scoped_fields_rekeys_and_is_immediately_due() {
         use crate::credential_source::VaultCapability;
 
         let now = Instant::now();
         let first_handle =
             CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_first_secret"));
-        let second_handle =
-            CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_second_secret"));
+        let second_handle = CredentialHandle::scoped("chatgpt:openai", "oauth");
         assert_ne!(first_handle, second_handle);
-        assert!(!format!("{first_handle:?}").contains("ckh_first_secret"));
 
         let first_key = SlotKey::new("codex", first_handle.clone());
         let second_key = SlotKey::new("codex", second_handle.clone());
         let mut store = SlotStore::new(now);
         store.reconcile("codex", &[first_handle], now);
-        let first_incarnation = store.get(&first_key).unwrap().incarnation;
+        let mut observed = store.get(&first_key).unwrap().clone();
+        observed.observation = Some(crate::provider::AccountObservation::new(
+            Some("prior-account".to_string()),
+            Some(3),
+        ));
+        let first_incarnation = observed.incarnation;
+        assert!(store.publish_if_current(
+            &first_key,
+            observed.incarnation,
+            observed.attempt_sequence,
+            observed,
+        ));
 
         store.reconcile("codex", &[second_handle], now);
+
         assert!(store.get(&first_key).is_none());
-        assert_ne!(
-            store.get(&second_key).unwrap().incarnation,
-            first_incarnation
-        );
+        let rekeyed = store.get(&second_key).unwrap();
+        assert_ne!(rekeyed.incarnation, first_incarnation);
+        assert!(rekeyed.observation.is_none());
+        assert_eq!(rekeyed.next_due_at, now);
     }
 
     #[test]

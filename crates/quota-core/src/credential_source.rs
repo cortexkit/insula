@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::model::AccountInfo;
+use crate::provider::CredentialHandle;
 
 /// An owned snapshot of one opaque vault capability.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -167,6 +168,22 @@ pub struct CredentialStatus {
     pub stale_pending: Option<bool>,
 }
 
+/// One secret-free credential row visible through the caller's scoped grants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedRowState {
+    pub credential_id: String,
+    pub credential_type: String,
+    pub record_version: u64,
+    pub state: String,
+}
+
+/// One complete scoped-enumeration result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedSnapshot {
+    pub grants: u64,
+    pub rows: Vec<ScopedRowState>,
+}
+
 /// Vault access supplied by the subc-aware module crate.
 #[async_trait]
 pub trait CredentialSource: Send + Sync {
@@ -176,7 +193,21 @@ pub trait CredentialSource: Send + Sync {
         min_ttl_ms: u64,
     ) -> Result<VaultCredential, VaultGetError>;
 
-    /// CAS-guarded report for the exact record version served to this attempt.
+    /// Resolve a credential by id under the caller's scoped grant.
+    async fn get_scoped(
+        &self,
+        _credential_id: &str,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
+
+    /// Enumerate the credentials visible through the caller's scoped grants.
+    async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
+
+    /// CAS-guarded report for the exact capability-addressed record version served.
     async fn report_auth_failure(
         &self,
         capability: &VaultCapability,
@@ -184,18 +215,46 @@ pub trait CredentialSource: Send + Sync {
         record_version: u64,
     );
 
+    /// CAS-guarded report for the exact scoped record version served.
+    async fn report_auth_failure_scoped(
+        &self,
+        _credential_id: &str,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+
     /// Handle resolution plus plaintext metadata. No decrypt, no refresh, no audit.
-    ///
-    /// A source that has not grown this method cannot accelerate a backoff: the
-    /// default refuses, and a refused status poll leaves the slot exactly as it
-    /// was. Implementors that can answer must not let a failure here condemn a
-    /// credential -- the poll is an accelerator, and an accelerator that can make
-    /// things worse is a defect.
     async fn status(
         &self,
         _capability: &VaultCapability,
     ) -> Result<CredentialStatus, VaultGetError> {
         Err(VaultGetError::FailClosed)
+    }
+
+    /// Scoped status lookup mirrors [`Self::status`]. An error means only that
+    /// the lookup could not answer, not that the credential is invalid.
+    async fn status_scoped(&self, _credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
+}
+
+/// Fetch through the address actually carried by a vault handle.
+pub async fn get_vault_credential(
+    source: &Arc<dyn CredentialSource>,
+    handle: &CredentialHandle,
+    min_ttl_ms: u64,
+) -> Result<VaultCredential, VaultGetError> {
+    match handle {
+        CredentialHandle::Vault { credential_id, .. } => {
+            source.get_scoped(credential_id, min_ttl_ms).await
+        }
+        CredentialHandle::LegacyVault { capability, .. } => {
+            source.get(capability, min_ttl_ms).await
+        }
+        CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => {
+            Err(VaultGetError::FailClosed)
+        }
     }
 }
 /// Auth failures this process has reported to the vault.
@@ -222,90 +281,49 @@ pub fn auth_failures_reported() -> u64 {
     AUTH_FAILURES_REPORTED.load(Ordering::Relaxed)
 }
 
-/// Report a rejected vault credential to the store that issued it, if anyone is
-/// listening.
+#[doc(hidden)]
+pub enum VaultAuthFailureAddress {
+    Capability(VaultCapability),
+    Scoped(String),
+}
+
+/// An address accepted by the shared auth-failure reporting gate.
+#[doc(hidden)]
+pub trait VaultAuthFailureTarget {
+    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress>;
+}
+
+impl VaultAuthFailureTarget for VaultCapability {
+    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress> {
+        Some(VaultAuthFailureAddress::Capability(self.clone()))
+    }
+}
+
+impl VaultAuthFailureTarget for CredentialHandle {
+    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress> {
+        if !self.is_vault() {
+            return None;
+        }
+        match self {
+            CredentialHandle::Vault { credential_id, .. } => {
+                Some(VaultAuthFailureAddress::Scoped(credential_id.clone()))
+            }
+            CredentialHandle::LegacyVault { capability, .. } => {
+                Some(VaultAuthFailureAddress::Capability(capability.clone()))
+            }
+            CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => None,
+        }
+    }
+}
+
+/// Report a rejected vault credential to the store that issued it.
 ///
-/// WHY THIS IS SHARED RATHER THAN A METHOD ON EACH PROVIDER. Seven vault lanes
-/// carried copies of this, and the gate inside it is subtle enough that an
-/// eighth would be written wrong: it matches ONLY `ProviderStatus(401, _)`, an
-/// upstream status that survives to this point solely because the vault lane
-/// uses a send which PRESERVES it. The local lane maps 401 to `Unauthorized`,
-/// correctly, because a local credential has no custodian to tell.
-///
-/// 403 IS DELIBERATELY EXCLUDED, AND THAT IS THE LOAD-BEARING PART.
-/// The vault's contract asks for reports when the credential is BELIEVED DEAD,
-/// never merely because a call was refused — and a report is terminal there: it
-/// latches the record and forecloses any later refresh, for every consumer, not
-/// just this one. So the question is not "was I refused" but "do I believe this
-/// credential is gone", and only one of the two statuses answers it.
-///
-/// Measured counterexample, on this host, 2026-08-21: gemini's Code Assist quota
-/// endpoint returned 403 to a credential whose refresh SUCCEEDED moments before.
-/// Google had withdrawn the entitlement, not the credential — the token renews
-/// perfectly and is refused this one resource. Reporting that as death would
-/// have killed a live Google credential for every consumer on the box, and
-/// antigravity's vault lane rides the same API family.
-///
-/// A 401 with a served bearer remains a reasonable death proxy: it is how
-/// revocation-on-rotation was correctly detected all month.
-///
-/// NOT gated on the response body instead. Distinguishing "invalid credential"
-/// from "insufficient permission" that way means parsing seven providers' error
-/// prose, which carries no stability promise from any of them — the same reason
-/// this wire tells consumers never to branch on its own error strings.
-///
-/// The cost of being wrong runs one way. Withholding a report leaves the lane
-/// failing visibly as `credential_rejected` on this wire, which is what an
-/// operator sees anyway; sending a wrong one destroys a working credential
-/// silently.
-///
-/// SIZED FROM THE CUSTODY SIDE, which this module cannot see from where it sits
-/// (reported on insula#10, 2026-08-24, from the vault's append-only audit
-/// chain). The `antigravity:google` record — the one a 403 arm would have
-/// reported, since it rides the same `cloudcode-pa` family as the gemini lane
-/// that produced the live counterexample — had accumulated hundreds of
-/// `refresh_commit` entries and ZERO auth-failure reports, renewing continuously.
-/// The exact count is deliberately not repeated here: it was stale before it was
-/// written, and a number that keeps moving invites a reader to check it rather
-/// than the ratio, which is the durable part.
-///
-/// A PREVIOUS VERSION OF THIS COMMENT SAID A REPORT LATCHES THE RECORD. It does
-/// not, and the correction is worth keeping because of how the wrong version got
-/// here: it was written from a reading of the deployed schema, and the migration
-/// that changed the answer had landed twenty-four minutes earlier. Measured end
-/// to end afterwards (insula#10, 2026-08-24) on a genuine 401:
-///
-///   report_auth_failure  ->  stale marker set, record stays ACTIVE
-///   +300s, vault's own forced refresh  ->  invalid_grant  ->  needs_reauth
-///
-/// So the report does not kill the credential; the vault's next failed refresh
-/// does. A wrong report costs a forced refresh and, if the credential is
-/// genuinely healthy, that refresh SUCCEEDS and the record survives.
-///
-/// THE ASYMMETRY IS THEREFORE WEAKER THAN THE ARGUMENT THAT SHIPPED THE FIX, and
-/// the fix is still right on the remaining margin. A wrong report on a live
-/// credential still forces an unnecessary refresh against a rotation-sensitive
-/// endpoint, and this module cannot see whether that costs anything on the
-/// custody side. Withholding it costs a lane that fails visibly as
-/// `credential_rejected`, which an operator sees anyway. The direction survives
-/// even though the magnitude did not.
-///
-/// So the gate depends on a transport decision made in another file, and
-/// deleting that decision once left every test green while silently ending all
-/// auth reporting. That is not a thing to re-derive per provider.
-///
-/// WHAT IT IS FOR, since the fire-and-forget shape hides the stakes: a static
-/// API-key record in the credential store has no refresh adapter and no intent,
-/// so nothing else ever marks it dead. This call is its only automatic
-/// invalidation trigger. Dropping it means an operator is never prompted to
-/// re-authenticate, and the lane simply fails on a fixed backoff forever.
-///
-/// Spawned rather than awaited on purpose: a usage fetch must not block on the
-/// credential store's availability. The result is deliberately discarded --
-/// nothing here can act on a failed report, and the next fetch reports again.
-pub fn report_vault_auth_failure(
+/// Only a provider 401 is evidence that the served credential itself was
+/// rejected. A 403 can describe entitlement instead, so reporting it would
+/// invalidate a credential that may still be healthy.
+pub fn report_vault_auth_failure<T: VaultAuthFailureTarget + ?Sized>(
     source: Option<&Arc<dyn CredentialSource>>,
-    capability: &VaultCapability,
+    target: &T,
     record_version: u64,
     error: &crate::provider::FetchError,
 ) {
@@ -315,17 +333,25 @@ pub fn report_vault_auth_failure(
     let Some(source) = source else {
         return;
     };
+    let Some(address) = target.auth_failure_address() else {
+        return;
+    };
     let source = Arc::clone(source);
-    let capability = capability.clone();
     let status = *status;
-    // Counted here rather than inside the task: this is the point where the
-    // decision to latch a credential is made, and a count taken inside a spawned
-    // future would silently miss reports lost to shutdown.
     AUTH_FAILURES_REPORTED.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
-        source
-            .report_auth_failure(&capability, status, record_version)
-            .await;
+        match address {
+            VaultAuthFailureAddress::Capability(capability) => {
+                source
+                    .report_auth_failure(&capability, status, record_version)
+                    .await;
+            }
+            VaultAuthFailureAddress::Scoped(credential_id) => {
+                source
+                    .report_auth_failure_scoped(&credential_id, status, record_version)
+                    .await;
+            }
+        }
     });
 }
 
@@ -518,6 +544,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSource {
         reports: Arc<std::sync::Mutex<Vec<(u16, u64)>>>,
+        scoped_reports: Arc<std::sync::Mutex<Vec<(String, u16, u64)>>>,
     }
 
     #[async_trait::async_trait]
@@ -538,7 +565,48 @@ mod tests {
         ) {
             self.reports.lock().unwrap().push((status, record_version));
         }
+
+        async fn report_auth_failure_scoped(
+            &self,
+            credential_id: &str,
+            status: u16,
+            record_version: u64,
+        ) {
+            self.scoped_reports.lock().unwrap().push((
+                credential_id.to_string(),
+                status,
+                record_version,
+            ));
+        }
     }
+
+    #[tokio::test]
+    async fn scoped_401_reports_id_and_served_version_but_other_errors_do_not() {
+        let source = RecordingSource::default();
+        let reports = Arc::clone(&source.scoped_reports);
+        let source: Arc<dyn CredentialSource> = Arc::new(source);
+        let handle = CredentialHandle::scoped("oauth:anthropic:test", "oauth");
+        for error in [
+            crate::provider::FetchError::ProviderStatus(401, String::new()),
+            crate::provider::FetchError::ProviderStatus(403, String::new()),
+            crate::provider::FetchError::Upstream("timeout".to_string()),
+        ] {
+            report_vault_auth_failure(Some(&source), &handle, 41, &error);
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            reports.lock().unwrap().as_slice(),
+            &[("oauth:anthropic:test".to_string(), 401, 41)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_vault_source_defaults_scoped_listing_to_fail_closed() {
+        let source = RecordingSource::default();
+        assert_eq!(source.list_scoped().await, Err(VaultGetError::FailClosed));
+    }
+
     use super::*;
 
     /// The capability is the bearer of vault authority: anything holding it can

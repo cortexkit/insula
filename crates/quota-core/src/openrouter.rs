@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
+#[cfg(test)]
+use crate::credential_source::VaultCapability;
 use crate::http::JsonRequest;
 use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
@@ -184,13 +186,13 @@ impl OpenRouterProvider {
 
     fn report_auth_failure(
         &self,
-        capability: &VaultCapability,
+        handle: &CredentialHandle,
         record_version: u64,
         error: &FetchError,
     ) {
         crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            capability,
+            handle,
             record_version,
             error,
         );
@@ -208,13 +210,20 @@ impl OpenRouterProvider {
         normalize_pools(&body)
     }
 
-    async fn fetch_vault(&self, handle_id: &str, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let handle_id = handle.stable_id();
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
             );
         };
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => {
                 eprintln!(
@@ -236,7 +245,7 @@ impl OpenRouterProvider {
             .map(|response| response.body)
             .and_then(|body| normalize_pools(&body));
         if let Err(error) = &result {
-            self.report_auth_failure(capability, record_version, error);
+            self.report_auth_failure(handle, record_version, error);
         }
         match result {
             Ok(pools) => {
@@ -283,8 +292,8 @@ impl UsageProvider for OpenRouterProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(handle.stable_id(), capability).await;
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
         }
         let key = match Self::api_key() {
             Ok(key) => key,
@@ -514,80 +523,49 @@ mod tests {
         }
     }
 
-    fn write_handles(body: &str) -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-openrouter-handles-{}-{}.json",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).unwrap();
-        std::io::Write::write_all(&mut file, body.as_bytes()).unwrap();
-        path
-    }
-
-    /// An `apikey:openrouter` handle routes to the openrouter provider.
     #[test]
     fn an_apikey_handle_routes_to_the_openrouter_provider() {
-        let path = write_handles(r#"{"handles":{"apikey:openrouter":"ckh_openrouter"}}"#);
-        let loader = crate::vault_handles::VaultHandleLoader::new(Some(path.clone()));
+        let loader = crate::vault_handles::VaultHandleLoader::default();
+        loader.install_rows_for_test(&[("apikey:openrouter", "apikey")]);
         let handles = loader.openrouter_handles().unwrap();
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].stable_id(), "apikey:openrouter");
-        assert!(handles[0].vault_capability().is_some());
-        let _ = std::fs::remove_file(path);
+        assert_eq!(handles[0].vault_credential_type(), Some("apikey"));
     }
 
-    /// Vault configured for the family: the local lane is absent.
     #[test]
     fn vault_handles_replace_the_implicit_local_lane() {
-        let path = write_handles(r#"{"handles":{"apikey:openrouter":"ckh_openrouter"}}"#);
+        let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("apikey:openrouter", "apikey")]);
         let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = OpenRouterProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
-                path.clone(),
-            ))),
-        );
+        let provider = OpenRouterProvider::new_with_handle_loader(Some(source), loader);
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 1);
-        assert!(handles[0].vault_capability().is_some());
+        assert!(handles[0].is_vault());
         assert_eq!(handles[0].stable_id(), "apikey:openrouter");
-        let _ = std::fs::remove_file(path);
     }
 
-    /// No vault handle configured: the local lane is present.
     #[test]
     fn implicit_local_lane_survives_when_no_vault_handles_are_mapped() {
-        let path = write_handles(r#"{"handles":{"oauth:xai":"ckh_grok"}}"#);
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = OpenRouterProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(Some(
-                path.clone(),
-            ))),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
     }
 
-    /// Two handles for one api-key family are refused at load time.
     #[test]
     fn two_handles_for_one_apikey_family_are_refused() {
-        let path = write_handles(
-            r#"{"handles":{"apikey:openrouter":"ckh_a","apikey:openrouter:second":"ckh_b"}}"#,
-        );
-        let loader = crate::vault_handles::VaultHandleLoader::new(Some(path.clone()));
+        let loader = crate::vault_handles::VaultHandleLoader::default();
+        loader.install_rows_for_test(&[
+            ("apikey:openrouter", "apikey"),
+            ("apikey:openrouter:second", "apikey"),
+        ]);
         assert!(loader.openrouter_handles().unwrap().is_empty());
-        let _ = std::fs::remove_file(path);
     }
 
     /// The vault lane serves the key and reports a 401 to the store.

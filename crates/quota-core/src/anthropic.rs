@@ -20,7 +20,9 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
+#[cfg(test)]
+use crate::credential_source::VaultCapability;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
@@ -257,13 +259,13 @@ impl AnthropicProvider {
 
     fn report_auth_failure(
         &self,
-        capability: &VaultCapability,
+        handle: &CredentialHandle,
         record_version: u64,
         error: &FetchError,
     ) {
         crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            capability,
+            handle,
             record_version,
             error,
         );
@@ -282,13 +284,20 @@ impl AnthropicProvider {
         }
     }
 
-    async fn fetch_vault(&self, handle_id: &str, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let handle_id = handle.stable_id();
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
             );
         };
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => {
                 // Name the failure class: the F1 fence collapses any get error into
@@ -317,7 +326,7 @@ impl AnthropicProvider {
             .map(|response| response.body)
             .and_then(|body| normalize_usage(&body));
         if let Err(error) = &result {
-            self.report_auth_failure(capability, record_version, error);
+            self.report_auth_failure(handle, record_version, error);
         }
         match result {
             Ok(usage) => {
@@ -352,8 +361,8 @@ impl UsageProvider for AnthropicProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(handle.stable_id(), capability).await;
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
         }
 
         let access = match opencode_auth::read_provider(OPENCODE_PROVIDER) {
@@ -375,7 +384,6 @@ impl UsageProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::sync::Mutex;
 
     use crate::credential_source::{VaultCredential, VaultGetError};
@@ -478,59 +486,34 @@ mod tests {
         (format!("{base}/usage"), task)
     }
 
-    fn write_handles(body: &str) -> std::path::PathBuf {
-        // Unique per call: parallel test threads sharing one pid-keyed path
-        // would truncate each other's file mid-read.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-anthropic-handles-{}-{}.json",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-        path
-    }
-
     #[test]
     fn vault_handles_replace_the_implicit_local_lane() {
-        // Vault-only custody: the local lane can never resolve an account_id,
-        // so keeping it alongside labeled vault lanes would collapse the
-        // emission gate to one unlabeled entry for every account.
-        let path = write_handles(
-            r#"{"handles":{"oauth:anthropic":"ckh_anthropic","oauth:anthropic:ufuk2":"ckh_a2","oauth:xai":"ckh_grok"}}"#,
-        );
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[
+            ("oauth:anthropic", "oauth"),
+            ("oauth:anthropic:ufuk2", "oauth"),
+            ("oauth:xai", "oauth"),
+        ]);
         let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = AnthropicProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
-        );
+        let provider = AnthropicProvider::new_with_handle_loader(Some(source), loader);
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 2);
-        assert!(handles.iter().all(|h| h.vault_capability().is_some()));
+        assert!(handles.iter().all(CredentialHandle::is_vault));
         assert_eq!(handles[0].stable_id(), "oauth:anthropic");
         assert_eq!(handles[1].stable_id(), "oauth:anthropic:ufuk2");
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn implicit_local_lane_survives_when_no_vault_handles_are_mapped() {
-        let path = write_handles(r#"{"handles":{"oauth:xai":"ckh_grok"}}"#);
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = AnthropicProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(VaultHandleLoader::default()),
         );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
     }
 
     #[tokio::test]

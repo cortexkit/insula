@@ -18,10 +18,10 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
 use crate::http::{Header, JsonRequest};
 use crate::model::{CreditExpiry, SavedResets, Usage};
-use crate::provider::FetchError;
+use crate::provider::{CredentialHandle, FetchError};
 use crate::LOG_TAG;
 
 pub const CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
@@ -857,7 +857,7 @@ fn journal_path_under(segment: &str) -> Result<PathBuf, JournalError> {
 #[derive(Clone)]
 pub struct AuthFailureContext {
     pub source: Arc<dyn CredentialSource>,
-    pub capability: VaultCapability,
+    pub handle: CredentialHandle,
     pub record_version: u64,
 }
 
@@ -866,7 +866,7 @@ impl std::fmt::Debug for AuthFailureContext {
         formatter
             .debug_struct("AuthFailureContext")
             .field("source", &"<credential-source>")
-            .field("capability", &"<redacted>")
+            .field("handle", &self.handle)
             .field("record_version", &self.record_version)
             .finish()
     }
@@ -892,7 +892,7 @@ impl ResetRequest {
         };
         crate::credential_source::report_vault_auth_failure(
             Some(&context.source),
-            &context.capability,
+            &context.handle,
             context.record_version,
             error,
         );

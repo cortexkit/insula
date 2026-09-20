@@ -65,7 +65,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::credential_source::{CredentialSource, VaultCapability};
+use crate::credential_source::CredentialSource;
+#[cfg(test)]
+use crate::credential_source::VaultCapability;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::{
@@ -587,13 +589,13 @@ impl GeminiProvider {
 
     fn report_auth_failure(
         &self,
-        capability: &VaultCapability,
+        handle: &CredentialHandle,
         record_version: u64,
         error: &FetchError,
     ) {
         crate::credential_source::report_vault_auth_failure(
             self.credential_source.as_ref(),
-            capability,
+            handle,
             record_version,
             error,
         );
@@ -632,7 +634,7 @@ impl GeminiProvider {
         }
     }
 
-    async fn fetch_vault(&self, capability: &VaultCapability) -> FetchAttempt {
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
                 crate::credential_source::VaultGetError::Permanent,
@@ -641,7 +643,13 @@ impl GeminiProvider {
         // The Google OAuth credential is refresh-only in the vault. A get may make
         // one extra provider roundtrip before serving; the vault client's existing
         // 10-second timeout accommodates that without provider handling.
-        let mut credential = match credential_source.get(capability, 120_000).await {
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            120_000,
+        )
+        .await
+        {
             Ok(credential) => credential,
             Err(error) => return FetchAttempt::unverified_vault_failure(error),
         };
@@ -683,7 +691,7 @@ impl GeminiProvider {
         }
         .await;
         if let Err(error) = &result {
-            self.report_auth_failure(capability, record_version, error);
+            self.report_auth_failure(handle, record_version, error);
         }
         match result {
             Ok(usage) => {
@@ -735,8 +743,8 @@ impl UsageProvider for GeminiProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if let Some(capability) = handle.vault_capability() {
-            return self.fetch_vault(capability).await;
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
         }
 
         let result: Result<ProviderUsage, FetchError> = async {
@@ -815,7 +823,6 @@ mod tests {
     }
     use super::*;
     use chrono::TimeZone as _;
-    use std::io::Write as _;
     use std::sync::Mutex;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -949,28 +956,6 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
-    fn write_handles(body: &str) -> std::path::PathBuf {
-        // Per-call, not per-process: cargo runs this module's tests concurrently
-        // and a shared path means two bodies race. Same defect found in grok's
-        // helper while adding a control that needed a different handles file.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "ck-quota-gemini-handles-{}-{unique}.json",
-            std::process::id()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).unwrap();
-        file.write_all(body.as_bytes()).unwrap();
-        path
-    }
-
     fn quota_body() -> Vec<u8> {
         br#"{"buckets":[{"modelId":"gemini-2.5-pro","remainingFraction":0.4,"resetTime":"2026-07-16T00:00:00Z"}]}"#.to_vec()
     }
@@ -1086,72 +1071,35 @@ mod tests {
         assert_eq!(lifetime, Duration::from_secs(300));
     }
 
-    /// The Antigravity Google credential is not a Gemini credential.
-    ///
-    /// Both are Google logins reaching the same Code Assist API, so pooling them
-    /// looks harmless and the requests even succeed. They answer for different
-    /// products: an Antigravity login's quota response carries Antigravity's own
-    /// model pool, Claude and GPT included, which a Gemini CLI login has no
-    /// access to. Serving it here would publish that pool as Gemini's capacity,
-    /// and the numbers would look entirely plausible.
-    ///
-    /// Today the local lane usually wins this provider's selection, so the
-    /// mistake would surface only once the local credential failed — which is
-    /// the worst moment to start reporting another product's numbers.
     #[test]
     fn the_antigravity_google_credential_is_not_offered_to_gemini() {
-        let path = write_handles(
-            r#"{"handles":{"antigravity:google":"ckh_antigravity","oauth:google:cli":"ckh_google","oauth:xai":"ckh_grok"}}"#,
-        );
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[
+            ("antigravity:google", "oauth"),
+            ("oauth:google:cli", "oauth"),
+            ("oauth:xai", "oauth"),
+        ]);
         let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = GeminiProvider::new_with_handle_loader(
-            Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
-        );
+        let provider = GeminiProvider::new_with_handle_loader(Some(source), loader);
         let handles = provider.handles().unwrap();
-
-        // Not vacuous: the Gemini CLI credential is still offered, so this
-        // cannot pass by dropping every vault handle.
-        //
-        // ONE HANDLE, NOT TWO. This asserted `len() == 2` with the implicit lane
-        // first until vault-only custody landed; the implicit lane is now replaced
-        // rather than accompanied, because a second identity-less slot for the
-        // same account splits the row the moment the vault side is labelled
-        // (insula#19, found in grok and swept to here). The subject of this test
-        // is unchanged: the Antigravity credential must not reach this lane.
         assert_eq!(handles.len(), 1, "{handles:?}");
         assert_eq!(handles[0].stable_id(), "oauth:google:cli");
-        assert!(
-            !handles
-                .iter()
-                .any(|handle| handle.stable_id() == "antigravity:google"),
-            "the Antigravity credential reached the Gemini lane"
-        );
-        let _ = std::fs::remove_file(path);
+        assert!(!handles
+            .iter()
+            .any(|handle| handle.stable_id() == "antigravity:google"));
     }
 
-    /// THE CONTROL: with no gemini vault handle mapped, the local lane survives.
-    ///
-    /// Without it, returning an empty vector satisfies the test above -- it only
-    /// checks that the antigravity credential is absent -- and takes gemini dark
-    /// on every host that has not migrated custody, which is most of them.
     #[test]
     fn the_implicit_lane_survives_when_no_gemini_vault_handle_is_mapped() {
-        let path = write_handles(
-            r#"{"handles":{"antigravity:google":"ckh_antigravity","oauth:xai":"ckh_grok"}}"#,
-        );
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = GeminiProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(Some(path.clone()))),
+            Arc::new(VaultHandleLoader::default()),
         );
-        let handles = provider.handles().unwrap();
         assert_eq!(
-            handles,
-            vec![CredentialHandle::implicit()],
-            "no gemini credential in custody means the local lane is all there is"
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

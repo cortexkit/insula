@@ -228,11 +228,11 @@ async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
 
     let credentials: HashMap<&'static str, (&'static [u8], &'static str, u64)> = HashMap::from([
         (
-            "ckh_openai_primary",
+            "chatgpt:openai",
             (b"vault-token-primary".as_slice(), "account-primary", 7),
         ),
         (
-            "ckh_openai_second",
+            "chatgpt:openai:gmail",
             (b"vault-token-second".as_slice(), "account-second", 11),
         ),
     ]);
@@ -272,10 +272,33 @@ async fn start_vault_stub(connection_file_path: &Path) -> VaultStub {
                 FrameType::Request => {
                     let request: Value = serde_json::from_slice(&frame.body).unwrap();
                     let result = match request["method"].as_str() {
-                        Some("credential.get") => {
+                        Some("credential.list_scoped") => serde_json::json!({
+                            "result": {
+                                "view": "test-view",
+                                "grants": 1,
+                                "grant_tuples": [],
+                                "credentials": [
+                                    {
+                                        "id": "chatgpt:openai",
+                                        "kind": "oauth",
+                                        "state": "active",
+                                        "record_version": 7
+                                    },
+                                    {
+                                        "id": "chatgpt:openai:gmail",
+                                        "kind": "oauth",
+                                        "state": "active",
+                                        "record_version": 11
+                                    }
+                                ]
+                            }
+                        }),
+                        Some("credential.get_scoped") => {
                             assert_eq!(request["params"]["min_ttl_ms"], 120_000);
-                            let handle = request["params"]["handle"].as_str().unwrap_or_default();
-                            match credentials.get(handle) {
+                            let credential_id = request["params"]["credential_id"]
+                                .as_str()
+                                .unwrap_or_default();
+                            match credentials.get(credential_id) {
                                 Some((payload, account_id, record_version)) => serde_json::json!({
                                     "result": {
                                         "payload": payload,
@@ -579,15 +602,8 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
         &codex_home.join("config.toml"),
         format!("chatgpt_base_url = {:?}\n", usage_stub.base_url).as_bytes(),
     );
-    let handles_path = daemon.temp_dir.join("vault-handles.json");
-    write_owner_only(
-        &handles_path,
-        br#"{"handles":{"chatgpt:openai":"ckh_openai_primary","chatgpt:openai:gmail":"ckh_openai_second"}}"#,
-    );
-
     let child = quota_module_command(&daemon.connection_file_path, &daemon.temp_dir)
         .env("CODEX_HOME", &codex_home)
-        .env("CK_QUOTA_VAULT_HANDLES_PATH", &handles_path)
         .spawn()
         .expect("spawn vault-wired quota-module");
     let _module = ModuleProcess { child };

@@ -95,7 +95,7 @@ pub mod zenmux;
 /// outlives its reason.
 pub const LOG_TAG: &str = "[insula]";
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -103,7 +103,7 @@ use std::time::{Duration, Instant};
 use futures_util::{stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use credential_source::{CredentialSource, VaultCapability};
+use credential_source::CredentialSource;
 use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
@@ -356,7 +356,8 @@ fn stable_handle_key(key: &SlotKey) -> (u8, &str) {
     match &key.handle {
         CredentialHandle::ImplicitLocal => (0, ""),
         CredentialHandle::Named(name) => (1, name.as_str()),
-        CredentialHandle::Vault { credential_id, .. } => (2, credential_id.as_str()),
+        CredentialHandle::Vault { credential_id, .. }
+        | CredentialHandle::LegacyVault { credential_id, .. } => (2, credential_id.as_str()),
     }
 }
 
@@ -487,6 +488,7 @@ pub struct Registry {
     /// steps backwards.
     dedup_winner: Mutex<std::collections::HashMap<String, String>>,
     credential_source: Option<Arc<dyn CredentialSource>>,
+    vault_handle_loader: Option<Arc<vault_handles::VaultHandleLoader>>,
 }
 
 impl Registry {
@@ -516,6 +518,7 @@ impl Registry {
             last_admitted_provider: Mutex::new(None),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
             credential_source: None,
+            vault_handle_loader: None,
         }
     }
     /// The default registry: every provider we support.
@@ -618,12 +621,21 @@ impl Registry {
             )),
         ]);
         registry.credential_source = credential_source;
+        registry.vault_handle_loader = Some(vault_handle_loader);
         registry
     }
 
     #[cfg(test)]
     pub(crate) fn attach_credential_source(&mut self, source: Arc<dyn CredentialSource>) {
         self.credential_source = Some(source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_vault_handle_loader(
+        &mut self,
+        loader: Arc<vault_handles::VaultHandleLoader>,
+    ) {
+        self.vault_handle_loader = Some(loader);
     }
 
     /// The slot store, for diagnostics that must stage a specific slot state.
@@ -684,8 +696,8 @@ impl Registry {
     /// Same reasoning as [`Self::cookie_based_provider_names`]: a caller and a
     /// mechanism that disagree are worse than either alone.
     ///
-    /// Enumeration reads local credential files and the vault handle map, so the
-    /// answer is specific to this host and this moment -- which is the point. A
+    /// Enumeration reads local credential files and the installed scoped vault
+    /// snapshot, so the answer is specific to this host and this moment. A
     /// provider whose handles cannot be enumerated is OMITTED rather than assumed
     /// dual-lane: a checker that skips on an unreadable config is the failure this
     /// exists to catch, wearing the costume of an exemption.
@@ -696,9 +708,8 @@ impl Registry {
                 let Ok(handles) = provider.fetcher.handles() else {
                     return false;
                 };
-                let (vault, other): (Vec<_>, Vec<_>) = handles
-                    .iter()
-                    .partition(|handle| handle.vault_capability().is_some());
+                let (vault, other): (Vec<_>, Vec<_>) =
+                    handles.iter().partition(|handle| handle.is_vault());
                 !vault.is_empty() && !other.is_empty()
             })
             .map(|provider| provider.name.as_str())
@@ -1107,16 +1118,11 @@ impl Registry {
     }
 
     /// Ask the vault whether a replaced record can end a non-transient backoff.
-    ///
-    /// Only vault-backed slots already waiting out the 300s floor are polled, and
-    /// only at [`refresh::BASE_INTERVAL`]. A successful version advance makes the
-    /// slot due for the fetch that follows in this turn. Any status failure leaves
-    /// serving state untouched -- the poll is an accelerator, not a verdict.
     async fn poll_replaced_credentials(&self, now: Instant) {
         let Some(source) = self.credential_source.as_ref() else {
             return;
         };
-        let eligible: Vec<(SlotKey, ProviderSlot, VaultCapability)> = {
+        let eligible: Vec<(SlotKey, ProviderSlot)> = {
             let store = self
                 .store
                 .lock()
@@ -1124,63 +1130,21 @@ impl Registry {
             store
                 .snapshot()
                 .into_iter()
-                .filter_map(|(key, slot)| {
-                    let capability = key.handle.vault_capability()?.clone();
-                    refresh::should_poll_credential_status(&slot, &key.handle, now)
-                        .then_some((key, slot, capability))
+                .filter(|(key, slot)| {
+                    refresh::should_poll_credential_status(slot, &key.handle, now)
                 })
                 .collect()
         };
-        for (key, slot, capability) in eligible {
-            let next = match source.status(&capability).await {
-                Ok(status) => {
-                    let applied = refresh::apply_credential_status(&slot, &status, now);
-                    // ANNOUNCED ONLY WHEN THE BACKOFF ACTUALLY ENDS, which is what
-                    // makes this an event rather than the heartbeat that was removed
-                    // from the reset tick: a poll that changes nothing says nothing.
-                    //
-                    // Without it this mechanism is unwitnessable from here. The
-                    // filer of insula#16 measured a recovery at 183s against a
-                    // 360s baseline, and could only attribute it by reading the
-                    // VAULT's audit chain -- from this module's own output the
-                    // accelerated fetch is indistinguishable from a coincidence,
-                    // because the only trace is a fetch happening earlier than a
-                    // reader can prove it should have.
-                    //
-                    // The discarded figure is the load-bearing one. It is the
-                    // difference between what the flat 300s floor would have cost
-                    // and what this slot actually waited, so a reader can tell a
-                    // working accelerator from one that fires and saves nothing.
-                    //
-                    // NOT DEFENDED BY A TEST, stated because a log line is the
-                    // exact thing that drifts unnoticed -- 27 of 29 sites in this
-                    // module carried a stale tag for weeks for want of a reader.
-                    // The CONDITION is defended: it is `next_due_at` moving, which
-                    // `apply_credential_status`'s own tests pin in both directions.
-                    // The message CONTENT is not, and the check that would catch a
-                    // wrong field is the next observed rotation.
-                    if applied.next_due_at != slot.next_due_at {
-                        let discarded = slot.next_due_at.saturating_duration_since(now);
-                        let previous = slot
-                            .observation
-                            .as_ref()
-                            .and_then(|observed| observed.record_version);
-                        eprintln!(
-                            "{LOG_TAG} {} vault record replaced, backoff cleared: {} \
-                             record_version {:?} -> {:?}, discarded {:.1}s of backoff",
-                            key.provider,
-                            // Formatting a handle exposes the credential id only.
-                            // The capability is a secret and is redacted by its own
-                            // Debug/Display, which is why this line can name the
-                            // lane at all.
-                            key.handle,
-                            previous,
-                            status.record_version,
-                            discarded.as_secs_f64()
-                        );
-                    }
-                    applied
+        for (key, slot) in eligible {
+            let status = match &key.handle {
+                CredentialHandle::Vault { credential_id, .. } => {
+                    source.status_scoped(credential_id).await
                 }
+                CredentialHandle::LegacyVault { capability, .. } => source.status(capability).await,
+                CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => continue,
+            };
+            let next = match status {
+                Ok(status) => refresh::apply_credential_status(&slot, &status, now),
                 Err(_) => refresh::slot_after_status_error(&slot, now),
             };
             let mut store = self
@@ -1203,12 +1167,50 @@ impl Registry {
         fetch_deadline: Duration,
     ) {
         let turn_start = Instant::now();
+        let existing_vault: HashMap<String, Vec<CredentialHandle>> = {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut retained = HashMap::new();
+            for (key, _) in store.snapshot() {
+                if key.handle.is_vault() {
+                    retained
+                        .entry(key.provider)
+                        .or_insert_with(Vec::new)
+                        .push(key.handle);
+                }
+            }
+            retained
+        };
+
+        let mut authoritative_vault_install = false;
+        let mut reactivated_ids = HashSet::new();
+        if let (Some(source), Some(loader)) = (
+            self.credential_source.as_ref(),
+            self.vault_handle_loader.as_ref(),
+        ) {
+            match source.list_scoped().await {
+                Ok(snapshot) => {
+                    let installed = loader.install_snapshot(snapshot, turn_start);
+                    authoritative_vault_install = installed.authoritative;
+                    reactivated_ids = installed.reactivated_ids;
+                }
+                Err(error) => loader.retain_after_failure(format!("{error:?}")),
+            }
+        }
+
         let enumerated: Vec<Option<Vec<CredentialHandle>>> = self
             .providers
             .iter()
             .map(|provider| {
                 match std::panic::catch_unwind(AssertUnwindSafe(|| provider.fetcher.handles())) {
                     Ok(Ok(mut handles)) => {
+                        if !authoritative_vault_install {
+                            if let Some(retained) = existing_vault.get(&provider.name) {
+                                handles.extend(retained.iter().cloned());
+                            }
+                        }
                         handles.sort_by(CredentialHandle::sort_cmp);
                         handles.dedup();
                         Some(handles)
@@ -1232,6 +1234,44 @@ impl Registry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.reconcile_batch(&authoritative, turn_start);
+            if authoritative_vault_install {
+                let rows: HashMap<_, _> = self
+                    .vault_handle_loader
+                    .as_ref()
+                    .and_then(|loader| loader.snapshot())
+                    .map(|snapshot| {
+                        snapshot
+                            .rows
+                            .into_iter()
+                            .map(|row| (row.credential_id.clone(), row))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (key, mut slot) in store.snapshot() {
+                    let CredentialHandle::Vault { credential_id, .. } = &key.handle else {
+                        continue;
+                    };
+                    let Some(row) = rows.get(credential_id) else {
+                        continue;
+                    };
+                    let observed_version = slot
+                        .observation
+                        .as_ref()
+                        .and_then(|observation| observation.record_version);
+                    if row.state != "needs_reauth"
+                        && (reactivated_ids.contains(credential_id)
+                            || observed_version != Some(row.record_version))
+                    {
+                        slot.next_due_at = turn_start;
+                        store.publish_if_current(
+                            &key,
+                            slot.incarnation,
+                            slot.attempt_sequence,
+                            slot,
+                        );
+                    }
+                }
+            }
             store.mark_tick(turn_start);
         }
         self.poll_replaced_credentials(turn_start).await;
@@ -1242,13 +1282,33 @@ impl Registry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.snapshot()
         };
+        let latched_ids: HashSet<String> = self
+            .vault_handle_loader
+            .as_ref()
+            .and_then(|loader| loader.snapshot())
+            .map(|snapshot| {
+                snapshot
+                    .rows
+                    .into_iter()
+                    .filter(|row| row.state == "needs_reauth")
+                    .map(|row| row.credential_id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let candidates = {
             let mut cursor = self
                 .last_admitted_provider
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (candidates, last_admitted) =
+            let (mut candidates, last_admitted) =
                 select_due_round_robin(&self.providers, snapshot, turn_start, *cursor);
+            candidates.retain(|candidate| {
+                !candidate
+                    .key
+                    .handle
+                    .vault_credential_id()
+                    .is_some_and(|id| latched_ids.contains(id))
+            });
             *cursor = last_admitted;
             candidates
         };
@@ -1563,56 +1623,22 @@ impl Registry {
                     .is_some()
             });
 
+            let vault_rows: Vec<_> = keyed
+                .iter()
+                .filter(|(key, _)| key.handle.is_vault())
+                .collect();
+            let all_vault_rows_are_unidentified_oauth = !vault_rows.is_empty()
+                && vault_rows.iter().all(|(key, slot)| {
+                    key.handle.vault_credential_type() == Some("oauth")
+                        && slot
+                            .observation
+                            .as_ref()
+                            .and_then(|observation| observation.account_id.as_deref())
+                            .is_none()
+                });
             if (has_fresh || has_stale)
-                && keyed.iter().any(|(key, slot)| {
-                    // Vault handles only. One exists because somebody minted it,
-                    // so a failing one is a credential that was configured and
-                    // stopped working. Most providers also keep an implicit local
-                    // lane -- an environment variable or a file path -- that
-                    // exists whether or not anyone uses it, and on a host that
-                    // does not, it fails with an absent credential and no
-                    // identity while the vault lane beside it serves perfectly.
-                    // Counting those named a provider whose only fault was
-                    // shipping a lane nobody configured.
-                    if key.handle.is_local() {
-                        return false;
-                    }
-                    if slot
-                        .observation
-                        .as_ref()
-                        .and_then(|observation| observation.account_id.as_deref())
-                        .is_some()
-                    {
-                        return false;
-                    }
-                    let failing = slot
-                        .entry
-                        .as_ref()
-                        .is_some_and(|entry| entry.error.is_some());
-
-                    // THE SERVING ARM, ADDED AFTER THIS METRIC READ EMPTY THROUGH
-                    // THE INCIDENT IT EXISTS FOR. Requiring a failure missed the
-                    // more damaging half: an identity-less handle that is SERVING
-                    // trips the emission gate, which collapses every sibling for
-                    // the provider into one unlabelled row so that two handles
-                    // cannot publish the same account twice. One vault record
-                    // without an `account_id` therefore strips the label off a
-                    // sibling that resolved its identity perfectly, and withholds
-                    // the provider from `complete_providers` so no consumer may
-                    // prune its accounts. Seen on antigravity: one unlabelled row
-                    // where two labelled ones belonged, this metric empty
-                    // throughout, and the cause found by hand.
-                    //
-                    // Gated on a sibling that DID resolve, which is what keeps the
-                    // arm silent on a healthy host: a provider whose handles are
-                    // all identity-less destroys no label, because there was never
-                    // one to destroy -- the ordinary permanent state of a lane
-                    // whose credential carries no account. Without that gate this
-                    // fires forever on those, and a number that is never zero when
-                    // nothing is wrong stops being read within a week, taking the
-                    // real signal with it.
-                    failing || has_identified_handle
-                })
+                && has_identified_handle
+                && all_vault_rows_are_unidentified_oauth
             {
                 handles_without_account.push(name.to_string());
             }
@@ -1705,6 +1731,24 @@ impl Registry {
             cookie_cohort_total,
             cookie_logins_stale,
             handles_without_account,
+            vault_enumeration_failure: self
+                .vault_handle_loader
+                .as_ref()
+                .and_then(|loader| loader.enumeration_failure()),
+            retained_vault_snapshot_age: self.vault_handle_loader.as_ref().and_then(|loader| {
+                loader
+                    .enumeration_failure()
+                    .and_then(|_| loader.retained_snapshot_age(now))
+            }),
+            vault_mapping_warning: self
+                .vault_handle_loader
+                .as_ref()
+                .and_then(|loader| loader.warning()),
+            scoped_credential_ids: self
+                .vault_handle_loader
+                .as_ref()
+                .map(|loader| loader.installed_credential_ids())
+                .unwrap_or_default(),
             last_tick_age,
             refresher_stalled,
             last_fetch_success_age,

@@ -198,6 +198,14 @@ pub struct HealthSnapshot {
     /// Does not participate in the conservation identity: a provider named here
     /// is still counted in exactly one bucket.
     pub handles_without_account: Vec<String>,
+    /// Most recent scoped-enumeration failure, while the prior snapshot remains served.
+    pub vault_enumeration_failure: Option<String>,
+    /// Age of the retained installed snapshot during an enumeration failure.
+    pub retained_vault_snapshot_age: Option<Duration>,
+    /// Non-fatal routing refusal or unsupported-id warning for the installed snapshot.
+    pub vault_mapping_warning: Option<String>,
+    /// Credential ids in the currently installed scoped snapshot.
+    pub scoped_credential_ids: Vec<String>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,
     /// The refresher loop is wedged/dead: its heartbeat is older than the stall
@@ -246,6 +254,10 @@ impl HealthSnapshot {
             cookie_cohort_total,
             cookie_logins_stale: Vec::new(),
             handles_without_account: Vec::new(),
+            vault_enumeration_failure: None,
+            retained_vault_snapshot_age: None,
+            vault_mapping_warning: None,
+            scoped_credential_ids: Vec::new(),
             last_tick_age: None,
             refresher_stalled: false,
             last_fetch_success_age: None,
