@@ -871,6 +871,12 @@ impl CodexProvider {
             }
         };
         let facts = UsageFacts::from_usage(&usage_snapshot.usage, usage_snapshot.limit_reached);
+        // HERE, BEFORE ANY ELIGIBILITY CHECK. An account holding no banked credit
+        // returns below without ever reaching the coordinator, and that is exactly
+        // the account whose headroom should stop a walled sibling spending one.
+        if let Ok(coordinator) = &self.reset_coordinator {
+            coordinator.observe_headroom(account_id, &facts, std::time::Instant::now());
+        }
         let (credits, now) = match credits_snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {

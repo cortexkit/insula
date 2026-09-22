@@ -5410,6 +5410,130 @@ async fn registry_scheduler_two_codex_units_same_account_send_one_consume_post()
     assert_eq!(usage[0].account.as_deref(), Some("same-codex-account"));
 }
 
+/// A walled account whose ONLY route to firing is the exhaustion trigger.
+///
+/// The shared `reset_tick_input` puts the credit five minutes from expiry, which
+/// fires the expiry trigger on its own -- a sibling test built on it would pass
+/// for the wrong reason, because expiry is deliberately not sibling-gated.
+fn walled_tick_far_from_expiry(now: chrono::DateTime<Utc>) -> ResetTickInput {
+    ResetTickInput {
+        earliest_expiry: Some(now + chrono::Duration::days(20)),
+        ..reset_tick_input(now, reset_facts(100.0, true))
+    }
+}
+
+fn walled_account_request() -> ResetRequest {
+    ResetRequest {
+        base_url: "https://example.invalid/backend-api".to_string(),
+        bearer: "walled-token".to_string(),
+        account_id: "walled-account".to_string(),
+        auth_failure: None,
+    }
+}
+
+/// The 2026-09-20 incident: one account at 100%, another with room, and a fresh
+/// banked reset landed on the walled one. It was consumed within a tick. It must
+/// be kept -- work continues on the account that still has quota.
+#[tokio::test]
+async fn a_walled_account_keeps_its_banked_reset_while_a_sibling_has_room() {
+    let temp = ResetTempDir::new("sibling-has-room");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    coordinator.observe_headroom("roomy-account", &reset_facts(44.0, false), Instant::now());
+
+    let result = coordinator
+        .process_tick(
+            "walled-account",
+            walled_tick_far_from_expiry(reset_now()),
+            &transport,
+            &walled_account_request(),
+        )
+        .await;
+
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "a banked reset was spent while another account had room"
+    );
+    assert!(!result.trigger.exhaustion_trigger);
+}
+
+/// The must-still-fire arm, and the one that keeps the guard from being an
+/// opinion. Each sibling below lacks POSITIVE proof of room, so the walled
+/// account must spend exactly as it did before siblings were considered --
+/// otherwise every account could sit walled with a credit unspent.
+#[tokio::test]
+async fn a_walled_account_still_resets_when_no_sibling_has_proven_room() {
+    let now = Instant::now();
+    let cases: [(&str, Option<(UsageFacts, Instant)>); 4] = [
+        ("no sibling at all", None),
+        ("sibling also walled", Some((reset_facts(100.0, true), now))),
+        (
+            // Under 99% but the upstream never affirmed `limit_reached: false`.
+            "sibling unaffirmed",
+            Some((
+                UsageFacts {
+                    raw_percents: vec![40.0],
+                    any_used_floor: true,
+                    at_wall: false,
+                    wall_clear: false,
+                },
+                now,
+            )),
+        ),
+        (
+            "sibling reading stale",
+            Some((
+                reset_facts(44.0, false),
+                now - crate::codex_resets::SIBLING_HEADROOM_HORIZON - Duration::from_secs(1),
+            )),
+        ),
+    ];
+    for (name, sibling) in cases {
+        let temp = ResetTempDir::new("sibling-no-proof");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        if let Some((facts, at)) = sibling {
+            coordinator.observe_headroom("other-account", &facts, at);
+        }
+        coordinator
+            .process_tick(
+                "walled-account",
+                walled_tick_far_from_expiry(reset_now()),
+                &transport,
+                &walled_account_request(),
+            )
+            .await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            1,
+            "case {name}: with no proven room elsewhere the walled account must reset"
+        );
+    }
+}
+
+/// An account's own headroom is not a sibling's. Recording the walled account's
+/// earlier roomy reading must not suppress its own reset.
+#[test]
+fn an_account_is_never_its_own_sibling() {
+    let temp = ResetTempDir::new("own-sibling");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let now = Instant::now();
+    coordinator.observe_headroom("walled-account", &reset_facts(44.0, false), now);
+    assert_eq!(
+        coordinator.sibling_with_headroom("walled-account", now),
+        None
+    );
+    coordinator.observe_headroom("other-account", &reset_facts(44.0, false), now);
+    assert_eq!(
+        coordinator
+            .sibling_with_headroom("walled-account", now)
+            .as_deref(),
+        Some("other-account")
+    );
+}
+
 #[test]
 fn codex_reset_trigger_truth_table_is_fully_fenced() {
     let now = reset_now();
@@ -5423,9 +5547,19 @@ fn codex_reset_trigger_truth_table_is_fully_fenced() {
         pending: false,
         spend_bound_allows: true,
         before_post_cutoff: true,
+        sibling_has_headroom: false,
     };
     let mut cases = Vec::new();
     cases.push(("expiry", base.clone(), true));
+
+    // Use-it-or-lose-it: an expiring credit fires whatever a sibling holds.
+    let mut expiry_despite_sibling = base.clone();
+    expiry_despite_sibling.sibling_has_headroom = true;
+    cases.push((
+        "expiry-despite-sibling-headroom",
+        expiry_despite_sibling,
+        true,
+    ));
 
     let mut unarmed = base.clone();
     unarmed.armed = false;
@@ -5443,7 +5577,17 @@ fn codex_reset_trigger_truth_table_is_fully_fenced() {
     exhaustion.any_used_floor = false;
     exhaustion.earliest_expiry = None;
     exhaustion.at_wall = true;
-    cases.push(("exhaustion", exhaustion, true));
+    cases.push(("exhaustion", exhaustion.clone(), true));
+
+    // The 2026-09-20 incident: walled here, room on another account. Keep the
+    // credit; work continues on the sibling.
+    let mut exhaustion_with_sibling = exhaustion;
+    exhaustion_with_sibling.sibling_has_headroom = true;
+    cases.push((
+        "exhaustion-with-sibling-headroom",
+        exhaustion_with_sibling,
+        false,
+    ));
 
     let mut pending = base.clone();
     pending.pending = true;
@@ -6655,6 +6799,7 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
         pending: false,
         spend_bound_allows: true,
         before_post_cutoff: true,
+        sibling_has_headroom: false,
     });
     assert!(!mixed_trigger.expiry_trigger);
     assert!(!mixed_trigger.fire);
@@ -6679,6 +6824,7 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
             pending: false,
             spend_bound_allows: true,
             before_post_cutoff: true,
+            sibling_has_headroom: false,
         })
         .fire
     );

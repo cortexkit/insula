@@ -30,6 +30,15 @@ pub const CREDITS_TIMEOUT: Duration = Duration::from_secs(8);
 pub const CONSUME_TIMEOUT: Duration = Duration::from_secs(8);
 pub const PRE_POST_CUTOFF: Duration = Duration::from_secs(20);
 pub const PENDING_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How old a sibling's reading may be and still count as proof of headroom.
+///
+/// Long enough to survive a sibling missing a tick or two (the base poll is one
+/// minute and a transient failure backs off), short enough that an account
+/// burning quota fast cannot be treated as roomy on a reading from an hour ago.
+/// Past this the sibling simply stops counting, and the exhaustion trigger
+/// behaves exactly as it did before siblings were considered.
+pub const SIBLING_HEADROOM_HORIZON: Duration = Duration::from_secs(10 * 60);
 pub const CREDIT_SAFETY_MARGIN_SECS: i64 = 60;
 pub const PENDING_OLD_AFTER_SECS: i64 = 24 * 60 * 60;
 pub const SPEND_BOUND_SECS: i64 = 30 * 60;
@@ -217,6 +226,10 @@ pub struct TriggerInput {
     pub pending: bool,
     pub spend_bound_allows: bool,
     pub before_post_cutoff: bool,
+    /// Another codex account has PROVEN headroom right now: a fresh reading in
+    /// which the upstream affirmed `limit_reached: false` and no window sat at the
+    /// wall. Suppresses the exhaustion trigger only -- see `evaluate_trigger`.
+    pub sibling_has_headroom: bool,
 }
 
 /// Individual trigger reasons and the fully fenced fire decision.
@@ -233,7 +246,22 @@ pub fn evaluate_trigger(input: &TriggerInput) -> TriggerDecision {
             expiry.signed_duration_since(input.now).num_seconds()
                 <= input.auto_use_resets_secs.min(i64::MAX as u64) as i64
         });
-    let exhaustion_trigger = input.at_wall;
+    // AN EXHAUSTED ACCOUNT IS NOT AN EXHAUSTED OPERATOR. Hitting the wall on one
+    // account while another still has room means work can continue on the other;
+    // spending a banked reset then buys capacity nobody needed yet, and the credit
+    // is gone. Observed 2026-09-20: one account at 100% with three days to its
+    // natural reset, the other near 40%, and a credit that landed on the walled
+    // account was consumed within one tick.
+    //
+    // THE EXPIRY TRIGGER IS DELIBERATELY NOT GATED. A credit about to lapse is
+    // lost whether or not anyone needs capacity, so use-it-or-lose-it stands on
+    // its own.
+    //
+    // SCOPED BY POSITIVE EVIDENCE. Only a sibling with a fresh, affirmed-clear
+    // reading suppresses; a sibling that is unknown, stale, degraded or merely
+    // unaffirmed does not. Withholding on a guess would leave every account walled
+    // at once with a credit sitting unspent, which is the worse of the two errors.
+    let exhaustion_trigger = input.at_wall && !input.sibling_has_headroom;
     let fire = input.armed
         && (expiry_trigger || exhaustion_trigger)
         && !input.pending
@@ -1097,6 +1125,7 @@ impl ResetTickResult {
                 pending: false,
                 spend_bound_allows: false,
                 before_post_cutoff: false,
+                sibling_has_headroom: false,
             }),
         }
     }
@@ -1106,6 +1135,10 @@ impl ResetTickResult {
 struct AccountMutationState {
     in_flight: bool,
     last_post_at: Option<Instant>,
+    /// Whether the last tick withheld an exhaustion reset because a sibling had
+    /// room. Kept only so the log line fires on the transition rather than once a
+    /// minute for as long as the account stays walled.
+    withheld_for_sibling: bool,
 }
 
 #[derive(Default)]
@@ -1132,6 +1165,10 @@ pub struct ResetCoordinator {
     journal: RedemptionJournal,
     journal_io: Mutex<()>,
     accounts: Mutex<HashMap<String, Arc<AccountMutation>>>,
+    /// Latest headroom verdict per account, with when it was observed. Fed from
+    /// EVERY codex fetch, including accounts that hold no credit and so never
+    /// reach `process_tick` -- those are the siblings that matter most.
+    headroom: Mutex<HashMap<String, (bool, Instant)>>,
 }
 
 impl ResetCoordinator {
@@ -1141,7 +1178,41 @@ impl ResetCoordinator {
             journal,
             journal_io: Mutex::new(()),
             accounts: Mutex::new(HashMap::new()),
+            headroom: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record whether `account_id` has proven headroom as of `at`.
+    ///
+    /// Call this for every successful usage read, BEFORE deciding whether the
+    /// account is eligible for a reset at all. An account with no banked credit
+    /// returns early and never reaches `process_tick`, and it is exactly such an
+    /// account whose room should stop a sibling from spending a credit.
+    pub fn observe_headroom(&self, account_id: &str, facts: &UsageFacts, at: Instant) {
+        self.headroom
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account_id.to_string(), (facts.below_wall(), at));
+    }
+
+    /// Another account with a fresh, affirmed-clear reading, if any.
+    pub fn sibling_with_headroom(&self, account_id: &str, now: Instant) -> Option<String> {
+        let table = self
+            .headroom
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut roomy: Vec<&String> = table
+            .iter()
+            .filter(|(other, (below_wall, at))| {
+                other.as_str() != account_id
+                    && *below_wall
+                    && now.saturating_duration_since(*at) <= SIBLING_HEADROOM_HORIZON
+            })
+            .map(|(other, _)| other)
+            .collect();
+        // Sorted only so the log names the same sibling every time.
+        roomy.sort();
+        roomy.first().map(|other| (*other).clone())
     }
 
     pub fn from_env() -> Result<Self, JournalError> {
@@ -1187,6 +1258,7 @@ impl ResetCoordinator {
         }
 
         let coordinator_started = Instant::now();
+        let sibling = self.sibling_with_headroom(account_id, coordinator_started);
         let account = self.account_mutation(account_id);
         let (request_id, trigger, no_post_result) = {
             let mut account_state = account
@@ -1227,6 +1299,7 @@ impl ResetCoordinator {
                     pending: true,
                     spend_bound_allows: false,
                     before_post_cutoff: input.elapsed_since_attempt_start < PRE_POST_CUTOFF,
+                    sibling_has_headroom: sibling.is_some(),
                 });
                 return ResetTickResult {
                     armed: true,
@@ -1270,7 +1343,19 @@ impl ResetCoordinator {
                 pending: journal_state.pending_id.is_some(),
                 spend_bound_allows: journal_state.spend_bound_allows,
                 before_post_cutoff,
+                sibling_has_headroom: sibling.is_some(),
             });
+            // Announce on the transition, not every tick: a walled account stays
+            // walled for days, and a line a minute would bury the one that matters.
+            let withheld = input.facts.at_wall && !trigger.expiry_trigger && sibling.is_some();
+            if withheld && !account_state.withheld_for_sibling {
+                eprintln!(
+                    "{LOG_TAG} codex reset withheld for account_id={account_id}: at its wall, \
+                     but account_id={} has room, so the banked reset is kept",
+                    sibling.as_deref().unwrap_or_default()
+                );
+            }
+            account_state.withheld_for_sibling = withheld;
             // A pending id represents an already-triggered logical redemption. Retry
             // that same id even if the current usage no longer triggers, so a crash
             // after a landed POST can promptly resolve as `already_redeemed` instead
