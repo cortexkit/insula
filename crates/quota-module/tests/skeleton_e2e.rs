@@ -241,7 +241,7 @@ impl StubCredential {
         let mut row = serde_json::json!({
             "id": self.id,
             "categories": ["llm-provider"],
-            "kind": self.kind,
+            "type": self.kind,
             "serves": [self.serves],
             "state": "active",
             "record_version": self.record_version,

@@ -1251,6 +1251,20 @@ struct ScopedCredential {
     id: String,
     #[serde(default)]
     categories: Vec<String>,
+    /// THE WIRE KEY IS `type`, AND SPELLING IT `kind` COST A PRODUCTION OUTAGE.
+    ///
+    /// The vault serialises this field `#[serde(rename = "type")]` and has since
+    /// the scoped listing was introduced (claustrum 9716081). A rewrite of this
+    /// struct renamed it `kind`; the fixture it was tested against spelled `kind`
+    /// too, and the e2e stub copied the fixture -- so every test agreed with every
+    /// other test and none agreed with the producer. Every real reply then failed
+    /// with `missing field kind`, a cold process had no snapshot to fall back on,
+    /// and every vault-backed lane went dark or collapsed onto its local lane.
+    ///
+    /// Deliberately NO `alias = "kind"`. The producer has never sent `kind`, so an
+    /// alias would accept a shape that does not exist and hide the next drift
+    /// rather than surface it.
+    #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
     serves: Vec<String>,
