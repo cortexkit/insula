@@ -397,7 +397,22 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         "grok" => Some("xai"),
         "copilot" => Some("github-copilot"),
         "deepseek" => Some("deepseek"),
-        "kimi-for-coding" => Some("kimi-for-coding"),
+        // models.dev RETIRED `kimi-for-coding` and split the plan into
+        // `kimi-code-plan-global` (api.kimi.ai) and `kimi-code-plan-cn`
+        // (api.kimi.com). This lane READS kimi.com -- the only host whose usage
+        // endpoint answers this key (kimi.ai's returns 403) -- yet publishes the
+        // GLOBAL slug, and that is deliberate, not a host mismatch:
+        //
+        //   - the operator's account is the kimi.ai plan, and OpenCode routes it
+        //     as `kimi-code-plan-global` against api.kimi.ai;
+        //   - measured 2026-09-22: 20 requests sent ONLY to api.kimi.ai moved the
+        //     5h counter read here from 0% to 1%, with nothing else drawing on
+        //     the account. One pool, reached through two hosts.
+        //
+        // So consumers joining on this slug bind the window to the route that
+        // actually spends it. Should the plans ever separate, the evidence above
+        // is what to re-run: a burst through one host, a read through the other.
+        "kimi-for-coding" => Some("kimi-code-plan-global"),
         "kilo" => Some("kilo"),
         "minimax" => Some("minimax"),
         "stepfun" => Some("stepfun"),

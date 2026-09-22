@@ -243,6 +243,11 @@ indistinguishable from a real pass, and that failure is silent.
 python3 scripts/endpoint-hosts.py
 `scripts/parity-citations.py` — reports provider source citations whose upstream CodexBar file no longer exists at the anchored parity tag. A parity-round instrument, not a gate: the ports stay correct, but their provenance stops being followable.
 
+# every `apiProvider` slug we publish, checked against models.dev. Consumers
+# join usage to pricing and routing on it, and models.dev renames providers; a
+# retired slug joins to nothing and fails silently. Needs the network:
+python3 scripts/models-dev-slugs.py
+
 # providers reporting an absent credential while a key they could read sits in
 # the shared opencode auth store. That combination reads to an operator as
 # "never configured", so nobody investigates it:
