@@ -3621,9 +3621,87 @@ mod drop_counter_tests {
         assert_eq!(state.stale_generation_drops(), 0);
     }
 
-    /// This fixture reproduces the success response published by the deployed vault.
-    /// It is not generated from this crate's decode structs, so it verifies the wire
-    /// format the vault actually sends.
+    /// The producer's own serialised reply decodes through the REAL decoder.
+    ///
+    /// `credential_list_scoped_golden.json` is a byte copy of the reply the vault's
+    /// own test serialises from its real `ListScopedResult` -- provenance in the
+    /// sibling `.PROVENANCE` file. It is the only fixture here the producer
+    /// stands behind; everything else is a hand copy.
+    ///
+    /// Decoding it, rather than asserting on its keys, is the point. The vault
+    /// owner reproduced this crate's `type`/`kind` outage on their own side: a
+    /// test checking what the fixture HOLDS stayed green on a decoder reading the
+    /// wrong key, and only driving the decoder caught it.
+    #[test]
+    fn the_producers_own_golden_reply_decodes() {
+        let decoded = decode_list_scoped_response(include_bytes!(
+            "../tests/fixtures/credential_list_scoped_golden.json"
+        ))
+        .expect("the producer's golden reply must decode through the real decoder");
+        assert_eq!(decoded.grants, 1);
+        assert_eq!(decoded.grant_tuples.len(), 1);
+        assert_eq!(decoded.credentials.len(), 1);
+        let row = &decoded.credentials[0];
+        assert_eq!(row.id, "oauth:anthropic");
+        assert_eq!(row.kind, "subscription", "read from the wire key `type`");
+        assert_eq!(row.record_version, 232);
+        assert_eq!(row.state, "active");
+        assert_eq!(
+            decoded.view, "p1YDHZzIi08ZabkLlYc2A2iixn6cgEyuYWN6oDsaRLE=",
+            "the view is the producer's digest, carried verbatim"
+        );
+    }
+
+    /// Every key the hand-written fixture puts on a row exists in the producer's.
+    ///
+    /// THE TEST THAT WOULD HAVE CAUGHT THE OUTAGE. The hand fixture spelled `kind`
+    /// where the producer sends `type`, the e2e stub copied the hand fixture, and
+    /// every test agreed with every other test while none agreed with the vault.
+    /// A hand fixture is still worth keeping -- it carries an api-key row with no
+    /// identity, which the golden does not -- but it may only use keys the
+    /// producer actually emits.
+    ///
+    /// Subset, not equality: the producer omits optional identity fields when they
+    /// are absent (`skip_serializing_if`), so a hand row may legitimately carry
+    /// fewer keys. It may never carry one the producer lacks.
+    #[test]
+    fn the_hand_fixture_uses_only_keys_the_producer_emits() {
+        fn row_keys(body: &[u8]) -> std::collections::BTreeSet<String> {
+            let value: Value = serde_json::from_slice(body).unwrap();
+            value["result"]["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_object().unwrap().keys().cloned())
+                .collect()
+        }
+        let mut producer = row_keys(include_bytes!(
+            "../tests/fixtures/credential_list_scoped_golden.json"
+        ));
+        // The golden is ONE example row, and the producer omits optional identity
+        // fields when they are absent, so an optional key the example happens not
+        // to carry is invisible to this subset check. `org_name` is exactly that:
+        // `#[serde(skip_serializing_if = "Option::is_none")] pub org_name` on
+        // `ListScopedCredential`, read at the producer's source 2026-09-22. Named
+        // here only until the golden row carries every optional field, at which
+        // point this line should go and the check needs no list at all.
+        producer.insert("org_name".to_string());
+        let hand = row_keys(include_bytes!(
+            "../tests/fixtures/credential_list_scoped_success.json"
+        ));
+        let invented: Vec<_> = hand.difference(&producer).collect();
+        assert!(
+            invented.is_empty(),
+            "the hand fixture uses keys the producer never sends: {invented:?}"
+        );
+    }
+
+    /// A HAND-WRITTEN fixture, kept because it carries an api-key row with no
+    /// identity, which the producer's golden does not. It used to claim it
+    /// reproduced the vault's published reply; it did not -- it spelled the type
+    /// field `kind` and its `view` is an invented `sha256:` string, where the
+    /// producer emits base64. Its keys are now checked against the golden by
+    /// `the_hand_fixture_uses_only_keys_the_producer_emits`.
     #[test]
     fn a_scoped_listing_decodes_the_shape_the_vault_publishes() {
         let decoded = decode_list_scoped_response(include_bytes!(
