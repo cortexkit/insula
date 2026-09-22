@@ -51,6 +51,10 @@ DAEMON_CLI_CANDIDATES = (
 # check is why the exemption is safe to keep -- an exemption nobody re-reads is
 # how a stale one survives, which this repo learned from a DUAL_LANE entry that
 # outlived its reason by hours.
+# A TWIN OF `ENUMERATED_UNSUPPORTED` in crates/quota-module/examples/vault-lanes.rs.
+# The two drifted within a day of the scoped-grant cutover (four ids here, one
+# there), so the Rust checker reported three findings on a healthy host. Keep the
+# ids and reasons identical in both.
 DELIBERATELY_UNCLAIMED = {
     "apikey:openai": "a platform API key is a different plane from a ChatGPT "
     "subscription; codex reads the subscription OAuth credential and must never "

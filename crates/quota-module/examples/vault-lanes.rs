@@ -48,10 +48,32 @@ const DUAL_LANE: &[(&str, &str)] = &[(
 ///
 /// Exact ids only. A prefix exemption would hide a new routing-table defect for
 /// another credential in the same vendor family.
-const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[(
-    "apikey:openai",
-    "a platform API key cannot feed the ChatGPT-subscription Codex lane",
-)];
+///
+/// A TWIN OF `DELIBERATELY_UNCLAIMED` IN `scripts/vault-id-families.py`, and the
+/// two drifted within a day of the cutover: that one listed four ids with reasons,
+/// this one listed one, so on a healthy host this checker reported three findings
+/// for credentials the other already explained. A checker that is never zero when
+/// nothing is wrong is ignored within a week. Keep the ids and reasons identical;
+/// adding an id to one without the other is the defect this note exists for.
+const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "apikey:openai",
+        "a platform API key is a different plane from a ChatGPT subscription; codex \
+         reads the subscription OAuth credential and must never be handed this",
+    ),
+    (
+        "apikey:openai:astro",
+        "another seat's platform key, same reason",
+    ),
+    (
+        "apikey:cerebras",
+        "declined: the endpoint is Cloudflare-blocked and exposes no usage API",
+    ),
+    (
+        "apikey:fireworks-ai",
+        "declined: no structured usage endpoint",
+    ),
+];
 
 fn connection_file_path() -> PathBuf {
     if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
