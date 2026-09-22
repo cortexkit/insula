@@ -4820,6 +4820,7 @@ struct MockResetTransport {
     journal_path: Option<std::path::PathBuf>,
     credits_error: bool,
     no_credits: bool,
+    account_credits: HashMap<String, CreditsHttpResponse>,
     started: Semaphore,
     release: Semaphore,
 }
@@ -4835,6 +4836,7 @@ impl MockResetTransport {
             journal_path: None,
             credits_error: false,
             no_credits: false,
+            account_credits: HashMap::new(),
             started: Semaphore::new(0),
             release: Semaphore::new(0),
         }
@@ -4859,6 +4861,17 @@ impl MockResetTransport {
         self
     }
 
+    fn with_account_credits(mut self, account_id: &str, body: Vec<u8>) -> Self {
+        self.account_credits.insert(
+            account_id.to_string(),
+            CreditsHttpResponse {
+                body,
+                date_header: None,
+            },
+        );
+        self
+    }
+
     fn body(outcome: ConsumeOutcome) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "code": outcome.as_code(),
@@ -4872,9 +4885,15 @@ impl MockResetTransport {
 impl ResetTransport for MockResetTransport {
     async fn fetch_credits(
         &self,
-        _request: &ResetRequest,
+        request: &ResetRequest,
     ) -> Result<CreditsHttpResponse, FetchError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        if let Some(response) = self.account_credits.get(&request.account_id) {
+            return Ok(CreditsHttpResponse {
+                body: response.body.clone(),
+                date_header: response.date_header.clone(),
+            });
+        }
         if self.credits_error {
             return Err(FetchError::Upstream("mock credits failure".into()));
         }
@@ -5083,6 +5102,8 @@ fn reset_request_debug_redacts_bearer_and_capability() {
 
 struct SameAccountVaultSource {
     gets: AtomicUsize,
+    account_id: &'static str,
+    token: &'static [u8],
 }
 
 impl SameAccountVaultSource {
@@ -5090,10 +5111,10 @@ impl SameAccountVaultSource {
         assert_eq!(min_ttl_ms, 120_000);
         self.gets.fetch_add(1, Ordering::SeqCst);
         Ok(VaultCredential {
-            payload: b"real-provider-vault-token".to_vec(),
+            payload: self.token.to_vec(),
             expires_at_ms: None,
             record_version: 8,
-            account_id: Some("real-provider-account".to_string()),
+            account_id: Some(self.account_id.to_string()),
             email: None,
             org_name: None,
             project_id: None,
@@ -5313,6 +5334,8 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
 
     let source = Arc::new(SameAccountVaultSource {
         gets: AtomicUsize::new(0),
+        account_id: "real-provider-account",
+        token: b"real-provider-vault-token",
     });
     let credential_source: Arc<dyn CredentialSource> = source.clone();
     let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
@@ -5344,6 +5367,139 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
     let usage = registry.get_usage(Some("codex")).await;
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].account.as_deref(), Some("real-provider-account"));
+}
+
+#[tokio::test]
+async fn real_codex_zero_credit_sibling_headroom_prevents_exhaustion_consume() {
+    for roomy_walled in [false, true] {
+        let temp = ResetTempDir::new("real-provider-sibling-headroom");
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let mut walled_reads = 0;
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 16 * 1024];
+                let size = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                let is_walled = request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: walled"));
+                let is_roomy = request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: roomy"));
+                assert!(is_walled || is_roomy, "unexpected usage request: {request}");
+                assert!(request.lines().any(|line| {
+                    line.eq_ignore_ascii_case(if is_walled {
+                        "authorization: Bearer walled-token"
+                    } else {
+                        "authorization: Bearer roomy-token"
+                    })
+                }));
+                if is_walled {
+                    walled_reads += 1;
+                }
+                // The first refresh records the sibling while the credit-holding
+                // account is below its rate limit. On the second refresh that
+                // account reaches its limit, and the coordinator already knows
+                // the sibling's status regardless of request completion order.
+                let at_wall = if is_walled {
+                    walled_reads == 2
+                } else {
+                    roomy_walled
+                };
+                let body = serde_json::json!({
+                    "rate_limit": {
+                        "limit_reached": at_wall,
+                        "primary_window": {
+                            "used_percent": if at_wall { 100.0 } else { 44.0 },
+                            "reset_at": 1_900_000_000_i64,
+                            "limit_window_seconds": 604_800
+                        }
+                    }
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let codex_home = temp.dir.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_owner_only_test_file(
+            &codex_home.join("auth.json"),
+            br#"{"tokens":{"access_token":"walled-token","account_id":"walled"}}"#,
+        );
+        write_owner_only_test_file(
+            &codex_home.join("config.toml"),
+            format!(
+                "chatgpt_base_url = {:?}\n",
+                format!("http://{address}/backend-api")
+            )
+            .as_bytes(),
+        );
+        let handle_loader = VaultHandleLoader::default();
+        handle_loader.install_rows_for_test(&[("chatgpt:openai", "oauth")]);
+        let source = Arc::new(SameAccountVaultSource {
+            gets: AtomicUsize::new(0),
+            account_id: "roomy",
+            token: b"roomy-token",
+        });
+        let expiry = (Utc::now() + chrono::Duration::days(20)).to_rfc3339();
+        let walled_credits = serde_json::json!({
+            "credits": [{"id": "credit-1", "status": "available", "expires_at": expiry}],
+            "available_count": 1
+        });
+        let transport = Arc::new(
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+                .with_account_credits("walled", walled_credits.to_string().into_bytes())
+                .with_account_credits(
+                    "roomy",
+                    br#"{"credits": [], "available_count": 0}"#.to_vec(),
+                ),
+        );
+        let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+        let provider = crate::codex::CodexProvider::new_for_test(
+            crate::config::CodexConfig {
+                auto_use_resets: 172_800,
+            },
+            Some(source.clone()),
+            reset_transport,
+            Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+            handle_loader,
+            codex_home,
+        );
+        let registry = Registry::new(vec![Box::new(provider)]);
+
+        tick(&registry).await;
+        assert_eq!(registry.get_usage(Some("codex")).await.len(), 2);
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+        force_due(&registry, "codex");
+        tick(&registry).await;
+        http_server.await.unwrap();
+        assert_eq!(source.gets.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.gets.load(Ordering::SeqCst), 4);
+        assert_eq!(registry.get_usage(Some("codex")).await.len(), 2);
+        let expected_posts = usize::from(roomy_walled);
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            expected_posts,
+            "a zero-credit sibling with room must prevent only the exhaustion consume (roomy_walled={roomy_walled})"
+        );
+        assert_eq!(
+            *transport.consume_accounts.lock().unwrap(),
+            if roomy_walled {
+                vec!["walled".to_string()]
+            } else {
+                vec![]
+            }
+        );
+    }
 }
 
 struct TwoUnitResetProvider {
