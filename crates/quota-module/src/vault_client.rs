@@ -3640,14 +3640,35 @@ mod drop_counter_tests {
         .expect("the producer's golden reply must decode through the real decoder");
         assert_eq!(decoded.grants, 1);
         assert_eq!(decoded.grant_tuples.len(), 1);
-        assert_eq!(decoded.credentials.len(), 1);
-        let row = &decoded.credentials[0];
-        assert_eq!(row.id, "oauth:anthropic");
-        assert_eq!(row.kind, "subscription", "read from the wire key `type`");
-        assert_eq!(row.record_version, 232);
-        assert_eq!(row.state, "active");
+        assert_eq!(decoded.credentials.len(), 2);
+        let row = |id: &str| {
+            decoded
+                .credentials
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("golden carries {id}"))
+        };
+
+        // `oauth` and `apikey` are what the producer's catalog function returns
+        // for these ids. An earlier golden carried a hand-typed `subscription`,
+        // which this vault never emits -- and this very assertion then "proved"
+        // the decoder read the producer's key by matching a value the producer
+        // cannot send. The values below come out of the producer's own code.
+        let full = row("oauth:anthropic");
+        assert_eq!(full.kind, "oauth", "read from the wire key `type`");
+        assert_eq!(full.record_version, 232);
+        assert_eq!(full.state, "active");
+        assert_eq!(full.org_name.as_deref(), Some("Example Org"));
+        assert!(full.account_id.is_some() && full.email.is_some());
+
+        // The row carrying NO optional field: absent identity must stay absent
+        // rather than decode as an empty string.
+        let bare = row("apikey:openrouter");
+        assert_eq!(bare.kind, "apikey");
+        assert!(bare.account_id.is_none() && bare.email.is_none() && bare.org_name.is_none());
+
         assert_eq!(
-            decoded.view, "p1YDHZzIi08ZabkLlYc2A2iixn6cgEyuYWN6oDsaRLE=",
+            decoded.view, "kBe+kDjFKPmOVpGi2AhGIa3hjAK9ZiatFUhHwfCNcxw=",
             "the view is the producer's digest, carried verbatim"
         );
     }
@@ -3657,9 +3678,8 @@ mod drop_counter_tests {
     /// THE TEST THAT WOULD HAVE CAUGHT THE OUTAGE. The hand fixture spelled `kind`
     /// where the producer sends `type`, the e2e stub copied the hand fixture, and
     /// every test agreed with every other test while none agreed with the vault.
-    /// A hand fixture is still worth keeping -- it carries an api-key row with no
-    /// identity, which the golden does not -- but it may only use keys the
-    /// producer actually emits.
+    /// Any hand-written reply kept in this crate may only use keys the producer
+    /// actually emits.
     ///
     /// Subset, not equality: the producer omits optional identity fields when they
     /// are absent (`skip_serializing_if`), so a hand row may legitimately carry
@@ -3675,17 +3695,13 @@ mod drop_counter_tests {
                 .flat_map(|row| row.as_object().unwrap().keys().cloned())
                 .collect()
         }
-        let mut producer = row_keys(include_bytes!(
+        // No hand-named keys: the golden carries one row with every optional field
+        // present and one with none, and the producer builds both from exhaustive
+        // struct literals -- so a field added on their side is a compile error
+        // there until the golden states it, and reaches this check untouched.
+        let producer = row_keys(include_bytes!(
             "../tests/fixtures/credential_list_scoped_golden.json"
         ));
-        // The golden is ONE example row, and the producer omits optional identity
-        // fields when they are absent, so an optional key the example happens not
-        // to carry is invisible to this subset check. `org_name` is exactly that:
-        // `#[serde(skip_serializing_if = "Option::is_none")] pub org_name` on
-        // `ListScopedCredential`, read at the producer's source 2026-09-22. Named
-        // here only until the golden row carries every optional field, at which
-        // point this line should go and the check needs no list at all.
-        producer.insert("org_name".to_string());
         let hand = row_keys(include_bytes!(
             "../tests/fixtures/credential_list_scoped_success.json"
         ));
@@ -3696,8 +3712,9 @@ mod drop_counter_tests {
         );
     }
 
-    /// A HAND-WRITTEN fixture, kept because it carries an api-key row with no
-    /// identity, which the producer's golden does not. It used to claim it
+    /// A HAND-WRITTEN fixture. The producer's golden now covers everything it was
+    /// kept for, so it survives only as a second sample, fenced by
+    /// `the_hand_fixture_uses_only_keys_the_producer_emits`. It used to claim it
     /// reproduced the vault's published reply; it did not -- it spelled the type
     /// field `kind` and its `view` is an invented `sha256:` string, where the
     /// producer emits base64. Its keys are now checked against the golden by
