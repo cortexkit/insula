@@ -142,13 +142,46 @@ pub fn request_cookie_header(jar: &CookieJar) -> Option<String> {
     }
 }
 
+/// The phrases [`looks_signed_out`] treats as a sign-in page, in match order.
+const SIGNED_OUT_MARKERS: &[&str] = &[
+    "login",
+    "sign in",
+    "auth/authorize",
+    "not associated with an account",
+    "actor of type \"public\"",
+];
+
 pub fn looks_signed_out(text: &str) -> bool {
+    signed_out_marker(text).is_some()
+}
+
+/// Which marker made [`looks_signed_out`] say yes, and where.
+///
+/// For diagnostics: the verdict is a substring match on the response body, so
+/// "signed out" can mean a real sign-in page or any body that happens to mention
+/// one of these words. Seeing the matched word in its context is what tells them
+/// apart, and a probe must ask this function rather than re-list the markers, or
+/// it would answer for its own copy instead of the provider's.
+pub fn signed_out_marker(text: &str) -> Option<(&'static str, usize)> {
     let lower = text.to_ascii_lowercase();
-    lower.contains("login")
-        || lower.contains("sign in")
-        || lower.contains("auth/authorize")
-        || lower.contains("not associated with an account")
-        || lower.contains("actor of type \"public\"")
+    SIGNED_OUT_MARKERS
+        .iter()
+        .find_map(|marker| lower.find(marker).map(|at| (*marker, at)))
+}
+
+/// The raw answer to the workspaces call, for a probe that needs to see the
+/// status, the URL that finally answered and the body, rather than the verdict
+/// the provider draws from them.
+pub async fn fetch_workspaces_raw(
+    client: &reqwest::Client,
+    cookie: &str,
+) -> Result<crate::http::HttpResponse, FetchError> {
+    apply_headers(
+        JsonRequest::get(server_get_url(WORKSPACES_SERVER_ID, None)).timeout(REQUEST_TIMEOUT),
+        common_server_headers(cookie, WORKSPACES_SERVER_ID, ORIGIN),
+    )
+    .send_raw(client)
+    .await
 }
 
 fn server_instance_header() -> String {

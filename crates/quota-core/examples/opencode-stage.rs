@@ -18,6 +18,40 @@
 use quota_core::browser_cookies;
 use quota_core::opencode;
 
+/// What the workspaces call actually answered, when the provider called it
+/// "signed out".
+///
+/// That verdict is a substring match on the body, so it cannot tell a real
+/// sign-in page from a body that merely mentions a login. The status, the URL
+/// that finally answered and the matched word in context are what separate them.
+/// Prints no cookie; the body context is a short window around the match.
+async fn explain_workspaces_answer(client: &reqwest::Client, cookie: &str) {
+    println!("\n  what the workspaces call answered:");
+    let response = match opencode::fetch_workspaces_raw(client, cookie).await {
+        Ok(response) => response,
+        Err(error) => {
+            println!("    request failed: {error}");
+            return;
+        }
+    };
+    let body = String::from_utf8_lossy(&response.body);
+    println!("    status     {}", response.status);
+    println!("    final url  {}", response.final_url);
+    println!("    body       {} bytes", body.len());
+    match opencode::signed_out_marker(&body) {
+        Some((marker, at)) => {
+            let start = body.floor_char_boundary(at.saturating_sub(60));
+            let end = body.ceil_char_boundary((at + marker.len() + 60).min(body.len()));
+            println!("    matched    {marker:?}");
+            println!(
+                "    context    ...{}...",
+                body[start..end].replace('\n', " ")
+            );
+        }
+        None => println!("    matched    nothing (the verdict came from somewhere else)"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let client = reqwest::Client::builder()
@@ -49,6 +83,7 @@ async fn main() {
             println!("FAILED: {error}");
             println!("\n  The failure is in the workspaces call, before any subscription");
             println!("  request is made. The pay-as-you-go reading does not apply.");
+            explain_workspaces_answer(&client, &cookie).await;
             std::process::exit(1);
         }
     };
