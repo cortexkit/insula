@@ -206,6 +206,15 @@ pub struct HealthSnapshot {
     pub vault_mapping_warning: Option<String>,
     /// Credential ids in the currently installed scoped snapshot.
     pub scoped_credential_ids: Vec<String>,
+    /// Whether the vault handle mapping is a verdict yet: `NoVault` (no vault
+    /// serves this module here; local lanes serve), `Awaiting` (a vault is wired
+    /// and has not answered an enumeration, so every vault-aware provider is
+    /// held back as unfinished and appears in `without_handles`), or `Answered`.
+    ///
+    /// `None` only for a registry built without a loader. A host stuck in
+    /// `Awaiting` is otherwise indistinguishable from one whose providers
+    /// simply hold no credentials, so this is the field that names it.
+    pub vault_handle_state: Option<crate::vault_handles::VaultHandleState>,
     /// Age of the refresher's last heartbeat; `None` if it has never ticked.
     pub last_tick_age: Option<Duration>,
     /// The refresher loop is wedged/dead: its heartbeat is older than the stall
@@ -258,6 +267,7 @@ impl HealthSnapshot {
             retained_vault_snapshot_age: None,
             vault_mapping_warning: None,
             scoped_credential_ids: Vec::new(),
+            vault_handle_state: None,
             last_tick_age: None,
             refresher_stalled: false,
             last_fetch_success_age: None,

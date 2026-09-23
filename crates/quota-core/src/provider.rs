@@ -310,6 +310,14 @@ impl FetchAttempt {
             VaultGetError::FailClosed => {
                 FetchError::Decode("credential vault rejected the request".to_string())
             }
+            // The credential module is not registered on the daemon. For a
+            // per-credential fetch that is retried like an outage: a vault that
+            // disappears mid-life (restarted, briefly removed from the config)
+            // must leave the lane stale-serving its last window and asking
+            // again, not degrade a credential nothing is wrong with.
+            VaultGetError::Unavailable => FetchError::Upstream(
+                "credential vault is not registered on this daemon".to_string(),
+            ),
         };
         Self {
             observed: None,
@@ -1004,6 +1012,7 @@ mod tests {
             VaultGetError::EmptyPayload,
             VaultGetError::Corrupt,
             VaultGetError::FailClosed,
+            VaultGetError::Unavailable,
         ];
 
         // Fails to compile when a variant is added, so this cannot fall behind
@@ -1016,7 +1025,8 @@ mod tests {
                 | VaultGetError::NotFound
                 | VaultGetError::EmptyPayload
                 | VaultGetError::Corrupt
-                | VaultGetError::FailClosed => {}
+                | VaultGetError::FailClosed
+                | VaultGetError::Unavailable => {}
             }
         }
 
@@ -1041,6 +1051,16 @@ mod tests {
         assert_eq!(
             crate::refresh::classify(
                 &FetchAttempt::unverified_vault_failure(VaultGetError::Transient)
+                    .usage
+                    .unwrap_err()
+            ),
+            crate::refresh::FetchClass::Transient,
+        );
+        // A vault that stops being registered mid-life is an outage for a
+        // per-credential fetch, so the lane keeps its last window and retries.
+        assert_eq!(
+            crate::refresh::classify(
+                &FetchAttempt::unverified_vault_failure(VaultGetError::Unavailable)
                     .usage
                     .unwrap_err()
             ),

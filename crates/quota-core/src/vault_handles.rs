@@ -76,8 +76,43 @@ impl ProviderHandleSnapshot {
     }
 }
 
+/// Whether the loader's handle mapping can be read as a verdict about this host.
+///
+/// Two states are not enough. An empty mapping on a process that has never heard
+/// from its vault means "could not look", and reading it as "no vault
+/// credentials here" makes every vault-aware provider fall back to its local
+/// lane -- which collapsed five labelled accounts into one unlabelled row on a
+/// cold start where the vault answered `module_warming` first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VaultHandleState {
+    /// This host has no vault for this module. The mapping is empty and
+    /// providers use their local lanes. The default, because every build and
+    /// test without a credential source constructs a loader and never installs
+    /// anything into it.
+    #[default]
+    NoVault,
+    /// A vault is wired but has not answered an enumeration yet. Provider
+    /// handle reads fail, so the scheduler treats every vault-aware provider as
+    /// unfinished rather than as holding no credentials.
+    Awaiting,
+    /// At least one authoritative snapshot has been installed.
+    Answered,
+}
+
+impl VaultHandleState {
+    /// Wire spelling for the health surface.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoVault => "no_vault",
+            Self::Awaiting => "awaiting",
+            Self::Answered => "answered",
+        }
+    }
+}
+
 #[derive(Default)]
 struct LoaderState {
+    phase: VaultHandleState,
     snapshot: Option<ScopedSnapshot>,
     mapped: ProviderHandleSnapshot,
     installed_at: Option<Instant>,
@@ -118,6 +153,30 @@ impl VaultHandleLoader {
         Self::default()
     }
 
+    /// Declare that a real credential source is wired to this loader, so an
+    /// empty mapping must not be read as "no vault credentials" until the vault
+    /// has answered once.
+    ///
+    /// Has no effect once a snapshot has been installed: a warm loader already
+    /// holds an answer, and going back to waiting would blank it.
+    pub fn await_first_answer(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.phase != VaultHandleState::Answered {
+            state.phase = VaultHandleState::Awaiting;
+        }
+    }
+
+    /// Current state of the mapping, for the health surface.
+    pub fn handle_state(&self) -> VaultHandleState {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .phase
+    }
+
     #[cfg(test)]
     pub(crate) fn install_rows_for_test(&self, rows: &[(&str, &str)]) {
         self.install_snapshot(
@@ -149,6 +208,13 @@ impl VaultHandleLoader {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if snapshot.grants == 0 {
             state.enumeration_failure = Some("principal is not granted".to_string());
+            // A vault that answers and grants nothing is a real answer for a
+            // loader that never heard from it: local lanes are correct. Once a
+            // grant has been seen, zero grants is deauthorisation and the
+            // previous snapshot is retained instead.
+            if state.phase == VaultHandleState::Awaiting {
+                state.phase = VaultHandleState::NoVault;
+            }
             return SnapshotInstall {
                 authoritative: false,
                 reactivated_ids: HashSet::new(),
@@ -185,6 +251,7 @@ impl VaultHandleLoader {
         state.mapped = mapped;
         state.installed_at = Some(now);
         state.enumeration_failure = None;
+        state.phase = VaultHandleState::Answered;
         SnapshotInstall {
             authoritative: true,
             reactivated_ids,
@@ -198,6 +265,23 @@ impl VaultHandleLoader {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.enumeration_failure = Some(error.into());
+    }
+
+    /// Record a list failure that says no vault serves this module here.
+    ///
+    /// Moves a loader that has never been answered to `NoVault`, so the local
+    /// lanes serve. A loader that HAS been answered keeps its snapshot exactly
+    /// as [`Self::retain_after_failure`] would: a warm vault going away must not
+    /// blank the lanes it was serving.
+    pub fn mark_unavailable(&self, error: impl Into<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.enumeration_failure = Some(error.into());
+        if state.phase == VaultHandleState::Awaiting {
+            state.phase = VaultHandleState::NoVault;
+        }
     }
 
     pub fn snapshot(&self) -> Option<ScopedSnapshot> {
@@ -336,7 +420,21 @@ impl VaultHandleLoader {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(state.mapped.for_provider(provider).to_vec())
+        match state.phase {
+            // An error, not an empty list: the scheduler keeps a provider whose
+            // enumeration failed as unfinished and publishes nothing new for it,
+            // whereas an empty list would let it fall back to a local lane and
+            // replace every labelled vault account with one unlabelled row.
+            VaultHandleState::Awaiting => Err(HandlesError::new(
+                "credential vault has not answered an enumeration yet",
+            )),
+            // No vault serves this module here, so there are no vault handles
+            // whatever the mapping holds. Only reachable before any
+            // authoritative install, when the mapping is empty anyway; stated
+            // so the state means the same thing however it was reached.
+            VaultHandleState::NoVault => Ok(Vec::new()),
+            VaultHandleState::Answered => Ok(state.mapped.for_provider(provider).to_vec()),
+        }
     }
 }
 
@@ -625,5 +723,103 @@ mod tests {
             loader.enumeration_failure().as_deref(),
             Some("principal is not granted")
         );
+    }
+
+    fn zero_grants(loader: &VaultHandleLoader) -> SnapshotInstall {
+        loader.install_snapshot(
+            ScopedSnapshot {
+                grants: 0,
+                rows: Vec::new(),
+            },
+            Instant::now(),
+        )
+    }
+
+    fn awaiting() -> VaultHandleLoader {
+        let loader = VaultHandleLoader::default();
+        loader.await_first_answer();
+        loader
+    }
+
+    #[test]
+    fn a_loader_nobody_awaits_reads_as_no_vault() {
+        let loader = VaultHandleLoader::default();
+        assert_eq!(loader.handle_state(), VaultHandleState::NoVault);
+        assert_eq!(loader.anthropic_handles().unwrap(), Vec::new());
+        assert_eq!(
+            loader.cookie_handles("cookie:opencode.ai").unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn an_unanswered_vault_is_an_enumeration_error_not_an_empty_inventory() {
+        let loader = awaiting();
+        assert_eq!(loader.handle_state(), VaultHandleState::Awaiting);
+        assert!(loader.anthropic_handles().is_err());
+        assert!(loader.cookie_handles("cookie:opencode.ai").is_err());
+    }
+
+    #[test]
+    fn an_authoritative_install_answers_an_awaiting_loader() {
+        let loader = awaiting();
+        install(&loader, vec![row("oauth:anthropic:first", "oauth")]);
+        assert_eq!(loader.handle_state(), VaultHandleState::Answered);
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn zero_grants_before_any_answer_means_no_vault() {
+        let loader = awaiting();
+        assert!(!zero_grants(&loader).authoritative);
+        assert_eq!(loader.handle_state(), VaultHandleState::NoVault);
+        assert_eq!(loader.anthropic_handles().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn an_unregistered_vault_before_any_answer_means_no_vault() {
+        let loader = awaiting();
+        loader.mark_unavailable("Unavailable");
+        assert_eq!(loader.handle_state(), VaultHandleState::NoVault);
+        assert_eq!(loader.anthropic_handles().unwrap(), Vec::new());
+        assert_eq!(loader.enumeration_failure().as_deref(), Some("Unavailable"));
+    }
+
+    #[test]
+    fn a_transient_failure_keeps_an_unanswered_loader_waiting() {
+        let loader = awaiting();
+        loader.retain_after_failure("Transient");
+        assert_eq!(loader.handle_state(), VaultHandleState::Awaiting);
+        assert!(loader.anthropic_handles().is_err());
+    }
+
+    #[test]
+    fn a_warm_vault_going_away_keeps_its_mapped_handles() {
+        let loader = awaiting();
+        install(&loader, vec![row("oauth:anthropic:first", "oauth")]);
+        loader.mark_unavailable("Unavailable");
+        assert_eq!(loader.handle_state(), VaultHandleState::Answered);
+        assert_eq!(
+            loader.anthropic_handles().unwrap(),
+            vec![CredentialHandle::scoped("oauth:anthropic:first", "oauth")]
+        );
+    }
+
+    #[test]
+    fn zero_grants_after_an_answer_keeps_its_mapped_handles() {
+        let loader = awaiting();
+        install(&loader, vec![row("oauth:anthropic:first", "oauth")]);
+        assert!(!zero_grants(&loader).authoritative);
+        assert_eq!(loader.handle_state(), VaultHandleState::Answered);
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn awaiting_an_answered_loader_does_not_blank_it() {
+        let loader = VaultHandleLoader::default();
+        install(&loader, vec![row("oauth:anthropic:first", "oauth")]);
+        loader.await_first_answer();
+        assert_eq!(loader.handle_state(), VaultHandleState::Answered);
+        assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
     }
 }

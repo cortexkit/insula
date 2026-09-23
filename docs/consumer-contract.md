@@ -364,6 +364,33 @@ mapped cleanly and otherwise carries the warning produced while mapping the
 snapshot. Family refusals can prevent usage rows; exact deliberately unsupported
 ids remain notes for a checker to classify rather than dark lanes.
 
+`vaultHandleState` says whether that inventory is a verdict yet. It is one of:
+
+- `"no_vault"` — no credential vault serves this module on this host: the daemon
+  has no credential module (a fresh install), or the vault answered and granted
+  this module nothing before ever granting it anything. Providers use their
+  local lanes.
+- `"awaiting"` — a vault is wired and has not answered an enumeration yet, for
+  example because it answered `module_warming` on the first turn after a restart.
+  Every vault-aware provider is held back as unfinished: it publishes **no**
+  entries, not even from a local lane, and is listed in `withoutHandles`. This
+  normally lasts one turn.
+- `"answered"` — at least one authoritative inventory has been installed. Later
+  list failures retain it (see `vaultEnumerationFailure`); a vault that
+  disappears afterwards does not blank the lanes it was serving.
+- `null` — this build has no vault loader at all.
+
+Why `awaiting` holds providers back rather than letting the local lane serve:
+a local credential usually resolves no account label, so falling back would
+replace every labelled account with one unlabelled row — and a single usable
+unlabelled row with no labelled siblings is exactly what this contract tells you
+to read as "this provider now resolves no identity". "Could not look" must not
+reach you as "absent". The cost is that a provider with both a vault lane and a
+local lane (`codex`, `antigravity`) serves neither while `awaiting`. A host that
+**stays** `awaiting` has a vault that keeps failing to list; read
+`vaultEnumerationFailure` for the reason. Its bucket counts look exactly like a
+host holding no credentials, so this field is the only place that state is named.
+
 `vaultConnectionsEstablished` counts the vault connections this process has
 opened. `1` means the first one is still in use; every increment is a reconnect
 after a transport failure. There is no idle timeout and no maximum lifetime, and

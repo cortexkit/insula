@@ -56,6 +56,19 @@ enum ClientFailure {
     RouteSetup,
     Transport,
     RouteGone,
+    /// The daemon has no credential module by this id: `unknown_module`, or
+    /// `module_removed` from its configuration.
+    ///
+    /// Split out of `RouteGone` because it is a fact about the HOST, not about a
+    /// route that expired. On a host with no vault configured -- every fresh
+    /// install -- this is the answer to every call, and reading it as transient
+    /// kept enumeration waiting for a vault that will never answer, with every
+    /// local lane dark. `unknown_channel` stays `RouteGone`: that is a channel
+    /// the daemon forgot, and the module behind it may be perfectly present.
+    ///
+    /// Not retried inside `call`: the same daemon asked again a moment later
+    /// gives the same answer, and the refresher asks again next turn anyway.
+    ModuleAbsent,
     Classified(VaultGetError),
     /// A route-layer error frame carrying a code this client has not been taught.
     ///
@@ -82,6 +95,7 @@ impl ClientFailure {
     fn vault_error(self) -> VaultGetError {
         match self {
             Self::Transport | Self::RouteGone => VaultGetError::Transient,
+            Self::ModuleAbsent => VaultGetError::Unavailable,
             Self::Classified(error) => error,
             // TRANSIENT, AND IT SHOULD NEVER REACH HERE. `open_route` consumes
             // this variant by reopening without the claim, so a caller seeing it
@@ -133,7 +147,7 @@ impl ClientFailure {
             // Retrying costs one tick; failing closed costs an outage with a
             // misattributed cause.
             //
-            // The accepted risk is the same one the `unknown_module` arm takes: a
+            // The accepted risk is the same one the `unknown_channel` arm takes: a
             // permanently unrecognised code stale-serves a healthy-looking window
             // indefinitely. That is why this path logs the code -- the wire looks
             // fine, so stderr has to be where it does not.
@@ -825,7 +839,10 @@ impl ClientState {
         let response = self.request(&connection, frame).await?;
         if response.header.ty == FrameType::Error {
             let error = classify_error_frame(&response.body, &self.route_warming_retries);
-            if error == ClientFailure::RouteGone {
+            if matches!(
+                error,
+                ClientFailure::RouteGone | ClientFailure::ModuleAbsent
+            ) {
                 self.invalidate_route(route).await;
             }
             return Err(error);
@@ -1448,12 +1465,23 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
         // refusal forever. `open_route` reopens without it, which de-escalates to
         // the `Direct` principal this client used before claims existed.
         Some("bad_consumer_identity") => ClientFailure::IdentityRefused,
-        Some(code @ ("unknown_channel" | codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
+        Some(code @ "unknown_channel") => {
             eprintln!(
                 "{LOG_TAG} warning: daemon answered {code:?} for module id \
                  {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
             );
             ClientFailure::RouteGone
+        }
+        // No credential module by this id on this daemon. Not retried: it is
+        // what a host without a vault answers every time, and the enumeration
+        // reads it as "no vault here" so the local lanes serve. The warning stays
+        // because the same code is also what a wrong or retired id produces.
+        Some(code @ (codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
+            eprintln!(
+                "{LOG_TAG} warning: daemon answered {code:?} for module id \
+                 {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
+            );
+            ClientFailure::ModuleAbsent
         }
         // The target exists and is not ready yet. `module_warming` is emphatically
         // NOT a failure: the daemon is telling us the module is mid-handshake and
@@ -2953,8 +2981,10 @@ mod tests {
 
     #[test]
     fn i3_module_reloading_is_transient_route_availability() {
+        // `unknown_module` used to be listed here. It now means "no credential
+        // module on this daemon" and maps to `Unavailable`, pinned by
+        // `an_absent_credential_module_is_unavailable_and_an_unknown_channel_is_not`.
         for code in [
-            "unknown_module",
             "target_unavailable",
             "module_reloading",
             "module_timeout",
@@ -3501,6 +3531,90 @@ mod tests {
         .unwrap();
         let error = classify_error_frame(&body, &AtomicU64::new(0));
         assert!(!format!("{error:?}").contains(secret));
+    }
+
+    /// A daemon with no credential module is a host without a vault, not an
+    /// outage.
+    ///
+    /// Every fresh install answers the credential route with `unknown_module`.
+    /// Classified as transient, enumeration would wait forever for a vault that
+    /// does not exist and keep every local lane dark. `unknown_channel` is a
+    /// different claim -- a channel the daemon forgot -- and must stay a
+    /// retryable route condition.
+    #[test]
+    fn an_absent_credential_module_is_unavailable_and_an_unknown_channel_is_not() {
+        use subc_protocol::error_codes as codes;
+        for code in [codes::UNKNOWN_MODULE, codes::MODULE_REMOVED] {
+            assert_eq!(
+                classify(code),
+                ClientFailure::ModuleAbsent,
+                "{code} must name an absent module"
+            );
+            assert_eq!(
+                classify(code).vault_error(),
+                VaultGetError::Unavailable,
+                "{code} must reach enumeration as `Unavailable`"
+            );
+        }
+        assert_eq!(
+            classify("unknown_channel").vault_error(),
+            VaultGetError::Transient,
+            "a forgotten channel says nothing about whether the module exists"
+        );
+    }
+
+    /// An absent credential module is asked about exactly once per call.
+    ///
+    /// The stub answers the first `route.open` with `unknown_module` and then
+    /// counts every further frame for a while. A retry inside `call` would
+    /// open the route a second time; the refresher already asks again next
+    /// turn, so retrying here only doubles the traffic to a daemon that has
+    /// already given its answer.
+    #[tokio::test]
+    async fn an_absent_credential_module_is_not_retried_inside_one_call() {
+        let (listener, path, key, daemon_id) = loopback_listener("module-absent").await;
+        let frames_after_refusal = Arc::new(AtomicU64::new(0));
+        let server_frames = Arc::clone(&frames_after_refusal);
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            let open = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(open.header.channel, 0, "the first frame must be route.open");
+            let refusal = Frame::build(
+                FrameType::Error,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                open.header.corr,
+                serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                    subc_protocol::error_codes::UNKNOWN_MODULE,
+                    "no such module",
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &refusal).await.unwrap();
+            // Any further frame within the window is a retry.
+            while let Ok(Ok(Some(_))) =
+                tokio::time::timeout(Duration::from_millis(300), read_frame(&mut stream)).await
+            {
+                server_frames.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_secs(2));
+
+        let result = CredentialSource::list_scoped(&client).await;
+
+        assert_eq!(result.unwrap_err(), VaultGetError::Unavailable);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("stub server did not finish")
+            .unwrap();
+        assert_eq!(
+            frames_after_refusal.load(Ordering::Relaxed),
+            0,
+            "an absent module was asked again inside the same call"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
