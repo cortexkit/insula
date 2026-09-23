@@ -507,27 +507,44 @@ fn should_try_legacy(console_error: &FetchError, cookie: &str) -> bool {
 
 /// Which lane's error to publish when both failed.
 ///
-/// Ported from CodexBar v0.64.1 `OpenCodeGoLegacyFallback`: the console's own
-/// 401 is its own session's verdict, so the legacy session answers for itself
-/// there. Otherwise a failed legacy read must not turn a console access failure
-/// into invalid auth or absent Go usage -- the console's error stands when the
-/// jar carries the console session cookie.
-///
-/// One case is stronger here than upstream's generic rule: a redirect off the
+/// Ported from CodexBar v0.64.1 `OpenCodeGoLegacyFallback`, with one case
+/// stronger than upstream's generic rule and checked FIRST: a redirect off the
 /// `/go` page is what a MIGRATED workspace looks like from the legacy side, so
-/// when the console did not answer 401 the console's error is the truth about
-/// this fetch whether or not the console cookie is visible in the header.
+/// the console's verdict stands whether or not the console cookie is visible
+/// in the header -- and in BOTH directions. A console 401 there is the one
+/// proof of an expired session, and any other console answer is the truth about
+/// this fetch; the redirect itself says nothing about the session in either
+/// case.
+///
+/// For every other legacy failure the upstream rules apply unchanged: the
+/// console's own 401 is its own session's verdict, so the legacy session
+/// answers for itself; otherwise a failed legacy read must not turn a console
+/// access failure into invalid auth or absent Go usage, and the console's
+/// error stands when the jar carries the console session cookie.
 fn resolve_dual_failure(
     console_error: FetchError,
     legacy_error: FetchError,
     cookie: &str,
 ) -> FetchError {
-    if matches!(console_error, FetchError::Unauthorized(_)) {
-        return legacy_error;
-    }
+    // The redirect verdict is checked FIRST, so it never outranks the console
+    // in either direction. A redirect off the `/go` page is what a MIGRATED
+    // workspace looks like from the legacy side: the page moved, and the
+    // console -- the workspace's real home -- has the say. If the console
+    // answered 401 that is the one proof of an expired session; publishing the
+    // redirect's Decode instead would send a reader hunting a parser bug while
+    // hiding the one fact they need. Any other console answer stands for the
+    // same reason.
     if is_redirect_verdict(&legacy_error) {
         return console_error;
     }
+    // For every OTHER legacy failure, upstream's rule: the console's own 401 is
+    // its own session's verdict, so the legacy session answers for itself.
+    if matches!(console_error, FetchError::Unauthorized(_)) {
+        return legacy_error;
+    }
+    // A failed legacy read cannot turn a console access failure into invalid
+    // auth or absent Go usage: the console's error stands when the jar carries
+    // the console session cookie.
     if has_named_cookie(cookie, CONSOLE_SESSION_COOKIE_NAMES) {
         return console_error;
     }
@@ -1112,6 +1129,45 @@ mod tests {
             error.error_class(),
             "credential_rejected",
             "the redirect must not turn this back into an expired session"
+        );
+    }
+
+    /// A console 401 outranks a legacy redirect.
+    ///
+    /// The common expired-session shape: a signed-out user whose jar still
+    /// carries the old `auth` cookie, on a migrated workspace. The console has
+    /// said authoritatively that the session is expired; the legacy page's
+    /// redirect to the console login says only that the page moved. Publishing
+    /// the redirect's Decode would send a reader hunting a parser bug while
+    /// hiding the one fact they need -- the mirror image of the misreading this
+    /// provider's console lane was added to fix.
+    #[tokio::test]
+    async fn a_console_401_outranks_a_legacy_redirect() {
+        let (error, _) = fetch_error(
+            "auth=legacy; __Host-console_session=expired",
+            |path, _request| {
+                if path == CONSOLE_WORKSPACES_PATH {
+                    return Reply::Body(200, r#"[{"id":"wrk_TEST123"}]"#);
+                }
+                if path == CONSOLE_GO_STATUS_PATH {
+                    return Reply::Body(401, r#"{"message":"Unauthorized"}"#);
+                }
+                if path == format!("/workspace/{WORKSPACE_ID}/go") {
+                    return Reply::Redirect("/console/login");
+                }
+                Reply::Body(200, CONSOLE_SHELL)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(&error, FetchError::Unauthorized(_)),
+            "the console's 401 is the expired-session verdict, got: {error}"
+        );
+        assert_eq!(error.error_class(), "credential_rejected");
+        assert!(
+            error.to_string().contains("console go status"),
+            "the published error is the console's, not the legacy page's: {error}"
         );
     }
 
