@@ -20,6 +20,7 @@ pub mod codebuff;
 pub mod codex;
 pub mod codex_resets;
 pub mod config;
+mod cookie_lifetime;
 mod cookie_vault;
 pub mod copilot;
 pub mod credential_source;
@@ -502,6 +503,9 @@ pub struct Registry {
     /// the wire: same provider, same account, same `source`, a value time that
     /// steps backwards.
     dedup_winner: Mutex<std::collections::HashMap<String, String>>,
+    /// How long each deposited session cookie kept working before its site
+    /// rejected it. See `cookie_lifetime` for why the fetches are the measurement.
+    pub(crate) cookie_lifetimes: Mutex<cookie_lifetime::CookieLifetimes>,
     credential_source: Option<Arc<dyn CredentialSource>>,
     vault_handle_loader: Option<Arc<vault_handles::VaultHandleLoader>>,
 }
@@ -532,8 +536,63 @@ impl Registry {
             store: Mutex::new(SlotStore::new(Instant::now())),
             last_admitted_provider: Mutex::new(None),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
+            cookie_lifetimes: Mutex::new(cookie_lifetime::CookieLifetimes::default()),
             credential_source: None,
             vault_handle_loader: None,
+        }
+    }
+
+    /// Feed one completed fetch into the cookie lifetime record, and announce a
+    /// deposited cookie's first rejection with how long it had worked.
+    ///
+    /// Only vault cookie credentials are recorded: a browser-read cookie is the
+    /// user's live session, which the user's own browsing keeps refreshing, so
+    /// its rejection says nothing about how long a static copy survives.
+    fn note_cookie_lifetime(&self, handle: &CredentialHandle, next: &refresh::ProviderSlot) {
+        let Some(credential_id) = handle
+            .vault_credential_id()
+            .filter(|id| id.starts_with("cookie:"))
+        else {
+            return;
+        };
+        let served = next
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.error.is_none());
+        let rejected = next.error_class == Some("credential_rejected");
+        if !served && !rejected {
+            return;
+        }
+        let record_version = self
+            .vault_handle_loader
+            .as_ref()
+            .and_then(|loader| loader.snapshot())
+            .and_then(|snapshot| {
+                snapshot
+                    .rows
+                    .iter()
+                    .find(|row| row.credential_id == credential_id)
+                    .map(|row| row.record_version)
+            });
+        let Ok(mut lifetimes) = self.cookie_lifetimes.lock() else {
+            return;
+        };
+        if let cookie_lifetime::LifetimeEvent::FirstRejection {
+            record_version,
+            age,
+        } = lifetimes.observe(
+            credential_id,
+            record_version,
+            served,
+            rejected,
+            Instant::now(),
+        ) {
+            eprintln!(
+                "{LOG_TAG} deposited cookie {credential_id} (version {}) first rejected after \
+                 working {} since first served",
+                record_version.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+                cookie_lifetime::render_age(age),
+            );
         }
     }
     /// The default registry: every provider we support.
@@ -1433,6 +1492,7 @@ impl Registry {
             // describes. A slot already stale is a continuation, not a new
             // episode.
             let enters_stale = refresh::enters_stale_transient(&unit.prev, &next);
+            self.note_cookie_lifetime(&unit.key.handle, &next);
             // Whether this attempt saw the account's used percent go DOWN.
             // Decided here for the same reason as the line above: the comparison
             // needs both readings, and this is the only place that holds them.

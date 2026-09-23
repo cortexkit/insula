@@ -9309,6 +9309,133 @@ async fn a_cold_start_whose_first_list_fails_publishes_no_local_fallback() {
     );
 }
 
+/// What a scripted vault provider's upstream answers on the next fetch.
+const SITE_SERVES: u8 = 0;
+const SITE_REJECTS: u8 = 1;
+const SITE_FAILS_TRANSIENTLY: u8 = 2;
+const SITE_SENDS_UNREADABLE: u8 = 3;
+
+/// A vault-lane provider whose upstream serves, rejects the credential the way
+/// an expired login does, or fails transiently, as the test directs.
+struct ScriptedSiteProvider {
+    name: &'static str,
+    family: &'static str,
+    loader: Arc<VaultHandleLoader>,
+    site: Arc<std::sync::atomic::AtomicU8>,
+}
+
+#[async_trait]
+impl UsageProvider for ScriptedSiteProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        // `cookie_handles` routes any family id to its providers; used here for
+        // an api-key family too, which is what the negative control needs.
+        self.loader.cookie_handles(self.family)
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        let error = match self.site.load(Ordering::SeqCst) {
+            SITE_REJECTS => FetchError::Unauthorized("session expired".to_string()),
+            SITE_FAILS_TRANSIENTLY => FetchError::Upstream("HTTP 503".to_string()),
+            SITE_SENDS_UNREADABLE => FetchError::Decode("no usage windows".to_string()),
+            _ => return FetchAttempt::success(None, "vault", Usage::default()),
+        };
+        FetchAttempt::failure(None, Some("vault".to_string()), error)
+    }
+}
+
+/// The scheduler records a vault cookie's first rejection only after the cookie
+/// has served at least once: that age is the site's session lifetime.
+///
+/// Driven through real refresh turns rather than `CookieLifetimes` alone, which
+/// has its own tests. What those cannot see is the wiring in
+/// `Registry::note_cookie_lifetime`: which fetches reach the record, and how a
+/// slot's outcome is read as "served" or "rejected". The only output is a log
+/// line, so broken wiring would print nothing and look like a quiet host.
+///
+/// Three controls:
+/// - an api-key credential rejected in the same turns must not be recorded; a
+///   static key's rejection is a revocation, not a session lifetime;
+/// - a transient failure must not count as a rejection. It keeps serving the
+///   last reading, so the slot still reads as served;
+/// - an unreadable payload must not count as a rejection either. This is the
+///   step that tells "rejected" from "not served": a decode failure takes the
+///   slot out of service although the site said nothing about the session.
+#[tokio::test]
+async fn a_deposited_cookies_first_rejection_after_serving_is_recorded() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+        1,
+        vec![
+            scoped_row("cookie:ollama.com:ufuk", "cookie", 3, "active"),
+            scoped_row("apikey:openrouter", "apikey", 1, "active"),
+        ],
+    ))]));
+    let site = Arc::new(std::sync::atomic::AtomicU8::new(SITE_SERVES));
+    let provider = |name, family| -> Box<dyn UsageProvider> {
+        Box::new(ScriptedSiteProvider {
+            name,
+            family,
+            loader: Arc::clone(&loader),
+            site: Arc::clone(&site),
+        })
+    };
+    let providers = vec![
+        provider("ollama", "cookie:ollama.com"),
+        provider("openrouter", "apikey:openrouter"),
+    ];
+    let registry = scoped_registry(providers, Arc::clone(&loader), source);
+    let reported = |id: &str| {
+        registry
+            .cookie_lifetimes
+            .lock()
+            .unwrap()
+            .rejection_reported(id)
+    };
+    let turn = |state: u8| {
+        site.store(state, Ordering::SeqCst);
+        force_due(&registry, "ollama");
+        force_due(&registry, "openrouter");
+        tick(&registry)
+    };
+
+    tick(&registry).await;
+    assert_eq!(
+        reported("cookie:ollama.com:ufuk"),
+        Some(false),
+        "a served read of a deposited cookie must start its lifetime"
+    );
+
+    turn(SITE_FAILS_TRANSIENTLY).await;
+    assert_eq!(
+        reported("cookie:ollama.com:ufuk"),
+        Some(false),
+        "a transient failure is not the site rejecting the session"
+    );
+
+    turn(SITE_SENDS_UNREADABLE).await;
+    assert_eq!(
+        reported("cookie:ollama.com:ufuk"),
+        Some(false),
+        "a payload we cannot read is not the site rejecting the session"
+    );
+
+    turn(SITE_REJECTS).await;
+    assert_eq!(
+        reported("cookie:ollama.com:ufuk"),
+        Some(true),
+        "the site's first rejection of a served cookie must be recorded"
+    );
+    assert_eq!(
+        reported("apikey:openrouter"),
+        None,
+        "only cookie credentials are session lifetimes; an api key must not be recorded"
+    );
+}
+
 /// A daemon with no credential module is a fresh install: the local lanes
 /// serve on the very first turn instead of waiting for a vault that does not
 /// exist.
