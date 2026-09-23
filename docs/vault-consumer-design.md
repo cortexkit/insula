@@ -315,3 +315,38 @@ labels), others unaffected.
 Live smoke (the end-goal): both real accounts through the real vault ⇒ two
 labeled codex entries, per-account percents, per-account banked-resets log
 lines; then kill -9 ck-credentials and verify fail-closed labels.
+
+## Depositing a session cookie: which URL to capture against
+
+A cookie-backed provider can read its session from the vault instead of the
+user's browser. The deposit is `cookie:<domain>:<account>`. The account suffix
+makes the provider read the vault only and never touch Chrome, and one domain
+takes ONE deposit: cookies carry no identity, so a second deposit for the same
+domain is refused at load time. Re-capturing replaces the same id
+(`ck auth put --replace`) rather than adding a new suffix.
+
+The captured value must be a REQUEST `Cookie:` header (`name=value; ...`) for
+the exact URL insula fetches, so host and path scoping match what that request
+sends. Capture tools take the URL from this table, not from memory.
+`cookie_capture_urls_match_the_providers_fetch_urls` checks each row against
+the provider's own source, so a provider changing its endpoint fails the build
+until this table follows.
+
+| Deposit id | Provider(s) | Fetch URL |
+|---|---|---|
+| `cookie:ollama.com:<account>` | ollama | `https://ollama.com/settings` |
+| `cookie:opencode.ai:<account>` | opencode, opencodego | `https://opencode.ai/console/api/go/status` |
+| `cookie:ampcode.com:<account>` | amp | `https://ampcode.com/settings` |
+| `cookie:qoder.com:<account>` | qoder | `https://qoder.com/api/v2/me/usages/big_model_credits` |
+| `cookie:qwencloud.com:<account>` | qwen-cloud | `https://cs-data.qwencloud.com/data/api.json` |
+| `cookie:xiaomimimo.com:<account>` | mimo | `https://platform.xiaomimimo.com/api/v1/tokenPlan/usage` |
+| `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
+| `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
+
+The login page can be any page on the site where the user signs in; it does not
+have to be the fetch URL, and for factory it is not (sign-in is on
+`app.factory.ai`, the fetch is on `api.factory.ai`).
+
+insula logs each deposit's first rejection after it has served, with its age
+(`deposited cookie ... first rejected after working <h>h<mm>m`). That is the
+site's session lifetime for that capture, and the only measurement of it.

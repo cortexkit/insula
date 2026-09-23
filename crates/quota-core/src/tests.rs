@@ -9436,6 +9436,93 @@ async fn a_deposited_cookies_first_rejection_after_serving_is_recorded() {
     );
 }
 
+/// The cookie-capture table in docs/vault-consumer-design.md names the URL each
+/// provider actually fetches.
+///
+/// A capture tool scopes the cookie it saves to that URL, so a row naming the
+/// wrong host or path produces a deposit the provider's request would not send
+/// -- well-formed, stored, and rejected on first use, with nothing pointing at
+/// the table. The table is also a second copy of facts that live in each
+/// provider's source, so this checks every row against that source, and checks
+/// the table covers every cookie family in both directions.
+#[test]
+fn cookie_capture_urls_match_the_providers_fetch_urls() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/vault-consumer-design.md"),
+    )
+    .expect("docs/vault-consumer-design.md must be readable");
+    let sources: std::collections::HashMap<&str, &str> = [
+        ("amp", include_str!("amp.rs")),
+        ("cursor", include_str!("cursor.rs")),
+        ("factory", include_str!("factory.rs")),
+        ("mimo", include_str!("mimo.rs")),
+        ("ollama", include_str!("ollama.rs")),
+        ("opencode", include_str!("opencode.rs")),
+        ("opencodego", include_str!("opencodego.rs")),
+        ("qoder", include_str!("qoder.rs")),
+        ("qwen-cloud", include_str!("qwen_cloud.rs")),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut documented = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    for line in doc.lines().filter(|line| line.starts_with("| `cookie:")) {
+        let cells: Vec<&str> = line
+            .split('|')
+            .map(|cell| cell.trim().trim_matches('`'))
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let [id, providers, url] = cells[..] else {
+            problems.push(format!("unreadable row: {line}"));
+            continue;
+        };
+        let family = id.trim_end_matches(":<account>");
+        let domain = family.trim_start_matches("cookie:");
+        let Some((host, path)) = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(host, path)| (host, format!("/{path}")))
+        else {
+            problems.push(format!("{family}: fetch URL is not https: {url}"));
+            continue;
+        };
+        if host != domain && !host.ends_with(&format!(".{domain}")) {
+            problems.push(format!("{family}: {host} is not on {domain}"));
+        }
+        let mut combined = String::new();
+        for provider in providers.split(',').map(str::trim) {
+            documented.insert((family.to_string(), provider.to_string()));
+            match sources.get(provider) {
+                Some(source) => combined.push_str(source),
+                None => problems.push(format!("{family}: no source registered for {provider}")),
+            }
+        }
+        for piece in [host, path.as_str()] {
+            if !combined.contains(piece) {
+                problems.push(format!("{family}: `{piece}` appears in no source of {providers}"));
+            }
+        }
+    }
+
+    let families: std::collections::BTreeSet<(String, String)> =
+        crate::vault_handles::CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(prefix, _)| prefix.starts_with("cookie:"))
+            .map(|(prefix, provider)| (prefix.to_string(), provider.to_string()))
+            .collect();
+    assert!(
+        families.len() >= 9,
+        "expected the nine cookie-backed provider routes; found {} -- the filter broke",
+        families.len()
+    );
+    assert!(problems.is_empty(), "cookie capture table is wrong:\n{}", problems.join("\n"));
+    assert_eq!(
+        documented, families,
+        "the capture table and CREDENTIAL_FAMILIES disagree on which provider each cookie domain serves"
+    );
+}
+
 /// A daemon with no credential module is a fresh install: the local lanes
 /// serve on the very first turn instead of waiting for a vault that does not
 /// exist.
