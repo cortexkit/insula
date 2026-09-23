@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.7"
+version = "0.20.8"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1567,6 +1567,7 @@ dependencies = [
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",
+ "subc-uptime",
  "tokio",
  "tracing",
 ]
@@ -1599,6 +1600,14 @@ dependencies = [
  "subc-protocol",
  "subtle",
  "tokio",
+]
+
+[[package]]
+name = "subc-uptime"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
