@@ -7,8 +7,13 @@
 //! shared [`browser_cookies`] layer.
 //!
 //! Flow: pull ollama.com cookies from Chrome (decrypted) → GET
-//! `https://ollama.com/settings` with the `Cookie:` header → parse the "Session
-//! usage" + "Weekly usage" blocks (`N% used` + a `data-time="<ISO>"` reset).
+//! `https://ollama.com/settings` with the `Cookie:` header → parse the "Monthly
+//! usage", "Session usage" and "Weekly usage" blocks (`N% used`, or a
+//! `$X of $Y used` credit pair, + a `data-time="<ISO>"` reset).
+//!
+//! Slots: `primary` is the monthly window when present, else the session window;
+//! `secondary` is the weekly window; `tertiary` is the session window when the
+//! monthly one holds `primary`. See `normalize_usage_at`.
 //!
 //! DESKTOP-COUPLED + BRITTLE (accepted): needs a local Chrome login + OS keychain,
 //! and the session cookie rotates (no headless refresh), so it degrades to
@@ -23,6 +28,9 @@
 //! captured real settings fixture. Decryption recipe + HTML field names ported from
 //! CodexBar `Sources/CodexBarCore/Providers/Ollama/OllamaUsageFetcher.swift` +
 //! `OllamaUsageParser.swift:28-131` (labels, `N% used` / `width:N%`, `data-time`).
+//! The monthly block, its `$X of $Y used` figure and the same-host `/signin`
+//! redirect are ported from the same two files at v0.65.0 and are
+//! fixture-verified, not live-verified (see `MONTHLY_LABEL`).
 
 use std::time::Duration;
 
@@ -87,7 +95,17 @@ fn is_session_cookie(name: &str) -> bool {
 // ---- HTML parsing (pure) ----------------------------------------------------
 
 /// All usage-block labels, used to bound one block's window at the next block.
-const ALL_LABELS: &[&str] = &["Session usage", "Hourly usage", "Weekly usage"];
+///
+/// `Monthly usage` is listed so that a session or weekly block ends where the
+/// monthly one begins; without it a legacy block could read the monthly block's
+/// percent or reset as its own. Upstream bounds blocks the same way
+/// (`usageLabels` in `OllamaUsageParser.swift` at v0.65.0).
+const ALL_LABELS: &[&str] = &[
+    "Monthly usage",
+    "Session usage",
+    "Hourly usage",
+    "Weekly usage",
+];
 
 /// Slice from just after `label` to the next other-label, or to the end of the
 /// page when no other label follows.
@@ -114,14 +132,123 @@ fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
     Some(&tail[..crate::text::floor_char_boundary(tail, end)])
 }
 
-/// Parse `N% used` (preferred) else `width: N%` from a block. Hand-scanned to avoid
-/// a regex dependency: find the `% used` marker (whitespace-tolerant) and read the
-/// number immediately before the `%`.
+/// Parse `N% used` (preferred), else `$X of $Y used`, else `width: N%` from a
+/// block -- upstream's order in `OllamaUsageParser.parsePercent` (v0.65.0).
+/// Hand-scanned to avoid a regex dependency: find the `% used` marker
+/// (whitespace-tolerant) and read the number immediately before the `%`.
 fn parse_percent(block: &str) -> Option<f64> {
     if let Some(p) = percent_before_marker(block, "used") {
         return Some(p);
     }
+    if let Some(p) = parse_dollar_used_percent(block) {
+        return Some(p);
+    }
     parse_width_percent(block)
+}
+
+/// `$<used> of $<limit> used` as a percent of the included monthly credit.
+///
+/// Accounts on monthly credits see a dollar pair instead of a percent, e.g.
+/// `$7.50 of $60 used`. The dollars are INCLUDED ALLOWANCE, not money on account:
+/// this converts them to utilisation (upstream: "not a spend estimate") and
+/// publishes only the percent. The amounts are deliberately not surfaced as
+/// `used_count`/`total_count`, which carry integer counts, nor as a spend pool.
+///
+/// Port of `parseDollarUsedPercent` (v0.65.0), whose pattern is
+/// `\$AMOUNT\s+of\s+\$AMOUNT\s+used`, case-insensitive, where AMOUNT is either
+/// comma-grouped thousands (`1,250`) or a plain digit run, with optional
+/// decimals. The first `$` that starts a full match wins. A zero limit or a
+/// non-finite value (an amount too long to represent) yields `None`, so the
+/// caller falls back to the bar's `width:`.
+fn parse_dollar_used_percent(block: &str) -> Option<f64> {
+    let mut search_from = 0;
+    while let Some(rel) = block[search_from..].find('$') {
+        let dollar_at = search_from + rel;
+        if let Some(percent) = dollar_pair_at(&block[dollar_at + 1..]) {
+            return Some(percent);
+        }
+        search_from = dollar_at + 1;
+    }
+    None
+}
+
+/// Try to match `<used> of $<limit> used` at the very start of `rest` (the text
+/// just after a `$`), returning the percent.
+fn dollar_pair_at(rest: &str) -> Option<f64> {
+    let (used, rest) = dollar_amount(rest)?;
+    let rest = skip_required_whitespace(rest)?;
+    let rest = strip_prefix_ignore_case(rest, "of")?;
+    let rest = skip_required_whitespace(rest)?;
+    let rest = rest.strip_prefix('$')?;
+    let (limit, rest) = dollar_amount(rest)?;
+    let rest = skip_required_whitespace(rest)?;
+    strip_prefix_ignore_case(rest, "used")?;
+
+    if !used.is_finite() || !limit.is_finite() || limit <= 0.0 {
+        return None;
+    }
+    let percent = used / limit * 100.0;
+    percent.is_finite().then(|| percent.clamp(0.0, 100.0))
+}
+
+/// Read one amount from the start of `text`: `1,250.00`, `60`, `7.50`.
+///
+/// Taking the LONGEST run of digits and commas is equivalent to upstream's
+/// regex here: every shorter reading would leave a digit or comma next, and the
+/// pattern requires whitespace or a decimal point after an amount, so no shorter
+/// reading can complete a match. The run is then validated: either no commas at
+/// all, or 1-3 leading digits followed by one or more `,ddd` groups. So `1,25`
+/// and `1,,250` are refused rather than read as some other number.
+fn dollar_amount(text: &str) -> Option<(f64, &str)> {
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b',') {
+        end += 1;
+    }
+    let integer = &text[..end];
+    if !valid_integer_amount(integer) {
+        return None;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        let mut frac_end = end + 1;
+        while frac_end < bytes.len() && bytes[frac_end].is_ascii_digit() {
+            frac_end += 1;
+        }
+        // A point with no digits after it is not part of the amount; the
+        // pattern then needs whitespace, which a `.` is not.
+        if frac_end > end + 1 {
+            end = frac_end;
+        }
+    }
+    let value = text[..end].replace(',', "").parse::<f64>().ok()?;
+    Some((value, &text[end..]))
+}
+
+/// A digit run with no commas, or `d{1,3}(,ddd)+`.
+fn valid_integer_amount(integer: &str) -> bool {
+    if integer.is_empty() {
+        return false;
+    }
+    let mut groups = integer.split(',');
+    let head = groups.next().unwrap_or_default();
+    let rest: Vec<&str> = groups.collect();
+    if rest.is_empty() {
+        return head.bytes().all(|b| b.is_ascii_digit());
+    }
+    (1..=3).contains(&head.len()) && rest.iter().all(|group| group.len() == 3)
+}
+
+/// Consume one or more whitespace characters; `None` when there are none.
+fn skip_required_whitespace(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    (trimmed.len() < text.len()).then_some(trimmed)
+}
+
+/// `text` without a leading `prefix`, compared ASCII-case-insensitively.
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 /// Find a `<number> % <marker>` occurrence (whitespace allowed around `%`) and
@@ -198,16 +325,47 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Whether the settings request was answered by somewhere else entirely.
+/// The path of a URL, lowercased, without query or fragment (`/` when empty).
+fn path_of(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let without_tail = after_scheme.split(['?', '#']).next()?;
+    let path = without_tail
+        .find('/')
+        .map_or("/", |slash| &without_tail[slash..]);
+    Some(path.to_ascii_lowercase())
+}
+
+/// Whether the settings request ended on a sign-in page instead.
+///
+/// Two rules, applied to the final URL after redirects:
+///
+/// 1. On ollama's own hosts (`ollama.com`, `www.ollama.com`) only the `/signin`
+///    path is a sign-in. The host alone says nothing there, so
+///    `www.ollama.com/settings` is the settings page, not a redirect. This is
+///    upstream's rule (`OllamaUsageFetcher.isSignInRedirect`, v0.65.0).
+/// 2. Any other host is a redirect away from the settings page. Upstream's two
+///    other positive cases -- `signin.ollama.com`, and a `*.workos.com` host on
+///    `/user_management/authorize` -- are both off-host and so covered here.
+///    This rule is WIDER than upstream, which parses the body of any other
+///    host: here that body would be a sign-in page read as a parser bug, which
+///    is the failure this check exists for, and naming auth hosts one by one
+///    needs updating every time ollama changes identity provider.
+///
+/// Upstream also requires `https`; that is not copied, because a plain-http
+/// landing on a sign-in path is no less a sign-in.
 ///
 /// An empty final URL is NOT a redirect. It means no transport recorded one --
 /// every test fixture constructs a response that way -- and treating absence as
 /// evidence would report every unit test's page as a sign-in redirect.
 fn redirected_off_settings(final_url: &str) -> bool {
-    match (host_of(final_url), host_of(SETTINGS_URL)) {
-        (Some(actual), Some(expected)) => actual != expected,
-        _ => false,
+    let (Some(host), Some(path)) = (host_of(final_url), path_of(final_url)) else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    if host == "ollama.com" || host == "www.ollama.com" {
+        return path == "/signin";
     }
+    true
 }
 
 /// Heuristic: the settings page was replaced by a sign-in page (dead cookie).
@@ -309,41 +467,43 @@ fn session_block_reports_weekly_limit(html: &str) -> bool {
         .any(|block| block.contains("Weekly limit reached"))
 }
 
-/// "Session usage" is the 5-hour window; "Hourly usage" is a distinct shorter
-/// window with no fixed length on the wire (CodexBar leaves it nil).
+/// The legacy short window: "Session usage" is the 5-hour window; "Hourly usage"
+/// is a distinct shorter window with no fixed length on the wire (CodexBar leaves
+/// it nil). The page has used one caption or the other, so the first that yields
+/// a percent is the session window.
 ///
-/// `Monthly usage` is here for a label we have NOT observed on this host. Upstream
-/// added it at v0.56.x as the primary label for accounts on monthly credits,
-/// keeping the two above "for older pages", and a probe of the live page found
-/// only the legacy pair — so this is a label the page can carry rather than one
-/// it does. `crates/quota-core/examples/ollama-labels.rs` is that probe; re-run
-/// it rather than re-deriving whether the page has moved.
-///
-/// LISTED ANYWAY, and the asymmetry is the whole reason. This provider is an HTML
-/// scrape, so a label we do not recognise is not an error — the block is simply
-/// not published, and an unpublished window reads downstream as capacity nobody
-/// is consuming. That is exactly the failure that took the fleet down on
-/// 2026-07-25. Recognising a label that never appears costs nothing; failing to
-/// recognise one that does costs a silent overstatement of headroom.
-///
-/// Its cadence is `None` rather than 30 days. Upstream stamps a month sentinel
-/// and resolves the real calendar month downstream from the reset date; we have
-/// never seen the block, so its length is not ours to state. The percent is
-/// load-bearing and publishes; the cadence is metadata and is omitted, which is
-/// the standing rule for every reset-optional window here.
-///
-/// BOUND WORTH KNOWING: [`window_for`] takes the FIRST label that yields a
-/// percent, so a page rendering both a session and a monthly block publishes only
-/// the session one. That is the honest reading of what is observable — upstream
-/// keeps the legacy labels "for older pages", which says the two are alternatives
-/// rather than siblings, and they are ALSO the tighter window when present. If a
-/// page ever carries both, this needs a second slot rather than a reordering, and
-/// the probe is what would show it.
+/// `Monthly usage` is NOT here. It is its own window, parsed from its own block
+/// ([`MONTHLY_LABEL`]); see there.
 const SESSION_LABELS: &[(&str, Option<i64>)] = &[
     ("Session usage", Some(SESSION_WINDOW_MINUTES)),
     ("Hourly usage", None),
-    ("Monthly usage", None),
 ];
+
+/// The monthly-credit window, a block of its own rather than a session caption.
+///
+/// WHAT CHANGED. Ollama moved paid accounts from the 5-hour + weekly quota to
+/// monthly included credits, and the settings page renders a "Monthly usage"
+/// block whose figure is a dollar pair (`$7.50 of $60 used`), not `N% used`.
+/// This module used to list the label as a last-resort session caption, never
+/// having observed it, and could read only a percent from it -- so a dollar-only
+/// page published nothing and failed as `no usage windows in settings HTML`.
+/// Upstream (`OllamaUsageParser.swift`, v0.65.0) parses monthly, session and
+/// weekly as three separate blocks, monthly first, and reads the dollar pair as
+/// a percent of the included credit; both are ported here.
+///
+/// VERIFICATION: fixture-verified, not live-verified. The fixtures are
+/// upstream's captured page markup; this host could not read its own page when
+/// the port was made. `crates/quota-core/examples/ollama-labels.rs` is the live
+/// probe that settles it.
+///
+/// Its cadence is `None` rather than 30 days. Upstream stamps a month sentinel
+/// and resolves the real calendar month downstream from the reset date; a
+/// calendar month has no fixed length, so it is not ours to state as one. The
+/// percent is load-bearing and publishes; the cadence is metadata and is
+/// omitted, which is the standing rule for every reset-optional window here. Its
+/// reset is therefore bounded by `MAX_RESET_HORIZON_MINUTES` (31 days), which
+/// admits a reset anywhere in the longest month.
+const MONTHLY_LABEL: (&str, Option<i64>) = ("Monthly usage", None);
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
@@ -361,6 +521,7 @@ pub fn normalize_usage_at(
     html: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Usage, FetchError> {
+    let monthly = window_for(html, &[MONTHLY_LABEL], now);
     let mut session = window_for(html, SESSION_LABELS, now);
     let mut weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))], now);
 
@@ -380,7 +541,7 @@ pub fn normalize_usage_at(
         }
     }
 
-    if session.is_none() && weekly.is_none() {
+    if monthly.is_none() && session.is_none() && weekly.is_none() {
         if looks_signed_out(html) {
             return Err(FetchError::Unauthorized(
                 "ollama session expired (settings page served a login)".to_string(),
@@ -391,10 +552,28 @@ pub fn normalize_usage_at(
         ));
     }
 
+    // SLOTS. `primary` is the monthly window when the page has one, else the
+    // session window; `secondary` is always the weekly window; `tertiary` holds
+    // the session window only when monthly took `primary`.
+    //
+    // Consumers key on these slot ids, so a legacy page (session + weekly, no
+    // monthly) must publish exactly what it did before the monthly block was
+    // parsed: session in `primary`, weekly in `secondary`. Moving session to a
+    // fixed `tertiary` would have silently renamed every legacy account's window.
+    //
+    // Upstream publishes `monthly ?? session` in primary and drops the session
+    // window when both exist. Here both publish: an unpublished window reads
+    // downstream as capacity nobody is consuming, and a five-hour limit can be
+    // the one that refuses requests while monthly credit remains.
+    let (primary, tertiary) = match monthly {
+        Some(monthly) => (Some(monthly), session),
+        None => (session, None),
+    };
+
     Ok(Usage {
-        primary: session,
+        primary,
         secondary: weekly,
-        tertiary: None,
+        tertiary,
         extra_rate_windows: None,
     })
 }
@@ -502,11 +681,12 @@ impl UsageProvider for OllamaProvider {
             // WITHOUT a redirect -- but it could not see this one, because the new
             // page carries no `<form>` and no `/auth/signin` route.
             //
-            // Host comparison rather than prefix matching: a redirect to any host
-            // that is not the one we asked is a redirect away from the settings
-            // page, and enumerating auth hostnames would need updating every time
-            // an upstream changes identity provider -- which is the event this
-            // exists to survive.
+            // Mostly a host comparison rather than prefix matching: a redirect to
+            // any host other than ollama's own is a redirect away from the
+            // settings page, and enumerating auth hostnames would need updating
+            // every time an upstream changes identity provider -- which is the
+            // event this exists to survive. On ollama's own hosts the path
+            // decides (`/signin`); see `redirected_off_settings`.
             if redirected_off_settings(&html_bytes.final_url) {
                 return Err(FetchError::Unauthorized(format!(
                     "ollama session expired (settings redirected to {})",
@@ -600,6 +780,44 @@ mod tests {
     /// redirect would make every parser test report a sign-in page. A guard that
     /// fires on missing evidence is worse than no guard -- it would take a healthy
     /// provider dark the moment a transport stopped recording the URL.
+    /// A sign-in on ollama's own host is caught by its path.
+    ///
+    /// The host comparison alone misses `https://ollama.com/signin`: same host as
+    /// the settings page, so the sign-in body went on to parsing and failed as a
+    /// parser bug. Upstream v0.65.0 `isSignInRedirect` treats that path as a
+    /// sign-in, on the bare and the `www.` host alike.
+    #[test]
+    fn a_signin_path_on_the_settings_host_is_an_expired_session() {
+        assert!(redirected_off_settings("https://ollama.com/signin"));
+        assert!(redirected_off_settings(
+            "https://ollama.com/signin?redirect=%2Fsettings"
+        ));
+        assert!(redirected_off_settings("https://www.ollama.com/signin"));
+    }
+
+    /// Upstream's other sign-in landings, from its v0.65.0 fetcher tests.
+    #[test]
+    fn upstream_signin_hosts_are_expired_sessions() {
+        for url in [
+            "https://signin.ollama.com/?client_id=test&authorization_session_id=x",
+            "https://api.workos.com/user_management/authorize?client_id=test",
+            "https://auth.workos.com/user_management/authorize?client_id=test",
+        ] {
+            assert!(redirected_off_settings(url), "{url}");
+        }
+    }
+
+    /// The `www.` settings page is the settings page, not a sign-in.
+    ///
+    /// A host comparison against `ollama.com` flags it, which would report a
+    /// healthy login as expired. On ollama's own hosts only the path decides.
+    #[test]
+    fn the_www_settings_page_is_not_a_redirect() {
+        assert!(!redirected_off_settings("https://www.ollama.com/settings"));
+        assert!(!redirected_off_settings("https://WWW.Ollama.com/settings"));
+        assert!(!redirected_off_settings("https://www.ollama.com"));
+    }
+
     #[test]
     fn the_settings_host_and_an_absent_url_are_not_redirects() {
         assert!(!redirected_off_settings("https://ollama.com/settings"));
@@ -952,25 +1170,23 @@ mod tests {
 
     /// A page on monthly credits publishes its percent rather than nothing.
     ///
-    /// SYNTHETIC FIXTURE, and deliberately labelled as one: this host's page
-    /// carries only the legacy `Session usage` / `Weekly usage` pair, verified by
-    /// `examples/ollama-labels.rs`, so the block below is built from upstream's
-    /// v0.56.x label rather than from an observed capture. The percent shape is
-    /// the page's own, which is what makes the fixture worth anything.
+    /// SYNTHETIC FIXTURE: a percent-shaped monthly block. The page itself renders
+    /// a dollar pair (see the next test, which uses upstream's capture), but a
+    /// block carrying `N% used` must still read that way, since `% used` is the
+    /// first shape tried.
     ///
     /// The failure this defends is silent in the dangerous direction. An
     /// unrecognised label is not an error here — the block is skipped, no window
     /// is published, and a consumer reads absent capacity pressure as headroom.
-    /// So the assertion is that SOMETHING is published, not that its cadence is
-    /// known: `window_minutes` stays `None` because a month is upstream's
-    /// sentinel to resolve and not a length we have observed.
+    /// `window_minutes` stays `None` because a calendar month has no fixed length.
     #[test]
     fn a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence() {
         let html = r#"
           <span>Monthly usage</span><span>61.5% used</span>
           <div data-time="2026-10-01T00:00:00Z">Resets in 28 days</div>
         "#;
-        let usage = normalize_usage(html).expect("a monthly block is a usable page");
+        let usage = normalize_usage_at(html, at("2026-09-10T00:00:00Z"))
+            .expect("a monthly block is a usable page");
         let monthly = usage
             .primary
             .expect("the monthly block must publish -- an unpublished window reads as headroom");
@@ -986,27 +1202,256 @@ mod tests {
         );
     }
 
-    /// The tighter legacy window still wins when a page carries both.
+    /// Upstream's captured monthly-credit page, verbatim.
     ///
-    /// Paired with the test above so the ORDER in `SESSION_LABELS` is load-bearing
-    /// rather than incidental: reversing it would publish a monthly percent while a
-    /// five-hour window was the binding constraint, which understates pressure on
-    /// the window that actually refuses requests.
+    /// PROVENANCE: CodexBar v0.65.0,
+    /// `Tests/CodexBarTests/OllamaUsageParserTests.swift`, test "parses monthly
+    /// dollar usage from new settings HTML". Upstream's note: "Captured
+    /// monthly-credit markup includes line breaks inside closing tags."
+    const MONTHLY_DOLLAR_FIXTURE: &str = r#"
+        <div>
+          <h2 class="text-xl font-medium flex items-center space-x-2">
+            <span>Included usage</span>
+            <span
+              class="text-xs font-normal px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-600 capitalize"
+              >pro</span
+            >
+          </h2>
+          <h2 id="header-email">user@example.com</h2>
+          <div>
+            <div class="flex justify-between mb-2">
+              <span class="text-sm">Monthly usage</span>
+              <span class="text-sm "
+                >$7.50 of $60 used</span
+              >
+            </div>
+            <div class="relative group" data-usage-meter>
+              <div
+                class="relative h-3 overflow-hidden rounded-full bg-neutral-200"
+                data-usage-track
+                aria-label="Monthly usage $7.50 of $60 used"
+              >
+                <div class="flex h-full overflow-hidden bg-neutral-950" style="width: 12.5%; ">
+                </div>
+              </div>
+            </div>
+            <div
+              class="text-xs text-neutral-500 mt-1 local-time"
+              data-time="2026-09-30T15:14:29Z"
+            >
+              Resets in 4 weeks.
+            </div>
+          </div>
+        </div>
+    "#;
+
+    /// A dollar-only monthly block publishes the credit used as a percent.
+    ///
+    /// Before the dollar read this page had no `% used` anywhere, and the bar's
+    /// `width: 12.5%` happens to agree -- so the fixture is ALSO checked with the
+    /// bar removed, which is what makes the dollar arm the thing under test
+    /// rather than the width fallback standing in for it.
     #[test]
-    fn a_session_block_outranks_a_monthly_one_when_both_are_present() {
+    fn a_dollar_monthly_block_publishes_the_credit_used_as_a_percent() {
+        // Four weeks before the page's reset, per its "Resets in 4 weeks.".
+        let now = at("2026-09-02T15:14:29Z");
+        let no_bar = MONTHLY_DOLLAR_FIXTURE.replace("width: 12.5%; ", "");
+        assert_ne!(no_bar, MONTHLY_DOLLAR_FIXTURE, "the bar must be stripped");
+
+        for page in [MONTHLY_DOLLAR_FIXTURE, no_bar.as_str()] {
+            let usage = normalize_usage_at(page, now).expect("a monthly-credit page parses");
+            let monthly = usage.primary.expect("monthly takes primary");
+            assert_eq!(monthly.used_percent, 12.5, "$7.50 of $60 is 12.5%");
+            assert_eq!(monthly.window_minutes, None);
+            assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-30T15:14:29Z"));
+            assert_eq!(
+                (monthly.used_count, monthly.total_count),
+                (None, None),
+                "dollars are included allowance, never published as counts"
+            );
+            assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+        }
+    }
+
+    /// A monthly reset up to 31 days out is kept.
+    ///
+    /// The monthly window states no cadence, so its reset is bounded by the
+    /// shared horizon; a reset early on the 1st seen late on the 1st of a
+    /// 31-day month is a real monthly reset right at that bound.
+    #[test]
+    fn a_monthly_reset_a_full_long_month_out_is_kept() {
+        let usage = normalize_usage_at(MONTHLY_DOLLAR_FIXTURE, at("2026-08-30T15:14:29Z"))
+            .expect("a monthly-credit page parses");
+        assert_eq!(
+            usage.primary.expect("monthly").resets_at.as_deref(),
+            Some("2026-09-30T15:14:29Z"),
+            "31 days out is inside the longest month"
+        );
+    }
+
+    /// Thousands separators and whole dollars; upstream's "$1,250 of $5,000".
+    #[test]
+    fn dollar_amounts_with_thousands_commas_and_whole_dollars_parse() {
+        let html = "<span>Monthly usage</span><span>$1,250 of $5,000 used</span>";
+        let usage = normalize_usage_at(html, at("2026-09-02T00:00:00Z")).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 25.0);
+
+        assert_eq!(parse_dollar_used_percent("$15 of $60 used"), Some(25.0));
+        assert_eq!(
+            parse_dollar_used_percent("$1,234,567.50 of $2,469,135 USED"),
+            Some(50.0),
+            "multiple groups, decimals, case-insensitive"
+        );
+        assert_eq!(
+            parse_dollar_used_percent("$90 of $60 used"),
+            Some(100.0),
+            "clamped like the other two shapes"
+        );
+    }
+
+    /// Amounts upstream refuses are refused here too, and fall back to the bar.
+    ///
+    /// Cases from upstream v0.65.0 "invalid monthly dollar amounts require a
+    /// valid meter fallback" and "monthly dollar usage with zero limit falls
+    /// back to meter width".
+    #[test]
+    fn malformed_or_degenerate_dollar_amounts_are_refused() {
+        let huge = "9".repeat(400);
+        let big = "9".repeat(308);
+        for text in [
+            "$1,25 of $5,000 used".to_string(),
+            "$1,,250 of $5,000 used".to_string(),
+            "$1,250 of $5,00 used".to_string(),
+            format!("${huge} of $60 used"),
+            format!("$7.50 of ${huge} used"),
+            format!("${big} of $0.01 used"),
+            "$0 of $0 used".to_string(),
+        ] {
+            assert_eq!(parse_dollar_used_percent(&text), None, "{text:.40}");
+            let block = format!(r#"{text}<div style="width: 17%;"></div>"#);
+            assert_eq!(parse_percent(&block), Some(17.0), "{text:.40}");
+        }
+    }
+
+    /// `% used` is read before the dollar pair when a block carries both.
+    #[test]
+    fn a_percent_used_figure_is_preferred_over_a_dollar_pair() {
+        let html = r#"
+          <span>Monthly usage</span><span>$7.50 of $60 used</span>
+          <span>40% used</span>
+        "#;
+        let usage = normalize_usage_at(html, at("2026-09-02T00:00:00Z")).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 40.0);
+    }
+
+    /// Upstream's legacy session + weekly page, verbatim.
+    ///
+    /// PROVENANCE: CodexBar v0.65.0,
+    /// `Tests/CodexBarTests/OllamaUsageParserTests.swift`, test "parses cloud
+    /// usage from settings HTML" (Swift `\"` escapes written as plain quotes).
+    const LEGACY_SESSION_WEEKLY_FIXTURE: &str = r#"
+        <div>
+          <h2 class="text-xl">
+            <span>Cloud Usage</span>
+            <span class="text-xs">free</span>
+          </h2>
+          <h2 id="header-email">user@example.com</h2>
+          <div>
+            <span>Session usage</span>
+            <span>0.1% used</span>
+            <div class="local-time" data-time="2026-01-30T18:00:00Z">Resets in 3 hours</div>
+          </div>
+          <div>
+            <span>Weekly usage</span>
+            <span>0.7% used</span>
+            <div class="local-time" data-time="2026-02-02T00:00:00Z">Resets in 2 days</div>
+          </div>
+        </div>
+    "#;
+
+    /// A legacy page publishes exactly the slots it published before monthly.
+    ///
+    /// Consumers key on slot ids, so parsing the monthly block must not move a
+    /// legacy account's windows: session stays `primary` with 300 minutes,
+    /// weekly stays `secondary` with 10080, and nothing appears in `tertiary`.
+    #[test]
+    fn a_legacy_session_and_weekly_page_keeps_its_slots() {
+        let usage =
+            normalize_usage_at(LEGACY_SESSION_WEEKLY_FIXTURE, at("2026-01-30T15:00:00Z")).unwrap();
+
+        let session = usage.primary.expect("session stays primary");
+        assert_eq!(session.used_percent, 0.1);
+        assert_eq!(session.window_minutes, Some(SESSION_WINDOW_MINUTES));
+        assert_eq!(session.resets_at.as_deref(), Some("2026-01-30T18:00:00Z"));
+
+        let weekly = usage.secondary.expect("weekly stays secondary");
+        assert_eq!(weekly.used_percent, 0.7);
+        assert_eq!(weekly.window_minutes, Some(WEEKLY_WINDOW_MINUTES));
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-02-02T00:00:00Z"));
+
+        assert!(usage.tertiary.is_none(), "a legacy page gains no slot");
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    /// A page carrying monthly AND session blocks publishes both.
+    ///
+    /// Monthly takes `primary`, session moves to `tertiary`. The session block
+    /// must keep its own figure and reset -- the monthly label bounds it -- and
+    /// neither may be dropped: a five-hour limit can refuse requests while
+    /// monthly credit remains, and an unpublished window reads as headroom.
+    ///
+    /// Replaces a test that pinned the opposite (session outranking monthly in a
+    /// single slot); that was a stopgap from before the monthly block was parsed
+    /// as its own window.
+    #[test]
+    fn a_page_with_monthly_and_session_blocks_publishes_both() {
         let html = r#"
           <span>Session usage</span><span>88.0% used</span>
           <div data-time="2026-09-03T04:00:00Z">Resets in 2 hours</div>
-          <span>Monthly usage</span><span>12.0% used</span>
+          <span>Monthly usage</span><span>$12 of $100 used</span>
           <div data-time="2026-10-01T00:00:00Z">Resets in 28 days</div>
+          <span>Weekly usage</span><span>30% used</span>
+          <div data-time="2026-09-07T00:00:00Z">Resets in 4 days</div>
         "#;
-        let usage = normalize_usage(html).unwrap();
-        let primary = usage.primary.unwrap();
+        let usage = normalize_usage_at(html, at("2026-09-03T02:00:00Z")).unwrap();
+
+        let monthly = usage.primary.expect("monthly in primary");
+        assert_eq!(monthly.used_percent, 12.0);
+        assert_eq!(monthly.window_minutes, None);
+        assert_eq!(monthly.resets_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+
+        let session = usage.tertiary.expect("session is published too");
+        assert_eq!(session.used_percent, 88.0);
+        assert_eq!(session.window_minutes, Some(SESSION_WINDOW_MINUTES));
+        assert_eq!(session.resets_at.as_deref(), Some("2026-09-03T04:00:00Z"));
+
+        let weekly = usage.secondary.expect("weekly in secondary");
+        assert_eq!(weekly.used_percent, 30.0);
+    }
+
+    /// A session block ends where the monthly block begins.
+    ///
+    /// Near the end of a month the monthly reset is hours away, well inside the
+    /// session window's five-hour horizon. A session block that ran on into the
+    /// monthly block would take that timestamp as its own reset.
+    #[test]
+    fn a_session_block_does_not_take_the_monthly_blocks_reset() {
+        let html = r#"
+          <span>Session usage</span><span>20% used</span>
+          <span>Monthly usage</span><span>$59 of $60 used</span>
+          <div data-time="2026-10-01T00:00:00Z">Resets in 2 hours</div>
+        "#;
+        let usage = normalize_usage_at(html, at("2026-09-30T22:00:00Z")).unwrap();
         assert_eq!(
-            primary.used_percent, 88.0,
-            "the session block is the tighter window"
+            usage.primary.expect("monthly").resets_at.as_deref(),
+            Some("2026-10-01T00:00:00Z")
         );
-        assert_eq!(primary.window_minutes, Some(SESSION_WINDOW_MINUTES));
+        let session = usage.tertiary.expect("session");
+        assert_eq!(session.used_percent, 20.0);
+        assert_eq!(
+            session.resets_at, None,
+            "the only timestamp is in the monthly block"
+        );
     }
 
     #[test]

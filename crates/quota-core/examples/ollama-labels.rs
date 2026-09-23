@@ -14,6 +14,12 @@
 //! the old ones, or both is a question about the page rather than about either
 //! implementation, so it is answered by looking rather than by reading a diff.
 //!
+//! The monthly block's figure is a dollar pair (`$7.50 of $60 used`), which the
+//! module reads as a percent of the included credit -- a port from upstream
+//! v0.65.0 made from upstream's fixtures, not from this host's page. This probe
+//! prints the pair it finds next to the percent the parser derives from it, so
+//! one run against the live page confirms or refutes that port.
+//!
 //! Reports which strings are PRESENT. Never prints page content, since the
 //! settings page carries account identifiers.
 
@@ -28,8 +34,16 @@ const SETTINGS_URL: &str = "https://ollama.com/settings";
 /// for what the page can contain. A label present on the page and absent from
 /// our list is a dropped window; one in our list and absent from the page is a
 /// window that has gone away, which is a different and less dangerous fact.
-const OUR_LABELS: &[&str] = &["Session usage", "Hourly usage", "Weekly usage"];
-const THEIR_ADDED_LABELS: &[&str] = &["Monthly usage"];
+const OUR_LABELS: &[&str] = &[
+    "Monthly usage",
+    "Session usage",
+    "Hourly usage",
+    "Weekly usage",
+];
+/// Upstream labels this module does not parse. Empty since the monthly block
+/// was ported; kept so the next label upstream adds has somewhere to go.
+const THEIR_ADDED_LABELS: &[&str] = &[];
+const MONTHLY_LABEL: &str = "Monthly usage";
 const PLAN_HEADINGS: &[&str] = &["Cloud Usage", "Included usage"];
 
 #[tokio::main]
@@ -110,7 +124,20 @@ async fn main() {
     for label in OUR_LABELS {
         println!("      {:<16} {}", label, mark(html.contains(label)));
     }
-    println!("  labels upstream added at v0.56.x:");
+    // The dollar figure the monthly percent is derived from. Printed because the
+    // derivation is the unverified part of the port: if the page words it
+    // differently, the parser falls back to the bar or publishes nothing, and
+    // this line shows the wording it would have had to read.
+    if html.contains(MONTHLY_LABEL) {
+        match monthly_dollar_pair(&html) {
+            Some(pair) => println!("  monthly figure: {pair}"),
+            None => println!(
+                "  monthly figure: NO `$X of $Y used` pair after the label -- \
+                 the dollar read cannot apply to this page"
+            ),
+        }
+    }
+    println!("  labels upstream has that this module does not parse:");
     for label in THEIR_ADDED_LABELS {
         let present = html.contains(label);
         println!("      {:<16} {}", label, mark(present));
@@ -235,6 +262,30 @@ async fn main() {
          so that window is not published at all"
     );
     std::process::exit(1);
+}
+
+/// The first `$... of $... used` text after the monthly label, whitespace
+/// collapsed.
+///
+/// A deliberately loose scan rather than the parser's strict one: the point is
+/// to show what the page says even when the parser would refuse it. Looks only
+/// within 600 bytes of the label so it cannot report a figure from another
+/// block, and prints at most 60 characters.
+fn monthly_dollar_pair(html: &str) -> Option<String> {
+    let start = html.find(MONTHLY_LABEL)? + MONTHLY_LABEL.len();
+    let tail = &html[start..];
+    let mut end = tail.len().min(600);
+    while !tail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let window = &tail[..end];
+    let dollar = window.find('$')?;
+    let used = window[dollar..].find("used")? + dollar + "used".len();
+    let text: String = window[dollar..used]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (text.contains(" of ") && text.len() <= 60).then_some(text)
 }
 
 /// Short usage-shaped strings on the page, for re-anchoring after a drift.
