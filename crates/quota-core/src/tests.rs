@@ -9448,7 +9448,8 @@ async fn a_deposited_cookies_first_rejection_after_serving_is_recorded() {
 #[test]
 fn cookie_capture_urls_match_the_providers_fetch_urls() {
     let doc = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/vault-consumer-design.md"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/vault-consumer-design.md"),
     )
     .expect("docs/vault-consumer-design.md must be readable");
     let sources: std::collections::HashMap<&str, &str> = [
@@ -9500,7 +9501,9 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         }
         for piece in [host, path.as_str()] {
             if !combined.contains(piece) {
-                problems.push(format!("{family}: `{piece}` appears in no source of {providers}"));
+                problems.push(format!(
+                    "{family}: `{piece}` appears in no source of {providers}"
+                ));
             }
         }
     }
@@ -9516,7 +9519,11 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         "expected the nine cookie-backed provider routes; found {} -- the filter broke",
         families.len()
     );
-    assert!(problems.is_empty(), "cookie capture table is wrong:\n{}", problems.join("\n"));
+    assert!(
+        problems.is_empty(),
+        "cookie capture table is wrong:\n{}",
+        problems.join("\n")
+    );
     assert_eq!(
         documented, families,
         "the capture table and CREDENTIAL_FAMILIES disagree on which provider each cookie domain serves"
