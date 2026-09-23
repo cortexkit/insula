@@ -123,6 +123,25 @@ pub enum VaultGetError {
     /// re-authenticate an account whose record is the evidence of a fault.
     Corrupt,
     FailClosed,
+    /// The credential module is not registered on this daemon at all.
+    ///
+    /// A fact about the HOST rather than about any credential: the daemon
+    /// answered that no module by that id exists (`unknown_module`) or that it
+    /// was removed from the configuration (`module_removed`). This is what every
+    /// host without a credential vault receives, which is the ordinary state of
+    /// a fresh install -- so on a list it means "there is no vault here, use the
+    /// local lanes", not "try again".
+    ///
+    /// Separate from [`Self::Transient`] because the two lead to opposite
+    /// enumeration verdicts. A transient failure says the vault may answer next
+    /// turn, so a process that has never heard from it must wait rather than
+    /// read the silence as an empty inventory. This one says no vault will
+    /// answer, and waiting would keep every local lane dark forever.
+    ///
+    /// For a per-credential fetch it is still retried like a transient
+    /// condition: a vault that disappears mid-life should stale-serve the last
+    /// window, not condemn the credential.
+    Unavailable,
 }
 
 impl std::fmt::Debug for VaultGetError {
@@ -135,6 +154,7 @@ impl std::fmt::Debug for VaultGetError {
             Self::EmptyPayload => "EmptyPayload",
             Self::Corrupt => "Corrupt",
             Self::FailClosed => "FailClosed",
+            Self::Unavailable => "Unavailable",
         })
     }
 }
@@ -149,6 +169,7 @@ impl std::fmt::Display for VaultGetError {
             Self::EmptyPayload => "credential vault served an empty credential",
             Self::Corrupt => "credential vault holds a corrupt or quarantined record",
             Self::FailClosed => "credential vault rejected the request",
+            Self::Unavailable => "credential vault is not registered on this daemon",
         })
     }
 }

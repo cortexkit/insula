@@ -898,6 +898,15 @@ fn health_report(
         // unverifiable before any usage row exposes the problem, so the lane
         // checker receives this warning alongside the inventory it evaluates.
         "vaultMappingWarning": snapshot.vault_mapping_warning,
+        // `awaiting` means the vault is wired and has not answered an
+        // enumeration yet, so every vault-aware provider is held back as
+        // unfinished (listed in `withoutHandles`) instead of falling back to a
+        // local lane. It normally lasts one turn; a host that stays here is
+        // diagnosable only from this field, because its counts look exactly
+        // like a host that holds no credentials.
+        "vaultHandleState": snapshot
+            .vault_handle_state
+            .map(quota_core::vault_handles::VaultHandleState::as_str),
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
         // How long since ANY fetch last succeeded, and whether that has gone on
@@ -2107,6 +2116,7 @@ mod tests {
             retained_vault_snapshot_age: None,
             vault_mapping_warning: None,
             scoped_credential_ids: Vec::new(),
+            vault_handle_state: None,
             last_tick_age: Some(std::time::Duration::from_secs(5)),
             refresher_stalled: false,
             last_fetch_success_age: Some(std::time::Duration::from_secs(5)),
@@ -2596,6 +2606,7 @@ mod tests {
             "vaultEnumerationFailure",
             "retainedVaultSnapshotAgeSecs",
             "vaultMappingWarning",
+            "vaultHandleState",
             "lastTickAgeSecs",
             "fetchBlackout",
             "lastFetchSuccessAgeSecs",
@@ -2626,6 +2637,8 @@ mod tests {
         assert_eq!(obj["fresh"].as_u64().unwrap(), 0);
         assert_eq!(obj["scopedCredentialIds"], serde_json::json!([]));
         assert_eq!(obj["vaultEnumerationFailure"], serde_json::Value::Null);
+        // Built without a credential source, so there is no vault to wait for.
+        assert_eq!(obj["vaultHandleState"], serde_json::json!("no_vault"));
         assert_eq!(obj["refresherStalled"], serde_json::json!(false));
     }
 
@@ -2639,6 +2652,7 @@ mod tests {
             vault_enumeration_failure: Some("vault route unavailable".into()),
             retained_vault_snapshot_age: Some(std::time::Duration::from_secs(73)),
             vault_mapping_warning: Some("cookie family has multiple deposits".into()),
+            vault_handle_state: Some(quota_core::vault_handles::VaultHandleState::Awaiting),
             ..healthy_snapshot()
         };
 
@@ -2665,6 +2679,7 @@ mod tests {
             metrics["vaultMappingWarning"],
             serde_json::json!("cookie family has multiple deposits")
         );
+        assert_eq!(metrics["vaultHandleState"], serde_json::json!("awaiting"));
     }
 
     /// The `route.bind` arm still acks unchanged after threading the registry in.

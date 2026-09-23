@@ -103,7 +103,7 @@ use std::time::{Duration, Instant};
 use futures_util::{stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use credential_source::CredentialSource;
+use credential_source::{CredentialSource, VaultGetError};
 use health::HealthSnapshot;
 use model::ProviderUsage;
 use provider::{CredentialHandle, FetchAttempt, UsageProvider};
@@ -635,6 +635,12 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
         ]);
+        // A real source means the empty mapping is "not answered yet" until the
+        // first enumeration returns, not "this host holds no vault credentials".
+        // Without a source the loader stays in its default no-vault state.
+        if credential_source.is_some() {
+            vault_handle_loader.await_first_answer();
+        }
         registry.credential_source = credential_source;
         registry.vault_handle_loader = Some(vault_handle_loader);
         registry
@@ -1211,6 +1217,16 @@ impl Registry {
                     authoritative_vault_install = installed.authoritative;
                     reactivated_ids = installed.reactivated_ids;
                 }
+                // No credential module on this daemon, or a principal the vault
+                // has granted nothing: both say there is no vault inventory for
+                // this module here, so a loader still waiting for its first
+                // answer may let the local lanes serve.
+                Err(error @ (VaultGetError::Unavailable | VaultGetError::NotFound)) => {
+                    loader.mark_unavailable(format!("{error:?}"))
+                }
+                // Anything else, `module_warming` included, says nothing about
+                // what the vault holds. Keep what is installed, and keep waiting
+                // if nothing is.
                 Err(error) => loader.retain_after_failure(format!("{error:?}")),
             }
         }
@@ -1759,6 +1775,10 @@ impl Registry {
                 .vault_handle_loader
                 .as_ref()
                 .and_then(|loader| loader.warning()),
+            vault_handle_state: self
+                .vault_handle_loader
+                .as_ref()
+                .map(|loader| loader.handle_state()),
             scoped_credential_ids: self
                 .vault_handle_loader
                 .as_ref()

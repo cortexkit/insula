@@ -9199,3 +9199,135 @@ async fn scoped_non_transient_backoff_polls_status_once_per_base_interval() {
         "one more elapsed BASE_INTERVAL admits exactly one more poll"
     );
 }
+
+/// Anthropic's lane shape: vault handles when the vault lists any, otherwise
+/// the one local credential file, which resolves no account label.
+struct VaultOrLocalProvider {
+    loader: Arc<VaultHandleLoader>,
+}
+
+#[async_trait]
+impl UsageProvider for VaultOrLocalProvider {
+    fn name(&self) -> &str {
+        "claude"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        let vault = self.loader.anthropic_handles()?;
+        if vault.is_empty() {
+            return Ok(vec![CredentialHandle::new("local")]);
+        }
+        Ok(vault)
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let account_id = handle
+            .is_vault()
+            .then(|| format!("account:{}", handle.stable_id()));
+        FetchAttempt::success(
+            Some(AccountObservation::new(
+                account_id,
+                handle.is_vault().then_some(1),
+            )),
+            if handle.is_vault() { "vault" } else { "local" },
+            Usage::default(),
+        )
+    }
+}
+
+fn vault_or_local_registry(source: Arc<ScriptedScopedSource>) -> Registry {
+    let loader = Arc::new(VaultHandleLoader::default());
+    // What `Registry::with_defaults` does when a real source is wired.
+    loader.await_first_answer();
+    let provider: Box<dyn UsageProvider> = Box::new(VaultOrLocalProvider {
+        loader: Arc::clone(&loader),
+    });
+    scoped_registry(vec![provider], loader, source)
+}
+
+/// A cold start whose first enumeration fails must publish nothing for a
+/// vault-aware provider rather than its local fallback.
+///
+/// Measured on a real host: the vault answered `module_warming` on the first
+/// turn after a restart, the empty mapping read as "no vault credentials", and
+/// five labelled accounts collapsed into one unlabelled row -- which the
+/// consumer contract tells a consumer to read as "this provider resolves no
+/// identity now", licensing it to drop its stored accounts.
+#[tokio::test]
+async fn a_cold_start_whose_first_list_fails_publishes_no_local_fallback() {
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        Err(VaultGetError::Transient),
+        Ok(scoped_snapshot(
+            1,
+            vec![
+                scoped_row("oauth:anthropic:first", "oauth", 1, "active"),
+                scoped_row("oauth:anthropic:second", "oauth", 1, "active"),
+            ],
+        )),
+    ]));
+    let registry = vault_or_local_registry(source);
+
+    tick(&registry).await;
+
+    assert!(
+        provider_slot_ids(&registry, "claude").is_empty(),
+        "an unanswered vault must leave the provider unfinished, not serve its local lane: {:?}",
+        provider_slot_ids(&registry, "claude")
+    );
+    assert!(registry.get_usage(Some("claude")).await.is_empty());
+    let health = registry.health();
+    assert_eq!(
+        health.vault_handle_state,
+        Some(crate::vault_handles::VaultHandleState::Awaiting)
+    );
+    assert_eq!(health.without_handles, vec!["claude"]);
+    // The conservation identity holds while waiting: the provider is counted
+    // once, as handle-less.
+    assert_eq!(
+        health.fresh
+            + health.stale
+            + health.pending
+            + health.degraded.len()
+            + health.unconfigured.len()
+            + health.without_handles.len(),
+        health.providers_total
+    );
+
+    tick(&registry).await;
+
+    assert_eq!(
+        provider_slot_ids(&registry, "claude"),
+        HashSet::from([
+            "oauth:anthropic:first".to_string(),
+            "oauth:anthropic:second".to_string(),
+        ])
+    );
+    assert_eq!(registry.get_usage(Some("claude")).await.len(), 2);
+    assert_eq!(
+        registry.health().vault_handle_state,
+        Some(crate::vault_handles::VaultHandleState::Answered)
+    );
+}
+
+/// A daemon with no credential module is a fresh install: the local lanes
+/// serve on the very first turn instead of waiting for a vault that does not
+/// exist.
+#[tokio::test]
+async fn a_daemon_without_a_credential_module_serves_local_lanes_on_the_first_turn() {
+    let source = Arc::new(ScriptedScopedSource::new(vec![Err(
+        VaultGetError::Unavailable,
+    )]));
+    let registry = vault_or_local_registry(source);
+
+    tick(&registry).await;
+
+    assert_eq!(
+        provider_slot_ids(&registry, "claude"),
+        HashSet::from(["local".to_string()])
+    );
+    assert_eq!(registry.get_usage(Some("claude")).await.len(), 1);
+    assert_eq!(
+        registry.health().vault_handle_state,
+        Some(crate::vault_handles::VaultHandleState::NoVault)
+    );
+}
