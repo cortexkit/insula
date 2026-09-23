@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.21"
+version = "0.20.25"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
