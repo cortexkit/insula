@@ -18,6 +18,13 @@
 //! working parser (`Providers/ElevenLabs/ElevenLabsUsageFetcher.swift:24-33,
 //! 192-238`); the test payload mirrors that shape. The shared HTTP transport it
 //! rides (`http.rs`) is itself live-proven via codex + anthropic.
+//!
+//! That Swift file exists up to CodexBar v0.63.0 and NO LONGER EXISTS from
+//! v0.64.0: upstream moved this provider into a bundled plugin,
+//! `Sources/CodexBarCore/Resources/Plugins/elevenlabs.ts`. Read the citation
+//! above at v0.63.0 or earlier; the plugin is where to look for later changes.
+//! (Recorded for `scripts/parity-citations.py`, which reports a cited file that
+//! is gone at the current anchor until its module says what replaced it.)
 
 use async_trait::async_trait;
 use serde::Deserialize;

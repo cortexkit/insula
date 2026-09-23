@@ -1244,6 +1244,59 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.62.0 → v0.64.1
+
+Three tags (`v0.63.0`, `v0.64.0`, `v0.64.1`). All EIGHT opaque constants present
+at `v0.64.1`, located by VALUE in the tagged tree: the original five, plus the
+three OpenCode Go console constants this round adds (`/console/api/orgs`,
+`/console/api/go/status`, `x-org-id`).
+
+**Triage method, since 17 served providers changed.** Most of the delta is one
+upstream-wide sweep converting floating-point to integer conversions to
+overflow-safe forms (`Int(exactly:)`), plus a shared browser-cookie import helper.
+Filtering each diff for changed lines naming a URL, cookie, header, JSON key or
+sign-in term separated the five with semantics (Kimi, OpenCode Go, OpenCode,
+Manus, MiniMax) from the rest, and each of those was then read.
+
+**One real finding, fixed: OpenCode Go moved to a console API.** OpenCode has
+migrated workspaces to a new console. For a migrated workspace the page we
+scraped, `/workspace/<id>/go`, redirects to `/console/login` and serves an empty
+shell. On 2026-09-19 this module classified that redirect as an expired session
+(`credential_rejected`), which for a migrated workspace tells the user to sign in
+again when signing in cannot help. `opencodego` now reads
+`console/api/orgs` and `console/api/go/status` (with `x-org-id`) first and falls
+back to the page only under upstream's `OpenCodeGoLegacyFallback` rule; only a
+console 401 proves an expired session, and a redirect never outranks the console
+in either direction. Also adopted: the new session cookie
+`__Host-console_session`, without which an account holding only that cookie read
+as signed out. Fixture-verified against upstream's own test payloads, not
+live-verified — the cookie lane was blocked on this host by a macOS permission.
+
+**Kimi region, noted and not adopted.** Upstream added a China (`kimi.com`) /
+International (`kimi.ai`) region setting, defaulting to China. We read `kimi.com`,
+which is that default, and on this host `api.kimi.ai`'s usage endpoint refuses the
+key while `api.kimi.com` answers; a 2026-09-22 burst through `kimi.ai` moved the
+counter read through `kimi.com`, so they are one pool. Adopting the setting would
+add a configuration knob with no account here that needs it. The trigger to
+revisit: an account whose key `kimi.com` refuses and `kimi.ai` accepts.
+
+**Four fetchers moved into bundled plugins** — ElevenLabs, LLMProxy, NeuralWatt,
+LiteLLM — under `Resources/Plugins/` (`elevenlabs.ts`, `llmproxy.ts`,
+`litellm.ts`, and `neuralwatt.js`, which has no `.ts`). They did not move together:
+ElevenLabs went at `v0.64.0` and NeuralWatt at `v0.64.1`. Our citations for the
+first three name the deleted Swift files. `elevenlabs.rs` and `neuralwatt.rs` now
+state the last tag the cited file exists at and where the plugin is;
+`llmproxy.rs` already carried its verification tag (`v0.37.2`). LiteLLM has no
+counterpart here.
+
+**Null for the rest, and why.** Amp's change sits in the paid-tier parser we never
+ported (we read only free-tier replenishment). Antigravity's is its local
+cost-estimate family, already a standing decline. Claude's is a keychain
+credential cache we do not use (credentials come from the vault). Manus and
+MiniMax changed only their browser-cookie importers; we read both with API keys.
+`Shared/OpenCodeWebParsing.swift` is code moved out of OpenCode Go, not new
+behaviour.
+
 ### Parity round: CodexBar v0.61.0 → v0.62.0
 
 One tag. All five opaque constants present at `v0.62.0`, located by VALUE in the

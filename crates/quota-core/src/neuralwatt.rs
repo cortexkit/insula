@@ -9,6 +9,13 @@
 //! Ported from CodexBar:
 //! - `Sources/CodexBarCore/Providers/NeuralWatt/NeuralWattUsageFetcher.swift`
 //! - `Sources/CodexBarCore/Providers/NeuralWatt/NeuralWattSettingsReader.swift`
+//!
+//! The fetcher exists up to CodexBar v0.64.0 and NO LONGER EXISTS from v0.64.1:
+//! upstream moved this provider into a bundled plugin,
+//! `Sources/CodexBarCore/Resources/Plugins/neuralwatt.js`. Read the fetcher
+//! citation at v0.64.0 or earlier; the plugin is where to look for later changes.
+//! (Recorded for `scripts/parity-citations.py`, which reports a cited file that
+//! is gone at the current anchor until its module says what replaced it.)
 
 use async_trait::async_trait;
 use serde::Deserialize;
