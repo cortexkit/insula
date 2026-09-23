@@ -406,8 +406,9 @@ pub(crate) async fn fetch_workspace_id_at(
 /// So the console is asked first, with the same cookie:
 ///
 /// - it lists a workspace: the session is valid and the account is on the
-///   console. Published as `Decode`, because the fix is reading Zen usage from
-///   the console here, and `Decode` is not counted as a stale login.
+///   console, where this module cannot read Zen usage yet. Published as
+///   `Decode` because the missing piece is ours (a console port), and `Decode`
+///   is not counted as a stale login.
 /// - it answers 401: the session really is expired; the original verdict.
 /// - anything else (transport error, 5xx, unreadable body, empty list): we
 ///   cannot tell, so the original verdict stands. This check must never make a
@@ -1628,7 +1629,7 @@ mod console_check_tests {
         (error, seen)
     }
 
-    /// The incident: a migrated account on a valid session.
+    /// A migrated account on a valid session, as observed live on 2026-09-23.
     ///
     /// The legacy call reads as signed out, the console lists a workspace on the
     /// same cookie, so the account is published as moved -- a decode failure,
