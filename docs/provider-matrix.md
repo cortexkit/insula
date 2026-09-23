@@ -63,6 +63,27 @@ confirm it changes the endpoint WE parse (e.g. Claude's live anchor reads
 changed within the range (`git show <old-tag>:<file>`), not a pre-existing value.
 
 
+### OpenCode console migration (ported 2026-09-23, from CodexBar v0.64.1)
+
+Not a full parity round -- a targeted port ahead of one. OpenCode migrated
+workspaces to a new console: for a migrated workspace the legacy
+`/workspace/<id>/go` page redirects to `/console/login` and serves an empty
+shell, and we were reading that redirect as an expired session, which signing
+in cannot fix. Upstream moved to the console JSON API
+(`/console/api/orgs` for the workspace id, `/console/api/go/status` with the
+`x-org-id` header for the meters, which arrive as micro-cent strings) and kept
+the HTML page as the fallback for workspaces that have not migrated. Our port
+follows `OpenCodeGo/OpenCodeGoUsageFetcher.swift`,
+`OpenCodeGo/OpenCodeGoLegacyFallback.swift` and
+`OpenCode/OpenCodeWebCookieSupport.swift` at that tag: console lane first,
+legacy page only when the console failed with something other than "no Go plan"
+and a legacy session cookie exists, and a redirect off the `/go` page never
+publishes `credential_rejected` on its own -- only a console 401 does. The
+console session cookie `__Host-console_session` joined the shared cookie names.
+The three console constants joined the parity table below. Fixture-verified
+against v0.64.1's `OpenCodeGoConsoleMigrationTests.swift`; NOT live-verified
+(the cookie lane is blocked on this host by a macOS permission).
+
 ### v0.49.4 - v0.49.6
 
 Upstream added a **pay-as-you-go fallback for OpenCode**: a workspace on that
@@ -693,7 +714,7 @@ standard `cornerstoneParam` block.
 
 ### Opaque constants, re-checked every round
 
-Five values are copied from the upstream rather than derived from anything we
+Eight values are copied from the upstream rather than derived from anything we
 can compute. They carry no meaning we can validate, so a stale one is invisible
 here and surfaces only as a request the upstream rejects — which reads exactly
 like an outage, and the confusion is expensive: the provider looks broken
@@ -711,10 +732,15 @@ whose logic changed:
 | `BILLING_SERVER_ID` | `crates/quota-core/src/opencode.rs` | Same, for the customer/billing call — the function a pay-as-you-go workspace is read from when it has no subscription object. Missing from this table until 2026-08-17. |
 | `BETA_HEADER` | `crates/quota-core/src/anthropic.rs` | Dated opt-in header (`oauth-2025-04-20`). Dated values get superseded. |
 | `OASIS_WEB_ID` | `crates/quota-core/src/stepfun.rs` | Fallback device identifier, used only when the token carries no `device_id` claim. |
+| `CONSOLE_WORKSPACES_PATH` | `crates/quota-core/src/opencodego.rs` | Console route listing the session's workspaces (`/console/api/orgs`). Added with the console lane, 2026-09-23. |
+| `CONSOLE_GO_STATUS_PATH` | `crates/quota-core/src/opencodego.rs` | Console route answering a workspace's Go meters (`/console/api/go/status`). Same addition. |
+| `CONSOLE_WORKSPACE_HEADER` | `crates/quota-core/src/opencodego.rs` | Header (`x-org-id`) naming the workspace a console request is about; the console answers HTTP 400 without it. Same addition. |
 
-All five matched CodexBar v0.55.0, re-verified 2026-08-25 by locating each
+The five server-function and header constants matched CodexBar v0.55.0,
+re-verified 2026-08-25 by locating each
 value in the tagged tree (`git grep -l <value> v0.55.0`) rather than in a
-checkout, since a working tree can be on any commit.
+checkout, since a working tree can be on any commit. The three console constants
+were located the same way in the v0.64.1 tree on 2026-09-23.
 
 File paths here carry no line numbers on purpose. The two that had them were
 both stale by the time anyone read them -- a line number drifts on every edit

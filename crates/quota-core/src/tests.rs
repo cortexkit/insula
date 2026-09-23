@@ -7089,8 +7089,8 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
     // satisfy both loops above by comparing two empty sets.
     assert_eq!(
         marked.len(),
-        5,
-        "expected the five known opaque constants, found {marked:?}"
+        8,
+        "expected the eight known opaque constants, found {marked:?}"
     );
 }
 

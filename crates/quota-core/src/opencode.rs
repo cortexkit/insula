@@ -1,7 +1,7 @@
 //! OpenCode subscription usage — browser cookies + Next.js `_server` actions.
 //!
-//! Flow: Chrome cookies for `opencode.ai` (`auth` / `__Host-auth` only) → workspace
-//! id via `_server` → subscription payload → parse `rollingUsage` + `weeklyUsage`.
+//! Flow: Chrome cookies for `opencode.ai` → workspace id via `_server` →
+//! subscription payload → parse `rollingUsage` + `weeklyUsage`.
 //!
 //! DESKTOP-COUPLED: needs a logged-in Chrome session on macOS. Dead cookie, login
 //! markers, or missing windows → [`FetchError`] (degrade-never-wrong).
@@ -10,7 +10,9 @@
 //! logged-in browser on the build machine). Ported from
 //! `OpenCode/OpenCodeUsageFetcher.swift` (cookies/headers :112-310, window keys
 //! :32-64, parse :312-756, signed-out :451-462, workspace :361-401) and
-//! `OpenCode/OpenCodeWebCookieSupport.swift:4-15` (cookie names).
+//! `OpenCode/OpenCodeWebCookieSupport.swift` at CodexBar v0.64.1 (cookie names:
+//! `auth` / `__Host-auth` for the legacy pages, `__Host-console_session` for the
+//! console OpenCode migrated workspaces to).
 
 use std::{sync::Arc, time::Duration};
 
@@ -42,8 +44,8 @@ pub const COOKIE_FAMILY: &str = "cookie:opencode.ai";
 
 const PROVIDER_NAME: &str = "opencode";
 const DOMAIN: &str = "opencode.ai";
-const SERVER_BASE: &str = "https://opencode.ai/_server";
-const ORIGIN: &str = "https://opencode.ai";
+pub(crate) const SERVER_BASE: &str = "https://opencode.ai/_server";
+pub(crate) const ORIGIN: &str = "https://opencode.ai";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
@@ -72,14 +74,16 @@ pub const BILLING_SERVER_ID: &str =
 pub const SUBSCRIPTION_SERVER_ID: &str =
     "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4";
 
-const ROLLING_WINDOW_MINUTES: i64 = 5 * 60;
-const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
-const MONTHLY_WINDOW_MINUTES: i64 = 30 * 24 * 60;
+/// Shared with `opencodego`'s console lane, which must publish the same window
+/// lengths the legacy scrape does -- consumers key on these durations.
+pub(crate) const ROLLING_WINDOW_MINUTES: i64 = 5 * 60;
+pub(crate) const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
+pub(crate) const MONTHLY_WINDOW_MINUTES: i64 = 30 * 24 * 60;
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
-const PERCENT_KEYS: &[&str] = &[
+pub(crate) const PERCENT_KEYS: &[&str] = &[
     "usagePercent",
     "usedPercent",
     "percentUsed",
@@ -91,7 +95,7 @@ const PERCENT_KEYS: &[&str] = &[
     "utilization_percent",
     "usage",
 ];
-const RESET_IN_KEYS: &[&str] = &[
+pub(crate) const RESET_IN_KEYS: &[&str] = &[
     "resetInSec",
     "resetInSeconds",
     "resetSeconds",
@@ -102,7 +106,7 @@ const RESET_IN_KEYS: &[&str] = &[
     "resetIn",
     "resetSec",
 ];
-const RESET_AT_KEYS: &[&str] = &[
+pub(crate) const RESET_AT_KEYS: &[&str] = &[
     "resetAt",
     "resetsAt",
     "reset_at",
@@ -113,7 +117,12 @@ const RESET_AT_KEYS: &[&str] = &[
     "renew_at",
 ];
 
-const SESSION_COOKIE_NAMES: &[&str] = &["auth", "__Host-auth"];
+/// `auth` serves the legacy pages and server functions. The console signs
+/// requests with its own session cookie, so both are forwarded while workspaces
+/// migrate (CodexBar v0.64.1 `OpenCode/OpenCodeWebCookieSupport.swift`).
+pub(crate) const LEGACY_SESSION_COOKIE_NAMES: &[&str] = &["auth", "__Host-auth"];
+pub(crate) const CONSOLE_SESSION_COOKIE_NAMES: &[&str] = &["__Host-console_session"];
+const SESSION_COOKIE_NAMES: &[&str] = &["auth", "__Host-auth", "__Host-console_session"];
 
 pub fn has_session_cookie(jar: &CookieJar) -> bool {
     jar.has_cookie_named(|n| SESSION_COOKIE_NAMES.contains(&n))
@@ -151,9 +160,15 @@ fn server_instance_header() -> String {
 }
 
 pub fn server_get_url(server_id: &str, args: Option<&[String]>) -> String {
-    let mut url = match url::Url::parse(SERVER_BASE) {
+    server_get_url_at(SERVER_BASE, server_id, args)
+}
+
+/// Build the URL against an explicit server base, so tests can point the fetch
+/// at a loopback server. Production callers go through [`server_get_url`].
+fn server_get_url_at(server_base: &str, server_id: &str, args: Option<&[String]>) -> String {
+    let mut url = match url::Url::parse(server_base) {
         Ok(u) => u,
-        Err(_) => return SERVER_BASE.to_string(),
+        Err(_) => return server_base.to_string(),
     };
     {
         let mut pairs = url.query_pairs_mut();
@@ -256,7 +271,17 @@ pub async fn fetch_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
 ) -> Result<String, FetchError> {
-    let get_url = server_get_url(WORKSPACES_SERVER_ID, None);
+    fetch_workspace_id_at(client, cookie, SERVER_BASE).await
+}
+
+/// [`fetch_workspace_id`] against an explicit server base, so the console-first
+/// fallback in `opencodego` can be driven against a loopback server in tests.
+pub(crate) async fn fetch_workspace_id_at(
+    client: &reqwest::Client,
+    cookie: &str,
+    server_base: &str,
+) -> Result<String, FetchError> {
+    let get_url = server_get_url_at(server_base, WORKSPACES_SERVER_ID, None);
     let text = server_get(
         client,
         &get_url,
@@ -283,7 +308,7 @@ pub async fn fetch_workspace_id(
     let mut ids = parse_workspace_ids(&text);
     if ids.is_empty() {
         let post_req = apply_headers(
-            JsonRequest::post_json(SERVER_BASE, b"[]".to_vec()).timeout(REQUEST_TIMEOUT),
+            JsonRequest::post_json(server_base, b"[]".to_vec()).timeout(REQUEST_TIMEOUT),
             common_server_headers(cookie, WORKSPACES_SERVER_ID, ORIGIN),
         );
         let body = post_req
@@ -486,7 +511,7 @@ fn is_explicit_null(text: &str) -> bool {
     trimmed.contains("server-fn:") && trimmed.ends_with(",null)")
 }
 
-fn parse_date_value(val: &Value) -> Option<i64> {
+pub(crate) fn parse_date_value(val: &Value) -> Option<i64> {
     if let Some(n) = val.as_f64() {
         // A non-finite or absurd magnitude (e.g. "1e308") is not a real timestamp;
         // reject it explicitly rather than letting a saturating float→int cast
@@ -1153,6 +1178,48 @@ mod tests {
             parse_windows(SIGNED_OUT, 0, false),
             Err(FetchError::Unauthorized(_))
         ));
+    }
+
+    /// The console session cookie alone is a session, for both providers.
+    ///
+    /// A migrated workspace's browser jar may carry ONLY `__Host-console_session`
+    /// (CodexBar v0.64.1 `OpenCodeCookieImporter` accepts exactly this), so a jar
+    /// holding nothing else must neither read as "no session cookie" nor be
+    /// filtered out of the request header. The tracker-cookie arm is the control:
+    /// an unrecognised cookie still counts as no session and stays off the wire.
+    #[test]
+    fn the_console_session_cookie_alone_is_a_session() {
+        let jar = |pairs: &[(&str, &str)]| CookieJar {
+            cookies: pairs
+                .iter()
+                .map(|(name, value)| Cookie {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                    host_key: ".opencode.ai".to_string(),
+                })
+                .collect(),
+        };
+
+        let console_only = jar(&[("__Host-console_session", "synthetic")]);
+        assert!(
+            has_session_cookie(&console_only),
+            "a migrated workspace may carry only the console session cookie"
+        );
+        let header = request_cookie_header(&console_only).expect("a session is present");
+        assert!(header.contains("__Host-console_session=synthetic"));
+
+        let with_tracker = jar(&[("_rdt_uuid", "tracker"), ("__Host-console_session", "s")]);
+        let header = request_cookie_header(&with_tracker).expect("a session is present");
+        assert!(
+            !header.contains("tracker"),
+            "the filter still keeps incidental cookies off the wire: {header}"
+        );
+
+        let tracker_only = jar(&[("_rdt_uuid", "tracker")]);
+        assert!(
+            !has_session_cookie(&tracker_only),
+            "an unrecognised cookie is still no session"
+        );
     }
 
     #[test]
