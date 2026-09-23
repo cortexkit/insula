@@ -1348,18 +1348,38 @@ impl Registry {
                         .observation
                         .as_ref()
                         .and_then(|observation| observation.record_version);
-                    if row.state != "needs_reauth"
-                        && (reactivated_ids.contains(credential_id)
-                            || observed_version != Some(row.record_version))
-                    {
-                        slot.next_due_at = turn_start;
-                        store.publish_if_current(
-                            &key,
-                            slot.incarnation,
-                            slot.attempt_sequence,
-                            slot,
+                    let Some(acceleration) = refresh::replaced_record_acceleration(
+                        observed_version,
+                        row.record_version,
+                        &row.state,
+                        reactivated_ids.contains(credential_id),
+                        slot.next_due_at,
+                        turn_start,
+                    ) else {
+                        continue;
+                    };
+                    // Logged only when a backoff was actually discarded; a slot
+                    // that was already due would otherwise print on every routine
+                    // refresh. It is this module's only record that a credential
+                    // failure was followed by an accelerated recovery: the degraded
+                    // window is usually shorter than a consumer's polling interval,
+                    // so nothing on the wire shows it either.
+                    if let Some(discarded) = acceleration.discarded_backoff {
+                        eprintln!(
+                            "{LOG_TAG} {} vault record {}, backoff cleared: {credential_id} \
+                             record_version {observed_version:?} -> Some({}), discarded {:.1}s of backoff",
+                            key.provider,
+                            if acceleration.reactivated {
+                                "reactivated"
+                            } else {
+                                "replaced"
+                            },
+                            row.record_version,
+                            discarded.as_secs_f64(),
                         );
                     }
+                    slot.next_due_at = turn_start;
+                    store.publish_if_current(&key, slot.incarnation, slot.attempt_sequence, slot);
                 }
             }
             store.mark_tick(turn_start);

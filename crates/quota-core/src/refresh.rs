@@ -842,6 +842,51 @@ fn next_slot_after_attempt_inner(
     }
 }
 
+/// A vault row seen by the turn's credential listing that should make its slot
+/// due now.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReplacedRecordAcceleration {
+    /// The row was reactivated rather than re-sealed.
+    pub reactivated: bool,
+    /// How much backoff was cut short, when the slot was not already due.
+    pub discarded_backoff: Option<Duration>,
+}
+
+/// Whether a vault row seen by the turn's listing makes its slot due now.
+///
+/// A repaired credential is re-sealed at a higher `record_version`; fetching it
+/// at once instead of waiting out a backoff is what lets a repair show within
+/// one turn. Reactivation clears `needs_reauth` without a new version, so it
+/// accelerates on its own signal.
+///
+/// THE VERSION COMPARISON NEEDS A VERSION TO COMPARE. A slot whose observation
+/// carries no `record_version` -- one that has never served, or a lane whose
+/// provider records none, as cookie and api-key lanes do -- has no basis to call
+/// the row "replaced". Treating that absence as a mismatch made such a slot due
+/// on EVERY turn, so a dead credential in non-transient backoff was fetched
+/// every minute instead of every five. Absence of a basis waits out the backoff,
+/// as it did before the scoped cutover.
+pub fn replaced_record_acceleration(
+    observed_version: Option<u64>,
+    row_version: u64,
+    row_state: &str,
+    reactivated: bool,
+    next_due_at: Instant,
+    turn_start: Instant,
+) -> Option<ReplacedRecordAcceleration> {
+    if row_state == "needs_reauth" {
+        return None;
+    }
+    let replaced = observed_version.is_some_and(|observed| observed != row_version);
+    if !reactivated && !replaced {
+        return None;
+    }
+    Some(ReplacedRecordAcceleration {
+        reactivated,
+        discarded_backoff: (next_due_at > turn_start).then(|| next_due_at - turn_start),
+    })
+}
+
 /// Whether this slot should ask the vault for `credential.status` on this turn.
 ///
 /// Only a vault-backed slot in non-transient backoff, and only once per

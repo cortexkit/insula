@@ -9322,6 +9322,7 @@ struct ScriptedSiteProvider {
     family: &'static str,
     loader: Arc<VaultHandleLoader>,
     site: Arc<std::sync::atomic::AtomicU8>,
+    fetches: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -9337,6 +9338,7 @@ impl UsageProvider for ScriptedSiteProvider {
     }
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
         let error = match self.site.load(Ordering::SeqCst) {
             SITE_REJECTS => FetchError::Unauthorized("session expired".to_string()),
             SITE_FAILS_TRANSIENTLY => FetchError::Upstream("HTTP 503".to_string()),
@@ -9381,6 +9383,7 @@ async fn a_deposited_cookies_first_rejection_after_serving_is_recorded() {
             family,
             loader: Arc::clone(&loader),
             site: Arc::clone(&site),
+            fetches: Arc::new(AtomicUsize::new(0)),
         })
     };
     let providers = vec![
@@ -9433,6 +9436,96 @@ async fn a_deposited_cookies_first_rejection_after_serving_is_recorded() {
         reported("apikey:openrouter"),
         None,
         "only cookie credentials are session lifetimes; an api key must not be recorded"
+    );
+}
+
+/// A vault slot whose observation carries no record version is not "replaced"
+/// by the listing, so a failing one stays in its backoff.
+///
+/// After the scoped cutover the listing compared `observed != Some(row)`, which
+/// is true on every turn when the observation holds no version -- cookie and
+/// api-key lanes record none -- so a rejected credential was fetched every
+/// minute instead of waiting out its five-minute backoff. Driven through real
+/// turns: the listing reports the same row each turn, and the only thing that
+/// may fetch the slot is the backoff expiring.
+#[tokio::test]
+async fn a_slot_with_no_observed_version_stays_in_backoff_across_listings() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let row = || {
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("cookie:ollama.com:ufuk", "cookie", 3, "active")],
+        ))
+    };
+    let source = Arc::new(ScriptedScopedSource::new(vec![row(), row(), row(), row()]));
+    let site = Arc::new(std::sync::atomic::AtomicU8::new(SITE_REJECTS));
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let provider: Box<dyn UsageProvider> = Box::new(ScriptedSiteProvider {
+        name: "ollama",
+        family: "cookie:ollama.com",
+        loader: Arc::clone(&loader),
+        site: Arc::clone(&site),
+        fetches: Arc::clone(&fetches),
+    });
+    let registry = scoped_registry(vec![provider], loader, source);
+
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 1, "the first turn fetches");
+    for turn in 2..=4 {
+        tick(&registry).await;
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "turn {turn}: an unchanged row with no observed version must not end the backoff"
+        );
+    }
+}
+
+/// The decision behind the listing's acceleration, both arms and the log gate.
+#[test]
+fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_backoff() {
+    use crate::refresh::{replaced_record_acceleration, ReplacedRecordAcceleration};
+    let now = Instant::now();
+    let backoff = now + Duration::from_secs(240);
+
+    assert_eq!(
+        replaced_record_acceleration(Some(212), 213, "active", false, backoff, now),
+        Some(ReplacedRecordAcceleration {
+            reactivated: false,
+            discarded_backoff: Some(Duration::from_secs(240)),
+        }),
+        "a re-sealed record ends the backoff and says how much it discarded"
+    );
+    assert_eq!(
+        replaced_record_acceleration(Some(212), 213, "active", false, now, now),
+        Some(ReplacedRecordAcceleration {
+            reactivated: false,
+            discarded_backoff: None,
+        }),
+        "a slot already due discards nothing, so nothing is announced"
+    );
+    assert_eq!(
+        replaced_record_acceleration(None, 213, "active", false, backoff, now),
+        None,
+        "no observed version is no basis to call the record replaced"
+    );
+    assert_eq!(
+        replaced_record_acceleration(Some(213), 213, "active", false, backoff, now),
+        None,
+        "an unchanged record keeps its backoff"
+    );
+    assert_eq!(
+        replaced_record_acceleration(None, 213, "active", true, backoff, now),
+        Some(ReplacedRecordAcceleration {
+            reactivated: true,
+            discarded_backoff: Some(Duration::from_secs(240)),
+        }),
+        "reactivation keeps no version bump, so it accelerates on its own signal"
+    );
+    assert_eq!(
+        replaced_record_acceleration(Some(212), 213, "needs_reauth", true, backoff, now),
+        None,
+        "a latched record is never fetched"
     );
 }
 
