@@ -1783,6 +1783,20 @@ meaningless. Do not assume a restart is visible any other way — a
 process-lifetime counter that resets to the value it already had reads as
 perfectly continuous.
 
+**`epoch` is an identifier, not a timestamp, though it looks like one.** It is
+formatted from the wall clock at the moment the ring was created, so it inherits
+whatever that clock said. A host that boots with a wrong clock and corrects it
+seconds later keeps a mis-dated `epoch` for the life of the process: measured on
+a consumer's host, two hours ahead, after an RTC read as UTC was corrected by
+time sync about 40 seconds into boot. Compared for change, as above, that is
+harmless, because a wrong value still changes on restart. Read as "when the
+module started", it is wrong with nothing on the wire to say so, and after the
+first hours it is not even implausible. This module publishes no start time of
+its own; the supervisor reports one (`ck module status insula`, "started ... ago"),
+and that is the place to ask. Per-record `at` stamps do not share the hazard in that
+boot window: a drop needs two successful readings at least one poll apart, so no
+record can be written in the seconds before the clock is corrected.
+
 **Every record carries both `seq` and `at`**, so a consumer that lost its cursor
 re-derives its position from the last line of its own log rather than keeping
 separate durable state. The state you keep in memory is exactly the state that
