@@ -13,6 +13,20 @@
 //! `OpenCode/OpenCodeWebCookieSupport.swift` at CodexBar v0.64.1 (cookie names:
 //! `auth` / `__Host-auth` for the legacy pages, `__Host-console_session` for the
 //! console OpenCode migrated workspaces to).
+//!
+//! MIGRATED ACCOUNTS -- live-verified 2026-09-23. OpenCode has moved accounts to
+//! a new console. For a migrated account the workspaces server function answers
+//! HTTP 200 with a serialised redirect to `/console/login` in the body, which the
+//! signed-out markers match. That is not an expired session: in the same minute
+//! the same cookie jar was accepted by the console (`opencodego` read
+//! `/console/api/orgs` and `/console/api/go/status` through it). So a signed-out
+//! verdict from the workspaces call is checked against the console first: if
+//! the console lists a workspace, the account is published as moved (a Decode,
+//! the fix being ours), and only a console 401 -- or a console that cannot answer
+//! -- keeps the expired-session verdict. There is no console endpoint for Zen
+//! usage known here: CodexBar v0.65.0 has the same gap (no console lane for Zen
+//! usage), so a parity round should check whether
+//! upstream later reads Zen from the console, and port that instead.
 
 use std::{sync::Arc, time::Duration};
 
@@ -304,15 +318,35 @@ pub async fn fetch_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
 ) -> Result<String, FetchError> {
-    fetch_workspace_id_at(client, cookie, SERVER_BASE).await
+    fetch_workspace_id_at(client, cookie, SERVER_BASE, Some(ORIGIN)).await
 }
 
-/// [`fetch_workspace_id`] against an explicit server base, so the console-first
-/// fallback in `opencodego` can be driven against a loopback server in tests.
+/// Ask the OpenCode console whether it accepts this cookie, answering with the
+/// first workspace id it lists.
+///
+/// The same console call the provider makes before it publishes a signed-out
+/// verdict for the workspaces stage, exposed so a diagnostic asks the real
+/// thing rather than a copy of it. `Unauthorized` means the console answered
+/// 401: the session really is expired.
+pub async fn fetch_console_workspace_id(
+    client: &reqwest::Client,
+    cookie: &str,
+) -> Result<String, FetchError> {
+    crate::opencodego::fetch_console_workspace_id(client, cookie, ORIGIN).await
+}
+
+/// [`fetch_workspace_id`] against an explicit server base, so both providers
+/// can be driven against a loopback server in tests.
+///
+/// `console_origin` is where to ask the console before publishing a signed-out
+/// verdict (see [`signed_out_verdict`]). `None` skips that check, for a caller
+/// that has already asked the console itself -- `opencodego` reads the console
+/// first and only reaches this call once the console has failed.
 pub(crate) async fn fetch_workspace_id_at(
     client: &reqwest::Client,
     cookie: &str,
     server_base: &str,
+    console_origin: Option<&str>,
 ) -> Result<String, FetchError> {
     let get_url = server_get_url_at(server_base, WORKSPACES_SERVER_ID, None);
     let text = server_get(
@@ -323,9 +357,7 @@ pub(crate) async fn fetch_workspace_id_at(
     )
     .await?;
     if looks_signed_out(&text) {
-        return Err(FetchError::Unauthorized(
-            "opencode session expired (workspace fetch)".to_string(),
-        ));
+        return Err(signed_out_verdict(client, cookie, console_origin, "workspace fetch").await);
     }
     // Checked before the retry, for the same reason it is checked on the
     // subscription call: an empty result and a stated "there is nothing here"
@@ -350,9 +382,7 @@ pub(crate) async fn fetch_workspace_id_at(
             .map_err(|error| error.stage("workspaces POST"))?;
         let fallback = String::from_utf8_lossy(&body);
         if looks_signed_out(&fallback) {
-            return Err(FetchError::Unauthorized(
-                "opencode session expired (workspace POST)".to_string(),
-            ));
+            return Err(signed_out_verdict(client, cookie, console_origin, "workspace POST").await);
         }
         if is_explicit_null(&fallback) {
             return Err(FetchError::NoQuotaReported(
@@ -364,6 +394,49 @@ pub(crate) async fn fetch_workspace_id_at(
     ids.into_iter().next().ok_or_else(|| {
         FetchError::Decode("opencode: missing workspace id in _server response".to_string())
     })
+}
+
+/// The error to publish when the workspaces call reads as signed out.
+///
+/// That reading is a substring match (`login` and friends), and for an account
+/// OpenCode has moved to its console the legacy call answers HTTP 200 with a
+/// serialised redirect to `/console/login` on a session that is perfectly
+/// valid. Publishing that as an expired session sends the operator to sign in
+/// again, which cannot help, and counts toward the stale-login health metric.
+/// So the console is asked first, with the same cookie:
+///
+/// - it lists a workspace: the session is valid and the account is on the
+///   console, where this module cannot read Zen usage yet. Published as
+///   `Decode` because the missing piece is ours (a console port), and `Decode`
+///   is not counted as a stale login.
+/// - it answers 401: the session really is expired; the original verdict.
+/// - anything else (transport error, 5xx, unreadable body, empty list): we
+///   cannot tell, so the original verdict stands. This check must never make a
+///   genuinely expired session read as something else.
+async fn signed_out_verdict(
+    client: &reqwest::Client,
+    cookie: &str,
+    console_origin: Option<&str>,
+    stage: &str,
+) -> FetchError {
+    let original = FetchError::Unauthorized(format!("opencode session expired ({stage})"));
+    let moved = || {
+        FetchError::Decode(format!(
+            "opencode: this account has moved to the OpenCode console, whose Zen usage \
+             this module does not read yet (the legacy {stage} answered a sign-in \
+             redirect on a session the console accepts)"
+        ))
+    };
+    let Some(origin) = console_origin else {
+        return original;
+    };
+    match crate::opencodego::fetch_console_workspace_id(client, cookie, origin).await {
+        Ok(_) => moved(),
+        // The console rejected the cookie too: a real expiry.
+        Err(FetchError::Unauthorized(_)) => original,
+        // The console could not answer, so it says nothing about the session.
+        Err(_) => original,
+    }
 }
 
 /// Fetch the billing payload for a workspace.
@@ -452,9 +525,20 @@ pub async fn fetch_subscription_text(
     cookie: &str,
     workspace_id: &str,
 ) -> Result<String, FetchError> {
+    fetch_subscription_text_at(client, cookie, workspace_id, SERVER_BASE).await
+}
+
+/// [`fetch_subscription_text`] against an explicit server base, so the
+/// provider's whole fetch can be driven against a loopback server in tests.
+async fn fetch_subscription_text_at(
+    client: &reqwest::Client,
+    cookie: &str,
+    workspace_id: &str,
+    server_base: &str,
+) -> Result<String, FetchError> {
     let referer = format!("{ORIGIN}/workspace/{workspace_id}/billing");
     let args = vec![workspace_id.to_string()];
-    let get_url = server_get_url(SUBSCRIPTION_SERVER_ID, Some(&args));
+    let get_url = server_get_url_at(server_base, SUBSCRIPTION_SERVER_ID, Some(&args));
     let text = server_get(
         client,
         &get_url,
@@ -482,7 +566,7 @@ pub async fn fetch_subscription_text(
     if parse_windows(&text, now, false).is_err() {
         let post_body = serde_json::to_vec(&args).map_err(|e| FetchError::Decode(e.to_string()))?;
         let post_req = apply_headers(
-            JsonRequest::post_json(SERVER_BASE, post_body).timeout(REQUEST_TIMEOUT),
+            JsonRequest::post_json(server_base, post_body).timeout(REQUEST_TIMEOUT),
             common_server_headers(cookie, SUBSCRIPTION_SERVER_ID, &referer),
         );
         let body = post_req
@@ -877,6 +961,12 @@ fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
 pub struct OpenCodeProvider {
     http: reqwest::Client,
     vault: crate::cookie_vault::CookieVault,
+    /// The legacy server-function endpoint. Production never overrides it;
+    /// tests point it at a loopback server.
+    server_base: String,
+    /// The console origin asked before a signed-out verdict is published.
+    /// Overridden only by tests, like `server_base`.
+    console_origin: String,
 }
 
 impl OpenCodeProvider {
@@ -891,6 +981,8 @@ impl OpenCodeProvider {
                 handle_loader,
                 COOKIE_FAMILY,
             ),
+            server_base: SERVER_BASE.to_string(),
+            console_origin: ORIGIN.to_string(),
         }
     }
 }
@@ -915,8 +1007,16 @@ impl UsageProvider for OpenCodeProvider {
                 .vault
                 .cookie_for(handle, load_cookie_header_async)
                 .await?;
-            let workspace_id = fetch_workspace_id(&self.http, &cookie).await?;
-            let text = fetch_subscription_text(&self.http, &cookie, &workspace_id).await?;
+            let workspace_id = fetch_workspace_id_at(
+                &self.http,
+                &cookie,
+                &self.server_base,
+                Some(&self.console_origin),
+            )
+            .await?;
+            let text =
+                fetch_subscription_text_at(&self.http, &cookie, &workspace_id, &self.server_base)
+                    .await?;
             let now = Utc::now().timestamp();
             let usage = parse_windows(&text, now, false)?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
@@ -1386,5 +1486,238 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(percent_from_map(&pct), Some(50.0));
+    }
+}
+
+/// The workspaces stage asks the console before it publishes "signed out".
+///
+/// Every test drives the provider's real `fetch_handle` against one loopback
+/// server standing in for both the legacy server functions and the console, so
+/// the assertion is on what the provider publishes, not on a helper.
+#[cfg(test)]
+mod console_check_tests {
+    use super::*;
+    use crate::opencodego::CONSOLE_WORKSPACES_PATH;
+    use std::sync::Mutex;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// The workspaces answer for a migrated account: HTTP 200 carrying a
+    /// serialised 302 to the console login. The `$R[5]=["location",...]`,
+    /// `status:302,statusText:"Found"` part is the live fragment captured
+    /// 2026-09-23; the envelope around it is the server-function shape.
+    const MIGRATED_WORKSPACES_BODY: &str = concat!(
+        r#";0x000000f1;((self.$R=self.$R||{})["server-fn:18cb"]=[],"#,
+        r#"($R=>$R[0]=new Response(null,{headers:$R[4]=new Headers($R[3]=[$R[5]="#,
+        r#"["location","https://opencode.ai/console/login"]]),status:302,statusText:"Found"}))"#,
+        r#"($R["server-fn:18cb"]))"#,
+    );
+
+    const WORKSPACES_BODY: &str = r#"[{"id":"wrk_TEST123","name":"Default"}]"#;
+    const SUBSCRIPTION_BODY: &str = r#"{
+      "rollingUsage": { "usagePercent": 42.5, "resetInSec": 7200 },
+      "weeklyUsage": { "usagePercent": 10, "resetInSec": 86400 }
+    }"#;
+
+    /// Serve every request with `respond(path_and_query)`, recording each one.
+    async fn serve(
+        respond: impl Fn(&str) -> (u16, &'static str) + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                recorded.lock().unwrap().push(path.clone());
+                let (status, body) = respond(&path);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    /// A vault-backed provider pointed at the loopback server, and its handle.
+    fn loopback_provider(base: &str) -> (OpenCodeProvider, CredentialHandle) {
+        struct DepositedCookie;
+
+        #[async_trait]
+        impl CredentialSource for DepositedCookie {
+            async fn get(
+                &self,
+                _capability: &crate::credential_source::VaultCapability,
+                _min_ttl_ms: u64,
+            ) -> Result<
+                crate::credential_source::VaultCredential,
+                crate::credential_source::VaultGetError,
+            > {
+                Err(crate::credential_source::VaultGetError::FailClosed)
+            }
+
+            async fn get_scoped(
+                &self,
+                _credential_id: &str,
+                _min_ttl_ms: u64,
+            ) -> Result<
+                crate::credential_source::VaultCredential,
+                crate::credential_source::VaultGetError,
+            > {
+                Ok(crate::credential_source::VaultCredential {
+                    payload: b"auth=test; __Host-console_session=synthetic".to_vec(),
+                    expires_at_ms: None,
+                    record_version: 1,
+                    account_id: None,
+                    email: None,
+                    org_name: None,
+                    project_id: None,
+                })
+            }
+
+            async fn report_auth_failure(
+                &self,
+                _capability: &crate::credential_source::VaultCapability,
+                _provider_status: u16,
+                _record_version: u64,
+            ) {
+            }
+        }
+
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("cookie:opencode.ai:test", "cookie")]);
+        let mut provider =
+            OpenCodeProvider::new_with_handle_loader(Some(Arc::new(DepositedCookie)), loader);
+        provider.server_base = format!("{base}/_server");
+        provider.console_origin = base.to_string();
+        let handle = provider.handles().unwrap().into_iter().next().unwrap();
+        (provider, handle)
+    }
+
+    /// The legacy workspaces call answers the migrated redirect, and the console
+    /// answers `console_status` / `console_body`. Returns the published error and
+    /// the paths the loopback saw.
+    async fn signed_out_workspaces_with_console(
+        console_status: u16,
+        console_body: &'static str,
+    ) -> (FetchError, Vec<String>) {
+        let (base, requests) = serve(move |path| {
+            if path == CONSOLE_WORKSPACES_PATH {
+                return (console_status, console_body);
+            }
+            (200, MIGRATED_WORKSPACES_BODY)
+        })
+        .await;
+        let (provider, handle) = loopback_provider(&base);
+        let error = provider
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect_err("a signed-out workspaces answer must fail the fetch");
+        let seen = requests.lock().unwrap().clone();
+        (error, seen)
+    }
+
+    /// A migrated account on a valid session, as observed live on 2026-09-23.
+    ///
+    /// The legacy call reads as signed out, the console lists a workspace on the
+    /// same cookie, so the account is published as moved -- a decode failure,
+    /// which does not tell anyone to sign in again.
+    #[tokio::test]
+    async fn a_migrated_account_the_console_accepts_is_not_an_expired_session() {
+        assert!(
+            looks_signed_out(MIGRATED_WORKSPACES_BODY),
+            "the fixture must be one the legacy call reads as signed out"
+        );
+        let (error, seen) = signed_out_workspaces_with_console(200, WORKSPACES_BODY).await;
+
+        assert_eq!(
+            error.error_class(),
+            "decode_failed",
+            "a session the console accepts is not expired: {error}"
+        );
+        assert!(
+            error.to_string().contains("moved to the OpenCode console"),
+            "the message must name the console: {error}"
+        );
+        assert!(
+            seen.iter().any(|path| path == CONSOLE_WORKSPACES_PATH),
+            "the console must have been asked: {seen:?}"
+        );
+    }
+
+    /// A console 401 confirms the expiry, so the verdict is unchanged.
+    #[tokio::test]
+    async fn a_console_401_keeps_the_expired_session_verdict() {
+        let (error, seen) =
+            signed_out_workspaces_with_console(401, r#"{"message":"Unauthorized"}"#).await;
+
+        assert!(
+            matches!(&error, FetchError::Unauthorized(m) if m.contains("workspace fetch")),
+            "a real expiry must still read as one: {error:?}"
+        );
+        assert_eq!(error.error_class(), "credential_rejected");
+        assert!(
+            seen.iter().any(|path| path == CONSOLE_WORKSPACES_PATH),
+            "the console must have been asked: {seen:?}"
+        );
+    }
+
+    /// A console that cannot answer says nothing about the session, so the
+    /// original verdict stands.
+    #[tokio::test]
+    async fn a_console_that_cannot_answer_keeps_the_expired_session_verdict() {
+        let (error, seen) = signed_out_workspaces_with_console(503, "unavailable").await;
+
+        assert!(
+            matches!(&error, FetchError::Unauthorized(m) if m.contains("workspace fetch")),
+            "an unanswered console must not change the verdict: {error:?}"
+        );
+        assert_eq!(error.error_class(), "credential_rejected");
+        assert!(
+            seen.iter().any(|path| path == CONSOLE_WORKSPACES_PATH),
+            "the console must have been asked: {seen:?}"
+        );
+    }
+
+    /// A working account never pays for the console check.
+    #[tokio::test]
+    async fn a_healthy_workspaces_answer_never_asks_the_console() {
+        let (base, requests) = serve(|path| {
+            if path.contains(SUBSCRIPTION_SERVER_ID) {
+                return (200, SUBSCRIPTION_BODY);
+            }
+            if path.contains(WORKSPACES_SERVER_ID) {
+                return (200, r#"id:"wrk_TEST123",name:"Default""#);
+            }
+            (500, "unexpected request")
+        })
+        .await;
+        let (provider, handle) = loopback_provider(&base);
+
+        let usage = provider
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect("a healthy account must fetch");
+        assert_eq!(usage.primary.expect("rolling window").used_percent, 42.5);
+
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "workspaces then subscription only: {seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.starts_with("/console")),
+            "a healthy account must not touch the console: {seen:?}"
+        );
     }
 }

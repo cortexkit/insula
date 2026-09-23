@@ -181,7 +181,10 @@ fn is_console_workspace_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-async fn fetch_console_workspace_id(
+/// Also called by `opencode`, which asks the console whether it accepts a
+/// cookie before it publishes a signed-out verdict from its legacy workspaces
+/// call. A console 401 comes back as `Unauthorized`.
+pub(crate) async fn fetch_console_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
     origin: &str,
@@ -569,7 +572,8 @@ async fn fetch_go_usage(
             if !should_try_legacy(&console_error, cookie) {
                 return Err(console_error);
             }
-            match fetch_workspace_id_at(client, cookie, &endpoints.server_base).await {
+            // No console check inside: the console has just been asked and failed.
+            match fetch_workspace_id_at(client, cookie, &endpoints.server_base, None).await {
                 Ok(id) => id,
                 Err(legacy_error) => {
                     return Err(resolve_dual_failure(console_error, legacy_error, cookie));

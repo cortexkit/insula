@@ -50,6 +50,11 @@ async fn explain_workspaces_answer(client: &reqwest::Client, cookie: &str) {
         }
         None => println!("    matched    nothing (the verdict came from somewhere else)"),
     }
+    // The provider asks this same console call before it believes "signed out".
+    match opencode::fetch_console_workspace_id(client, cookie).await {
+        Ok(_) => println!("    console    ACCEPTS this cookie (account moved, session valid)"),
+        Err(error) => println!("    console    does not accept it: {error}"),
+    }
 }
 
 #[tokio::main]
