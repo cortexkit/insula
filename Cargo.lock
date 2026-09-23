@@ -191,8 +191,8 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.1"
-source = "git+https://github.com/cortexkit/commons.git?rev=b13e7fcee60b42accc256e9c05284ad044b9f8f6#b13e7fcee60b42accc256e9c05284ad044b9f8f6"
+version = "0.3.2"
+source = "git+https://github.com/cortexkit/commons.git?rev=4bfcb4924ac9efea5825e74beed2e39807bfdd17#4bfcb4924ac9efea5825e74beed2e39807bfdd17"
 dependencies = [
  "chrono",
  "cortexkit-store-types",
@@ -219,7 +219,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-store-types"
 version = "0.2.2"
-source = "git+https://github.com/cortexkit/commons.git?rev=b13e7fcee60b42accc256e9c05284ad044b9f8f6#b13e7fcee60b42accc256e9c05284ad044b9f8f6"
+source = "git+https://github.com/cortexkit/commons.git?rev=4bfcb4924ac9efea5825e74beed2e39807bfdd17#4bfcb4924ac9efea5825e74beed2e39807bfdd17"
 dependencies = [
  "serde",
 ]
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.15"
+version = "0.20.20"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.23.0"
+version = "0.24.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
