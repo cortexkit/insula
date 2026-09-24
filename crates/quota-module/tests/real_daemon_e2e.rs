@@ -27,8 +27,8 @@ use std::{
 use tokio::process::{Child, Command};
 
 use common::{
-    connect_consumer, raw_route_frame, route_open, unique_temp_dir, usage_get, wait_for_catalog,
-    MODULE_ID, SETUP_TIMEOUT,
+    connect_consumer, isolate_env, raw_route_frame, route_open, unique_temp_dir, usage_get,
+    wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
@@ -81,7 +81,10 @@ async fn start_real_daemon() -> RealDaemon {
     assert!(quota_module.exists());
 
     let rig = unique_temp_dir("quota-real-daemon");
-    let config_dir = rig.join("config/cortexkit");
+    // Both locations are the ones `isolate_env` gives the daemon below, which
+    // is how the daemon finds this subc.jsonc and where it publishes its
+    // connection file.
+    let config_dir = rig.join("quota-config").join("cortexkit");
     let runtime_dir = rig.join("runtime");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&runtime_dir).unwrap();
@@ -101,10 +104,13 @@ async fn start_real_daemon() -> RealDaemon {
     )
     .unwrap();
 
-    let child = Command::new(&subc_daemon)
-        .env("XDG_CONFIG_HOME", rig.join("config"))
-        .env("CK_QUOTA_STATE_DIR", rig.join("quota-state"))
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
+    // The daemon spawns the module with its own environment, so isolating the
+    // daemon is what isolates the module: an inherited HOME here would have the
+    // module read the developer's real provider sessions and poll their real
+    // accounts. The subc.jsonc above adds nothing to that environment.
+    let mut command = Command::new(&subc_daemon);
+    isolate_env(&mut command, &rig);
+    let child = command
         .env("SUBC_PORT", "0") // ephemeral port
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
