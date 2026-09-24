@@ -9481,6 +9481,71 @@ async fn a_slot_with_no_observed_version_stays_in_backoff_across_listings() {
     }
 }
 
+/// A routine vault refresh of a HEALTHY credential fetches early and reports
+/// nothing; the same bump on a credential whose last fetch failed reports the
+/// backoff it cut.
+///
+/// Driven through real turns so the caller's "is this slot in backoff" input is
+/// under test, not only the decision it feeds.
+#[tokio::test]
+async fn a_healthy_refresh_accelerates_silently_and_a_failed_one_reports() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let listing = |version| {
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", version, "active")],
+        ))
+    };
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        listing(1),
+        listing(2),
+        listing(2),
+        listing(3),
+    ]));
+    let (provider, fetches, versions) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+    let reported = || registry.backoffs_cleared.load(Ordering::SeqCst);
+
+    tick(&registry).await;
+    defer_provider_slots(&registry, "claude", Duration::from_secs(42));
+    versions.store(2, Ordering::SeqCst);
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "a routine refresh still fetches early"
+    );
+    assert_eq!(reported(), 0, "a healthy slot had no backoff to discard");
+
+    // Now the last fetch failed and the slot is in backoff when the vault
+    // re-seals.
+    let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
+    {
+        let mut store = registry.store.lock().unwrap();
+        let mut slot = store
+            .snapshot()
+            .into_iter()
+            .find(|(key, _)| key.handle == handle)
+            .unwrap()
+            .1;
+        slot.last_failure_class = Some(crate::refresh::FetchClass::NonTransient);
+        slot.next_due_at = Instant::now() + Duration::from_secs(240);
+        let (incarnation, sequence) = (slot.incarnation, slot.attempt_sequence);
+        let key = store
+            .snapshot()
+            .into_iter()
+            .find(|(key, _)| key.handle == handle)
+            .unwrap()
+            .0;
+        assert!(store.publish_if_current(&key, incarnation, sequence, slot));
+    }
+    tick(&registry).await;
+    versions.store(3, Ordering::SeqCst);
+    tick(&registry).await;
+    assert_eq!(reported(), 1, "a failed slot's cut backoff is reported");
+}
+
 /// The decision behind the listing's acceleration, both arms and the log gate.
 #[test]
 fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_backoff() {
@@ -9488,8 +9553,10 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
     let now = Instant::now();
     let backoff = now + Duration::from_secs(240);
 
+    let interval = now + Duration::from_secs(42);
+
     assert_eq!(
-        replaced_record_acceleration(Some(212), 213, "active", false, backoff, now),
+        replaced_record_acceleration(Some(212), 213, "active", false, true, backoff, now),
         Some(ReplacedRecordAcceleration {
             reactivated: false,
             discarded_backoff: Some(Duration::from_secs(240)),
@@ -9497,7 +9564,15 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         "a re-sealed record ends the backoff and says how much it discarded"
     );
     assert_eq!(
-        replaced_record_acceleration(Some(212), 213, "active", false, now, now),
+        replaced_record_acceleration(Some(215), 216, "active", false, false, interval, now),
+        Some(ReplacedRecordAcceleration {
+            reactivated: false,
+            discarded_backoff: None,
+        }),
+        "a healthy slot partway through its interval accelerates but discarded no backoff"
+    );
+    assert_eq!(
+        replaced_record_acceleration(Some(212), 213, "active", false, true, now, now),
         Some(ReplacedRecordAcceleration {
             reactivated: false,
             discarded_backoff: None,
@@ -9505,17 +9580,17 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         "a slot already due discards nothing, so nothing is announced"
     );
     assert_eq!(
-        replaced_record_acceleration(None, 213, "active", false, backoff, now),
+        replaced_record_acceleration(None, 213, "active", false, true, backoff, now),
         None,
         "no observed version is no basis to call the record replaced"
     );
     assert_eq!(
-        replaced_record_acceleration(Some(213), 213, "active", false, backoff, now),
+        replaced_record_acceleration(Some(213), 213, "active", false, true, backoff, now),
         None,
         "an unchanged record keeps its backoff"
     );
     assert_eq!(
-        replaced_record_acceleration(None, 213, "active", true, backoff, now),
+        replaced_record_acceleration(None, 213, "active", true, true, backoff, now),
         Some(ReplacedRecordAcceleration {
             reactivated: true,
             discarded_backoff: Some(Duration::from_secs(240)),
@@ -9523,7 +9598,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         "reactivation keeps no version bump, so it accelerates on its own signal"
     );
     assert_eq!(
-        replaced_record_acceleration(Some(212), 213, "needs_reauth", true, backoff, now),
+        replaced_record_acceleration(Some(212), 213, "needs_reauth", true, true, backoff, now),
         None,
         "a latched record is never fetched"
     );

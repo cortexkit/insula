@@ -506,6 +506,10 @@ pub struct Registry {
     /// How long each deposited session cookie kept working before its site
     /// rejected it. See `cookie_lifetime` for why the fetches are the measurement.
     pub(crate) cookie_lifetimes: Mutex<cookie_lifetime::CookieLifetimes>,
+    /// How many "backoff cleared" lines this process has printed. Kept beside
+    /// the line so a test driving real turns can see what it reports; the line
+    /// itself goes to stderr, where no test can read it.
+    pub(crate) backoffs_cleared: std::sync::atomic::AtomicU64,
     credential_source: Option<Arc<dyn CredentialSource>>,
     vault_handle_loader: Option<Arc<vault_handles::VaultHandleLoader>>,
 }
@@ -537,6 +541,7 @@ impl Registry {
             last_admitted_provider: Mutex::new(None),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
             cookie_lifetimes: Mutex::new(cookie_lifetime::CookieLifetimes::default()),
+            backoffs_cleared: std::sync::atomic::AtomicU64::new(0),
             credential_source: None,
             vault_handle_loader: None,
         }
@@ -1353,18 +1358,22 @@ impl Registry {
                         row.record_version,
                         &row.state,
                         reactivated_ids.contains(credential_id),
+                        slot.last_failure_class.is_some(),
                         slot.next_due_at,
                         turn_start,
                     ) else {
                         continue;
                     };
-                    // Logged only when a backoff was actually discarded; a slot
-                    // that was already due would otherwise print on every routine
-                    // refresh. It is this module's only record that a credential
+                    // Logged only when a backoff was actually discarded -- the
+                    // slot's last fetch failed and it was not yet due -- so a
+                    // routine refresh of a healthy credential prints nothing. It
+                    // is this module's only record that a credential
                     // failure was followed by an accelerated recovery: the degraded
                     // window is usually shorter than a consumer's polling interval,
                     // so nothing on the wire shows it either.
                     if let Some(discarded) = acceleration.discarded_backoff {
+                        self.backoffs_cleared
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         eprintln!(
                             "{LOG_TAG} {} vault record {}, backoff cleared: {credential_id} \
                              record_version {observed_version:?} -> Some({}), discarded {:.1}s of backoff",

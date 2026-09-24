@@ -848,7 +848,8 @@ fn next_slot_after_attempt_inner(
 pub struct ReplacedRecordAcceleration {
     /// The row was reactivated rather than re-sealed.
     pub reactivated: bool,
-    /// How much backoff was cut short, when the slot was not already due.
+    /// How much backoff was cut short. `None` when the slot was not in backoff
+    /// (its last fetch succeeded) or was already due.
     pub discarded_backoff: Option<Duration>,
 }
 
@@ -866,11 +867,24 @@ pub struct ReplacedRecordAcceleration {
 /// on EVERY turn, so a dead credential in non-transient backoff was fetched
 /// every minute instead of every five. Absence of a basis waits out the backoff,
 /// as it did before the scoped cutover.
+///
+/// A HEALTHY SLOT IS NOT IN BACKOFF, even though it is not due yet. Its next
+/// fetch sits up to one base interval ahead, and a routine vault refresh
+/// (a new `record_version` on a working credential) pulls it forward. Pulling
+/// it forward is right; calling the skipped interval "discarded backoff" is
+/// not, because the line exists to be the local record that a FAILURE was
+/// recovered from. So `in_backoff` -- the slot's last fetch failed -- gates the
+/// report, not the timing. Caught on a reporter's host within minutes of the
+/// line shipping (insula#20): every refresh of a healthy Claude credential
+/// printed "backoff cleared" with 0-60s "discarded", and the magnitude cannot
+/// tell the cases apart because a repair late in a real backoff also discards
+/// under 60s.
 pub fn replaced_record_acceleration(
     observed_version: Option<u64>,
     row_version: u64,
     row_state: &str,
     reactivated: bool,
+    in_backoff: bool,
     next_due_at: Instant,
     turn_start: Instant,
 ) -> Option<ReplacedRecordAcceleration> {
@@ -883,7 +897,8 @@ pub fn replaced_record_acceleration(
     }
     Some(ReplacedRecordAcceleration {
         reactivated,
-        discarded_backoff: (next_due_at > turn_start).then(|| next_due_at - turn_start),
+        discarded_backoff: (in_backoff && next_due_at > turn_start)
+            .then(|| next_due_at - turn_start),
     })
 }
 
