@@ -4741,19 +4741,41 @@ fn adapter_distinguishes_absent_label_from_unavailable_observation() {
 
 static RESET_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
-struct ResetTempDir {
-    dir: std::path::PathBuf,
+/// A scratch directory under the OS temp root that removes itself when dropped.
+///
+/// Shared by the unit tests across this crate (hence `pub(crate)`) so every
+/// scratch-directory helper cleans up the same way instead of each keeping its
+/// own copy. A test that forgets to remove its directory leaves one behind per
+/// run in the temp root the whole host shares, and those accumulate.
+///
+/// The directory is KEPT when the dropping thread is panicking: a failed test's
+/// files are the evidence for why it failed, and the directory name (prefix,
+/// label, pid, sequence number) says which test left it.
+pub(crate) struct ResetTempDir {
+    pub(crate) dir: std::path::PathBuf,
 }
 
 impl ResetTempDir {
     fn new(label: &str) -> Self {
+        Self::with_prefix("ck-quota-reset", label)
+    }
+
+    /// Create `<temp root>/<prefix>-<label>-<pid>-<sequence>`. The sequence
+    /// number is unique within the process, so two tests passing the same label
+    /// never share a directory.
+    pub(crate) fn with_prefix(prefix: &str, label: &str) -> Self {
         let id = RESET_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "ck-quota-reset-{label}-{}-{id}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{label}-{}-{id}", std::process::id()));
+        // A leftover from a crashed earlier run with the same pid would
+        // otherwise leak its files into this test.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self { dir }
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.dir
     }
 
     fn journal(&self) -> RedemptionJournal {
@@ -4763,6 +4785,13 @@ impl ResetTempDir {
 
 impl Drop for ResetTempDir {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "keeping scratch directory of a failed test: {}",
+                self.dir.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

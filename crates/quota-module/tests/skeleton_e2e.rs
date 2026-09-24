@@ -52,8 +52,8 @@ use tokio::{
 };
 
 use common::{
-    catalog_list, connect_consumer, raw_route_frame, route_open, unique_temp_dir, usage_get, Route,
-    MODULE_ID, SETUP_TIMEOUT,
+    catalog_list, connect_consumer, isolate_env, isolated_env, raw_route_frame, route_open,
+    unique_temp_dir, usage_get, Route, MODULE_ID, SETUP_TIMEOUT,
 };
 
 // ---- in-process daemon -----------------------------------------------------
@@ -535,39 +535,163 @@ impl Drop for ModuleProcess {
     }
 }
 
+/// Whether a spawned module may see the developer's own provider sessions.
+#[derive(Clone, Copy)]
+enum HostSessions {
+    /// Every credential location points inside the rig. The default, and the
+    /// only choice for a test that runs without `--ignored`.
+    Isolated,
+    /// The live proofs, which exist to read a real session: they alone get the
+    /// real home directory back, and only when someone runs them on purpose.
+    /// Reset config and state stay in the rig even then, so a live proof can
+    /// never act on the developer's real reset configuration.
+    Real,
+}
+
+/// The host variables a live proof needs to find a real codex or anthropic
+/// session: the home directory, and the two overrides those providers honour.
+const REAL_SESSION_ENV: &[&str] = &["HOME", "USERPROFILE", "CODEX_HOME", "XDG_DATA_HOME"];
+
 fn quota_module_command(subc_connection_file: &Path, test_temp_dir: &Path) -> Command {
+    quota_module_command_for(subc_connection_file, test_temp_dir, HostSessions::Isolated)
+}
+
+fn quota_module_command_for(
+    subc_connection_file: &Path,
+    test_temp_dir: &Path,
+    sessions: HostSessions,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ck-insula"));
+    isolate_env(&mut command, test_temp_dir);
+    if let HostSessions::Real = sessions {
+        for name in REAL_SESSION_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
     command
         .arg("--subc")
         .arg(subc_connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
-        .env("XDG_CONFIG_HOME", test_temp_dir.join("quota-config"))
-        .env("CK_QUOTA_STATE_DIR", test_temp_dir.join("quota-state"))
-        .env(
-            "CK_QUOTA_VAULT_HANDLES_PATH",
-            test_temp_dir.join("absent-vault-handles.json"),
-        )
         .stderr(process::Stdio::inherit())
         .kill_on_drop(true);
     command
 }
 
-fn spawn_quota_module(subc_connection_file: &Path, test_temp_dir: &Path) -> ModuleProcess {
-    let child = quota_module_command(subc_connection_file, test_temp_dir)
+fn spawn_quota_module(
+    subc_connection_file: &Path,
+    test_temp_dir: &Path,
+    sessions: HostSessions,
+) -> ModuleProcess {
+    let child = quota_module_command_for(subc_connection_file, test_temp_dir, sessions)
         .spawn()
         .expect("spawn quota-module");
     ModuleProcess { child }
 }
 
+/// Set on the probe process `f1_…` spawns; see [`env_probe_prints_its_environment_when_asked`].
+const ENV_PROBE_MARKER: &str = "INSULA_E2E_ENV_PROBE";
+const ENV_PROBE_TEST: &str = "env_probe_prints_its_environment_when_asked";
+const ENV_PROBE_LINE: &str = "env-probe ";
+
+/// Not a test on its own: a no-op unless [`ENV_PROBE_MARKER`] is set. `f1_…`
+/// re-runs this test binary filtered to this one test, under the same
+/// environment isolation the module gets, and reads back what it prints. That
+/// observes the environment a spawned process actually receives, which the
+/// command's own list of explicit variables cannot show: whether everything
+/// else was cleared.
+#[test]
+fn env_probe_prints_its_environment_when_asked() {
+    if std::env::var_os(ENV_PROBE_MARKER).is_none() {
+        return;
+    }
+    for (key, value) in std::env::vars_os() {
+        println!(
+            "{ENV_PROBE_LINE}{}={}",
+            key.to_string_lossy(),
+            value.to_string_lossy()
+        );
+    }
+}
+
+/// The name of every credential-bearing environment variable the providers
+/// read, taken from the source rather than typed out here.
+///
+/// Every such name appears in the provider code as a string literal written in
+/// upper snake case (`"MINIMAX_API_KEY"`, `"GH_TOKEN"`,
+/// `"VOLCENGINE_SECRET_ACCESS_KEY"`). Collecting them by scanning means a
+/// provider added tomorrow is covered without anyone remembering to extend a
+/// list, which is exactly how a hand-typed deny-list goes stale.
+fn provider_secret_env_names() -> std::collections::BTreeSet<String> {
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a source directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    const SECRET_WORDS: &[&str] = &["KEY", "TOKEN", "SECRET", "COOKIE", "PASSWORD"];
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    rust_sources(&manifest.join("src"), &mut sources);
+    rust_sources(&manifest.join("../quota-core/src"), &mut sources);
+
+    let mut names = std::collections::BTreeSet::new();
+    for source in sources {
+        let text = std::fs::read_to_string(&source).expect("read a provider source file");
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b'"' && end > start {
+                let name = &text[start..end];
+                if bytes[start].is_ascii_uppercase()
+                    && SECRET_WORDS.iter().any(|word| name.contains(word))
+                {
+                    names.insert(name.to_owned());
+                }
+                // The closing quote may open the next literal, so look at it again.
+                i = end;
+            } else {
+                i = start;
+            }
+        }
+    }
+    names
+}
+
 #[test]
 fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
-    let temp_dir = Path::new("/isolated-test-rig");
-    let command = quota_module_command(Path::new("/isolated/connection.json"), temp_dir);
-    let env: std::collections::HashMap<_, _> = command
+    let rig = Path::new("/isolated-test-rig");
+    let command = quota_module_command(Path::new("/isolated/connection.json"), rig);
+    let env: HashMap<String, Option<String>> = command
         .as_std()
         .get_envs()
-        .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
         .collect();
+    let set = |name: &str| env.get(name).cloned().flatten();
 
     // Expectations are built with the same path joining the code under test
     // uses, rather than written as literal strings. The property being checked
@@ -576,26 +700,127 @@ fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
     // is the platform's business. A literal picks one platform's separator and
     // fails everywhere else for a reason unrelated to isolation.
     let expect = |name: &str| {
-        temp_dir
-            .join(name)
+        rig.join(name)
             .to_str()
             .expect("the rig path is valid UTF-8")
             .to_owned()
     };
+    assert_eq!(set("XDG_CONFIG_HOME"), Some(expect("quota-config")));
+    assert_eq!(set("CK_QUOTA_STATE_DIR"), Some(expect("quota-state")));
 
-    assert_eq!(
-        env.get("XDG_CONFIG_HOME").map(|value| value.to_string()),
-        Some(expect("quota-config"))
+    // Every root a credential path is resolved from is set, and inside the rig.
+    for name in [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        let value = set(name).unwrap_or_else(|| {
+            panic!("{name} must be set to a rig path, or the module inherits the real one")
+        });
+        assert!(
+            Path::new(&value).starts_with(rig),
+            "{name}={value} must point inside the rig {}",
+            rig.display()
+        );
+    }
+    for (name, value) in &env {
+        if let (true, Some(value)) = (name.starts_with("XDG_"), value) {
+            assert!(
+                Path::new(value).starts_with(rig),
+                "{name}={value} must point inside the rig"
+            );
+        }
+    }
+
+    // The scan must actually find the provider keys, or the checks below
+    // would pass over an empty list. These are two the module is known to
+    // read from the environment.
+    let secrets = provider_secret_env_names();
+    for known in ["MINIMAX_API_KEY", "KIMI_CODE_API_KEY"] {
+        assert!(
+            secrets.contains(known),
+            "the provider-key scan missed {known}; found {secrets:?}"
+        );
+    }
+    let allowed: std::collections::BTreeSet<&str> = isolated_env(rig)
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(common::INHERITED_ENV.iter().copied())
+        .chain(["SUBC_MODULE_ID"])
+        .collect();
+    let leaked_by_allowlist: Vec<_> = allowed
+        .iter()
+        .filter(|name| secrets.contains(**name))
+        .collect();
+    assert!(
+        leaked_by_allowlist.is_empty(),
+        "credential variables must never be on the pass-through list: {leaked_by_allowlist:?}"
+    );
+    for (name, value) in &env {
+        if value.is_some() {
+            assert!(
+                allowed.contains(name.as_str()),
+                "{name} is set on the module command but is not part of the isolated environment"
+            );
+        }
+    }
+
+    // Now what a spawned process actually receives. Seed the probe with a fake
+    // real home and every provider key, as a developer's shell would, then
+    // isolate it exactly as the module is isolated. Any of them surviving means
+    // the inherited environment was not cleared.
+    let mut probe = Command::new(std::env::current_exe().expect("this test binary"));
+    probe.env("HOME", "/leaked-real-home");
+    for name in &secrets {
+        probe.env(name, "leaked-credential");
+    }
+    isolate_env(&mut probe, rig);
+    probe.env(ENV_PROBE_MARKER, "1").args([
+        ENV_PROBE_TEST,
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    let output = probe
+        .as_std_mut()
+        .output()
+        .expect("run the environment probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "environment probe failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let received: HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(ENV_PROBE_LINE))
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert!(
+        received.contains_key(ENV_PROBE_MARKER),
+        "the probe printed no environment, so nothing below would be checked: {stdout}"
     );
     assert_eq!(
-        env.get("CK_QUOTA_STATE_DIR").map(|value| value.to_string()),
-        Some(expect("quota-state"))
+        received.get("HOME").copied(),
+        rig.join("home").to_str(),
+        "the probe must see the rig home, not the caller's"
     );
-    assert_eq!(
-        env.get("CK_QUOTA_VAULT_HANDLES_PATH")
-            .map(|value| value.to_string()),
-        Some(expect("absent-vault-handles.json"))
-    );
+    // macOS adds `__CF_USER_TEXT_ENCODING` (the user's id and text encoding)
+    // to every new process's environment even when the parent passed none, so
+    // it arrives whatever the isolation does. It names no file and no secret.
+    let added_by_os = ["__CF_USER_TEXT_ENCODING"];
+    for name in received.keys() {
+        assert!(
+            allowed.contains(name) || *name == ENV_PROBE_MARKER || added_by_os.contains(name),
+            "{name} reached the spawned process although the isolation does not set it: {received:?}"
+        );
+    }
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
@@ -617,9 +842,11 @@ async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Durat
 /// Stand up daemon + real module, confirm it is in the catalog, and open a route
 /// to its management surface. Returns the live pieces plus an authenticated
 /// consumer already bound to the route `(channel, epoch)`.
-async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Route) {
+async fn open_quota_route(
+    sessions: HostSessions,
+) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Route) {
     let daemon = start_daemon().await;
-    let module = spawn_quota_module(&daemon.connection_file_path, &daemon.temp_dir);
+    let module = spawn_quota_module(&daemon.connection_file_path, &daemon.temp_dir, sessions);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = unique_temp_dir("quota-e2e-project");
@@ -644,8 +871,11 @@ async fn open_quota_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream
 /// provider's result AS IT COMPLETES, so a non-empty array may still be missing
 /// a specific provider mid-sweep; poll until the asserted provider appears (or a
 /// deadline), exactly as a real consumer reading async-refreshed data would.
-async fn drive_usage_get_for(want_provider: &str) -> (TestDaemon, ModuleProcess, Vec<Value>) {
-    let (daemon, module, mut consumer, route) = open_quota_route().await;
+async fn drive_usage_get_for(
+    want_provider: &str,
+    sessions: HostSessions,
+) -> (TestDaemon, ModuleProcess, Vec<Value>) {
+    let (daemon, module, mut consumer, route) = open_quota_route(sessions).await;
     let deadline = Instant::now() + Duration::from_secs(40);
     let mut corr = 3;
     let result = loop {
@@ -667,7 +897,7 @@ async fn drive_usage_get_for(want_provider: &str) -> (TestDaemon, ModuleProcess,
 /// or without a real session (silent-degrade is acceptable here).
 #[tokio::test]
 async fn skeleton_round_trips_usage_get_over_the_wire() {
-    let (_daemon, _module, result) = drive_usage_get_for("codex").await;
+    let (_daemon, _module, result) = drive_usage_get_for("codex", HostSessions::Isolated).await;
     let codex = result
         .iter()
         .find(|e| e["provider"] == "codex")
@@ -995,7 +1225,7 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
 /// wholesale Error frames are reserved for bad-request/unknown-method.
 #[tokio::test]
 async fn unknown_method_returns_error_frame_with_canonical_error_body() {
-    let (_daemon, _module, mut consumer, route) = open_quota_route().await;
+    let (_daemon, _module, mut consumer, route) = open_quota_route(HostSessions::Isolated).await;
 
     // An unknown method on a well-formed body.
     let frame = raw_route_frame(
@@ -1037,7 +1267,7 @@ async fn unknown_method_returns_error_frame_with_canonical_error_body() {
 #[tokio::test]
 #[ignore = "requires a real ~/.codex/auth.json session"]
 async fn skeleton_returns_real_codex_window() {
-    let (_daemon, _module, result) = drive_usage_get_for("codex").await;
+    let (_daemon, _module, result) = drive_usage_get_for("codex", HostSessions::Real).await;
     let codex = result
         .iter()
         .find(|e| e["provider"] == "codex")
@@ -1069,7 +1299,7 @@ async fn skeleton_returns_real_codex_window() {
 #[tokio::test]
 #[ignore = "requires a real anthropic OAuth session in opencode auth.json"]
 async fn skeleton_returns_real_anthropic_window() {
-    let (_daemon, _module, result) = drive_usage_get_for("claude").await;
+    let (_daemon, _module, result) = drive_usage_get_for("claude", HostSessions::Real).await;
     let claude = result
         .iter()
         .find(|e| e["provider"] == "claude")

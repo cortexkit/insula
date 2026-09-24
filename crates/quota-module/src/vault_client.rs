@@ -2419,7 +2419,35 @@ mod tests {
         );
     }
 
-    async fn loopback_listener(label: &str) -> (TcpListener, PathBuf, Vec<u8>, [u8; 16]) {
+    /// The private directory a loopback test's connection file lives in,
+    /// removed with everything in it when the test drops this guard.
+    ///
+    /// Kept when the dropping thread is panicking, so a failed test's
+    /// connection file stays behind for inspection. This mirrors the scratch
+    /// guard in quota-core's unit tests, which this crate cannot reach because
+    /// test-only code is not exported across crates.
+    struct LoopbackDir(PathBuf);
+
+    impl Drop for LoopbackDir {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "keeping connection-file directory of a failed test: {}",
+                    self.0.display()
+                );
+                return;
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Returns the listener, the connection file pointing at it, its key and
+    /// daemon id, and the guard that removes the file's directory. Bind the
+    /// guard to a named variable (`_dir`, not `_`) so it lives until the test
+    /// ends; `_` would drop it, and remove the file, immediately.
+    async fn loopback_listener(
+        label: &str,
+    ) -> (TcpListener, PathBuf, Vec<u8>, [u8; 16], LoopbackDir) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -2446,6 +2474,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("private connection-file dir");
         let path = dir.join(format!("{label}.json"));
+        let dir = LoopbackDir(dir);
         connection_file::write_atomic(
             &path,
             &connection_file::ConnectionInfo {
@@ -2462,7 +2491,7 @@ mod tests {
             },
         )
         .unwrap();
-        (listener, path, key, daemon_id)
+        (listener, path, key, daemon_id, dir)
     }
 
     static NEXT_LOOPBACK_ID: AtomicU64 = AtomicU64::new(0);
@@ -2526,7 +2555,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_scoped_serializes_the_120_second_floor() {
-        let (listener, path, key, daemon_id) = loopback_listener("get-scoped-floor").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("get-scoped-floor").await;
         let server = tokio::spawn(async move {
             let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
             reply_route(&mut stream, 7, 3).await;
@@ -2563,12 +2592,11 @@ mod tests {
         assert_eq!(credential.payload, b"vault-token");
         assert_eq!(credential.record_version, 41);
         server.await.unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn scoped_status_and_report_use_only_the_credential_id() {
-        let (listener, path, key, daemon_id) = loopback_listener("scoped-addresses").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("scoped-addresses").await;
         let server = tokio::spawn(async move {
             let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
             reply_route(&mut stream, 7, 3).await;
@@ -2632,7 +2660,6 @@ mod tests {
             .report_auth_failure_scoped("apikey:deepseek", 401, 41)
             .await;
         server.await.unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3060,7 +3087,7 @@ mod tests {
     /// if it was retained the second call reuses it and the count stays at 1.
     #[tokio::test]
     async fn a_timed_out_call_discards_the_connection_it_could_not_reach() {
-        let (listener, path, key, daemon_id) = loopback_listener("wedged").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("wedged").await;
         // A daemon that accepts, completes the handshake and the route, and then
         // never answers -- the observable shape of a connection that died
         // without closing. It accepts twice, so a client that DOES reconnect is
@@ -3103,12 +3130,11 @@ mod tests {
         );
 
         server.abort();
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn i9_public_client_timeout_deregisters_and_discards_late_response() {
-        let (listener, path, key, daemon_id) = loopback_listener("timeout").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("timeout").await;
         // The client timeout must fire strictly BETWEEN the request being sent
         // and the response arriving, on any runner speed: the 1s budget is
         // generous for loopback connect + auth + route.open (so the request is
@@ -3153,12 +3179,11 @@ mod tests {
         // The late credential.get response arrived after the timeout: it must
         // have been discarded without reviving or leaking a pending entry.
         assert!(client.state.pending.lock().unwrap().is_empty());
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn i9_public_client_connection_death_completes_waiters() {
-        let (listener, path, key, daemon_id) = loopback_listener("connection-death").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("connection-death").await;
         let server = tokio::spawn(async move {
             let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
             reply_route(&mut stream, 7, 3).await;
@@ -3180,12 +3205,11 @@ mod tests {
         assert_eq!(second.unwrap_err(), VaultGetError::Transient);
         assert!(client.state.pending.lock().unwrap().is_empty());
         server.await.unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn i9_public_client_unknown_channel_reopens_route_on_same_connection() {
-        let (listener, path, key, daemon_id) = loopback_listener("route-reopen").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("route-reopen").await;
         let accepts = Arc::new(AtomicU64::new(0));
         let server_accepts = Arc::clone(&accepts);
         let server = tokio::spawn(async move {
@@ -3222,7 +3246,6 @@ mod tests {
         assert_eq!(credential.payload, b"recovered-token");
         server.await.unwrap();
         assert_eq!(accepts.load(Ordering::Relaxed), 1);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3573,7 +3596,7 @@ mod tests {
     /// already given its answer.
     #[tokio::test]
     async fn an_absent_credential_module_is_not_retried_inside_one_call() {
-        let (listener, path, key, daemon_id) = loopback_listener("module-absent").await;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("module-absent").await;
         let frames_after_refusal = Arc::new(AtomicU64::new(0));
         let server_frames = Arc::clone(&frames_after_refusal);
         let server = tokio::spawn(async move {
@@ -3615,7 +3638,6 @@ mod tests {
             0,
             "an absent module was asked again inside the same call"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

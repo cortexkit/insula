@@ -9,6 +9,7 @@
 //! only differ in how the daemon is stood up.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -55,6 +56,62 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
 }
 
+/// Variables a spawned test process inherits from the test runner, and why.
+///
+/// Everything else is cleared. These are the Windows system locations the OS
+/// libraries resolve themselves through: without `SYSTEMROOT` Winsock cannot
+/// initialise, and the module could not open a socket at all. None of them
+/// names a user or a credential. Unix needs nothing from the parent: a run with
+/// an empty inherited environment passes the whole e2e suite.
+pub const INHERITED_ENV: &[&str] = &["SYSTEMROOT", "SYSTEMDRIVE", "WINDIR"];
+
+/// Every variable a credential location is resolved from, pointed inside `rig`.
+///
+/// The module discovers provider sessions by reading files relative to the
+/// home directory and the XDG / Windows profile roots. Inheriting any of them
+/// from a developer's shell makes the suite read that developer's real
+/// credentials and poll their real accounts -- including OAuth refresh grants
+/// and usage polls that spend a shared per-account rate limit -- while the
+/// tests still pass, because they accept a degraded entry as readily as a
+/// healthy one. Pointing them at the rig makes every such read find nothing.
+///
+/// The directories need not exist: a missing credential file is the "no
+/// session" case the module already handles.
+pub fn isolated_env(rig: &Path) -> Vec<(&'static str, OsString)> {
+    let home = rig.join("home");
+    let mut env: Vec<(&'static str, OsString)> = vec![
+        ("HOME", home.clone().into()),
+        ("USERPROFILE", home.clone().into()),
+        ("APPDATA", home.join("AppData").join("Roaming").into()),
+        ("LOCALAPPDATA", home.join("AppData").join("Local").into()),
+        ("XDG_CONFIG_HOME", rig.join("quota-config").into()),
+        ("XDG_DATA_HOME", rig.join("xdg-data").into()),
+        ("XDG_STATE_HOME", rig.join("xdg-state").into()),
+        ("XDG_CACHE_HOME", rig.join("xdg-cache").into()),
+        ("XDG_RUNTIME_DIR", rig.join("runtime").into()),
+        ("CK_QUOTA_STATE_DIR", rig.join("quota-state").into()),
+    ];
+    for name in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            env.push((name, value));
+        }
+    }
+    env
+}
+
+/// Replace `command`'s whole environment with [`isolated_env`].
+///
+/// Clearing first, rather than overriding a list of known variables, is the
+/// point: a provider key such as `MINIMAX_API_KEY` exported in the developer's
+/// shell is read straight from the environment, and a deny-list goes stale the
+/// day a provider adds a new variable. Anything set on `command` before this
+/// call is discarded too, so set extra variables afterwards.
+pub fn isolate_env<'a>(
+    command: &'a mut tokio::process::Command,
+    rig: &Path,
+) -> &'a mut tokio::process::Command {
+    command.env_clear().envs(isolated_env(rig))
+}
 /// Connect to a daemon from its connection file and complete the client HMAC
 /// handshake. Works identically for the in-process and real-binary daemons.
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {

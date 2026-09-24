@@ -1575,28 +1575,18 @@ mod tests {
     /// Separate from the gate test below because that one sets both signals at
     /// once: an account reported as limited *and* at 100%. Either term alone
     /// refuses that fixture, so it cannot show that both are required.
-    /// A per-test scratch directory, matching the idiom used elsewhere in this
-    /// crate rather than adding a dependency for two tests. Named so a failure
-    /// leaves an inspectable directory behind.
+    /// A per-test scratch directory, removed when the returned guard drops and
+    /// kept for inspection when the test panicked. Built on the crate's shared
+    /// [`crate::tests::ResetTempDir`] rather than adding a dependency.
     ///
-    /// The counter is load-bearing, not decoration. Two tests in this file
-    /// briefly shared a directory because they were given the same label and the
-    /// timestamp resolved identically -- one test then read the other's journal
-    /// and failed with a confusing mismatch. A monotonic counter makes a
-    /// collision impossible regardless of what labels callers choose.
-    fn scratch_dir(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "insula-journal-{label}-{seq}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// Each directory gets a process-wide sequence number, and that is
+    /// load-bearing: two tests in this file once briefly shared a directory
+    /// because they were given the same label and a timestamp resolved
+    /// identically -- one test then read the other's journal and failed with a
+    /// confusing mismatch. A monotonic counter makes a collision impossible
+    /// regardless of what labels callers choose.
+    fn scratch_dir(label: &str) -> crate::tests::ResetTempDir {
+        crate::tests::ResetTempDir::with_prefix("insula-journal", label)
     }
 
     fn tick_credits(count: usize, expiry: DateTime<Utc>) -> CreditsSnapshot {
@@ -1843,8 +1833,8 @@ mod tests {
     /// symptom is a consume attempt every tick.
     #[test]
     fn a_consume_that_burned_no_credit_still_holds_the_spend_bound() {
-        let dir = scratch_dir("spend-bound-outcome");
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = scratch_dir("spend-bound-outcome");
+        let dir = scratch.path();
         let journal = RedemptionJournal::new(dir.join("redemptions.json"));
         let now = Utc::now();
 
@@ -1866,7 +1856,6 @@ mod tests {
                 outcome.as_code()
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// And it releases once the bound has passed.
@@ -1875,8 +1864,8 @@ mod tests {
     /// satisfy the test above and disarm the feature entirely.
     #[test]
     fn the_spend_bound_releases_once_it_has_elapsed() {
-        let dir = scratch_dir("spend-bound-elapsed");
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = scratch_dir("spend-bound-elapsed");
+        let dir = scratch.path();
         let journal = RedemptionJournal::new(dir.join("redemptions.json"));
         let now = Utc::now();
         // One second past the bound, derived from the constant rather than a
@@ -1898,7 +1887,6 @@ mod tests {
             state.spend_bound_allows,
             "past the bound the fence must release, or the feature never fires again"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A PENDING record outlives the retention horizon; only RESOLVED ones age out.
@@ -1921,8 +1909,8 @@ mod tests {
     /// constant moves.
     #[test]
     fn a_pending_record_survives_the_resolved_retention_horizon() {
-        let dir = scratch_dir("pending-survives-retention");
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = scratch_dir("pending-survives-retention");
+        let dir = scratch.path();
         let journal = RedemptionJournal::new(dir.join("redemptions.json"));
         let now = Utc::now();
         let ancient = now - chrono::Duration::seconds(RESOLVED_RETENTION_SECS + 1);
@@ -1983,8 +1971,6 @@ mod tests {
              remain -- if both survive the retention rule does nothing, and if \
              both vanish the unconfirmed request id is lost"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only the environment-resolving constructor may migrate.
@@ -2062,7 +2048,8 @@ mod tests {
     /// corrupt file is left exactly where it is, so an operator can look at it.
     #[test]
     fn an_unreadable_current_journal_refuses_adoption_rather_than_being_overwritten() {
-        let dir = scratch_dir("adopt-unreadable");
+        let scratch = scratch_dir("adopt-unreadable");
+        let dir = scratch.path();
         let legacy_dir = dir.join("cortexkit/ck-quota");
         let current_dir = dir.join("cortexkit/insula");
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
@@ -2102,7 +2089,8 @@ mod tests {
 
     #[test]
     fn a_journal_at_the_old_location_is_adopted_and_the_old_file_removed() {
-        let dir = scratch_dir("adopt");
+        let scratch = scratch_dir("adopt");
+        let dir = scratch.path();
         let legacy_dir = dir.join("cortexkit/ck-quota");
         let current_dir = dir.join("cortexkit/insula");
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
@@ -2134,7 +2122,8 @@ mod tests {
     /// which is the same double-spend hazard pointing the other way.
     #[test]
     fn a_populated_journal_is_not_overwritten_by_the_legacy_one() {
-        let dir = scratch_dir("no-overwrite");
+        let scratch = scratch_dir("no-overwrite");
+        let dir = scratch.path();
         let legacy_dir = dir.join("cortexkit/ck-quota");
         let current_dir = dir.join("cortexkit/insula");
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");

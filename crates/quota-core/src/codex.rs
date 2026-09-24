@@ -1684,18 +1684,12 @@ mod tests {
     }
 
     /// A scratch codex home, unique per test, with `auth.json` when `login`.
-    fn lane_test_home(name: &str, login: bool) -> PathBuf {
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let home = std::env::temp_dir().join(format!(
-            "ck-quota-codex-lane-{name}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+    /// Removed when the returned guard drops (kept if the test panicked).
+    fn lane_test_home(name: &str, login: bool) -> crate::tests::ResetTempDir {
+        let home = crate::tests::ResetTempDir::with_prefix("ck-quota-codex-lane", name);
         if login {
             std::fs::write(
-                home.join("auth.json"),
+                home.path().join("auth.json"),
                 br#"{"tokens":{"access_token":"t","account_id":"acct-a"}}"#,
             )
             .unwrap();
@@ -1708,8 +1702,9 @@ mod tests {
     /// would keep codex out of `completeProviders` for good.
     #[test]
     fn no_local_login_beside_vault_handles_enumerates_no_local_lane() {
-        let home = lane_test_home("absent-with-vault", false);
-        let handles = provider_for_lane_test(&home, 2).handles().unwrap();
+        let scratch = lane_test_home("absent-with-vault", false);
+        let home = scratch.path();
+        let handles = provider_for_lane_test(home, 2).handles().unwrap();
         assert!(
             !handles.contains(&CredentialHandle::implicit()),
             "{handles:?}"
@@ -1720,8 +1715,9 @@ mod tests {
     /// A local login that exists is the backup for a vault outage and stays.
     #[test]
     fn a_local_login_beside_vault_handles_keeps_the_local_lane() {
-        let home = lane_test_home("present-with-vault", true);
-        let handles = provider_for_lane_test(&home, 1).handles().unwrap();
+        let scratch = lane_test_home("present-with-vault", true);
+        let home = scratch.path();
+        let handles = provider_for_lane_test(home, 1).handles().unwrap();
         assert!(
             handles.contains(&CredentialHandle::implicit()),
             "{handles:?}"
@@ -1734,14 +1730,15 @@ mod tests {
     #[test]
     fn an_unreadable_codex_home_beside_vault_handles_keeps_the_local_lane() {
         use std::os::unix::fs::PermissionsExt;
-        let home = lane_test_home("unreadable-with-vault", false);
+        let scratch = lane_test_home("unreadable-with-vault", false);
+        let home = scratch.path();
         // Built before `home` loses its permissions below, because the
         // provider's redemption journal is created under `home`.
-        let provider = provider_for_lane_test(&home, 1);
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let provider = provider_for_lane_test(home, 1);
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o000)).unwrap();
         let probe = std::fs::symlink_metadata(home.join("auth.json"));
         let handles = provider.handles().unwrap();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Root ignores directory permissions; there the fixture cannot build the
         // case, and the assertion would be about nothing.
         if !matches!(&probe, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied) {
@@ -1758,8 +1755,9 @@ mod tests {
     /// host still reports `credential_absent` rather than nothing.
     #[test]
     fn no_local_login_and_no_vault_keeps_the_local_lane() {
-        let home = lane_test_home("absent-no-vault", false);
-        let handles = provider_for_lane_test(&home, 0).handles().unwrap();
+        let scratch = lane_test_home("absent-no-vault", false);
+        let home = scratch.path();
+        let handles = provider_for_lane_test(home, 0).handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 
