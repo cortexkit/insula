@@ -9793,124 +9793,240 @@ impl CredentialSource for FlakyCodexVaultSource {
     }
 }
 
+/// How the fake codex upstream answers the local `auth.json` bearer.
+#[derive(Clone, Copy)]
+enum LocalCodexLogin {
+    /// A working login: usage at 21%.
+    Healthy,
+    /// A long-expired login: 401 on every request.
+    Expired,
+}
+
+/// A codex provider with one vault row for `acct-a` and a local `auth.json`
+/// login for `local_account`, both pointed at one fake upstream. The vault
+/// bearer always gets usage at 12%; the local bearer is answered per `login`.
+struct CodexVaultAndLocalLogin {
+    registry: Registry,
+    source: Arc<FlakyCodexVaultSource>,
+    local_requests: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+    _temp: ResetTempDir,
+}
+
+impl CodexVaultAndLocalLogin {
+    async fn new(name: &str, local_account: &str, login: LocalCodexLogin) -> Self {
+        let temp = ResetTempDir::new(name);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let local_requests = Arc::new(AtomicUsize::new(0));
+        let server_local_requests = Arc::clone(&local_requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let counter = Arc::clone(&server_local_requests);
+                tokio::spawn(async move {
+                    let mut request = vec![0; 16 * 1024];
+                    let size = stream.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let vault_bearer = request.lines().any(|line| {
+                        line.eq_ignore_ascii_case("authorization: Bearer vault-served-token")
+                    });
+                    if !vault_bearer {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let used_percent = match (vault_bearer, login) {
+                        (true, _) => Some(12.0),
+                        (false, LocalCodexLogin::Healthy) => Some(21.0),
+                        (false, LocalCodexLogin::Expired) => None,
+                    };
+                    let response = match used_percent {
+                        Some(used_percent) => {
+                            let body = serde_json::json!({
+                                "rate_limit": {
+                                    "primary_window": {
+                                        "used_percent": used_percent,
+                                        "reset_at": 1_900_000_000_i64,
+                                        "limit_window_seconds": 604_800
+                                    }
+                                }
+                            })
+                            .to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                        }
+                        None => "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let codex_home = temp.dir.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_owner_only_test_file(
+            &codex_home.join("auth.json"),
+            serde_json::json!({
+                "tokens": {"access_token": "local-token", "account_id": local_account}
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        write_owner_only_test_file(
+            &codex_home.join("config.toml"),
+            format!(
+                "chatgpt_base_url = {:?}\n",
+                format!("http://{address}/backend-api")
+            )
+            .as_bytes(),
+        );
+
+        let loader = Arc::new(VaultHandleLoader::default());
+        let source = Arc::new(FlakyCodexVaultSource {
+            // Surrounding whitespace on the vault side proves both ids are
+            // normalised before they are compared.
+            list: ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+                1,
+                vec![scoped_row_for_account(
+                    "chatgpt:openai",
+                    "oauth",
+                    " acct-a ",
+                )],
+            ))]),
+            gets: AtomicUsize::new(0),
+        });
+        let credential_source: Arc<dyn CredentialSource> = source.clone();
+        let provider = crate::codex::CodexProvider::new_with_handle_loader(
+            crate::config::CodexConfig::default(),
+            Some(Arc::clone(&credential_source)),
+            Arc::clone(&loader),
+        )
+        .with_codex_home_for_test(codex_home);
+        let registry = scoped_registry(vec![Box::new(provider)], loader, credential_source);
+        Self {
+            registry,
+            source,
+            local_requests,
+            server,
+            _temp: temp,
+        }
+    }
+
+    /// One healthy turn, then a turn in which the vault is restarting: the
+    /// listing fails (the scripted source has no more replies) and the
+    /// credential read fails transiently. Returns what is published then.
+    async fn usage_during_vault_flux(&self) -> Vec<ProviderUsage> {
+        tick(&self.registry).await;
+        force_due(&self.registry, "codex");
+        tick(&self.registry).await;
+        assert_eq!(
+            self.source.gets.load(Ordering::SeqCst),
+            2,
+            "the vault slot was refetched"
+        );
+        assert!(
+            provider_slot_ids(&self.registry, "codex")
+                .contains(CredentialHandle::implicit().stable_id()),
+            "the local lane is still enumerated beside the vault"
+        );
+        assert!(
+            self.local_requests.load(Ordering::SeqCst) > 0,
+            "the local lane was fetched"
+        );
+        self.registry.get_usage(Some("codex")).await
+    }
+}
+
+impl Drop for CodexVaultAndLocalLogin {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 /// insula#23: a month-dead `~/.codex/auth.json` for the account the vault
 /// serves. While the vault slot's label was in flux, the local slot -- fetched
 /// with an expired bearer every tick -- became the account's only claimant and
 /// the wire reported a healthy account as `credential_rejected`. The local lane
-/// must not exist at all when the vault holds the same account.
+/// is still fetched (it is the backup for a vault outage), but its failure
+/// must never be published for an account the vault holds.
 #[tokio::test]
-async fn a_stale_local_login_for_a_vault_account_is_never_fetched_or_published() {
-    let temp = ResetTempDir::new("codex-local-lane-served-by-vault");
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let address = listener.local_addr().unwrap();
-    let local_requests = Arc::new(AtomicUsize::new(0));
-    let server_local_requests = Arc::clone(&local_requests);
-    // Answers every request: the vault bearer gets a healthy usage body, any
-    // other bearer (the stale local one) gets the 401 an expired login gets.
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let counter = Arc::clone(&server_local_requests);
-            tokio::spawn(async move {
-                let mut request = vec![0; 16 * 1024];
-                let size = stream.read(&mut request).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&request[..size]);
-                let vault_bearer = request.lines().any(|line| {
-                    line.eq_ignore_ascii_case("authorization: Bearer vault-served-token")
-                });
-                let response = if vault_bearer {
-                    let body = serde_json::json!({
-                        "rate_limit": {
-                            "primary_window": {
-                                "used_percent": 12.0,
-                                "reset_at": 1_900_000_000_i64,
-                                "limit_window_seconds": 604_800
-                            }
-                        }
-                    })
-                    .to_string();
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                } else {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        .to_string()
-                };
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-
-    let codex_home = temp.dir.join("codex-home");
-    std::fs::create_dir_all(&codex_home).unwrap();
-    write_owner_only_test_file(
-        &codex_home.join("auth.json"),
-        br#"{"tokens":{"access_token":"stale-local-token","account_id":"acct-a"}}"#,
-    );
-    write_owner_only_test_file(
-        &codex_home.join("config.toml"),
-        format!(
-            "chatgpt_base_url = {:?}\n",
-            format!("http://{address}/backend-api")
-        )
-        .as_bytes(),
-    );
-
-    let loader = Arc::new(VaultHandleLoader::default());
-    let source = Arc::new(FlakyCodexVaultSource {
-        list: ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
-            1,
-            vec![scoped_row_for_account("chatgpt:openai", "oauth", "acct-a")],
-        ))]),
-        gets: AtomicUsize::new(0),
-    });
-    let credential_source: Arc<dyn CredentialSource> = source.clone();
-    let provider = crate::codex::CodexProvider::new_with_handle_loader(
-        crate::config::CodexConfig::default(),
-        Some(Arc::clone(&credential_source)),
-        Arc::clone(&loader),
+async fn a_stale_local_login_for_a_vault_account_never_publishes_rejected_during_vault_flux() {
+    let fixture = CodexVaultAndLocalLogin::new(
+        "codex-stale-local-lane-vault-account",
+        "acct-a",
+        LocalCodexLogin::Expired,
     )
-    .with_codex_home_for_test(codex_home);
-    let registry = scoped_registry(vec![Box::new(provider)], loader, credential_source);
+    .await;
 
-    tick(&registry).await;
-    let healthy = registry.get_usage(Some("codex")).await;
+    tick(&fixture.registry).await;
+    let healthy = fixture.registry.get_usage(Some("codex")).await;
     assert_eq!(healthy.len(), 1, "{healthy:?}");
     assert_eq!(healthy[0].account.as_deref(), Some("acct-a"));
     assert!(healthy[0].error_class.is_none(), "{healthy:?}");
 
-    // The vault is now restarting: the listing fails (the scripted source has
-    // no more replies) and the credential read fails transiently.
-    force_due(&registry, "codex");
-    tick(&registry).await;
-    assert_eq!(
-        source.gets.load(Ordering::SeqCst),
-        2,
-        "the vault slot was refetched"
-    );
-
-    let during_flux = registry.get_usage(Some("codex")).await;
+    let during_flux = fixture.usage_during_vault_flux().await;
     assert!(
         !during_flux
             .iter()
-            .any(|entry| { entry.error_class.as_deref() == Some("credential_rejected") }),
+            .any(|entry| entry.error_class.as_deref() == Some("credential_rejected")),
         "a healthy vault account must not be published as rejected: {during_flux:?}"
     );
+}
+
+/// The other half of the same lane: when the vault cannot serve a credential,
+/// a HEALTHY local login for the account the vault holds is what keeps that
+/// account visible, labelled, with its own reading.
+#[tokio::test]
+async fn a_healthy_local_login_serves_a_vault_account_labelled_when_the_vault_read_fails() {
+    let fixture = CodexVaultAndLocalLogin::new(
+        "codex-healthy-local-lane-vault-account",
+        "acct-a",
+        LocalCodexLogin::Healthy,
+    )
+    .await;
+
+    let during_flux = fixture.usage_during_vault_flux().await;
+    let served: Vec<_> = during_flux
+        .iter()
+        .filter(|entry| entry.account.as_deref() == Some("acct-a"))
+        .collect();
+    assert_eq!(served.len(), 1, "{during_flux:?}");
+    assert!(served[0].error.is_none(), "{during_flux:?}");
+    let used = served[0]
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.primary.as_ref())
+        .map(|window| window.used_percent);
     assert_eq!(
-        local_requests.load(Ordering::SeqCst),
-        0,
-        "the stale local login must never be fetched"
+        used,
+        Some(21.0),
+        "the local login's reading: {during_flux:?}"
     );
+}
+
+/// The suppression is keyed on the account, not on the vault being present: a
+/// failing local login for an account the vault does NOT hold is that
+/// account's only voice, and its verdict is still published.
+#[tokio::test]
+async fn a_stale_local_login_for_an_account_the_vault_lacks_still_publishes_its_failure() {
+    let fixture = CodexVaultAndLocalLogin::new(
+        "codex-stale-local-lane-other-account",
+        "acct-b",
+        LocalCodexLogin::Expired,
+    )
+    .await;
+
+    let during_flux = fixture.usage_during_vault_flux().await;
     assert!(
-        !provider_slot_ids(&registry, "codex")
-            .iter()
-            .any(|id| *id == CredentialHandle::implicit().stable_id()),
-        "no local slot exists for a vault-served account"
+        during_flux.iter().any(|entry| {
+            entry.account.as_deref() == Some("acct-b")
+                && entry.error_class.as_deref() == Some("credential_rejected")
+        }),
+        "the local account's rejection is published: {during_flux:?}"
     );
-    server.abort();
 }
