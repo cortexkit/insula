@@ -801,6 +801,23 @@ impl Registry {
             .collect()
     }
 
+    /// Accounts the vault holds for `provider`, normalised, for the providers
+    /// whose failing non-vault lanes must not speak for a vault account. Empty
+    /// for every other provider, and when no vault is wired.
+    fn vault_held_accounts(&self, provider: &str) -> HashSet<String> {
+        if provider != codex::PROVIDER_NAME {
+            return HashSet::new();
+        }
+        let Some(loader) = self.vault_handle_loader.as_ref() else {
+            return HashSet::new();
+        };
+        loader
+            .account_ids_for_provider(provider)
+            .into_iter()
+            .filter_map(|account| codex::canonical_account_id(Some(account)))
+            .collect()
+    }
+
     /// Serve usage exclusively from active slot snapshots, discarding the
     /// completeness claim.
     ///
@@ -899,6 +916,50 @@ impl Registry {
                 if enumeration_succeeded {
                     complete_providers.push(name.to_string());
                 }
+                continue;
+            }
+
+            // A FAILING non-vault lane never speaks for an account the vault
+            // holds. Codex keeps its local `auth.json` lane beside the vault
+            // lanes on purpose: when the vault is down, a healthy local login is
+            // the only thing still serving that account, so a SERVING local
+            // entry is kept and deduplicated against the vault row as usual.
+            // But a stale local login for the same account publishes
+            // `credential_rejected`, and while the vault slot's label is in flux
+            // (a vault restart, a cold boot) the vault slot is withheld and that
+            // verdict becomes the account's only entry: a healthy account read
+            // as rejected (insula#23). Dropping the degraded local entry leaves
+            // the account unpublished for that window instead, the ordinary
+            // not-yet-fetched shape of a vault account.
+            //
+            // The vault's accounts come from its retained snapshot, which
+            // survives a failed listing, so they are known during exactly that
+            // window. Only codex is filtered: it is the provider this was
+            // observed on, and whose account ids are normalised identically on
+            // both sides of the comparison.
+            let vault_accounts = self.vault_held_accounts(name);
+            let mut suppressed_accounts: Vec<&str> = Vec::new();
+            let slots: Vec<_> = slots
+                .into_iter()
+                .filter(|(key, slot)| {
+                    let degraded = slot
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.usage.is_none());
+                    let held_by_vault = slot
+                        .account_id()
+                        .and_then(|account| codex::canonical_account_id(Some(account.to_string())))
+                        .is_some_and(|account| vault_accounts.contains(&account));
+                    if degraded && held_by_vault && !key.handle.is_vault() {
+                        suppressed_accounts.extend(slot.account_id());
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            if slots.is_empty() {
+                // Every slot was a suppressed failure: the provider publishes
+                // nothing and, having left accounts out, claims no completeness.
                 continue;
             }
 
@@ -1139,6 +1200,7 @@ impl Registry {
                 }
                 seen.insert(account_id.clone(), winner);
             }
+            let candidates_published: HashSet<String> = candidates.keys().cloned().collect();
             let mut selected: Vec<_> = candidates.into_iter().collect();
             selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.sort_cmp(&right.handle));
             for (account_id, (_, slot)) in selected {
@@ -1163,6 +1225,14 @@ impl Registry {
                     entry.api_provider = api_provider_name(name).map(String::from);
                     out.push(entry);
                 }
+            }
+            // A suppressed failure is an omitted account unless another slot
+            // (normally the vault's own) published that account anyway.
+            if suppressed_accounts
+                .iter()
+                .any(|account| !candidates_published.contains(*account))
+            {
+                skipped_a_slot = true;
             }
             // Every slot contributed its account, so the emitted accounts ARE
             // the resolved inventory -- compared as a set, since two handles

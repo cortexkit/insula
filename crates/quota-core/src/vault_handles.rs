@@ -333,15 +333,21 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Codex)
     }
 
-    /// Account ids the vault reports for the codex-family rows of the installed
-    /// snapshot, skipping rows whose account is unknown.
+    /// Account ids the vault reports for the rows of the installed snapshot that
+    /// are routed to the registry provider named `provider`, skipping rows whose
+    /// account is unknown. The ids are returned as the vault reported them; a
+    /// caller comparing them to a provider's own ids normalises both sides.
     ///
-    /// Rows are routed to codex by the same family table `codex_handles` uses,
-    /// so the two can never disagree about which rows are codex rows. Read
-    /// from the retained snapshot whatever the loader phase: the answer is a
-    /// statement about accounts the vault holds, not about which handles are
-    /// currently enumerable.
-    pub fn codex_account_ids(&self) -> Vec<String> {
+    /// Rows are routed by the same family table the provider's handle
+    /// enumeration uses, so the two can never disagree about which rows belong
+    /// to which provider. Read from the retained snapshot whatever the loader
+    /// phase: the answer is a statement about accounts the vault holds, not
+    /// about which handles are currently enumerable, so it survives a failed
+    /// listing (a vault restart) exactly when it is most needed.
+    pub fn account_ids_for_provider(&self, provider: &str) -> Vec<String> {
+        let Some(kind) = provider_kind(provider) else {
+            return Vec::new();
+        };
         let state = self
             .state
             .lock()
@@ -351,7 +357,7 @@ impl VaultHandleLoader {
         };
         let mapped_ids: HashSet<&str> = state
             .mapped
-            .for_provider(ProviderKind::Codex)
+            .for_provider(kind)
             .iter()
             .filter_map(CredentialHandle::vault_credential_id)
             .collect();

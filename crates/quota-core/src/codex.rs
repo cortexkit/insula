@@ -167,7 +167,11 @@ impl std::fmt::Debug for ServedCodexContext {
     }
 }
 
-fn canonical_account_id(account_id: Option<String>) -> Option<String> {
+/// The one normalisation every codex account id goes through before it is
+/// published or compared: surrounding whitespace is dropped, and an empty id is
+/// no id. The registry applies it to vault-reported ids too, so an id the vault
+/// spells with padding still matches the id this provider publishes.
+pub(crate) fn canonical_account_id(account_id: Option<String>) -> Option<String> {
     account_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -540,17 +544,6 @@ fn codex_home() -> Option<PathBuf> {
         return Some(PathBuf::from(home));
     }
     dirs_home().map(|h| h.join(".codex"))
-}
-
-/// The account id of the local `auth.json` login, read synchronously.
-///
-/// Same file, same parser and same normalisation as the local fetch lane, so
-/// the id compared here is the id that lane would publish. Any failure to read
-/// or parse the file is `None`: with no known account there is nothing to match.
-fn local_account_id(codex_home: Option<PathBuf>) -> Option<String> {
-    let auth_path = codex_home?.join("auth.json");
-    let data = crate::env::read_credential_file(&auth_path, "codex auth.json").ok()?;
-    canonical_account_id(parse_credentials(&data).ok()?.account_id)
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -1007,37 +1000,21 @@ impl UsageProvider for CodexProvider {
         PROVIDER_NAME
     }
 
-    /// The local `auth.json` lane is enumerated beside the vault handles, EXCEPT
-    /// when the local login's account id equals the account id of a codex row in
-    /// the current vault snapshot.
+    /// The local `auth.json` lane is always enumerated beside the vault handles,
+    /// including when the local login belongs to an account the vault also
+    /// holds. It is the backup that keeps such an account visible while the
+    /// vault is down or restarting: its credential read fails, and a healthy
+    /// local login is then the only lane still serving the account.
     ///
-    /// The lane exists so a CLI login for an account the vault does NOT hold is
-    /// still visible, so it stays in every other case: no vault rows, a
-    /// different account, a vault row with no account id, or a local file with
-    /// no account id or that cannot be read.
-    ///
-    /// It is dropped on a match because a duplicate local lane is not harmless.
-    /// A stale local login for an account the vault serves keeps being fetched
-    /// with an expired bearer, and while the vault slot's label is in flux (a
-    /// vault restart, a cold boot) its healthy row is withheld, leaving the local
-    /// slot as the account's only claimant: the wire then reports a healthy
-    /// account's credential as rejected (insula#23).
+    /// A FAILING local lane for a vault-held account must not speak for that
+    /// account (a stale login would report a healthy account's credential as
+    /// rejected while the vault slot's label is in flux, insula#23). That is
+    /// decided where entries are published, in `Registry::usage_snapshot`,
+    /// because only the registry sees the vault slots beside this one.
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = Vec::new();
-        let mut vault_account_ids = Vec::new();
+        let mut handles = vec![CredentialHandle::implicit()];
         if self.credential_source.is_some() {
             handles.extend(self.handle_loader.codex_handles()?);
-            vault_account_ids = self.handle_loader.codex_account_ids();
-        }
-        let served_by_vault = !vault_account_ids.is_empty()
-            && local_account_id(self.resolved_codex_home()).is_some_and(|local| {
-                vault_account_ids
-                    .into_iter()
-                    .filter_map(|id| canonical_account_id(Some(id)))
-                    .any(|vault| vault == local)
-            });
-        if !served_by_vault {
-            handles.insert(0, CredentialHandle::implicit());
         }
         Ok(handles)
     }
@@ -1632,134 +1609,6 @@ mod tests {
         provider.report_auth_failure(&context, &FetchError::ProviderStatus(401, String::new()));
         tokio::task::yield_now().await;
         assert_eq!(*reports.lock().unwrap(), vec![(401, 23)]);
-    }
-
-    /// A codex provider wired to a vault, reading `auth.json` from `home` and
-    /// holding a vault snapshot of `rows` as `(credential id, account id)`.
-    fn provider_with_vault_rows(
-        home: &std::path::Path,
-        rows: &[(&str, Option<&str>)],
-    ) -> CodexProvider {
-        let loader = VaultHandleLoader::default();
-        if !rows.is_empty() {
-            loader.install_snapshot(
-                crate::credential_source::ScopedSnapshot {
-                    grants: 1,
-                    rows: rows
-                        .iter()
-                        .map(|(id, account)| crate::credential_source::ScopedRowState {
-                            credential_id: (*id).to_string(),
-                            credential_type: "oauth".to_string(),
-                            record_version: 1,
-                            state: "active".to_string(),
-                            account_id: account.map(str::to_string),
-                        })
-                        .collect(),
-                },
-                Instant::now(),
-            );
-        }
-        let source: Arc<dyn CredentialSource> = Arc::new(ReportingSource {
-            reports: Arc::new(Mutex::new(Vec::new())),
-        });
-        let transport = Arc::new(CountingResetTransport {
-            gets: AtomicUsize::new(0),
-            posts: AtomicUsize::new(0),
-            fail_get: false,
-        });
-        let coordinator = Arc::new(
-            ResetCoordinator::new(RedemptionJournal::new(
-                home.join("state").join("redemptions.json"),
-            ))
-            .unwrap(),
-        );
-        CodexProvider::new_for_test(
-            CodexConfig::default(),
-            Some(source),
-            transport as Arc<dyn ResetTransport>,
-            coordinator,
-            loader,
-            home.to_path_buf(),
-        )
-    }
-
-    /// A scratch codex home, with `auth.json` holding `auth` when given.
-    fn scratch_codex_home(name: &str, auth: Option<&[u8]>) -> PathBuf {
-        let home =
-            std::env::temp_dir().join(format!("ck-quota-codex-lane-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        if let Some(auth) = auth {
-            std::fs::write(home.join("auth.json"), auth).unwrap();
-        }
-        home
-    }
-
-    fn has_implicit(handles: &[CredentialHandle]) -> bool {
-        handles.contains(&CredentialHandle::implicit())
-    }
-
-    const LOCAL_AUTH_ACCT_A: &[u8] =
-        br#"{"tokens":{"access_token":"stale-local-token","account_id":"acct-a"}}"#;
-
-    #[test]
-    fn a_local_login_for_a_vault_served_account_is_not_enumerated() {
-        let home = scratch_codex_home("same-account", Some(LOCAL_AUTH_ACCT_A));
-        // Surrounding whitespace on the vault side proves both ids go through
-        // the same normalisation before being compared.
-        let provider = provider_with_vault_rows(&home, &[("chatgpt:openai", Some(" acct-a "))]);
-
-        let handles = provider.handles().unwrap();
-
-        assert!(!has_implicit(&handles), "{handles:?}");
-        assert_eq!(handles.len(), 1, "only the vault handle: {handles:?}");
-        assert_eq!(handles[0].vault_credential_id(), Some("chatgpt:openai"));
-    }
-
-    #[test]
-    fn a_local_login_for_an_account_the_vault_lacks_is_enumerated() {
-        let home = scratch_codex_home("other-account", Some(LOCAL_AUTH_ACCT_A));
-        let provider = provider_with_vault_rows(&home, &[("chatgpt:openai", Some("acct-b"))]);
-
-        let handles = provider.handles().unwrap();
-
-        assert!(has_implicit(&handles), "{handles:?}");
-        assert_eq!(handles.len(), 2, "{handles:?}");
-    }
-
-    #[test]
-    fn a_vault_row_without_an_account_id_keeps_the_local_lane() {
-        let home = scratch_codex_home("vault-no-account", Some(LOCAL_AUTH_ACCT_A));
-        let provider = provider_with_vault_rows(&home, &[("chatgpt:openai", None)]);
-
-        let handles = provider.handles().unwrap();
-
-        assert!(has_implicit(&handles), "{handles:?}");
-        assert_eq!(handles.len(), 2, "{handles:?}");
-    }
-
-    #[test]
-    fn an_absent_or_unreadable_auth_file_keeps_the_local_lane() {
-        let absent = scratch_codex_home("auth-absent", None);
-        let unreadable = scratch_codex_home("auth-unreadable", Some(b"not json"));
-        for home in [absent, unreadable] {
-            let provider = provider_with_vault_rows(&home, &[("chatgpt:openai", Some("acct-a"))]);
-
-            let handles = provider.handles().unwrap();
-
-            assert!(has_implicit(&handles), "{}: {handles:?}", home.display());
-            assert_eq!(handles.len(), 2, "{}: {handles:?}", home.display());
-        }
-    }
-
-    #[test]
-    fn with_no_vault_rows_the_local_lane_is_enumerated() {
-        let home = scratch_codex_home("no-vault-rows", Some(LOCAL_AUTH_ACCT_A));
-        let provider = provider_with_vault_rows(&home, &[]);
-
-        let handles = provider.handles().unwrap();
-
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 
     fn jwt_with_payload(payload: serde_json::Value) -> String {
