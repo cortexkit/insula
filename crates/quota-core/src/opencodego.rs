@@ -1,5 +1,27 @@
-//! OpenCode Go usage — console JSON API first, the legacy HTML `/go` page as
-//! fallback.
+//! OpenCode Go usage — an API key when one is configured; otherwise the console
+//! JSON API first, the legacy HTML `/go` page as fallback.
+//!
+//! API-KEY LANE. `GET https://opencode.ai/zen/go/v1/usage` with
+//! `Authorization: Bearer <key>`, the key coming from a vault `apikey:opencode`
+//! credential or the `OPENCODE_API_KEY` environment variable. It needs no
+//! browser, so it is the lane for Windows and headless hosts that cannot read
+//! Chrome's cookie store. When a key is present it is the ONLY lane this
+//! provider enumerates (see [`OpenCodeGoProvider::handles`]).
+//! Ported from CodexBar v0.65.0 `OpenCodeGoUsageFetcher.fetchAPIUsage` /
+//! `parseAPIUsage` (present upstream since v0.54.0); payload shapes come from
+//! `Tests/CodexBarTests/OpenCodeGoUsageFetcherErrorTests.swift` and
+//! `OpenCodeGoWebOverlayTests.swift` at that tag. VERIFICATION of this lane:
+//! fixture-verified only, NOT live-verified -- no OpenCode API key exists on the
+//! host it was written on.
+//!
+//! What the API lane does NOT do, deliberately:
+//! - It reports no "no subscription" verdict. Upstream's API lane has none: every
+//!   body without `usage.rolling` is a parse failure there, and no captured
+//!   response shows what an unsubscribed key receives. So such a body is
+//!   `decode_failed` here too, until someone captures the real answer.
+//! - It publishes no account identity: the response carries none.
+//! - It does not publish upstream's extra "Renews" window built from
+//!   `renewAt`; the console lane publishes no such window either.
 //!
 //! OpenCode has migrated workspaces to a new console. For a migrated workspace
 //! the legacy `/workspace/<id>/go` page redirects to `/console/login` and serves
@@ -26,6 +48,7 @@ use serde_json::Value;
 
 use crate::{
     credential_source::CredentialSource,
+    env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     opencode::{
@@ -34,12 +57,25 @@ use crate::{
         MONTHLY_WINDOW_MINUTES, PERCENT_KEYS, RESET_AT_KEYS, RESET_IN_KEYS, ROLLING_WINDOW_MINUTES,
         USER_AGENT, WEEKLY_WINDOW_MINUTES,
     },
-    provider::{CredentialHandle, FetchAttempt, FetchError, UsageProvider},
-    vault_handles::VaultHandleLoader,
+    provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider},
+    vault_handles::{handle_id_names_family, VaultHandleLoader},
+    LOG_TAG,
 };
 
 pub const PROVIDER_NAME: &str = "opencodego";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Usage endpoint for the API-key lane. Answers 401 or 403 for a key it
+/// rejects.
+const API_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+/// Vault credential family holding an OpenCode API key.
+pub const API_KEY_FAMILY: &str = "apikey:opencode";
+/// Environment variable upstream reads the API key from.
+const API_KEY_ENV: &[&str] = &["OPENCODE_API_KEY"];
+/// `source` published for a fetch made with the environment's API key.
+const API_SOURCE: &str = "api";
+/// `source` published for a fetch made with a vault-held API key.
+const VAULT_SOURCE: &str = "vault";
 
 /// OPAQUE-UPSTREAM-CONSTANT: copied from the upstream, unvalidatable here.
 ///
@@ -92,6 +128,8 @@ struct Endpoints {
     origin: String,
     /// The legacy Next.js server-function endpoint the workspace id comes from.
     server_base: String,
+    /// The API-key lane's usage endpoint.
+    api_usage_url: String,
 }
 
 impl Endpoints {
@@ -99,6 +137,7 @@ impl Endpoints {
         Self {
             origin: crate::opencode::ORIGIN.to_string(),
             server_base: crate::opencode::SERVER_BASE.to_string(),
+            api_usage_url: API_USAGE_URL.to_string(),
         }
     }
 }
@@ -251,13 +290,16 @@ fn parse_console_go_status(text: &str, now_secs: i64) -> Option<Usage> {
     // stands in for it.
     let period_end = access.get("endsAt").and_then(parse_date_value);
 
-    let primary = console_meter_window(five_hour, now_secs, ROLLING_WINDOW_MINUTES, None)?;
+    let encoding = DirectPercent::FractionOrPercent;
+    let primary =
+        console_meter_window(five_hour, now_secs, ROLLING_WINDOW_MINUTES, None, encoding)?;
     let secondary = match meters.get("week").and_then(Value::as_object) {
         Some(week) => Some(console_meter_window(
             week,
             now_secs,
             WEEKLY_WINDOW_MINUTES,
             None,
+            encoding,
         )?),
         None => None,
     };
@@ -265,7 +307,13 @@ fn parse_console_go_status(text: &str, now_secs: i64) -> Option<Usage> {
         .get("month")
         .and_then(Value::as_object)
         .and_then(|month| {
-            console_meter_window(month, now_secs, MONTHLY_WINDOW_MINUTES, period_end)
+            console_meter_window(
+                month,
+                now_secs,
+                MONTHLY_WINDOW_MINUTES,
+                period_end,
+                encoding,
+            )
         });
     Some(Usage {
         primary: Some(primary),
@@ -275,18 +323,33 @@ fn parse_console_go_status(text: &str, now_secs: i64) -> Option<Usage> {
     })
 }
 
-/// One console meter as a rate window.
+/// How a meter's direct percent field is to be read.
+///
+/// Mirrors upstream's `DirectPercentEncoding`. The console and dashboard
+/// payloads may send a 0..1 fraction; the usage API always sends 0..100. Reading
+/// the API's `0.5` as a fraction would publish 50% for half a percent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectPercent {
+    /// A value in 0..=1 is a fraction and is rescaled to a percent.
+    FractionOrPercent,
+    /// The value is already a percent, whatever its size.
+    Percent,
+}
+
+/// One meter as a rate window, shared by the console lane and the API lane.
 ///
 /// The console reports micro-cent meters (`usedMicroCents` / `limitMicroCents`,
 /// as strings), which the generic window parser cannot key on, so the percent
 /// is computed here exactly as upstream's `parseWindow` does: a direct percent
-/// field wins (rescaled when it arrives as a 0..1 fraction), otherwise
-/// used/limit -- and the `* 100.0` is what turns that ratio into a percent.
+/// field wins (rescaled from a 0..1 fraction only under
+/// [`DirectPercent::FractionOrPercent`]), otherwise used/limit -- and the
+/// `* 100.0` is what turns that ratio into a percent.
 fn console_meter_window(
     meter: &serde_json::Map<String, Value>,
     now_secs: i64,
     window_minutes: i64,
     fallback_reset_epoch: Option<i64>,
+    encoding: DirectPercent,
 ) -> Option<RateWindow> {
     let direct = crate::json_scan::first_finite_f64(meter, PERCENT_KEYS);
     let mut percent = match direct {
@@ -300,7 +363,10 @@ fn console_meter_window(
             (used / limit) * 100.0
         }
     };
-    if direct.is_some() && (0.0..=1.0).contains(&percent) {
+    if direct.is_some()
+        && encoding == DirectPercent::FractionOrPercent
+        && (0.0..=1.0).contains(&percent)
+    {
         percent *= 100.0;
     }
     if !percent.is_finite() {
@@ -606,9 +672,81 @@ async fn fetch_legacy_go_usage(
     parse_windows(&text, now, true)
 }
 
+// ---------------------------------------------------------------------------
+// API-key lane
+// ---------------------------------------------------------------------------
+
+/// The usage API's answer as windows: `usage.rolling` is required and becomes
+/// the 5h window, `usage.weekly` the weekly, `usage.monthly` the monthly -- the
+/// same slots and window lengths the cookie lanes publish.
+///
+/// Ported from upstream's `parseAPIUsage` + `buildSnapshot(directPercentEncoding:
+/// .percent)`: the API's percents are always 0..100, a present-but-unreadable
+/// weekly window fails the whole payload, and an unreadable monthly one is
+/// dropped. Every failure is `Decode`; see the module doc for why there is no
+/// "no subscription" verdict on this lane.
+fn parse_api_usage(text: &str, now_secs: i64) -> Result<Usage, FetchError> {
+    let missing =
+        || FetchError::Decode("opencodego: usage API response carries no usage fields".to_string());
+    let root: Value = serde_json::from_str(text).map_err(|_| missing())?;
+    let usage = root
+        .get("usage")
+        .and_then(Value::as_object)
+        .ok_or_else(missing)?;
+    let rolling = usage
+        .get("rolling")
+        .and_then(Value::as_object)
+        .ok_or_else(missing)?;
+    let encoding = DirectPercent::Percent;
+    let primary = console_meter_window(rolling, now_secs, ROLLING_WINDOW_MINUTES, None, encoding)
+        .ok_or_else(missing)?;
+    let secondary = match usage.get("weekly").and_then(Value::as_object) {
+        Some(weekly) => Some(
+            console_meter_window(weekly, now_secs, WEEKLY_WINDOW_MINUTES, None, encoding)
+                .ok_or_else(missing)?,
+        ),
+        None => None,
+    };
+    let tertiary = usage
+        .get("monthly")
+        .and_then(Value::as_object)
+        .and_then(|monthly| {
+            console_meter_window(monthly, now_secs, MONTHLY_WINDOW_MINUTES, None, encoding)
+        });
+    Ok(Usage {
+        primary: Some(primary),
+        secondary,
+        tertiary,
+        extra_rate_windows: None,
+    })
+}
+
+/// The request both API-key sub-lanes send.
+fn api_usage_request(url: &str, key: &str) -> JsonRequest {
+    // `JsonRequest::get` already sends `Accept: application/json`, which is
+    // the other header upstream sets.
+    JsonRequest::get(url).timeout(REQUEST_TIMEOUT).bearer(key)
+}
+
+/// Whether a vault handle carries the API key rather than a cookie deposit.
+fn is_api_key_handle(handle: &CredentialHandle) -> bool {
+    handle
+        .vault_credential_id()
+        .is_some_and(|id| handle_id_names_family(id, API_KEY_FAMILY))
+}
+
+fn env_api_key() -> Option<String> {
+    env::first_env(API_KEY_ENV)
+}
+
 pub struct OpenCodeGoProvider {
     http: reqwest::Client,
     vault: crate::cookie_vault::CookieVault,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    /// Reads the environment's API key. A field so tests can supply a key
+    /// without mutating the process environment other tests share.
+    env_api_key: fn() -> Option<String>,
     endpoints: Endpoints,
 }
 
@@ -620,12 +758,102 @@ impl OpenCodeGoProvider {
         Self {
             http: crate::http::provider_client(),
             vault: crate::cookie_vault::CookieVault::new(
-                credential_source,
-                handle_loader,
+                credential_source.clone(),
+                Arc::clone(&handle_loader),
                 crate::opencode::COOKIE_FAMILY,
             ),
+            credential_source,
+            handle_loader,
+            env_api_key,
             endpoints: Endpoints::production(),
         }
+    }
+
+    /// Vault handles in the `apikey:opencode` family. The loader's opencodego
+    /// mapping also holds the shared `cookie:opencode.ai` deposits, so the
+    /// family is filtered here.
+    fn vault_api_key_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        if self.credential_source.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .handle_loader
+            .opencodego_handles()?
+            .into_iter()
+            .filter(is_api_key_handle)
+            .collect())
+    }
+
+    /// The environment-key lane: 401/403 become `Unauthorized`, which is the
+    /// rejected-key class, through the shared request helper.
+    async fn fetch_env_api(&self, key: &str) -> Result<ProviderUsage, FetchError> {
+        let body = api_usage_request(&self.endpoints.api_usage_url, key)
+            .send(&self.http)
+            .await?;
+        let usage = parse_api_usage(
+            &String::from_utf8_lossy(&body),
+            chrono::Utc::now().timestamp(),
+        )?;
+        Ok(ProviderUsage::healthy(
+            PROVIDER_NAME,
+            None,
+            API_SOURCE,
+            usage,
+        ))
+    }
+
+    /// The vault-key lane. The status-first helper keeps the HTTP status, so a
+    /// 401/403 is `ProviderStatus`, which classifies as rejected just as
+    /// `Unauthorized` does, and a 401 is reported back to the vault so it can
+    /// mark the stored key.
+    async fn fetch_vault_api(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                eprintln!(
+                    "{LOG_TAG} warning: opencodego vault credential.get failed ({}): {error:?}",
+                    handle.stable_id()
+                );
+                return FetchAttempt::unverified_vault_failure(error);
+            }
+        };
+        let record_version = credential.record_version;
+        let key = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(key) => key,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+        let result = async {
+            let response = api_usage_request(&self.endpoints.api_usage_url, key.trim())
+                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .await?;
+            parse_api_usage(
+                &String::from_utf8_lossy(&response.body),
+                chrono::Utc::now().timestamp(),
+            )
+        }
+        .await;
+        if let Err(error) = &result {
+            crate::credential_source::report_vault_auth_failure(
+                self.credential_source.as_ref(),
+                handle,
+                record_version,
+                error,
+            );
+        }
+        FetchAttempt::from_provider_usage(
+            result.map(|usage| ProviderUsage::healthy(PROVIDER_NAME, None, VAULT_SOURCE, usage)),
+        )
     }
 }
 
@@ -639,11 +867,38 @@ impl UsageProvider for OpenCodeGoProvider {
         true
     }
 
-    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+    /// An API key, when present, is the ONLY lane.
+    ///
+    /// Every handle becomes its own slot and every lane here is identity-less,
+    /// so enumerating the key beside a cookie lane would publish two unlabelled
+    /// rows that the registry's emission gate collapses to one by a tie-break
+    /// nobody can see. An explicitly configured key beats an ambient browser
+    /// session, the same rule `CookieVault` applies to a named deposit and the
+    /// static-key providers apply to a vault key. A vault key comes before the
+    /// environment's, as in `deepseek`. With no key, the cookie lanes are
+    /// exactly what they were before the API lane existed.
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        let vault_keys = self.vault_api_key_handles()?;
+        if !vault_keys.is_empty() {
+            return Ok(vault_keys);
+        }
+        if (self.env_api_key)().is_some() {
+            // The implicit handle: `fetch_handle` sends it down the API lane
+            // while the environment still holds a key.
+            return Ok(vec![CredentialHandle::implicit()]);
+        }
         self.vault.handles()
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if is_api_key_handle(handle) {
+            return self.fetch_vault_api(handle).await;
+        }
+        if !handle.is_vault() {
+            if let Some(key) = (self.env_api_key)() {
+                return FetchAttempt::from_provider_usage(self.fetch_env_api(key.trim()).await);
+            }
+        }
         let result: Result<ProviderUsage, FetchError> = async {
             let (cookie, source) = self
                 .vault
@@ -660,11 +915,13 @@ impl UsageProvider for OpenCodeGoProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_go_page, is_console_workspace_id, looks_unsubscribed, parse_console_go_status,
-        parse_console_workspace_ids, redirected_off_go_page, Endpoints, OpenCodeGoProvider,
-        CONSOLE_GO_STATUS_PATH, CONSOLE_WORKSPACES_PATH, CONSOLE_WORKSPACE_HEADER,
+        classify_go_page, is_console_workspace_id, looks_unsubscribed, parse_api_usage,
+        parse_console_go_status, parse_console_workspace_ids, redirected_off_go_page, Endpoints,
+        OpenCodeGoProvider, API_KEY_FAMILY, API_USAGE_URL, CONSOLE_GO_STATUS_PATH,
+        CONSOLE_WORKSPACES_PATH, CONSOLE_WORKSPACE_HEADER,
     };
     use crate::opencode::parse_windows;
+    use crate::provider::CredentialHandle;
     use crate::provider::{FetchError, UsageProvider};
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
@@ -859,6 +1116,25 @@ mod tests {
         cookie: &str,
         base: &str,
     ) -> (OpenCodeGoProvider, crate::provider::CredentialHandle) {
+        let mut provider = provider_with_rows(&[("cookie:opencode.ai:test", "cookie")], cookie);
+        point_at(&mut provider, base);
+        let handle = provider.handles().unwrap().into_iter().next().unwrap();
+        (provider, handle)
+    }
+
+    /// Aim every lane of `provider` at the loopback server at `base`.
+    fn point_at(provider: &mut OpenCodeGoProvider, base: &str) {
+        provider.endpoints = Endpoints {
+            origin: base.to_string(),
+            server_base: format!("{base}/_server"),
+            api_usage_url: format!("{base}{API_USAGE_PATH}"),
+        };
+    }
+
+    /// A vault-backed provider whose installed snapshot holds `rows`, whose
+    /// every vault read returns `payload`, and which sees NO environment key
+    /// (so a key in the test runner's own environment cannot change a result).
+    fn provider_with_rows(rows: &[(&str, &str)], payload: &str) -> OpenCodeGoProvider {
         struct MockCookieSource {
             cookie: String,
         }
@@ -905,19 +1181,15 @@ mod tests {
         }
 
         let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
-        loader.install_rows_for_test(&[("cookie:opencode.ai:test", "cookie")]);
+        loader.install_rows_for_test(rows);
         let mut provider = OpenCodeGoProvider::new_with_handle_loader(
             Some(Arc::new(MockCookieSource {
-                cookie: cookie.to_string(),
+                cookie: payload.to_string(),
             })),
             loader,
         );
-        provider.endpoints = Endpoints {
-            origin: base.to_string(),
-            server_base: format!("{base}/_server"),
-        };
-        let handle = provider.handles().unwrap().into_iter().next().unwrap();
-        (provider, handle)
+        provider.env_api_key = || None;
+        provider
     }
 
     /// Drive the provider's real fetch against the script and return the error
@@ -1403,5 +1675,269 @@ mod tests {
                 "concluded there is no plan while {field} was populated"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // API-key lane
+    // -----------------------------------------------------------------------
+
+    /// The path of the usage endpoint, which the loopback server is asked on.
+    const API_USAGE_PATH: &str = "/zen/go/v1/usage";
+
+    /// Upstream's reset timestamps for the three windows
+    /// (`OpenCodeGoUsageFetcherErrorTests`, "public usage API sends bearer token
+    /// and preserves percent units").
+    const ROLLING_RESET: &str = "2026-08-12T02:00:00.000Z";
+    const WEEKLY_RESET: &str = "2026-08-18T00:00:00.000Z";
+    const MONTHLY_RESET: &str = "2026-09-01T00:00:00.000Z";
+    /// That test's `now`.
+    const UPSTREAM_NOW: i64 = 1_786_493_600;
+
+    /// The payload that upstream test builds: `{"usage": {window: {"percent",
+    /// "resetsAt"}}}`, weekly and monthly present only when given.
+    fn api_payload(rolling: f64, weekly: Option<f64>, monthly: Option<f64>) -> String {
+        let mut windows = serde_json::Map::new();
+        windows.insert(
+            "rolling".into(),
+            serde_json::json!({ "percent": rolling, "resetsAt": ROLLING_RESET }),
+        );
+        if let Some(weekly) = weekly {
+            windows.insert(
+                "weekly".into(),
+                serde_json::json!({ "percent": weekly, "resetsAt": WEEKLY_RESET }),
+            );
+        }
+        if let Some(monthly) = monthly {
+            windows.insert(
+                "monthly".into(),
+                serde_json::json!({ "percent": monthly, "resetsAt": MONTHLY_RESET }),
+            );
+        }
+        serde_json::json!({ "usage": windows }).to_string()
+    }
+
+    fn iso(rfc3339: &str) -> Option<String> {
+        crate::env::epoch_to_iso8601(
+            chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .timestamp(),
+        )
+    }
+
+    #[test]
+    fn the_api_usage_url_is_the_upstream_endpoint() {
+        assert_eq!(
+            API_USAGE_URL,
+            format!("https://opencode.ai{API_USAGE_PATH}")
+        );
+        assert_eq!(API_KEY_FAMILY, "apikey:opencode");
+    }
+
+    /// Rolling only: one window, and the API's percent is already a percent.
+    ///
+    /// Upstream case `(1, nil, nil)`. A `1` read as a 0..1 fraction would
+    /// publish 100% -- the dashboard payload's rule, which this lane must not
+    /// inherit.
+    #[test]
+    fn api_usage_with_only_a_rolling_window_publishes_only_the_primary() {
+        let usage = parse_api_usage(&api_payload(1.0, None, None), UPSTREAM_NOW)
+            .expect("a rolling-only payload parses");
+        let primary = usage.primary.expect("rolling is the primary");
+        assert_eq!(primary.used_percent, 1.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at, iso(ROLLING_RESET));
+        assert!(usage.secondary.is_none());
+        assert!(usage.tertiary.is_none());
+    }
+
+    /// Rolling + weekly + monthly, with upstream's percent-unit cases: every
+    /// value, including the sub-1 ones, is published as sent.
+    #[test]
+    fn api_usage_with_all_three_windows_preserves_percent_units() {
+        for (rolling, weekly, monthly) in [
+            (12.0, 8.0, 35.0),
+            (3.0, 1.0, 0.0),
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0),
+            (100.0, 100.0, 100.0),
+            (0.5, 0.5, 0.5),
+        ] {
+            let usage = parse_api_usage(
+                &api_payload(rolling, Some(weekly), Some(monthly)),
+                UPSTREAM_NOW,
+            )
+            .expect("a three-window payload parses");
+            let primary = usage.primary.unwrap();
+            let secondary = usage.secondary.expect("weekly is the secondary");
+            let tertiary = usage.tertiary.expect("monthly is the tertiary");
+            assert_eq!(
+                (
+                    primary.used_percent,
+                    secondary.used_percent,
+                    tertiary.used_percent
+                ),
+                (rolling, weekly, monthly),
+                "percents must be published in the units the API sends"
+            );
+            assert_eq!(secondary.window_minutes, Some(10_080));
+            assert_eq!(tertiary.window_minutes, Some(43_200));
+            assert_eq!(secondary.resets_at, iso(WEEKLY_RESET));
+            assert_eq!(tertiary.resets_at, iso(MONTHLY_RESET));
+        }
+    }
+
+    /// The seconds-until-reset shape, from upstream's
+    /// `OpenCodeGoWebOverlayTests` ("local strategy prefers API windows").
+    #[test]
+    fn api_usage_reads_reset_in_seconds() {
+        let payload = r#"{"usage": {
+          "rolling": {"percent": 3, "resetInSec": 18100},
+          "weekly": {"percent": 1, "resetInSec": 266500},
+          "monthly": {"percent": 0, "resetInSec": 1539100}
+        }}"#;
+        let usage = parse_api_usage(payload, UPSTREAM_NOW).expect("the payload parses");
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 3.0);
+        assert_eq!(
+            primary.resets_at,
+            crate::env::epoch_to_iso8601(UPSTREAM_NOW + 18_100)
+        );
+        assert_eq!(usage.secondary.unwrap().used_percent, 1.0);
+        assert_eq!(usage.tertiary.unwrap().used_percent, 0.0);
+    }
+
+    /// A success with no usage fields is our decode failure.
+    ///
+    /// Includes the null shapes: upstream's API lane has no "no subscription"
+    /// verdict and no captured response shows one, so `null` is not read as
+    /// "no plan" -- publishing that on a guessed shape would stop consumers
+    /// routing here for an account that may well have a plan.
+    #[test]
+    fn api_usage_without_usage_fields_is_a_decode_failure() {
+        for body in [
+            r#"{"renewAt":"2026-09-01T00:00:00.000Z"}"#,
+            r#"{"usage":{}}"#,
+            r#"{"usage":{"weekly":{"percent":1}}}"#,
+            r#"{"usage":null}"#,
+            "null",
+            "not json",
+        ] {
+            let error = parse_api_usage(body, UPSTREAM_NOW).expect_err(body);
+            assert_eq!(error.error_class(), "decode_failed", "{body}: {error}");
+        }
+        // A present-but-unreadable weekly window fails the whole payload, as
+        // upstream's `buildSnapshot` does.
+        let error = parse_api_usage(
+            r#"{"usage":{"rolling":{"percent":1},"weekly":{}}}"#,
+            UPSTREAM_NOW,
+        )
+        .expect_err("an unreadable weekly window");
+        assert_eq!(error.error_class(), "decode_failed");
+    }
+
+    fn ids(handles: Vec<CredentialHandle>) -> Vec<String> {
+        handles
+            .iter()
+            .map(|handle| handle.stable_id().to_string())
+            .collect()
+    }
+
+    /// An API key is the only lane; without one, the cookie lanes are exactly
+    /// what they were.
+    ///
+    /// A named cookie deposit is present in the key cases because it is the
+    /// cookie lane that would otherwise enumerate as a vault handle of its own:
+    /// kept beside the key, it would be a second identity-less slot for this
+    /// provider.
+    #[test]
+    fn an_api_key_replaces_the_cookie_lanes() {
+        let cookie = ("cookie:opencode.ai:acct", "cookie");
+        let key = ("apikey:opencode", "apikey");
+
+        // A vault key: only the key's handle.
+        let provider = provider_with_rows(&[cookie, key], "");
+        assert_eq!(ids(provider.handles().unwrap()), vec!["apikey:opencode"]);
+
+        // An environment key: only the implicit handle, which fetches with it.
+        let mut provider = provider_with_rows(&[cookie], "");
+        provider.env_api_key = || Some("go_secret".to_string());
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
+
+        // No key: the named cookie deposit, as before.
+        let provider = provider_with_rows(&[cookie], "");
+        assert_eq!(
+            ids(provider.handles().unwrap()),
+            vec!["cookie:opencode.ai:acct"]
+        );
+        // No key and only a bare cookie deposit: the local lane, as before.
+        let provider = provider_with_rows(&[("cookie:opencode.ai", "cookie")], "");
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
+    }
+
+    /// An env-key fetch sends the bearer key to the usage path and publishes
+    /// the windows -- the full route, not just the parser.
+    #[tokio::test]
+    async fn an_env_key_fetch_reads_the_usage_api() {
+        let body: &'static str =
+            Box::leak(api_payload(12.0, Some(8.0), Some(35.0)).into_boxed_str());
+        let (base, requests) = serve(move |_path, _request| Reply::Body(200, body)).await;
+        let mut provider = provider_with_rows(&[("cookie:opencode.ai:acct", "cookie")], "");
+        provider.env_api_key = || Some("go_secret".to_string());
+        point_at(&mut provider, &base);
+
+        let handle = provider.handles().unwrap().remove(0);
+        let attempt = provider.fetch_handle(&handle).await;
+        let usage = attempt.usage.expect("the API lane serves the fetch");
+        assert_eq!(usage.primary.unwrap().used_percent, 12.0);
+        assert_eq!(usage.secondary.unwrap().used_percent, 8.0);
+        assert_eq!(usage.tertiary.unwrap().used_percent, 35.0);
+
+        assert_eq!(paths(&requests), vec![API_USAGE_PATH.to_string()]);
+        let request = requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            request.contains("authorization: bearer go_secret"),
+            "the key must travel as a bearer token: {request}"
+        );
+    }
+
+    /// A 401 from the usage API is the rejected-key class, for both the vault
+    /// key and the environment key -- never a decode failure or an outage.
+    #[tokio::test]
+    async fn a_401_from_the_usage_api_is_a_rejected_key() {
+        let (base, requests) =
+            serve(|_path, _request| Reply::Body(401, r#"{"error":"unauthorized"}"#)).await;
+
+        let mut vault = provider_with_rows(&[("apikey:opencode", "apikey")], "bad");
+        point_at(&mut vault, &base);
+        let handle = vault.handles().unwrap().remove(0);
+        let error = vault
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect_err("a rejected key is not usage");
+        assert_eq!(error.error_class(), "credential_rejected", "{error}");
+
+        let mut env = provider_with_rows(&[], "");
+        env.env_api_key = || Some("bad".to_string());
+        point_at(&mut env, &base);
+        let handle = env.handles().unwrap().remove(0);
+        let error = env
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect_err("a rejected key is not usage");
+        assert_eq!(error.error_class(), "credential_rejected", "{error}");
+
+        assert_eq!(
+            paths(&requests),
+            vec![API_USAGE_PATH.to_string(), API_USAGE_PATH.to_string()],
+            "both fetches must have asked the usage API and nothing else"
+        );
     }
 }

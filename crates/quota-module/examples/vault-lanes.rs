@@ -249,6 +249,13 @@ fn evaluate(
         .credential_ids
         .iter()
         .any(|id| quota_core::vault_handles::handle_id_names_family(id, "oauth:cursor"));
+    // An OpenCode API key is opencodego's only lane when present, so the shared
+    // `cookie:opencode.ai` deposits are not expected to serve opencodego then
+    // (they still serve `opencode`).
+    let opencode_api_key_present = installed
+        .credential_ids
+        .iter()
+        .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:opencode"));
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
         if prefix.starts_with("cookie:") || prefix.starts_with("apikey:") {
@@ -291,11 +298,17 @@ fn evaluate(
         routed += providers.len();
         for provider in providers {
             routed_providers.insert(provider);
-            let precedence_suppressed = cursor_oauth_present
+            let precedence_suppressed = (cursor_oauth_present
                 && quota_core::vault_handles::handle_id_names_family(
                     credential_id,
                     "cookie:cursor.com",
-                );
+                ))
+                || (opencode_api_key_present
+                    && provider == "opencodego"
+                    && quota_core::vault_handles::handle_id_names_family(
+                        credential_id,
+                        "cookie:opencode.ai",
+                    ));
             if !dual_lane.iter().any(|(name, _)| *name == provider)
                 && !precedence_suppressed
                 && !refused_ids.contains(credential_id.as_str())
@@ -861,6 +874,24 @@ mod tests {
         assert_eq!(cursor_counts.routed, 2);
         assert_eq!(cursor_counts.expected, 1);
         assert_eq!(cursor.exit_code, 0, "{cursor:?}");
+
+        // The OpenCode API key replaces opencodego's cookie lane but not
+        // opencode's: one opencodego entry answers for the key, and the cookie
+        // deposit is still expected to serve opencode.
+        let opencode_key = evaluate(
+            granted(&["apikey:opencode", "cookie:opencode.ai"]),
+            usage(vec![
+                healthy("opencode", "vault"),
+                healthy("opencodego", "vault"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        let opencode_key_counts = opencode_key.counts.expect("opencode run has counts");
+        assert_eq!(opencode_key_counts.routed, 3);
+        assert_eq!(opencode_key_counts.expected, 2);
+        assert_eq!(opencode_key.exit_code, 0, "{opencode_key:?}");
 
         let duplicate_cookie = evaluate(
             granted(&["cookie:opencode.ai", "cookie:opencode.ai:second"]),

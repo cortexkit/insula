@@ -1477,6 +1477,19 @@ the seven it accepts as answered are the same seven as last round.
    `go/status`. Upstream has had this lane since `v0.54.0`, so it is a gap that
    predates this round rather than a change in it.
 
+   **Built 2026-09-24; NOT live-verified** (no OpenCode API key on this host, so
+   it is fixture-verified against upstream's tests only). The key comes from the
+   `OPENCODE_API_KEY` environment variable or a vault `apikey:opencode` credential
+   (a new family, routed to `opencodego` only; a second deposit is refused like
+   every identity-less family). The ordering rule: a present key is the ONLY lane
+   `opencodego` enumerates, vault key before environment key, and with no key the
+   console and legacy lanes are exactly as before. Two deliberate differences from
+   upstream: the key is recognised by its vault family, not by sniffing a stored
+   value's shape, and upstream's extra "Renews" window is not published. The API
+   lane has no "no subscription" verdict, because upstream's has none either: a
+   body without `usage.rolling` is `decode_failed` until someone captures what an
+   unsubscribed key actually receives.
+
 Nothing else in this release is worth porting.
 
 ### Parity round: CodexBar v0.62.0 → v0.64.1
