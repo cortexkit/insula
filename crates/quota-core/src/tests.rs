@@ -9800,6 +9800,8 @@ enum LocalCodexLogin {
     Healthy,
     /// A long-expired login: 401 on every request.
     Expired,
+    /// No `auth.json` at all.
+    Absent,
 }
 
 /// A codex provider with one vault row for `acct-a` and a local `auth.json`
@@ -9839,7 +9841,9 @@ impl CodexVaultAndLocalLogin {
                     let used_percent = match (vault_bearer, login) {
                         (true, _) => Some(12.0),
                         (false, LocalCodexLogin::Healthy) => Some(21.0),
-                        (false, LocalCodexLogin::Expired) => None,
+                        // With no auth.json the local lane never builds a request,
+                        // so reaching here means it did: answer as an expired login.
+                        (false, LocalCodexLogin::Expired | LocalCodexLogin::Absent) => None,
                     };
                     let response = match used_percent {
                         Some(used_percent) => {
@@ -9869,14 +9873,16 @@ impl CodexVaultAndLocalLogin {
 
         let codex_home = temp.dir.join("codex-home");
         std::fs::create_dir_all(&codex_home).unwrap();
-        write_owner_only_test_file(
-            &codex_home.join("auth.json"),
-            serde_json::json!({
-                "tokens": {"access_token": "local-token", "account_id": local_account}
-            })
-            .to_string()
-            .as_bytes(),
-        );
+        if !matches!(login, LocalCodexLogin::Absent) {
+            write_owner_only_test_file(
+                &codex_home.join("auth.json"),
+                serde_json::json!({
+                    "tokens": {"access_token": "local-token", "account_id": local_account}
+                })
+                .to_string()
+                .as_bytes(),
+            );
+        }
         write_owner_only_test_file(
             &codex_home.join("config.toml"),
             format!(
@@ -9946,6 +9952,36 @@ impl Drop for CodexVaultAndLocalLogin {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+/// A host that keeps every codex account in the vault and has no local login
+/// must still claim a complete codex account set, and must not publish an
+/// unlabelled `credential_absent` row beside its healthy accounts (insula#23).
+#[tokio::test]
+async fn a_vault_only_codex_host_without_a_local_login_claims_completeness() {
+    let fixture = CodexVaultAndLocalLogin::new(
+        "codex-vault-only-no-local-login",
+        "acct-a",
+        LocalCodexLogin::Absent,
+    )
+    .await;
+
+    tick(&fixture.registry).await;
+    let snapshot = fixture.registry.usage_snapshot(Some("codex")).await;
+    assert!(
+        snapshot.complete_providers.iter().any(|p| p == "codex"),
+        "codex must claim completeness: {:?}",
+        snapshot.complete_providers
+    );
+    assert!(
+        !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.error_class.as_deref() == Some("credential_absent")),
+        "no unlabelled credential_absent row: {:?}",
+        snapshot.entries
+    );
+    assert_eq!(fixture.local_requests.load(Ordering::SeqCst), 0);
 }
 
 /// insula#23: a month-dead `~/.codex/auth.json` for the account the vault

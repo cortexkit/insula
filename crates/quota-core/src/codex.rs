@@ -759,6 +759,21 @@ impl CodexProvider {
         self.codex_home_override.clone().or_else(codex_home)
     }
 
+    /// True only when the local login file definitely does not exist.
+    ///
+    /// Anything short of a clean "not found" -- an unresolvable home directory,
+    /// a permission error -- is "could not look", not "absent", and keeps the
+    /// lane so its own fetch reports what went wrong.
+    fn local_login_absent(&self) -> bool {
+        let Some(home) = self.resolved_codex_home() else {
+            return false;
+        };
+        matches!(
+            std::fs::symlink_metadata(home.join("auth.json")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     fn report_auth_failure(&self, context: &ServedCodexContext, error: &FetchError) {
         // A served context may carry neither capability nor version: a local
         // credential has no custodian to report to. Resolve those first, then let
@@ -1011,11 +1026,27 @@ impl UsageProvider for CodexProvider {
     /// rejected while the vault slot's label is in flux, insula#23). That is
     /// decided where entries are published, in `Registry::usage_snapshot`,
     /// because only the registry sees the vault slots beside this one.
+    ///
+    /// THE ONE CASE THE LANE IS LEFT OUT: vault handles exist and `auth.json`
+    /// does not exist. Enumerated anyway, the lane could only fail `NoSession`
+    /// with no account identity. An identity-less failing slot stops the
+    /// registry from listing the provider in `completeProviders` (the claim that
+    /// every account was read), so a host keeping all its codex accounts in the
+    /// vault would never be complete, and would also publish an unlabelled
+    /// `credential_absent` row beside its healthy accounts. Seen on a host with
+    /// no `~/.codex/auth.json` (insula#23). With no vault handles the lane stays,
+    /// so an unconfigured host still reports the missing credential.
     fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        let mut handles = vec![CredentialHandle::implicit()];
-        if self.credential_source.is_some() {
-            handles.extend(self.handle_loader.codex_handles()?);
+        let vault = if self.credential_source.is_some() {
+            self.handle_loader.codex_handles()?
+        } else {
+            Vec::new()
+        };
+        let mut handles = Vec::new();
+        if vault.is_empty() || !self.local_login_absent() {
+            handles.push(CredentialHandle::implicit());
         }
+        handles.extend(vault);
         Ok(handles)
     }
 
@@ -1609,6 +1640,127 @@ mod tests {
         provider.report_auth_failure(&context, &FetchError::ProviderStatus(401, String::new()));
         tokio::task::yield_now().await;
         assert_eq!(*reports.lock().unwrap(), vec![(401, 23)]);
+    }
+
+    /// A test provider reading `auth.json` from `home`, with `vault_rows`
+    /// synthetic codex credentials in its vault snapshot (0 means an empty vault).
+    fn provider_for_lane_test(home: &std::path::Path, vault_rows: usize) -> CodexProvider {
+        let loader = VaultHandleLoader::default();
+        if vault_rows > 0 {
+            let ids: Vec<String> = (0..vault_rows)
+                .map(|n| {
+                    if n == 0 {
+                        "chatgpt:openai".to_string()
+                    } else {
+                        format!("chatgpt:openai:acct{n}")
+                    }
+                })
+                .collect();
+            let rows: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "oauth")).collect();
+            loader.install_rows_for_test(&rows);
+        }
+        let source: Arc<dyn CredentialSource> = Arc::new(ReportingSource {
+            reports: Arc::new(Mutex::new(Vec::new())),
+        });
+        let transport = Arc::new(CountingResetTransport {
+            gets: AtomicUsize::new(0),
+            posts: AtomicUsize::new(0),
+            fail_get: false,
+        });
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(
+                home.join("state").join("redemptions.json"),
+            ))
+            .unwrap(),
+        );
+        CodexProvider::new_for_test(
+            CodexConfig::default(),
+            Some(source),
+            transport as Arc<dyn ResetTransport>,
+            coordinator,
+            loader,
+            home.to_path_buf(),
+        )
+    }
+
+    /// A scratch codex home, unique per test, with `auth.json` when `login`.
+    fn lane_test_home(name: &str, login: bool) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "ck-quota-codex-lane-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        if login {
+            std::fs::write(
+                home.join("auth.json"),
+                br#"{"tokens":{"access_token":"t","account_id":"acct-a"}}"#,
+            )
+            .unwrap();
+        }
+        home
+    }
+
+    /// With codex accounts in the vault and no local login at all, the local
+    /// lane is left out: its only possible result, an identity-less `NoSession`,
+    /// would keep codex out of `completeProviders` for good.
+    #[test]
+    fn no_local_login_beside_vault_handles_enumerates_no_local_lane() {
+        let home = lane_test_home("absent-with-vault", false);
+        let handles = provider_for_lane_test(&home, 2).handles().unwrap();
+        assert!(
+            !handles.contains(&CredentialHandle::implicit()),
+            "{handles:?}"
+        );
+        assert_eq!(handles.len(), 2, "{handles:?}");
+    }
+
+    /// A local login that exists is the backup for a vault outage and stays.
+    #[test]
+    fn a_local_login_beside_vault_handles_keeps_the_local_lane() {
+        let home = lane_test_home("present-with-vault", true);
+        let handles = provider_for_lane_test(&home, 1).handles().unwrap();
+        assert!(
+            handles.contains(&CredentialHandle::implicit()),
+            "{handles:?}"
+        );
+    }
+
+    /// A home directory that cannot be listed is "could not look", not "no
+    /// login": the lane stays so its own fetch reports what went wrong.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_codex_home_beside_vault_handles_keeps_the_local_lane() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = lane_test_home("unreadable-with-vault", false);
+        // Built before `home` loses its permissions below, because the
+        // provider's redemption journal is created under `home`.
+        let provider = provider_for_lane_test(&home, 1);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::symlink_metadata(home.join("auth.json"));
+        let handles = provider.handles().unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root ignores directory permissions; there the fixture cannot build the
+        // case, and the assertion would be about nothing.
+        if !matches!(&probe, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied) {
+            eprintln!("skipping: permissions not enforced here ({probe:?})");
+            return;
+        }
+        assert!(
+            handles.contains(&CredentialHandle::implicit()),
+            "{handles:?}"
+        );
+    }
+
+    /// With no vault handles the local lane is the only lane, so an unconfigured
+    /// host still reports `credential_absent` rather than nothing.
+    #[test]
+    fn no_local_login_and_no_vault_keeps_the_local_lane() {
+        let home = lane_test_home("absent-no-vault", false);
+        let handles = provider_for_lane_test(&home, 0).handles().unwrap();
+        assert_eq!(handles, vec![CredentialHandle::implicit()]);
     }
 
     fn jwt_with_payload(payload: serde_json::Value) -> String {
