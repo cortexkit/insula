@@ -241,12 +241,13 @@ impl CookieVault {
             .credential_source
             .as_ref()
             .ok_or_else(|| FetchError::NoSession("no credential source configured".to_string()))?;
-        // 120s matches the other vault providers; a bare literal here would be a
-        // second answer to a question `kimi_for_coding` already answers.
-        let mut credential =
-            crate::credential_source::get_vault_credential(source, handle, 120_000)
-                .await
-                .map_err(|error| FetchError::Upstream(error.to_string()))?;
+        let mut credential = crate::credential_source::get_vault_credential(
+            source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        .map_err(|error| FetchError::Upstream(error.to_string()))?;
         crate::credential_source::take_utf8_payload(&mut credential.payload)
     }
 }

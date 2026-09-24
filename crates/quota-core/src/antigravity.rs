@@ -1633,7 +1633,7 @@ impl AntigravityProvider {
         let mut credential = match crate::credential_source::get_vault_credential(
             credential_source,
             handle,
-            120_000,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
         )
         .await
         {

@@ -540,12 +540,16 @@ impl UsageProvider for CursorProvider {
                     crate::credential_source::VaultGetError::Permanent,
                 );
             };
-            let mut credential =
-                match crate::credential_source::get_vault_credential(source, handle, 120_000).await
-                {
-                    Ok(credential) => credential,
-                    Err(error) => return FetchAttempt::unverified_vault_failure(error),
-                };
+            let mut credential = match crate::credential_source::get_vault_credential(
+                source,
+                handle,
+                crate::credential_source::VAULT_READ_MIN_TTL_MS,
+            )
+            .await
+            {
+                Ok(credential) => credential,
+                Err(error) => return FetchAttempt::unverified_vault_failure(error),
+            };
             let record_version = credential.record_version;
             let account_info = credential.account_info();
             let token = match crate::credential_source::take_utf8_payload(&mut credential.payload) {

@@ -263,6 +263,23 @@ pub trait CredentialSource: Send + Sync {
     }
 }
 
+/// The minimum remaining lifetime every provider asks for when it reads a
+/// vault credential.
+///
+/// It exists so a token cannot expire in the middle of a fetch: without a
+/// floor, a token with seconds left would reach the provider, come back 401,
+/// and be reported to the vault as a dead credential. It sits well above the
+/// fetch deadline for that reason.
+///
+/// IT ALSO DRIVES VAULT REFRESHES, which is why it is one named value and is
+/// declared in the module manifest (`vault_refresh_on_read`). The vault
+/// refreshes a credential whose remaining lifetime is under the caller's
+/// floor, so with reads every refresher turn, insula's reads trigger the
+/// refresh of each refreshable credential in roughly its last two minutes. The
+/// vault's refresh cadence for those credentials is therefore partly this
+/// module's schedule, and an analyst measuring it needs to know that.
+pub const VAULT_READ_MIN_TTL_MS: u64 = 120_000;
+
 /// Fetch through the address actually carried by a vault handle.
 pub async fn get_vault_credential(
     source: &Arc<dyn CredentialSource>,

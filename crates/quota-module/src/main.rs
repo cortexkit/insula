@@ -1362,8 +1362,64 @@ fn manifest(module_id: &str) -> ModuleManifest {
             }),
             domain: Some("provider-usage".to_string()),
             note: Some(
-                "Reads every configured provider's usage endpoint. Read-only: it \
-                 consumes no quota and changes nothing upstream."
+                "Reads every configured provider's usage endpoint. It consumes no \
+                 token quota and changes no quota state upstream, but each read \
+                 spends the polled endpoint's own rate-limit budget, which some \
+                 providers (Anthropic) enforce per account and share with every \
+                 other client polling the same account."
+                    .to_string(),
+            ),
+        },
+        SelfSignalDeclaration {
+            name: "vault_refresh_on_read".to_string(),
+            kind: SelfSignalKind::Other("mutation".to_string()),
+            // A mutation of ANOTHER module's state: the vault refreshes a
+            // credential when a read asks for more remaining lifetime than it
+            // has, and every insula read asks for the same floor. The refresh
+            // mints a new record version and calls the provider's token
+            // endpoint, and where refresh tokens are single-use it rotates them.
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::Event {
+                event: format!(
+                    "a vault credential read with under {} s of lifetime left",
+                    quota_core::credential_source::VAULT_READ_MIN_TTL_MS / 1000
+                ),
+            },
+            cadence: Some(SignalCadence::Derived {
+                source: format!(
+                    "one read per credential every {} s (refresher base interval), \
+                     each asking for at least {} s of lifetime: so roughly one \
+                     refresh per token lifetime, in its last {} s",
+                    quota_core::refresh::BASE_INTERVAL.as_secs(),
+                    quota_core::credential_source::VAULT_READ_MIN_TTL_MS / 1000,
+                    quota_core::credential_source::VAULT_READ_MIN_TTL_MS / 1000
+                ),
+            }),
+            domain: Some("credential-vault".to_string()),
+            note: Some(
+                "insula's vault reads trigger the refresh of each refreshable \
+                 credential it holds. Anyone measuring the vault's refresh cadence \
+                 should subtract this series; the read principal is \
+                 reserved:insula."
+                    .to_string(),
+            ),
+        },
+        SelfSignalDeclaration {
+            name: "vault_auth_failure_report".to_string(),
+            kind: SelfSignalKind::Other("mutation".to_string()),
+            effect: SelfSignalEffect::Mutate,
+            anchored_to: SignalAnchor::Event {
+                event: "a provider answering HTTP 401 to a bearer the vault served"
+                    .to_string(),
+            },
+            cadence: None,
+            domain: Some("credential-vault".to_string()),
+            note: Some(
+                "Reports the 401 to the vault (credential.report_auth_failure), which \
+                 marks the record stale and can lead to a refresh or needs_reauth. \
+                 Only 401s are reported, never 403s, and never for cookie \
+                 credentials. The count is published in health as \
+                 vaultAuthFailuresReported."
                     .to_string(),
             ),
         },
@@ -1539,7 +1595,7 @@ mod tests {
     /// declaration would leave this module spending banked credits while
     /// telling the fleet it only observes.
     #[test]
-    fn manifest_declares_both_self_signals_including_the_mutator() {
+    fn manifest_declares_every_self_signal_including_the_mutators() {
         let m = manifest("insula");
         let signals = m
             .self_signals
@@ -1548,8 +1604,13 @@ mod tests {
         let names: Vec<&str> = signals.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["provider_refresh", "codex_banked_reset_consume"],
-            "both signals must survive: an observer and the credit-spending mutator"
+            vec![
+                "provider_refresh",
+                "vault_refresh_on_read",
+                "vault_auth_failure_report",
+                "codex_banked_reset_consume",
+            ],
+            "every signal must survive: the observer and the three mutators"
         );
 
         let mutators: Vec<&str> = signals
@@ -1559,10 +1620,37 @@ mod tests {
             .collect();
         assert_eq!(
             mutators,
-            vec!["codex_banked_reset_consume"],
-            "the reset consumer must be declared as a MUTATOR; downgrading it to \
-                 an observer tells the fleet its effect can be subtracted after the fact"
+            vec![
+                "vault_refresh_on_read",
+                "vault_auth_failure_report",
+                "codex_banked_reset_consume",
+            ],
+            "each mutator must be declared as one; downgrading any to an observer \
+                 tells the fleet its effect can be subtracted after the fact"
         );
+    }
+
+    /// The declared refresh window is the floor the providers actually pass.
+    ///
+    /// The declaration and every provider's vault read both use
+    /// `VAULT_READ_MIN_TTL_MS`, so this pins the declaration to that constant
+    /// rather than to a literal: a change to the floor moves the declared window
+    /// with it, and a declaration hand-edited to a different number fails here.
+    #[test]
+    fn the_vault_refresh_declaration_names_the_real_read_floor() {
+        let m = manifest("insula");
+        let signals = m.self_signals.expect("self-signals declared");
+        let refresh = signals
+            .iter()
+            .find(|s| s.name == "vault_refresh_on_read")
+            .expect("vault_refresh_on_read declared");
+        let floor_secs = quota_core::credential_source::VAULT_READ_MIN_TTL_MS / 1000;
+        match &refresh.anchored_to {
+            SignalAnchor::Event { event } => {
+                assert!(event.contains(&format!("under {floor_secs} s")), "{event}")
+            }
+            other => panic!("expected an event anchor, got {other:?}"),
+        }
     }
 
     /// The trust tier survives a migration, and the storage binding stays absent.
