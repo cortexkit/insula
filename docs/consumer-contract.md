@@ -948,6 +948,41 @@ healthy — its whole answer is the balance. Consumers that reduce an account to
 its most constrained window must not treat such an entry as capacity-less or
 malformed.
 
+### `claude`: paid overage as the `extra_usage` pool
+
+A Claude account with extra usage enabled keeps serving past 100% of its
+windows and bills the overage. Without the pool, "every window at 100%" cannot
+be told apart from "still serving, and billing". The overage is published beside
+the windows as one pool:
+
+```json
+"spend": [
+  { "id": "extra_usage", "label": "Extra usage",
+    "funding": "unknown", "basis": "derived", "spendable": true,
+    "total":     { "minor": 10000, "exponent": 2, "unit": "USD" },
+    "remaining": { "minor": 8723,  "exponent": 2, "unit": "USD" } }
+]
+```
+
+- `total` is the overage limit the provider states, and `remaining` is that
+  limit minus the overage used so far. It never goes below zero, even when usage
+  has run past the limit. `basis: derived` because the provider states a limit
+  and a usage figure, not a remainder.
+- `spendable: true` means paid overage is switched on **and** has not reached
+  its spend limit. `false` means one of the two stopped it. The value comes
+  from the provider's own switches, so it can be `false` while `remaining` is
+  above zero. It is absent when the provider did not state both.
+- `funding: unknown` here means **post-paid**: overage is billed after it is
+  used. None of the named kinds describes that, and `purchased` would claim the
+  money was paid in advance. Spending this pool costs money, which is what the
+  conservative reading of `unknown` already assumes.
+- The pool has no reset. The provider states no period for it, so none is
+  published.
+- No pool, and `spend` absent, when the provider sends no overage figures, sends
+  a shape this producer cannot read, or states the limit and usage in different
+  currencies or scales. An account without extra usage is in that group. The
+  windows are published as usual in every one of these cases.
+
 ## 100% used does not mean requests are being refused
 
 `usedPercent` is a **capacity reading**, not an enforcement state. A window at

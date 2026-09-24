@@ -28,7 +28,7 @@ use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
 use crate::{
     http::{Header, JsonRequest},
-    model::{RateWindow, Usage},
+    model::{Amount, Pool, PoolBasis, PoolFunding, RateWindow, Usage},
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
 };
@@ -62,6 +62,101 @@ struct OAuthUsageResponse {
     seven_day_opus: Option<OAuthWindow>,
     seven_day_sonnet: Option<OAuthWindow>,
     limits: Option<Vec<ApiLimitEntry>>,
+    /// Paid overage ("extra usage"), read into a spend pool by [`overage_pool`].
+    ///
+    /// Held as raw JSON and decoded separately, so a shape this decoder does not
+    /// expect costs the pool and never the rate windows above. Money is the
+    /// secondary fact on this endpoint; the windows are the primary one.
+    spend: Option<serde_json::Value>,
+    /// Only `spend_limit_reached` is read from here; see [`overage_pool`].
+    extra_usage: Option<serde_json::Value>,
+}
+
+/// One money figure in the `spend` object: integer minor units, a currency, and
+/// the number of decimal places the minor units carry.
+#[derive(Debug, Deserialize)]
+struct SpendAmount {
+    amount_minor: Option<i64>,
+    currency: Option<String>,
+    exponent: Option<u8>,
+}
+
+/// The `spend` object, as observed on an account with extra usage enabled. It
+/// states no period and no reset, so the overage it describes is a pool rather
+/// than a window.
+#[derive(Debug, Deserialize)]
+struct OverageSpend {
+    used: Option<SpendAmount>,
+    limit: Option<SpendAmount>,
+    enabled: Option<bool>,
+}
+
+/// The one field read from `extra_usage`.
+#[derive(Debug, Deserialize)]
+struct ExtraUsage {
+    spend_limit_reached: Option<bool>,
+}
+
+/// A usable money figure: every part present and the amount not negative.
+fn spend_amount(amount: Option<SpendAmount>) -> Option<(i64, u8, String)> {
+    let amount = amount?;
+    let minor = amount.amount_minor.filter(|minor| *minor >= 0)?;
+    Some((minor, amount.exponent?, amount.currency?))
+}
+
+/// Build the paid-overage pool, or nothing when the payload does not support one.
+///
+/// Every failure here yields no pool rather than an error, because an error
+/// would fail the whole fetch and take the rate windows down with it. That
+/// includes an account without extra usage: its `spend` shape has not been
+/// observed, so rather than guess at it, anything without a readable `limit`
+/// publishes no pool.
+fn overage_pool(
+    spend: Option<serde_json::Value>,
+    extra_usage: Option<serde_json::Value>,
+) -> Option<Pool> {
+    let spend: OverageSpend = serde_json::from_value(spend?).ok()?;
+    let (limit, limit_exponent, limit_unit) = spend_amount(spend.limit)?;
+    let (used, used_exponent, used_unit) = spend_amount(spend.used)?;
+    // The remainder is only meaningful when both figures are in the same unit at
+    // the same scale. Nothing is converted: a mismatch publishes no pool.
+    if limit_exponent != used_exponent || limit_unit != used_unit {
+        return None;
+    }
+    // Overage can run past its limit; a pool never goes below empty.
+    let remaining = limit.saturating_sub(used).max(0);
+    let spend_limit_reached = extra_usage
+        .and_then(|value| serde_json::from_value::<ExtraUsage>(value).ok())
+        .and_then(|extra| extra.spend_limit_reached);
+    // Read from the provider's own switches, never from `remaining`: a pool with
+    // money left can still be switched off. When either switch is missing the
+    // answer is left unstated rather than guessed.
+    let spendable = match (spend.enabled, spend_limit_reached) {
+        (Some(enabled), Some(reached)) => Some(enabled && !reached),
+        _ => None,
+    };
+    Some(Pool {
+        id: "extra_usage".to_string(),
+        label: "Extra usage".to_string(),
+        // Overage is billed after it is used. None of granted, purchased or
+        // subscription says that (purchased would claim it was bought in
+        // advance), and there is no post-paid kind to use instead. `Unknown` is
+        // the value every consumer already reads conservatively.
+        funding: PoolFunding::Unknown,
+        remaining: Some(Amount {
+            minor: remaining,
+            exponent: limit_exponent,
+            unit: limit_unit.clone(),
+        }),
+        total: Some(Amount {
+            minor: limit,
+            exponent: limit_exponent,
+            unit: limit_unit,
+        }),
+        // A limit minus a usage figure, not a remainder the provider states.
+        basis: PoolBasis::Derived,
+        spendable,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,9 +301,17 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWi
 /// sparse account as having less usage than it does, and a consumer that stops
 /// early reports the wrong constraint as binding.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+    normalize_response(body).map(|(usage, _)| usage)
+}
+
+/// Normalize the body to its rate windows and the paid-overage pool, if any.
+///
+/// The pool never fails this call: see [`overage_pool`].
+fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> {
     let response: OAuthUsageResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
-    Ok(Usage {
+    let pool = overage_pool(response.spend, response.extra_usage);
+    let usage = Usage {
         primary: to_window(response.five_hour.as_ref(), FIVE_HOUR_MINUTES),
         secondary: to_window(response.seven_day.as_ref(), SEVEN_DAY_MINUTES),
         tertiary: to_window(
@@ -219,7 +322,24 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             SEVEN_DAY_MINUTES,
         ),
         extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
-    })
+    };
+    Ok((usage, pool))
+}
+
+/// A successful attempt carrying the windows and, when there is one, the pool.
+///
+/// No pool leaves `pools` absent rather than empty: an empty list would state
+/// that the provider reports no pools, which an unreadable or unobserved
+/// `spend` does not establish.
+fn success_attempt(
+    observed: Option<AccountObservation>,
+    source: &str,
+    usage: Usage,
+    pool: Option<Pool>,
+) -> FetchAttempt {
+    let mut attempt = FetchAttempt::success(observed, source, usage);
+    attempt.pools = pool.map(|pool| vec![pool]);
+    attempt
 }
 
 fn canonical_account_id(account_id: Option<String>) -> Option<String> {
@@ -275,11 +395,14 @@ impl AnthropicProvider {
         let result = usage_request(&self.usage_url, bearer)
             .send(&self.http)
             .await
-            .and_then(|body| normalize_usage(&body));
+            .and_then(|body| normalize_response(&body));
         match result {
-            Ok(usage) => {
-                FetchAttempt::success(Some(AccountObservation::new(None, None)), "oauth", usage)
-            }
+            Ok((usage, pool)) => success_attempt(
+                Some(AccountObservation::new(None, None)),
+                "oauth",
+                usage,
+                pool,
+            ),
             Err(error) => FetchAttempt::failure(None, None, error),
         }
     }
@@ -324,13 +447,13 @@ impl AnthropicProvider {
             .send_provider_status_first(&self.http, PROVIDER_NAME)
             .await
             .map(|response| response.body)
-            .and_then(|body| normalize_usage(&body));
+            .and_then(|body| normalize_response(&body));
         if let Err(error) = &result {
             self.report_auth_failure(handle, record_version, error);
         }
         match result {
-            Ok(usage) => {
-                FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+            Ok((usage, pool)) => {
+                success_attempt(observed, "vault", usage, pool).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
@@ -917,5 +1040,172 @@ mod tests {
         assert!(usage.primary.is_none());
         assert!(usage.secondary.is_none());
         assert!(usage.tertiary.is_none());
+    }
+
+    /// `extra_usage` exactly as captured from an account with extra usage enabled
+    /// (2026-09-24T20:37:23Z).
+    const CAPTURED_EXTRA_USAGE: &str = r#"{"is_enabled":true,"monthly_limit":10000,"used_credits":1277,"utilization":12.770000000000001,"currency":"USD","decimal_places":2,"disabled_reason":null,"user_disabled":false,"spend_limit_reached":false,"credits_ever_enabled":true,"daily":null,"weekly":null}"#;
+
+    /// `spend` exactly as captured in the same response.
+    const CAPTURED_SPEND: &str = r#"{"used":{"amount_minor":1277,"currency":"USD","exponent":2},"limit":{"amount_minor":10000,"currency":"USD","exponent":2},"percent":13,"severity":"normal","enabled":true,"disabled_reason":null,"cap":{"money":null,"credits":{"amount_minor":10000,"exponent":2}},"balance":null,"auto_reload":null,"disclaimer":"…","can_purchase_credits":false,"can_toggle":false}"#;
+
+    /// A usage body with a live session window, the given `extra_usage`, and the
+    /// given `spend` (omitted entirely when `None`).
+    fn overage_body(extra_usage: &str, spend: Option<&str>) -> Vec<u8> {
+        let spend = spend
+            .map(|spend| format!(r#","spend":{spend}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"five_hour":{{"utilization":42.0,"resets_at":"2026-09-24T22:00:00Z"}},"extra_usage":{extra_usage}{spend}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn usd(minor: i64) -> Amount {
+        Amount {
+            minor,
+            exponent: 2,
+            unit: "USD".to_string(),
+        }
+    }
+
+    /// Normalize a body, asserting the session window survived whatever the
+    /// money fields held, and return the pool.
+    fn pool_beside_windows(body: &[u8]) -> Option<Pool> {
+        let (usage, pool) = normalize_response(body).expect("the windows must still parse");
+        assert_eq!(usage.primary.expect("five_hour").used_percent, 42.0);
+        pool
+    }
+
+    #[test]
+    fn captured_overage_account_publishes_one_extra_usage_pool() {
+        let pool = pool_beside_windows(&overage_body(CAPTURED_EXTRA_USAGE, Some(CAPTURED_SPEND)))
+            .expect("an overage-enabled account publishes its pool");
+        assert_eq!(pool.id, "extra_usage");
+        assert_eq!(pool.label, "Extra usage");
+        assert_eq!(pool.total, Some(usd(10000)));
+        assert_eq!(pool.remaining, Some(usd(8723)));
+        assert_eq!(pool.basis, PoolBasis::Derived);
+        assert_eq!(pool.funding, PoolFunding::Unknown);
+        assert_eq!(pool.spendable, Some(true));
+    }
+
+    #[test]
+    fn overage_at_its_spend_limit_is_not_spendable() {
+        let extra_usage = CAPTURED_EXTRA_USAGE.replace(
+            r#""spend_limit_reached":false"#,
+            r#""spend_limit_reached":true"#,
+        );
+        let pool = pool_beside_windows(&overage_body(&extra_usage, Some(CAPTURED_SPEND))).unwrap();
+        // Money remains, so only the provider's own flag can say this is closed.
+        assert_eq!(pool.remaining, Some(usd(8723)));
+        assert_eq!(pool.spendable, Some(false));
+    }
+
+    #[test]
+    fn disabled_overage_is_not_spendable() {
+        let spend = CAPTURED_SPEND.replace(r#""enabled":true"#, r#""enabled":false"#);
+        let pool = pool_beside_windows(&overage_body(CAPTURED_EXTRA_USAGE, Some(&spend))).unwrap();
+        assert_eq!(pool.spendable, Some(false));
+    }
+
+    #[test]
+    fn spendable_is_unstated_when_a_switch_is_missing() {
+        let extra_usage = CAPTURED_EXTRA_USAGE.replace(r#""spend_limit_reached":false,"#, "");
+        let pool = pool_beside_windows(&overage_body(&extra_usage, Some(CAPTURED_SPEND))).unwrap();
+        assert_eq!(pool.spendable, None);
+    }
+
+    #[test]
+    fn unusable_spend_publishes_no_pool_and_keeps_the_windows() {
+        let limit_null = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
+            r#""limit":null"#,
+        );
+        let currency_mismatch = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD""#,
+            r#""limit":{"amount_minor":10000,"currency":"EUR""#,
+        );
+        let exponent_mismatch = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
+            r#""limit":{"amount_minor":100000,"currency":"USD","exponent":3}"#,
+        );
+        let cases: [(&str, Option<&str>); 6] = [
+            ("spend null", Some("null")),
+            ("spend absent", None),
+            ("limit null", Some(&limit_null)),
+            ("currency mismatch", Some(&currency_mismatch)),
+            ("exponent mismatch", Some(&exponent_mismatch)),
+            (
+                "spend unparseable",
+                Some(r#"{"used":"a lot","enabled":"yes"}"#),
+            ),
+        ];
+        for (case, spend) in cases {
+            let body = overage_body(CAPTURED_EXTRA_USAGE, spend);
+            let (usage, pool) = normalize_response(&body)
+                .unwrap_or_else(|error| panic!("{case}: the windows must still parse: {error:?}"));
+            assert_eq!(
+                usage.primary.expect("five_hour").used_percent,
+                42.0,
+                "{case}"
+            );
+            assert!(pool.is_none(), "{case}: no pool may be published");
+        }
+    }
+
+    #[test]
+    fn overage_past_its_limit_leaves_nothing_rather_than_a_negative() {
+        let spend = CAPTURED_SPEND.replace(r#""amount_minor":1277"#, r#""amount_minor":12500"#);
+        let pool = pool_beside_windows(&overage_body(CAPTURED_EXTRA_USAGE, Some(&spend))).unwrap();
+        assert_eq!(pool.remaining, Some(usd(0)));
+        assert_eq!(pool.total, Some(usd(10000)));
+    }
+
+    #[tokio::test]
+    async fn overage_pool_reaches_the_published_spend() {
+        // The session window resets an hour from now, so the wire rules below
+        // judge a live window rather than one whose reset has already passed.
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let body = String::from_utf8(overage_body(CAPTURED_EXTRA_USAGE, Some(CAPTURED_SPEND)))
+            .unwrap()
+            .replace("2026-09-24T22:00:00Z", &reset)
+            .into_bytes();
+        let (url, _) = serve_once(200, body).await;
+        let (source, _) = source(Ok(credential(b"anthropic-vault-token", 31)));
+        let handle =
+            CredentialHandle::vault("oauth:anthropic", VaultCapability::new("ckh_anthropic"));
+        let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
+            provider: test_provider(source, url),
+            handle,
+        })]);
+
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
+        assert_eq!(entries.len(), 1);
+        let spend = entries[0].spend.as_ref().expect("the pool is published");
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].id, "extra_usage");
+        assert_eq!(spend[0].remaining, Some(usd(8723)));
+        assert_eq!(spend[0].spendable, Some(true));
+        // The windows are published beside it, not replaced by it.
+        assert_eq!(
+            entries[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            42.0
+        );
+        // The published pool also satisfies the wire rules, remaining within
+        // total among them.
+        let report = crate::wire_sanity::check_entries(&entries, crate::wire_sanity::now());
+        assert_eq!(report.pool_comparisons, 1);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 }
