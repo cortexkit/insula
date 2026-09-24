@@ -752,7 +752,9 @@ The five server-function and header constants matched CodexBar v0.55.0,
 re-verified 2026-08-25 by locating each
 value in the tagged tree (`git grep -l <value> v0.55.0`) rather than in a
 checkout, since a working tree can be on any commit. The three console constants
-were located the same way in the v0.64.1 tree on 2026-09-23.
+were located the same way in the v0.64.1 tree on 2026-09-23. All eight were
+last re-located by value in the v0.65.0 tree on 2026-09-24, unchanged (see that
+parity round).
 
 File paths here carry no line numbers on purpose. The two that had them were
 both stale by the time anyone read them -- a line number drifts on every edit
@@ -1255,6 +1257,224 @@ not parallel workers:
 - **Q-matrix-3 (credits signal):** should the router model a credits/balance signal at
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
+
+### Parity round: CodexBar v0.64.1 → v0.65.0
+
+One tag. All EIGHT opaque constants present at `v0.65.0`, located by VALUE in
+the tagged tree (`git grep -l <value> v0.65.0 -- Sources`), each in the same file
+as at `v0.64.1` — none moved:
+
+| Constant | Value located in (`v0.65.0`) |
+|---|---|
+| `WORKSPACES_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `BILLING_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `SUBSCRIPTION_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift` |
+| `BETA_HEADER` (`oauth-2025-04-20`) | `Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift` |
+| `OASIS_WEB_ID` | `StepFun/StepFunUsageFetcher.swift` |
+| `CONSOLE_WORKSPACES_PATH` (`/console/api/orgs`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_GO_STATUS_PATH` (`/console/api/go/status`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_WORKSPACE_HEADER` (`x-org-id`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+
+Paths are under `Sources/CodexBarCore/Providers/`.
+
+**Triage method, as last round.** The provider delta is dominated by three
+upstream-wide refactors: a shared HTTP session factory (`ProviderHTTPSessionFactory`
+in `ProviderHTTPClient.swift`), shared settings/environment lookup and
+endpoint-override policy (`SettingsValue.first`,
+`ProviderEndpointOverrideValidator.rejectedOverrideKey`), and shared parsing for
+OneConsole JSON and credit counters. Each served provider's diff was filtered for
+changed lines naming a URL, cookie, header, JSON key, sign-in or redirect term,
+parsing rule, or error mapping; where a filter hit was a moved block, the old and
+new blocks were compared side by side. **No served provider changes what it
+requests or how it reads the answer.** No provider behaviour changes here.
+
+**Claude (6 files): no effect.** The six files are `ClaudeCLIScreen.swift` (new),
+`ClaudeCLISession.swift`, `ClaudeStatusProbe.swift`, `ClaudeConfigPaths.swift`,
+`ClaudeSwap/ClaudeSwapAccountList.swift` and
+`ClaudeSwap/ClaudeSwapAccountProjection.swift`. Nothing under `ClaudeOAuth/`,
+nor `ClaudeUsageFetcher.swift` or the scoped-weekly mapper, changed. `anthropic.rs`
+reads only `GET /api/oauth/usage` with the vault's OAuth token, so it shares no
+code path with any of the six:
+- `ClaudeCLIScreen` + `ClaudeCLISession` + `ClaudeStatusProbe`: the `claude` TUI
+  scrape (`/usage`, `/status` in a PTY) now replays cursor and erase sequences
+  onto a 160×50 screen before parsing, and sends Escape before reusing a live
+  session. That is a fix for a terminal-capture lane we do not have.
+- `ClaudeConfigPaths.costProjectsRoots`: adds claude-swap session homes to the
+  local JSONL cost scan. That is consumption with no denominator, the standing
+  decline for local cost families.
+- `ClaudeSwap*`: the claude-swap adapter gains an optional
+  `supportsAccountSwitching` boolean (default true) that gates the menu's
+  "activate" action. The scoped-window parser was folded into the shared window
+  parser: same `pct` clamp to 0–100, same ISO `resetsAt`. We do not read
+  claude-swap; our accounts come from the vault.
+
+**Ollama and OpenCode Go: the 2026-09-23 ports stand, and this round adds
+nothing to them.**
+- Ollama's only `v0.65.0` change is the session-factory refactor in
+  `OllamaUsageFetcher.swift`; the request headers (`origin`, `referer`) and
+  response handling are untouched. The behaviour ported on 2026-09-23 (the
+  `Monthly usage` block with its `$X of $Y used` figure, and the same-host
+  `/signin` redirect) is present at `v0.65.0` as ported. It did not arrive in this
+  release: the sign-in redirect detection dates from `v0.42.0` and the monthly
+  compatibility fix from `v0.56.3`, so the "(CodexBar v0.65.0)" in that merge's
+  title names the tree the port was read from, not the release that introduced it.
+- OpenCode Go's `v0.65.0` change (`OpenCodeGoProviderDescriptor.swift`,
+  `OpenCodeGoSettingsReader.swift`) lets a saved token account hold an
+  `OPENCODE_API_KEY` as well as a Cookie header, and routes such an account to
+  the API lane. The console lane ported on 2026-09-23 (from `v0.64.1`) is
+  unchanged at `v0.65.0`, and so are its three constants (table above). The API
+  lane itself is not something we have: `GET https://opencode.ai/zen/go/v1/usage`
+  with `Authorization: Bearer <OPENCODE_API_KEY>` has existed upstream since
+  `v0.54.0`, and `opencodego.rs` has never read it. That gap predates this round;
+  see Recommended ports.
+
+**Kimi: no effect.** `KimiProviderDescriptor.swift` adds labeled web accounts
+(one `kimi-auth` cookie per stored account) and lets a manual cookie source pass
+the Linux CLI browser gate. Request, headers and parsing in `KimiUsageFetcher`
+are unchanged. Labeled account storage is credential plumbing in the app, with
+nothing to port into the fetch.
+
+**Moonshot: not ours; moved to a plugin.** `MoonshotUsageFetcher.swift` was
+deleted and its fetch moved to `Resources/Plugins/moonshot.ts`/`.js`, keeping the
+same surface: `GET {api.moonshot.ai|api.moonshot.cn}/v1/users/me/balance`, bearer
+`MOONSHOT_API_KEY`, reading `available_balance` / `cash_balance` /
+`voucher_balance`. That is the Moonshot developer platform's prepaid balance, not
+`kimi.rs` (the www.kimi.com coding-plan subscription; see `lib.rs`'s
+models.dev slug note) and not `kimi_for_coding.rs`. We have no Moonshot module and
+cite nothing in the deleted file.
+
+**Doubao: no effect.** `DoubaoProviderDescriptor.swift` adds labeled Ark API-key
+accounts. Its settings-to-environment rewrite now sets the configured region on
+every branch instead of on each branch separately; reading both versions, the
+result is the same on every branch. The `AKLT` access-key rule is unchanged: a key
+with that prefix is still an access key ID, because every other key returns
+earlier. `DoubaoSettingsReader.swift` swapped a private `firstValue` for the shared
+`SettingsValue.first`, which does the same thing.
+
+**MiniMax: no effect.** `MiniMaxUsageFetcher.swift` extracted the transport /
+status / parse steps into `fetchResponse` and `parseRemainsResponse`. The
+API-token request we mirror keeps `Authorization: Bearer`, `accept` and
+`Content-Type: application/json`, and `MM-API-Source: CodexBar`; 401/403 still map
+to invalid credentials, and parse errors on that path still pass through
+`normalizedAPITokenError`. The web-cookie requests keep their headers (`accept`,
+`user-agent`, `origin`, `referer`) via a shared `makeWebRequest`. We read MiniMax
+with an API key only.
+
+**Alibaba (4) and QwenCloud: no effect.** The personal token-plan parse
+(`per5HourPercentage` / `per1WeekPercentage`, plan code from
+`specCode|spec_code|planName|plan_name`, quota totals from `five_hour|fiveHour` /
+`weekly`) was lifted verbatim into
+`Shared/AliyunOneConsole/OneConsoleTokenPlanSnapshot.swift`. Alibaba keeps its
+`"Personal"` default plan name through a `defaultPlanName` parameter.
+`OneConsoleJSON.swift`'s recursive lookups were unified on one `firstMatch`
+traversal, still dictionary before descendants and in container order, and
+Alibaba's coding-plan named-object lookup keeps its dictionary-only descent
+(`descendingIntoArrays: false`). The settings reader's check of its
+"endpoint overrides must be provider-owned" switch moved into
+`ProviderEndpointOverrideValidator.HostPolicy`, with the same `1/true/yes/on`
+values.
+
+**Kilo and Codebuff: no effect.** Their `resolvedTotal` / `resolvedUsed`
+reconciliation (total, else used + remaining; used, else total − remaining;
+clamped at 0) moved into `Shared/CreditUsage.swift` unchanged, including Kilo's
+pass counters.
+
+**Amp: no effect.** Session-factory refactor only; the API and web request
+headers are unchanged.
+
+**Antigravity (3): no effect.**
+- `AntigravityCLIPrintFailure.swift` (new) classifies an `agy` print-usage
+  subprocess failure into fixed messages so raw stderr never reaches the UI.
+- `AntigravityProviderDescriptor.swift` has three changes. Its CLI-HTTPS polling
+  loop now stops at once on an account mismatch when the snapshot carries a
+  non-empty email, and keeps polling only while the email is still empty on a
+  cold start. A winning offline/cache strategy now explains why the live source
+  failed, through the new `ProviderFetchStrategy.diagnostic(forPriorFailure:)`.
+  The session pace rule changed from a closure to
+  `.windowDuration(minutes: 300)`.
+- `AntigravityStatusProbe.swift` adds a `cliReportFailed` error case.
+
+  None of this reaches a request or a parse we share. We never spawn `agy`, and
+  our account guard already requires an email match and falls through to the
+  plugin cache and then the cloud lane on a mismatch or a missing email. The
+  pace rule is display policy.
+
+**Windsurf (deferred): one line.** `WindsurfDevinSessionImporter.swift` now uses
+the shared Chromium browser-session discovery from Devin (#3883); the cached
+plan-info read that the deferral concerns is untouched.
+
+**Shared and top-level.**
+- `ProviderFetchPlan.swift` adds `diagnostic(forPriorFailure:)` and
+  `ProviderFetchResult.withDiagnostic`: an explanatory string attached to a
+  degraded winner. It does not change which strategy wins.
+- `ProviderManifest.swift`, `Providers.swift` and
+  `ProviderInstanceIDAliases.generated.swift` only register Bifrost, Hyper and
+  GitKraken.
+- `ProviderHTTPClient.swift` adds `ProviderHTTPSessionFactory`, one ephemeral
+  session per request, as before.
+- `ProviderEndpointOverrideValidator.swift` adds `rejectedOverrideKey`.
+
+Nothing here changes how every provider fetches.
+
+**New or changed providers we do not implement.** Bifrost, Hyper and GitKraken
+are new this release; the rest existed at `v0.64.1` and changed.
+- **Bifrost** (new plugin `bifrost.ts`): a self-hosted gateway at a
+  user-configured `BIFROST_BASE_URL`, virtual key in the `x-bf-vk` header,
+  `GET /api/governance/virtual-keys/quota`, answering budgets (`max_limit` /
+  `current_usage`) and rate limits. Headless, API key plus URL. Serving it is
+  possible, but only for someone running a Bifrost gateway.
+- **Hyper** (Charm, new plugin `hyper.ts`): `GET https://hyper.charm.land/v1/credits`
+  with a browser cookie or `HYPER_API_KEY`; a non-negative `balance` in Hyper
+  credits. Headless via the API key; a balance with no denominator, so it would
+  sit on the Balance axis.
+- **GitKraken** (new plugin `gitkraken.ts`): `GET https://api.gitkraken.dev/v1/ai-tasks/usage`,
+  bearer `GITKRAKEN_API_TOKEN` plus an organization ID and a `Client-Version`
+  header; `{used, limit}` credit pools, where `-1` means unlimited. Headless;
+  window-less credit allowance.
+- **Zed** (moved to plugin `zed.js`; `ZedStatusProbe.swift` shrank by ~300 lines):
+  either `https://cloud.zed.dev/frontend/billing/usage` with a `zed.dev` browser
+  cookie, or the editor API URL with the editor credential Zed stores in the
+  macOS Keychain. Edit-prediction count against a limit. Both credentials are
+  desktop-coupled, so it cannot be served headlessly.
+- **Devin** (small change, Chromium discovery sharing):
+  `https://app.devin.ai/settings/usage` via a browser session or
+  `DEVIN_BEARER_TOKEN`. Headless only with a pasted bearer token of unknown
+  lifetime.
+- **LiteLLM** (plugin reworked): a self-hosted proxy at `LITELLM_BASE_URL`, bearer
+  `LITELLM_API_KEY`; key/team budgets (`spend` / `max_budget`) plus
+  `key/spend/report` and `user/spend/report` for spend. Headless, but only for a
+  LiteLLM operator.
+- **Fireworks** (settings-reader refactor only):
+  `api.fireworks.ai/v1/accounts/<slug>/billing/summary` with `FIREWORKS_API_KEY`.
+  Our own probe of `/v1/accounts` answers 412 for a suspended account (see the
+  `fireworks-ai` row above), so the standing note holds.
+- **DeepInfra** (settings-reader refactor only):
+  `api.deepinfra.com/payment/usage?from=current` and `/payment/checklist` with
+  `DEEPINFRA_API_KEY`. Headless; spend and owed amount, with no window.
+
+**Citations.** The release deletes exactly one Swift file,
+`MoonshotUsageFetcher.swift`, and no module here cites it.
+`scripts/parity-citations.py` against `v0.65.0` reports no new dead citations;
+the seven it accepts as answered are the same seven as last round.
+
+**Recommended ports** (none built this round; for the owner to choose):
+1. **OpenCode Go API-key lane.** In `opencodego.rs`, add a lane reading
+   `GET https://opencode.ai/zen/go/v1/usage` with
+   `Authorization: Bearer <OPENCODE_API_KEY>` (401/403 mean invalid credentials),
+   parsed as upstream's `parseAPIUsage`. Upstream path:
+   `Sources/CodexBarCore/Providers/OpenCodeGo/OpenCodeGoUsageFetcher.swift`
+   (`fetchAPIUsage`, `parseAPIUsage`), with the token-account routing in
+   `OpenCodeGoProviderDescriptor.swift` and `OpenCodeGoSettingsReader.swift`
+   (`tokenAccountAPIKey`: a value with no whitespace, `=` or `:` is a key, not a
+   Cookie header). Why: it is headless. The cookie lane is blocked on this host by
+   a macOS permission, so an API key would be the first OpenCode Go reading we
+   could live-verify. Risk: medium. It adds a second lane whose ordering against
+   the console and legacy lanes needs a rule, and it has not been verified whether
+   the key's `/zen/go` answer covers the same meters as the console's
+   `go/status`. Upstream has had this lane since `v0.54.0`, so it is a gap that
+   predates this round rather than a change in it.
+
+Nothing else in this release is worth porting.
 
 ### Parity round: CodexBar v0.62.0 → v0.64.1
 
