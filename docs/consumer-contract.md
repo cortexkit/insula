@@ -269,6 +269,27 @@ distorts what you are computing, the cause is the producer's lifecycle rather
 than your key, and `stale` does not mark it: this is a fresh read, not a
 preserved one.
 
+**A restart can also step `fetchedAt` BACKWARDS on a cache-backed lane.** Within
+one process, a successful fetch whose reading is older than the one already
+served is discarded and the entry disclosed `stale` (no class). That memory is
+the process's own: after a restart a slot has nothing to compare against, so if
+the source it reads has rewound in the meantime (antigravity's plugin cache has
+been measured doing this), the first reading published can be older than the
+one the previous process was serving, with no `stale`. It is not marked because
+it is not stale by this contract's meaning: it WAS obtained by the latest fetch.
+`fetchedAt` stays honest and shows the step. Measured on a consumer's host at a
+routine module swap (insula#22): `fetchedAt` 06:31:08 before, 06:19:59 after,
+value 24.09 -> 20.16, for 40 seconds until a newer reading arrived.
+
+So a consumer that differences a value series, for cost or drop analysis, must
+treat a pair whose later `fetchedAt` is EARLIER than the former as non-comparable
+rather than as a decrease. This module's own drop detector does exactly that
+(`quota_drop::detect` refuses continuity when the newer reading describes an
+earlier moment). The ring `epoch` changing is the separate signal that a restart
+happened at all. Persisting the high-water across restarts was considered and
+not done: it would be the first persisted quota state in a module that keeps
+none, to spare a check a correct differencer needs anyway.
+
 ## Degraded means "we cannot read it", not "the provider is down"
 
 The set that produces a degraded entry is the non-transient failures, defined by
