@@ -15,7 +15,11 @@
 //!     ISO 8601 — unlike codex's int-percent + epoch. So normalization is a
 //!     near-passthrough here, mapping window names to known window lengths.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -97,31 +101,114 @@ struct ExtraUsage {
     spend_limit_reached: Option<bool>,
 }
 
-/// A usable money figure: every part present and the amount not negative.
-fn spend_amount(amount: Option<SpendAmount>) -> Option<(i64, u8, String)> {
-    let amount = amount?;
-    let minor = amount.amount_minor.filter(|minor| *minor >= 0)?;
-    Some((minor, amount.exponent?, amount.currency?))
+/// Why a `spend` the provider did send was not turned into a pool.
+///
+/// Kept apart from "nothing stated" (`spend` absent or `null`) so the two kinds
+/// of silence can be told apart in the log. Every variant still publishes no
+/// pool; only the diagnostic differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalReason {
+    /// `spend` is not an object of the expected field types.
+    Unparseable,
+    /// `limit` is absent, or lacks its amount, currency or exponent.
+    LimitMissing,
+    /// `used` is absent, or lacks its amount, currency or exponent.
+    UsedMissing,
+    /// `limit` or `used` carries an amount below zero.
+    NegativeAmount,
+    /// `limit` and `used` are in different currencies.
+    CurrencyMismatch,
+    /// `limit` and `used` carry a different number of decimal places.
+    ExponentMismatch,
 }
 
-/// Build the paid-overage pool, or nothing when the payload does not support one.
+impl RefusalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unparseable => "unparseable",
+            Self::LimitMissing => "limit missing",
+            Self::UsedMissing => "used missing",
+            Self::NegativeAmount => "negative amount",
+            Self::CurrencyMismatch => "currency mismatch",
+            Self::ExponentMismatch => "exponent mismatch",
+        }
+    }
+}
+
+/// A present `spend` that was refused: the reason, plus the sorted key names of
+/// the object so the log can show its shape. Key names only, never values, so
+/// no amount or provider text ever reaches the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverageRefusal {
+    reason: RefusalReason,
+    spend_keys: Vec<String>,
+}
+
+/// What is wrong with one money figure, before it is known whether it is the
+/// limit or the usage.
+enum AmountProblem {
+    Missing,
+    Negative,
+}
+
+/// A usable money figure: every part present and the amount not negative.
+fn spend_amount(amount: Option<SpendAmount>) -> Result<(i64, u8, String), AmountProblem> {
+    let amount = amount.ok_or(AmountProblem::Missing)?;
+    let minor = amount.amount_minor.ok_or(AmountProblem::Missing)?;
+    let exponent = amount.exponent.ok_or(AmountProblem::Missing)?;
+    let currency = amount.currency.ok_or(AmountProblem::Missing)?;
+    if minor < 0 {
+        return Err(AmountProblem::Negative);
+    }
+    Ok((minor, exponent, currency))
+}
+
+/// Build the paid-overage pool, or say why there is none.
 ///
-/// Every failure here yields no pool rather than an error, because an error
-/// would fail the whole fetch and take the rate windows down with it. That
-/// includes an account without extra usage: its `spend` shape has not been
-/// observed, so rather than guess at it, anything without a readable `limit`
-/// publishes no pool.
+/// `Ok(None)` means the provider stated nothing (`spend` absent or `null`);
+/// `Err` means it sent a `spend` this code cannot use. Neither is an error to
+/// the fetch, because failing the fetch would take the rate windows down with
+/// it: both publish no pool. That includes an account without extra usage: its
+/// `spend` shape has not been observed, so rather than guess at it, anything
+/// without a readable `limit` publishes no pool.
 fn overage_pool(
     spend: Option<serde_json::Value>,
     extra_usage: Option<serde_json::Value>,
-) -> Option<Pool> {
-    let spend: OverageSpend = serde_json::from_value(spend?).ok()?;
-    let (limit, limit_exponent, limit_unit) = spend_amount(spend.limit)?;
-    let (used, used_exponent, used_unit) = spend_amount(spend.used)?;
+) -> Result<Option<Pool>, OverageRefusal> {
+    let spend = match spend {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let mut spend_keys: Vec<String> = spend
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    spend_keys.sort();
+    let refuse = |reason| OverageRefusal {
+        reason,
+        spend_keys: spend_keys.clone(),
+    };
+    let spend: OverageSpend =
+        serde_json::from_value(spend).map_err(|_| refuse(RefusalReason::Unparseable))?;
+    let (limit, limit_exponent, limit_unit) = spend_amount(spend.limit).map_err(|problem| {
+        refuse(match problem {
+            AmountProblem::Missing => RefusalReason::LimitMissing,
+            AmountProblem::Negative => RefusalReason::NegativeAmount,
+        })
+    })?;
+    let (used, used_exponent, used_unit) = spend_amount(spend.used).map_err(|problem| {
+        refuse(match problem {
+            AmountProblem::Missing => RefusalReason::UsedMissing,
+            AmountProblem::Negative => RefusalReason::NegativeAmount,
+        })
+    })?;
     // The remainder is only meaningful when both figures are in the same unit at
     // the same scale. Nothing is converted: a mismatch publishes no pool.
-    if limit_exponent != used_exponent || limit_unit != used_unit {
-        return None;
+    if limit_unit != used_unit {
+        return Err(refuse(RefusalReason::CurrencyMismatch));
+    }
+    if limit_exponent != used_exponent {
+        return Err(refuse(RefusalReason::ExponentMismatch));
     }
     // Overage can run past its limit; a pool never goes below empty.
     let remaining = limit.saturating_sub(used).max(0);
@@ -135,7 +222,7 @@ fn overage_pool(
         (Some(enabled), Some(reached)) => Some(enabled && !reached),
         _ => None,
     };
-    Some(Pool {
+    Ok(Some(Pool {
         id: "extra_usage".to_string(),
         label: "Extra usage".to_string(),
         // Overage is billed after it is used. None of granted, purchased or
@@ -156,7 +243,17 @@ fn overage_pool(
         // A limit minus a usage figure, not a remainder the provider states.
         basis: PoolBasis::Derived,
         spendable,
-    })
+    }))
+}
+
+/// Whether a handle's refusal state change deserves a log line.
+///
+/// The provider polls every account every minute, so logging each refusal
+/// would repeat the same line forever. Instead a line is written when a refusal
+/// first appears, when its reason changes, and when it clears (the `spend`
+/// became readable or stopped being stated). `None` means not refused.
+fn refusal_needs_log(previous: Option<RefusalReason>, current: Option<RefusalReason>) -> bool {
+    previous != current
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +405,14 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 ///
 /// The pool never fails this call: see [`overage_pool`].
 fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> {
+    normalize_with_overage(body).map(|(usage, overage)| (usage, overage.unwrap_or(None)))
+}
+
+/// [`normalize_response`], keeping the reason a present `spend` was refused so
+/// the provider can log it.
+fn normalize_with_overage(
+    body: &[u8],
+) -> Result<(Usage, Result<Option<Pool>, OverageRefusal>), FetchError> {
     let response: OAuthUsageResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
     let pool = overage_pool(response.spend, response.extra_usage);
@@ -362,6 +467,9 @@ pub struct AnthropicProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     usage_url: String,
+    /// The last `spend` refusal logged per handle stable id; a handle whose
+    /// `spend` is readable or unstated has no entry. See [`refusal_needs_log`].
+    overage_refusals: Mutex<HashMap<String, RefusalReason>>,
 }
 
 impl AnthropicProvider {
@@ -374,7 +482,40 @@ impl AnthropicProvider {
             credential_source,
             handle_loader,
             usage_url: USAGE_URL.to_string(),
+            overage_refusals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Log a handle's `spend` refusal when it first appears, changes, or clears,
+    /// and hand back the pool to publish (none when refused).
+    fn settle_overage(
+        &self,
+        handle_id: &str,
+        overage: Result<Option<Pool>, OverageRefusal>,
+    ) -> Option<Pool> {
+        let current = overage.as_ref().err().map(|refusal| refusal.reason);
+        let mut refusals = self
+            .overage_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = refusals.get(handle_id).copied();
+        if refusal_needs_log(previous, current) {
+            match &overage {
+                Err(refusal) => eprintln!(
+                    "{LOG_TAG} warning: anthropic spend refused ({handle_id}): {}; spend keys [{}]; no overage pool published",
+                    refusal.reason.as_str(),
+                    refusal.spend_keys.join(", ")
+                ),
+                Ok(_) => eprintln!(
+                    "{LOG_TAG} anthropic spend no longer refused ({handle_id})"
+                ),
+            }
+        }
+        match current {
+            Some(reason) => refusals.insert(handle_id.to_string(), reason),
+            None => refusals.remove(handle_id),
+        };
+        overage.unwrap_or(None)
     }
 
     fn report_auth_failure(
@@ -391,17 +532,17 @@ impl AnthropicProvider {
         );
     }
 
-    async fn fetch_local_bearer(&self, bearer: &str) -> FetchAttempt {
+    async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {
         let result = usage_request(&self.usage_url, bearer)
             .send(&self.http)
             .await
-            .and_then(|body| normalize_response(&body));
+            .and_then(|body| normalize_with_overage(&body));
         match result {
-            Ok((usage, pool)) => success_attempt(
+            Ok((usage, overage)) => success_attempt(
                 Some(AccountObservation::new(None, None)),
                 "oauth",
                 usage,
-                pool,
+                self.settle_overage(handle_id, overage),
             ),
             Err(error) => FetchAttempt::failure(None, None, error),
         }
@@ -447,12 +588,13 @@ impl AnthropicProvider {
             .send_provider_status_first(&self.http, PROVIDER_NAME)
             .await
             .map(|response| response.body)
-            .and_then(|body| normalize_response(&body));
+            .and_then(|body| normalize_with_overage(&body));
         if let Err(error) = &result {
             self.report_auth_failure(handle, record_version, error);
         }
         match result {
-            Ok((usage, pool)) => {
+            Ok((usage, overage)) => {
+                let pool = self.settle_overage(handle_id, overage);
                 success_attempt(observed, "vault", usage, pool).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
@@ -500,7 +642,7 @@ impl UsageProvider for AnthropicProvider {
             }
             Err(error) => return FetchAttempt::failure(None, None, error),
         };
-        self.fetch_local_bearer(&access).await
+        self.fetch_local_bearer(handle.stable_id(), &access).await
     }
 }
 
@@ -774,7 +916,9 @@ mod tests {
         reports.lock().unwrap().clear();
         let (local_url, _) = serve_once(401, Vec::new()).await;
         provider.usage_url = local_url;
-        let local = provider.fetch_local_bearer("anthropic-local-token").await;
+        let local = provider
+            .fetch_local_bearer("implicit", "anthropic-local-token")
+            .await;
         assert!(matches!(
             local.usage,
             Err(FetchError::Unauthorized(message)) if message == "HTTP 401 (no response body)"
@@ -1160,6 +1304,120 @@ mod tests {
         let pool = pool_beside_windows(&overage_body(CAPTURED_EXTRA_USAGE, Some(&spend))).unwrap();
         assert_eq!(pool.remaining, Some(usd(0)));
         assert_eq!(pool.total, Some(usd(10000)));
+    }
+
+    /// Run `overage_pool` on a `spend` fixture (absent when `None`) beside the
+    /// captured `extra_usage`.
+    fn overage_verdict(spend: Option<&str>) -> Result<Option<Pool>, OverageRefusal> {
+        overage_pool(
+            spend.map(|spend| serde_json::from_str(spend).unwrap()),
+            Some(serde_json::from_str(CAPTURED_EXTRA_USAGE).unwrap()),
+        )
+    }
+
+    #[test]
+    fn unstated_spend_is_no_pool_rather_than_a_refusal() {
+        assert_eq!(overage_verdict(None), Ok(None), "spend absent");
+        assert_eq!(overage_verdict(Some("null")), Ok(None), "spend null");
+    }
+
+    #[test]
+    fn each_unusable_spend_names_its_refusal_reason() {
+        let limit_null = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
+            r#""limit":null"#,
+        );
+        let used_without_currency = CAPTURED_SPEND.replace(
+            r#""used":{"amount_minor":1277,"currency":"USD","exponent":2}"#,
+            r#""used":{"amount_minor":1277,"exponent":2}"#,
+        );
+        let negative_used =
+            CAPTURED_SPEND.replace(r#""amount_minor":1277"#, r#""amount_minor":-5"#);
+        let currency_mismatch = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD""#,
+            r#""limit":{"amount_minor":10000,"currency":"EUR""#,
+        );
+        let exponent_mismatch = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
+            r#""limit":{"amount_minor":100000,"currency":"USD","exponent":3}"#,
+        );
+        let cases: [(&str, RefusalReason); 6] = [
+            (
+                r#"{"used":"a lot","enabled":"yes"}"#,
+                RefusalReason::Unparseable,
+            ),
+            (&limit_null, RefusalReason::LimitMissing),
+            (&used_without_currency, RefusalReason::UsedMissing),
+            (&negative_used, RefusalReason::NegativeAmount),
+            (&currency_mismatch, RefusalReason::CurrencyMismatch),
+            (&exponent_mismatch, RefusalReason::ExponentMismatch),
+        ];
+        for (spend, expected) in cases {
+            let refusal = overage_verdict(Some(spend)).expect_err(expected.as_str());
+            assert_eq!(refusal.reason, expected, "{}", expected.as_str());
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_only_the_sorted_spend_key_names() {
+        let refusal = overage_verdict(Some(r#"{"used":"a lot","enabled":"yes"}"#)).unwrap_err();
+        assert_eq!(refusal.spend_keys, vec!["enabled", "used"]);
+        // A `spend` that is not an object has no key names to report.
+        let refusal = overage_verdict(Some(r#""a lot""#)).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::Unparseable);
+        assert!(refusal.spend_keys.is_empty());
+    }
+
+    #[test]
+    fn first_refusal_is_logged() {
+        assert!(refusal_needs_log(None, Some(RefusalReason::LimitMissing)));
+    }
+
+    #[test]
+    fn the_same_refusal_again_is_silent() {
+        assert!(!refusal_needs_log(
+            Some(RefusalReason::LimitMissing),
+            Some(RefusalReason::LimitMissing)
+        ));
+    }
+
+    #[test]
+    fn a_different_refusal_is_logged() {
+        assert!(refusal_needs_log(
+            Some(RefusalReason::LimitMissing),
+            Some(RefusalReason::CurrencyMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_refusal_clearing_is_logged_and_readable_stays_silent() {
+        assert!(refusal_needs_log(Some(RefusalReason::Unparseable), None));
+        assert!(!refusal_needs_log(None, None));
+    }
+
+    #[test]
+    fn refusal_state_is_held_per_handle_and_cleared_when_readable() {
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = test_provider(source, "http://unused.invalid".to_string());
+        let refused = overage_verdict(Some(r#"{"used":"a lot"}"#));
+        assert_eq!(provider.settle_overage("oauth:anthropic", refused), None);
+        assert_eq!(
+            provider
+                .overage_refusals
+                .lock()
+                .unwrap()
+                .get("oauth:anthropic"),
+            Some(&RefusalReason::Unparseable)
+        );
+        assert!(!provider
+            .overage_refusals
+            .lock()
+            .unwrap()
+            .contains_key("oauth:anthropic:other"));
+        let pool =
+            provider.settle_overage("oauth:anthropic", overage_verdict(Some(CAPTURED_SPEND)));
+        assert!(pool.is_some(), "a readable spend still publishes its pool");
+        assert!(provider.overage_refusals.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
