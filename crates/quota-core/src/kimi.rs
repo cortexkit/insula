@@ -13,6 +13,13 @@
 //! Reset parsing also cross-checked with
 //! OmniRoute `open-sse/services/usage.ts` `parseResetTime` (~1178-1199) and
 //! `getKimiUsage` limit `resetTime` fields (~2492-2517). Rides live-proven `http.rs`.
+//!
+//! ACCOUNT: the `sub` claim of the `kimi-auth` JWT payload, the same payload
+//! already decoded here for the `x-msh-*` headers (it is also sent as
+//! `x-traffic-id`). `sub` is the stable Kimi user id; see the "kimi (web lane)"
+//! section of `docs/audits/account-identity-survey.md`, which verified it on the
+//! browser copy of this token. A token that is not a JWT, or carries no `sub`,
+//! publishes with no account, as it did before this was read.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -99,7 +106,24 @@ fn resolve_auth_token() -> Option<String> {
 struct SessionInfo {
     device_id: Option<String>,
     session_id: Option<String>,
+    /// The JWT `sub` claim: the Kimi user id. Sent as `x-traffic-id` and also
+    /// published as the entry's account.
     traffic_id: Option<String>,
+}
+
+/// The account this token belongs to: its `sub` claim, trimmed, or none.
+fn session_account(session: Option<&SessionInfo>) -> Option<String> {
+    session
+        .and_then(|value| value.traffic_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The published entry for one successful fetch, labelled with the token's
+/// account when the token names one.
+fn web_entry(usage: Usage, session: Option<&SessionInfo>) -> ProviderUsage {
+    ProviderUsage::healthy(PROVIDER_NAME, session_account(session), "web", usage)
 }
 
 /// Decode JWT payload for optional `x-msh-*` headers (CodexBar `decodeSessionInfo`).
@@ -451,7 +475,7 @@ impl UsageProvider for KimiProvider {
                 }
             }
 
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "web", usage))
+            Ok(web_entry(usage, session.as_ref()))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -638,6 +662,54 @@ mod tests {
     fn clean_auth_token_strips_quotes() {
         assert_eq!(clean_auth_token("\"tok\"").as_deref(), Some("tok"));
         assert_eq!(clean_auth_token("  'x'  ").as_deref(), Some("x"));
+    }
+
+    /// Build a `header.payload.signature` token around `claims`, with the
+    /// payload base64url-encoded without padding as a real JWT is.
+    fn token_with_claims(claims: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("header.{payload}.signature")
+    }
+
+    /// The `kimi-auth` token names its user in `sub`, and a successful fetch
+    /// publishes that as the account, so the entry can be told apart from
+    /// another credential's.
+    #[test]
+    fn a_token_with_sub_labels_the_entry_with_that_account() {
+        let token = token_with_claims(json!({
+            "sub": "kimi-user-0000000001",
+            "abstract_user_id": "kimi-user-0000000001",
+            "device_id": "device-1",
+            "ssid": "session-1"
+        }));
+        let session = decode_session_info(&token);
+        let usage = normalize_usage(&fixture_body()).unwrap();
+
+        let attempt = FetchAttempt::from_provider_usage(Ok(web_entry(usage, session.as_ref())));
+
+        assert_eq!(
+            attempt.observed.unwrap().account_id.as_deref(),
+            Some("kimi-user-0000000001")
+        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 25.0);
+    }
+
+    /// No `sub` claim, or a token that is not a JWT at all: the entry still
+    /// publishes its usage, with no account, exactly as before the claim was read.
+    #[test]
+    fn a_token_without_sub_publishes_usage_with_no_account() {
+        let without_sub = token_with_claims(json!({ "device_id": "device-1", "ssid": "s" }));
+        for token in [without_sub.as_str(), "opaque-not-a-jwt"] {
+            let session = decode_session_info(token);
+            let usage = normalize_usage(&fixture_body()).unwrap();
+
+            let attempt = FetchAttempt::from_provider_usage(Ok(web_entry(usage, session.as_ref())));
+
+            assert_eq!(attempt.observed.unwrap().account_id, None, "{token}");
+            assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 25.0);
+        }
     }
 
     #[test]

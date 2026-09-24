@@ -83,7 +83,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     # usage one. Added after the checker caught it missing -- the provider shipped
     # and the manifest entry did not, which is exactly the drift this file exists
     # to name.
-    "openrouter": {"CREDITS_URL": "openrouter.ai"},
+    "openrouter": {"CREDITS_URL": "openrouter.ai", "KEY_URL": "openrouter.ai"},
     "ollama": {"SETTINGS_URL": "ollama.com"},
     "opencode": {"SERVER_BASE": "opencode.ai"},
     "qoder": {"USAGE_URL": "qoder.com"},

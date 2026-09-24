@@ -268,6 +268,12 @@ publishing consumption with no denominator invites a consumer to invent one. If
 an account ever sets a spend limit, that is a separate decision with its own
 evidence.
 
+**Identity, added 2026-09-24:** the same endpoint (`GET /api/v1/key`) is now
+called for the key's OWNER only, never for its usage fields. The account is
+`data.organization_id` when set, else `data.creator_user_id`, looked up once per
+credential and cached in memory; a failed lookup publishes the balance
+unlabelled. Evidence: `docs/audits/account-identity-survey.md`, "openrouter".
+
 The other four were probed on 2026-08-16 and **none is portable**. Recorded with
 what was tried, so the next reader inherits the evidence rather than the
 curiosity — all four are plain API keys, so the rotation gate is clear for every
@@ -551,6 +557,12 @@ Declined deliberately: our grok lane resolves no account identity, so the label
 would decorate an unlabelled row, and it costs an extra HTTP call per tick on a
 provider whose windows already serve. Reconsider if grok ever gains identity --
 the endpoint is recorded here so that is a lookup rather than a rediscovery.
+
+*Update 2026-09-24:* grok now has identity -- the access token's JWT `sub`
+(the xAI user id), read without a request on both lanes; kimi's web lane
+likewise publishes its `kimi-auth` JWT `sub`. The reconsideration trigger above
+has fired; the tier label is still not ported. Evidence:
+`docs/audits/account-identity-survey.md`, "grok" and "kimi (web lane)".
 
 **Kiro and Zed:** not implemented here.
 

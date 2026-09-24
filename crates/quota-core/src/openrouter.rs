@@ -7,10 +7,22 @@
 //!
 //! - Credential: the `openrouter` API entry in opencode's auth store.
 //! - Endpoint: `GET https://openrouter.ai/api/v1/credits`, bearer API key.
+//! - Account: `GET https://openrouter.ai/api/v1/key` with the same key returns
+//!   `data.organization_id` and `data.creator_user_id`. The account is the
+//!   organization when one is set, because an org key's credits bill to the org,
+//!   and otherwise the user who created the key. See the "openrouter" section of
+//!   `docs/audits/account-identity-survey.md`, which verified the fields live.
+//!
+//!   A key's owner does not change, so the lookup is made once per credential and
+//!   cached in memory: per `record_version` for a vault record, per key value for
+//!   the local key. The cached key is never logged. The lookup is enrichment only:
+//!   if it fails, the balance still publishes, with no account, and the lookup is
+//!   tried again on the next fetch.
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::credential_source::CredentialSource;
 #[cfg(test)]
@@ -18,12 +30,15 @@ use crate::credential_source::VaultCapability;
 use crate::http::JsonRequest;
 use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
-use crate::provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider};
+use crate::provider::{
+    AccountObservation, CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider,
+};
 use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
 
 const PROVIDER_NAME: &str = "openrouter";
 const CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
+const KEY_URL: &str = "https://openrouter.ai/api/v1/key";
 const USD: &str = "USD";
 const USD_EXPONENT: u8 = 2;
 // OpenRouter sends JSON numbers rather than decimal strings. Preserve up to the
@@ -41,6 +56,52 @@ struct CreditsResponse {
 struct CreditsData {
     total_credits: serde_json::Number,
     total_usage: serde_json::Number,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyResponse {
+    data: KeyData,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyData {
+    #[serde(default)]
+    creator_user_id: Option<String>,
+    #[serde(default)]
+    organization_id: Option<String>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The account a key belongs to, from the `/api/v1/key` payload.
+///
+/// The organization wins when set: credits on an org key bill to the org, so
+/// two keys created by different members of one org spend the same balance.
+/// A payload naming neither is a valid answer of "no account", not an error.
+fn account_from_key_response(body: &[u8]) -> Result<Option<String>, FetchError> {
+    let response: KeyResponse = serde_json::from_slice(body)
+        .map_err(|error| FetchError::Decode(format!("openrouter key info: {error}")))?;
+    Ok(non_empty(response.data.organization_id).or(non_empty(response.data.creator_user_id)))
+}
+
+/// Which credential a cached account was resolved for.
+///
+/// Deliberately not `Debug`: the local variant holds the API key itself, so
+/// that a changed key is looked up again, and it must never be formatted.
+#[derive(PartialEq, Eq)]
+enum CredentialVersion {
+    Vault(u64),
+    Local(String),
+}
+
+/// The account resolved for one handle, and the credential it was resolved for.
+struct CachedAccount {
+    version: CredentialVersion,
+    account: Option<String>,
 }
 
 /// Parse a JSON number through the shared money parser without scaling an `f64`.
@@ -166,9 +227,13 @@ fn api_key_from_auth(
 
 pub struct OpenRouterProvider {
     url: String,
+    key_url: String,
     http: reqwest::Client,
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
+    /// Resolved accounts keyed by handle id, one entry per handle, replaced
+    /// when that handle's credential changes. Memory only.
+    accounts: Mutex<HashMap<String, CachedAccount>>,
 }
 
 impl OpenRouterProvider {
@@ -178,9 +243,64 @@ impl OpenRouterProvider {
     ) -> Self {
         Self {
             url: CREDITS_URL.to_string(),
+            key_url: KEY_URL.to_string(),
             http: crate::http::provider_client(),
             credential_source,
             handle_loader,
+            accounts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The account behind `key`, looked up once per credential.
+    ///
+    /// Returns none, and caches nothing, when the lookup fails: a missing
+    /// identity must not cost the balance reading it would have labelled, and the
+    /// next fetch tries again. A successful answer is cached even when it names
+    /// no account, because a key's owner does not change.
+    async fn resolve_account(
+        &self,
+        handle_id: &str,
+        version: CredentialVersion,
+        key: &str,
+    ) -> Option<String> {
+        if let Some(cached) = self
+            .accounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(handle_id)
+            .filter(|cached| cached.version == version)
+        {
+            return cached.account.clone();
+        }
+
+        let lookup = JsonRequest::get(&self.key_url)
+            .bearer(key)
+            .send(&self.http)
+            .await
+            .and_then(|body| account_from_key_response(&body));
+        match lookup {
+            Ok(account) => {
+                self.accounts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        handle_id.to_string(),
+                        CachedAccount {
+                            version,
+                            account: account.clone(),
+                        },
+                    );
+                account
+            }
+            Err(error) => {
+                // The class only: error text can quote a response body, and
+                // nothing about the key belongs in a log line.
+                eprintln!(
+                    "{LOG_TAG} warning: openrouter account lookup failed ({handle_id}): {}",
+                    error.error_class()
+                );
+                None
+            }
         }
     }
 
@@ -208,6 +328,29 @@ impl OpenRouterProvider {
             .send(&self.http)
             .await?;
         normalize_pools(&body)
+    }
+
+    /// Fetch the balance for the local key and label it with the key's account.
+    async fn fetch_local_key(&self, handle: &CredentialHandle, key: String) -> FetchAttempt {
+        let pools = match self.fetch_with_key(&key).await {
+            Ok(pools) => pools,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+        let account = self
+            .resolve_account(
+                handle.stable_id(),
+                CredentialVersion::Local(key.clone()),
+                &key,
+            )
+            .await;
+
+        // This endpoint has no rate windows. An otherwise empty Usage beside a
+        // non-empty spend list is the balance-only shape accepted by wire_sanity.
+        // No account resolved means no observation, as before the lookup existed.
+        let observed = account.map(|account| AccountObservation::new(Some(account), None));
+        let mut attempt = FetchAttempt::success(observed, "api", Usage::default());
+        attempt.pools = Some(pools);
+        attempt
     }
 
     async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -249,7 +392,14 @@ impl OpenRouterProvider {
         }
         match result {
             Ok(pools) => {
-                let mut attempt = FetchAttempt::success(None, "vault", Usage::default());
+                let account = self
+                    .resolve_account(handle_id, CredentialVersion::Vault(record_version), &key)
+                    .await;
+                // No account resolved means no observation, which is what this
+                // lane published before it looked the account up.
+                let observed = account
+                    .map(|account| AccountObservation::new(Some(account), Some(record_version)));
+                let mut attempt = FetchAttempt::success(observed, "vault", Usage::default());
                 attempt.pools = Some(pools);
                 attempt
             }
@@ -261,9 +411,11 @@ impl OpenRouterProvider {
     fn with_url(url: String) -> Self {
         Self {
             url,
+            key_url: KEY_URL.to_string(),
             http: crate::http::provider_client(),
             credential_source: None,
             handle_loader: Arc::new(VaultHandleLoader::new(None)),
+            accounts: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -299,16 +451,7 @@ impl UsageProvider for OpenRouterProvider {
             Ok(key) => key,
             Err(error) => return FetchAttempt::failure(None, None, error),
         };
-        let pools = match self.fetch_with_key(&key).await {
-            Ok(pools) => pools,
-            Err(error) => return FetchAttempt::failure(None, None, error),
-        };
-
-        // This endpoint has no rate windows. An otherwise empty Usage beside a
-        // non-empty spend list is the balance-only shape accepted by wire_sanity.
-        let mut attempt = FetchAttempt::success(None, "api", Usage::default());
-        attempt.pools = Some(pools);
-        attempt
+        self.fetch_local_key(handle, key).await
     }
 }
 
@@ -579,6 +722,9 @@ mod tests {
             Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         provider.url = format!("{base}/api/v1/credits");
+        // The one-shot server is gone by the account lookup, so it fails fast
+        // on loopback instead of reaching the real host.
+        provider.key_url = format!("{base}/api/v1/key");
         let attempt = provider
             .fetch_handle(&CredentialHandle::vault(
                 "apikey:openrouter",
@@ -594,6 +740,184 @@ mod tests {
             .to_ascii_lowercase()
             .contains("authorization: bearer openrouter-vault-key"));
         assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// A loopback OpenRouter that answers `/api/v1/credits` with a balance and
+    /// `/api/v1/key` with `key_status` and `key_body`, counting `/key` requests.
+    ///
+    /// Every response closes its connection, so each request is its own accept
+    /// and the count is exact.
+    async fn serve_openrouter(
+        key_status: u16,
+        key_body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let key_requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&key_requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                let (status, body) = if request.starts_with("GET /api/v1/key ") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (key_status, key_body)
+                } else if request.starts_with("GET /api/v1/credits ") {
+                    (
+                        200,
+                        r#"{"data":{"total_credits":25,"total_usage":19.506207297}}"#,
+                    )
+                } else {
+                    (404, "")
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), key_requests)
+    }
+
+    fn provider_at(base: &str, source: Option<Arc<dyn CredentialSource>>) -> OpenRouterProvider {
+        let mut provider = OpenRouterProvider::new_with_handle_loader(
+            source,
+            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+        );
+        provider.url = format!("{base}/api/v1/credits");
+        provider.key_url = format!("{base}/api/v1/key");
+        provider
+    }
+
+    const PERSONAL_KEY: &str =
+        r#"{"data":{"creator_user_id":"user_creator","workspace_id":"w","organization_id":null}}"#;
+    const ORG_KEY: &str =
+        r#"{"data":{"creator_user_id":"user_creator","organization_id":"org_billing"}}"#;
+
+    fn observed_account(attempt: &FetchAttempt) -> Option<&str> {
+        attempt
+            .observed
+            .as_ref()
+            .and_then(|observed| observed.account_id.as_deref())
+    }
+
+    /// A personal key's account is the user who created it.
+    #[tokio::test]
+    async fn a_key_with_a_creator_labels_the_entry_with_that_user() {
+        let (base, _) = serve_openrouter(200, PERSONAL_KEY).await;
+        let provider = provider_at(&base, None);
+
+        let attempt = provider
+            .fetch_local_key(&CredentialHandle::implicit(), "local-key".to_string())
+            .await;
+
+        assert_eq!(observed_account(&attempt), Some("user_creator"));
+        assert_eq!(attempt.observed.as_ref().unwrap().record_version, None);
+        assert_eq!(attempt.pools.as_ref().unwrap().len(), 1);
+    }
+
+    /// An org key bills its credits to the org, so the org is the account even
+    /// though a user created the key.
+    #[tokio::test]
+    async fn the_organization_wins_over_the_creator_when_set() {
+        let (base, _) = serve_openrouter(200, ORG_KEY).await;
+        let provider = provider_at(&base, None);
+
+        let attempt = provider
+            .fetch_local_key(&CredentialHandle::implicit(), "local-key".to_string())
+            .await;
+
+        assert_eq!(observed_account(&attempt), Some("org_billing"));
+    }
+
+    /// A key payload naming neither id publishes the balance with no
+    /// observation, exactly as the lane did before the lookup existed.
+    #[tokio::test]
+    async fn a_key_naming_no_owner_publishes_the_balance_unlabelled() {
+        let (base, _) = serve_openrouter(200, r#"{"data":{"workspace_id":"w"}}"#).await;
+        let provider = provider_at(&base, None);
+
+        let attempt = provider
+            .fetch_local_key(&CredentialHandle::implicit(), "local-key".to_string())
+            .await;
+
+        assert!(attempt.observed.is_none());
+        assert!(attempt.usage.is_ok());
+        assert_eq!(attempt.pools.as_ref().unwrap().len(), 1);
+    }
+
+    /// A failing lookup costs the label, never the reading.
+    #[tokio::test]
+    async fn a_failing_key_lookup_still_publishes_the_balance() {
+        let (base, key_requests) = serve_openrouter(500, "upstream down").await;
+        let provider = provider_at(&base, None);
+
+        let attempt = provider
+            .fetch_local_key(&CredentialHandle::implicit(), "local-key".to_string())
+            .await;
+
+        assert_eq!(
+            key_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the lookup must actually have been made and failed"
+        );
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(attempt.observed.is_none());
+        let pools = attempt.pools.as_ref().expect("the balance still publishes");
+        assert_eq!(pools[0].remaining.as_ref().unwrap().minor, 549);
+    }
+
+    /// The owner of a key does not change, so two fetches with one credential
+    /// make one lookup -- on the local lane and on the vault lane -- and a new
+    /// credential is looked up afresh.
+    #[tokio::test]
+    async fn the_key_lookup_is_made_once_per_credential() {
+        use std::sync::atomic::Ordering;
+
+        let (base, key_requests) = serve_openrouter(200, PERSONAL_KEY).await;
+        let provider = provider_at(&base, None);
+        let local = CredentialHandle::implicit();
+        for _ in 0..2 {
+            let attempt = provider
+                .fetch_local_key(&local, "local-key".to_string())
+                .await;
+            assert_eq!(observed_account(&attempt), Some("user_creator"));
+        }
+        assert_eq!(key_requests.load(Ordering::SeqCst), 1);
+
+        provider
+            .fetch_local_key(&local, "a-replaced-key".to_string())
+            .await;
+        assert_eq!(
+            key_requests.load(Ordering::SeqCst),
+            2,
+            "a different key is a different credential"
+        );
+
+        let (vault_base, vault_requests) = serve_openrouter(200, ORG_KEY).await;
+        let (source, _) = source(Ok(credential(b"openrouter-vault-key", 7)));
+        let provider = provider_at(&vault_base, Some(source));
+        let handle = CredentialHandle::vault("apikey:openrouter", VaultCapability::new("ckh_or"));
+        for _ in 0..2 {
+            let attempt = provider.fetch_handle(&handle).await;
+            assert_eq!(
+                attempt.observed,
+                Some(AccountObservation::new(
+                    Some("org_billing".to_string()),
+                    Some(7)
+                ))
+            );
+        }
+        assert_eq!(vault_requests.load(Ordering::SeqCst), 1);
     }
 
     /// A 401 on the vault lane is reported to the credential store.

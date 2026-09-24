@@ -25,6 +25,16 @@
 //! (grpc-web framing, `scanProtobuf`, percent = shallowest `path.last==1` fixed32 in
 //! 0..100, reset = future varint preferring path `[1,5,1]`). `tests/grok_live.rs`
 //! is the ignored live proof; the unit test below decodes a REAL captured wire frame.
+//!
+//! ACCOUNT: the OAuth access token is a JWT issued by `auth.x.ai`, and its
+//! payload `sub` is the xAI user id (a UUID). Both lanes read it from the token
+//! they already send; no request is made for it and the signature is not checked,
+//! because the value only labels the entry. See the "grok" section of
+//! `docs/audits/account-identity-survey.md`, which verified `sub` live against
+//! `user_id` in `~/.grok/auth.json`. A vault record's own account label, when it
+//! has one, still wins. A token that is not a JWT, or has no `sub`, publishes with
+//! no account, as before. The token's `team_id` is not published: `orgName` on
+//! the wire holds a display name, and a bare team UUID is not one.
 
 use std::{sync::Arc, time::Duration};
 
@@ -335,6 +345,32 @@ fn canonical_account_id(account_id: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The xAI user id in an access token: the JWT payload's `sub` claim.
+///
+/// Returns none for anything that is not a three-part JWT with a decodable JSON
+/// payload and a non-empty string `sub`, so an opaque token keeps the lane
+/// unlabelled rather than failing it.
+fn token_subject(token: &str) -> Option<String> {
+    use base64::Engine as _;
+
+    let mut parts = token.trim().split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    canonical_account_id(
+        claims
+            .get("sub")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    )
+}
+
 fn usage_request(url: &str, bearer: &str) -> JsonRequest {
     // An empty gRPC-web message: a single frame with flags=0 and length=0.
     let frame: Vec<u8> = vec![0, 0, 0, 0, 0];
@@ -394,9 +430,11 @@ impl GrokProvider {
             .await
             .and_then(|body| normalize_usage(&body));
         match result {
-            Ok(usage) => {
-                FetchAttempt::success(Some(AccountObservation::new(None, None)), "oauth", usage)
-            }
+            Ok(usage) => FetchAttempt::success(
+                Some(AccountObservation::new(token_subject(bearer), None)),
+                "oauth",
+                usage,
+            ),
             Err(error) => FetchAttempt::failure(None, None, error),
         }
     }
@@ -419,14 +457,20 @@ impl GrokProvider {
         };
         let record_version = credential.record_version;
         let account_info = credential.account_info();
-        let observed = Some(AccountObservation::new(
-            canonical_account_id(credential.account_id.clone()),
-            Some(record_version),
-        ));
+        let vault_account = canonical_account_id(credential.account_id.clone());
         let bearer = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
             Ok(value) => value,
-            Err(error) => return FetchAttempt::failure(observed, None, error),
+            Err(error) => {
+                let observed = Some(AccountObservation::new(vault_account, Some(record_version)));
+                return FetchAttempt::failure(observed, None, error);
+            }
         };
+        // The record's own label first, as the vault lane always used it; the
+        // token's `sub` fills in when the record carries none.
+        let observed = Some(AccountObservation::new(
+            vault_account.or_else(|| token_subject(&bearer)),
+            Some(record_version),
+        ));
 
         let result = usage_request(&self.usage_url, &bearer)
             .send_provider_status_first(&self.http, PROVIDER_NAME)
@@ -772,6 +816,109 @@ mod tests {
                 .unwrap()
                 .used_percent,
             76.57
+        );
+    }
+
+    /// An `auth.x.ai`-shaped access token: a JWT whose payload carries `sub`
+    /// (the xAI user) and `team_id`, as the identity survey recorded.
+    fn xai_token(claims: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("eyJhbGciOiJSUzI1NiJ9.{payload}.signature")
+    }
+
+    const XAI_USER: &str = "00000000-0000-4000-8000-00000000a11c";
+
+    fn xai_token_with_sub() -> String {
+        xai_token(serde_json::json!({
+            "iss": "https://auth.x.ai",
+            "sub": XAI_USER,
+            "principal_id": XAI_USER,
+            "principal_type": "User",
+            "team_id": "00000000-0000-4000-8000-0000000000f1"
+        }))
+    }
+
+    /// The vault lane labels its entry with the token's `sub` when the record
+    /// itself carries no account.
+    #[tokio::test]
+    async fn vault_token_with_sub_publishes_it_as_the_account() {
+        let (url, _) = serve_once(200, decode_b64(LIVE_FIXTURE_B64)).await;
+        let token = xai_token_with_sub();
+        let (source, _) = source(Ok(credential(token.as_bytes(), 33)));
+        let provider = test_provider(source, url);
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:xai",
+                VaultCapability::new("ckh_grok"),
+            ))
+            .await;
+
+        assert_eq!(
+            attempt.observed.unwrap(),
+            AccountObservation::new(Some(XAI_USER.to_string()), Some(33))
+        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 76.57);
+    }
+
+    /// The local lane reads the same claim from the opencode-store token.
+    #[tokio::test]
+    async fn local_token_with_sub_publishes_it_as_the_account() {
+        let (url, _) = serve_once(200, decode_b64(LIVE_FIXTURE_B64)).await;
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = test_provider(source, url);
+
+        let attempt = provider.fetch_local_bearer(&xai_token_with_sub()).await;
+
+        assert_eq!(
+            attempt.observed.unwrap(),
+            AccountObservation::new(Some(XAI_USER.to_string()), None)
+        );
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 76.57);
+    }
+
+    /// A JWT without `sub`, or an opaque token: usage still publishes, with no
+    /// account, which is what the local lane did before the claim was read.
+    #[tokio::test]
+    async fn local_token_without_sub_publishes_usage_with_no_account() {
+        let without_sub = xai_token(serde_json::json!({ "iss": "https://auth.x.ai" }));
+        for token in [without_sub.as_str(), "opaque-xai-token"] {
+            let (url, _) = serve_once(200, decode_b64(LIVE_FIXTURE_B64)).await;
+            let (source, _) = source(Err(VaultGetError::Permanent));
+            let provider = test_provider(source, url);
+
+            let attempt = provider.fetch_local_bearer(token).await;
+
+            assert_eq!(
+                attempt.observed.unwrap(),
+                AccountObservation::new(None, None),
+                "{token}"
+            );
+            assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 76.57);
+        }
+    }
+
+    /// A record that already names its account keeps that name; the token's
+    /// claim only fills a gap.
+    #[tokio::test]
+    async fn a_vault_record_label_wins_over_the_token_sub() {
+        let (url, _) = serve_once(200, decode_b64(LIVE_FIXTURE_B64)).await;
+        let token = xai_token_with_sub();
+        let mut record = credential(token.as_bytes(), 34);
+        record.account_id = Some("vault-label".to_string());
+        let (source, _) = source(Ok(record));
+        let provider = test_provider(source, url);
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:xai",
+                VaultCapability::new("ckh_grok"),
+            ))
+            .await;
+
+        assert_eq!(
+            attempt.observed.unwrap().account_id.as_deref(),
+            Some("vault-label")
         );
     }
 
