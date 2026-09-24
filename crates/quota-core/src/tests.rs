@@ -5356,7 +5356,15 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
     let registry = Registry::new(vec![Box::new(provider)]);
 
     tick(&registry).await;
-    http_server.await.unwrap();
+    // Bounded: the server expects exactly two usage requests, one per lane. If a
+    // change removes a lane, an unbounded wait hangs the whole suite instead of
+    // failing this test by name -- which is how it surfaced, as a hung run with
+    // no test named, when the codex local lane learned to step aside for a vault
+    // row carrying the same account id.
+    tokio::time::timeout(Duration::from_secs(10), http_server)
+        .await
+        .expect("expected two usage requests, one from each lane for the shared account")
+        .unwrap();
 
     assert_eq!(source.gets.load(Ordering::SeqCst), 1);
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
