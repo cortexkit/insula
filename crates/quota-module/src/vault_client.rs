@@ -1754,7 +1754,7 @@ fn describe_list_scoped_failure(body: &[u8]) -> String {
 
 fn decode_list_scoped_response(body: &[u8]) -> Result<CompleteScopedListResult, VaultGetError> {
     let decoded = decode_list_scoped_inner(body);
-    if decoded.is_err() {
+    if list_scoped_reply_was_unreadable(&decoded) {
         // NOT GATED ON A VERBOSITY FLAG. It fires only when an enumeration is
         // already being thrown away, and the cost of that silence has been
         // measured once.
@@ -1764,6 +1764,18 @@ fn decode_list_scoped_response(body: &[u8]) -> Result<CompleteScopedListResult, 
         );
     }
     decoded
+}
+
+/// Whether a decoded `list_scoped` reply is one this client could not read.
+///
+/// Only `FailClosed` qualifies. A recognised refusal (`permanent`, `transient`,
+/// `auth_required`) is a verdict the vault stated, not an unreadable body, and
+/// logging it as "body unreadable" printed a sentence claiming `permanent` was
+/// a class outside `[permanent, ...]`.
+fn list_scoped_reply_was_unreadable(
+    decoded: &Result<CompleteScopedListResult, VaultGetError>,
+) -> bool {
+    matches!(decoded, Err(VaultGetError::FailClosed))
 }
 
 fn decode_list_scoped_inner(body: &[u8]) -> Result<CompleteScopedListResult, VaultGetError> {
@@ -3956,6 +3968,35 @@ mod drop_counter_tests {
             seen.len(),
             "two causes share a rendering, which is the whole defect: {seen:#?}"
         );
+    }
+
+    /// A recognised refusal is a verdict and is NOT logged as an unreadable
+    /// body; an unknown class is. Logging the first printed "class=permanent is a
+    /// class outside [permanent, ...]", a sentence that contradicts itself, on
+    /// every refused listing -- including the ordinary one a standalone probe gets.
+    #[test]
+    fn only_an_unreadable_listing_is_logged_as_unreadable() {
+        let refused_not_found = br#"{"result":{"error":{"class":"permanent","code":"not_found"}}}"#;
+        let decoded = decode_list_scoped_inner(refused_not_found);
+        assert_eq!(decoded, Err(VaultGetError::NotFound));
+        assert!(!list_scoped_reply_was_unreadable(&decoded));
+
+        for class in ["permanent", "transient", "auth_required"] {
+            let body = format!(r#"{{"result":{{"error":{{"class":"{class}"}}}}}}"#);
+            let decoded = decode_list_scoped_inner(body.as_bytes());
+            assert!(
+                !list_scoped_reply_was_unreadable(&decoded),
+                "{class} is a verdict, not an unreadable body: {decoded:?}"
+            );
+        }
+
+        let unknown = br#"{"result":{"error":{"class":"invalid_request"}}}"#;
+        assert!(list_scoped_reply_was_unreadable(&decode_list_scoped_inner(
+            unknown
+        )));
+        assert!(list_scoped_reply_was_unreadable(&decode_list_scoped_inner(
+            b"not json"
+        )));
     }
 
     #[test]
