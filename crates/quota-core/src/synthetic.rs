@@ -138,15 +138,6 @@ fn first_string(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str])
     None
 }
 
-fn normalized_percent(val: Option<f64>) -> Option<f64> {
-    let v = val?;
-    if v <= 1.0 {
-        Some(v * 100.0)
-    } else {
-        Some(v)
-    }
-}
-
 fn first_date(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(val) = map.get(*key) {
@@ -286,12 +277,19 @@ fn is_quota_payload(map: &serde_json::Map<String, serde_json::Value>) -> bool {
 }
 
 fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateWindow> {
-    let percent_used =
-        normalized_percent(crate::json_scan::first_finite_f64(map, PERCENT_USED_KEYS));
-    let percent_remaining = normalized_percent(crate::json_scan::first_finite_f64(
-        map,
-        PERCENT_REMAINING_KEYS,
-    ));
+    // PERCENT KEYS ARE READ ON A 0-100 SCALE, AS THEIR NAMES SAY.
+    //
+    // This used to guess the scale from the value -- anything <= 1 was taken
+    // for a fraction and multiplied by 100, a rule carried over from the
+    // upstream reader (CodexBar v0.65.0 `Resources/Plugins/synthetic.js` still
+    // has it). A value-based guess has a hole at the boundary because 0.5% and
+    // 50% are both legal readings, and it fails in the dangerous direction: an
+    // account with its last 1% of weekly credits (`percentRemaining` 0.9878)
+    // published about 1% used. Observed on a reporter's host (insula#21): each
+    // mis-scaled sample was a small rise from the true 0-100 reading before it,
+    // which only a 0-100 provider produces.
+    let percent_used = crate::json_scan::first_finite_f64(map, PERCENT_USED_KEYS);
+    let percent_remaining = crate::json_scan::first_finite_f64(map, PERCENT_REMAINING_KEYS);
 
     let mut used_percent = percent_used;
     if used_percent.is_none() {
@@ -773,6 +771,38 @@ mod tests {
 
     use super::*;
 
+    /// A percent at or below 1 is a percent, not a fraction.
+    ///
+    /// The boundary the old value-based rule got wrong: an account with under 1%
+    /// of its weekly credits left must read as nearly exhausted, and a small
+    /// used percent must stay small. The 0.9878 value is the one from the report.
+    #[test]
+    fn percents_at_or_below_one_are_not_read_as_fractions() {
+        let window = |key: &str, value: f64| {
+            let map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_value(serde_json::json!({ key: value })).unwrap();
+            parse_quota(&map)
+                .expect("a percent must produce a window")
+                .used_percent
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        assert!(
+            close(window("percentRemaining", 0.9878), 99.0122),
+            "last 1% left is ~99% used"
+        );
+        assert!(close(window("percentRemaining", 1.0), 99.0));
+        assert!(close(window("percentRemaining", 0.5), 99.5));
+        assert!(
+            close(window("percentUsed", 0.5), 0.5),
+            "half a percent used stays half a percent"
+        );
+        assert!(close(window("percentUsed", 1.0), 1.0));
+        // Above the old boundary nothing changes.
+        assert!(close(window("percentRemaining", 42.0), 58.0));
+        assert!(close(window("percentUsed", 42.0), 42.0));
+    }
+
     #[test]
     fn test_normalize_object_form() {
         let body = br#"{
@@ -886,21 +916,20 @@ mod tests {
         assert_eq!(primary.resets_at, None);
     }
 
-    /// A percent field may arrive as a fraction or as a percentage, so a value at
-    /// or below 1.0 is read as a fraction and scaled. That guess is only safe for
-    /// a value the upstream *labelled* as a percent.
+    /// Neither a computed used/limit ratio nor a labelled percent is rescaled.
     ///
-    /// A used/limit ratio computed here is already a percentage, and applying the
-    /// same guess to it turns a barely-touched account into an exhausted one: one
-    /// request against a limit of a hundred is 1.0, which would be rescaled to
-    /// 100. The upstream that reports counts rather than percentages is exactly
-    /// the one where a single request is a plausible reading.
+    /// A used/limit ratio computed here is already a percentage: one request
+    /// against a limit of a hundred is 1.0, and rescaling it would turn a
+    /// barely-touched account into an exhausted one.
     ///
-    /// The two are kept apart by which path produced the number, so this pins
-    /// both: the ratio must survive untouched, and the labelled field must still
-    /// be scaled.
+    /// A labelled percent below 1 is ALSO a percent. This test used to assert
+    /// the opposite -- that `usedPercent: 0.42` is a fraction and means 42% --
+    /// on the theory that some upstream sends fractions. No payload ever showed
+    /// one, and a reporter's live samples (insula#21) showed this provider uses
+    /// 0-100: the fraction rule published an account with its last 1% of credits
+    /// as about 1% used. Both halves now pin the same rule from two paths.
     #[test]
-    fn a_computed_ratio_is_not_rescaled_but_a_labelled_fraction_is() {
+    fn neither_a_computed_ratio_nor_a_small_labelled_percent_is_rescaled() {
         // The five-hour key fills `usage.primary`; a weekly key would fill
         // `usage.secondary` instead, so the assertions below would read an empty
         // slot and fail for a reason unrelated to the rescaling under test.
@@ -921,21 +950,21 @@ mod tests {
             "one request in a hundred is 1%, not an exhausted account"
         );
 
-        // The control: without it this test would also pass if the fraction
-        // heuristic were deleted outright, which would misread every upstream
-        // that reports a 0..1 fraction as a fully idle account.
-        let fraction = br#"{
+        let labelled = br#"{
             "rollingFiveHourLimit": {
                 "usedPercent": 0.42,
                 "window": "5hr"
             }
         }"#;
-        let scaled = normalize_usage(fraction)
+        let read = normalize_usage(labelled)
             .unwrap()
             .primary
             .expect("a labelled percent must produce a window")
             .used_percent;
-        assert_eq!(scaled, 42.0, "a labelled 0..1 fraction is still scaled");
+        assert_eq!(
+            read, 0.42,
+            "a labelled percent below 1 is a percent, not a fraction"
+        );
     }
 
     /// A garbage percent alias must not cost the account its window.
