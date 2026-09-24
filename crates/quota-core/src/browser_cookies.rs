@@ -895,18 +895,10 @@ fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
 
 /// Filename prefix for the temp copy of Chrome's cookie database.
 ///
-/// Named rather than inlined because `scripts/measure-disk-io.py` counts these
-/// copies by globbing for them, and it reads this constant out of this file
-/// rather than restating the format. Restating it would let a rename here
-/// silently reduce that count to zero -- and zero is exactly the figure that
-/// script prints when the snapshot sharing is working perfectly, so a broken
-/// instrument and the best possible result are indistinguishable in its output.
-///
-/// That glob now undercounts: each copy is deleted as soon as it is opened (see
-/// [`open_and_unlink`]), so it exists on disk only for the moment between the
-/// copy and the open, and a directory listing polled every 50 ms will usually
-/// miss it. A copy count from that script is no longer evidence of how often
-/// the store is copied; its disk-read figure still is.
+/// Named so the tests can look for leftover copies by it. A copy exists on disk
+/// only between [`copy_cookie_store`] and [`open_and_unlink`], so nothing
+/// outside can count copies by listing the temp root; the per-process disk
+/// write counter (`scripts/measure-disk-io.py`) is the measure of copy cost.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const COOKIE_SNAPSHOT_PREFIX: &str = "quota-chrome-cookies";
 

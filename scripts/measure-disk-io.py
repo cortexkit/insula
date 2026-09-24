@@ -1,19 +1,24 @@
-"""Measure a process's disk reads and the cookie-store copies it makes.
+"""Measure a process's disk reads and writes.
 
 The counter is `proc_pid_rusage`'s ri_diskio_bytesread, read by byte offset
 rather than by restating the whole rusage_info_v4 struct: a field-order mistake
 in a restated struct yields plausible zeros rather than an error, which is the
 failure this measurement is trying to avoid making.
 
-Usage: measure_cookie_reads.py <pid> <seconds>
+This script used to also count the cookie-store copies the module makes, by
+globbing the temp root for them. It no longer can: the module deletes each copy
+the moment it opens it, so a copy exists on disk for only an instant and a
+listing almost always sees none. A count here would read 0 whatever the real
+rate, which looks like a perfect result. So the count is gone. Each copy writes
+one full cookie store, so the WRITTEN figure below carries the copy cost:
+divide it by the store's size for an approximate copy count.
+
+Usage: measure-disk-io.py <pid> <seconds>
 """
 
 import ctypes
-import glob
 import os
 import sys
-import pathlib
-import re
 import tempfile
 import time
 
@@ -50,45 +55,14 @@ def control():
         raise SystemExit("  counter is not tracking writes; readings below are void")
 
 
-SOURCE = pathlib.Path(__file__).resolve().parent.parent / "crates/quota-core/src/browser_cookies.rs"
-
-
-def snapshot_prefix():
-    """Read the temp-copy filename prefix out of the module that creates them.
-
-    Restating it here would make a rename in that file reduce the copy count to
-    zero with no other symptom -- and zero is what this script prints when the
-    snapshot sharing is working perfectly, so the broken instrument and the best
-    possible result would be indistinguishable in the output.
-
-    Refuses rather than falling back to a literal: a default would restore
-    exactly the silent-zero failure this exists to prevent, and would do it at
-    the moment the constant moved.
-    """
-    text = SOURCE.read_text(encoding="utf-8")
-    match = re.search(r'COOKIE_SNAPSHOT_PREFIX: &str = "([^"]+)"', text)
-    if not match:
-        sys.exit(
-            "refusing: no COOKIE_SNAPSHOT_PREFIX in %s.\n"
-            "The copy count cannot be measured without it, and a zero here would\n"
-            "read as a perfect result rather than as a broken instrument." % SOURCE
-        )
-    return match.group(1)
-
-
 def main():
     pid = int(sys.argv[1])
     window = float(sys.argv[2]) if len(sys.argv) > 2 else 180.0
     control()
 
-    prefix = snapshot_prefix()
-    pattern = os.path.join(tempfile.gettempdir(), "%s-%d-*.db" % (prefix, pid))
     start = counters(pid)
     t0 = time.time()
-    seen = set()
-    while time.time() - t0 < window:
-        seen.update(glob.glob(pattern))
-        time.sleep(0.05)
+    time.sleep(window)
     end = counters(pid)
     elapsed = time.time() - t0
 
@@ -97,7 +71,6 @@ def main():
     print("  pid %d over %.0fs:" % (pid, elapsed))
     print("    read           %8.1f MB   -> %.3f GB/hour" % (read_mb, read_mb * 3600 / elapsed / 1024))
     print("    written        %8.1f MB   -> %.3f GB/hour" % (written_mb, written_mb * 3600 / elapsed / 1024))
-    print("    store copies   %8d" % len(seen))
 
 
 if __name__ == "__main__":
