@@ -31,6 +31,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:ollama.com", "ollama"),
     ("cookie:opencode.ai", "opencode"),
     ("cookie:opencode.ai", "opencodego"),
+    // The OpenCode Go usage API's key. Routed to opencodego only: `opencode`
+    // (the Zen balance) has no API-key lane.
+    ("apikey:opencode", "opencodego"),
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
@@ -688,6 +691,35 @@ mod tests {
         );
         assert!(loader.deepseek_handles().unwrap().is_empty());
         assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
+    }
+
+    /// `apikey:opencode` routes to opencodego alone, and like every identity-less
+    /// family a second deposit darkens it rather than racing the first.
+    #[test]
+    fn the_opencode_api_key_routes_to_opencodego_and_a_second_is_refused() {
+        let loader = VaultHandleLoader::default();
+        install(&loader, vec![row("apikey:opencode", "apikey")]);
+        assert_eq!(
+            loader.opencodego_handles().unwrap(),
+            vec![CredentialHandle::scoped("apikey:opencode", "apikey")]
+        );
+        assert!(
+            loader.opencode_handles().unwrap().is_empty(),
+            "the Zen balance provider has no API-key lane"
+        );
+
+        let loader = VaultHandleLoader::default();
+        install(
+            &loader,
+            vec![
+                row("apikey:opencode", "apikey"),
+                row("apikey:opencode:second", "apikey"),
+            ],
+        );
+        assert!(loader.opencodego_handles().unwrap().is_empty());
+        assert!(loader.warning().is_some_and(|warning| {
+            warning.contains("multiple identity-less credentials name `apikey:opencode`")
+        }));
     }
 
     #[test]

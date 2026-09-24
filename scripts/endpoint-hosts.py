@@ -86,6 +86,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "openrouter": {"CREDITS_URL": "openrouter.ai", "KEY_URL": "openrouter.ai"},
     "ollama": {"SETTINGS_URL": "ollama.com"},
     "opencode": {"SERVER_BASE": "opencode.ai"},
+    "opencodego": {"API_USAGE_URL": "opencode.ai"},
     "qoder": {"USAGE_URL": "qoder.com"},
     "qwen_cloud": {
         "QUOTA_CONFIG_URL": "cs-data.qwencloud.com",
