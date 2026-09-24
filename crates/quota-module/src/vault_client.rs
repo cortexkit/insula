@@ -2002,6 +2002,7 @@ impl CredentialSource for VaultClient {
                     credential_type: row.kind,
                     record_version: row.record_version,
                     state: row.state,
+                    account_id: row.account_id,
                 })
                 .collect(),
         })

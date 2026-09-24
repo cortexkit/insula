@@ -196,6 +196,9 @@ pub struct ScopedRowState {
     pub credential_type: String,
     pub record_version: u64,
     pub state: String,
+    /// The upstream account this row's credential belongs to, when the vault
+    /// knows it. `None` means unknown, never "no account".
+    pub account_id: Option<String>,
 }
 
 /// One complete scoped-enumeration result.

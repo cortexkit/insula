@@ -19,6 +19,7 @@ fn row(id: &str, kind: &str) -> ScopedRowState {
         credential_type: kind.to_string(),
         record_version: 1,
         state: "active".to_string(),
+        account_id: None,
     }
 }
 
