@@ -189,6 +189,7 @@ impl VaultHandleLoader {
                         credential_type: (*credential_type).to_string(),
                         record_version: 1,
                         state: "active".to_string(),
+                        account_id: None,
                     })
                     .collect(),
             },
@@ -330,6 +331,36 @@ impl VaultHandleLoader {
 
     pub fn codex_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Codex)
+    }
+
+    /// Account ids the vault reports for the codex-family rows of the installed
+    /// snapshot, skipping rows whose account is unknown.
+    ///
+    /// Rows are routed to codex by the same family table `codex_handles` uses,
+    /// so the two can never disagree about which rows are codex rows. Read
+    /// from the retained snapshot whatever the loader phase: the answer is a
+    /// statement about accounts the vault holds, not about which handles are
+    /// currently enumerable.
+    pub fn codex_account_ids(&self) -> Vec<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(snapshot) = state.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let mapped_ids: HashSet<&str> = state
+            .mapped
+            .for_provider(ProviderKind::Codex)
+            .iter()
+            .filter_map(CredentialHandle::vault_credential_id)
+            .collect();
+        snapshot
+            .rows
+            .iter()
+            .filter(|row| mapped_ids.contains(row.credential_id.as_str()))
+            .filter_map(|row| row.account_id.clone())
+            .collect()
     }
 
     pub fn anthropic_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
@@ -593,6 +624,7 @@ mod tests {
             credential_type: credential_type.to_string(),
             record_version: 1,
             state: "active".to_string(),
+            account_id: None,
         }
     }
 

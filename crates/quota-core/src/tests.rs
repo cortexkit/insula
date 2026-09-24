@@ -8735,6 +8735,19 @@ fn scoped_row(
         credential_type: credential_type.to_string(),
         record_version,
         state: state.to_string(),
+        account_id: None,
+    }
+}
+
+/// An active scoped row the vault reports as belonging to `account_id`.
+fn scoped_row_for_account(
+    credential_id: &str,
+    credential_type: &str,
+    account_id: &str,
+) -> ScopedRowState {
+    ScopedRowState {
+        account_id: Some(account_id.to_string()),
+        ..scoped_row(credential_id, credential_type, 1, "active")
     }
 }
 
@@ -9719,4 +9732,177 @@ async fn a_daemon_without_a_credential_module_serves_local_lanes_on_the_first_tu
         registry.health().vault_handle_state,
         Some(crate::vault_handles::VaultHandleState::NoVault)
     );
+}
+
+/// Serves the codex vault credential once, then fails transiently, the way a
+/// vault that is restarting answers. Listing is delegated to the scripted
+/// source so the scoped snapshot comes from the shared fixture.
+struct FlakyCodexVaultSource {
+    list: ScriptedScopedSource,
+    gets: AtomicUsize,
+}
+
+#[async_trait]
+impl CredentialSource for FlakyCodexVaultSource {
+    async fn get(
+        &self,
+        _capability: &VaultCapability,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::FailClosed)
+    }
+
+    async fn get_scoped(
+        &self,
+        credential_id: &str,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        assert_eq!(credential_id, "chatgpt:openai");
+        if self.gets.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Err(VaultGetError::Transient);
+        }
+        Ok(VaultCredential {
+            payload: b"vault-served-token".to_vec(),
+            expires_at_ms: None,
+            record_version: 3,
+            account_id: Some("acct-a".to_string()),
+            email: None,
+            org_name: None,
+            project_id: None,
+        })
+    }
+
+    async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
+        self.list.list_scoped().await
+    }
+
+    async fn report_auth_failure(
+        &self,
+        _capability: &VaultCapability,
+        _provider_status: u16,
+        _record_version: u64,
+    ) {
+    }
+}
+
+/// insula#23: a month-dead `~/.codex/auth.json` for the account the vault
+/// serves. While the vault slot's label was in flux, the local slot -- fetched
+/// with an expired bearer every tick -- became the account's only claimant and
+/// the wire reported a healthy account as `credential_rejected`. The local lane
+/// must not exist at all when the vault holds the same account.
+#[tokio::test]
+async fn a_stale_local_login_for_a_vault_account_is_never_fetched_or_published() {
+    let temp = ResetTempDir::new("codex-local-lane-served-by-vault");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let local_requests = Arc::new(AtomicUsize::new(0));
+    let server_local_requests = Arc::clone(&local_requests);
+    // Answers every request: the vault bearer gets a healthy usage body, any
+    // other bearer (the stale local one) gets the 401 an expired login gets.
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let counter = Arc::clone(&server_local_requests);
+            tokio::spawn(async move {
+                let mut request = vec![0; 16 * 1024];
+                let size = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..size]);
+                let vault_bearer = request.lines().any(|line| {
+                    line.eq_ignore_ascii_case("authorization: Bearer vault-served-token")
+                });
+                let response = if vault_bearer {
+                    let body = serde_json::json!({
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 12.0,
+                                "reset_at": 1_900_000_000_i64,
+                                "limit_window_seconds": 604_800
+                            }
+                        }
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"stale-local-token","account_id":"acct-a"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+
+    let loader = Arc::new(VaultHandleLoader::default());
+    let source = Arc::new(FlakyCodexVaultSource {
+        list: ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
+            1,
+            vec![scoped_row_for_account("chatgpt:openai", "oauth", "acct-a")],
+        ))]),
+        gets: AtomicUsize::new(0),
+    });
+    let credential_source: Arc<dyn CredentialSource> = source.clone();
+    let provider = crate::codex::CodexProvider::new_with_handle_loader(
+        crate::config::CodexConfig::default(),
+        Some(Arc::clone(&credential_source)),
+        Arc::clone(&loader),
+    )
+    .with_codex_home_for_test(codex_home);
+    let registry = scoped_registry(vec![Box::new(provider)], loader, credential_source);
+
+    tick(&registry).await;
+    let healthy = registry.get_usage(Some("codex")).await;
+    assert_eq!(healthy.len(), 1, "{healthy:?}");
+    assert_eq!(healthy[0].account.as_deref(), Some("acct-a"));
+    assert!(healthy[0].error_class.is_none(), "{healthy:?}");
+
+    // The vault is now restarting: the listing fails (the scripted source has
+    // no more replies) and the credential read fails transiently.
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    assert_eq!(
+        source.gets.load(Ordering::SeqCst),
+        2,
+        "the vault slot was refetched"
+    );
+
+    let during_flux = registry.get_usage(Some("codex")).await;
+    assert!(
+        !during_flux
+            .iter()
+            .any(|entry| { entry.error_class.as_deref() == Some("credential_rejected") }),
+        "a healthy vault account must not be published as rejected: {during_flux:?}"
+    );
+    assert_eq!(
+        local_requests.load(Ordering::SeqCst),
+        0,
+        "the stale local login must never be fetched"
+    );
+    assert!(
+        !provider_slot_ids(&registry, "codex")
+            .iter()
+            .any(|id| *id == CredentialHandle::implicit().stable_id()),
+        "no local slot exists for a vault-served account"
+    );
+    server.abort();
 }
