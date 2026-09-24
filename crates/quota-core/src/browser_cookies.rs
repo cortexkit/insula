@@ -429,14 +429,21 @@ pub fn chrome_cookies_for(_domain_suffix: &str) -> Result<CookieJar, CookieError
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SNAPSHOT_TTL: Duration = Duration::from_secs(45);
 
-/// A copy of the cookie store, plus the key that decrypts what is inside it.
+/// An open copy of the cookie store, plus the key that decrypts what is inside it.
 ///
 /// The key is held with the snapshot rather than separately because the two are
 /// acquired together and are useless apart. Deriving it means another `security`
 /// subprocess, which was also being paid once per provider per tick.
+///
+/// The copy is held as an open connection rather than a path because its file
+/// is deleted as soon as it is opened (see [`open_and_unlink`]). The connection
+/// is the only way left to reach the data, and closing it is what frees the
+/// disk space, so there is no file to clean up afterwards. `Connection` is
+/// `Send` but not `Sync`; it lives inside the `SNAPSHOT` mutex and every query
+/// runs with that lock held.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Snapshot {
-    path: PathBuf,
+    conn: rusqlite::Connection,
     keys: CookieKeys,
     taken_at: Instant,
 }
@@ -461,15 +468,6 @@ struct CookieKeys {
     /// key existed, which keeps a keyring problem from costing the `v10` half
     /// of the same jar.
     v11: Option<Vec<u8>>,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        // Best-effort: a leftover copy is a stale temp file, not a correctness
-        // problem, and there is nothing useful to do if removal fails.
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -501,8 +499,9 @@ where
     F: FnOnce() -> Result<Snapshot, CookieError>,
 {
     if snapshot_is_stale(guard.as_ref().map(|s| s.taken_at), now, ttl) {
-        // Dropped before the replacement is built so the old copy is removed
-        // even if taking the new one fails.
+        // Dropped before the replacement is built so the old copy is closed,
+        // which releases its already-deleted file, even if taking the new one
+        // fails.
         *guard = None;
         *guard = Some(acquire()?);
     }
@@ -535,9 +534,9 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
     refresh_snapshot_if_stale(&mut guard, Instant::now(), SNAPSHOT_TTL, || {
         let store = locate_chrome_cookie_store()?.ok_or(CookieError::NoStore)?;
         let keys = cookie_keys()?;
-        let path = copy_cookie_store(&store)?;
+        let copy = copy_cookie_store(&store, &std::env::temp_dir())?;
         Ok(Snapshot {
-            path,
+            conn: open_and_unlink(&copy)?,
             keys,
             taken_at: Instant::now(),
         })
@@ -548,7 +547,9 @@ pub fn chrome_cookies_for(domain_suffix: &str) -> Result<CookieJar, CookieError>
         .expect("a snapshot was just taken or was already fresh");
     let v10_key = snapshot.keys.v10.clone();
     let v11_key = snapshot.keys.v11.clone();
-    let rows = read_encrypted_cookies(&snapshot.path, domain_suffix)?;
+    // Queried before the lock is released: the connection is not `Sync`, and
+    // the mutex is what keeps two providers from using it at once.
+    let rows = read_encrypted_cookies(&snapshot.conn, domain_suffix)?;
     drop(guard);
 
     let mut cookies = Vec::new();
@@ -900,17 +901,31 @@ fn derive_key(password: &str, rounds: u32) -> Result<Vec<u8>, CookieError> {
 /// silently reduce that count to zero -- and zero is exactly the figure that
 /// script prints when the snapshot sharing is working perfectly, so a broken
 /// instrument and the best possible result are indistinguishable in its output.
+///
+/// That glob now undercounts: each copy is deleted as soon as it is opened (see
+/// [`open_and_unlink`]), so it exists on disk only for the moment between the
+/// copy and the open, and a directory listing polled every 50 ms will usually
+/// miss it. A copy count from that script is no longer evidence of how often
+/// the store is copied; its disk-read figure still is.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const COOKIE_SNAPSHOT_PREFIX: &str = "quota-chrome-cookies";
 
-/// Copy the (possibly locked) cookie DB to a temp path.
+/// Copy the (possibly locked) cookie DB into `dir` (the temp root in
+/// production).
 ///
 /// Chrome keeps the database open, so this reads a consistent snapshot without
 /// contending on its lock. The caller owns the returned path and is responsible
-/// for removing it.
+/// for removing it; [`open_and_unlink`] does that as soon as the copy is open.
+///
+/// `dir` is a parameter so tests can put the copy in their own scratch
+/// directory and check what is left there, without seeing copies taken by
+/// other tests running in the same process.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
-    let tmp = std::env::temp_dir().join(format!(
+fn copy_cookie_store(
+    store: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<PathBuf, CookieError> {
+    let tmp = dir.join(format!(
         "{COOKIE_SNAPSHOT_PREFIX}-{}-{}.db",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
@@ -960,19 +975,81 @@ fn copy_cookie_store(store: &std::path::Path) -> Result<PathBuf, CookieError> {
     Ok(tmp)
 }
 
+/// Open a copy made by [`copy_cookie_store`] read-only, then delete its file.
+///
+/// The copy is deleted whether or not the open succeeds. On success the
+/// returned connection keeps the data readable; on failure nothing will ever
+/// read the file again.
+///
+/// Deleting at open time rather than when the snapshot is dropped is what
+/// keeps copies from piling up in the temp root. Rust never runs destructors
+/// for statics, so a snapshot held in `SNAPSHOT` at process exit was never
+/// dropped, and every process left its last copy of the user's cookie database
+/// behind: one multi-megabyte file per restart, deploy and test run. With the
+/// file gone from the start, nothing is left to clean up, whether the process
+/// exits normally, crashes or is killed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_and_unlink(copy: &std::path::Path) -> Result<rusqlite::Connection, CookieError> {
+    let opened = open_immutable(copy);
+    // THIS RELIES ON UNIX FILE SEMANTICS, and this code is only compiled for
+    // macOS and Linux, both of which provide them: removing a file only removes
+    // its name. A descriptor that is already open keeps reading the same data,
+    // and the kernel frees the space when the last descriptor closes. So the
+    // open connection keeps working after this line, and the disk space comes
+    // back when the connection is closed or the process ends for any reason.
+    // (On Windows, deleting an open file fails instead.)
+    //
+    // Best-effort: if the removal fails, the copy is left behind exactly as it
+    // was before this deletion existed, and the snapshot still works.
+    let _ = std::fs::remove_file(copy);
+    opened
+}
+
+/// Open the copy read-only and read its schema, so SQLite already has the file
+/// open before the caller deletes it.
+///
+/// `immutable=1` tells SQLite nothing else will change the file, so it takes no
+/// locks and never looks for or writes a journal next to it. That is true of a
+/// private copy, and it means no query ever needs the file's name again.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_immutable(copy: &std::path::Path) -> Result<rusqlite::Connection, CookieError> {
+    let path = copy
+        .to_str()
+        .ok_or_else(|| CookieError::Extract("open store: snapshot path is not UTF-8".into()))?;
+    // SQLite URI filenames treat `?` and `#` as delimiters and `%` as an
+    // escape, so those three are percent-encoded; everything else is literal.
+    let mut uri = String::from("file:");
+    for ch in path.chars() {
+        match ch {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
+    // Reading the schema forces SQLite to actually read the file now, while it
+    // still has a name, and fails early on a copy that is not a database.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
+    Ok(conn)
+}
+
 /// Read the encrypted cookies whose host_key ends with `domain_suffix` from a
-/// snapshot taken by [`copy_cookie_store`].
+/// snapshot opened by [`open_and_unlink`].
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_encrypted_cookies(
-    snapshot: &std::path::Path,
+    conn: &rusqlite::Connection,
     domain_suffix: &str,
 ) -> Result<Vec<(String, String, Vec<u8>)>, CookieError> {
     let result = (|| {
-        let conn = rusqlite::Connection::open_with_flags(
-            snapshot,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| CookieError::Extract(format!("open store: {e}")))?;
         // Deliberately unfiltered on expiry. An expired cookie is sent, the
         // upstream rejects it, and that arrives as a rejected credential --
         // which is the honest reading: the login is no longer usable.
@@ -1097,23 +1174,20 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_wal_mode_cookie_store_is_refused_rather_than_read_stale() {
-        let dir = std::env::temp_dir().join(format!(
-            "insula-wal-probe-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // Removed when the test passes, kept as evidence when it fails.
+        let scratch = crate::tests::ResetTempDir::with_prefix("insula-wal-probe", "cookies");
+        let dir = scratch.path();
         let store = dir.join("Cookies");
         std::fs::write(&store, b"not a real sqlite file").expect("store");
 
         // No sidecar: the copy proceeds.
-        let copied = copy_cookie_store(&store).expect("a delete-mode store is copied");
+        let copied = copy_cookie_store(&store, dir).expect("a delete-mode store is copied");
         assert!(copied.exists(), "the snapshot must exist");
         let _ = std::fs::remove_file(&copied);
 
         // Sidecar present: refused, and the reason names the file.
         std::fs::write(dir.join("Cookies-wal"), b"wal").expect("sidecar");
-        let refusal = copy_cookie_store(&store).expect_err("a WAL-mode store is refused");
+        let refusal = copy_cookie_store(&store, dir).expect_err("a WAL-mode store is refused");
         assert!(
             matches!(refusal, CookieError::Unavailable(_)),
             "must be the incomplete-source class, got {refusal:?}"
@@ -1128,8 +1202,149 @@ mod tests {
             crate::refresh::FetchClass::Transient,
             "a pending checkpoint is not a dead credential"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Write a minimal Chrome `Cookies` database holding one row per
+    /// `(host_key, name, encrypted_value)`. Only the columns the reader queries
+    /// are created.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn write_cookie_store(path: &std::path::Path, rows: &[(&str, &str, &[u8])]) {
+        let conn = rusqlite::Connection::open(path).expect("fixture store");
+        conn.execute_batch(
+            "CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT NOT NULL, \
+             encrypted_value BLOB NOT NULL)",
+        )
+        .expect("fixture schema");
+        for (host_key, name, value) in rows {
+            conn.execute(
+                "INSERT INTO cookies (host_key, name, encrypted_value) VALUES (?1, ?2, ?3)",
+                rusqlite::params![host_key, name, value],
+            )
+            .expect("fixture row");
+        }
+    }
+
+    /// Names of snapshot copies this process has left in `dir`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn leftover_copies(dir: &std::path::Path) -> Vec<String> {
+        let mine = format!("{COOKIE_SNAPSHOT_PREFIX}-{}-", std::process::id());
+        std::fs::read_dir(dir)
+            .expect("list scratch dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(&mine))
+            .collect()
+    }
+
+    /// Take a snapshot the way `chrome_cookies_for` does, with the copy placed
+    /// in `dir` instead of the shared temp root.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn snapshot_of(store: &std::path::Path, dir: &std::path::Path) -> Snapshot {
+        let copy = copy_cookie_store(store, dir).expect("copy fixture store");
+        Snapshot {
+            conn: open_and_unlink(&copy).expect("open fixture copy"),
+            keys: CookieKeys {
+                v10: Vec::new(),
+                v11: None,
+            },
+            taken_at: Instant::now(),
+        }
+    }
+
+    /// Taking a snapshot leaves no copy of the cookie database on disk, and the
+    /// snapshot still answers queries.
+    ///
+    /// Rust never drops statics, so any cleanup tied to dropping the held
+    /// snapshot never ran for the last one a process took: every process left a
+    /// multi-megabyte copy of the user's cookies in the shared temp root. The
+    /// copy is now deleted as soon as it is opened, and this checks both halves:
+    /// the file is gone, and the open connection still reads it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_snapshot_leaves_no_copy_behind_and_still_answers() {
+        let scratch = crate::tests::ResetTempDir::with_prefix("insula-cookie-snapshot", "unlink");
+        let store_dir = scratch.path().join("profile");
+        let copy_dir = scratch.path().join("tmp");
+        std::fs::create_dir_all(&store_dir).expect("profile dir");
+        std::fs::create_dir_all(&copy_dir).expect("copy dir");
+        let store = store_dir.join("Cookies");
+        write_cookie_store(
+            &store,
+            &[
+                (".example.com", "session", b"v10first"),
+                (".other.org", "unrelated", b"v10other"),
+            ],
+        );
+
+        let snapshot = snapshot_of(&store, &copy_dir);
+
+        assert_eq!(
+            leftover_copies(&copy_dir),
+            Vec::<String>::new(),
+            "the copy must be deleted as soon as it is open"
+        );
+        let rows = read_encrypted_cookies(&snapshot.conn, "example.com").expect("query snapshot");
+        assert_eq!(
+            rows,
+            vec![(
+                ".example.com".to_string(),
+                "session".to_string(),
+                b"v10first".to_vec()
+            )]
+        );
+    }
+
+    /// Replacing a held snapshot serves the new store, not the old one.
+    ///
+    /// The old snapshot's file was deleted when it was opened, so a replacement
+    /// has to be read through its own connection. Queried both before and after
+    /// the replacement, so an implementation that kept serving the first
+    /// connection would fail on the second query.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_replaced_snapshot_reads_the_new_store() {
+        let scratch = crate::tests::ResetTempDir::with_prefix("insula-cookie-snapshot", "replace");
+        let copy_dir = scratch.path().join("tmp");
+        std::fs::create_dir_all(&copy_dir).expect("copy dir");
+        let first = scratch.path().join("first-Cookies");
+        let second = scratch.path().join("second-Cookies");
+        write_cookie_store(&first, &[(".example.com", "session", b"v10first")]);
+        write_cookie_store(&second, &[(".example.com", "session", b"v10second")]);
+
+        let ttl = Duration::from_secs(45);
+        let start = Instant::now();
+        let mut held: Option<Snapshot> = None;
+        let query = |held: &Option<Snapshot>| {
+            read_encrypted_cookies(&held.as_ref().expect("held").conn, "example.com")
+                .expect("query snapshot")
+                .into_iter()
+                .map(|(_, _, value)| value)
+                .collect::<Vec<_>>()
+        };
+
+        refresh_snapshot_if_stale(&mut held, start, ttl, || {
+            let mut snapshot = snapshot_of(&first, &copy_dir);
+            snapshot.taken_at = start;
+            Ok(snapshot)
+        })
+        .expect("first snapshot");
+        assert_eq!(query(&held), vec![b"v10first".to_vec()]);
+
+        // Past the bound, so the held snapshot is replaced.
+        let later = start + ttl;
+        refresh_snapshot_if_stale(&mut held, later, ttl, || {
+            let mut snapshot = snapshot_of(&second, &copy_dir);
+            snapshot.taken_at = later;
+            Ok(snapshot)
+        })
+        .expect("second snapshot");
+        assert_eq!(query(&held), vec![b"v10second".to_vec()]);
+        assert_eq!(leftover_copies(&copy_dir), Vec::<String>::new());
     }
 
     /// A pasted header round-trips to the same jar the browser store yields.
@@ -2107,7 +2322,7 @@ mod tests {
             refresh_snapshot_if_stale(guard, now, Duration::from_secs(45), || {
                 copies.set(copies.get() + 1);
                 Ok(Snapshot {
-                    path: std::path::PathBuf::from("/tmp/witness"),
+                    conn: rusqlite::Connection::open_in_memory().expect("in-memory db"),
                     keys: CookieKeys {
                         v10: Vec::new(),
                         v11: None,
