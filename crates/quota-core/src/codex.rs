@@ -465,10 +465,17 @@ fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
         // Upstream states a balance without saying how it was funded: a
         // promotional grant and a purchased top-up land in the same field.
         funding: PoolFunding::Unknown,
+        // Only a stated balance has a basis. `has_credits: true` beside
+        // `balance: null` is a real shape (seen on every sample of a team
+        // account), and claiming `Reported` there would say the provider
+        // stated a remainder it did not.
+        basis: if remaining.is_some() {
+            PoolBasis::Reported
+        } else {
+            PoolBasis::Unstated
+        },
         remaining,
         total: None,
-        // The balance is stated directly rather than derived from a total.
-        basis: PoolBasis::Reported,
         // `overage_limit_reached` is the account's own enforcement statement.
         // Only the blocking direction is propagated: true means no further
         // spend is accepted, while false says the overage allowance is intact
@@ -2080,6 +2087,24 @@ mod credit_pool_tests {
         assert_eq!(pool.basis, PoolBasis::Reported);
         // Upstream states a balance without saying how it was funded.
         assert_eq!(pool.funding, PoolFunding::Unknown);
+    }
+
+    /// `has_credits: true` beside `balance: null` publishes the pool with no
+    /// amount and an unstated basis: the account has credits, and the provider
+    /// did not say how many.
+    ///
+    /// The `credits` object is verbatim from a team account's `wham/usage`
+    /// (insula#28, 2026-09-25); the reporter saw `balance: null` on every sample.
+    #[test]
+    fn a_null_balance_publishes_a_pool_with_no_amount_and_no_basis() {
+        let body = br#"{ "rate_limit": { "primary_window": { "used_percent": 1 } },
+                         "credits": {"has_credits":true,"unlimited":false,"overage_limit_reached":false,"balance":null,"approx_local_messages":null,"approx_cloud_messages":null} }"#;
+        let snapshot = normalize_usage_snapshot(body).expect("parses");
+        assert_eq!(snapshot.pools.len(), 1, "{:?}", snapshot.pools);
+        let pool = &snapshot.pools[0];
+        assert_eq!(pool.remaining, None);
+        assert_eq!(pool.basis, PoolBasis::Unstated);
+        assert_eq!(pool.spendable, None);
     }
 
     /// Absent `has_credits` is not treated as true.

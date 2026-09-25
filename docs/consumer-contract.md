@@ -942,6 +942,13 @@ providers, and any provider whose pool fetch failed. `spend: []` means it asked
 and the provider reports none. They are not interchangeable: an absent list is
 silence, an empty one is a statement.
 
+**A pool may carry no `remaining` at all.** That states "this pool exists, and
+the provider did not say how much is in it". Its `basis` is then `unstated`,
+since no remainder was stated. `codex` publishes this shape for an account whose
+plan has credits (`has_credits: true`) but whose balance comes back `null`,
+which is every sample seen from a team account so far. Read it as "credits
+exist, amount unknown", never as zero.
+
 **An entry may carry pools and no windows at all.** A provider that sells only
 credit publishes `usage: {}` beside a non-empty `spend`, and that entry is
 healthy — its whole answer is the balance. Consumers that reduce an account to
