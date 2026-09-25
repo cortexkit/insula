@@ -349,6 +349,15 @@ struct UsageResponse {
     rate_limit: Option<RateLimit>,
     #[serde(default)]
     credits: Option<CreditDetails>,
+    /// Workspace spend controls on team and enterprise accounts.
+    ///
+    /// Held as raw JSON and read by hand in [`individual_limit_pool`] rather
+    /// than through a typed struct. The only typed instance anyone holds comes
+    /// from one account's historical records, so a field arriving in a shape we
+    /// have not seen must drop this pool, never fail the decode and take the
+    /// rate windows down with it.
+    #[serde(default)]
+    spend_control: Option<serde_json::Value>,
 }
 
 /// The prepaid credit balance carried in the same `/wham/usage` body.
@@ -484,7 +493,90 @@ fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
             Some(true) => Some(false),
             _ => None,
         },
+        // The payload states no period for prepaid credit.
+        resets_at: None,
     }]
+}
+
+/// Build the workspace credit-limit pool from `spend_control`, when there is one.
+///
+/// Team and enterprise workspaces can cap each member's monthly credit spend.
+/// Upstream shape, as recorded from a team account (insula#28):
+/// `{"reached": bool, "individual_limit": {source, unit, limit, used, remaining,
+/// used_percent, remaining_percent, reset_at}}`, with the amounts as decimal
+/// strings and `reset_at` in epoch seconds. Accounts without the control send
+/// `individual_limit: null`.
+///
+/// Every unreadable case returns `None` and publishes nothing: a null or
+/// missing limit, a missing or unparseable `limit` or `remaining`, or a missing
+/// `unit`. A unit is never guessed, because a credit figure labelled with the
+/// wrong denomination looks authoritative. The rate windows never depend on
+/// this, so nothing here can fail the fetch.
+fn individual_limit_pool(spend_control: Option<&serde_json::Value>) -> Option<Pool> {
+    let control = spend_control?.as_object()?;
+    let limit = control.get("individual_limit")?.as_object()?;
+    let unit = limit
+        .get("unit")?
+        .as_str()
+        .map(str::trim)
+        .filter(|unit| !unit.is_empty())?;
+    let amount = |field: &str| {
+        limit
+            .get(field)
+            .and_then(amount_from_json)
+            .map(|(minor, exponent)| Amount {
+                minor,
+                exponent,
+                unit: unit.to_string(),
+            })
+    };
+    let (total, remaining) = common_exponent(amount("limit")?, amount("remaining")?)?;
+
+    Some(Pool {
+        id: "individual_limit".to_string(),
+        label: "Workspace credit limit".to_string(),
+        // A cap set by the workspace admin. It is not a grant, a purchase or a
+        // subscription allowance, so none of the named funding kinds is true.
+        funding: PoolFunding::Unknown,
+        remaining: Some(remaining),
+        total: Some(total),
+        basis: PoolBasis::Reported,
+        // Same one-direction rule as `overage_limit_reached`: `reached: true`
+        // says further spend is refused, while false is not a promise that
+        // this pool may be drawn on.
+        spendable: match control.get("reached").and_then(serde_json::Value::as_bool) {
+            Some(true) => Some(false),
+            _ => None,
+        },
+        // The provider's own period end, rendered the same way as rate-window
+        // resets. Absent or unreadable leaves it unstated, and the pool is
+        // still published: the amounts stand on their own.
+        resets_at: limit
+            .get("reset_at")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(crate::env::epoch_to_iso8601),
+    })
+}
+
+/// Restate two amounts at the larger of their two exponents.
+///
+/// The limit and remainder arrive as independent decimal strings ("1000" beside
+/// "749.5"), so each parses at its own precision. Left like that the pool states
+/// its remaining and total in different terms, and nothing downstream can
+/// compare them: the wire rules report the mismatch rather than convert. Scaling
+/// up by a power of ten is exact, so no precision is lost; an overflow drops
+/// the pool instead of publishing a wrong figure.
+fn common_exponent(a: Amount, b: Amount) -> Option<(Amount, Amount)> {
+    let exponent = a.exponent.max(b.exponent);
+    let rescale = |amount: Amount| -> Option<Amount> {
+        let factor = 10i64.checked_pow(u32::from(exponent - amount.exponent))?;
+        Some(Amount {
+            minor: amount.minor.checked_mul(factor)?,
+            exponent,
+            unit: amount.unit,
+        })
+    };
+    Some((rescale(a)?, rescale(b)?))
 }
 
 /// Codex states no currency on this balance, and the account's billing currency
@@ -514,8 +606,8 @@ pub struct CodexUsageSnapshot {
     pub usage: Usage,
     pub limit_reached: Option<bool>,
     pub plan_type: Option<String>,
-    /// Prepaid credit on this account. Empty when the account has no credit
-    /// product, which is not the same as a spent one.
+    /// Prepaid credit and the workspace credit limit on this account. Empty
+    /// when the account has neither, which is not the same as a spent pool.
     pub pools: Vec<Pool>,
 }
 
@@ -541,7 +633,10 @@ pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, Fetch
             extra_rate_windows: None,
         },
         limit_reached: rate_limit.limit_reached,
-        pools: credit_pools(response.credits.as_ref()),
+        pools: credit_pools(response.credits.as_ref())
+            .into_iter()
+            .chain(individual_limit_pool(response.spend_control.as_ref()))
+            .collect(),
     })
 }
 
@@ -1359,6 +1454,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// The workspace credit limit travels the provider's real fetch path into
+    /// the published entry's `spend`, reset included, and the published entry
+    /// passes the wire rules.
+    ///
+    /// SYNTHETIC-FROM-TYPED-DESCRIPTION (insula#28): the `spend_control` value is
+    /// built from the reporter's typed record of a team account, since no live
+    /// instance exists anywhere now.
+    #[tokio::test]
+    async fn the_individual_limit_reaches_the_published_spend() {
+        // The window resets an hour from now so the wire rules judge a live
+        // window rather than one whose reset has already passed.
+        let window_reset = chrono::Utc::now().timestamp() + 3600;
+        let usage_body = format!(
+            r#"{{
+            "plan_type": "team",
+            "rate_limit": {{
+                "primary_window": {{"used_percent": 41.0, "reset_at": {window_reset}, "limit_window_seconds": 18000}}
+            }},
+            "spend_control": {{ "reached": false, "individual_limit": {{
+                "source": "workspace_spend_controls", "unit": "credit",
+                "limit": "1000", "used": "250.5", "remaining": "749.5",
+                "used_percent": 25, "remaining_percent": 75, "reset_at": 1790812800 }} }}
+        }}"#
+        );
+        let usage_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            usage_body.len(),
+            usage_body
+        );
+        let usage_base = serve_one_raw_response(usage_response.into_bytes()).await;
+        let home = std::env::temp_dir().join(format!(
+            "ck-quota-codex-individual-limit-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            br#"{"tokens":{"access_token":"oauth-token","account_id":"acct-limit"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            context_config(&usage_base).unwrap(),
+        )
+        .unwrap();
+
+        let transport = Arc::new(CountingResetTransport {
+            gets: AtomicUsize::new(0),
+            posts: AtomicUsize::new(0),
+            fail_get: false,
+        });
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(
+                home.join("state").join("redemptions.json"),
+            ))
+            .unwrap(),
+        );
+        let provider = CodexProvider::new_for_test(
+            CodexConfig::default(),
+            None,
+            Arc::clone(&transport) as Arc<dyn ResetTransport>,
+            coordinator,
+            VaultHandleLoader::new(None),
+            home.clone(),
+        );
+        let registry = crate::Registry::new(vec![Box::new(provider)]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(None).await;
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].error.is_none(), "{:?}", entries[0].error);
+        let spend = entries[0].spend.as_ref().expect("the pool is published");
+        let pool = spend
+            .iter()
+            .find(|pool| pool.id == "individual_limit")
+            .unwrap_or_else(|| panic!("no individual_limit pool: {spend:?}"));
+        assert_eq!(pool.resets_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert_eq!(
+            pool.remaining,
+            Some(Amount {
+                minor: 7495,
+                exponent: 1,
+                unit: "credit".to_string()
+            })
+        );
+        // The window is published beside it, not replaced by it.
+        assert_eq!(
+            entries[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            41.0
+        );
+        let report = crate::wire_sanity::check_entries(&entries, crate::wire_sanity::now());
+        assert_eq!(report.pool_comparisons, 1, "remaining was bounded by total");
+        assert_eq!(
+            report.pool_resets_checked, 1,
+            "the stated reset was checked"
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
     #[tokio::test]
     async fn unarmed_registry_http_gets_credits_without_consume_post() {
         let usage_body = br#"{
@@ -2173,5 +2377,180 @@ mod credit_pool_tests {
         let snapshot = normalize_usage_snapshot(body).expect("parses");
         assert_eq!(snapshot.pools.len(), 1);
         assert_eq!(snapshot.pools[0].remaining, None);
+    }
+}
+
+#[cfg(test)]
+mod individual_limit_tests {
+    use super::*;
+
+    /// A `/wham/usage` body carrying the given `spend_control` value (raw JSON)
+    /// beside one ordinary window and no credit product.
+    fn body_with_spend_control(spend_control: &str) -> Vec<u8> {
+        format!(
+            r#"{{ "plan_type": "team",
+                 "rate_limit": {{ "primary_window": {{ "used_percent": 12.5, "limit_window_seconds": 18000 }} }},
+                 "credits": {{ "has_credits": false, "balance": "0" }},
+                 "spend_control": {spend_control} }}"#
+        )
+        .into_bytes()
+    }
+
+    /// SYNTHETIC-FROM-TYPED-DESCRIPTION (insula#28): no live instance exists
+    /// anywhere now. Built from the reporter's typed record of a team account on
+    /// 2026-09-18: decimal-string amounts, integer percents, epoch-second
+    /// `reset_at` (this one is 2026-10-01T00:00:00Z, the value recorded).
+    const POPULATED_LIMIT: &str = r#"{ "reached": false, "individual_limit": {
+        "source": "workspace_spend_controls", "unit": "credit",
+        "limit": "1000", "used": "250.5", "remaining": "749.5",
+        "used_percent": 25, "remaining_percent": 75, "reset_at": 1790812800 } }"#;
+
+    fn limit_pool(snapshot: &CodexUsageSnapshot) -> Option<&Pool> {
+        snapshot
+            .pools
+            .iter()
+            .find(|pool| pool.id == "individual_limit")
+    }
+
+    fn credit(minor: i64, exponent: u8) -> Amount {
+        Amount {
+            minor,
+            exponent,
+            unit: "credit".to_string(),
+        }
+    }
+
+    /// A populated limit publishes a reported pool with its amounts, its own
+    /// unit, and the provider's stated period end on the wire as `resetsAt`.
+    #[test]
+    fn a_populated_individual_limit_publishes_a_pool_with_its_reset() {
+        let snapshot =
+            normalize_usage_snapshot(&body_with_spend_control(POPULATED_LIMIT)).expect("parses");
+        let pool = limit_pool(&snapshot).expect("the limit is published");
+        assert_eq!(pool.label, "Workspace credit limit");
+        // 1000 and 749.5, restated at the finer of the two precisions so the
+        // remainder and the limit can be compared.
+        assert_eq!(pool.total, Some(credit(10000, 1)));
+        assert_eq!(pool.remaining, Some(credit(7495, 1)));
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        assert_eq!(pool.funding, PoolFunding::Unknown);
+        assert_eq!(pool.spendable, None, "reached: false states nothing");
+        assert_eq!(pool.resets_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+
+        let wire = serde_json::to_string(pool).unwrap();
+        assert!(
+            wire.contains(r#""resetsAt":"2026-10-01T00:00:00Z""#),
+            "{wire}"
+        );
+    }
+
+    /// `reached: true` is the workspace refusing further spend, so the pool is
+    /// marked unspendable.
+    #[test]
+    fn a_reached_limit_marks_the_pool_unspendable() {
+        let reached = POPULATED_LIMIT.replace(r#""reached": false"#, r#""reached": true"#);
+        let snapshot =
+            normalize_usage_snapshot(&body_with_spend_control(&reached)).expect("parses");
+        let pool = limit_pool(&snapshot).expect("the limit is published");
+        assert_eq!(pool.spendable, Some(false));
+    }
+
+    /// The live sample from the reporter's account after it left the team plan
+    /// (insula#28, 2026-09-25), verbatim: no pool, and the windows still parse.
+    #[test]
+    fn a_null_individual_limit_publishes_no_pool_and_keeps_the_windows() {
+        let snapshot = normalize_usage_snapshot(&body_with_spend_control(
+            r#"{"reached":false,"individual_limit":null}"#,
+        ))
+        .expect("a null limit must not fail the fetch");
+        assert!(limit_pool(&snapshot).is_none(), "{:?}", snapshot.pools);
+        assert_eq!(snapshot.usage.primary.as_ref().unwrap().used_percent, 12.5);
+    }
+
+    /// Shapes this cannot read publish no pool and never fail the fetch.
+    ///
+    /// SYNTHETIC-FROM-TYPED-DESCRIPTION (insula#28): each is the populated
+    /// record with one field broken or removed.
+    #[test]
+    fn an_unreadable_individual_limit_publishes_no_pool_and_keeps_the_windows() {
+        let cases = [
+            (
+                "unreadable limit",
+                POPULATED_LIMIT.replace(r#""limit": "1000""#, r#""limit": "1,000""#),
+            ),
+            (
+                "missing remaining",
+                POPULATED_LIMIT.replace(r#", "remaining": "749.5""#, ""),
+            ),
+            (
+                "missing unit",
+                POPULATED_LIMIT.replace(r#""unit": "credit","#, ""),
+            ),
+            (
+                "limit not an object",
+                r#"{"reached":false,"individual_limit":"1000"}"#.to_string(),
+            ),
+            ("spend_control not an object", r#"[1, 2]"#.to_string()),
+        ];
+        for (case, spend_control) in cases {
+            assert_ne!(
+                spend_control, POPULATED_LIMIT,
+                "{case}: the fixture edit must apply"
+            );
+            let snapshot = normalize_usage_snapshot(&body_with_spend_control(&spend_control))
+                .unwrap_or_else(|error| panic!("{case}: must not fail the fetch: {error:?}"));
+            assert!(
+                limit_pool(&snapshot).is_none(),
+                "{case}: {:?}",
+                snapshot.pools
+            );
+            assert_eq!(
+                snapshot.usage.primary.as_ref().unwrap().used_percent,
+                12.5,
+                "{case}: windows intact"
+            );
+        }
+    }
+
+    /// An absent or unreadable `reset_at` leaves the reset unstated and still
+    /// publishes the pool.
+    #[test]
+    fn an_unreadable_reset_publishes_the_pool_without_one() {
+        for (case, spend_control) in [
+            (
+                "absent",
+                POPULATED_LIMIT.replace(r#", "reset_at": 1790812800"#, ""),
+            ),
+            ("string", POPULATED_LIMIT.replace("1790812800", r#""soon""#)),
+        ] {
+            assert_ne!(
+                spend_control, POPULATED_LIMIT,
+                "{case}: the fixture edit must apply"
+            );
+            let snapshot =
+                normalize_usage_snapshot(&body_with_spend_control(&spend_control)).expect("parses");
+            let pool = limit_pool(&snapshot).expect("the pool is still published");
+            assert_eq!(pool.resets_at, None, "{case}");
+            assert!(
+                !serde_json::to_string(pool).unwrap().contains("resetsAt"),
+                "{case}"
+            );
+        }
+    }
+
+    /// The limit sits beside the prepaid `credits` pool rather than replacing it.
+    #[test]
+    fn the_limit_is_published_beside_the_credits_pool() {
+        let body = String::from_utf8(body_with_spend_control(POPULATED_LIMIT))
+            .unwrap()
+            .replace(
+                r#""has_credits": false, "balance": "0""#,
+                r#""has_credits": true, "balance": "24.02""#,
+            );
+        let snapshot = normalize_usage_snapshot(body.as_bytes()).expect("parses");
+        let ids: Vec<&str> = snapshot.pools.iter().map(|pool| pool.id.as_str()).collect();
+        assert_eq!(ids, ["credits", "individual_limit"]);
+        assert_eq!(snapshot.pools[0].remaining, Some(credit(2402, 2)));
+        assert_eq!(snapshot.pools[0].resets_at, None, "credits state no period");
     }
 }

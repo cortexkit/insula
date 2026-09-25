@@ -280,6 +280,7 @@ mod pool_bound_tests {
             }),
             basis: PoolBasis::Reported,
             spendable: None,
+            resets_at: None,
         }]);
 
         let mut entries = [entry];

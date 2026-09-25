@@ -91,6 +91,7 @@ fn pools_from(info: &BalanceInfo) -> Vec<Pool> {
             // `is_available` is an account-level statement and saying it applies
             // to each pool would be this module's inference, not DeepSeek's.
             spendable: None,
+            resets_at: None,
         });
     };
 

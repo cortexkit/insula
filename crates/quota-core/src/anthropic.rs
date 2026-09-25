@@ -253,6 +253,7 @@ fn overage_pool(
         // A limit minus a usage figure, not a remainder the provider states.
         basis: PoolBasis::Derived,
         spendable,
+        resets_at: None,
     }))
 }
 
