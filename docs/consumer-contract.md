@@ -990,6 +990,40 @@ the windows as one pool:
   currencies or scales. An account without extra usage is in that group. The
   windows are published as usual in every one of these cases.
 
+### `codex`: the workspace credit limit as the `individual_limit` pool
+
+Codex team and enterprise workspaces can cap each member's monthly credit
+spend. When the account reports that cap, it is published beside the windows,
+and beside the `credits` pool if there is one, never in place of it:
+
+```json
+"spend": [
+  { "id": "individual_limit", "label": "Workspace credit limit",
+    "funding": "unknown", "basis": "reported",
+    "total":     { "minor": 10000, "exponent": 1, "unit": "credit" },
+    "remaining": { "minor": 7495,  "exponent": 1, "unit": "credit" },
+    "resetsAt": "2026-10-01T00:00:00Z" }
+]
+```
+
+- `total` is the limit the workspace set and `remaining` is what the provider
+  says is left of it, so `basis: reported`. Both are stated at one exponent so
+  they can be compared. `unit` is the provider's own; no pool is published if
+  it names none.
+- `funding: unknown`: an admin-set cap is not a grant, a purchase or a
+  subscription allowance.
+- `spendable: false` when the provider says the limit has been reached.
+  Otherwise it is absent, which is not a promise that the pool can be drawn on.
+- `resetsAt` is the provider's own period end for this limit, rendered like a
+  window's `resetsAt`. It is the only pool here that states one. **A pool
+  without `resetsAt` means the period was not stated, never that the pool does
+  not renew.** Claude's `extra_usage` and Codex's `credits` both carry no reset
+  for that reason. The limit pool is still published when its reset is missing
+  or unreadable, just without `resetsAt`.
+- No pool when the account has no limit (`individual_limit: null`, the usual
+  case outside a team workspace), or when the limit or remainder is missing or
+  unreadable. The windows are published as usual in every one of these cases.
+
 ## 100% used does not mean requests are being refused
 
 `usedPercent` is a **capacity reading**, not an enforcement state. A window at

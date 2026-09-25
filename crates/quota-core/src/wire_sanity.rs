@@ -118,6 +118,12 @@ pub struct SanityReport {
     /// catches a balance stated wrongly against its own cap, so a zero here is
     /// worth seeing rather than inferring from the pool count.
     pub pool_comparisons: usize,
+    /// Pool `resetsAt` values the parse rule examined.
+    ///
+    /// Only pools that state a reset reach that rule, and almost none do: an
+    /// absent reset means the provider did not state one. Counted on its own so
+    /// a sweep over pools with no reset is visibly one that never ran the rule.
+    pub pool_resets_checked: usize,
     /// Spend pools examined by the pool rules.
     ///
     /// Counted separately from windows because the two populations are
@@ -184,6 +190,7 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
     report.pools_checked = tally.pools;
     report.pool_amounts_checked = tally.amounts;
     report.pool_comparisons = tally.comparisons;
+    report.pool_resets_checked = tally.resets;
     report
 }
 
@@ -201,11 +208,12 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
 /// What the pool rules actually examined, so a zero is visible rather than
 /// inferred from a neighbouring count.
 ///
-/// **A NEW RULE WITH A PRECONDITION NEEDS A NEW FIELD HERE.** Three populations
-/// exist because the rules divide into three: every pool reaches the id rules,
-/// only pools stating an amount reach the unit and exponent rules, and only
-/// pools stating BOTH a remaining and a total reach the bound rule. A fourth
-/// precondition without a fourth count is invisible in exactly the way this
+/// **A NEW RULE WITH A PRECONDITION NEEDS A NEW FIELD HERE.** Four populations
+/// exist because the rules divide into four: every pool reaches the id rules,
+/// only pools stating an amount reach the unit and exponent rules, only pools
+/// stating BOTH a remaining and a total reach the bound rule, and only pools
+/// stating a reset reach the reset parse rule. A fifth precondition without a
+/// fifth count is invisible in exactly the way this
 /// struct exists to prevent — the neighbouring numbers keep reporting, and the
 /// new rule is indistinguishable from one that never fires.
 ///
@@ -225,6 +233,7 @@ struct PoolTally {
     pools: usize,
     amounts: usize,
     comparisons: usize,
+    resets: usize,
 }
 
 fn check_pools(
@@ -280,6 +289,20 @@ fn check_pools(
                 findings.push(format!(
                     "{where_}: pool '{}' states a {field} with exponent {}, which no currency or credit uses",
                     pool.id, amount.exponent
+                ));
+            }
+        }
+
+        // A stated period end that does not parse gives a consumer a renewal it
+        // cannot place in time, which reads as either "never" or "now". Only
+        // parseability is checked: unlike a window, a pool has no length to
+        // bound its reset against.
+        if let Some(text) = pool.resets_at.as_deref() {
+            tally.resets += 1;
+            if DateTime::parse_from_rfc3339(text).is_err() {
+                findings.push(format!(
+                    "{where_}: pool '{}' states an unparseable resetsAt: {text}",
+                    pool.id
                 ));
             }
         }
@@ -853,6 +876,7 @@ mod tests {
             }),
             basis: PoolBasis::Reported,
             spendable: None,
+            resets_at: None,
         }
     }
 
@@ -990,6 +1014,37 @@ mod tests {
         );
     }
 
+    /// A pool's stated reset must parse as RFC 3339, and the rule counts what it
+    /// examined so a sweep of pools stating no reset shows it never ran.
+    #[test]
+    fn an_unparseable_pool_reset_is_a_finding() {
+        let mut bad = pool("individual_limit", Some((7_495, 1, "credit")), None);
+        bad.resets_at = Some("October 1st".to_string());
+        let report = check_entries(&[entry_with_pools(vec![bad])], at("2026-07-28T10:00:00Z"));
+        assert_eq!(report.pool_resets_checked, 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("unparseable resetsAt: October 1st")),
+            "{:?}",
+            report.findings
+        );
+
+        let mut good = pool("individual_limit", Some((7_495, 1, "credit")), None);
+        good.resets_at = Some("2026-10-01T00:00:00Z".to_string());
+        let unstated = pool("credits", Some((2_402, 2, "credit")), None);
+        let report = check_entries(
+            &[entry_with_pools(vec![good, unstated])],
+            at("2026-07-28T10:00:00Z"),
+        );
+        assert_eq!(
+            report.pool_resets_checked, 1,
+            "a pool without a reset states nothing and is not examined"
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
     /// A provider selling only credit publishes no window, and that is healthy.
     ///
     /// The shape rules above exist to catch an entry that occupies a row and
@@ -1017,6 +1072,7 @@ mod tests {
             total: None,
             basis: PoolBasis::Reported,
             spendable: None,
+            resets_at: None,
         }]);
 
         entry.fetched_at = Some(stamped_at());

@@ -510,6 +510,7 @@ fn wallet_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
             basis: PoolBasis::Reported,
             // No per-pool enable flag on this endpoint.
             spendable: None,
+            resets_at: None,
         });
     };
 
