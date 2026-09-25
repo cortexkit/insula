@@ -7,6 +7,14 @@
 //! - `Sources/CodexBarCore/Providers/ZenMux/ZenMuxUsageFetcher.swift:121-205`
 //! - `Sources/CodexBarCore/Providers/ZenMux/ZenMuxSettingsReader.swift:4-23`
 //!
+//! The fetcher exists up to CodexBar v0.65.0 and NO LONGER EXISTS from v0.66.0:
+//! upstream moved this provider into a bundled plugin,
+//! `Sources/CodexBarCore/Resources/Plugins/zenmux.js`. Read the fetcher citation at
+//! v0.65.0 or earlier; the plugin is where to look for later changes. The settings
+//! reader is still present. (Recorded for `scripts/parity-citations.py`, which
+//! reports a cited file that is gone at the current anchor until its module says
+//! what replaced it.)
+//!
 //! Note: the PAYG balance call (`payg/balance`) is not fetched. Prepaid balances
 //! are publishable now -- they travel as `Pool`s on `ProviderUsage::spend` -- so
 //! the remaining obstacle is verification, not the wire: no credential for this

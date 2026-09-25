@@ -10,6 +10,16 @@
 //! CodexBar `Sources/CodexBarCore/Providers/Qoder/QoderUsageFetcher.swift:10-17,47-129,140-207,210-315`.
 //! The primary window mapping is from `QoderUsageSnapshot.swift:30-49`; cookie
 //! header construction and exact domains are from `QoderCookieImporter.swift:23-25,37-44,83-101`.
+//!
+//! Those three Swift files exist up to CodexBar v0.65.0 and NO LONGER EXIST under
+//! `Sources/` from v0.66.0: upstream made its bundled plugin,
+//! `Sources/CodexBarCore/Resources/Plugins/qoder.js`, the fetch path. The fetcher
+//! and snapshot survive only as test references (`Tests/CodexBarTests/
+//! QoderReferenceParser.swift`, `CookieReferenceQoderUsageSnapshot.swift`), and the
+//! cookie importer was deleted. Read the citations above at v0.65.0 or earlier; the
+//! plugin is where to look for later changes. (Recorded for
+//! `scripts/parity-citations.py`, which reports a cited file that is gone at the
+//! current anchor until its module says what replaced it.)
 
 use std::time::Duration;
 

@@ -1261,6 +1261,271 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.65.0 → v0.66.0
+
+One tag. All EIGHT opaque constants present at `v0.66.0`, located by VALUE in
+the tagged tree (`git grep -l -F <value> v0.66.0 -- Sources`), each in the same
+file as at `v0.65.0`. None moved:
+
+| Constant | Value located in (`v0.66.0`) |
+|---|---|
+| `WORKSPACES_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `BILLING_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `SUBSCRIPTION_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift` |
+| `BETA_HEADER` (`oauth-2025-04-20`) | `Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift` |
+| `OASIS_WEB_ID` | `StepFun/StepFunUsageFetcher.swift` |
+| `CONSOLE_WORKSPACES_PATH` (`/console/api/orgs`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_GO_STATUS_PATH` (`/console/api/go/status`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_WORKSPACE_HEADER` (`x-org-id`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+
+Paths are under `Sources/CodexBarCore/Providers/`.
+
+**What moved.** Most of the deletion count comes from one migration: eleven
+providers' Swift fetchers were replaced by their bundled plugins
+(`Sources/CodexBarCore/Resources/Plugins/<id>.js`), which became the live fetch
+path. Deleted from `Sources/`: `AiAndUsageFetcher`, `ChutesUsageStats`,
+`DeepInfraUsageFetcher`, `FireworksUsageFetcher`, `ManusCookieImporter`,
+`OpenAIAPICreditBalanceFetcher`, `OpenAIAPIUsageFetcher`,
+`OpenAIAPIUsageResponses`, `PerplexityUsageFetcher`, `QoderCookieImporter`,
+`T3ChatUsageFetcher` and `ZenMuxUsageFetcher`. Moved out of `Sources/` into
+`Tests/CodexBarTests/` as reference copies for the plugin tests: the Manus fetcher,
+the Qoder fetcher and snapshot, and the Perplexity and T3Chat models and snapshots.
+Three of these served providers are ours (Manus, Qoder, ZenMux); their verdicts
+are below. No provider left the registry. Four were added (DevPass, Atlas Cloud,
+Vercel, llmman). The plugin runtime gained a cookie broker (`browser.sessions`,
+`rejectCookie`), which is how the migrated plugins iterate browser sessions.
+
+**Triage method, as last round.** Each served provider's diff, and for migrated
+providers the old Swift fetcher at `v0.65.0` against the plugin at `v0.66.0`, was
+filtered for changed lines naming a URL, cookie, header, JSON key, sign-in or
+redirect term, parsing rule, or error mapping. **Only one served provider now
+requests or reads something new: the Aliyun token-plan monthly window (Qwen
+Cloud).** Nothing else changes what we request or how we read the answer. No
+provider behaviour changes here.
+
+Every provider directory we implement was checked. Changed this release: Alibaba,
+Copilot, Cursor, Doubao, Grok, Kimi, Manus, MiniMax, Ollama, Qoder, QwenCloud,
+ZenMux, plus `Shared/`. Unchanged, with no change to any plugin they moved to
+earlier: Amp, Antigravity, Claude, ClinePass, Codebuff, Codex, DeepSeek,
+ElevenLabs, Factory, Gemini, JetBrains, Kilo, LLMProxy, MiMo, NeuralWatt,
+OpenCode, OpenCode Go, OpenRouter, Sakana, StepFun, Sub2API, Synthetic, Warp
+and z.ai. None of their cited files was deleted.
+
+**Grok (3 files): no effect; identity differs from upstream by design.**
+- `GrokRPCClient.swift` and `GrokStatusProbe.swift`: the Grok CLI JSON-RPC lane now
+  carries the JSON-RPC error `code`, and "billing method unavailable" is decided
+  by `code == -32601` instead of matching the text `method not found`. We do not
+  run the Grok CLI. `grok.rs` reads the web billing lane (`POST
+  grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`, gRPC-web), and
+  `GrokWebBillingFetcher.swift` is unchanged.
+- `GrokProviderDescriptor.swift`: the Chrome-only cookie order moved into the
+  shared `BrowserCookieImportSupport.chromeOnly`. Same order.
+- Identity. Upstream does NOT read the token's `sub`. It takes `email` and
+  `team_id` from the preferred entry of `~/.grok/auth.json` (`GrokAuth.parse`,
+  unchanged this release), and publishes them as `accountEmail` and
+  `accountOrganization`. It parses `user_id` but never publishes it as identity.
+  `grok.rs` names the account by the access token's JWT `sub`, which the identity
+  survey verified live to equal that same `user_id`. It publishes neither email
+  nor team: the token carries no email, and the module already declines a bare
+  team UUID as an org name. That is a different source for the same account, not
+  a gap this release opened. Reading `email` from `auth.json` would give a
+  friendlier label, but only for the CLI lane's file, which our vault lane does
+  not have.
+
+**Cursor (2 files): no effect.** `CursorUsageEventsFetcher.swift` inlines its
+request builder: same `POST /api/dashboard/get-filtered-usage-events`, same
+`Cookie`, `Origin` (CSRF) and JSON headers. It now maps HTTP 403 to a new
+`costRequestForbidden` error, and the app backs off cost refreshes for six hours
+on it (#3924). That is the cost-events lane. `cursor.rs` reads only
+`GET cursor.com/api/usage-summary`, whose request and parse did not change.
+
+**OpenAI (4 files): not `codex`; Codex is unchanged except one plan-label rule.**
+The `OpenAI/` directory is the OpenAI **API** platform provider (an
+`OPENAI_API_KEY` reading organization usage and costs plus
+`/v1/dashboard/billing/credit_grants`). Its three Swift fetch files were deleted
+and the fetch moved into `openai.js`. We do not implement that provider.
+`Providers/Codex/` has no change. The one Codex-relevant change is in
+`UsageFetcher.swift`, the Codex CLI app-server lane: the account's plan label
+(`loginMethod`) now prefers the plan type from the fresh `rateLimits` response
+over the one from `account/read` ("prefer fresh CLI usage plans"). `codex.rs`
+already does the equivalent: it takes `plan_type` from the same `/wham/usage`
+response the windows come from. Already ported, in effect.
+
+**Qoder (6 files): no effect; citations re-anchored.** The Swift fetcher, snapshot
+and cookie importer left `Sources/`, and `qoder.js` became the fetch path.
+`QoderCookieRouting.swift` (new) routes a pasted Cookie header or cURL capture to
+the international or China site. Plugin against `qoder.rs`:
+- Request: same `GET {origin}/api/v2/me/usages/big_model_credits`, and the same
+  headers (`Accept`, `Accept-Language`, the Chrome 143 `User-Agent`, `Origin`,
+  `Referer: {origin}/account/usage`, `X-Requested-With: XMLHttpRequest`,
+  `Bx-V: 2.5.35`), with a 15 s default timeout.
+- Parse: same camel/snake aliases. Base and shared quota are merged; the
+  provided `usagePercentage` is used only when there is no shared quota; a zero
+  total must carry zero used and zero remaining, and reads as 100%; negatives
+  are rejected; the result is clamped to 0–100; `nextResetAt` is millis above
+  1e10, else seconds, or an ISO string. `qoder.rs` matches each rule. The plugin
+  also rejects a non-string `unit`, a field we do not read.
+- Error mapping: 401/403 rejects that cookie and tries the next session. We send
+  one vault/Chrome jar, and the shared transport already maps 401/403.
+- The China site (`qoder.com.cn`) is served upstream and not by us. It is not new:
+  the `v0.65.0` Swift fetcher already had it. We read only the international
+  hosts.
+
+**Manus (4 files): no effect; citations re-anchored.** `ManusUsageFetcher.swift`
+left `Sources/`, `ManusCookieImporter.swift` was deleted, and `manus.js` is now
+the fetch path. It tries each browser session's `session_id`, then the
+`SESSION_TOKEN` setting. `ManusSettingsReader` still reads `MANUS_SESSION_TOKEN`,
+`MANUS_SESSION_ID` and `MANUS_COOKIE`. The request is the one `manus.rs` sends:
+`POST api.manus.im/user.v1.UserService/GetAvailableCredits` with `{}`, Bearer,
+`Origin`, `Referer`, `Connect-Protocol-Version: 1`, and a Chrome 135
+`User-Agent`. The same envelope keys are unwrapped (`data`, `result`, `response`,
+`availableCredits`), and the same eight credit keys are required. One rule is
+now explicit, and we deliberately differ from it: the plugin reads a NUMERIC
+`nextRefreshTime` as seconds since 2001-01-01 ("Foundation's 2001 reference
+epoch"). That keeps the old Swift behaviour, where a default `JSONDecoder` decoded
+any number as `Date` that way. `manus.rs` reads a number as Unix seconds, or
+millis, and ignores anything below 1e9. So a 2001-epoch number (about 8e8 today)
+would be ignored here, and with no reset the refresh window fails as "no
+refilling window" instead of showing a wrong date. No Manus response has been captured here,
+so neither reading is proven. The plugin's comment calls it legacy fidelity, not
+a server fact, so this is declined until a real payload shows a number. The
+pre-existing differences stand: we require a reset for the refresh window, and we
+do not publish the `proMonthlyCredits` window.
+
+**ZenMux (2 files): no effect; citation re-anchored.** `ZenMuxUsageFetcher.swift`
+was deleted; `zenmux.js` has the same `GET
+zenmux.ai/api/v1/management/subscription/detail` with Bearer
+`ZENMUX_MANAGEMENT_API_KEY`, 401/403 as rejected credentials, `success == true`
+required, `quota_5_hour` → 300 min and `quota_7_day` → 10080 min with
+`usage_percentage × 100` clamped, the four numeric fields required, and an
+RFC 3339 `resets_at` or none. The optional PAYG balance (`INCLUDE_PAYG`) is
+unchanged and still unfetched by us (see the module note). Display only: the
+plugin title-cases every word of the tier, where `zenmux.rs` capitalises only the
+first letter. Swift's `capitalized` already did the former, so this predates the
+round.
+
+**Kimi (3 files): no effect.** The web lane gains one more place to find a token:
+an unexpired three-part JWT stored as `access_token` in Chromium localStorage for
+the Kimi web origin (`KimiCookieImporter.localStorageTokens`). It is tried after
+the `kimi-auth` cookie. `KimiDesktopAuthToken.swift` only moved a platform
+`#if`. The request, headers and parsing in `KimiUsageFetcher` are unchanged.
+`kimi.rs` takes the JWT from the environment. Reading browser
+localStorage is a desktop-coupled source we do not use.
+
+**QwenCloud (3) and Alibaba (2), via `Shared/AliyunOneConsole`: one new field.**
+The shared personal token-plan parse (`OneConsoleTokenPlanSnapshot.personalUsage`)
+now also reads `per1MonthPercentage` and `per1MonthResetTime`, and a `monthly`
+total from quota-config (`79db9dc65 fix(alibaba): parse monthly Token Plan
+usage`). A monthly-only payload publishes the monthly window as primary
+(43200 min). With a 5-hour or weekly window present, it goes to an extra
+`"monthly"` window. The Qwen Cloud labeler calls a 43200-minute primary
+"Monthly". `qwen_cloud.rs` reads only the four 5-hour and weekly fields, so a
+monthly-only plan would reach it as "plan block names neither percentage field"
+(`decode_failed`). The monthly fields are not observed on our HAR-captured
+account. See Recommended ports. The Alibaba half does not reach us:
+`AlibabaTokenPlanCLIUsageFetcher` (the `aliyun` CLI lane, now calling
+`console call --api zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage` for
+personal-plan regions) and the token-plan snapshot are the Alibaba **Token Plan**
+provider. `alibaba.rs` is the Coding Plan (`queryCodingPlanInstanceInfoV2`),
+unchanged.
+
+**Copilot, Doubao, MiniMax, Ollama: no effect.**
+- Copilot: the Chrome-only budget cookie order moved into
+  `BrowserCookieImportSupport.chromeOnly`. `copilot.rs` uses the token lane.
+- Doubao: a menu-bar icon resolver that falls back to the agent-plan extra
+  windows. Display only.
+- MiniMax: `MiniMaxLocalStorageImporter` uses the shared Chromium storage
+  discovery. We read MiniMax with an API key.
+- Ollama: the cookie importer returns a candidate list and uses the first, and an
+  empty manual cookie header now has its own error. Same request, same `/signin`
+  handling; the 2026-09-23 port stands.
+
+**Shared and top-level.**
+- `Providers.swift`, `ProviderManifest.swift` and
+  `ProviderInstanceIDAliases.generated.swift` only register DevPass, Atlas Cloud,
+  Vercel and llmman.
+- `ProviderSettingsSnapshot.swift` and `Shared/ProviderCookieSettings.swift` add an
+  optional `manualCookieOrigin` to cookie settings. It defaults to nil and is used
+  by Qoder's manual-cookie site routing.
+- `ProviderDescriptor.swift` adds `pluginResultPolicy`, and `ProviderFetchPlan.swift`
+  adds a `settingsWriter` to the fetch context, used by plugins to persist
+  settings.
+- `Vendored/CostUsage/*`: write-amplification fixes in the local Claude/Codex
+  cost cache. That is local consumption with no denominator, the standing decline.
+
+Nothing here changes how every provider fetches.
+
+**Changed or new providers we do not implement.**
+- **Perplexity** (fetcher → `perplexity.js`): `GET
+  www.perplexity.ai/rest/billing/credits` with a browser cookie. Desktop-coupled;
+  not headless.
+- **T3Chat** (fetcher → `t3chat.js`): `GET t3.chat/api/trpc/getCustomerData` with
+  a browser cookie. Not headless.
+- **llmman** (new plugin): a local model manager at a user-set `LLMMAN_HOST`
+  (HTTPS or private-network HTTP), optional bearer, reading `/api/version` and
+  memory in use. A local resource meter, not a quota; nothing to serve.
+- **Fireworks** (fetcher → `fireworks.js`): `api.fireworks.ai/v1/accounts…` with
+  `FIREWORKS_API_KEY`. Headless; the standing 412-for-suspended note holds.
+- **DeepInfra** (fetcher → `deepinfra.js`): `api.deepinfra.com/payment/…` with
+  `DEEPINFRA_API_KEY`. Headless; spend with no window.
+- **CommandCode**: a better-auth session cookie on `commandcode.ai`; now reads
+  `monthlyCreditsGranted` from the credits response when present. Cookie only,
+  so not headless.
+- **Chutes** (stats → `chutes.js`): `CHUTES_API_KEY` against
+  `{BASE_URL|api.chutes.ai}/users/me/…` quota endpoints. Headless, API key.
+- **AiAnd** (fetcher → `aiand.js`): `AIAND_API_KEY`, `GET
+  api.aiand.com/logs?range=30days`. It sums spend from logs. Headless, but no
+  window or limit.
+- **ZoomMate**: `ai.zoom.us/ai-computer/api/v1/credits/status` with a Zoom browser
+  cookie. Not headless. (Change: shared Chrome-only order.)
+- **Vercel** (new plugin): `GET ai-gateway.vercel.sh/v1/credits` with
+  `AI_GATEWAY_API_KEY`; `balance` and `total_used`. Headless; a balance.
+- **Venice**: `VENICE_API_KEY`, `outerface.venice.ai/api/user/session`. Headless.
+  (Change: shared Chrome-only order.)
+- **TypeSafe**, **Replicate**, **Helmcode**, **Notion**: browser-cookie consoles.
+  Not headless. (Change: shared Chrome-only order only.)
+- **DevPass** (new plugin): `GET api.llmgateway.io/v1/key` with `DEVPASS_API_KEY`;
+  dev-plan credits used against a limit. Headless; a credit allowance with no
+  reset seen.
+- **Atlas Cloud** (new plugin): `GET api.atlascloud.ai/public/v1/balance` with
+  `ATLASCLOUD_API_KEY`. Headless; a USD balance.
+- **Muse**: `MUSE_DEVICE_TOKEN` or a Keychain item; the change is Keychain
+  presence detection. Keychain-coupled, not headless.
+- **OpenAI API** (fetchers → `openai.js`): see the OpenAI paragraph above.
+  Headless with an admin-scoped key; spend, not a quota window.
+
+**Citations.** Three modules cited files gone at `v0.66.0`, each now annotated
+with the last tag the file exists at and the plugin that replaced it:
+`qoder.rs` (`QoderUsageFetcher.swift`, `QoderUsageSnapshot.swift`,
+`QoderCookieImporter.swift`), `manus.rs` (`ManusUsageFetcher.swift`) and
+`zenmux.rs` (`ZenMuxUsageFetcher.swift`). `scripts/parity-citations.py` against
+`v0.66.0` reports no outstanding findings; it lists twelve dead citations as
+answered: last round's seven and these five.
+
+**Recommended ports** (none built this round; for the owner to choose):
+1. **Qwen Cloud monthly token-plan window.** In `qwen_cloud.rs`, read
+   `per1MonthPercentage` (a used fraction, 0–1, like the other two) and
+   `per1MonthResetTime`, and a `monthly` cap from quota-config. Publish it as
+   primary (43200 min) when neither the 5-hour nor the weekly window is present,
+   else as an extra `monthly` window. Count it in the "plan block names a
+   percentage field" check, so a monthly-only plan stops reading as
+   `decode_failed`. Upstream path:
+   `Sources/CodexBarCore/Providers/Shared/AliyunOneConsole/OneConsoleTokenPlanSnapshot.swift`
+   (`personalUsage`, `quotaTotals`), fixtures in
+   `Tests/CodexBarTests/TokenPlanMonthlyWindowTests.swift`. Risk: low for the
+   parse, since it is additive and ignored when absent. It is unverifiable here:
+   our account's live `/usage` returns only the four 5-hour and weekly fields, so
+   it would be fixture-verified against upstream only.
+2. **Not upstream: a key-name slip found while comparing.** The "stated the keys"
+   check in `qwen_cloud.rs` (the branch that tells `no_quota_reported` from
+   `decode_failed`) looks for `perWeekPercentage`. The wire field, and the struct's
+   own `rename`, is `per1WeekPercentage`. A block that names only an empty weekly
+   field therefore reads as `decode_failed` instead of `no_quota_reported`. Fix:
+   correct the string, and add `per1MonthPercentage` if port 1 is taken. Risk:
+   low; one string and a test.
+
+Nothing else in this release is worth porting.
+
 ### Parity round: CodexBar v0.64.1 → v0.65.0
 
 One tag. All EIGHT opaque constants present at `v0.65.0`, located by VALUE in
