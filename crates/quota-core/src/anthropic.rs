@@ -188,6 +188,16 @@ fn overage_pool(
         reason,
         spend_keys: spend_keys.clone(),
     };
+    // `"limit": null` is the provider stating there is no overage limit, not a
+    // shape this code failed to read. Every Claude account on the host this
+    // was measured on sends it (the refusal log named `limit` among the keys
+    // and reported it missing on all five), and the one account known to have
+    // overage off publishes no pool either way. So it is "nothing stated" and
+    // stays silent. An absent `limit` key, or a `limit` object missing its
+    // parts, is still a refusal: those are shapes nobody has observed.
+    if spend.get("limit").is_some_and(serde_json::Value::is_null) {
+        return Ok(None);
+    }
     let spend: OverageSpend =
         serde_json::from_value(spend).map_err(|_| refuse(RefusalReason::Unparseable))?;
     let (limit, limit_exponent, limit_unit) = spend_amount(spend.limit).map_err(|problem| {
@@ -1319,14 +1329,17 @@ mod tests {
     fn unstated_spend_is_no_pool_rather_than_a_refusal() {
         assert_eq!(overage_verdict(None), Ok(None), "spend absent");
         assert_eq!(overage_verdict(Some("null")), Ok(None), "spend null");
-    }
-
-    #[test]
-    fn each_unusable_spend_names_its_refusal_reason() {
+        // An explicit null limit states there is no overage limit.
         let limit_null = CAPTURED_SPEND.replace(
             r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
             r#""limit":null"#,
         );
+        assert_ne!(limit_null, CAPTURED_SPEND, "the fixture edit must apply");
+        assert_eq!(overage_verdict(Some(&limit_null)), Ok(None), "limit null");
+    }
+
+    #[test]
+    fn each_unusable_spend_names_its_refusal_reason() {
         let used_without_currency = CAPTURED_SPEND.replace(
             r#""used":{"amount_minor":1277,"currency":"USD","exponent":2}"#,
             r#""used":{"amount_minor":1277,"exponent":2}"#,
@@ -1341,12 +1354,22 @@ mod tests {
             r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
             r#""limit":{"amount_minor":100000,"currency":"USD","exponent":3}"#,
         );
-        let cases: [(&str, RefusalReason); 6] = [
+        let limit_without_currency = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2}"#,
+            r#""limit":{"amount_minor":10000,"exponent":2}"#,
+        );
+        let limit_absent = CAPTURED_SPEND.replace(
+            r#""limit":{"amount_minor":10000,"currency":"USD","exponent":2},"#,
+            "",
+        );
+        assert_ne!(limit_absent, CAPTURED_SPEND, "the fixture edit must apply");
+        let cases: [(&str, RefusalReason); 7] = [
             (
                 r#"{"used":"a lot","enabled":"yes"}"#,
                 RefusalReason::Unparseable,
             ),
-            (&limit_null, RefusalReason::LimitMissing),
+            (&limit_without_currency, RefusalReason::LimitMissing),
+            (&limit_absent, RefusalReason::LimitMissing),
             (&used_without_currency, RefusalReason::UsedMissing),
             (&negative_used, RefusalReason::NegativeAmount),
             (&currency_mismatch, RefusalReason::CurrencyMismatch),
