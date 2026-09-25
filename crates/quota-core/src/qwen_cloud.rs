@@ -13,7 +13,15 @@
 //! `SEC_TOKEN` authentication, and the `per5HourPercentage`,
 //! `per5HourResetTime`, `per1WeekPercentage`, and `per1WeekResetTime` response
 //! fields. `per5HourPercentage` and `per1WeekPercentage` are interpreted as USED
-//! fractions (0–1) from their field semantics and observed values. The shared
+//! fractions (0–1) from their field semantics and observed values.
+//!
+//! A third, monthly window (`per1MonthPercentage`, a USED fraction like the other
+//! two, and `per1MonthResetTime`, plus a `monthly` cap in `/quota-config`) is read
+//! as CodexBar v0.66.0 reads it for the shared Aliyun ONE_CONSOLE token plan. It
+//! is FIXTURE-VERIFIED ONLY: the account this was built against returns just the
+//! five-hour and weekly fields. Placement follows upstream: the monthly window is
+//! `primary` when neither rolling window is reported, and otherwise rides in
+//! `extra_rate_windows` with id `monthly`, so it is never dropped. The shared
 //! cookie transport in `browser_cookies.rs` is live-proven; the gateway call shape
 //! is HAR-verified.
 //!
@@ -84,6 +92,25 @@ const SUBSCRIPTION_PARAMS: &str = r#"{"Api":"zeldaHttp.apikeyMgr./tokenplan/pers
 
 const FIVE_HOUR_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
+/// Thirty days, the same span CodexBar gives this window.
+const MONTHLY_WINDOW_MINUTES: i64 = 30 * 24 * 60;
+/// The id and title the monthly window carries when it is an extra window.
+const MONTHLY_WINDOW_ID: &str = "monthly";
+const MONTHLY_WINDOW_TITLE: &str = "Monthly";
+
+/// The wire names of every percentage field in [`TokenPlanUsage`].
+///
+/// This list decides whether a window-less plan block STATED its fields (the
+/// account has no windows) or named none of them (a payload we no longer
+/// understand). serde's `rename` only accepts a literal, so the struct cannot be
+/// built from this list; the test `percentage_keys_match_the_struct_renames`
+/// pins the two together instead. They drifted once already: the list said
+/// `perWeekPercentage` while the wire and the struct said `per1WeekPercentage`.
+const PERCENTAGE_KEYS: [&str; 3] = [
+    "per5HourPercentage",
+    "per1WeekPercentage",
+    "per1MonthPercentage",
+];
 
 #[derive(Debug, Deserialize)]
 struct GatewayResponse {
@@ -122,6 +149,10 @@ struct TokenPlanUsage {
     per_week_percentage: Option<f64>,
     #[serde(rename = "per1WeekResetTime")]
     per_week_reset_time: Option<i64>,
+    #[serde(rename = "per1MonthPercentage")]
+    per_month_percentage: Option<f64>,
+    #[serde(rename = "per1MonthResetTime")]
+    per_month_reset_time: Option<i64>,
 }
 
 /// Per-tier quota caps from `/quota-config`.
@@ -138,6 +169,7 @@ struct QuotaConfigResult {
 struct TierCaps {
     five_hour: Option<f64>,
     weekly: Option<f64>,
+    monthly: Option<f64>,
 }
 
 /// Plan metadata from `/subscription`.
@@ -266,14 +298,32 @@ fn enrich_with_counts(usage: &mut Usage, quota_config_body: &[u8], subscription_
     // console divides by something other than the cap this endpoint reports,
     // exactly the entitled-versus-enforced gap described at the top of this
     // file. A derived count would carry that disagreement as if it were data.
-    if let Some(ref mut primary) = usage.primary {
-        if let Some(cap) = tier.five_hour {
-            primary.total_count = Some(cap);
+    //
+    // Each cap is matched to its window by span, not by slot: `primary` holds the
+    // monthly window when no rolling window is reported, and a five-hour cap on
+    // a monthly window would be a count that agrees with nothing.
+    fn apply(window: &mut RateWindow, tier: &TierCaps) {
+        let cap = match window.window_minutes {
+            Some(FIVE_HOUR_WINDOW_MINUTES) => tier.five_hour,
+            Some(WEEKLY_WINDOW_MINUTES) => tier.weekly,
+            Some(MONTHLY_WINDOW_MINUTES) => tier.monthly,
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            window.total_count = Some(cap);
         }
     }
-    if let Some(ref mut secondary) = usage.secondary {
-        if let Some(cap) = tier.weekly {
-            secondary.total_count = Some(cap);
+    for window in [usage.primary.as_mut(), usage.secondary.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        apply(window, tier);
+    }
+    for extra in usage.extra_rate_windows.iter_mut().flatten() {
+        if extra.id.as_deref() == Some(MONTHLY_WINDOW_ID) {
+            if let Some(window) = extra.window.as_mut() {
+                apply(window, tier);
+            }
         }
     }
 }
@@ -495,20 +545,23 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         quota.per_week_reset_time,
         WEEKLY_WINDOW_MINUTES,
     );
-    if primary.is_none() && secondary.is_none() {
+    let monthly = window_from_fraction(
+        quota.per_month_percentage,
+        quota.per_month_reset_time,
+        MONTHLY_WINDOW_MINUTES,
+    );
+    if primary.is_none() && secondary.is_none() && monthly.is_none() {
         // The same discriminator one level down. A plan block that NAMES its
         // percentage keys and leaves them empty is the upstream stating there are
         // no windows; a block that mentions neither key is a payload we no longer
         // understand, and calling that "no quota" would retire a working provider
         // silently on the day they rename a field.
-        let stated_the_keys = ["per5HourPercentage", "perWeekPercentage"]
-            .iter()
-            .any(|key| {
-                result_value
-                    .get("data")
-                    .and_then(|data| data.get(key))
-                    .is_some()
-            });
+        let stated_the_keys = PERCENTAGE_KEYS.iter().any(|key| {
+            result_value
+                .get("data")
+                .and_then(|data| data.get(key))
+                .is_some()
+        });
         return Err(if stated_the_keys {
             FetchError::NoQuotaReported(
                 "qwen-cloud: the token plan reports no windows (percentage fields present and empty)"
@@ -519,11 +572,28 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         });
     }
 
+    // Placement follows CodexBar v0.66.0 (`OneConsoleTokenPlanSnapshot`): the
+    // monthly window leads only when it is the sole window, and otherwise sits
+    // beside the rolling windows. Either way it is published, because a monthly
+    // limit that binds first is exactly the headroom a reader must not miss.
+    let (primary, extra_rate_windows) = match (primary, &secondary, monthly) {
+        (None, None, monthly) => (monthly, None),
+        (primary, _, Some(monthly)) => (
+            primary,
+            Some(vec![crate::model::ExtraWindow {
+                id: Some(MONTHLY_WINDOW_ID.to_string()),
+                title: Some(MONTHLY_WINDOW_TITLE.to_string()),
+                window: Some(monthly),
+            }]),
+        ),
+        (primary, _, None) => (primary, None),
+    };
+
     Ok(Usage {
         primary,
         secondary,
         tertiary: None,
-        extra_rate_windows: None,
+        extra_rate_windows,
     })
 }
 
@@ -751,13 +821,202 @@ mod tests {
     /// plan exists but reports nothing.
     #[test]
     fn a_plan_block_with_empty_percentage_fields_reports_no_quota() {
-        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","data":{"per5HourPercentage":null,"perWeekPercentage":null}}}}}"#;
+        let body = br#"{"successResponse":true,"data":{"DataV2":{"data":{"success":true,"code":"SUCCESS","data":{"per5HourPercentage":null,"per1WeekPercentage":null}}}}}"#;
         match normalize_usage(body) {
             Err(FetchError::NoQuotaReported(message)) => {
                 assert!(message.contains("no windows"), "got {message}");
             }
             other => panic!("expected NoQuotaReported, got {other:?}"),
         }
+    }
+
+    /// Wrap a token-plan block in a SUCCESS usage envelope.
+    fn usage_body(plan: &str) -> Vec<u8> {
+        format!(
+            r#"{{"successResponse":true,"data":{{"DataV2":{{"data":{{"success":true,"code":"SUCCESS","data":{plan}}}}}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// A plan block naming ONLY an empty weekly field states "no windows".
+    ///
+    /// SYNTHETIC. This is the case the stated-keys list used to get wrong: it
+    /// looked for `perWeekPercentage`, while the wire field (and the struct's
+    /// own rename) is `per1WeekPercentage`, so this block read as a payload we
+    /// could not understand and published `decode_failed`.
+    #[test]
+    fn a_plan_block_naming_only_an_empty_weekly_field_reports_no_quota() {
+        match normalize_usage(&usage_body(r#"{"per1WeekPercentage":null}"#)) {
+            Err(FetchError::NoQuotaReported(message)) => {
+                assert!(message.contains("no windows"), "got {message}");
+            }
+            other => panic!("expected NoQuotaReported, got {other:?}"),
+        }
+    }
+
+    /// A monthly-only plan block with its fields empty states "no windows".
+    ///
+    /// SYNTHETIC: the monthly key counts as a stated field like the other two.
+    #[test]
+    fn a_monthly_only_plan_block_with_empty_fields_reports_no_quota() {
+        let body = usage_body(r#"{"per1MonthPercentage":null,"per1MonthResetTime":null}"#);
+        match normalize_usage(&body) {
+            Err(FetchError::NoQuotaReported(message)) => {
+                assert!(message.contains("no windows"), "got {message}");
+            }
+            other => panic!("expected NoQuotaReported, got {other:?}"),
+        }
+    }
+
+    /// Every key in `PERCENTAGE_KEYS` is a field the struct actually reads, and
+    /// every percentage field the struct reads is in the list.
+    ///
+    /// serde's `rename` takes only a literal, so the list and the struct are two
+    /// spellings of the same names; this is what keeps them from drifting apart
+    /// the way `perWeekPercentage` once did.
+    #[test]
+    fn percentage_keys_match_the_struct_renames() {
+        let read = |value: serde_json::Value| -> Vec<Option<f64>> {
+            let usage: TokenPlanUsage = serde_json::from_value(value).unwrap();
+            vec![
+                usage.per_five_hour_percentage,
+                usage.per_week_percentage,
+                usage.per_month_percentage,
+            ]
+        };
+        // One key at a time: each must land in exactly its own struct field.
+        for (index, key) in PERCENTAGE_KEYS.iter().enumerate() {
+            let fields = read(serde_json::json!({ *key: 0.5 }));
+            let populated: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| f.map(|_| i))
+                .collect();
+            assert_eq!(
+                populated,
+                vec![index],
+                "`{key}` must be read by the struct's percentage field #{index}"
+            );
+        }
+        // And the list covers every percentage field the struct has.
+        assert_eq!(PERCENTAGE_KEYS.len(), read(serde_json::json!({})).len());
+    }
+
+    // The tests below check where the monthly window is placed (primary when it
+    // is alone, an extra beside the rolling windows) and which cap it receives.
+    // UPSTREAM-DERIVED fixtures: the monthly payload and expectations come from
+    // CodexBar v0.66.0 `Tests/CodexBarTests/TokenPlanMonthlyWindowTests.swift`
+    // (`monthly`, `monthly usage retains rolling windows`, and `web monthly
+    // quota preserves totals and provider identity`), wrapped in the console
+    // gateway envelope this module actually receives.
+    const UPSTREAM_MONTHLY: &str =
+        r#"{"per1MonthPercentage":0.25,"per1MonthResetTime":1791043200000}"#;
+
+    /// A block reporting only the monthly window publishes it as `primary`.
+    #[test]
+    fn a_monthly_only_block_makes_the_monthly_window_primary() {
+        let usage = normalize_usage(&usage_body(UPSTREAM_MONTHLY)).unwrap();
+        let primary = usage.primary.expect("the monthly window leads when alone");
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.window_minutes, Some(43_200));
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-10-03T16:00:00Z"));
+        assert!(usage.secondary.is_none());
+        assert!(usage.tertiary.is_none());
+        assert!(
+            usage.extra_rate_windows.is_none(),
+            "a primary monthly window must not also be published as an extra"
+        );
+    }
+
+    /// Beside the rolling windows, the monthly window is an extra with id
+    /// `monthly`, and the rolling windows keep their slots.
+    #[test]
+    fn a_monthly_window_beside_the_rolling_windows_is_an_extra() {
+        let usage = normalize_usage(&usage_body(
+            r#"{"per5HourPercentage":0.1,"per1WeekPercentage":0.2,"per1MonthPercentage":0.3}"#,
+        ))
+        .unwrap();
+        let primary = usage.primary.expect("five-hour window");
+        assert_eq!(primary.used_percent, 10.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        let secondary = usage.secondary.expect("weekly window");
+        assert_eq!(secondary.used_percent, 20.0);
+        assert_eq!(secondary.window_minutes, Some(10_080));
+        assert!(usage.tertiary.is_none());
+        let extras = usage
+            .extra_rate_windows
+            .expect("the monthly window is kept");
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].id.as_deref(), Some("monthly"));
+        assert_eq!(extras[0].title.as_deref(), Some("Monthly"));
+        let monthly = extras[0].window.as_ref().expect("monthly window");
+        assert!((monthly.used_percent - 30.0).abs() < 1e-9);
+        assert_eq!(monthly.window_minutes, Some(43_200));
+    }
+
+    /// One rolling window is enough to push the monthly window into the extras:
+    /// upstream promotes it only when BOTH rolling windows are absent.
+    #[test]
+    fn a_monthly_window_beside_only_the_weekly_window_is_an_extra() {
+        let usage = normalize_usage(&usage_body(
+            r#"{"per1WeekPercentage":0.2,"per1MonthPercentage":0.3}"#,
+        ))
+        .unwrap();
+        assert!(usage.primary.is_none(), "no five-hour window was reported");
+        assert_eq!(
+            usage.secondary.expect("weekly").window_minutes,
+            Some(10_080)
+        );
+        let extras = usage
+            .extra_rate_windows
+            .expect("the monthly window is kept");
+        assert_eq!(extras[0].id.as_deref(), Some("monthly"));
+    }
+
+    /// Without a monthly field the output is exactly what it was before the
+    /// monthly window existed: the live-shaped fixture serializes to the same
+    /// bytes, with no extra-window key at all.
+    ///
+    /// The percentages are pinned as serde_json parses the fixture (its default
+    /// float parser, not Rust's literal parser, so the weekly value's last digits
+    /// differ from the fixture text).
+    #[test]
+    fn an_absent_monthly_window_leaves_the_output_unchanged() {
+        let usage = normalize_usage(HAR_RESPONSE.as_bytes()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&usage).unwrap(),
+            r#"{"primary":{"usedPercent":13.117665718963334,"resetsAt":"2026-07-20T00:09:00Z","windowMinutes":300},"secondary":{"usedPercent":5.3834972282899995,"resetsAt":"2026-07-26T14:09:00Z","windowMinutes":10080}}"#
+        );
+    }
+
+    /// The `monthly` cap lands on the monthly window wherever it sits, and a
+    /// rolling cap never lands on it.
+    ///
+    /// Upstream-derived: the `{"standard":{"monthly":45000}}` cap table is the
+    /// one CodexBar's monthly test uses.
+    #[test]
+    fn the_monthly_cap_lands_on_the_monthly_window() {
+        // Monthly as primary: a five-hour cap in the same row must not apply.
+        let mut alone = normalize_usage(&usage_body(UPSTREAM_MONTHLY)).unwrap();
+        let caps = gateway(
+            r#"{"success":true,"data":{"standard":{"five_hour":1000,"weekly":10000,"monthly":45000}}}"#,
+        );
+        enrich_with_counts(&mut alone, &caps, &subscription_body("standard"));
+        assert_eq!(alone.primary.unwrap().total_count, Some(45_000.0));
+
+        // Monthly as an extra: each window gets its own cap.
+        let mut mixed = normalize_usage(&usage_body(
+            r#"{"per5HourPercentage":0.1,"per1WeekPercentage":0.2,"per1MonthPercentage":0.3}"#,
+        ))
+        .unwrap();
+        enrich_with_counts(&mut mixed, &caps, &subscription_body("standard"));
+        assert_eq!(mixed.primary.unwrap().total_count, Some(1000.0));
+        assert_eq!(mixed.secondary.unwrap().total_count, Some(10_000.0));
+        let extras = mixed.extra_rate_windows.unwrap();
+        assert_eq!(
+            extras[0].window.as_ref().unwrap().total_count,
+            Some(45_000.0)
+        );
     }
 
     /// A plan block mentioning neither percentage key degrades.
