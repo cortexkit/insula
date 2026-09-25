@@ -14,6 +14,15 @@
 //! (request `73-104`, response `7-17`, `129-160`, refresh window guard `177-190` in
 //! `toUsageSnapshot`). `proMonthlyCredits` is intentionally omitted (`resetsAt: nil` at
 //! `165-175`). Rides the shared `http.rs` transport.
+//!
+//! `ManusUsageFetcher.swift` exists up to CodexBar v0.65.0 and NO LONGER EXISTS
+//! under `Sources/` from v0.66.0: upstream made its bundled plugin,
+//! `Sources/CodexBarCore/Resources/Plugins/manus.js`, the fetch path, and kept the
+//! old fetcher only as a test reference (`Tests/CodexBarTests/ManusReference.swift`).
+//! Read the fetcher citations in this module at v0.65.0 or earlier; the plugin is
+//! where to look for later changes. `ManusSettingsReader.swift` is still present.
+//! (Recorded for `scripts/parity-citations.py`, which reports a cited file that is
+//! gone at the current anchor until its module says what replaced it.)
 
 use std::time::Duration;
 
