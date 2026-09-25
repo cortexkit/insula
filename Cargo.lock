@@ -1537,14 +1537,14 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "subc-control"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.21.12"
+version = "0.21.15"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jobobject"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "rustix",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
