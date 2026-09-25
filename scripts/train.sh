@@ -92,7 +92,7 @@ fi
 # cancelled one can be the newer. Delete first so the sha gets exactly one.
 git push -q --delete "origin" "$branch" 2>/dev/null
 sleep 2
-if ! git push -q origin "HEAD:refs/heads/$branch"; then
+if ! git push -q origin "$sha:refs/heads/$branch"; then
   echo "  REFUSED: could not push the train branch" >&2
   exit 2
 fi
@@ -175,8 +175,17 @@ else
   echo "  required checks produced: $(printf '%s\n' "$required" | grep -c .) of $(printf '%s\n' "$required" | grep -c .)"
 fi
 
+# PUSH THE SHA THAT WAS TESTED, NOT WHATEVER LOCAL MASTER POINTS AT NOW.
+#
+# This pushed `master`, which resolves at push time. CI takes minutes, and a
+# merge made in that window (2026-09-25: a worker's delivery merged while this
+# train watched its run) moved local master to an untested commit. The push
+# then asked protection about THAT commit and was rejected with "2 of 2
+# required status checks are expected" -- beside a run that had just passed, so
+# it read as GitHub lagging. Pushing "$sha" makes the landed commit the tested
+# one by construction; later local commits simply stay local for the next train.
     before_push=$(git rev-parse origin/master)
-    out=$(git push origin master 2>&1); push_rc=$?
+    out=$(git push origin "$sha:refs/heads/master" 2>&1); push_rc=$?
 echo "$out" | grep -E '\->|GH006|required status' | sed 's/^/  /'
 
 # DELETE THE BRANCH ONLY ON SUCCESS.
