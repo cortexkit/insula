@@ -1,6 +1,6 @@
 //! MiniMax coding-plan usage — API key from the credential vault or the environment.
 //!
-//! Credential: an `apikey:minimax` vault handle when one is granted (it replaces
+//! Credential: an `apikey:minimax-coding-plan` vault handle when one is granted (it replaces
 //! the environment lane), otherwise `MINIMAX_CODING_API_KEY` then
 //! `MINIMAX_API_KEY` (`env::first_env`).
 //! Request: `GET {apiHost}/v1/api/openplatform/coding_plan/remains` with
@@ -1381,7 +1381,10 @@ mod vault_lane_tests {
     }
 
     fn vault_handle() -> CredentialHandle {
-        CredentialHandle::vault("apikey:minimax", VaultCapability::new("ckh_minimax"))
+        CredentialHandle::vault(
+            "apikey:minimax-coding-plan:main",
+            VaultCapability::new("ckh_minimax"),
+        )
     }
 
     /// A provider whose two regional hosts are the given URLs.
@@ -1420,14 +1423,17 @@ mod vault_lane_tests {
     #[test]
     fn a_vault_handle_replaces_the_environment_lane() {
         let loader = Arc::new(VaultHandleLoader::default());
-        loader.install_rows_for_test(&[("apikey:minimax", "apikey")]);
+        loader.install_rows_for_test(&[("apikey:minimax-coding-plan:main", "apikey")]);
         let (source, _) = source(Err(VaultGetError::Permanent));
         let provider = MinimaxProvider::new_with_handle_loader(Some(source), loader);
 
         let handles = provider.handles().unwrap();
         assert_eq!(
             handles,
-            vec![CredentialHandle::scoped("apikey:minimax", "apikey")],
+            vec![CredentialHandle::scoped(
+                "apikey:minimax-coding-plan:main",
+                "apikey"
+            )],
             "only the vault lane may be enumerated once a vault key exists"
         );
     }

@@ -37,7 +37,14 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
-    ("apikey:minimax", "minimax"),
+    // Named after OpenCode's `minimax-coding-plan` provider id, as
+    // `apikey:kimi-for-coding` is: the record is the Coding Plan key OpenCode
+    // sends, and the vault cannot rename it (insula#29). There is deliberately
+    // no second, bare `apikey:minimax` family. Each family refuses a second
+    // deposit on its own, so two families mapping here would let one key under
+    // each through as two identity-less minimax slots, which the emission gate
+    // collapses into one unlabelled row.
+    ("apikey:minimax-coding-plan", "minimax"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -729,11 +736,15 @@ mod tests {
         }));
     }
 
-    /// `apikey:minimax`, bare or labelled, routes to minimax; ids that merely
-    /// share its spelling or belong to another vendor do not.
+    /// `apikey:minimax-coding-plan`, bare or labelled, routes to minimax; ids that
+    /// merely share its spelling or belong to another vendor do not. The bare
+    /// `apikey:minimax` is one of them: it is not a family here.
     #[test]
     fn the_minimax_api_key_routes_to_minimax_and_nothing_else_does() {
-        for id in ["apikey:minimax", "apikey:minimax:label"] {
+        for id in [
+            "apikey:minimax-coding-plan",
+            "apikey:minimax-coding-plan:main",
+        ] {
             let loader = VaultHandleLoader::default();
             install(&loader, vec![row(id, "apikey")]);
             assert_eq!(
@@ -743,7 +754,13 @@ mod tests {
             );
         }
 
-        for id in ["apikey:minimaxi", "apikey:deepseek", "apikey:openai"] {
+        for id in [
+            "apikey:minimax",
+            "apikey:minimax:main",
+            "apikey:minimax-coding-planx",
+            "apikey:deepseek",
+            "apikey:openai",
+        ] {
             let loader = VaultHandleLoader::default();
             install(&loader, vec![row(id, "apikey")]);
             assert!(
@@ -761,13 +778,13 @@ mod tests {
         install(
             &loader,
             vec![
-                row("apikey:minimax", "apikey"),
-                row("apikey:minimax:second", "apikey"),
+                row("apikey:minimax-coding-plan:main", "apikey"),
+                row("apikey:minimax-coding-plan:second", "apikey"),
             ],
         );
         assert!(loader.minimax_handles().unwrap().is_empty());
         assert!(loader.warning().is_some_and(|warning| {
-            warning.contains("multiple identity-less credentials name `apikey:minimax`")
+            warning.contains("multiple identity-less credentials name `apikey:minimax-coding-plan`")
         }));
     }
 

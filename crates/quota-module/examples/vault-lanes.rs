@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn the_minimax_api_key_routes_and_a_serving_row_is_clean() {
         let report = evaluate(
-            granted(&["apikey:minimax"]),
+            granted(&["apikey:minimax-coding-plan:main"]),
             usage(vec![healthy("minimax", "vault")]),
             quota_core::vault_handles::CREDENTIAL_FAMILIES,
             DUAL_LANE,
