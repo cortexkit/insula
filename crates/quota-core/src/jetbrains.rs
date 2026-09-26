@@ -7,7 +7,19 @@
 //! the two JSON blobs, and map quota usage + next refill to a window.
 //!
 //! quotaInfo JSON: `{ "type", "current", "maximum", "until", "tariffQuota": {
-//! "available" } }` (numbers are STRINGS). usedPercent = current/maximum*100.
+//! "current", "maximum", "available" }, "topUpQuota": { same } }` (numbers are
+//! STRINGS; shape from the insula#1 capture). The top-level figures are the sum
+//! of the two parts, and only the tariff refills at `nextRefill`: the top-up is
+//! purchased, does not renew, and is drawn after the tariff is spent.
+//!
+//! MAPPING. When `tariffQuota` is readable the primary window is the tariff
+//! alone -- usedPercent = tariff.current/tariff.maximum*100, counts from the
+//! tariff, and `windowMinutes` from `nextRefill.tariff.duration` when stated --
+//! and `topUpQuota` is published as one `Purchased` spend pool (remaining =
+//! `available`, total = `maximum`). A window over the sum could never reach
+//! 100% while top-up remained, so it read as headroom once the refilling part
+//! was exhausted. Without `tariffQuota` there is nothing to split: the window is
+//! the summed current/maximum, with no `windowMinutes` and no pool.
 //! nextRefill JSON: `next` is the reset when present. CodexBar also models
 //! `amount` and `duration` on this object, both optional -- transcribed here as
 //! fact once, and it is NOT fact: no payload observed on any host has carried
@@ -28,8 +40,9 @@
 //! VERIFICATION: HYBRID. The file-discovery + XML-extract + entity-decode + JSON
 //! parse + Unknown→degrade path is LIVE-verified (this machine has real
 //! AIAssistantQuotaManager2.xml files; they currently read `type:"Unknown"`, which
-//! the provider degrades correctly). The active-window MAPPING (current/maximum→%,
-//! nextRefill.next→reset) is fixture-verified (CodexBar-sourced) — no active
+//! the provider degrades correctly). The active-window MAPPING (tariff split,
+//! top-up pool, nextRefill.next→reset) is fixture-verified (the insula#1 capture
+//! and CodexBar-sourced fixtures) — no active
 //! JetBrains AI quota on this machine to live-anchor a real window. Field names +
 //! mapping ported from CodexBar
 //! `Sources/CodexBarCore/Providers/JetBrains/JetBrainsStatusProbe.swift:9-31,60-68,
@@ -43,9 +56,13 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::money::parse_amount;
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    model::{ProviderUsage, RateWindow, Regeneration, RegenerationRate, Usage},
+    model::{
+        Amount, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Regeneration,
+        RegenerationRate, Usage,
+    },
     provider::{FetchError, UsageProvider},
 };
 
@@ -157,8 +174,28 @@ fn extract_option_value(xml: &str, name: &str) -> Option<String> {
 struct QuotaInfo {
     #[serde(rename = "type")]
     kind: Option<String>,
+    /// The whole balance: the tariff and the top-up summed. Read only when the
+    /// payload carries no `tariffQuota` to split it by.
     current: Option<String>,
     maximum: Option<String>,
+    /// The part of the balance that refills at `nextRefill`.
+    #[serde(rename = "tariffQuota")]
+    tariff_quota: Option<SubQuota>,
+    /// The purchased part, which does not refill and is drawn only after the
+    /// tariff is spent.
+    #[serde(rename = "topUpQuota")]
+    top_up_quota: Option<SubQuota>,
+}
+
+/// One part of the balance. Every figure is a decimal string (`"207000.000"`).
+///
+/// Observed on insula#1: `current` is the amount USED and `available` the
+/// remainder, so `current + available == maximum` within each part.
+#[derive(Debug, Deserialize)]
+struct SubQuota {
+    current: Option<String>,
+    maximum: Option<String>,
+    available: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +331,60 @@ fn regeneration_from(refill: &NextRefill) -> Option<Regeneration> {
     })
 }
 
+/// What JetBrains' quota is denominated in. The payload states no unit at all,
+/// so this is a label for the provider's own quota units rather than a currency:
+/// a consumer must not read these amounts as money.
+const TOP_UP_UNIT: &str = "jetbrains-ai-quota";
+
+/// Build the spend pool for the purchased top-up, from `topUpQuota`.
+///
+/// The top-up is a balance drawn after the refilling tariff runs out, the same
+/// mechanic as Codex credits or Claude's extra usage, so it is published as a
+/// pool beside the window rather than folded into the window's percent.
+///
+/// Refused -- `None`, nothing logged -- when either figure is absent or not
+/// exactly a decimal number. A pool with a guessed balance is worse than no
+/// pool, since a consumer spends against the figure it is given.
+fn top_up_pool(top_up: &SubQuota) -> Option<Pool> {
+    let remaining = parse_amount(top_up.available.as_deref()?, TOP_UP_UNIT)?;
+    let total = parse_amount(top_up.maximum.as_deref()?, TOP_UP_UNIT)?;
+    let (remaining, total) = same_exponent(remaining, total)?;
+    Some(Pool {
+        // The provider's own key for this part of the balance.
+        id: "topUpQuota".to_string(),
+        label: "Top-up quota".to_string(),
+        // A top-up is bought, and `Purchased` is documented as exactly that:
+        // spending it costs money. It never renews, so `Subscription` would be
+        // wrong, and nothing in the payload suggests it could be a free grant.
+        funding: PoolFunding::Purchased,
+        remaining: Some(remaining),
+        total: Some(total),
+        // `available` is the provider's own statement of what is left of this
+        // pool alone, not a share computed from a figure covering several.
+        basis: PoolBasis::Reported,
+        // The payload has no enable flag for the top-up.
+        spendable: None,
+        // The top-up does not refill; `nextRefill` belongs to the tariff.
+        resets_at: None,
+    })
+}
+
+/// Restate two amounts at the larger of their exponents, so a pool's remaining
+/// and total can be compared. Scaling up by a power of ten is exact; an overflow
+/// refuses the pair rather than publishing a wrong figure.
+fn same_exponent(a: Amount, b: Amount) -> Option<(Amount, Amount)> {
+    let exponent = a.exponent.max(b.exponent);
+    let rescale = |amount: Amount| -> Option<Amount> {
+        let factor = 10i64.checked_pow(u32::from(exponent - amount.exponent))?;
+        Some(Amount {
+            minor: amount.minor.checked_mul(factor)?,
+            exponent,
+            unit: amount.unit,
+        })
+    };
+    Some((rescale(a)?, rescale(b)?))
+}
+
 /// Parse `current`/`maximum` (string numbers) → used percent. CodexBar `:24-25`.
 fn used_percent(current: Option<&str>, maximum: Option<&str>) -> Option<f64> {
     let current: f64 = current?.trim().parse().ok()?;
@@ -305,8 +396,21 @@ fn used_percent(current: Option<&str>, maximum: Option<&str>) -> Option<f64> {
 }
 
 /// Normalize the IDE quota XML to [`Usage`]. Pure — unit-testable against a
-/// CodexBar-shaped fixture.
+/// CodexBar-shaped fixture. The top-up pool, when there is one, is dropped here;
+/// [`normalize`] returns both.
 pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
+    normalize(xml_bytes).map(|normalized| normalized.usage)
+}
+
+/// The window and, when the payload splits the balance, the top-up pool.
+#[derive(Debug)]
+pub struct Normalized {
+    pub usage: Usage,
+    pub top_up: Option<Pool>,
+}
+
+/// Normalize the IDE quota XML to the window plus the top-up pool.
+pub fn normalize(xml_bytes: &[u8]) -> Result<Normalized, FetchError> {
     let xml = std::str::from_utf8(xml_bytes)
         .map_err(|e| FetchError::Decode(format!("jetbrains xml not UTF-8: {e}")))?;
 
@@ -315,18 +419,30 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
     let quota: QuotaInfo = serde_json::from_str(&decode_html_entities(&quota_raw))
         .map_err(|e| FetchError::Decode(format!("jetbrains quotaInfo not JSON: {e}")))?;
 
+    // The figures the window is measured against. When the payload splits the
+    // balance, the window is the tariff alone: it is the only part that refills
+    // at `nextRefill`, so it is the only part a window's percent and length can
+    // honestly describe. Without a readable split there is nothing to separate,
+    // and the summed balance is used as it always was.
+    let tariff = quota.tariff_quota.as_ref().filter(|tariff| {
+        used_percent(tariff.current.as_deref(), tariff.maximum.as_deref()).is_some()
+    });
+    let (current, maximum) = match tariff {
+        Some(tariff) => (tariff.current.as_deref(), tariff.maximum.as_deref()),
+        None => (quota.current.as_deref(), quota.maximum.as_deref()),
+    };
+
     // type Unknown/Error (or absent current/maximum) means the IDE is installed
     // and its config was read, but this account has no AI quota to report. The
     // credential is fine and nothing is broken, so this is neither an absent
     // credential nor a failure -- a consumer must not count it as something to
     // fix, or the number never reaches zero.
-    let used =
-        used_percent(quota.current.as_deref(), quota.maximum.as_deref()).ok_or_else(|| {
-            FetchError::NoQuotaReported(format!(
-                "jetbrains: no active quota (type {:?})",
-                quota.kind.as_deref().unwrap_or("?")
-            ))
-        })?;
+    let used = used_percent(current, maximum).ok_or_else(|| {
+        FetchError::NoQuotaReported(format!(
+            "jetbrains: no active quota (type {:?})",
+            quota.kind.as_deref().unwrap_or("?")
+        ))
+    })?;
 
     // Parsed ONCE and both halves kept. The reset instant and the stated
     // mechanic come out of the same object, so reading it twice would let them
@@ -335,6 +451,26 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
         .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok());
 
     let regeneration = refill.as_ref().and_then(regeneration_from);
+
+    // The tariff's own period, and only when the payload states it and the
+    // window IS the tariff. Over the summed balance a length would claim the
+    // purchased part resets too, which it never does.
+    let window_minutes = tariff.and_then(|_| {
+        refill
+            .as_ref()?
+            .tariff
+            .as_ref()?
+            .duration
+            .as_deref()
+            .and_then(iso8601_duration_minutes)
+            .filter(|minutes| *minutes > 0)
+    });
+
+    // Published only beside a tariff window. Without the split the top-up is
+    // already inside the summed window, and a pool too would count it twice.
+    let top_up = tariff
+        .and(quota.top_up_quota.as_ref())
+        .and_then(top_up_pool);
 
     let resets_at = refill.and_then(|r| r.next).filter(|s| !s.trim().is_empty());
 
@@ -351,39 +487,35 @@ pub fn normalize_usage(xml_bytes: &[u8]) -> Result<Usage, FetchError> {
     // Whole numbers only, via the shared rule: an observed payload carries
     // fractional values such as "8134.155", and a fractional count is not the
     // count it appears to be.
-    let (used_count, total_count) = quota
-        .current
-        .as_deref()
+    let (used_count, total_count) = current
         .and_then(|c| c.trim().parse::<f64>().ok())
-        .zip(
-            quota
-                .maximum
-                .as_deref()
-                .and_then(|m| m.trim().parse::<f64>().ok()),
-        )
+        .zip(maximum.and_then(|m| m.trim().parse::<f64>().ok()))
         .map_or((None, None), |(current, maximum)| {
             crate::model::window_counts(current, maximum)
         });
 
-    Ok(Usage {
-        primary: Some(RateWindow {
-            used_percent: used,
-            raw_used_percent: None,
-            resets_at: Some(resets_at),
-            // NOT derived from `nextRefill.tariff.duration`, though that states
-            // PT720H. The observed payload decomposes the balance into a tariff
-            // pool that refills on that period and a purchased top-up pool that
-            // does not, while `maximum` -- the percent's denominator -- is their
-            // sum. One window length would claim the whole balance resets
-            // monthly when part of it never does. See insula#1 for the capture.
-            window_minutes: None,
-            used_count,
-            total_count,
-            regeneration,
-        }),
-        secondary: None,
-        tertiary: None,
-        extra_rate_windows: None,
+    Ok(Normalized {
+        usage: Usage {
+            primary: Some(RateWindow {
+                used_percent: used,
+                raw_used_percent: None,
+                resets_at: Some(resets_at),
+                // `nextRefill.tariff.duration` when the window is the tariff
+                // and the payload states a period; absent otherwise. The
+                // observed payload splits the balance into a tariff that
+                // refills on that period and a purchased top-up that does not
+                // (insula#1). The window measures the tariff alone, so the
+                // period is its length; the top-up is published as a pool.
+                window_minutes,
+                used_count,
+                total_count,
+                regeneration,
+            }),
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: None,
+        },
+        top_up,
     })
 }
 
@@ -414,8 +546,12 @@ impl UsageProvider for JetBrainsProvider {
                 FetchError::NoSession("no JetBrains AIAssistantQuotaManager2.xml found".to_string())
             })?;
             let bytes = crate::env::read_credential_file(&path, "JetBrains quota XML")?;
-            let usage = normalize_usage(&bytes)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            let normalized = normalize(&bytes)?;
+            let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", normalized.usage);
+            // Absent rather than empty when there is no top-up: an empty list
+            // would state that the provider reports none.
+            entry.spend = normalized.top_up.map(|pool| vec![pool]);
+            Ok(entry)
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -440,9 +576,16 @@ mod tests {
     /// Pinning the ARITHMETIC, which was never checkable before. `current` is
     /// the amount USED and `available` the remainder, proved by the payload's
     /// own decomposition: tariff 8100 used + 991900 available = 1000000 maximum.
-    /// So the percent is 8100/1207000, and a reading of `current` as "remaining"
-    /// -- the plausible misreading -- would report 99.3% used on an account that
-    /// has spent two thirds of one percent.
+    /// A reading of `current` as "remaining" -- the plausible misreading --
+    /// would report 99.19% used on an account that has spent under one percent.
+    ///
+    /// DELIBERATELY CHANGED from the original pin. This used to assert the
+    /// percent over the summed balance (8100/1207000 = 0.6711%) with no window
+    /// length. The window is now the refilling tariff alone (8100/1000000 =
+    /// 0.81%), which makes the tariff's stated PT720H its length, and the
+    /// purchased top-up that never refills is published as its own pool. Over
+    /// the sum the window could not reach 100% while top-up remained, so it
+    /// showed headroom once the part that refills was gone.
     #[test]
     fn the_observed_credentialed_payload_normalizes_as_measured() {
         let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","until":"2026-11-14T21:00:00Z","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"},"topUpQuota":{"current":"0","maximum":"207000.000","available":"207000.000"}}"#;
@@ -458,23 +601,149 @@ mod tests {
             escape(next_refill)
         );
 
-        let usage = normalize_usage(xml.as_bytes()).expect("the observed payload must normalize");
-        let window = usage.primary.expect("a primary window");
+        let normalized = normalize(xml.as_bytes()).expect("the observed payload must normalize");
+        let window = normalized.usage.primary.expect("a primary window");
 
         assert!(
-            (window.used_percent - 0.6711).abs() < 0.001,
-            "expected 8100/1207000 = 0.6711%, got {}",
+            (window.used_percent - 0.81).abs() < 1e-9,
+            "expected tariff 8100/1000000 = 0.81%, got {}",
             window.used_percent
         );
         assert_eq!(window.used_count, Some(8100.0));
-        assert_eq!(window.total_count, Some(1_207_000.0));
+        assert_eq!(
+            window.total_count,
+            Some(1_000_000.0),
+            "the tariff's own maximum"
+        );
         assert_eq!(
             window.resets_at.as_deref(),
             Some("2026-07-15T06:00:00.000Z")
         );
-        // Deliberately absent: the tariff period refills only part of the
-        // balance the percent is measured against.
+        // PT720H, stated by the payload and describing exactly this window.
+        assert_eq!(window.window_minutes, Some(43_200));
+
+        let pool = normalized
+            .top_up
+            .expect("the top-up is published as a pool");
+        assert_eq!(pool.id, "topUpQuota");
+        assert_eq!(pool.funding, PoolFunding::Purchased);
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        assert_eq!(pool.resets_at, None, "the top-up does not refill");
+        // "207000.000" read exactly: 207000000 thousandths.
+        let quota = |minor| Amount {
+            minor,
+            exponent: 3,
+            unit: TOP_UP_UNIT.to_string(),
+        };
+        assert_eq!(pool.remaining, Some(quota(207_000_000)));
+        assert_eq!(pool.total, Some(quota(207_000_000)));
+    }
+
+    /// The case the split exists for: the tariff is spent, the top-up untouched.
+    ///
+    /// Over the summed balance this read 1000000/1207000 = 82.9% -- apparent
+    /// headroom on an account whose refilling allowance is gone and which is now
+    /// drawing purchased quota. The window must say 100% and the pool must show
+    /// the top-up still full.
+    #[test]
+    fn a_spent_tariff_reads_full_while_the_top_up_stays_untouched() {
+        let quota_info = r#"{"type":"Available","current":"1000000.000","maximum":"1207000.000","tariffQuota":{"current":"1000000.000","maximum":"1000000","available":"0.000"},"topUpQuota":{"current":"0","maximum":"207000.000","available":"207000.000"}}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"PT720H"}}"#;
+        let normalized =
+            normalize(observed_xml(quota_info, next_refill).as_bytes()).expect("must normalize");
+
+        let window = normalized.usage.primary.expect("a primary window");
+        assert_eq!(
+            window.used_percent, 100.0,
+            "the refilling part is exhausted"
+        );
+        let pool = normalized.top_up.expect("a top-up pool");
+        assert_eq!(pool.remaining, pool.total, "the top-up is untouched");
+        assert_eq!(pool.remaining.map(|a| a.minor), Some(207_000_000));
+    }
+
+    /// Without `tariffQuota` there is nothing to split, so the output is the
+    /// summed window exactly as before: its percent and counts, no length, and
+    /// no pool -- even when `topUpQuota` is present, since the summed window
+    /// already contains the top-up and a pool would count it twice.
+    #[test]
+    fn without_a_tariff_split_the_summed_window_is_unchanged() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","topUpQuota":{"current":"0","maximum":"207000.000","available":"207000.000"}}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"PT720H"}}"#;
+        let normalized =
+            normalize(observed_xml(quota_info, next_refill).as_bytes()).expect("must normalize");
+
+        let window = normalized.usage.primary.expect("a primary window");
+        assert!(
+            (window.used_percent - 8100.0 / 1_207_000.0 * 100.0).abs() < 1e-9,
+            "expected the summed 0.6711%, got {}",
+            window.used_percent
+        );
+        assert_eq!(window.used_count, Some(8100.0));
+        assert_eq!(window.total_count, Some(1_207_000.0));
         assert_eq!(window.window_minutes, None);
+        assert!(normalized.top_up.is_none(), "{:?}", normalized.top_up);
+    }
+
+    /// A tariff window whose period the payload does not state has no length.
+    /// The length is never assumed from what the observed payload happened to
+    /// carry.
+    #[test]
+    fn a_refill_without_a_stated_duration_gives_no_window_length() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"}}"#;
+        let next_refill =
+            r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000"}}"#;
+        let window = normalize_usage(observed_xml(quota_info, next_refill).as_bytes())
+            .expect("must normalize")
+            .primary
+            .expect("a primary window");
+
+        assert!(
+            (window.used_percent - 0.81).abs() < 1e-9,
+            "still the tariff"
+        );
+        assert_eq!(window.window_minutes, None);
+    }
+
+    /// A top-up figure that is not exactly a decimal number publishes no pool,
+    /// and the tariff window is unaffected by it.
+    #[test]
+    fn an_unreadable_top_up_publishes_no_pool_and_leaves_the_window() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"},"topUpQuota":{"current":"0","maximum":"207,000.000","available":"207000.000"}}"#;
+        let next_refill = r#"{"type":"Known","next":"2026-07-15T06:00:00.000Z","tariff":{"amount":"1000000","duration":"PT720H"}}"#;
+        let normalized = normalize(observed_xml(quota_info, next_refill).as_bytes())
+            .expect("an unreadable pool must not fail the window");
+
+        assert!(normalized.top_up.is_none(), "{:?}", normalized.top_up);
+        let window = normalized.usage.primary.expect("a primary window");
+        assert!((window.used_percent - 0.81).abs() < 1e-9);
+        assert_eq!(window.total_count, Some(1_000_000.0));
+        assert_eq!(window.window_minutes, Some(43_200));
+    }
+
+    /// The published entry passes the wire checker's pool rules, the
+    /// remaining-within-total comparison among them.
+    #[test]
+    fn the_top_up_pool_satisfies_the_wire_rules() {
+        let quota_info = r#"{"type":"Available","current":"8100.000","maximum":"1207000.000","tariffQuota":{"current":"8100.000","maximum":"1000000","available":"991900.000"},"topUpQuota":{"current":"0","maximum":"207000.000","available":"207000.000"}}"#;
+        // The checker also judges the window against the clock, so the reset is
+        // placed inside the 30-day period from now and the entry is stamped.
+        let now = crate::wire_sanity::now();
+        let reset = (now + chrono::Duration::days(10)).to_rfc3339();
+        let next_refill = format!(
+            r#"{{"type":"Known","next":"{reset}","tariff":{{"amount":"1000000","duration":"PT720H"}}}}"#
+        );
+        let normalized =
+            normalize(observed_xml(quota_info, &next_refill).as_bytes()).expect("must normalize");
+        let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", normalized.usage);
+        entry.fetched_at = Some(now.to_rfc3339());
+        entry.spend = normalized.top_up.map(|pool| vec![pool]);
+
+        let report = crate::wire_sanity::check_entries(&[entry], now);
+        assert_eq!(report.pools_checked, 1);
+        assert_eq!(report.pool_amounts_checked, 2);
+        assert_eq!(report.pool_comparisons, 1, "remaining was bounded by total");
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
     /// The observed payload's stated mechanic, ASSERTED ON THE WIRE BYTES.
@@ -507,14 +776,12 @@ mod tests {
             "PT720H is 43200 minutes"
         );
 
-        // The whole point of the field: the 720h period must NOT have leaked into
-        // the window's own length. They describe different things -- the period
-        // refills only the tariff pool, while the percent is measured against a
-        // total that includes a purchased pool that never refills.
-        assert!(
-            window.get("windowMinutes").is_none(),
-            "the refill period is not this window's length: {window}"
-        );
+        // The period belongs in `windowMinutes` too: the window measures only
+        // the tariff, so the tariff's stated period is the window's length.
+        // This was once asserted absent, when the window measured the tariff
+        // plus a purchased top-up that never refills. The reset instant stays
+        // in `resetsAt`.
+        assert_eq!(window["windowMinutes"], 43_200);
         assert_eq!(window["resetsAt"], "2026-07-15T06:00:00.000Z");
     }
 

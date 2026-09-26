@@ -1199,7 +1199,7 @@ protobuf decoding of the billing Timestamps, not JSON.
 | provider | cb_id | session source | endpoint | window |
 |---|---|---|---|---|
 | **grok** ✅ | grok | opencode `xai` OAuth (LIVE-VERIFIED) | POST grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig (grpc-web+proto) | monthly (billingPeriodEnd) — DONE, commit ed302a5 |
-| **jetbrains** ✅ | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — DONE, commit cb31db2 (hybrid-verified) |
+| **jetbrains** ✅ | jetbrains | local XML `AIAssistantQuotaManager2.xml` | local file read | quota + nextRefill — DONE, commit cb31db2 (hybrid-verified). Window = `tariffQuota` alone, `windowMinutes` from `nextRefill.tariff.duration` when stated; `topUpQuota` published as a `purchased` spend pool (insula#32, fixture-verified). No `tariffQuota` → summed window as before |
 | kiro | kiro | `kiro-cli` CLI probe | CLI stdout parse | credits + reset — PARTIAL (not in v1) |
 | **codebuff** ✅ | codebuff | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | POST codebuff.com/api/v1/usage + GET /api/user/subscription | weekly (subscription) — DONE, commit 7a3f4c9 |
 
