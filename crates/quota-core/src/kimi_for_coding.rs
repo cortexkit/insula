@@ -238,8 +238,9 @@ fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> 
 /// The monthly + code-7d extras come from a separate `GetSubscriptionStats`
 /// call and are merged by the caller.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let response: KimiCodeApiResponse = serde_json::from_slice(body)
-        .map_err(|e| FetchError::Decode(format!("kimi coding usage not decodable: {e}")))?;
+    let response: KimiCodeApiResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|e| FetchError::Decode(format!("kimi coding usage not decodable: {e}")))?;
 
     let primary = window_from_detail(&response.usage, Some(WEEKLY_MINUTES)).ok_or_else(|| {
         FetchError::Decode("kimi coding usage missing valid weekly window".to_string())

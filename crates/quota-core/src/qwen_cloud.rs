@@ -444,9 +444,10 @@ fn degraded_response_error(result: Option<&serde_json::Value>, reason: &str) -> 
 ///
 /// This is pure so it can be fixture-tested without a browser session.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let response: GatewayResponse = serde_json::from_slice(body).map_err(|error| {
-        FetchError::Decode(format!("qwen-cloud response not decodable: {error}"))
-    })?;
+    let response: GatewayResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body).map_err(|error| {
+            FetchError::Decode(format!("qwen-cloud response not decodable: {error}"))
+        })?;
 
     let result = response
         .data

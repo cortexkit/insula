@@ -613,7 +613,7 @@ pub struct CodexUsageSnapshot {
 
 /// Normalize a full `/wham/usage` JSON body without relaxing any percentages.
 pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, FetchError> {
-    let response: UsageResponse = serde_json::from_slice(body)
+    let response: UsageResponse = crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
         .map_err(|e| FetchError::Decode(format!("usage response not decodable: {e}")))?;
     let rate_limit = response
         .rate_limit
@@ -2254,6 +2254,34 @@ mod credit_pool_tests {
         "credits": { "has_credits": true, "unlimited": false,
                      "overage_limit_reached": false, "balance": "24.02" }
     }"#;
+
+    /// A key added to the live usage body is reported by name, and it is the
+    /// only name the addition contributes. The key is unique to this test, so
+    /// no other test decoding codex bodies in parallel can report it first.
+    #[test]
+    fn an_extra_key_in_the_live_usage_body_is_reported_by_name() {
+        const EXTRA: &str = "insula_probe_unread_key";
+        let base = std::str::from_utf8(NO_CREDIT_PRODUCT).unwrap();
+        let extended = base.replacen(
+            r#""plan_type": "pro","#,
+            &format!(r#""plan_type": "pro", "{EXTRA}": {{ "limit": 5 }},"#),
+            1,
+        );
+        assert_ne!(base, extended, "the fixture must gain the key");
+
+        let (_, before) =
+            crate::unread_keys::decode_collecting_unread::<UsageResponse>(base.as_bytes());
+        let (_, after) =
+            crate::unread_keys::decode_collecting_unread::<UsageResponse>(extended.as_bytes());
+        let added: Vec<&String> = after.iter().filter(|name| !before.contains(name)).collect();
+        assert_eq!(added, [EXTRA]);
+
+        normalize_usage_snapshot(extended.as_bytes()).expect("live shape must parse");
+        assert!(
+            crate::unread_keys::was_reported(PROVIDER_NAME, EXTRA),
+            "the codex usage decode must report the unread key"
+        );
+    }
 
     /// An account with no credit product publishes NO pool, not a zero one.
     ///

@@ -160,9 +160,10 @@ fn parse_reset_at(value: &Value) -> Option<String> {
 
 /// Normalize Qoder's member quota response into one primary usage window.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let response: QoderUsageResponse = serde_json::from_slice(body).map_err(|error| {
-        FetchError::Decode(format!("qoder usage response not decodable: {error}"))
-    })?;
+    let response: QoderUsageResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body).map_err(|error| {
+            FetchError::Decode(format!("qoder usage response not decodable: {error}"))
+        })?;
     let base = response
         .total_quota
         .as_ref()

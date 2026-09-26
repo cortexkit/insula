@@ -252,7 +252,7 @@ fn window_minutes_from_reset(reset_time: &str, now: DateTime<Utc>) -> Option<i64
 /// bucket remains visible; the most-used bucket is also copied to `primary` so
 /// the headline reflects the single current binding constraint.
 fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchError> {
-    let response: QuotaResponse = serde_json::from_slice(body)
+    let response: QuotaResponse = crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
         .map_err(|e| FetchError::Decode(format!("gemini quota not decodable: {e}")))?;
     // Two distinguishable inputs, and they need different answers. An ABSENT
     // field means our struct and their payload disagree -- a rename upstream or

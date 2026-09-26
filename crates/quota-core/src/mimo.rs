@@ -72,8 +72,9 @@ fn parse_reset_time(s: &str) -> Option<String> {
 
 /// Normalize the detail and usage JSON responses to [`Usage`]. Pure — unit-testable.
 pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchError> {
-    let detail_envelope: MimoEnvelope<MimoDetail> = serde_json::from_str(detail_json)
-        .map_err(|e| FetchError::Decode(format!("failed to parse detail JSON: {e}")))?;
+    let detail_envelope: MimoEnvelope<MimoDetail> =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, detail_json.as_bytes())
+            .map_err(|e| FetchError::Decode(format!("failed to parse detail JSON: {e}")))?;
 
     if detail_envelope.code == 401 || detail_envelope.code == 403 {
         return Err(FetchError::Unauthorized(format!(
@@ -92,8 +93,9 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         .data
         .ok_or_else(|| FetchError::Decode("mimo detail response missing data field".to_string()))?;
 
-    let usage_envelope: MimoEnvelope<MimoUsage> = serde_json::from_str(usage_json)
-        .map_err(|e| FetchError::Decode(format!("failed to parse usage JSON: {e}")))?;
+    let usage_envelope: MimoEnvelope<MimoUsage> =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, usage_json.as_bytes())
+            .map_err(|e| FetchError::Decode(format!("failed to parse usage JSON: {e}")))?;
 
     if usage_envelope.code == 401 || usage_envelope.code == 403 {
         return Err(FetchError::Unauthorized(format!(
