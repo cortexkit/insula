@@ -322,6 +322,25 @@ pub fn auth_failures_reported() -> u64 {
     AUTH_FAILURES_REPORTED.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The reports made on this thread, for tests only.
+    ///
+    /// The process-wide counter cannot be read exactly from a test: cargo runs
+    /// tests on parallel threads of one process, and every adapter test that
+    /// drives a vault 401 moves it too. A lock around one module's readers only
+    /// covers that module, so a sibling adapter's 401 still landed between a read
+    /// and its assertion (insula#30). The gate counts synchronously on the
+    /// caller's thread, so a per-thread count is exact under any parallelism.
+    static REPORTED_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_auth_failure_reported() {
+    AUTH_FAILURES_REPORTED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    REPORTED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
 #[doc(hidden)]
 pub enum VaultAuthFailureAddress {
     Capability(VaultCapability),
@@ -379,7 +398,7 @@ pub fn report_vault_auth_failure<T: VaultAuthFailureTarget + ?Sized>(
     };
     let source = Arc::clone(source);
     let status = *status;
-    AUTH_FAILURES_REPORTED.fetch_add(1, Ordering::Relaxed);
+    count_auth_failure_reported();
     tokio::spawn(async move {
         match address {
             VaultAuthFailureAddress::Capability(capability) => {
@@ -422,22 +441,10 @@ pub fn take_utf8_payload(payload: &mut Vec<u8>) -> Result<String, crate::provide
 #[cfg(test)]
 mod tests {
 
-    /// Serialises the tests that move the process-wide report counter.
-    ///
-    /// The counter is deliberately process-wide -- the gate is a free function with
-    /// nothing to hang state off -- and cargo runs these tests in parallel threads
-    /// of ONE process. Without this, a sibling test's 401 lands between another
-    /// test's read and its assertion, and the failure is a rare flake that reads
-    /// like a real defect in the gate.
-    ///
-    /// One lock in one module, covering every caller here. Two locks would be worse
-    /// than none: the pair would look like protection while guarding nothing
-    /// against each other.
-    /// A tokio mutex rather than a std one: these tests await, and holding a std
-    /// guard across an await point blocks the executor thread rather than the
-    /// task -- correct here only by luck, and a lint that would be silenced
-    /// rather than fixed.
-    static COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The reports counted on this thread so far.
+    fn reported_here() -> u64 {
+        REPORTED_ON_THIS_THREAD.with(|count| count.get())
+    }
 
     /// The counter moves with the decision, and only with it.
     ///
@@ -452,14 +459,19 @@ mod tests {
     /// moved on those would report this module as the cause of latches it never
     /// performed, which is worse than no counter -- it would send an operator to
     /// the wrong repository with evidence in hand.
+    ///
+    /// Exact counts are read per thread, because other tests move the global
+    /// counter concurrently. The global is still checked, but only as "moved by
+    /// at least one": a monotonic counter can be read that way under any
+    /// parallelism.
     #[tokio::test]
     async fn the_counter_moves_only_when_a_credential_is_actually_latched() {
-        let _serial = COUNTER_LOCK.lock().await;
         let source = RecordingSource::default();
         let source: Arc<dyn CredentialSource> = Arc::new(source);
         let capability = VaultCapability::new("ckh_counter");
 
-        let before = auth_failures_reported();
+        let before = reported_here();
+        let global_before = auth_failures_reported();
 
         // A 403 must not move it, however many times it arrives.
         for _ in 0..3 {
@@ -477,8 +489,27 @@ mod tests {
             1,
             &crate::provider::FetchError::Upstream("timeout".into()),
         );
+        // A 401 reported on ANOTHER thread in the middle of this test, which is
+        // exactly what a parallel adapter test does. It must not disturb this
+        // test's count: a read of the global here would see it and fail.
+        let other_source = Arc::clone(&source);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    report_vault_auth_failure(
+                        Some(&other_source),
+                        &VaultCapability::new("ckh_other_thread"),
+                        1,
+                        &crate::provider::FetchError::ProviderStatus(401, String::new()),
+                    );
+                });
+        })
+        .join()
+        .unwrap();
         assert_eq!(
-            auth_failures_reported(),
+            reported_here(),
             before,
             "only a latch may move this counter, and none of those latched anything"
         );
@@ -491,9 +522,13 @@ mod tests {
             &crate::provider::FetchError::ProviderStatus(401, String::new()),
         );
         assert_eq!(
-            auth_failures_reported(),
+            reported_here(),
             before + 1,
             "a latch must leave a trace, because nothing else in the process does"
+        );
+        assert!(
+            auth_failures_reported() > global_before,
+            "the published counter must move with the latch"
         );
     }
 
@@ -504,7 +539,6 @@ mod tests {
     /// the system -- nothing else ever marks such a record dead.
     #[tokio::test]
     async fn a_401_is_reported_as_credential_death() {
-        let _serial = COUNTER_LOCK.lock().await;
         let source = RecordingSource::default();
         let reports = source.reports.clone();
         let source: Arc<dyn CredentialSource> = Arc::new(source);
@@ -538,7 +572,6 @@ mod tests {
     /// antigravity's vault lane rides the same API family.
     #[tokio::test]
     async fn a_403_is_not_reported_because_it_can_mean_a_live_credential() {
-        let _serial = COUNTER_LOCK.lock().await;
         let source = RecordingSource::default();
         let reports = source.reports.clone();
         let source: Arc<dyn CredentialSource> = Arc::new(source);
