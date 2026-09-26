@@ -897,14 +897,24 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
 
 /// Normalize a RetrieveUserQuotaSummary JSON body to [`Usage`]. Pure — unit-testable.
 pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
-    let envelope: QuotaSummaryEnvelope = serde_json::from_str(body)
+    let (envelope, unread) =
+        crate::unread_keys::decode_collecting_unread::<QuotaSummaryEnvelope>(body.as_bytes());
+    let envelope = envelope
         .map_err(|e| FetchError::Decode(format!("antigravity quota summary not JSON: {e}")))?;
     // Prefer the `{"response": {...}}` envelope (live wire); fall back to a top-level
-    // `{"groups": ...}` shape.
+    // `{"groups": ...}` shape. Unread keys are reported only for the shape
+    // actually used: decoding a top-level shape as the envelope skips `groups`,
+    // which the fallback then reads.
     let summary = match envelope.response {
-        Some(s) => s,
-        None => serde_json::from_str::<QuotaSummary>(body)
-            .map_err(|e| FetchError::Decode(format!("antigravity quota summary not JSON: {e}")))?,
+        Some(s) => {
+            crate::unread_keys::report_unread(PROVIDER_NAME, unread);
+            s
+        }
+        None => crate::unread_keys::decode_reporting_unread::<QuotaSummary>(
+            PROVIDER_NAME,
+            body.as_bytes(),
+        )
+        .map_err(|e| FetchError::Decode(format!("antigravity quota summary not JSON: {e}")))?,
     };
     normalize_quota_summary(summary)
 }
@@ -1089,8 +1099,9 @@ fn summary_unavailable(error: &FetchError) -> bool {
 }
 
 fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
-    let response: RemoteQuotaResponse = serde_json::from_slice(body)
-        .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
+    let response: RemoteQuotaResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|e| FetchError::Decode(format!("antigravity remote quota not JSON: {e}")))?;
     // Two distinguishable inputs needing different answers. An ABSENT field means
     // our struct and their payload disagree -- a rename upstream or a mistake
     // here -- and Decode is the class that sends a reader to this repo. A field

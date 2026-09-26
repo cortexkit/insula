@@ -424,8 +424,9 @@ fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> 
 fn normalize_with_overage(
     body: &[u8],
 ) -> Result<(Usage, Result<Option<Pool>, OverageRefusal>), FetchError> {
-    let response: OAuthUsageResponse = serde_json::from_slice(body)
-        .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
+    let response: OAuthUsageResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
         primary: to_window(response.five_hour.as_ref(), FIVE_HOUR_MINUTES),

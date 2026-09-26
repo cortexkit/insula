@@ -421,8 +421,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 }
 
 fn normalize_usage_at(body: &[u8], now_secs: i64) -> Result<Usage, FetchError> {
-    let payload: CodingPlanPayload = serde_json::from_slice(body)
-        .map_err(|e| FetchError::Decode(format!("minimax remains not decodable: {e}")))?;
+    let payload: CodingPlanPayload =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|e| FetchError::Decode(format!("minimax remains not decodable: {e}")))?;
 
     let base = payload
         .data

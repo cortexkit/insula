@@ -176,8 +176,9 @@ fn remaining_amount(total: Amount, usage: Amount) -> Result<Amount, FetchError> 
 
 /// Normalize the OpenRouter credits payload into its one derived credit pool.
 pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
-    let response: CreditsResponse = serde_json::from_slice(body)
-        .map_err(|error| FetchError::Decode(format!("openrouter: {error}")))?;
+    let response: CreditsResponse =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|error| FetchError::Decode(format!("openrouter: {error}")))?;
     let total = amount_from_number(&response.data.total_credits, "total_credits")?;
     let usage = amount_from_number(&response.data.total_usage, "total_usage")?;
     // The grant is published beside the remainder because the upstream states

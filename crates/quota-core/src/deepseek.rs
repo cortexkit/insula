@@ -112,8 +112,9 @@ fn pools_from(info: &BalanceInfo) -> Vec<Pool> {
 
 /// Turn a response body into the pools to publish.
 pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
-    let response: BalanceResponse = serde_json::from_slice(body)
-        .map_err(|error| FetchError::Decode(format!("deepseek: {error}")))?;
+    let response: BalanceResponse =
+        crate::unread_keys::decode_reporting_unread("deepseek", body)
+            .map_err(|error| FetchError::Decode(format!("deepseek: {error}")))?;
 
     let Some(infos) = response.balance_infos else {
         return Err(FetchError::Decode(

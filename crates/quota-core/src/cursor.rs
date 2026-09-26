@@ -403,8 +403,9 @@ fn parse_billing_cycle_end(s: &str) -> Option<String> {
 
 /// Normalize the usage summary JSON to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let summary: CursorUsageSummary = serde_json::from_slice(body)
-        .map_err(|e| FetchError::Decode(format!("cursor usage summary not decodable: {e}")))?;
+    let summary: CursorUsageSummary =
+        crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+            .map_err(|e| FetchError::Decode(format!("cursor usage summary not decodable: {e}")))?;
 
     let resets_at = summary
         .billing_cycle_end

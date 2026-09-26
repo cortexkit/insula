@@ -28,6 +28,7 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
 libc = "0.2"
+serde_ignored = "0.1"
 
 # Linux only: reading a `v11` cookie needs Chrome's storage password, which
 # lives in the Secret Service and is reachable only over D-Bus. Gated to Linux
