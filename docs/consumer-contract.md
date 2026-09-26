@@ -1024,6 +1024,36 @@ and beside the `credits` pool if there is one, never in place of it:
   case outside a team workspace), or when the limit or remainder is missing or
   unreadable. The windows are published as usual in every one of these cases.
 
+### `jetbrains`: the purchased top-up as the `topUpQuota` pool
+
+JetBrains splits the AI quota into a tariff that refills at `nextRefill` and a
+purchased top-up that does not renew and is drawn only after the tariff is
+spent. The primary window is the **tariff alone**: its `usedPercent`,
+`usedCount` and `totalCount` come from the tariff, and `windowMinutes` is the
+tariff period when the payload states one (`PT720H` is 43200). The top-up is
+published beside it:
+
+```json
+"spend": [
+  { "id": "topUpQuota", "label": "Top-up quota",
+    "funding": "purchased", "basis": "reported",
+    "total":     { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" },
+    "remaining": { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" } }
+]
+```
+
+- A window at 100% with this pool non-empty means the refilling allowance is
+  spent and the account is drawing purchased quota. Before the split the window
+  measured the sum of both parts, so it could not reach 100% while any top-up
+  remained.
+- `unit` is a label, not a currency. JetBrains states no unit for its quota.
+- `funding: purchased`: the top-up is bought. It has no `resetsAt` because it
+  does not renew.
+- No pool, and `spend` absent, when the payload has no `topUpQuota` or states
+  its figures in a form that does not parse exactly. When the payload has no
+  readable `tariffQuota` the window is the summed balance, as before, with no
+  `windowMinutes` and no pool: the sum already contains the top-up.
+
 ## 100% used does not mean requests are being refused
 
 `usedPercent` is a **capacity reading**, not an enforcement state. A window at
