@@ -659,7 +659,10 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
-            Box::new(minimax::MinimaxProvider::new()),
+            Box::new(minimax::MinimaxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(neuralwatt::NeuralWattProvider::new()),
             Box::new(ollama::OllamaProvider::new()),
             Box::new(opencode::OpenCodeProvider::new_with_handle_loader(

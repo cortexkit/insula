@@ -37,6 +37,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
+    ("apikey:minimax", "minimax"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -59,6 +60,7 @@ enum ProviderKind {
     DeepSeek,
     Synthetic,
     OpenRouter,
+    MiniMax,
 }
 
 #[derive(Clone, Default)]
@@ -440,6 +442,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::OpenRouter)
     }
 
+    pub fn minimax_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::MiniMax)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -532,6 +538,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "deepseek" => Some(ProviderKind::DeepSeek),
         "synthetic" => Some(ProviderKind::Synthetic),
         "openrouter" => Some(ProviderKind::OpenRouter),
+        "minimax" => Some(ProviderKind::MiniMax),
         _ => None,
     }
 }
@@ -719,6 +726,48 @@ mod tests {
         assert!(loader.opencodego_handles().unwrap().is_empty());
         assert!(loader.warning().is_some_and(|warning| {
             warning.contains("multiple identity-less credentials name `apikey:opencode`")
+        }));
+    }
+
+    /// `apikey:minimax`, bare or labelled, routes to minimax; ids that merely
+    /// share its spelling or belong to another vendor do not.
+    #[test]
+    fn the_minimax_api_key_routes_to_minimax_and_nothing_else_does() {
+        for id in ["apikey:minimax", "apikey:minimax:label"] {
+            let loader = VaultHandleLoader::default();
+            install(&loader, vec![row(id, "apikey")]);
+            assert_eq!(
+                loader.minimax_handles().unwrap(),
+                vec![CredentialHandle::scoped(id, "apikey")],
+                "{id} must route to minimax"
+            );
+        }
+
+        for id in ["apikey:minimaxi", "apikey:deepseek", "apikey:openai"] {
+            let loader = VaultHandleLoader::default();
+            install(&loader, vec![row(id, "apikey")]);
+            assert!(
+                loader.minimax_handles().unwrap().is_empty(),
+                "{id} must not route to minimax"
+            );
+        }
+    }
+
+    /// Like every `apikey:` family, a second minimax deposit darkens the family
+    /// rather than racing the first.
+    #[test]
+    fn a_second_minimax_api_key_is_refused() {
+        let loader = VaultHandleLoader::default();
+        install(
+            &loader,
+            vec![
+                row("apikey:minimax", "apikey"),
+                row("apikey:minimax:second", "apikey"),
+            ],
+        );
+        assert!(loader.minimax_handles().unwrap().is_empty());
+        assert!(loader.warning().is_some_and(|warning| {
+            warning.contains("multiple identity-less credentials name `apikey:minimax`")
         }));
     }
 

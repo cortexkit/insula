@@ -1,6 +1,8 @@
-//! MiniMax coding-plan usage — API key from environment variables.
+//! MiniMax coding-plan usage — API key from the credential vault or the environment.
 //!
-//! Credential: `MINIMAX_CODING_API_KEY` then `MINIMAX_API_KEY` (`env::first_env`).
+//! Credential: an `apikey:minimax` vault handle when one is granted (it replaces
+//! the environment lane), otherwise `MINIMAX_CODING_API_KEY` then
+//! `MINIMAX_API_KEY` (`env::first_env`).
 //! Request: `GET {apiHost}/v1/api/openplatform/coding_plan/remains` with
 //! `Authorization: Bearer`, `accept`/`Content-Type: application/json`, and
 //! `MM-API-Source: CodexBar` (ported from CodexBar's API-token path).
@@ -29,9 +31,14 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::credential_source::CredentialSource;
+use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
+use crate::vault_handles::VaultHandleLoader;
+use crate::LOG_TAG;
 use crate::{
     env,
     http::{Header, JsonRequest},
@@ -554,80 +561,191 @@ async fn fetch_wallet(client: &reqwest::Client, api_key: &str, base: &str) -> Op
     wallet_pools(&body).ok()
 }
 
-fn api_base_url() -> String {
-    let region = env::first_env(REGION_ENV)
+/// Whether `MINIMAX_API_REGION` selects the China mainland host.
+fn region_is_china(lookup: &impl Fn(&str) -> Option<OsString>) -> bool {
+    let region = env::first_env_from(REGION_ENV, lookup)
         .map(|v| v.trim().to_lowercase())
         .unwrap_or_default();
-    if region == "cn" || region == "china" || region == "china_mainland" {
-        CHINA_API_BASE.to_string()
-    } else {
-        GLOBAL_API_BASE.to_string()
-    }
+    region == "cn" || region == "china" || region == "china_mainland"
+}
+
+/// Whether a refusal may only mean the key belongs to the other region's host.
+///
+/// The environment lane sees 401/403 as `Unauthorized`; the vault lane keeps
+/// the raw status as `ProviderStatus` so a 401 can be reported to the vault.
+/// Both retry the China host from the global one on either status, exactly as
+/// the environment lane always has.
+fn may_be_wrong_region(error: &FetchError) -> bool {
+    matches!(
+        error,
+        FetchError::Unauthorized(_) | FetchError::ProviderStatus(401 | 403, _)
+    )
 }
 
 fn remains_url(base: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), REMAINS_PATH)
 }
 
+/// Which credential lane a request serves, because the two classify refusals
+/// differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// The environment key: 401/403 become `Unauthorized`, as they always have.
+    Local,
+    /// A vault key: the raw status is kept, so a 401 can be reported against
+    /// the record that served it.
+    Vault,
+}
+
 async fn fetch_remains_once(
     client: &reqwest::Client,
     api_key: &str,
     base: &str,
+    lane: Lane,
 ) -> Result<Vec<u8>, FetchError> {
     let url = remains_url(base);
-    JsonRequest::get(url)
+    let request = JsonRequest::get(url)
         .bearer(api_key)
         .header(Header::new("accept", "application/json"))
         .header(Header::new("Content-Type", "application/json"))
-        .header(Header::new("MM-API-Source", "CodexBar"))
-        .send(client)
-        .await
+        .header(Header::new("MM-API-Source", "CodexBar"));
+    match lane {
+        Lane::Local => request.send(client).await,
+        Lane::Vault => request
+            .send_provider_status_first(client, PROVIDER_NAME)
+            .await
+            .map(|response| response.body),
+    }
 }
 
 pub struct MinimaxProvider {
     http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    /// The two regional hosts. Fields rather than the constants so tests can
+    /// point both at loopback servers and still exercise the region fallback.
+    global_base: String,
+    china_base: String,
 }
 
 impl MinimaxProvider {
-    pub fn new() -> Self {
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            credential_source,
+            handle_loader,
+            global_base: GLOBAL_API_BASE.to_string(),
+            china_base: CHINA_API_BASE.to_string(),
         }
     }
-}
 
-impl Default for MinimaxProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl UsageProvider for MinimaxProvider {
-    fn name(&self) -> &str {
-        PROVIDER_NAME
+    /// The host `MINIMAX_API_REGION` selects. Applies to both lanes: the region
+    /// is a property of where the account lives, not of where its key is kept.
+    fn configured_base(&self, lookup: &impl Fn(&str) -> Option<OsString>) -> String {
+        if region_is_china(lookup) {
+            self.china_base.clone()
+        } else {
+            self.global_base.clone()
+        }
     }
 
-    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+    /// Fetch the rate windows, returning them with the host that answered.
+    ///
+    /// Which host actually answered, not which one was tried first. A key
+    /// minted in one region is rejected by the other, so a later request on
+    /// this account has to go to the host that accepted this one -- sending it
+    /// elsewhere earns a 401 for a credential that is fine.
+    async fn fetch_usage(
+        &self,
+        api_key: &str,
+        configured: String,
+        lane: Lane,
+    ) -> Result<(Usage, String), FetchError> {
+        let (body, base) = match fetch_remains_once(&self.http, api_key, &configured, lane).await {
+            Ok(body) => (body, configured),
+            Err(error) if may_be_wrong_region(&error) && configured == self.global_base => (
+                fetch_remains_once(&self.http, api_key, &self.china_base, lane).await?,
+                self.china_base.clone(),
+            ),
+            Err(error) => return Err(error),
+        };
+        Ok((normalize_usage(&body)?, base))
+    }
+
+    async fn fetch_vault(&self, handle: &CredentialHandle, configured: String) -> FetchAttempt {
+        let handle_id = handle.stable_id();
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                eprintln!(
+                    "{LOG_TAG} warning: minimax vault credential.get failed ({handle_id}): {error:?}"
+                );
+                return FetchAttempt::unverified_vault_failure(error);
+            }
+        };
+        let record_version = credential.record_version;
+        let api_key = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(value) => value,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+
+        let (usage, base) = match self.fetch_usage(&api_key, configured, Lane::Vault).await {
+            Ok(value) => value,
+            Err(error) => {
+                // Only a 401 is reported, and only the final answer's: a global
+                // 401 that the China host then accepts was a region mismatch,
+                // not a rejected key.
+                crate::credential_source::report_vault_auth_failure(
+                    self.credential_source.as_ref(),
+                    handle,
+                    record_version,
+                    &error,
+                );
+                return FetchAttempt::failure(None, Some("vault".to_string()), error);
+            }
+        };
+
+        let entry = ProviderUsage::healthy(PROVIDER_NAME, None, "vault", usage);
+        // Same wallet rule as the environment lane below: fetched after the
+        // windows, failure discarded, and never reported to the vault -- the
+        // endpoint is undocumented, so its refusal is no verdict on the key.
+        let pools = fetch_wallet(&self.http, &api_key, &base).await;
+        let mut attempt = FetchAttempt::from_provider_usage(Ok(entry));
+        attempt.pools = pools;
+        attempt
+    }
+
+    /// Fetch one handle over an arbitrary environment, so tests never have to
+    /// mutate the process environment.
+    async fn fetch_handle_from(
+        &self,
+        handle: &CredentialHandle,
+        lookup: impl Fn(&str) -> Option<OsString> + Send + Sync,
+    ) -> FetchAttempt {
+        let configured = self.configured_base(&lookup);
+        if handle.is_vault() {
+            return self.fetch_vault(handle, configured).await;
+        }
+
         let result: Result<(ProviderUsage, String, String), FetchError> = async {
-            let api_key = env::first_env(API_KEY_ENV)
+            let api_key = env::first_env_from(API_KEY_ENV, &lookup)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
 
-            let configured = api_base_url();
-            // Which host actually answered, not which one was tried first. A key
-            // minted in one region is rejected by the other, so a later request
-            // on this account has to go to the host that accepted this one --
-            // sending it elsewhere earns a 401 for a credential that is fine.
-            let (body, base) = match fetch_remains_once(&self.http, &api_key, &configured).await {
-                Ok(body) => (body, configured),
-                Err(FetchError::Unauthorized(_)) if configured == GLOBAL_API_BASE => (
-                    fetch_remains_once(&self.http, &api_key, CHINA_API_BASE).await?,
-                    CHINA_API_BASE.to_string(),
-                ),
-                Err(e) => return Err(e),
-            };
-
-            let usage = normalize_usage(&body)?;
+            let (usage, base) = self.fetch_usage(&api_key, configured, Lane::Local).await?;
             Ok((
                 ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage),
                 api_key,
@@ -657,6 +775,34 @@ impl UsageProvider for MinimaxProvider {
         let mut attempt = FetchAttempt::from_provider_usage(Ok(entry));
         attempt.pools = pools;
         attempt
+    }
+}
+
+#[async_trait]
+impl UsageProvider for MinimaxProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        if self.credential_source.is_some() {
+            let vault = self.handle_loader.minimax_handles()?;
+            if !vault.is_empty() {
+                // Vault-only once an apikey handle exists. A static API key
+                // carries no account identity, so an environment lane beside it
+                // would be a second identity-less slot, and the emission gate
+                // would collapse the two into one unlabelled row with an
+                // arbitrary winner. The key the operator put in the vault is the
+                // explicit choice, so it wins over whatever the process inherited.
+                return Ok(vault);
+            }
+        }
+        Ok(vec![CredentialHandle::implicit()])
+    }
+
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        self.fetch_handle_from(handle, |key| std::env::var_os(key))
+            .await
     }
 }
 
@@ -1152,5 +1298,296 @@ mod wallet_tests {
             wallet_pools(br#"{ "base_resp": { "status_code": 0 } }"#),
             Err(FetchError::Decode(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod vault_lane_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use crate::credential_source::{
+        VaultCapability, VaultCredential, VaultGetError, VAULT_READ_MIN_TTL_MS,
+    };
+
+    /// A remains body with one readable window.
+    const REMAINS: &[u8] = br#"{
+      "base_resp": { "status_code": 0 },
+      "model_remains": [{
+        "model_name": "general",
+        "current_interval_total_count": 100,
+        "current_interval_usage_count": 80
+      }]
+    }"#;
+
+    /// A port nothing listens on, for the host a test must not reach.
+    const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    type Reports = Arc<Mutex<Vec<(u16, u64)>>>;
+
+    struct MockCredentialSource {
+        get_result: Result<VaultCredential, VaultGetError>,
+        reports: Reports,
+    }
+
+    #[async_trait]
+    impl CredentialSource for MockCredentialSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            assert_eq!(min_ttl_ms, VAULT_READ_MIN_TTL_MS);
+            self.get_result.clone()
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            provider_status: u16,
+            record_version: u64,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((provider_status, record_version));
+        }
+    }
+
+    fn source(
+        get_result: Result<VaultCredential, VaultGetError>,
+    ) -> (Arc<dyn CredentialSource>, Reports) {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(MockCredentialSource {
+                get_result,
+                reports: Arc::clone(&reports),
+            }),
+            reports,
+        )
+    }
+
+    fn credential(payload: &[u8], record_version: u64) -> VaultCredential {
+        VaultCredential {
+            payload: payload.to_vec(),
+            expires_at_ms: None,
+            record_version,
+            account_id: None,
+            email: None,
+            org_name: None,
+            project_id: None,
+        }
+    }
+
+    fn vault_handle() -> CredentialHandle {
+        CredentialHandle::vault("apikey:minimax", VaultCapability::new("ckh_minimax"))
+    }
+
+    /// A provider whose two regional hosts are the given URLs.
+    fn provider_at(
+        source: Option<Arc<dyn CredentialSource>>,
+        global: &str,
+        china: &str,
+    ) -> MinimaxProvider {
+        let mut provider =
+            MinimaxProvider::new_with_handle_loader(source, Arc::new(VaultHandleLoader::default()));
+        provider.global_base = global.to_string();
+        provider.china_base = china.to_string();
+        provider
+    }
+
+    /// An environment holding exactly these variables.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + Send + Sync + 'static {
+        let values: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key| values.get(key).map(OsString::from)
+    }
+
+    async fn settled(reports: &Reports) -> Vec<(u16, u64)> {
+        // The report is sent from a spawned task; give it a chance to run.
+        for _ in 0..20 {
+            if !reports.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        reports.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_vault_handle_replaces_the_environment_lane() {
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("apikey:minimax", "apikey")]);
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = MinimaxProvider::new_with_handle_loader(Some(source), loader);
+
+        let handles = provider.handles().unwrap();
+        assert_eq!(
+            handles,
+            vec![CredentialHandle::scoped("apikey:minimax", "apikey")],
+            "only the vault lane may be enumerated once a vault key exists"
+        );
+    }
+
+    #[test]
+    fn without_a_vault_handle_the_environment_lane_is_enumerated() {
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = MinimaxProvider::new_with_handle_loader(
+            Some(source),
+            Arc::new(VaultHandleLoader::default()),
+        );
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
+    }
+
+    /// The vault lane sends the vault key even when an environment key is set.
+    ///
+    /// The environment key is present on purpose: without it, a vault fetch that
+    /// fell back to the environment would fail rather than send the wrong key,
+    /// and this test could not tell the two apart.
+    #[tokio::test]
+    async fn the_vault_lane_sends_the_vault_key_not_the_environment_key() {
+        let (base, request) = crate::loopback::serve_once(200, REMAINS.to_vec()).await;
+        let (source, reports) = source(Ok(credential(b"minimax-vault-key", 7)));
+        let provider = provider_at(Some(source), &base, UNREACHABLE);
+
+        let attempt = provider
+            .fetch_handle_from(
+                &vault_handle(),
+                env_of(&[("MINIMAX_API_KEY", "minimax-env-key")]),
+            )
+            .await;
+
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("authorization: bearer minimax-vault-key"),
+            "{request}"
+        );
+        assert!(!request.contains("minimax-env-key"), "{request}");
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// `MINIMAX_API_REGION` picks the host for the vault lane too.
+    #[tokio::test]
+    async fn the_region_setting_applies_to_the_vault_lane() {
+        let (china, request) = crate::loopback::serve_once(200, REMAINS.to_vec()).await;
+        let (source, _) = source(Ok(credential(b"minimax-vault-key", 7)));
+        let provider = provider_at(Some(source), UNREACHABLE, &china);
+
+        let attempt = provider
+            .fetch_handle_from(&vault_handle(), env_of(&[("MINIMAX_API_REGION", "cn")]))
+            .await;
+
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(request
+            .await
+            .unwrap()
+            .starts_with("GET /v1/api/openplatform"));
+    }
+
+    /// A 401 from both hosts is the key being refused, and is reported with the
+    /// record version that served it.
+    #[tokio::test]
+    async fn a_vault_key_refused_with_401_is_reported() {
+        let (global, _) = crate::loopback::serve_once(401, Vec::new()).await;
+        let (china, _) = crate::loopback::serve_once(401, Vec::new()).await;
+        let (source, reports) = source(Ok(credential(b"minimax-vault-key", 44)));
+        let provider = provider_at(Some(source), &global, &china);
+
+        let attempt = provider
+            .fetch_handle_from(&vault_handle(), env_of(&[]))
+            .await;
+
+        assert!(matches!(
+            attempt.usage,
+            Err(FetchError::ProviderStatus(401, _))
+        ));
+        assert_eq!(settled(&reports).await, vec![(401, 44)]);
+    }
+
+    /// A 403 is not reported: it can describe entitlement rather than a bad key.
+    #[tokio::test]
+    async fn a_vault_key_refused_with_403_is_not_reported() {
+        let (global, _) = crate::loopback::serve_once(403, Vec::new()).await;
+        let (china, _) = crate::loopback::serve_once(403, Vec::new()).await;
+        let (source, reports) = source(Ok(credential(b"minimax-vault-key", 44)));
+        let provider = provider_at(Some(source), &global, &china);
+
+        let attempt = provider
+            .fetch_handle_from(&vault_handle(), env_of(&[]))
+            .await;
+
+        assert!(matches!(
+            attempt.usage,
+            Err(FetchError::ProviderStatus(403, _))
+        ));
+        assert!(settled(&reports).await.is_empty());
+    }
+
+    /// A global 401 that the China host then accepts was a region mismatch,
+    /// not a rejected key, so nothing is reported.
+    #[tokio::test]
+    async fn a_global_401_the_china_host_accepts_is_not_reported() {
+        let (global, _) = crate::loopback::serve_once(401, Vec::new()).await;
+        let (china, _) = crate::loopback::serve_once(200, REMAINS.to_vec()).await;
+        let (source, reports) = source(Ok(credential(b"minimax-vault-key", 44)));
+        let provider = provider_at(Some(source), &global, &china);
+
+        let attempt = provider
+            .fetch_handle_from(&vault_handle(), env_of(&[]))
+            .await;
+
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(settled(&reports).await.is_empty());
+    }
+
+    /// The environment lane still reads the environment key.
+    #[tokio::test]
+    async fn the_environment_lane_sends_the_environment_key() {
+        let (base, request) = crate::loopback::serve_once(200, REMAINS.to_vec()).await;
+        let provider = provider_at(None, &base, UNREACHABLE);
+
+        let attempt = provider
+            .fetch_handle_from(
+                &CredentialHandle::implicit(),
+                env_of(&[("MINIMAX_API_KEY", "minimax-env-key")]),
+            )
+            .await;
+
+        assert_eq!(attempt.source.as_deref(), Some("api"));
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(request
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer minimax-env-key"));
+    }
+
+    /// No key in the environment is still an absent credential, with the same
+    /// message as before the vault lane existed.
+    #[tokio::test]
+    async fn a_missing_environment_key_is_still_credential_absent() {
+        let provider = provider_at(None, UNREACHABLE, UNREACHABLE);
+
+        let attempt = provider
+            .fetch_handle_from(&CredentialHandle::implicit(), env_of(&[]))
+            .await;
+
+        let error = attempt.usage.expect_err("no key is configured");
+        assert_eq!(error.error_class(), "credential_absent");
+        assert_eq!(
+            error.to_string(),
+            FetchError::NoSession(
+                "none of [\"MINIMAX_CODING_API_KEY\", \"MINIMAX_API_KEY\"] is set".to_string()
+            )
+            .to_string()
+        );
     }
 }

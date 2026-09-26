@@ -8624,6 +8624,7 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "apikey:deepseek",
         "apikey:openrouter",
         "apikey:opencode",
+        "apikey:minimax",
     ] {
         assert!(
             crate::vault_handles::CREDENTIAL_FAMILIES
