@@ -382,6 +382,16 @@ fn prioritized_quota_slots(
     }
 }
 
+/// Quota objects for a response that carries none of the priority slots.
+///
+/// `subscription` is read only here, never beside the priority slots, and that
+/// is deliberate: on accounts that have the rolling five-hour and weekly limits
+/// it is a legacy field. Measured on insula#33 (2026-09-26): across 6,402
+/// samples over 47 days of heavy use, `subscription.requests` stayed exactly 0
+/// while `rollingFiveHourLimit` moved, and `renewsAt` sat 5 to 6 hours ahead of
+/// each sample, so it is not a billing period either. Publishing it beside the
+/// priority slots would give every such account a window that never moves,
+/// which a consumer could fold into headroom.
 fn fallback_quota_objects(
     root: &serde_json::Map<String, serde_json::Value>,
 ) -> Vec<serde_json::Map<String, serde_json::Value>> {
