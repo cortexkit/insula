@@ -907,6 +907,23 @@ mod tests {
             .contains("multiple identity-less credential rows are refused"));
     }
 
+    /// A granted MiniMax key routes to minimax and a serving vault row for it
+    /// is clean, so the checker reports neither an unmapped id nor a dark lane.
+    #[test]
+    fn the_minimax_api_key_routes_and_a_serving_row_is_clean() {
+        let report = evaluate(
+            granted(&["apikey:minimax"]),
+            usage(vec![healthy("minimax", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        let counts = report.counts.expect("a checked report has counts");
+        assert_eq!(counts.routed, 1, "{report:?}");
+        assert_eq!(counts.checked, 1, "{report:?}");
+        assert_eq!(report.exit_code, 0, "{report:?}");
+    }
+
     #[test]
     fn removing_a_required_family_mapping_is_not_excused_as_unsupported() {
         let families_without_anthropic: Vec<_> = quota_core::vault_handles::CREDENTIAL_FAMILIES
