@@ -776,11 +776,11 @@ mod tests {
             "PT720H is 43200 minutes"
         );
 
-        // The period also reaches `windowMinutes` now, and that is not a leak:
-        // since the window became the tariff alone, the tariff's period IS its
-        // length. It used to be asserted absent because the window measured the
-        // tariff plus a purchased top-up that never refills. The reset stays in
-        // `resetsAt`, where it belongs.
+        // The period belongs in `windowMinutes` too: the window measures only
+        // the tariff, so the tariff's stated period is the window's length.
+        // This was once asserted absent, when the window measured the tariff
+        // plus a purchased top-up that never refills. The reset instant stays
+        // in `resetsAt`.
         assert_eq!(window["windowMinutes"], 43_200);
         assert_eq!(window["resetsAt"], "2026-07-15T06:00:00.000Z");
     }
