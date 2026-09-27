@@ -186,6 +186,17 @@ cargo run -p quota-core --example opencode-stage
 # daemon running, since it dials it for the credential:
 cargo run -p quota-module --example grok-resets
 
+# see what the usage-response fields insula does not read actually hold, for
+# claude or codex. The unread-key log names such fields but never prints values;
+# this prints the fields under study, plus anything shaped like a usage window,
+# with identity values redacted, and every other key as a shape only. It needs a
+# capability handle for one credential in a file, because a standalone binary is
+# a direct vault principal. Revoke the handle afterwards, using ONLY the
+# `revoke with:` line mint-handle prints for it: the lines under it name OTHER
+# consumers' live handles.
+umask 077; ck auth mint-handle --id oauth:anthropic > /tmp/h 2> /tmp/h.err
+QUOTA_PROBE_HANDLE_FILE=/tmp/h cargo run -p quota-module --example unread-fields -- claude
+
 # exercise `credential.list_scoped`, the read half of retiring the hand-edited
 # vault handle map. RUN AS-IS IT REFUSES, AND THAT IS INFORMATIVE: scoped ops are
 # authorised by the caller's bus principal, and a standalone example is a Direct
