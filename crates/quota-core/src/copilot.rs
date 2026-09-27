@@ -148,6 +148,7 @@ fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 

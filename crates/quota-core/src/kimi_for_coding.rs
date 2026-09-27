@@ -229,6 +229,7 @@ fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> 
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 
@@ -301,6 +302,7 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                             used_count: None,
                             total_count: None,
                             regeneration: None,
+                            breakdown: None,
                         }),
                     });
                 }
@@ -325,6 +327,7 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                             used_count: None,
                             total_count: None,
                             regeneration: None,
+                            breakdown: None,
                         }),
                     });
                 }

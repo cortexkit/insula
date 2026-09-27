@@ -297,6 +297,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         });
     }
 
@@ -314,6 +315,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 
@@ -334,6 +336,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
                     used_count: None,
                     total_count: None,
                     regeneration: None,
+                    breakdown: None,
                 });
             }
             if weekly_total(m) == 0 && opt_int(&m.current_weekly_usage_count).unwrap_or(0) == 0 {
@@ -353,6 +356,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         });
     }
 
@@ -374,6 +378,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 

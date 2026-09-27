@@ -712,6 +712,7 @@ fn window_from_map(
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 
@@ -901,6 +902,7 @@ fn window_from_parts(
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 

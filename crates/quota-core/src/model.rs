@@ -397,6 +397,7 @@ mod tests {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         }
     }
 

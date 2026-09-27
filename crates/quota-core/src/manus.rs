@@ -226,6 +226,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         })
     } else {
         return Err(FetchError::Decode("manus: no refilling window".into()));

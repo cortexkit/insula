@@ -510,6 +510,7 @@ pub fn normalize(xml_bytes: &[u8]) -> Result<Normalized, FetchError> {
                 used_count,
                 total_count,
                 regeneration,
+                breakdown: None,
             }),
             secondary: None,
             tertiary: None,

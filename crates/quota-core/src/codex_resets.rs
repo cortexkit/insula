@@ -2165,6 +2165,7 @@ mod tests {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         });
 
         // The upstream is explicit that it is not currently refusing requests.
@@ -2253,6 +2254,7 @@ mod tests {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
             ..Usage::default()
         }
@@ -2326,6 +2328,7 @@ mod tests {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
             secondary: Some(RateWindow {
                 used_percent: 99.4,
@@ -2335,6 +2338,7 @@ mod tests {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
             ..Usage::default()
         };

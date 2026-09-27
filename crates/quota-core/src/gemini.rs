@@ -317,6 +317,7 @@ fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchErr
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         };
         let used_percent = window.used_percent;
         if primary.as_ref().is_none_or(|(_, current_id, current)| {

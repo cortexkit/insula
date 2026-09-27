@@ -224,6 +224,7 @@ fn window_from_used_total_reset(
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 
