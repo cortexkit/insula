@@ -16,8 +16,8 @@
 //! See `docs/balance-axis-design.md` for why the shape is what it is.
 
 pub use cortexkit_provider_usage::{
-    AccountInfo, Amount, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding, ProviderUsage,
-    RateWindow, Regeneration, RegenerationRate, SavedResets, Usage,
+    AccountInfo, Amount, BreakdownRow, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding,
+    ProviderUsage, RateWindow, Regeneration, RegenerationRate, SavedResets, Usage, UsageBreakdown,
 };
 
 /// Every rate window a `Usage` carries, in slot order then extras.

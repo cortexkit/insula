@@ -1323,6 +1323,58 @@ observed, not planned, so it arrives on the wire before anyone can warn you.
 `title` is weaker than both — render it, never match on it, and note that a title
 can legitimately carry mutable detail such as a count of the models in a pool.
 
+### `breakdown`: who consumed a window
+
+`breakdown` is optional on every window, and today exactly one window carries
+it: `claude`'s weekly all-models window (the `secondary` slot,
+`windowMinutes: 10080`). No other `claude` window and no other provider
+publishes one. It is read from `seven_day_breakdown` on Anthropic's
+`/api/oauth/usage`.
+
+```json
+"breakdown": {
+  "asOf": "2026-09-27T08:37:37.083733+00:00",
+  "windowStartedAt": "2026-09-23T14:00:00.060894+00:00",
+  "rows": [
+    { "key": "claude_code", "sharePercent": 100 },
+    { "key": "chat", "sharePercent": 0 },
+    { "key": "cowork", "sharePercent": 0 },
+    { "key": "other", "sharePercent": 0 }
+  ]
+}
+```
+
+**`sharePercent` is a share of consumption, not a used-percent.** Across rows it
+sums to about 100 whatever the window's `usedPercent`: a window 85% used whose
+consumption was all Claude Code reads 100 on `claude_code`, not 85. The part of
+`usedPercent` a surface accounts for is `usedPercent * sharePercent / 100`.
+Every published share is in 0..=100; the wire-sanity checker reports any that
+is not.
+
+**`key` is the upstream's own category key, verbatim.** It is never mapped or
+renamed, and it is not an enum: a category Anthropic adds arrives as itself, so
+handle keys you do not know rather than rejecting the window. The upstream's
+human-facing `display_name` is not carried; render from `key`. A row the
+upstream sent without a key is dropped.
+
+**Absence means unpublished, never zero.** No `breakdown` on the weekly window
+means the upstream sent no split, sent one this module could not read, or sent
+one with no usable rows; it never means nothing was consumed. Likewise a row
+without `sharePercent` means the upstream gave that surface no usable figure
+(missing, non-numeric, or outside 0..=100), not a share of 0. A malformed split
+never fails the fetch: the windows publish without it. `asOf` (when the split
+was computed) and `windowStartedAt` (when the window it describes began, which
+tells you which window a split belongs to across a reset) are each omitted when
+unstated.
+
+**Which surface third-party OAuth clients land in is not confirmed.** Traffic
+from clients such as OpenCode, authenticating through anthropic-auth with a
+Claude subscription, is attributed by Anthropic to one of these keys, and
+which one is not documented. This host's accounts, used through such a client,
+read `claude_code` 100, which fits attribution to `claude_code` but does not
+prove it. Do not build on that mapping without confirming it for your own
+traffic.
+
 ### Fields on the account, not the window
 
 `accountInfo` carries `email`, `orgName` and `planType`, each optional and each

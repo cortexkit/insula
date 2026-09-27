@@ -32,7 +32,9 @@ use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
 use crate::{
     http::{Header, JsonRequest},
-    model::{Amount, Pool, PoolBasis, PoolFunding, RateWindow, Usage},
+    model::{
+        Amount, BreakdownRow, Pool, PoolBasis, PoolFunding, RateWindow, Usage, UsageBreakdown,
+    },
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
 };
@@ -74,6 +76,71 @@ struct OAuthUsageResponse {
     spend: Option<serde_json::Value>,
     /// Only `spend_limit_reached` is read from here; see [`overage_pool`].
     extra_usage: Option<serde_json::Value>,
+    /// The `seven_day` window's consumption split by surface, read by
+    /// [`weekly_breakdown`].
+    ///
+    /// Held as raw JSON for the same reason as `spend`: a shape this decoder
+    /// does not expect costs the split and never the rate windows.
+    seven_day_breakdown: Option<serde_json::Value>,
+}
+
+/// The `seven_day_breakdown` object. Every field is optional because none of
+/// them is documented upstream; only the observed shape is known.
+#[derive(Debug, Deserialize)]
+struct OAuthBreakdown {
+    as_of: Option<String>,
+    window_started_at: Option<String>,
+    /// Kept as raw rows so one unreadable row is dropped on its own instead of
+    /// discarding the whole split.
+    rows: Option<Vec<serde_json::Value>>,
+}
+
+/// One row of `seven_day_breakdown.rows`. The row's `display_name` is not read:
+/// it is UI text, and `key` is the identity.
+#[derive(Debug, Deserialize)]
+struct OAuthBreakdownRow {
+    key: Option<String>,
+    /// Raw, so a non-numeric figure leaves this row's share unstated rather
+    /// than dropping the row.
+    percent: Option<serde_json::Value>,
+}
+
+/// Read `seven_day_breakdown` into the weekly window's split.
+///
+/// Never an error: the split is secondary to the windows, so anything that
+/// cannot be read publishes no split (`None`) and leaves the fetch alone. `None`
+/// also covers "not sent" and "no usable rows", because absence on the wire
+/// means unpublished, and an empty split would read as a statement that
+/// nothing was consumed.
+fn weekly_breakdown(raw: Option<serde_json::Value>) -> Option<UsageBreakdown> {
+    let breakdown: OAuthBreakdown = serde_json::from_value(raw?).ok()?;
+    let rows: Vec<BreakdownRow> = breakdown
+        .rows?
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<OAuthBreakdownRow>(row).ok())
+        .filter_map(|row| {
+            // A row without a key cannot say which surface it is, so it is
+            // dropped. The key is published verbatim, never mapped.
+            let key = row.key?;
+            // A missing, non-numeric, non-finite or out-of-range figure stays
+            // unstated. Defaulting it to 0 would claim the surface consumed
+            // nothing, which the upstream did not say.
+            let share_percent = row
+                .percent
+                .as_ref()
+                .and_then(serde_json::Value::as_f64)
+                .filter(|share| share.is_finite() && (0.0..=100.0).contains(share));
+            Some(BreakdownRow { key, share_percent })
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(UsageBreakdown {
+        as_of: breakdown.as_of,
+        window_started_at: breakdown.window_started_at,
+        rows,
+    })
 }
 
 /// One money figure in the `spend` object: integer minor units, a currency, and
@@ -432,7 +499,12 @@ fn normalize_with_overage(
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
         primary: to_window(response.five_hour.as_ref(), FIVE_HOUR_MINUTES),
-        secondary: to_window(response.seven_day.as_ref(), SEVEN_DAY_MINUTES),
+        // The split describes `seven_day` only, so it goes on that window and
+        // nowhere else.
+        secondary: to_window(response.seven_day.as_ref(), SEVEN_DAY_MINUTES).map(|mut window| {
+            window.breakdown = weekly_breakdown(response.seven_day_breakdown);
+            window
+        }),
         tertiary: to_window(
             response
                 .seven_day_opus
@@ -968,9 +1040,42 @@ mod tests {
             "seven_day": { "utilization": 48.0, "resets_at": "2026-06-24T14:00:00.175619+00:00" },
             "seven_day_oauth_apps": null,
             "seven_day_opus": null,
-            "seven_day_sonnet": { "utilization": 4.0, "resets_at": "2026-06-24T14:00:00.175629+00:00" }
+            "seven_day_sonnet": { "utilization": 4.0, "resets_at": "2026-06-24T14:00:00.175629+00:00" },
+            "seven_day_breakdown": {"as_of":"2026-09-27T08:37:37.083733+00:00","rows":[{"key":"claude_code","percent":100},{"key":"chat","percent":0},{"key":"cowork","percent":0},{"key":"other","percent":0}],"window_started_at":"2026-09-23T14:00:00.060894+00:00"}
         }"#;
         let usage = normalize_usage(body).unwrap();
+        // The split is the weekly window's, and only the weekly window's.
+        let breakdown = usage
+            .secondary
+            .as_ref()
+            .unwrap()
+            .breakdown
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            breakdown.as_of.as_deref(),
+            Some("2026-09-27T08:37:37.083733+00:00")
+        );
+        assert_eq!(
+            breakdown.window_started_at.as_deref(),
+            Some("2026-09-23T14:00:00.060894+00:00")
+        );
+        let rows: Vec<(&str, Option<f64>)> = breakdown
+            .rows
+            .iter()
+            .map(|row| (row.key.as_str(), row.share_percent))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("claude_code", Some(100.0)),
+                ("chat", Some(0.0)),
+                ("cowork", Some(0.0)),
+                ("other", Some(0.0)),
+            ]
+        );
+        assert!(usage.primary.as_ref().unwrap().breakdown.is_none());
+        assert!(usage.tertiary.as_ref().unwrap().breakdown.is_none());
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 16.0); // already a percent, NOT /100
         assert_eq!(primary.window_minutes, Some(300));
@@ -982,6 +1087,93 @@ mod tests {
         assert!(usage.extra_rate_windows.is_none());
         // opus is null, so tertiary falls back to sonnet.
         assert_eq!(usage.tertiary.unwrap().used_percent, 4.0);
+    }
+
+    const BREAKDOWN_WINDOWS: &str = r#"
+        "five_hour": { "utilization": 16.0, "resets_at": "2026-06-22T17:00:00Z" },
+        "seven_day": { "utilization": 48.0, "resets_at": "2026-06-24T14:00:00Z" }"#;
+
+    fn with_breakdown(breakdown: &str) -> Usage {
+        normalize_usage(
+            format!("{{{BREAKDOWN_WINDOWS},\n\"seven_day_breakdown\": {breakdown}}}").as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn weekly_rows(usage: &Usage) -> Vec<(String, Option<f64>)> {
+        usage
+            .secondary
+            .as_ref()
+            .unwrap()
+            .breakdown
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| (row.key.clone(), row.share_percent))
+            .collect()
+    }
+
+    #[test]
+    fn a_breakdown_row_without_a_percent_publishes_no_share_not_zero() {
+        let usage = with_breakdown(
+            r#"{"rows":[{"key":"claude_code","percent":100},{"key":"chat"},{"key":"cowork","percent":"n/a"}]}"#,
+        );
+        assert_eq!(
+            weekly_rows(&usage),
+            vec![
+                ("claude_code".to_string(), Some(100.0)),
+                ("chat".to_string(), None),
+                ("cowork".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_share_is_unstated_and_a_keyless_row_is_dropped() {
+        let usage = with_breakdown(
+            r#"{"rows":[{"key":"claude_code","percent":140},{"key":"chat","percent":-1},{"percent":50},{"key":"other","percent":12.5}]}"#,
+        );
+        assert_eq!(
+            weekly_rows(&usage),
+            vec![
+                ("claude_code".to_string(), None),
+                ("chat".to_string(), None),
+                ("other".to_string(), Some(12.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_breakdown_publishes_no_split_and_leaves_the_windows_alone() {
+        for malformed in [
+            r#""claude_code""#,
+            "[1,2]",
+            r#"{"rows":"none"}"#,
+            r#"{"rows":[]}"#,
+            r#"{"rows":[{"percent":100}]}"#,
+            "null",
+        ] {
+            let usage = with_breakdown(malformed);
+            let primary = usage.primary.as_ref().unwrap();
+            let secondary = usage.secondary.as_ref().unwrap();
+            assert_eq!(primary.used_percent, 16.0, "{malformed}");
+            assert_eq!(secondary.used_percent, 48.0, "{malformed}");
+            assert_eq!(
+                secondary.window_minutes,
+                Some(SEVEN_DAY_MINUTES),
+                "{malformed}"
+            );
+            assert!(secondary.breakdown.is_none(), "{malformed}");
+            assert!(primary.breakdown.is_none(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn no_breakdown_on_the_wire_publishes_no_split() {
+        let usage = normalize_usage(format!("{{{BREAKDOWN_WINDOWS}}}").as_bytes()).unwrap();
+        assert_eq!(usage.secondary.as_ref().unwrap().used_percent, 48.0);
+        assert!(usage.secondary.as_ref().unwrap().breakdown.is_none());
     }
 
     /// The upstream reports each window independently, so a filled `tertiary`
