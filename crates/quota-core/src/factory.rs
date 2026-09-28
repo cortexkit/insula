@@ -242,6 +242,7 @@ fn rate_window_from(
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 

@@ -432,6 +432,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 

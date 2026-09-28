@@ -133,6 +133,13 @@ pub struct SanityReport {
     /// as one that examined hundreds, and the six pool rules are indistinguishable
     /// from rules that never fire.
     pub pools_checked: usize,
+    /// Breakdown `sharePercent` values the range rule examined.
+    ///
+    /// Only a window that publishes a consumption split carries any, and today
+    /// that is Claude's weekly window alone, so most sweeps examine none.
+    /// Counted on its own so a sweep that never met a split is visibly one that
+    /// never ran the rule, rather than one where every share was in range.
+    pub shares_checked: usize,
     /// How many providers had their sibling entries compared against each other.
     ///
     /// Separate from `windows_checked` because the two can diverge sharply: an
@@ -182,6 +189,7 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
                 entry.account.as_deref().unwrap_or("unlabeled")
             );
             check_window(&where_, window, now, &mut report.findings);
+            report.shares_checked += check_breakdown(&where_, window, &mut report.findings);
         }
     }
 
@@ -842,6 +850,34 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
     }
 }
 
+/// Check each published breakdown share is a percentage, and return how many
+/// shares were examined.
+///
+/// A share is a category's part of what the window consumed, so it lives in
+/// 0..=100 like a used-percent. A consumer multiplies it into `usedPercent` to
+/// attribute usage to a surface, so a value outside that range attributes more
+/// (or less) than the window has. An absent share is not checked: it means the
+/// upstream stated no figure for that category.
+fn check_breakdown(where_: &str, window: &RateWindow, findings: &mut Vec<String>) -> usize {
+    let Some(breakdown) = window.breakdown.as_ref() else {
+        return 0;
+    };
+    let mut checked = 0;
+    for row in &breakdown.rows {
+        let Some(share) = row.share_percent else {
+            continue;
+        };
+        checked += 1;
+        if !share.is_finite() || !(0.0..=100.0).contains(&share) {
+            findings.push(format!(
+                "{where_}: breakdown {} sharePercent out of range: {share}",
+                row.key
+            ));
+        }
+    }
+    checked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +892,7 @@ mod tests {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         }
     }
 
@@ -1618,6 +1655,62 @@ mod tests {
                 "{bad} accepted"
             );
         }
+    }
+
+    fn with_shares(shares: &[Option<f64>]) -> RateWindow {
+        let mut w = window(40.0);
+        w.breakdown = Some(cortexkit_provider_usage::UsageBreakdown {
+            as_of: None,
+            window_started_at: None,
+            rows: shares
+                .iter()
+                .enumerate()
+                .map(|(index, share)| cortexkit_provider_usage::BreakdownRow {
+                    key: format!("surface{index}"),
+                    share_percent: *share,
+                })
+                .collect(),
+        });
+        w
+    }
+
+    /// A breakdown share outside 0..=100 is a finding, at both ends and for a
+    /// non-finite value. The window's own percent is in range so the finding has
+    /// exactly one cause.
+    #[test]
+    fn an_out_of_range_share_percent_is_reported() {
+        for bad in [-1.0, 100.5, f64::NAN, f64::INFINITY] {
+            let report = check_entries(
+                &[entry(with_shares(&[Some(50.0), Some(bad)]))],
+                at(FIXTURE_NOW),
+            );
+            assert_eq!(
+                report.findings,
+                vec![format!(
+                    "codex/acct/primary: breakdown surface1 sharePercent out of range: {bad}"
+                )],
+                "{bad} accepted"
+            );
+            assert_eq!(report.shares_checked, 2);
+        }
+    }
+
+    /// The paired silent case: shares at both edges of the range and an absent
+    /// share stay quiet, and the count shows the rule examined the stated ones.
+    #[test]
+    fn in_range_and_absent_share_percents_are_not_reported() {
+        let report = check_entries(
+            &[entry(with_shares(&[
+                Some(100.0),
+                Some(0.0),
+                Some(37.5),
+                None,
+            ]))],
+            at(FIXTURE_NOW),
+        );
+        assert_eq!(report.findings, Vec::<String>::new());
+        assert_eq!(report.shares_checked, 3);
+        assert_eq!(report.windows_checked, 1);
     }
 
     /// `rawUsedPercent` needs its own bound, and its own test.

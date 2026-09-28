@@ -230,6 +230,7 @@ fn parse_window(
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     }))
 }
 

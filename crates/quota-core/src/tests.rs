@@ -1623,6 +1623,7 @@ impl UsageProvider for PairedDropProvider {
                     used_count: None,
                     total_count: None,
                     regeneration: None,
+                    breakdown: None,
                 }),
                 secondary: None,
                 tertiary: None,
@@ -1771,6 +1772,7 @@ async fn a_verdict_discloses_no_staleness_while_a_stale_served_window_does() {
                             used_count: None,
                             total_count: None,
                             regeneration: None,
+                            breakdown: None,
                         }),
                         secondary: None,
                         tertiary: None,
@@ -3643,6 +3645,7 @@ impl UsageProvider for EmptyBodyProvider {
                     used_count: None,
                     total_count: None,
                     regeneration: None,
+                    breakdown: None,
                 }),
                 ..Usage::default()
             };
@@ -6223,6 +6226,7 @@ fn full_usage(percent: f64) -> Usage {
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     };
     Usage {
         primary: Some(window(percent, "01:00", 300)),
@@ -7371,6 +7375,7 @@ impl UsageProvider for StaleDuplicateProvider {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
             ..Usage::default()
         };
@@ -7411,6 +7416,7 @@ impl UsageProvider for ResetDuplicateProvider {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
             ..Usage::default()
         };
@@ -7680,6 +7686,7 @@ fn named_window(id: &str) -> Usage {
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             }),
         }]),
         ..Usage::default()

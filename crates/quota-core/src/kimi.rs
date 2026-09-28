@@ -257,6 +257,7 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
         used_count: None,
         total_count: None,
         regeneration: None,
+        breakdown: None,
     })
 }
 
@@ -315,6 +316,7 @@ fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<Ex
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         }),
     })
 }
@@ -336,6 +338,7 @@ fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         }),
     })
 }

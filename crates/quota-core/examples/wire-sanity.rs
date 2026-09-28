@@ -49,7 +49,7 @@ fn main() {
     // the two apart from the transcript has a pass for a check that never ran.
     println!("lane: local credentials only (vault lane NOT examined; see deployed-sanity)");
     println!(
-        "entries: {} ({} degraded)   windows checked: {}   pools checked: {} ({} amounts, {} bound comparisons, {} resets)   providers compared: {}   warm-up {:.0}s",
+        "entries: {} ({} degraded)   windows checked: {}   pools checked: {} ({} amounts, {} bound comparisons, {} resets)   breakdown shares checked: {}   providers compared: {}   warm-up {:.0}s",
         report.entries,
         report.degraded,
         report.windows_checked,
@@ -57,6 +57,7 @@ fn main() {
         report.pool_amounts_checked,
         report.pool_comparisons,
         report.pool_resets_checked,
+        report.shares_checked,
         report.providers_compared,
         warm_up.as_secs_f64()
     );

@@ -204,6 +204,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 used_count: None,
                 total_count: None,
                 regeneration: None,
+                breakdown: None,
             })
         }
     } else {

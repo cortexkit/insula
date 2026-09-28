@@ -238,6 +238,7 @@ fn rate_limit_to_extra(rate_limit: RateLimitResponse) -> Option<ExtraWindow> {
             used_count: None,
             total_count: None,
             regeneration: None,
+            breakdown: None,
         }),
     })
 }
