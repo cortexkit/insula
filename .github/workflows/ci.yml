@@ -150,28 +150,15 @@ jobs:
         working-directory: insula
         run: ./scripts/check-train-preconditions.sh
 
-      # quota-module path-deps the private cortexkit/subconscious sibling
-      # (subc-protocol/subc-transport, plus subc-core as a dev-dep). The default
-      # GITHUB_TOKEN is scoped to this repo only, so mint a short-lived token from the
-      # org-installed cortexkit-ci GitHub App (Contents: read) to check it out. quota
-      # path-deps ONLY subconscious (not commons), so this is a single-sibling checkout.
-      - name: Mint cross-repo read token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious
-
-      # The path-dep layout is ../subconscious relative to the workspace, so check the
-      # sibling out next to insula.
+      # quota-module path-deps the cortexkit/subconscious sibling (subc-protocol,
+      # subc-transport, plus subc-core as a dev-dep), and only that sibling. It is
+      # public, so no token is needed. The path-dep layout is ../subconscious
+      # relative to the workspace, so check the sibling out next to insula.
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: subconscious
-          token: ${{ steps.app-token.outputs.token }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:

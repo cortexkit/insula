@@ -28,26 +28,16 @@ jobs:
           path: insula
 
       # `cargo metadata` resolves the whole dependency graph, including the
-      # private path-dep sibling -- so this job needs the same checkout the build
-      # legs do. Without it the command fails to load the workspace manifest and
-      # this gate refuses for a reason that has nothing to do with the version,
-      # which is how the first v0.1.0 attempt failed: correctly closed, wrongly
-      # explained.
-      - name: Mint cross-repo read token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious
-
+      # path-dep sibling -- so this job needs the same checkout the build legs
+      # do. Without it the command fails to load the workspace manifest and this
+      # gate refuses for a reason that has nothing to do with the version, which
+      # is how the first v0.1.0 attempt failed: correctly closed, wrongly
+      # explained. The sibling is public, so no token is needed.
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: subconscious
-          token: ${{ steps.app-token.outputs.token }}
 
       # Read the version from the manifest rather than from anywhere it is
       # restated. `cargo metadata` resolves the same value the binary compiles
@@ -101,24 +91,13 @@ jobs:
         with:
           path: insula
 
-      # Same single-sibling checkout as CI: quota-module path-deps the private
-      # cortexkit/subconscious for subc-protocol and subc-transport, and the
-      # default GITHUB_TOKEN cannot read it.
-      - name: Mint cross-repo read token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious
-
+      # Same single-sibling checkout as CI: quota-module path-deps the public
+      # cortexkit/subconscious for subc-protocol and subc-transport.
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: subconscious
-          token: ${{ steps.app-token.outputs.token }}
 
       - uses: dtolnay/rust-toolchain@stable
 
