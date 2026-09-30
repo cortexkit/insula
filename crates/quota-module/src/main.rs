@@ -142,7 +142,30 @@ async fn main() -> Result<(), ModuleError> {
         println!("{message}");
         return Ok(());
     }
-    let config = ModuleConfig::from_env()?;
+    // THE LAUNCH NONCE IS READ HERE, FIRST, before anything that could start a
+    // child process. The daemon hands it over on an inherited pipe (descriptor 3)
+    // that stays inheritable until it is read, and this module spawns system
+    // binaries (`ps`, `lsof`, `security`) from the refresher: each one started
+    // before this line would inherit the pipe holding the one secret that proves
+    // supervised launch. `subc_os::launch_nonce()` reads it once, closes it, and
+    // caches the answer, so the HELLO and the vault client both go through it
+    // again later and get the same value without touching the descriptor.
+    //
+    // An error REFUSES TO START, with the reason printed (never the nonce). It
+    // means the daemon named a descriptor that could not be read: the handoff is
+    // broken. Carrying on would send a HELLO without the nonce, which the daemon
+    // refuses anyway, and open every vault route as `Direct`, which leaves every
+    // vault-backed account dark while the module looks up. Exiting here makes the
+    // daemon report a failed launch at its cause instead.
+    //
+    // After the informational flags on purpose: `--version` reads no nonce and
+    // spawns nothing, and must keep answering in a shell that inherited the
+    // descriptor variable without the descriptor.
+    let launch_nonce = subc_os::launch_nonce().map_err(|error| {
+        eprintln!("{LOG_TAG} refusing to start: cannot read the launch nonce: {error}");
+        ModuleError::Message(format!("launch nonce: {error}"))
+    })?;
+    let config = ModuleConfig::from_env(launch_nonce)?;
     let quota_config = load_quota_config();
     eprintln!(
         "{LOG_TAG} codex banked resets armed={} auto_use_resets={}s (startup-only; arm one host per account)",
@@ -155,10 +178,13 @@ async fn main() -> Result<(), ModuleError> {
 struct ModuleConfig {
     connection_file_path: PathBuf,
     module_id: String,
+    /// From the one `subc_os::launch_nonce()` read at startup. `None` when the
+    /// daemon did not launch this process (run by hand).
+    launch_nonce: Option<subc_os::LaunchNonce>,
 }
 
 impl ModuleConfig {
-    fn from_env() -> Result<Self, ModuleError> {
+    fn from_env(launch_nonce: Option<subc_os::LaunchNonce>) -> Result<Self, ModuleError> {
         let connection_file_path = parse_subc_arg(std::env::args_os().skip(1))?;
         let module_id = std::env::var(SUBC_MODULE_ID_ENV)
             .ok()
@@ -167,6 +193,7 @@ impl ModuleConfig {
         Ok(Self {
             connection_file_path,
             module_id,
+            launch_nonce,
         })
     }
 }
@@ -406,17 +433,25 @@ async fn send_hello(
     config: &ModuleConfig,
 ) -> Result<(), ModuleError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: manifest(&config.module_id),
+        manifest: manifest(
+            &config.module_id,
+            config.launch_nonce.as_ref().map(|nonce| nonce.source()),
+        ),
         protocol_ver: PROTOCOL_VERSION,
         // Advertise health.check so the daemon actively probes us (capability-
         // gated: unadvertised = health "unknown", never probed). We answer L2
         // through the same frame path and report L3 domain health from the sweep.
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        // Echo the one-time launch nonce subc injects via SUBC_LAUNCH_NONCE for a
-        // reserved module; absent (None) for a normally-supervised module like this one.
-        launch_nonce: std::env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty()),
+        // Echo the launch nonce the daemon gave this process, which it checks to
+        // admit the module as itself. Every daemon-launched module has one,
+        // this one included; it is absent only when the binary was run by hand.
+        // Taken from the single startup read, never from the environment: the
+        // environment copy is going away, and the descriptor can be read only
+        // once.
+        launch_nonce: config
+            .launch_nonce
+            .as_ref()
+            .map(|nonce| nonce.value().to_string()),
     })
     .map_err(ModuleError::Json)?;
     // Channel-0 control frame: epoch is always 0.
@@ -1231,7 +1266,29 @@ fn build_lock_digest() -> Option<String> {
     (!raw.is_empty()).then(|| raw.to_string())
 }
 
-fn manifest(module_id: &str) -> ModuleManifest {
+/// Map the accessor's answer onto the protocol's vocabulary for provenance.
+///
+/// Two enums because subc-os does not depend on subc-protocol. The subc-os enum
+/// is `#[non_exhaustive]`, so a source added there is passed through by its own
+/// wire name rather than forced into `fd` or `env`, which would each be a claim
+/// about how this process was launched.
+fn launch_nonce_source_wire(
+    source: subc_os::LaunchNonceSource,
+) -> subc_protocol::manifest::LaunchNonceSource {
+    use subc_protocol::manifest::LaunchNonceSource as Wire;
+    match source {
+        subc_os::LaunchNonceSource::Fd => Wire::Fd,
+        subc_os::LaunchNonceSource::Env => Wire::Env,
+        other => Wire::from_wire_name(other.as_str()),
+    }
+}
+
+/// `launch_nonce_source` is where this process read its launch nonce from, or
+/// `None` when it has none; it is published in the manifest provenance.
+fn manifest(
+    module_id: &str,
+    launch_nonce_source: Option<subc_os::LaunchNonceSource>,
+) -> ModuleManifest {
     // Built through the builder rather than as a literal: `ModuleManifest` is
     // `#[non_exhaustive]` upstream, so a field added there becomes a compile
     // error here instead of a silent default. That is the point of the shape,
@@ -1477,9 +1534,14 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // `store_schema_version` is None as an ABSENT FACT rather than an unfilled
     // blank: this module owns no persistent store. `wire_crate_version` is filled
     // by the constructor from the linked crate, so it is no longer ours to pass.
-    .provenance(
-        build_provenance().ok(),
-    )
+    //
+    // `launch_nonce_source` says how the running process got its launch nonce:
+    // `fd` from the daemon's pipe, `env` from the environment copy that is being
+    // retired, absent when there is none. It is what shows a census that this
+    // module has moved to the pipe, so it must follow the actual read.
+    .provenance(build_provenance().ok().map(|provenance| {
+        provenance.with_launch_nonce_source(launch_nonce_source.map(launch_nonce_source_wire))
+    }))
     .capabilities(
         // No versioned capability grammar declared. `None` and an empty block are
         // NOT the same statement: the protocol makes this optional precisely so a
@@ -1596,7 +1658,7 @@ mod tests {
     /// telling the fleet it only observes.
     #[test]
     fn manifest_declares_every_self_signal_including_the_mutators() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
         let signals = m
             .self_signals
             .expect("manifest must declare self-signals, not stay silent");
@@ -1638,7 +1700,7 @@ mod tests {
     /// with it, and a declaration hand-edited to a different number fails here.
     #[test]
     fn the_vault_refresh_declaration_names_the_real_read_floor() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
         let signals = m.self_signals.expect("self-signals declared");
         let refresh = signals
             .iter()
@@ -1678,7 +1740,7 @@ mod tests {
     /// would agree with them.
     #[test]
     fn manifest_states_a_true_trust_tier_and_no_storage_it_does_not_own() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
 
         assert_eq!(
             m.trust_tier,
@@ -1710,7 +1772,7 @@ mod tests {
     /// AGREEMENT rather than on a remembered spelling.
     #[test]
     fn manifest_declares_the_credential_vault_it_actually_dials() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
 
         let named: Vec<&str> = m
             .consumes
@@ -1753,7 +1815,7 @@ mod tests {
     /// dispatches on, no more.
     #[test]
     fn every_advertised_operation_is_one_the_router_answers() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
 
         let advertised: Vec<&str> = m
             .provides
@@ -1891,7 +1953,7 @@ mod tests {
 
     #[test]
     fn manifest_provenance_states_what_it_can_source_and_nothing_else() {
-        let m = manifest("insula");
+        let m = manifest("insula", None);
         let p = m.provenance.expect("manifest must state provenance");
 
         match p.build_git_sha.as_deref() {
@@ -1962,6 +2024,48 @@ mod tests {
             p.store_schema_version.is_none(),
             "this module owns no persistent store, so it has no schema version to state"
         );
+    }
+
+    /// The provenance names where the launch nonce was read from, and nothing when
+    /// there was none.
+    ///
+    /// A census reads this field to tell a module that has moved to the daemon's
+    /// pipe from one still on the environment copy, and the environment copy is
+    /// going away. Declaring nothing while a nonce exists would list this module
+    /// as not having moved; declaring a source while none exists would claim a
+    /// supervised launch that did not happen. Checked on the serialized manifest
+    /// as well, because the census reads the wire spelling (`"fd"`), not the enum.
+    #[test]
+    fn manifest_provenance_declares_where_the_launch_nonce_came_from() {
+        use subc_protocol::manifest::LaunchNonceSource as Wire;
+        for (read, expected, wire_name) in [
+            (
+                Some(subc_os::LaunchNonceSource::Fd),
+                Some(Wire::Fd),
+                Some("fd"),
+            ),
+            (
+                Some(subc_os::LaunchNonceSource::Env),
+                Some(Wire::Env),
+                Some("env"),
+            ),
+            (None, None, None),
+        ] {
+            let m = manifest("insula", read);
+            let serialized = serde_json::to_value(&m).expect("the manifest serializes");
+            let p = m.provenance.expect("manifest must state provenance");
+            assert_eq!(
+                p.launch_nonce_source, expected,
+                "a nonce read from {read:?} must be declared as {expected:?}"
+            );
+            assert_eq!(
+                serialized["provenance"]
+                    .get("launch_nonce_source")
+                    .and_then(|v| v.as_str()),
+                wire_name,
+                "the wire spelling for a nonce read from {read:?}"
+            );
+        }
     }
 
     /// Every health metric this module publishes is explained in the contract.

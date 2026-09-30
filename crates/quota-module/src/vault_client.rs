@@ -953,17 +953,30 @@ pub struct VaultClient {
 
 /// The supervisor-issued identity that earns a `Reserved` principal, or `None`.
 ///
-/// Both variables are injected at spawn (`SUBC_MODULE_ID`, `SUBC_LAUNCH_NONCE`)
-/// and are present on the running module; they are absent when the binary is run
-/// by hand, which is exactly when `Direct` is the honest answer. So an absent
-/// value is omitted rather than defaulted -- a fabricated nonce would be refused
-/// with `bad_consumer_identity`, turning "I am not supervised" into "I tried to
-/// forge an identity".
+/// Both halves are handed over at spawn -- the module id in `SUBC_MODULE_ID`, the
+/// launch nonce on the descriptor the daemon passes -- and are present on the
+/// running module; they are absent when the binary is run by hand, which is
+/// exactly when `Direct` is the honest answer. So an absent value is omitted
+/// rather than defaulted -- a fabricated nonce would be refused with
+/// `bad_consumer_identity`, turning "I am not supervised" into "I tried to forge
+/// an identity".
+///
+/// THE NONCE COMES FROM `subc_os::launch_nonce()`, NEVER THE ENVIRONMENT. That
+/// accessor reads the descriptor once, closes it and caches the answer; `main`
+/// makes the first call at startup and refuses to start on an error, so this
+/// call only ever sees the cached value. Reading the environment copy instead
+/// would stop working when the daemon stops setting it, and a second reader of
+/// the descriptor would close whatever the process had since opened at that
+/// number. An error here (unreachable after startup) is treated as no nonce.
 ///
 /// THE NONCE IS NEVER LOGGED. It is the proof of supervised launch, so it goes on
 /// the wire and nowhere else -- not into an error string, not into a Debug.
 fn consumer_identity() -> Option<serde_json::Value> {
-    consumer_identity_from(|key| std::env::var(key).ok())
+    let launch_nonce = subc_os::launch_nonce().ok().flatten();
+    consumer_identity_from(
+        |key| std::env::var(key).ok(),
+        launch_nonce.as_ref().map(|nonce| nonce.value()),
+    )
 }
 
 /// Over an arbitrary environment, so both outcomes are testable without mutating
@@ -974,9 +987,15 @@ fn consumer_identity() -> Option<serde_json::Value> {
 /// concurrent test and nothing flakes only until two files touch the same name.
 /// Injection is the established shape here (`env::home_dir_from`,
 /// `opencode_auth::auth_path_from`).
-fn consumer_identity_from(lookup: impl Fn(&str) -> Option<String>) -> Option<serde_json::Value> {
+///
+/// The nonce is a parameter rather than a lookup key because it no longer lives
+/// in the environment (see `consumer_identity`).
+fn consumer_identity_from(
+    lookup: impl Fn(&str) -> Option<String>,
+    launch_nonce: Option<&str>,
+) -> Option<serde_json::Value> {
     let module_id = lookup("SUBC_MODULE_ID").filter(|value| !value.is_empty())?;
-    let launch_nonce = lookup("SUBC_LAUNCH_NONCE").filter(|value| !value.is_empty())?;
+    let launch_nonce = launch_nonce.filter(|value| !value.is_empty())?;
     Some(serde_json::json!({
         "module_id": module_id,
         "launch_nonce": launch_nonce,
@@ -2175,11 +2194,10 @@ mod tests {
     /// took reading the daemon's source to tell the two apart.
     #[test]
     fn consumer_identity_fields_match_the_daemons_wire_names() {
-        let identity = consumer_identity_from(|key| match key {
-            "SUBC_MODULE_ID" => Some("insula".to_string()),
-            "SUBC_LAUNCH_NONCE" => Some("nonce-value".to_string()),
-            _ => None,
-        })
+        let identity = consumer_identity_from(
+            |key| (key == "SUBC_MODULE_ID").then(|| "insula".to_string()),
+            Some("nonce-value"),
+        )
         .expect("a supervised environment yields an identity");
 
         assert_eq!(identity["module_id"], "insula");
@@ -2207,25 +2225,26 @@ mod tests {
     /// different thing.
     #[test]
     fn an_unsupervised_process_presents_no_identity() {
-        assert!(consumer_identity_from(|_| None).is_none());
+        assert!(consumer_identity_from(|_| None, None).is_none());
 
         // A HALF-SET ENVIRONMENT IS ALSO NO IDENTITY. A module id without a nonce
         // cannot be validated, so presenting it earns a refusal rather than being
         // ignored -- and this arm is the one a `?` on only the first lookup would
         // miss.
         assert!(consumer_identity_from(
-            |key| (key == "SUBC_MODULE_ID").then(|| "insula".to_string())
+            |key| (key == "SUBC_MODULE_ID").then(|| "insula".to_string()),
+            None,
         )
         .is_none());
-        assert!(consumer_identity_from(
-            |key| (key == "SUBC_LAUNCH_NONCE").then(|| "nonce".to_string())
-        )
-        .is_none());
+        assert!(consumer_identity_from(|_| None, Some("nonce")).is_none());
 
         // An empty value is absence, not a value: the supervisor sets both, so a
         // blank one means something upstream went wrong and forging past it would
         // hide that.
-        assert!(consumer_identity_from(|_| Some(String::new())).is_none());
+        assert!(consumer_identity_from(|_| Some(String::new()), Some("")).is_none());
+        // Each blank on its own, so a filter dropped from either half reddens.
+        assert!(consumer_identity_from(|_| Some("insula".to_string()), Some("")).is_none());
+        assert!(consumer_identity_from(|_| Some(String::new()), Some("nonce")).is_none());
     }
 
     fn classify(code: &str) -> ClientFailure {
