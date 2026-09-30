@@ -768,7 +768,12 @@ fn no_production_source_reads_the_launch_nonce_directly() {
         "quota-module/src/vault_client.rs",
     ] {
         assert!(
-            examined.iter().any(|path| path.ends_with(required)),
+            // By path components, not by string suffix: on Windows the examined
+            // paths are joined with `\`, so a string suffix with `/` never matches
+            // and the guard would fire on a correct scan.
+            examined
+                .iter()
+                .any(|path| std::path::Path::new(path).ends_with(required)),
             "the scan must cover {required}, which reads the nonce; examined {examined:?}"
         );
     }
