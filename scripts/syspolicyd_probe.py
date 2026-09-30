@@ -64,7 +64,11 @@ def probe_source() -> str:
     every few seconds would make the watcher part of the load it watches for.
     """
     global _PROBE_SRC
-    if _PROBE_SRC:
+    # The cache is dropped when its file is gone. A fleet sweep deletes every
+    # `target/debug` it finds idle (daily, from 2026-10-01), and a long-running
+    # watcher that kept the dead path would fail every copy and read -1.0
+    # ("nothing measured") for the rest of its life: safe, but blind.
+    if _PROBE_SRC and os.path.isfile(_PROBE_SRC):
         return _PROBE_SRC
     root = os.path.expanduser("~/Work/Projects/CortexKit")
     skip = (".rlib", ".rmeta", ".d", ".o", ".dylib", ".so", ".a")
