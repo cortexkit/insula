@@ -15,6 +15,11 @@ subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
 subc-daemon = { path = "../subconscious/crates/subc-daemon" }
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
+# `subc_os::launch_nonce()` is the one reader of the launch nonce the daemon hands
+# a supervised module on descriptor 3. It must be the only reader in the process:
+# it closes the descriptor after reading, so a second reader would hit whatever
+# the process opened next at that number.
+subc-os = { path = "../subconscious/crates/subc-os" }
 
 # The shared usage.get wire types (ProviderUsage/Usage/RateWindow + account/reset
 # metadata), extracted to cortexkit/commons so every consumer (ALF's router,

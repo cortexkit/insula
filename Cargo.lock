@@ -1150,6 +1150,7 @@ dependencies = [
  "sha2",
  "subc-daemon",
  "subc-jsonc",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -1605,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libc",
  "rustix",

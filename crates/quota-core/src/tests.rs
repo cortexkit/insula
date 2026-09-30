@@ -303,6 +303,18 @@ fn no_provider_builds_its_own_http_client() {
 /// `scripts/prod_body.py` has cut correctly for weeks. The rule existed in the
 /// tooling and not in the tests, which is why five checks here shared one defect.
 fn production_body(source: &str) -> String {
+    production_lines(source)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The lines `production_body` keeps, each with its 1-based line number in the
+/// original file, for a check that has to name where an offender is. One
+/// implementation of the rule serves both, so they cannot disagree about what
+/// counts as a test module.
+fn production_lines(source: &str) -> Vec<(usize, &str)> {
     let lines: Vec<&str> = source.lines().collect();
     let mut kept = Vec::with_capacity(lines.len());
     let mut index = 0;
@@ -323,11 +335,11 @@ fn production_body(source: &str) -> String {
             index += 1;
             continue;
         }
-        kept.push(lines[index]);
+        kept.push((index + 1, lines[index]));
         index += 1;
     }
 
-    kept.join("\n")
+    kept
 }
 
 /// No provider offers an implicit local lane BESIDE vault handles, except one.
@@ -667,6 +679,103 @@ fn production_stderr_emissions_do_not_hard_code_ck_tags() {
     assert!(
         examined > 55,
         "expected to examine both crates' production modules; examined only {examined}"
+    );
+}
+
+/// Every read of the launch nonce in production source, as `path:line: text`,
+/// with the files examined.
+///
+/// A read is a string literal naming either nonce variable, or one of the
+/// constants that name them. Whole-line comments are skipped so the reasons for
+/// the rule can be written down beside the code; a trailing comment is not, which
+/// errs towards a false alarm rather than a missed read.
+fn launch_nonce_reads_in(dirs: &[std::path::PathBuf]) -> (Vec<String>, Vec<String>) {
+    const LITERALS: [&str; 2] = ["\"SUBC_LAUNCH_NONCE\"", "\"SUBC_LAUNCH_NONCE_FD\""];
+    const CONSTANTS: [&str; 3] = [
+        "SUBC_LAUNCH_NONCE_ENV",
+        "LAUNCH_NONCE_ENV",
+        "LAUNCH_NONCE_FD_ENV",
+    ];
+    let mut offenders = Vec::new();
+    let mut examined = Vec::new();
+
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).expect("the source directory must be readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            // The test module file holds this check's own list of names.
+            if path.file_name().is_some_and(|name| name == "tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            examined.push(path.display().to_string());
+            for (number, line) in production_lines(&source) {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // Whole identifiers only: `LAUNCH_NONCE_ENV` is a suffix of
+                // `SUBC_LAUNCH_NONCE_ENV`, and both are listed in their own right.
+                let names_a_constant = line
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|token| CONSTANTS.contains(&token));
+                let names_a_literal = LITERALS.iter().any(|literal| line.contains(literal));
+                if names_a_constant || names_a_literal {
+                    offenders.push(format!("{}:{number}: {}", path.display(), line.trim()));
+                }
+            }
+        }
+    }
+    (offenders, examined)
+}
+
+/// Nothing in production reads the launch nonce except `subc_os::launch_nonce()`.
+///
+/// The daemon hands a supervised module its launch nonce on an inherited pipe,
+/// descriptor 3, and for now also in the environment. The accessor reads the
+/// pipe once, closes it and caches the value. So two rules follow, and a direct
+/// read breaks one of them:
+///
+/// - reading the environment copy works today and fails silently when the daemon
+///   stops setting it: HELLO goes out with no nonce and every vault route opens
+///   as `Direct`, so every vault-backed account goes dark;
+/// - reading the descriptor a second time reads and closes whatever the process
+///   has opened at number 3 since, which is some unrelated socket or file.
+///
+/// BOTH CRATES: the direct reads this replaced were in `quota-module`, outside
+/// this crate's own `src`, so a walk of this crate alone would pass while
+/// missing the only places they ever were. And because a scan that finds no
+/// files also finds no offenders, the test first asserts that it examined some
+/// files, including `main.rs` and `vault_client.rs` in the module crate, before
+/// trusting an empty offender list.
+#[test]
+fn no_production_source_reads_the_launch_nonce_directly() {
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../quota-module/src")
+        .canonicalize()
+        .expect("the sibling module crate must be present in this workspace");
+    let dirs = [core, module];
+    let (offenders, examined) = launch_nonce_reads_in(&dirs);
+
+    assert!(
+        !examined.is_empty(),
+        "the scan examined no source files in {dirs:?}, so it proves nothing"
+    );
+    for required in [
+        "quota-module/src/main.rs",
+        "quota-module/src/vault_client.rs",
+    ] {
+        assert!(
+            examined.iter().any(|path| path.ends_with(required)),
+            "the scan must cover {required}, which reads the nonce; examined {examined:?}"
+        );
+    }
+    assert!(
+        offenders.is_empty(),
+        "read the launch nonce through subc_os::launch_nonce(), not directly:\n{}",
+        offenders.join("\n")
     );
 }
 

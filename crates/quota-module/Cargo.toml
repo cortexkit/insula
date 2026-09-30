@@ -24,6 +24,7 @@ quota-core = { path = "../quota-core" }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
+subc-os = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
