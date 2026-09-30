@@ -1273,6 +1273,389 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.66.0 → v0.70.0
+
+Four tags: v0.67.0, v0.68.0, v0.69.0 and v0.70.0. All EIGHT opaque constants
+are present at `v0.70.0`, located by VALUE in the tagged tree (`git grep -l -F
+<value> v0.70.0 -- Sources Resources`), each in the same file as at `v0.66.0`.
+None moved:
+
+| Constant | Value located in (`v0.70.0`) |
+|---|---|
+| `WORKSPACES_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `BILLING_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `SUBSCRIPTION_SERVER_ID` | `OpenCode/OpenCodeUsageFetcher.swift` |
+| `BETA_HEADER` (`oauth-2025-04-20`) | `Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift` |
+| `OASIS_WEB_ID` | `StepFun/StepFunUsageFetcher.swift` |
+| `CONSOLE_WORKSPACES_PATH` (`/console/api/orgs`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_GO_STATUS_PATH` (`/console/api/go/status`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_WORKSPACE_HEADER` (`x-org-id`) | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+
+Paths are under `Sources/CodexBarCore/Providers/`.
+
+**Size and what moved.** 246 files changed under `Sources/CodexBarCore`
+(+9940/−9435), 160 of them under `Providers/` (+3178/−8027). Nineteen files
+were deleted under `Providers/`. Five providers' Swift fetchers were replaced by
+bundled plugins (`Sources/CodexBarCore/Resources/Plugins/<id>.js`): Sakana
+(v0.67.0), Abacus (v0.68.0), LongCat, Notion and ZoomMate (v0.69.0). Three
+providers were added, each as a plugin: Aixy, Raycast and xKiro (v0.67.0). The
+remaining deletion is `Qoder/QoderUsageError.swift`, dead since Qoder's
+migration last round. No provider left the registry. Most of the rest is one
+refactor: about thirty descriptors now declare themselves through a shared
+`PluginProviderSpec` (metadata, branding, settings), and many providers only
+changed colour. The plugin runtime gained optional second requests
+(`getWithOptional`), form POST bodies, bounded per-plugin storage and a host
+cookie jar. Those are new capabilities for plugins; they change no request an
+existing plugin we port sends.
+
+**Of the files we cite, one is gone: Sakana's.** `SakanaUsageFetcher.swift`
+and its test file were deleted when Sakana moved to `sakana.js`. Every other
+file our modules cite is present at `v0.70.0`, and no deleted file is one a
+port of ours depends on.
+
+**Triage method, as last round.** Each served provider's diff, and for Sakana
+the `v0.66.0` Swift fetcher against the `v0.70.0` plugin, was filtered for
+changed lines naming a URL, cookie, header, JSON key, sign-in or redirect term,
+parsing rule, or error mapping. **Nothing in this range changes what we request
+or how we read the answer on the five live accounts (Claude, Antigravity, Grok,
+Codex, Cursor).** Two upstream rules are stricter than ours and are listed as
+ports: Antigravity's explicit bucket cadence and Grok's gRPC-web frame flags.
+Separately, z.ai has a gap that predates this range. No provider behaviour
+changes here.
+
+Every provider directory we implement was checked. Changed in this range:
+Alibaba, Amp, Antigravity, Claude, ClinePass, Codebuff, Codex, Copilot, Cursor,
+DeepSeek, Doubao, ElevenLabs, Gemini, Grok, JetBrains, Kilo, Kimi, LLMProxy,
+Manus, MiniMax, NeuralWatt, OpenCode, OpenCode Go, OpenRouter, Qoder, QwenCloud,
+Sakana, Sub2API, Synthetic, Warp and ZenMux. Of the plugins we port against,
+`clinepass`, `openrouter`, `sakana` and `zai` changed. Unchanged: Factory,
+MiMo, Ollama, StepFun, `Shared/`, and the Zai directory (its fetch is
+`zai.js`, covered below). LLMProxy belongs in this list: `llmproxy.rs`
+implements it, although it is easy to mistake for one of the unported gateways.
+
+**Claude (14 files): no effect on the OAuth lane.** `anthropic.rs` reads only
+`GET api.anthropic.com/api/oauth/usage`. Upstream's parser for that response,
+`ClaudeOAuth/ClaudeOAuthUsageFetcher.swift`, is byte-identical across the
+range, and so are `ClaudeScopedWeeklyLimitMapper.swift` (the `limits[]`
+`weekly_scoped` mapping) and `ClaudeWeb/ClaudeWebExtraRateWindowParser.swift`.
+The OAuth-to-snapshot mapping in `ClaudeUsageFetcher.swift` changed only by a
+refactor (the configuration accessors were inlined). So upstream reads no new
+window, scope, breakdown or overage field. It does not change how it reads
+`is_active`, `scope.model.id` against `display_name`, or `extra_usage`, and it
+has nothing like our per-surface weekly breakdown. The changes:
+- Limit-reset credits, from the claude.ai **Web** lane only (v0.69.0,
+  `8d76a4205`, `9bcab5803`). `ClaudeWebAPIFetcher.swift` now requests
+  `claude.ai/api/organizations/{org}/usage?cedar_ember=1` with the `sessionKey`
+  cookie and no URL cache. It reads a `cedar_ember` block (`eligible`, `grants[]`
+  with `resets_left`, `resets_total`, `starts_at`, `ends_at` and `paused`) into
+  an inventory of free resets (new `ClaudeRateLimitResetCredits.swift`). Any
+  status other than 200, 401 or 429, and not a Cloudflare challenge, is retried
+  once without the opt-in. The inventory is a display row, not a window. We have
+  no Web lane. Declined.
+- Admin API workspace spend (v0.67.0, `b9844e4d7`): with
+  `ANTHROPIC_ADMIN_WORKSPACE_SPEND=true` the cost report is also grouped by
+  `workspace_id`. That is the Admin-key cost provider, which we do not
+  implement.
+- `ClaudeOAuthCredentials.swift`: CodexBar's own Keychain cache now keeps a
+  credential it already read when the cache is briefly unavailable (v0.68.0,
+  `5aaa29fa1`; v0.69.0, `66004975a`). Keychain-only; we do not read the
+  Keychain.
+- The rest is `@ProcessEnvironment` wrapping (v0.70.0, `ee6a89d90`), a redaction
+  change that touches no request.
+
+**Antigravity (9 files): cloud lane converged with ours; one stricter rule.**
+`62acfd8ea` (v0.69.0, "group OAuth quotas and parse Starter weekly quotas")
+makes upstream's cloud lane do what `antigravity.rs` already does. It calls
+`POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` first,
+with the same `{"project": …}` body, and falls back to `fetchAvailableModels`
+plus `retrieveUserQuota`. Endpoints, bucket ids (`gemini-5h`, `gemini-weekly`,
+`3p-5h`, `3p-weekly`) and tier detection (`resolvePlan`, only moved) are
+unchanged, and no changed line in the directory touches tier or account
+gating, so our paid-tier guard has nothing to follow. Against
+`antigravity.rs`:
+- Already ported: summary first; publishing the summary as named per-pool
+  windows with no unnamed primary; weekly-only Starter (free-tier) payloads,
+  which our parser handles like any other bucket set.
+- **Cadence precedence differs.** Upstream's `quotaCadenceCandidates` now reads
+  ONLY the bucket's `window` when it is present, and falls back to `bucketId` and
+  `displayName` only when it is absent. `quota_cadence_candidates` unions all
+  three, and session aliases win over weekly. So `{"bucketId":"gemini-5h",
+  "window":"weekly"}` is weekly upstream and 300 minutes here. `"window":
+  "unknown"` with that id is no cadence upstream and 300 minutes here. Upstream
+  fixtures: `Tests/CodexBarTests/AntigravityQuotaSourceParityTests.swift`
+  (`explicit cadence takes precedence over legacy bucket names`). On today's live
+  wire, `window` and the id agree, so nothing wrong is published yet. See
+  Recommended ports.
+- Fallback breadth differs, by design. Upstream falls back to the per-model lane
+  on any summary failure except 401 and cancellation, including a timeout (it
+  caps the summary call at 2 s), a 5xx, and a summary with no enabled bucket
+  that has a fraction. `summary_unavailable` falls back only on a refusal (403,
+  404, 401). A summary with no known bucket reads as `decode_failed`. The module
+  explains why: the fallback lane publishes one cadence-less window, so
+  degrading to it on a transient failure trades a retryable error for a quieter
+  wrong number. Declined, standing.
+- `AntigravityProviderDescriptor.swift`: the `agy -p /usage` subprocess now
+  reaps MCP servers it leaves behind (`231bbef9c`, `d58804f78`, `e45ea8feb`,
+  v0.69.0). We never spawn `agy`; the local lane talks to an already-running
+  process's server. No effect.
+- `AntigravityLocalSQLite*.swift`, `AntigravityLocalReader.swift` and
+  `AntigravityLocalScan.swift` change local token-history scanning and pricing
+  aliases (v0.67.0, `79b38f346`; `fb7d4a914`). That is local cost with no
+  denominator, the standing decline. The OAuth credentials store only changed
+  how it writes its file.
+
+**Grok (7 files): no effect on our lane; one stricter framing rule.** The request
+is unchanged: the same `POST
+grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`, gRPC-web, with
+the same headers.
+- Product breakdown. The CLI credits-proxy JSON now carries
+  `productUsage[]` (`product`, `usagePercent`) (v0.67.0, `bbeb03cd9`), and the
+  web path decodes the same shares from repeated `[1, 7]` entries (`{1:
+  product id, 2: fixed32 percent}`; id 2 is GrokBuild, id 4 is GrokChat)
+  (v0.69.0, `d0a11a4aa`). They are kept only when they add up, within 1 point,
+  to the `[1, 1]` credit percent. They split the one credit window by product,
+  and are not a separate quota. Our scan does recurse into `[1, 7]`, but those
+  fixed32 values sit at field 2, and our percent rule takes the shallowest
+  fixed32 whose path ends in field 1. The live fixture upstream checked in (6 =
+  Chat 4 + Build 2) still reads 6 here. No effect. Porting the breakdown would
+  add detail, not a window; declined for now.
+- Shared wire reader (`GrokProtobufField.swift`, new; `b9ea0da7b`, v0.69.0).
+  Billing, reset-coupon and timestamp parsing share one bounded reader. Two
+  rules got stricter. First, `grpcWebDataFrames` now rejects the whole body if a
+  frame's flag byte is anything but `0x00` or `0x80`, where it used to take a
+  compressed (`0x01`) frame's bytes as protobuf. Second, a malformed field ends
+  the scan and marks it incomplete, where it used to skip a byte and resync.
+  `grok.rs` still takes any frame without bit `0x80` as data. It still skips a
+  byte on a zero key, and on any other malformed field it stops without an
+  incomplete flag. We send no `grpc-accept-encoding`, so a compressed frame is
+  not expected. See Recommended ports.
+- `GetRemainingResets` (`GrokRemainingResetsFetcher.swift`: `POST
+  grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets`) only moved to the
+  shared reader: token records at field 10, then id, granted and expiry at 10,
+  20 and 30. A timestamp must now sit in a message that parses completely. We do
+  not call it.
+- Identity. `GrokAuth.swift` is unchanged, and upstream still takes `email` and
+  `team_id` from `~/.grok/auth.json`, never the token's `sub`. `grok.rs` names
+  the account by `sub`, which equals that file's `user_id`: a different source
+  for the same account, not a gap (as recorded last round).
+- `GrokLocalSessionScanner.swift` (local token history when billing is
+  unavailable, `03f4b6888`, v0.69.0) and the reset-credit detail rows are
+  local or display only.
+
+**Codex (5 files): no effect.** The `wham/usage` parse is unchanged:
+`CodexOAuth/CodexOAuthUsageFetcher.swift`, `CodexAdditionalRateLimitMapper.swift`
+and `CodexReconciledState.swift` are byte-identical across the range, so
+`spend_control`, credits, `plan_type` and the reset-credit fields read as they
+did. `9013fd81b` (v0.69.0) makes the OAuth strategy reread `auth.json` up to
+twice, 50 ms apart, when the token it finds needs a refresh, because the CLI may
+be publishing a new one. It still never redeems the CLI's refresh token. `codex.rs`
+already reads the file on every fetch and never refreshes, so the next tick picks
+up a republished token. The same commit's plan-change invalidation of old reset
+evidence lives in the app target (`Sources/CodexBar/`), not in the fetch. The
+dashboard link moved to `chatgpt.com/codex/cloud/settings/analytics#usage`
+(v0.68.0, `41ad05db3`, `c584b448a`); that is a link, not a request.
+`CodexHomeScope.swift` only adds app-server process detection.
+
+**Cursor (2 files): no effect.** The cost-events lane clamps an all-history
+`startDate` to the Unix epoch, because Cursor answers a negative timestamp with
+HTTP 500 (v0.68.0, `a7ad58d61`, `d9ec1b116`). The rest is palette. `cursor.rs`
+reads only `GET cursor.com/api/usage-summary`, which did not change.
+
+**Sakana (2 files): no effect; citation annotated.** `SakanaUsageFetcher.swift`
+was deleted and `sakana.js` became the fetch path (v0.67.0, `461253181`). The
+plugin sends the same request as `sakana.rs`: `GET
+console.sakana.ai/billing` with the `SAKANA_COOKIE` header, `Accept:
+text/html,application/xhtml+xml`, `Accept-Language: en-US,en;q=0.9`, and a 15 s
+timeout. Its error mapping is ours too. A 401, a 403, a 3xx, or a final URL off
+`https://console.sakana.ai` means login required; any other non-200 is an API
+failure. So is the parse: the `5-hour` and `Weekly` label paragraphs, a body
+bounded by the next label or a `data-slot="card"`/`"card-title"` div, an
+`N% used` paragraph in 0–100, and `Resets on <Month> D, YYYY at H:MM AM|PM` read
+as UTC. A missing window is absent, both missing is a parse failure. The
+pay-as-you-go balance (`?tab=payAsYouGo`) and the card-title plan label were
+already in the `v0.66.0` Swift fetcher, and we still do not read them.
+
+**z.ai (`zai.js`): one change, and a gap that predates it.** `e9b2823d6`
+(v0.69.0) moves the unknown-type check ahead of the field check. An entry whose
+`type` is not `TOKENS_LIMIT`, `TIME_LIMIT` or `CREDIT_LIMIT` is now skipped
+before its `unit`, `number` and `percentage` are required, and a skipped entry
+adds an "Unavailable" detail row. `zai.rs` also skips unknown types. But its
+struct requires `unit`, `number` and `percentage` on every entry, so an
+unknown-type entry without them fails the whole response as `decode_failed`.
+Found while comparing, and not from this range: upstream has treated
+`CREDIT_LIMIT` as a token limit since before `v0.60.0`, while `zai.rs` skips it.
+On a plan that reports `CREDIT_LIMIT` plus `TIME_LIMIT`, we would publish the MCP
+`TIME_LIMIT` as `primary` and drop the credit quota. See Recommended ports.
+
+**ClinePass (2 files + `clinepass.ts`): new credential source, not ported.**
+With no `CLINE_API_KEY` or `CLINEPASS_API_KEY`, upstream now reads the Cline
+CLI's own session (v0.68.0, `0ab15e453`, `bc809208d`). The file is
+`$CLINE_PROVIDER_SETTINGS_PATH`, else
+`{$CLINE_DATA_DIR | $CLINE_DIR/data | ~/.cline/data}/settings/providers.json`.
+It takes `providers.cline.settings.auth.accessToken`, prefixed `workos:`, over
+`settings.apiKey` or `auth.apiKey`. The request is unchanged: `GET
+api.cline.bot/api/v1/users/me/plan/usage-limits` with that value as the bearer.
+The 401/403 message now also points to `cline auth`, and the login method reads
+"Browser" for the OAuth source. `clinepass.rs` reads only the two environment
+keys. The file is headless-readable, so it could be a port; see Recommended
+ports.
+
+**Kimi, MiniMax, ZenMux, Qoder, OpenRouter, JetBrains, Gemini, LLMProxy: no
+effect.**
+- Kimi: one merged message for an expired or invalid CLI credential, and a
+  "Blocked by monthly limit" card for `kimi-monthly` (`e9b2823d6`, v0.69.0).
+  The session-window pick (60–720 min) was only compacted. Display only;
+  `kimi.rs` and `kimi_for_coding.rs` read the same responses.
+- MiniMax: the cookie-header normaliser moved into the shared
+  `CookieHeaderNormalizer`. `MiniMaxServiceUsage.parseWindowType` and
+  `parseTimeRange` were deleted as dead code. We port neither; `minimax.rs`
+  uses the API key.
+- ZenMux, Qoder, LLMProxy: descriptors moved to `PluginProviderSpec`. Qoder's
+  dead `QoderUsageError.swift` was deleted, and LLMProxy dropped an unused
+  `hasBaseURLOverride`. `zenmux.js`, `qoder.js` and `llmproxy.js` are unchanged.
+- OpenRouter: `openrouter.js` changed two settings subtitles; the descriptor
+  now fails with a classified missing-credential error. Same requests.
+- JetBrains: reset text now comes from a shared formatter. Display only.
+- Gemini: the curl data loader writes its request and the refreshed
+  credentials through `CredentialFileWriter.writePrivate`. Same request.
+
+**Descriptor, palette or local-only changes: no effect.** Alibaba and QwenCloud
+(the `@ProcessEnvironment` wrapper on the token-plan client), Amp, Codebuff,
+Copilot, DeepSeek, Doubao, Kilo, OpenCode and Warp (palette), ElevenLabs,
+Manus, NeuralWatt, Sub2API and Synthetic (descriptor moved to
+`PluginProviderSpec`, with their plugins unchanged), and OpenCode Go
+(`OpenCodeGoLocalUsageReader.swift` reads token counts from the local opencode
+database for cost, which is not the console API `opencodego.rs` reads). None of
+their cited files was deleted.
+
+**Shared and top-level.**
+- `Plugins/*` and `provider-plugin-prelude.js`: the plugin runtime additions
+  above, plus `PluginProviderSpec` for the descriptor refactor.
+- `ProviderFetchPlan.swift`, `UsageFetcher.swift` and many fetchers: the
+  environment is wrapped in `@ProcessEnvironment` so it is redacted when
+  stored (`c15a962be`, v0.69.0; `ee6a89d90`, v0.70.0). `UsageFetcher.swift` also carries
+  the Claude reset-credit inventory and keeps it out of persisted snapshots.
+- `CookieHeaderNormalizer.swift` takes caller-supplied header patterns;
+  `BrowserCookieImportSupport.swift` lets a caller have no missing-session
+  error; `CredentialFileWriter.swift` is used for more private writes.
+- `CurrencyExchange.swift`: display-currency table refactor.
+- `CostUsageFetcher.swift`, `CostReportingPeriod.swift` (new), and
+  `Vendored/CostUsage/*`: local cost scanning and calendar reporting periods.
+  Local consumption with no denominator, the standing decline.
+- `Host/Process/ProcessOwnershipReaper.swift` (new) and `SubprocessRunner.swift`:
+  reaping for the Antigravity `agy` probe.
+- `Providers.swift` and `ProviderManifest.swift` only register Aixy, Raycast and
+  xKiro.
+
+Nothing here changes how every provider fetches.
+
+**Changed or new providers we do not implement.**
+- **LongCat** (fetcher → `longcat.js`, v0.69.0): `longcat.chat` platform usage
+  with a browser cookie through the host cookie jar. Not headless.
+- **ZoomMate** (fetcher → `zoommate.js`, v0.69.0):
+  `{ai.zoom.us|zoommate.zoom.us}/ai-computer/api/v1/…` with a browser cookie or
+  captured authorization headers. Not headless.
+- **Notion** (fetcher → `notion.js`, v0.69.0): `POST
+  app.notion.com/api/v3/…` with a browser cookie or captured headers and a
+  workspace id. Not headless.
+- **Abacus** (fetcher → `abacus.js`, v0.68.0):
+  `apps.abacus.ai/api/_getOrganizationComputePoints` and `_getBillingInfo` with
+  a browser cookie. Not headless.
+- **Venice**: the web lane now accepts Clerk sessions (`363e3beaa`, v0.68.0). Browser
+  cookie for the web lane; the `VENICE_API_KEY` lane
+  (`outerface.venice.ai/api/user/session`) is headless.
+- **Mistral**: billing usage priced by event type, zone and tier from
+  `admin.mistral.ai/api/billing/v2/usage` and `console.mistral.ai/…/billing.vibeUsage`,
+  with an `ory_session_*` browser cookie and CSRF token. Spend, not a quota
+  window; not headless.
+- **Augment**: opt-in session keepalive and credential-expiry alerts on
+  `app.augmentcode.com` browser sessions. Not headless.
+- **Windsurf**: shared parsing/formatting refactor only;
+  `windsurf.com/_backend/…/GetPlanStatus` with a browser session. Not
+  headless.
+- **Raycast** (new plugin, v0.67.0): `GET
+  www.raycast.com/frontend_api/current_user/ai_credits` with a browser cookie.
+  Not headless.
+- **Poe**: descriptor presentation only; `POE_API_KEY` against
+  `api.poe.com/usage/current_balance` and `points_history`. Headless; a points
+  balance with no window.
+- **Muse** (`muse.js`): now shows a user-selected `dev.meta.ai` team quota when
+  the login omits quotas. `MUSE_DEVICE_TOKEN` or Keychain, plus browser cookies
+  for the team quota. Not headless as a whole.
+- **LiteLLM** (`litellm.js`): optional model activity
+  (`LITELLM_MODEL_USAGE_ENABLED`). `LITELLM_API_KEY` with a user-set
+  `LITELLM_BASE_URL`. Headless; gateway spend.
+- **LLMMan**: settings spec refactor only. A local resource meter, as last round.
+- **DeepInfra**: descriptor and settings spec only; `DEEPINFRA_API_KEY`.
+  Headless; spend with no window.
+- **Bifrost**: settings spec refactor. A self-hosted gateway, `BIFROST_API_KEY`
+  with a user-set base URL. Headless.
+- **Bedrock**: calendar reporting periods for cost. AWS credentials against Cost
+  Explorer and CloudWatch. Headless with AWS keys; spend, not a quota.
+- **Aixy** (new plugin, v0.67.0): `AIXY_API_KEY` against
+  `{AIXY_BASE_URL | api.aixy-gateway.com}/v1/usage`, a list of budgets.
+  Headless; budgets.
+- **xKiro** (new plugin, v0.67.0): `XKIRO_API_KEY` against
+  `api.xkiro.com/v1/usage`, daily (1440 min) used against limit. Headless; a
+  window-bearing candidate.
+- **Others** changed by the spec refactor or palette only: AiAnd, AtlasCloud,
+  Chutes, ClawRouter, CommandCode, Deepgram, DevPass, Devin, Fireworks,
+  GitKraken, Groq, Helmcode, HuggingFace, Hyper, Kiro, Moonshot, Nous, OpenAI,
+  Perplexity, T3Chat, V0, Vercel, XAI and Zed. None changed a request.
+
+**Citations.** One module cited files gone at `v0.70.0`: `sakana.rs`
+(`SakanaUsageFetcher.swift`, `SakanaUsageFetcherTests.swift`). It is now
+annotated with the last tag they exist at (v0.66.0), the plugin that replaced the
+fetcher, and the plugin test file. `scripts/parity-citations.py` against
+`v0.70.0` reports no outstanding findings and lists fourteen dead citations as
+answered: last round's twelve and these two.
+
+**Recommended ports** (none built this round; for the owner to choose). Ranked
+by how directly the gap can put a wrong number on an account. None of them
+publishes a wrong number on a live account here today.
+1. **Antigravity: an explicit `window` decides the cadence.** In
+   `quota_cadence_candidates`, when `bucket.window` is present and non-empty,
+   derive candidates from it alone. Fall back to `bucket_id` and `display_name`
+   only when it is absent. Today a bucket whose `window` disagrees with its id
+   gets the id's session cadence. So if the server ever relabels a bucket (the
+   Starter weekly-only change shows it varies cadence by tier), we would publish
+   a weekly meter as a 300-minute window on a live account. Consumers read
+   `windowMinutes` as the pace. Upstream:
+   `Sources/CodexBarCore/Providers/Antigravity/AntigravityStatusProbe.swift`
+   (`quotaCadenceCandidates`), fixtures in
+   `Tests/CodexBarTests/AntigravityQuotaSourceParityTests.swift`. Risk: low. The
+   live wire has `window` agreeing with the id on all four buckets, so today's
+   output is unchanged. The only new behaviour is an unrecognised `window` value
+   giving no cadence instead of the id's.
+2. **z.ai: read `CREDIT_LIMIT`, and skip unknown entries before decoding
+   them.** Treat `CREDIT_LIMIT` as a token limit, as upstream has since before
+   `v0.60.0`. Otherwise a credit-limit plan publishes its MCP `TIME_LIMIT` as the
+   headline. Make `unit`, `number` and `percentage` optional at the serde layer,
+   and require them only for the three known types, so one unknown entry stops
+   failing the whole response (`e9b2823d6`, v0.69.0). Upstream:
+   `Sources/CodexBarCore/Resources/Plugins/zai.js` (`parseLimit`, the
+   `tokenLimits` filter). Risk: low to medium. The window-length mapping for a
+   `CREDIT_LIMIT` unit is unverified here, and z.ai is not one of the live
+   accounts, so this is fixture-verified only.
+3. **Grok: reject frames whose flag byte is not `0x00` or `0x80`.** In
+   `grpc_web_frames`, return no frames (a decode failure) on any other flag,
+   instead of reading a compressed frame's bytes as protobuf. Our percent is
+   found by shape, so garbage bytes could in principle yield a plausible
+   in-range float. Upstream: `GrokWebBillingFetcher.swift`
+   (`grpcWebDataFrames`), `b9ea0da7b`, v0.69.0. Risk: very low. We request no
+   compression and none has been seen on the wire.
+4. **ClinePass: fall back to the Cline CLI session file.** When neither
+   environment key is set, read
+   `providers.cline.settings.auth.accessToken` (prefixed `workos:`) or
+   `apiKey` from `~/.cline/data/settings/providers.json`, honouring
+   `CLINE_PROVIDER_SETTINGS_PATH`, `CLINE_DATA_DIR` and `CLINE_DIR`. Upstream:
+   `Sources/CodexBarCore/Providers/ClinePass/ClinePassSettingsReader.swift`
+   (`fileCredential`, `providersFileURL`, `parseCredential`). Risk: low for the
+   read. It is coverage, not correctness: it reads another tool's credential file
+   and cannot be verified without a Cline login here.
+
+Nothing else in this range is worth porting.
+
 ### Parity round: CodexBar v0.65.0 → v0.66.0
 
 One tag. All EIGHT opaque constants present at `v0.66.0`, located by VALUE in
