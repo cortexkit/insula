@@ -1384,8 +1384,8 @@ gating, so our paid-tier guard has nothing to follow. Against
   "unknown"` with that id is no cadence upstream and 300 minutes here. Upstream
   fixtures: `Tests/CodexBarTests/AntigravityQuotaSourceParityTests.swift`
   (`explicit cadence takes precedence over legacy bucket names`). On today's live
-  wire, `window` and the id agree, so nothing wrong is published yet. See
-  Recommended ports.
+  wire, `window` and the id agree, so nothing wrong is published yet. Now
+  ported; see Recommended ports.
 - Fallback breadth differs, by design. Upstream falls back to the per-model lane
   on any summary failure except 401 and cancellation, including a timeout (it
   caps the summary call at 2 s), a 5xx, and a summary with no enabled bucket
@@ -1425,10 +1425,10 @@ the same headers.
   frame's flag byte is anything but `0x00` or `0x80`, where it used to take a
   compressed (`0x01`) frame's bytes as protobuf. Second, a malformed field ends
   the scan and marks it incomplete, where it used to skip a byte and resync.
-  `grok.rs` still takes any frame without bit `0x80` as data. It still skips a
-  byte on a zero key, and on any other malformed field it stops without an
-  incomplete flag. We send no `grpc-accept-encoding`, so a compressed frame is
-  not expected. See Recommended ports.
+  `grok.rs` took any frame without bit `0x80` as data; the flag rule is now
+  ported (see Recommended ports). It still skips a byte on a zero key, and on
+  any other malformed field it stops without an incomplete flag. We send no
+  `grpc-accept-encoding`, so a compressed frame is not expected.
 - `GetRemainingResets` (`GrokRemainingResetsFetcher.swift`: `POST
   grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets`) only moved to the
   shared reader: token records at field 10, then id, granted and expiry at 10,
@@ -1485,7 +1485,8 @@ unknown-type entry without them fails the whole response as `decode_failed`.
 Found while comparing, and not from this range: upstream has treated
 `CREDIT_LIMIT` as a token limit since before `v0.60.0`, while `zai.rs` skips it.
 On a plan that reports `CREDIT_LIMIT` plus `TIME_LIMIT`, we would publish the MCP
-`TIME_LIMIT` as `primary` and drop the credit quota. See Recommended ports.
+`TIME_LIMIT` as `primary` and drop the credit quota. Both are now ported; see
+Recommended ports.
 
 **ClinePass (2 files + `clinepass.ts`): new credential source, not ported.**
 With no `CLINE_API_KEY` or `CLINEPASS_API_KEY`, upstream now reads the Cline
@@ -1610,10 +1611,10 @@ fetcher, and the plugin test file. `scripts/parity-citations.py` against
 `v0.70.0` reports no outstanding findings and lists fourteen dead citations as
 answered: last round's twelve and these two.
 
-**Recommended ports** (none built this round; for the owner to choose). Ranked
-by how directly the gap can put a wrong number on an account. None of them
-publishes a wrong number on a live account here today.
-1. **Antigravity: an explicit `window` decides the cadence.** In
+**Recommended ports** (1, 2 and 3 built; 4 declined). Ranked by how directly
+the gap can put a wrong number on an account. None of them publishes a wrong
+number on a live account here today.
+1. **Built.** **Antigravity: an explicit `window` decides the cadence.** In
    `quota_cadence_candidates`, when `bucket.window` is present and non-empty,
    derive candidates from it alone. Fall back to `bucket_id` and `display_name`
    only when it is absent. Today a bucket whose `window` disagrees with its id
@@ -1627,8 +1628,16 @@ publishes a wrong number on a live account here today.
    live wire has `window` agreeing with the id on all four buckets, so today's
    output is unchanged. The only new behaviour is an unrecognised `window` value
    giving no cadence instead of the id's.
-2. **z.ai: read `CREDIT_LIMIT`, and skip unknown entries before decoding
-   them.** Treat `CREDIT_LIMIT` as a token limit, as upstream has since before
+   Built in `antigravity.rs` (`quota_cadence_candidates`), with upstream's
+   fixtures: `window` weekly on id `gemini-5h` is 10080 minutes; the same id
+   with no `window` is 300; `"window":"unknown"` is no cadence, as upstream (the
+   bucket is still published, its `windowMinutes` absent); the four live bucket
+   shapes are unchanged. One existing test changed with it: a `window` of
+   `Weekly_Limit` had read as weekly only because the union also read the id
+   `gemini-weekly`. It is now an unrecognised explicit value, as upstream, and
+   the test reads that label from `displayName` with `window` absent.
+2. **Built.** **z.ai: read `CREDIT_LIMIT`, and skip unknown entries before
+   decoding them.** Treat `CREDIT_LIMIT` as a token limit, as upstream has since before
    `v0.60.0`. Otherwise a credit-limit plan publishes its MCP `TIME_LIMIT` as the
    headline. Make `unit`, `number` and `percentage` optional at the serde layer,
    and require them only for the three known types, so one unknown entry stops
@@ -1637,14 +1646,27 @@ publishes a wrong number on a live account here today.
    `tokenLimits` filter). Risk: low to medium. The window-length mapping for a
    `CREDIT_LIMIT` unit is unverified here, and z.ai is not one of the live
    accounts, so this is fixture-verified only.
-3. **Grok: reject frames whose flag byte is not `0x00` or `0x80`.** In
+   Built in `zai.rs` (`ZaiLimitRaw`, `normalize_usage`). The unit mapping is not
+   ambiguous upstream: `parseLimit` applies one table (`1` day, `3` hour, `5`
+   minute, `6` week) to every type, and `window` gives `CREDIT_LIMIT` the
+   non-`TIME_LIMIT` branch, the same as `TOKENS_LIMIT`; `get_window_minutes` is
+   that table. A known-type entry missing `unit`, `number` or `percentage`, or an
+   entry with no string `type`, still fails the response, as upstream throws on
+   them. No counts are derived. Fixtures come from `ZaiProviderTests.swift` and
+   `ProviderPluginDetailsParityTests.swift` (`zaiCreditQuota`).
+3. **Built.** **Grok: reject frames whose flag byte is not `0x00` or `0x80`.** In
    `grpc_web_frames`, return no frames (a decode failure) on any other flag,
    instead of reading a compressed frame's bytes as protobuf. Our percent is
    found by shape, so garbage bytes could in principle yield a plausible
    in-range float. Upstream: `GrokWebBillingFetcher.swift`
    (`grpcWebDataFrames`), `b9ea0da7b`, v0.69.0. Risk: very low. We request no
    compression and none has been seen on the wire.
-4. **ClinePass: fall back to the Cline CLI session file.** When neither
+   Built in `grok.rs` (`grpc_web_frames`): any other flag, including a
+   compressed trailer (`0x81`), fails the body as `Decode`, not as the
+   transient empty-body error. The live fixture still decodes. Only the flag
+   rule was ported; the stricter truncation and malformed-field rules above are
+   not.
+4. **Declined.** **ClinePass: fall back to the Cline CLI session file.** When neither
    environment key is set, read
    `providers.cline.settings.auth.accessToken` (prefixed `workos:`) or
    `apiKey` from `~/.cline/data/settings/providers.json`, honouring

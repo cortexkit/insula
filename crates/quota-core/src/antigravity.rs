@@ -44,6 +44,14 @@
 //! (ps :1013-1018, process match :1104-1156, csrf :1130-1184, lsof :1191-1232, paths
 //! :771-775, request/headers :1467-1505/:1651-1660, representative :231-244, bucket
 //! kinds :362-371) + `AntigravityQuotaSummaryParser.swift:96-173`.
+//!
+//! Cadence precedence follows upstream at v0.70.0 (`quotaCadenceCandidates` in
+//! the same `AntigravityStatusProbe.swift`; fixtures in
+//! `Tests/CodexBarTests/AntigravityQuotaSourceParityTests.swift`): a bucket's
+//! explicit, non-empty `window` alone decides its cadence, and `bucketId` and
+//! `displayName` are read only when `window` is absent or blank. An unrecognised
+//! `window` gives no cadence. On the live wire `window` and the id agree, so
+//! this changes no published window today.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -756,13 +764,33 @@ fn pool_of_model_id(model_id: &str) -> Pool {
 
 const SESSION_CADENCE_ALIASES: &[&str] = &["session", "5h", "5-hour", "five hour", "five-hour"];
 
+/// The cadence words a bucket states, normalized.
+///
+/// An explicit, non-empty `window` is the ONLY source when present; the id and
+/// display name are read only when it is absent or blank. Taking the union
+/// instead let the id outvote the window: session aliases win over weekly, so
+/// `{"bucketId":"gemini-5h","window":"weekly"}` was published as a 300-minute
+/// window although the server said weekly, and consumers read `windowMinutes`
+/// as the pace. The id is a legacy name; the window is the statement.
+///
+/// A consequence: an unrecognised `window` (say `"unknown"`) yields no cadence
+/// at all, rather than borrowing one from the id. Upstream does the same
+/// (`quotaCadenceCandidates` in
+/// `Sources/CodexBarCore/Providers/Antigravity/AntigravityStatusProbe.swift`, and
+/// `explicit cadence takes precedence over legacy bucket names` in
+/// `Tests/CodexBarTests/AntigravityQuotaSourceParityTests.swift`, v0.70.0).
 fn quota_cadence_candidates(bucket: &QuotaBucket) -> HashSet<String> {
     let mut candidates = HashSet::new();
-    for raw_value in [
-        bucket.window.as_deref().unwrap_or(""),
-        bucket.bucket_id.as_str(),
-        bucket.display_name.as_str(),
-    ] {
+    let explicit = bucket
+        .window
+        .as_deref()
+        .map(str::trim)
+        .filter(|window| !window.is_empty());
+    let values: Vec<&str> = match explicit {
+        Some(window) => vec![window],
+        None => vec![bucket.bucket_id.as_str(), bucket.display_name.as_str()],
+    };
+    for raw_value in values {
         let normalized = raw_value.trim().to_ascii_lowercase().replace('_', "-");
         if normalized.is_empty() {
             continue;
@@ -2262,12 +2290,21 @@ mod tests {
         assert_no_unnamed_slot(&usage);
     }
 
+    /// The session alias is read from `window`, and the underscore label form
+    /// (`Weekly_Limit`, observed in `displayName`) resolves through the id.
+    ///
+    /// `Weekly_Limit` normalizes to `weekly-limit`, which is not itself a cadence
+    /// word: the weekly cadence here always came from the id `gemini-weekly`. So
+    /// the second bucket carries no `window`, where the id is read. When the same
+    /// label arrives AS the `window`, it is an explicit value this module does not
+    /// recognise, and it gives no cadence rather than borrowing the id's -- the
+    /// same answer upstream's `quotaCadenceCandidates` gives it.
     #[test]
     fn cadence_aliases_cover_session_and_underscore_weekly_limit() {
         let body = r#"{"groups":[{"displayName":"Gemini Models","buckets":[
             {"bucketId":"gemini-session","displayName":"Session Limit","window":"session",
              "remainingFraction":0.8,"resetTime":"2026-07-24T18:34:51Z"},
-            {"bucketId":"gemini-weekly","displayName":"Weekly_Limit","window":"Weekly_Limit",
+            {"bucketId":"gemini-weekly","displayName":"Weekly_Limit",
              "remainingFraction":0.6,"resetTime":"2026-07-30T18:34:51Z"}
         ]}]}"#;
         let usage = parse_quota_summary(body).unwrap();
@@ -2276,6 +2313,153 @@ mod tests {
         assert_eq!(
             extras[1].window.as_ref().unwrap().window_minutes,
             Some(10080)
+        );
+
+        assert_eq!(
+            cadence_of("gemini-weekly", "Weekly_Limit", Some("Weekly_Limit")),
+            None,
+            "a label form in `window` is an unrecognised explicit value"
+        );
+    }
+
+    /// The cadence one bucket publishes, from a one-bucket Gemini summary.
+    ///
+    /// `window` is spliced in as raw JSON so a test can pass an absent field
+    /// (`None`) as well as any string value.
+    fn cadence_of(bucket_id: &str, display_name: &str, window: Option<&str>) -> Option<i64> {
+        let window_field = window
+            .map(|w| format!(r#","window":"{w}""#))
+            .unwrap_or_default();
+        let body = format!(
+            r#"{{"groups":[{{"displayName":"Gemini Models","buckets":[{{
+                "bucketId":"{bucket_id}","displayName":"{display_name}"{window_field},
+                "remainingFraction":0.8}}]}}]}}"#
+        );
+        let usage = parse_quota_summary(&body).expect("a one-bucket summary parses");
+        pool_window(&usage, bucket_id).window_minutes
+    }
+
+    /// An explicit `window` decides the cadence, over what the id says.
+    ///
+    /// Upstream's fixture (`explicit cadence takes precedence over legacy bucket
+    /// names`, AntigravityQuotaSourceParityTests.swift at v0.70.0): a bucket whose
+    /// id reads `gemini-5h` but whose `window` reads `weekly` is a weekly meter.
+    /// Reading both and letting the session alias win published it as 300
+    /// minutes, and consumers pace against `windowMinutes`.
+    #[test]
+    fn an_explicit_window_outranks_the_bucket_id() {
+        assert_eq!(
+            cadence_of("gemini-5h", "Five Hour Limit", Some("weekly")),
+            Some(WEEKLY_WINDOW_MINUTES),
+            "the stated window is weekly, whatever the legacy id says"
+        );
+    }
+
+    /// An unrecognised explicit `window` gives no cadence, not the id's.
+    ///
+    /// Upstream runs the same fixture with `"window":"unknown"`: with the id
+    /// `gemini-5h` it yields a nil `windowMinutes`. The bucket is still published
+    /// (its fraction is real); only the pace is withheld, because the server named
+    /// a cadence this module does not know and the id is not allowed to overrule it.
+    #[test]
+    fn an_unrecognised_explicit_window_gives_no_cadence() {
+        assert_eq!(
+            cadence_of("gemini-5h", "Five Hour Limit", Some("unknown")),
+            None
+        );
+    }
+
+    /// With no `window`, or a blank one, the id and display name still decide.
+    ///
+    /// Upstream treats a whitespace-only `window` as absent (it trims before the
+    /// emptiness check), so both shapes fall back.
+    #[test]
+    fn an_absent_or_blank_window_falls_back_to_the_id_and_name() {
+        assert_eq!(
+            cadence_of("gemini-5h", "Five Hour Limit", None),
+            Some(SESSION_WINDOW_MINUTES),
+            "with no window, the id's 5h cadence is the only evidence"
+        );
+        assert_eq!(
+            cadence_of("gemini-5h", "Five Hour Limit", Some("  ")),
+            Some(SESSION_WINDOW_MINUTES),
+            "a blank window is no statement, so the id still decides"
+        );
+        assert_eq!(
+            cadence_of("gemini-allowance", "Weekly Limit", None),
+            Some(WEEKLY_WINDOW_MINUTES),
+            "and the display name is read when the id carries no cadence"
+        );
+    }
+
+    /// An opaque bucket id takes its cadence from the explicit window.
+    ///
+    /// Upstream's `summary honors explicit cadence for opaque bucket IDs`: the id
+    /// `gemini-allowance` names no cadence, so the window is the only evidence.
+    #[test]
+    fn an_opaque_bucket_id_takes_the_explicit_window() {
+        assert_eq!(
+            cadence_of("gemini-allowance", "Limit Remaining", Some("weekly")),
+            Some(WEEKLY_WINDOW_MINUTES)
+        );
+        assert_eq!(
+            cadence_of("gemini-allowance", "Limit Remaining", Some("5h")),
+            Some(SESSION_WINDOW_MINUTES)
+        );
+    }
+
+    /// The four live bucket shapes publish the cadence they did before.
+    ///
+    /// On today's wire every bucket's `window` agrees with its id, so reading
+    /// the window alone must change nothing here. This is the control for the
+    /// precedence rule above: a rule that broke the live shapes would pass the
+    /// disagreement tests and still move every live account's pace.
+    #[test]
+    fn the_four_live_bucket_shapes_keep_their_cadence() {
+        let body = r#"{"response":{"groups":[
+            {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-5h","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.8,"resetTime":"2026-06-24T08:00:00Z"},
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.53,"resetTime":"2026-06-30T00:00:00Z"}
+            ]},
+            {"displayName":"Claude and GPT models","buckets":[
+                {"bucketId":"3p-5h","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.95,"resetTime":"2026-06-24T08:00:00Z"},
+                {"bucketId":"3p-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.4,"resetTime":"2026-06-30T00:00:00Z"}
+            ]}
+        ]}}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        let published: Vec<(String, String, Option<i64>)> = usage
+            .extra_rate_windows
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|extra| {
+                (
+                    extra.id.clone().unwrap(),
+                    extra.title.clone().unwrap(),
+                    extra.window.as_ref().unwrap().window_minutes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            published,
+            vec![
+                ("gemini-5h".into(), "Gemini Models 5h".into(), Some(300)),
+                (
+                    "gemini-weekly".into(),
+                    "Gemini Models weekly".into(),
+                    Some(10080)
+                ),
+                ("3p-5h".into(), "Claude and GPT models 5h".into(), Some(300)),
+                (
+                    "3p-weekly".into(),
+                    "Claude and GPT models weekly".into(),
+                    Some(10080)
+                ),
+            ]
         );
     }
 

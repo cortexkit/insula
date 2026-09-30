@@ -25,6 +25,10 @@
 //! (grpc-web framing, `scanProtobuf`, percent = shallowest `path.last==1` fixed32 in
 //! 0..100, reset = future varint preferring path `[1,5,1]`). `tests/grok_live.rs`
 //! is the ignored live proof; the unit test below decodes a REAL captured wire frame.
+//! Frame flags follow upstream's stricter v0.69.0 rule (`grpcWebDataFrames`,
+//! `b9ea0da7b`): only `0x00` (data) and `0x80` (trailer) are accepted, and any
+//! other flag, such as a compressed `0x01` frame, fails the body as a decode
+//! error rather than being scanned as protobuf.
 //!
 //! ACCOUNT: the OAuth access token is a JWT issued by `auth.x.ai`, and its
 //! payload `sub` is the xAI user id (a UUID). Both lanes read it from the token
@@ -190,14 +194,35 @@ fn scan_message(bytes: &[u8], path: &[u64], scan: &mut Scan) {
     }
 }
 
-/// Split a gRPC-web body into data-frame payloads (flag bit 0x80 clear). Trailer
-/// frames (0x80 set) carry `grpc-status` and are returned separately as text.
-fn grpc_web_frames(data: &[u8]) -> (Vec<Vec<u8>>, String) {
+/// gRPC-web frame flags this decoder accepts: an uncompressed data frame and an
+/// uncompressed trailer frame. Every other flag byte (a compressed frame is
+/// `0x01`) is refused.
+const FRAME_FLAG_DATA: u8 = 0x00;
+const FRAME_FLAG_TRAILER: u8 = 0x80;
+
+/// Split a gRPC-web body into data-frame payloads (flag `0x00`). Trailer frames
+/// (flag `0x80`) carry `grpc-status` and are returned separately as text.
+///
+/// A frame with any other flag byte fails the whole body as a decode error.
+/// Before, any frame without bit `0x80` was taken as data, so a compressed
+/// frame's bytes would have been scanned as protobuf -- and because the percent
+/// is found by shape (a 32-bit float in 0..=100), garbage can yield a plausible
+/// number. We send no `grpc-accept-encoding`, so compression is not expected;
+/// this makes it a failure rather than a reading if it ever arrives. Matches
+/// upstream `grpcWebDataFrames` in
+/// `Sources/CodexBarCore/Providers/Grok/GrokWebBillingFetcher.swift` (v0.69.0,
+/// `b9ea0da7b`).
+fn grpc_web_frames(data: &[u8]) -> Result<(Vec<Vec<u8>>, String), FetchError> {
     let mut data_frames = Vec::new();
     let mut trailer = String::new();
     let mut i = 0;
     while i + 5 <= data.len() {
         let flags = data[i];
+        if flags != FRAME_FLAG_DATA && flags != FRAME_FLAG_TRAILER {
+            return Err(FetchError::Decode(format!(
+                "grok: gRPC-web frame flag {flags:#04x} is neither data nor trailer"
+            )));
+        }
         let length = ((data[i + 1] as usize) << 24)
             | ((data[i + 2] as usize) << 16)
             | ((data[i + 3] as usize) << 8)
@@ -207,14 +232,14 @@ fn grpc_web_frames(data: &[u8]) -> (Vec<Vec<u8>>, String) {
         if end > data.len() {
             break;
         }
-        if flags & 0x80 == 0 {
+        if flags == FRAME_FLAG_DATA {
             data_frames.push(data[start..end].to_vec());
         } else {
             trailer.push_str(&String::from_utf8_lossy(&data[start..end]));
         }
         i = end;
     }
-    (data_frames, trailer)
+    Ok((data_frames, trailer))
 }
 
 /// `grpc-status` from a trailer block; `Some(0)` is success, non-zero an RPC error.
@@ -231,7 +256,7 @@ fn grpc_status(trailer: &str) -> Option<i64> {
 /// Decode a gRPC-web protobuf billing response to [`Usage`]. Pure — unit-testable
 /// against captured real wire bytes.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let (frames, trailer) = grpc_web_frames(body);
+    let (frames, trailer) = grpc_web_frames(body)?;
     if let Some(status) = grpc_status(&trailer) {
         if status != 0 {
             return Err(FetchError::Upstream(format!("grok grpc-status {status}")));
@@ -1132,6 +1157,46 @@ mod tests {
         let primary = usage.primary.expect("a window is emitted");
         assert_eq!(primary.used_percent, 50.0);
         assert!(primary.resets_at.is_some());
+    }
+
+    /// A frame whose flag byte is neither `0x00` (data) nor `0x80` (trailer) is
+    /// a decode failure, never a reading.
+    ///
+    /// A compressed frame (`0x01`) used to be scanned as protobuf, and the
+    /// percent here is found by shape, so its bytes could have produced a
+    /// plausible number. Upstream `grpcWebDataFrames` rejects the whole body on
+    /// any other flag (v0.69.0, `b9ea0da7b`).
+    #[test]
+    fn a_frame_with_an_unknown_flag_is_a_decode_failure() {
+        let readable = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MIN + 1);
+        // Control: the uncompressed frame is a reading, so the refusals below
+        // are about the flag and not about the payload.
+        assert_eq!(
+            normalize_usage(&readable)
+                .unwrap()
+                .primary
+                .unwrap()
+                .used_percent,
+            50.0
+        );
+
+        let mut compressed = readable.clone();
+        compressed[0] = 0x01;
+        assert!(
+            matches!(normalize_usage(&compressed), Err(FetchError::Decode(_))),
+            "a compressed frame's bytes must not be read as protobuf"
+        );
+
+        // A later frame with an unknown flag fails the whole body too, even
+        // after a good data frame, and so does a compressed trailer.
+        for flag in [0x01u8, 0x81] {
+            let mut body = readable.clone();
+            body.extend_from_slice(&[flag, 0, 0, 0, 0]);
+            assert!(
+                matches!(normalize_usage(&body), Err(FetchError::Decode(_))),
+                "flag {flag:#04x} after a data frame must fail the body"
+            );
+        }
     }
 
     #[test]

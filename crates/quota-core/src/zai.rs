@@ -14,6 +14,17 @@
 //! than deleted -- it is the provenance for a fixture-verified port, and a
 //! tagged path is still openable while a bare one sends a reader hunting.
 //! Flagged by scripts/parity-citations.py.
+//!
+//! Two entry rules follow the plugin that replaced it,
+//! `Sources/CodexBarCore/Resources/Plugins/zai.js` (`parseLimit` and the
+//! `tokenLimits` filter, v0.70.0; fixtures in
+//! `Tests/CodexBarTests/ZaiProviderTests.swift` and
+//! `Tests/CodexBarTests/ProviderPluginDetailsParityTests.swift`):
+//! - `CREDIT_LIMIT` is read as a token limit, with the same unit table. Skipping
+//!   it left a credit plan's MCP `TIME_LIMIT` as the headline.
+//! - An entry of an unknown type is skipped before `unit`, `number` and
+//!   `percentage` are required (v0.69.0, `e9b2823d6`), so one new kind of entry
+//!   cannot fail the whole response. The three known types still require them.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -45,20 +56,34 @@ struct ZaiQuotaLimitData {
     limits: Vec<ZaiLimitRaw>,
 }
 
+/// One entry of `data.limits`.
+///
+/// Only `type` is required at this layer. `unit`, `number` and `percentage` are
+/// required of the three types this module reads, and checked there: an entry
+/// of a type it does not know (upstream has sent `FUTURE_POINTS_POOL` with only
+/// `pointsRemaining`) is skipped before its fields are looked at, so one new
+/// kind of entry cannot fail the whole response. Upstream orders the checks the
+/// same way (`parseLimit` in `zai.js`, since v0.69.0 `e9b2823d6`).
 #[derive(Debug, Deserialize)]
 struct ZaiLimitRaw {
     #[serde(rename = "type")]
     limit_type: String,
-    unit: i64,
-    number: i64,
+    unit: Option<i64>,
+    number: Option<i64>,
     usage: Option<i64>,
     #[serde(rename = "currentValue")]
     current_value: Option<i64>,
     remaining: Option<i64>,
-    percentage: i64,
+    percentage: Option<i64>,
     #[serde(rename = "nextResetTime")]
     next_reset_time: Option<i64>,
 }
+
+/// The entry types this module reads. `CREDIT_LIMIT` is a token limit in all
+/// but name: upstream sorts it into the same list, with the same unit table.
+const TOKENS_LIMIT: &str = "TOKENS_LIMIT";
+const CREDIT_LIMIT: &str = "CREDIT_LIMIT";
+const TIME_LIMIT: &str = "TIME_LIMIT";
 
 #[derive(Clone)]
 struct ValidLimit {
@@ -192,9 +217,20 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let mut time_limit = None;
 
     for limit in data.limits {
-        if limit.limit_type != "TOKENS_LIMIT" && limit.limit_type != "TIME_LIMIT" {
+        let is_token_limit = limit.limit_type == TOKENS_LIMIT || limit.limit_type == CREDIT_LIMIT;
+        let is_time_limit = limit.limit_type == TIME_LIMIT;
+        // Unknown types are skipped BEFORE their fields are required.
+        if !is_token_limit && !is_time_limit {
             continue;
         }
+        let (Some(unit), Some(number), Some(percentage)) =
+            (limit.unit, limit.number, limit.percentage)
+        else {
+            return Err(FetchError::Decode(format!(
+                "zai {} entry missing unit, number or percentage",
+                limit.limit_type
+            )));
+        };
         let resets_at = limit
             .next_reset_time
             .and_then(|ms| env::epoch_to_iso8601(ms / 1000));
@@ -202,19 +238,19 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             limit.usage,
             limit.remaining,
             limit.current_value,
-            limit.percentage,
+            percentage,
         );
-        let window_minutes = if limit.limit_type == "TOKENS_LIMIT" {
-            get_window_minutes(limit.unit, limit.number)
+        let window_minutes = if is_token_limit {
+            get_window_minutes(unit, number)
         } else {
-            time_limit_window_minutes(limit.unit, limit.number)
+            time_limit_window_minutes(unit, number)
         };
         let valid = ValidLimit {
             used_percent,
             window_minutes,
             resets_at,
         };
-        if limit.limit_type == "TOKENS_LIMIT" {
+        if is_token_limit {
             token_limits.push(valid);
         } else {
             time_limit = Some(valid);
@@ -506,6 +542,138 @@ mod tests {
         assert_eq!(tertiary.window_minutes, Some(300));
         assert_eq!(tertiary.resets_at.as_deref(), Some("2026-07-03T03:35:03Z"));
         assert!(usage.extra_rate_windows.is_none());
+    }
+
+    /// A credit-limit plan headlines its credit quota, not its MCP limit (the
+    /// `TIME_LIMIT` entry, which meters MCP tool calls such as web search).
+    ///
+    /// Upstream has read `CREDIT_LIMIT` as a token limit since before v0.60.0
+    /// (`zai.js`, the `tokenLimits` filter). Skipping it left the `TIME_LIMIT`
+    /// alone, and a lone time limit is promoted to `primary` -- so a credit plan
+    /// published its MCP tool quota as the account's headline and dropped the
+    /// credit quota entirely.
+    #[test]
+    fn a_credit_limit_plan_headlines_its_credit_quota_not_the_mcp_limit() {
+        let body = br#"{"code":200,"success":true,"data":{"limits":[
+            {"type":"CREDIT_LIMIT","unit":3,"number":5,"percentage":25,
+             "nextResetTime":1785816000000},
+            {"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":220,
+             "remaining":780,"percentage":22}
+        ]}}"#;
+        let usage = normalize_usage(body).unwrap();
+
+        let primary = usage.primary.expect("the credit quota is the headline");
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.window_minutes, Some(300));
+
+        let secondary = usage.secondary.expect("the MCP limit is still published");
+        assert_eq!(secondary.used_percent, 22.0);
+        assert_eq!(secondary.window_minutes, None, "the one-minute marker");
+        assert!(usage.tertiary.is_none());
+    }
+
+    /// A `CREDIT_LIMIT` takes its window from the same unit table as a token
+    /// limit, and sorts with the token limits.
+    ///
+    /// Upstream fixtures: `zaiCreditQuota` (ProviderPluginDetailsParityTests.swift,
+    /// two credit limits at 5 hours and 1 week), `plugin preserves rolling 30-day
+    /// limits without MCP semantics` (a 30-day credit limit is not mistaken for
+    /// the MCP tool quota) and `explicit zero usage remains a real quota
+    /// window` (ZaiProviderTests.swift), each run with `CREDIT_LIMIT`. Slot layout
+    /// is this module's own (longest token limit primary, shortest tertiary), not
+    /// upstream's; only the window lengths and percents are compared.
+    #[test]
+    fn a_credit_limit_reads_like_a_token_limit() {
+        let golden = br#"{"code":200,"msg":"success","success":true,"data":{"level":"lite","limits":[
+          {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":100,"remaining":1900,
+           "percentage":5,"nextResetTime":1786073946574},
+          {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,"currentValue":1000,"remaining":9000,
+           "percentage":10,"nextResetTime":1786660486998}
+        ]}}"#;
+        let usage = normalize_usage(golden).unwrap();
+        let primary = usage.primary.expect("the weekly credit limit");
+        assert_eq!(primary.used_percent, 10.0);
+        assert_eq!(primary.window_minutes, Some(10_080));
+        let tertiary = usage.tertiary.expect("the five-hour credit limit");
+        assert_eq!(tertiary.used_percent, 5.0);
+        assert_eq!(tertiary.window_minutes, Some(300));
+        assert!(usage.secondary.is_none(), "no MCP limit in this payload");
+        // No counts are derived: the provider's `usage`/`remaining` feed the
+        // percent only, as for a token limit.
+        assert_eq!(primary.used_count, None);
+        assert_eq!(primary.total_count, None);
+
+        let single = |unit: i64, number: i64, percentage: i64| {
+            let body = format!(
+                r#"{{"code":200,"success":true,"data":{{"limits":[
+                  {{"type":"CREDIT_LIMIT","unit":{unit},"number":{number},"percentage":{percentage}}}
+                ]}}}}"#
+            );
+            normalize_usage(body.as_bytes()).unwrap().primary.unwrap()
+        };
+        let rolling = single(1, 30, 50);
+        assert_eq!(rolling.window_minutes, Some(43_200), "30 days");
+        assert_eq!(rolling.used_percent, 50.0);
+        let untouched = single(3, 5, 0);
+        assert_eq!(untouched.window_minutes, Some(300));
+        assert_eq!(untouched.used_percent, 0.0, "zero usage is a real reading");
+    }
+
+    /// An entry of a type this module does not read is skipped before its
+    /// fields are required.
+    ///
+    /// Upstream fixtures (ZaiProviderTests.swift, from v0.69.0 `e9b2823d6`): a
+    /// `FUTURE_POINTS_POOL` entry carrying only `pointsRemaining`, beside a known
+    /// limit. Requiring `unit`, `number` and `percentage` of every entry at
+    /// decode time failed the whole response on it, and cost the known limit too.
+    #[test]
+    fn an_unknown_entry_without_quota_fields_is_skipped() {
+        let with_mcp = br#"{"code":200,"success":true,"data":{"limits":[
+          {"type":"FUTURE_POINTS_POOL","pointsRemaining":800},
+          {"type":"TIME_LIMIT","unit":5,"number":1,"percentage":25}
+        ]}}"#;
+        let usage = normalize_usage(with_mcp).expect("the unknown entry is skipped");
+        assert_eq!(usage.primary.unwrap().used_percent, 25.0);
+
+        let with_tokens = br#"{"code":200,"success":true,"data":{"limits":[
+          {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":25},
+          {"type":"FUTURE_POINTS_POOL","pointsRemaining":800}
+        ]}}"#;
+        let primary = normalize_usage(with_tokens).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.window_minutes, Some(300));
+
+        // Alone, it publishes nothing rather than inventing an unused quota.
+        let alone = br#"{"code":200,"success":true,"data":{"limits":[
+          {"type":"FUTURE_POINTS_POOL","pointsRemaining":800}
+        ]}}"#;
+        let usage = normalize_usage(alone).unwrap();
+        assert!(usage.primary.is_none() && usage.secondary.is_none() && usage.tertiary.is_none());
+    }
+
+    /// A known entry, or an entry with no usable type, still fails the response
+    /// when it lacks what it needs.
+    ///
+    /// The control for the test above: making the fields optional must not turn
+    /// a malformed known limit into a silent skip or a zero reading. Upstream
+    /// throws on the same shapes (`unsupported quota shapes explain where to check
+    /// usage`, ZaiProviderTests.swift: no `type`, `type: null`, `type: 42`).
+    #[test]
+    fn a_known_entry_missing_its_fields_still_fails() {
+        for entry in [
+            r#"{"type":"TOKENS_LIMIT","unit":3,"number":5}"#,
+            r#"{"type":"CREDIT_LIMIT","number":5,"percentage":25}"#,
+            r#"{"type":"TIME_LIMIT","unit":5,"percentage":25}"#,
+            r#"{"unit":3,"number":5,"percentage":25}"#,
+            r#"{"type":null,"unit":3,"number":5,"percentage":25}"#,
+            r#"{"type":42,"unit":3,"number":5,"percentage":25}"#,
+        ] {
+            let body = format!(r#"{{"code":200,"success":true,"data":{{"limits":[{entry}]}}}}"#);
+            match normalize_usage(body.as_bytes()) {
+                Err(FetchError::Decode(_)) => {}
+                other => panic!("{entry} must fail to decode, got {other:?}"),
+            }
+        }
     }
 
     #[test]
