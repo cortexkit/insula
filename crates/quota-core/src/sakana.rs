@@ -11,6 +11,15 @@
 //! `Sources/CodexBarCore/Providers/Sakana/SakanaUsageFetcher.swift:40-54,135-165,182-201,349-440`.
 //! Unit-tested with the billing-page fixture from
 //! `Tests/CodexBarTests/SakanaUsageFetcherTests.swift:376-390`.
+//!
+//! `SakanaUsageFetcher.swift` and `SakanaUsageFetcherTests.swift` exist up to
+//! CodexBar v0.66.0 and NO LONGER EXIST from v0.67.0: upstream made its bundled
+//! plugin, `Sources/CodexBarCore/Resources/Plugins/sakana.js`, the fetch path, and
+//! its tests moved to `TestsPlugin/SakanaPluginTests.swift`. Read the fetcher and
+//! fixture citations in this module at v0.66.0 or earlier; the plugin is where to
+//! look for later changes. `SakanaSettingsReader.swift` is still present.
+//! (Recorded for `scripts/parity-citations.py`, which reports a cited file that is
+//! gone at the current anchor until its module says what replaced it.)
 
 use std::time::Duration;
 
