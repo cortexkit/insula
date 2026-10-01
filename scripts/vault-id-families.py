@@ -146,7 +146,11 @@ def installed_snapshot_ids():
 
 
 def claims(cid, fams):
-    """Which providers claim this id. Mirrors `handle_id_names_family`."""
+    """Which providers claim this id. Mirrors `handle_id_names_family`.
+
+    A family ends at a colon boundary: `apikey:opencode` must not claim
+    the models.dev-slug family `apikey:opencode-go`.
+    """
     return [n for p, n in fams if cid == p or cid.startswith(p + ":")]
 
 

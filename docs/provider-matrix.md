@@ -2161,7 +2161,7 @@ the seven it accepts as answered are the same seven as last round.
 
    **Built 2026-09-24; NOT live-verified** (no OpenCode API key on this host, so
    it is fixture-verified against upstream's tests only). The key comes from the
-   `OPENCODE_API_KEY` environment variable or a vault `apikey:opencode` credential
+   `OPENCODE_API_KEY` environment variable or a vault `apikey:opencode-go` credential
    (a new family, routed to `opencodego` only; a second deposit is refused like
    every identity-less family). The ordering rule: a present key is the ONLY lane
    `opencodego` enumerates, vault key before environment key, and with no key the

@@ -255,7 +255,7 @@ fn evaluate(
     let opencode_api_key_present = installed
         .credential_ids
         .iter()
-        .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:opencode"));
+        .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:opencode-go"));
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
         if prefix.starts_with("cookie:") || prefix.starts_with("apikey:") {
@@ -879,7 +879,7 @@ mod tests {
         // opencode's: one opencodego entry answers for the key, and the cookie
         // deposit is still expected to serve opencode.
         let opencode_key = evaluate(
-            granted(&["apikey:opencode", "cookie:opencode.ai"]),
+            granted(&["apikey:opencode-go", "cookie:opencode.ai"]),
             usage(vec![
                 healthy("opencode", "vault"),
                 healthy("opencodego", "vault"),
