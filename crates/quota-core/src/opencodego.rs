@@ -11,14 +11,13 @@
 //! `parseAPIUsage` (present upstream since v0.54.0); payload shapes come from
 //! `Tests/CodexBarTests/OpenCodeGoUsageFetcherErrorTests.swift` and
 //! `OpenCodeGoWebOverlayTests.swift` at that tag. VERIFICATION of this lane:
-//! fixture-verified only, NOT live-verified -- no OpenCode API key exists on the
-//! host it was written on.
+//! fixture-verified, with a live authenticated no-subscription response observed
+//! on 2026-10-01: HTTP 403 with `error.type == "EntitlementError"` maps to
+//! `no_quota_reported`, not a rejected key.
 //!
 //! What the API lane does NOT do, deliberately:
-//! - It reports no "no subscription" verdict. Upstream's API lane has none: every
-//!   body without `usage.rolling` is a parse failure there, and no captured
-//!   response shows what an unsubscribed key receives. So such a body is
-//!   `decode_failed` here too, until someone captures the real answer.
+//! - A success body without `usage.rolling` remains `decode_failed`; only a
+//!   parsed HTTP 403 `EntitlementError` establishes no Go subscription.
 //! - It publishes no account identity: the response carries none.
 //! - It does not publish upstream's extra "Renews" window built from
 //!   `renewAt`; the console lane publishes no such window either.
@@ -751,6 +750,25 @@ pub struct OpenCodeGoProvider {
     endpoints: Endpoints,
 }
 
+/// Only the upstream's typed entitlement refusal establishes a missing plan.
+/// Messages can mention subscriptions even when the actual refusal is unrelated.
+fn classify_api_error(error: FetchError) -> FetchError {
+    if let FetchError::ProviderStatus(403, body) = &error {
+        if serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value["error"]["type"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("EntitlementError")
+        {
+            return FetchError::NoQuotaReported(
+                "no Go subscription on this account (OpenCode Go API: EntitlementError)"
+                    .to_string(),
+            );
+        }
+    }
+    error
+}
+
 impl OpenCodeGoProvider {
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
@@ -785,14 +803,30 @@ impl OpenCodeGoProvider {
             .collect())
     }
 
-    /// The environment-key lane: 401/403 become `Unauthorized`, which is the
-    /// rejected-key class, through the shared request helper.
+    /// The environment-key lane: a parsed 403 EntitlementError means no Go
+    /// subscription; other 401/403 responses retain the Unauthorized key verdict.
     async fn fetch_env_api(&self, key: &str) -> Result<ProviderUsage, FetchError> {
-        let body = api_usage_request(&self.endpoints.api_usage_url, key)
-            .send(&self.http)
-            .await?;
+        let response = api_usage_request(&self.endpoints.api_usage_url, key)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+            .map_err(classify_api_error)
+            .map_err(|error| match error {
+                FetchError::ProviderStatus(status, body) => {
+                    let detail = if body.is_empty() {
+                        format!("HTTP {status} (no response body)")
+                    } else {
+                        format!("HTTP {status}: {body}")
+                    };
+                    if status == 401 || status == 403 {
+                        FetchError::Unauthorized(detail)
+                    } else {
+                        FetchError::Upstream(detail)
+                    }
+                }
+                error => error,
+            })?;
         let usage = parse_api_usage(
-            &String::from_utf8_lossy(&body),
+            &String::from_utf8_lossy(&response.body),
             chrono::Utc::now().timestamp(),
         )?;
         Ok(ProviderUsage::healthy(
@@ -804,9 +838,9 @@ impl OpenCodeGoProvider {
     }
 
     /// The vault-key lane. The status-first helper keeps the HTTP status, so a
-    /// 401/403 is `ProviderStatus`, which classifies as rejected just as
-    /// `Unauthorized` does, and a 401 is reported back to the vault so it can
-    /// mark the stored key.
+    /// parsed 403 EntitlementError means no Go subscription. Other 401/403
+    /// responses remain rejected; only a 401 is reported back to the vault so
+    /// it can mark the stored key.
     async fn fetch_vault_api(&self, handle: &CredentialHandle) -> FetchAttempt {
         let Some(credential_source) = self.credential_source.as_ref() else {
             return FetchAttempt::unverified_vault_failure(
@@ -837,7 +871,8 @@ impl OpenCodeGoProvider {
         let result = async {
             let response = api_usage_request(&self.endpoints.api_usage_url, key.trim())
                 .send_provider_status_first(&self.http, PROVIDER_NAME)
-                .await?;
+                .await
+                .map_err(classify_api_error)?;
             parse_api_usage(
                 &String::from_utf8_lossy(&response.body),
                 chrono::Utc::now().timestamp(),
@@ -1136,8 +1171,18 @@ mod tests {
     /// every vault read returns `payload`, and which sees NO environment key
     /// (so a key in the test runner's own environment cannot change a result).
     fn provider_with_rows(rows: &[(&str, &str)], payload: &str) -> OpenCodeGoProvider {
+        provider_with_reports(rows, payload).0
+    }
+
+    type AuthReports = Arc<Mutex<Vec<(u16, u64)>>>;
+
+    fn provider_with_reports(
+        rows: &[(&str, &str)],
+        payload: &str,
+    ) -> (OpenCodeGoProvider, AuthReports) {
         struct MockCookieSource {
             cookie: String,
+            reports: AuthReports,
         }
 
         #[async_trait::async_trait]
@@ -1172,25 +1217,43 @@ mod tests {
                 })
             }
 
+            async fn report_auth_failure_scoped(
+                &self,
+                _credential_id: &str,
+                provider_status: u16,
+                record_version: u64,
+            ) {
+                self.reports
+                    .lock()
+                    .unwrap()
+                    .push((provider_status, record_version));
+            }
+
             async fn report_auth_failure(
                 &self,
                 _capability: &crate::credential_source::VaultCapability,
-                _provider_status: u16,
-                _record_version: u64,
+                provider_status: u16,
+                record_version: u64,
             ) {
+                self.reports
+                    .lock()
+                    .unwrap()
+                    .push((provider_status, record_version));
             }
         }
 
+        let reports = Arc::new(Mutex::new(Vec::new()));
         let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
         loader.install_rows_for_test(rows);
         let mut provider = OpenCodeGoProvider::new_with_handle_loader(
             Some(Arc::new(MockCookieSource {
                 cookie: payload.to_string(),
+                reports: Arc::clone(&reports),
             })),
             loader,
         );
         provider.env_api_key = || None;
-        provider
+        (provider, reports)
     }
 
     /// Drive the provider's real fetch against the script and return the error
@@ -1907,6 +1970,70 @@ mod tests {
         );
     }
 
+    const ENTITLEMENT_BODY: &str = r#"{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required"}}"#;
+
+    #[tokio::test]
+    async fn vault_api_entitlement_is_no_quota_without_auth_report() {
+        let (base, _) = serve(|_, _| Reply::Body(403, ENTITLEMENT_BODY)).await;
+        let (mut provider, reports) =
+            provider_with_reports(&[("apikey:opencode-go", "apikey")], "valid");
+        point_at(&mut provider, &base);
+        let handle = provider.handles().unwrap().remove(0);
+        let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert!(
+            matches!(&error, FetchError::NoQuotaReported(m) if m.contains("no Go subscription")),
+            "{error}"
+        );
+        tokio::task::yield_now().await;
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn env_api_entitlement_is_no_quota() {
+        let (base, _) = serve(|_, _| Reply::Body(403, ENTITLEMENT_BODY)).await;
+        let mut provider = provider_with_rows(&[], "");
+        provider.env_api_key = || Some("valid".to_string());
+        point_at(&mut provider, &base);
+        let error = provider
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .unwrap_err();
+        assert!(
+            matches!(&error, FetchError::NoQuotaReported(m) if m.contains("no Go subscription")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_subscription_message_without_entitlement_type_is_rejected() {
+        let body = r#"{"error":{"type":"AuthenticationError","message":"subscription EntitlementError mentioned in an unrelated refusal"}}"#;
+        let (base, _) = serve(move |_, _| Reply::Body(403, body)).await;
+        let (mut vault, reports) =
+            provider_with_reports(&[("apikey:opencode-go", "apikey")], "bad");
+        point_at(&mut vault, &base);
+        let handle = vault.handles().unwrap().remove(0);
+        let error = vault.fetch_handle(&handle).await.usage.unwrap_err();
+        assert!(matches!(error, FetchError::ProviderStatus(403, _)));
+        assert_eq!(error.error_class(), "credential_rejected");
+        tokio::task::yield_now().await;
+        assert!(reports.lock().unwrap().is_empty());
+
+        let mut env = provider_with_rows(&[], "");
+        env.env_api_key = || Some("bad".to_string());
+        point_at(&mut env, &base);
+        let error = env
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .unwrap_err();
+        assert!(
+            matches!(&error, FetchError::Unauthorized(detail) if detail == &format!("HTTP 403: {body}")),
+            "{error}"
+        );
+        assert_eq!(error.error_class(), "credential_rejected");
+    }
+
     /// A 401 from the usage API is the rejected-key class, for both the vault
     /// key and the environment key -- never a decode failure or an outage.
     #[tokio::test]
@@ -1914,7 +2041,8 @@ mod tests {
         let (base, requests) =
             serve(|_path, _request| Reply::Body(401, r#"{"error":"unauthorized"}"#)).await;
 
-        let mut vault = provider_with_rows(&[("apikey:opencode-go", "apikey")], "bad");
+        let (mut vault, reports) =
+            provider_with_reports(&[("apikey:opencode-go", "apikey")], "bad");
         point_at(&mut vault, &base);
         let handle = vault.handles().unwrap().remove(0);
         let error = vault
@@ -1923,6 +2051,17 @@ mod tests {
             .usage
             .expect_err("a rejected key is not usage");
         assert_eq!(error.error_class(), "credential_rejected", "{error}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !reports.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("vault auth-failure report must arrive");
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 1)]);
 
         let mut env = provider_with_rows(&[], "");
         env.env_api_key = || Some("bad".to_string());
