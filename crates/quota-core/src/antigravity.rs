@@ -57,6 +57,9 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use crate::credential_source::{CredentialSource, VaultGetError};
 use crate::provider::AccountObservation;
+#[cfg(any(target_os = "macos", test))]
+use crate::subprocess::SubprocessError;
+use crate::subprocess::{BoundedCommand, Gate};
 use crate::vault_handles::VaultHandleLoader;
 
 use async_trait::async_trait;
@@ -653,42 +656,130 @@ fn parse_listening_ports(output: &str) -> Vec<u16> {
     ports
 }
 
+/// How long a process-table scan may run before the probe stops waiting for it.
+///
+/// Measured on the development host (1,336 processes): a healthy
+/// `/bin/ps -ax -o pid=,command=` took 0.28-0.35 s, and the same command has been
+/// seen hanging for minutes (one measurement took 256 s) while the process table
+/// was stalled host-wide. Five seconds is roughly fifteen times the healthy
+/// figure, so a slow-but-working scan still answers, while a stalled one costs a
+/// fetch five seconds instead of its whole deadline.
+const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one `lsof` listening-port scan may run.
+///
+/// Measured on the same host at 0.02-0.05 s for one process. Five seconds for
+/// the same reason as [`PROCESS_SCAN_TIMEOUT`]: generous for a working scan and
+/// bounded for a stuck one.
 #[cfg(target_os = "macos")]
-fn discover_servers() -> Vec<LocalServer> {
-    let Ok(out) = std::process::Command::new("/bin/ps")
-        .args(["-ax", "-o", "pid=,command="])
-        .output()
-    else {
-        return Vec::new();
+const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lets only one process-table scan run at a time, so at most one `ps` child is
+/// alive even while one is stuck.
+static PROCESS_SCAN_GATE: Gate = Gate::new("/bin/ps -ax -o pid=,command=");
+
+/// Lets only one port scan run at a time, so at most one `lsof` child is alive
+/// even while one is stuck.
+#[cfg(target_os = "macos")]
+static PORT_SCAN_GATE: Gate = Gate::new("lsof -nP -iTCP -sTCP:LISTEN");
+
+/// The process-table scan discovery runs: the real `/bin/ps`, bounded by
+/// [`PROCESS_SCAN_TIMEOUT`]. Tests substitute their own command.
+fn process_scan() -> BoundedCommand {
+    BoundedCommand::new(
+        &PROCESS_SCAN_GATE,
+        "/bin/ps",
+        ["-ax", "-o", "pid=,command="],
+        PROCESS_SCAN_TIMEOUT,
+    )
+}
+
+/// Report a scan that could not run as "could not look".
+///
+/// Transient `LocalSourceUnavailable`, so the last healthy reading keeps
+/// serving, and worded so a reader can tell it apart from "no Antigravity
+/// running": a stalled process table says nothing about whether the editor is
+/// open.
+#[cfg(any(target_os = "macos", test))]
+fn could_not_look(what: &str, error: &SubprocessError) -> FetchError {
+    FetchError::LocalSourceUnavailable(format!("could not {what}: {error}"))
+}
+
+/// List the running Antigravity servers.
+///
+/// `Ok(empty)` means the scan ran and found none. A scan that timed out, was
+/// skipped because the previous one is still stuck, or could not start is an
+/// `Err`, never an empty list: an empty list is published as "no Antigravity
+/// running", which is a different fact.
+#[cfg(any(target_os = "macos", test))]
+async fn discover_servers(scan: &BoundedCommand) -> Result<Vec<LocalServer>, FetchError> {
+    let output = match scan.output().await {
+        Ok(output) => output,
+        Err(error) => return Err(could_not_look("list processes", &error)),
     };
-    parse_process_list(&String::from_utf8_lossy(&out.stdout))
+    if !output.status.success() {
+        return Err(FetchError::LocalSourceUnavailable(format!(
+            "could not list processes: `ps` exited with {}",
+            output.status
+        )));
+    }
+    Ok(parse_process_list(&String::from_utf8_lossy(&output.stdout)))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn discover_servers() -> Vec<LocalServer> {
-    Vec::new()
+#[cfg(not(any(target_os = "macos", test)))]
+async fn discover_servers(_scan: &BoundedCommand) -> Result<Vec<LocalServer>, FetchError> {
+    Ok(Vec::new())
 }
 
+/// The loopback ports a server process listens on.
+///
+/// Same contract as [`discover_servers`]: a scan that could not run is an `Err`.
+/// The exit status is not checked because `lsof` exits 1 when the process simply
+/// has no listening socket, which is an ordinary empty answer.
 #[cfg(target_os = "macos")]
-fn discover_ports(pid: i32) -> Vec<u16> {
+async fn discover_ports(pid: i32) -> Result<Vec<u16>, FetchError> {
     let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists());
     let Some(lsof) = lsof else {
-        return Vec::new();
+        return Err(FetchError::LocalSourceUnavailable(
+            "could not list listening ports: no lsof binary on this machine".to_string(),
+        ));
     };
-    let Ok(out) = std::process::Command::new(lsof)
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &pid.to_string()])
-        .output()
-    else {
-        return Vec::new();
-    };
-    parse_listening_ports(&String::from_utf8_lossy(&out.stdout))
+    let scan = BoundedCommand::new(
+        &PORT_SCAN_GATE,
+        lsof,
+        [
+            "-nP".to_string(),
+            "-iTCP".to_string(),
+            "-sTCP:LISTEN".to_string(),
+            "-a".to_string(),
+            "-p".to_string(),
+            pid.to_string(),
+        ],
+        PORT_SCAN_TIMEOUT,
+    );
+    match scan.output().await {
+        Ok(output) => Ok(parse_listening_ports(&String::from_utf8_lossy(
+            &output.stdout,
+        ))),
+        Err(error) => Err(could_not_look("list listening ports", &error)),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn discover_ports(_pid: i32) -> Vec<u16> {
-    Vec::new()
+async fn discover_ports(_pid: i32) -> Result<Vec<u16>, FetchError> {
+    Ok(Vec::new())
+}
+
+/// What one local probe found, cached briefly so concurrent handle fetches share
+/// a single discovery.
+#[derive(Clone, Debug)]
+struct LocalProbe {
+    snapshots: Vec<LocalSnapshot>,
+    /// Whether any Antigravity server process was found, so a probe that served
+    /// nothing can say whether nothing is running or nothing answered.
+    servers_found: bool,
 }
 
 // ---- response parsing (pure, unit-tested) -----------------------------------
@@ -1273,7 +1364,19 @@ pub struct AntigravityProvider {
     quota_url: String,
     quota_summary_url: String,
     token_url: String,
-    local_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<LocalSnapshot>)>>,
+    /// The last local probe and when it was taken. A failed probe is cached as
+    /// its reason, for the same two seconds, so every handle in one tick gets the
+    /// same answer.
+    ///
+    /// An async lock held ACROSS discovery, not just around the read and write:
+    /// handles fetched concurrently must wait for one discovery and share it. The
+    /// process scan admits one child at a time, so a second handle racing the
+    /// first would otherwise be refused as "still running" and report a
+    /// could-not-look error during an ordinary, healthy tick.
+    local_cache: tokio::sync::Mutex<Option<(std::time::Instant, Result<LocalProbe, String>)>>,
+    /// The process-table scan discovery runs. Always the real `ps` outside
+    /// tests; a test substitutes a command it controls to simulate a stall.
+    process_scan: BoundedCommand,
     /// Which lane last answered for each handle, so a SWITCH can be logged.
     ///
     /// Three lanes stamp the same `source` on the wire (the local editor probe,
@@ -1313,7 +1416,8 @@ impl AntigravityProvider {
             quota_url: REMOTE_QUOTA_URL.to_string(),
             quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
-            local_cache: std::sync::Mutex::new(None),
+            local_cache: tokio::sync::Mutex::new(None),
+            process_scan: process_scan(),
             served_lane: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_endpoints: None,
             override_accounts: None,
@@ -1323,9 +1427,7 @@ impl AntigravityProvider {
     #[doc(hidden)]
     pub fn set_local_endpoints(&mut self, endpoints: Vec<(LocalServer, u16)>) {
         self.local_endpoints = Some(endpoints);
-        if let Ok(mut guard) = self.local_cache.lock() {
-            *guard = None;
-        }
+        *self.local_cache.get_mut() = None;
     }
 
     #[doc(hidden)]
@@ -1455,7 +1557,14 @@ impl AntigravityProvider {
         // handle's email case-insensitively. A mismatch, missing email, or absent local
         // server falls through to the cloud lane.
         if let Some(expected_email) = account.email.as_deref() {
-            let snapshots = self.probe_local_snapshots().await;
+            // A probe that could not look falls through exactly like one that
+            // found no matching session: either way the local lane has nothing to
+            // serve, and the lanes below decide what this account publishes.
+            let snapshots = self
+                .probe_local_snapshots()
+                .await
+                .map(|probe| probe.snapshots)
+                .unwrap_or_default();
             if let Some(matching) = snapshots
                 .into_iter()
                 .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
@@ -1711,7 +1820,13 @@ impl AntigravityProvider {
         // entitled to a different tier. If the local session matches this vault handle's
         // identity, serve local usage.
         if let Some(expected_email) = &observed_email {
-            let snapshots = self.probe_local_snapshots().await;
+            // As in the plugin lane: could-not-look falls through to the lanes
+            // below, the same as no matching session.
+            let snapshots = self
+                .probe_local_snapshots()
+                .await
+                .map(|probe| probe.snapshots)
+                .unwrap_or_default();
             if let Some(matching) = snapshots
                 .into_iter()
                 .find(|s| emails_match(Some(expected_email), s.email.as_deref()))
@@ -1876,33 +1991,54 @@ impl AntigravityProvider {
 
     /// Discover and probe running Antigravity servers on loopback, caching the
     /// snapshot for 2 seconds to share discovery across concurrent handle fetches within a tick.
-    async fn probe_local_snapshots(&self) -> Vec<LocalSnapshot> {
-        let now = std::time::Instant::now();
-        if let Ok(guard) = self.local_cache.lock() {
-            if let Some((taken_at, snapshots)) = guard.as_ref() {
-                if now.duration_since(*taken_at) < Duration::from_secs(2) {
-                    return snapshots.clone();
-                }
+    ///
+    /// `Err` means discovery could not look (a scan timed out, was skipped because
+    /// the previous one is still stuck, or could not start). It is never folded
+    /// into an empty probe, which would read as "no Antigravity running".
+    async fn probe_local_snapshots(&self) -> Result<LocalProbe, FetchError> {
+        let mut cache = self.local_cache.lock().await;
+        if let Some((taken_at, probe)) = cache.as_ref() {
+            if taken_at.elapsed() < Duration::from_secs(2) {
+                return probe.clone().map_err(FetchError::LocalSourceUnavailable);
             }
         }
 
-        let candidates = if let Some(endpoints) = &self.local_endpoints {
-            endpoints.clone()
+        let probe = self.probe_local_uncached().await;
+        // Stamped when discovery FINISHES, so handles that queued behind a slow
+        // discovery reuse its answer instead of starting their own.
+        *cache = Some((
+            std::time::Instant::now(),
+            probe.as_ref().cloned().map_err(|error| match error {
+                FetchError::LocalSourceUnavailable(reason) => reason.clone(),
+                other => other.to_string(),
+            }),
+        ));
+        probe
+    }
+
+    async fn probe_local_uncached(&self) -> Result<LocalProbe, FetchError> {
+        let (candidates, servers_found, port_error) = if let Some(endpoints) = &self.local_endpoints
+        {
+            (endpoints.clone(), !endpoints.is_empty(), None)
         } else {
-            let servers = tokio::task::spawn_blocking(discover_servers)
-                .await
-                .unwrap_or_else(|_join_error| Vec::new());
+            let servers = discover_servers(&self.process_scan).await?;
             let mut list = Vec::new();
-            for server in servers {
-                let pid = server.pid;
-                let ports = tokio::task::spawn_blocking(move || discover_ports(pid))
-                    .await
-                    .unwrap_or_else(|_join_error| Vec::new());
-                for port in ports {
-                    list.push((server.clone(), port));
+            let mut port_error = None;
+            for server in &servers {
+                match discover_ports(server.pid).await {
+                    Ok(ports) => {
+                        for port in ports {
+                            list.push((server.clone(), port));
+                        }
+                    }
+                    // Kept rather than returned at once: another server may
+                    // still answer, and an answer beats the error.
+                    Err(error) => {
+                        port_error.get_or_insert(error);
+                    }
                 }
             }
-            list
+            (list, !servers.is_empty(), port_error)
         };
 
         let mut snapshots = Vec::new();
@@ -1912,11 +2048,15 @@ impl AntigravityProvider {
             }
         }
 
-        if let Ok(mut guard) = self.local_cache.lock() {
-            *guard = Some((now, snapshots.clone()));
+        if snapshots.is_empty() {
+            if let Some(error) = port_error {
+                return Err(error);
+            }
         }
-
-        snapshots
+        Ok(LocalProbe {
+            snapshots,
+            servers_found,
+        })
     }
 }
 
@@ -2017,8 +2157,8 @@ impl UsageProvider for AntigravityProvider {
         }
 
         let result: Result<ProviderUsage, FetchError> = async {
-            let snapshots = self.probe_local_snapshots().await;
-            if let Some(snapshot) = snapshots.into_iter().next() {
+            let probe = self.probe_local_snapshots().await?;
+            if let Some(snapshot) = probe.snapshots.into_iter().next() {
                 return Ok(ProviderUsage::healthy(
                     PROVIDER_NAME,
                     None,
@@ -2027,14 +2167,10 @@ impl UsageProvider for AntigravityProvider {
                 ));
             }
 
-            let servers = if let Some(endpoints) = &self.local_endpoints {
-                endpoints.iter().map(|(s, _)| s.clone()).collect()
-            } else {
-                tokio::task::spawn_blocking(discover_servers)
-                    .await
-                    .unwrap_or_else(|_join_error| Vec::new())
-            };
-            if servers.is_empty() {
+            // Decided from the scan the probe already ran. Scanning again here
+            // only to pick a message would double the `ps` children per fetch,
+            // and on a stalled process table every extra one is a stuck child.
+            if !probe.servers_found {
                 return Err(FetchError::LocalSourceUnavailable(
                     "no Antigravity language server or agy CLI process running".to_string(),
                 ));
@@ -3772,5 +3908,73 @@ mod plugin_lane_tests {
             Some(&"local-probe")
         );
         assert_eq!(provider.served_lane.lock().unwrap().len(), 2);
+    }
+
+    /// A provider whose process scan is `command`, with no endpoints and no
+    /// plugin accounts, so the implicit handle runs real discovery against it.
+    fn provider_scanning_with(command: BoundedCommand) -> AntigravityProvider {
+        let mut provider = AntigravityProvider::new();
+        provider.process_scan = command;
+        provider.set_override_accounts(Vec::new());
+        provider
+    }
+
+    fn local_unavailable_reason(attempt: FetchAttempt) -> String {
+        match attempt.usage {
+            Err(FetchError::LocalSourceUnavailable(reason)) => reason,
+            other => panic!("expected LocalSourceUnavailable, got {other:?}"),
+        }
+    }
+
+    /// A process scan that could not look reaches the provider as
+    /// could-not-look, never as "no Antigravity running".
+    ///
+    /// The two read alike on the wire (both `local_source_unavailable`), so the
+    /// REASON is what is asserted: "no server running" tells a reader the editor
+    /// is closed, which a stalled process table does not establish. The first
+    /// fetch's scan outlives its timeout; a second provider then finds the stuck
+    /// scan still running and must report the skip without starting another.
+    #[tokio::test]
+    async fn a_scan_that_could_not_look_is_never_reported_as_no_server_running() {
+        // Control: a scan that RUNS and lists nothing is "no server running".
+        // Without it, the assertions below could pass because that message had
+        // simply changed.
+        static EMPTY: Gate = Gate::new("empty process list");
+        let empty = provider_scanning_with(BoundedCommand::new(
+            &EMPTY,
+            "/usr/bin/true",
+            Vec::<String>::new(),
+            Duration::from_secs(5),
+        ));
+        let reason =
+            local_unavailable_reason(empty.fetch_handle(&CredentialHandle::implicit()).await);
+        assert!(
+            reason.contains("process running"),
+            "an empty process list is the no-server case: {reason}"
+        );
+
+        static STUCK: Gate = Gate::new("stuck process scan");
+        let stuck = BoundedCommand::new(&STUCK, "/bin/sleep", ["2"], Duration::from_millis(200));
+
+        let timed_out = provider_scanning_with(stuck.clone());
+        let reason =
+            local_unavailable_reason(timed_out.fetch_handle(&CredentialHandle::implicit()).await);
+        assert!(
+            reason.contains("timed out") && !reason.contains("process running"),
+            "a timed-out scan must say it could not look: {reason}"
+        );
+
+        let skipped = provider_scanning_with(stuck);
+        let reason =
+            local_unavailable_reason(skipped.fetch_handle(&CredentialHandle::implicit()).await);
+        assert!(
+            reason.contains("still running") && !reason.contains("process running"),
+            "a skipped scan must say it could not look: {reason}"
+        );
+        assert_eq!(
+            STUCK.spawns(),
+            1,
+            "one fetch runs one scan, and the skipped one starts none"
+        );
     }
 }

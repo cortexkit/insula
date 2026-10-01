@@ -62,6 +62,7 @@ pub mod sakana;
 pub mod stepfun;
 pub mod store;
 pub mod sub2api;
+mod subprocess;
 pub mod synthetic;
 pub mod text;
 pub mod unread_keys;
