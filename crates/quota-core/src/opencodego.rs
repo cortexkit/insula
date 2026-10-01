@@ -2,7 +2,7 @@
 //! JSON API first, the legacy HTML `/go` page as fallback.
 //!
 //! API-KEY LANE. `GET https://opencode.ai/zen/go/v1/usage` with
-//! `Authorization: Bearer <key>`, the key coming from a vault `apikey:opencode`
+//! `Authorization: Bearer <key>`, the key coming from a vault `apikey:opencode-go`
 //! credential or the `OPENCODE_API_KEY` environment variable. It needs no
 //! browser, so it is the lane for Windows and headless hosts that cannot read
 //! Chrome's cookie store. When a key is present it is the ONLY lane this
@@ -69,7 +69,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// rejects.
 const API_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 /// Vault credential family holding an OpenCode API key.
-pub const API_KEY_FAMILY: &str = "apikey:opencode";
+pub const API_KEY_FAMILY: &str = "apikey:opencode-go";
 /// Environment variable upstream reads the API key from.
 const API_KEY_ENV: &[&str] = &["OPENCODE_API_KEY"];
 /// `source` published for a fetch made with the environment's API key.
@@ -770,7 +770,7 @@ impl OpenCodeGoProvider {
         }
     }
 
-    /// Vault handles in the `apikey:opencode` family. The loader's opencodego
+    /// Vault handles in the `apikey:opencode-go` family. The loader's opencodego
     /// mapping also holds the shared `cookie:opencode.ai` deposits, so the
     /// family is filtered here.
     fn vault_api_key_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
@@ -1731,7 +1731,7 @@ mod tests {
             API_USAGE_URL,
             format!("https://opencode.ai{API_USAGE_PATH}")
         );
-        assert_eq!(API_KEY_FAMILY, "apikey:opencode");
+        assert_eq!(API_KEY_FAMILY, "apikey:opencode-go");
     }
 
     /// Rolling only: one window, and the API's percent is already a percent.
@@ -1853,11 +1853,11 @@ mod tests {
     #[test]
     fn an_api_key_replaces_the_cookie_lanes() {
         let cookie = ("cookie:opencode.ai:acct", "cookie");
-        let key = ("apikey:opencode", "apikey");
+        let key = ("apikey:opencode-go", "apikey");
 
         // A vault key: only the key's handle.
         let provider = provider_with_rows(&[cookie, key], "");
-        assert_eq!(ids(provider.handles().unwrap()), vec!["apikey:opencode"]);
+        assert_eq!(ids(provider.handles().unwrap()), vec!["apikey:opencode-go"]);
 
         // An environment key: only the implicit handle, which fetches with it.
         let mut provider = provider_with_rows(&[cookie], "");
@@ -1914,7 +1914,7 @@ mod tests {
         let (base, requests) =
             serve(|_path, _request| Reply::Body(401, r#"{"error":"unauthorized"}"#)).await;
 
-        let mut vault = provider_with_rows(&[("apikey:opencode", "apikey")], "bad");
+        let mut vault = provider_with_rows(&[("apikey:opencode-go", "apikey")], "bad");
         point_at(&mut vault, &base);
         let handle = vault.handles().unwrap().remove(0);
         let error = vault

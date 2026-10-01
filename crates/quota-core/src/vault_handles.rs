@@ -33,7 +33,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:opencode.ai", "opencodego"),
     // The OpenCode Go usage API's key. Routed to opencodego only: `opencode`
     // (the Zen balance) has no API-key lane.
-    ("apikey:opencode", "opencodego"),
+    ("apikey:opencode-go", "opencodego"),
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
@@ -707,15 +707,40 @@ mod tests {
         assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
     }
 
-    /// `apikey:opencode` routes to opencodego alone, and like every identity-less
-    /// family a second deposit darkens it rather than racing the first.
+    #[test]
+    fn the_opencode_go_vault_id_routes_only_to_opencodego_and_the_old_id_is_unclaimed() {
+        for id in ["apikey:opencode-go", "apikey:opencode-go:main"] {
+            let providers: Vec<_> = CREDENTIAL_FAMILIES
+                .iter()
+                .filter(|(family, _)| handle_id_names_family(id, family))
+                .map(|(_, provider)| *provider)
+                .collect();
+            assert_eq!(providers, vec!["opencodego"], "{id}");
+            assert!(
+                handle_id_names_family(id, crate::opencodego::API_KEY_FAMILY),
+                "the OpenCode Go API-key lane must consume {id}"
+            );
+            assert!(!handle_id_names_family(id, "apikey:opencode"));
+        }
+        for id in ["apikey:opencode", "apikey:opencode:main"] {
+            assert!(
+                !CREDENTIAL_FAMILIES
+                    .iter()
+                    .any(|(family, _)| handle_id_names_family(id, family)),
+                "the retired {id} spelling must not route to any provider"
+            );
+        }
+    }
+
+    /// `apikey:opencode-go` routes to opencodego alone. A second deposit disables
+    /// the family because its keys carry no account identity to distinguish them.
     #[test]
     fn the_opencode_api_key_routes_to_opencodego_and_a_second_is_refused() {
         let loader = VaultHandleLoader::default();
-        install(&loader, vec![row("apikey:opencode", "apikey")]);
+        install(&loader, vec![row("apikey:opencode-go", "apikey")]);
         assert_eq!(
             loader.opencodego_handles().unwrap(),
-            vec![CredentialHandle::scoped("apikey:opencode", "apikey")]
+            vec![CredentialHandle::scoped("apikey:opencode-go", "apikey")]
         );
         assert!(
             loader.opencode_handles().unwrap().is_empty(),
@@ -726,13 +751,13 @@ mod tests {
         install(
             &loader,
             vec![
-                row("apikey:opencode", "apikey"),
-                row("apikey:opencode:second", "apikey"),
+                row("apikey:opencode-go", "apikey"),
+                row("apikey:opencode-go:second", "apikey"),
             ],
         );
         assert!(loader.opencodego_handles().unwrap().is_empty());
         assert!(loader.warning().is_some_and(|warning| {
-            warning.contains("multiple identity-less credentials name `apikey:opencode`")
+            warning.contains("multiple identity-less credentials name `apikey:opencode-go`")
         }));
     }
 
