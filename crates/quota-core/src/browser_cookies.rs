@@ -740,21 +740,56 @@ fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> 
         .map(|(_, p)| p))
 }
 
+/// How long the Keychain read may take before the cookie cohort stops waiting.
+///
+/// Measured on the development host at 0.04-0.05 s. Ten seconds allows a
+/// Keychain that is slow after wake or unlock, and still leaves a cookie
+/// provider's 20 s request inside the refresher's 35 s fetch deadline.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Single-flight slot for the Keychain read: at most one `security` child alive.
+#[cfg(target_os = "macos")]
+static KEYCHAIN_READ_GATE: crate::subprocess::Gate =
+    crate::subprocess::Gate::new("security find-generic-password");
+
 /// Read the "Chrome Safe Storage" generic password from the login keychain via the
 /// `security` CLI (zero-dependency, and the path proven against the real keychain).
+///
+/// Bounded like every other child this crate spawns (see `subprocess`): the
+/// caller is answered within [`KEYCHAIN_READ_TIMEOUT`], and a `security` that
+/// will not exit blocks further reads instead of being joined by a new child per
+/// refresh tick. A child left waiting is not killed, so if it is waiting on a
+/// Keychain access prompt the prompt stays up, and once someone answers it the
+/// next tick reads normally.
 #[cfg(target_os = "macos")]
 fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
-    let output = std::process::Command::new("security")
-        .args([
+    use crate::subprocess::{BoundedCommand, SubprocessError};
+
+    let output = BoundedCommand::new(
+        &KEYCHAIN_READ_GATE,
+        "security",
+        [
             "find-generic-password",
             "-s",
             "Chrome Safe Storage",
             "-a",
             "Chrome",
             "-w",
-        ])
-        .output()
-        .map_err(|e| CookieError::NoKeychainKey(e.to_string()))?;
+        ],
+        KEYCHAIN_READ_TIMEOUT,
+    )
+    .output_blocking()
+    .map_err(|error| match error {
+        // A failure to start keeps the mapping it always had.
+        SubprocessError::Spawn { .. } => CookieError::NoKeychainKey(error.to_string()),
+        // A Keychain that did not answer in time says nothing about whether the
+        // key exists. Reported as a local source this lane cannot read right
+        // now: transient, so the last healthy readings keep serving.
+        SubprocessError::Timeout { .. } | SubprocessError::Busy { .. } => {
+            CookieError::Unavailable(format!("reading the Chrome Safe Storage key: {error}"))
+        }
+    })?;
     if !output.status.success() {
         return Err(CookieError::NoKeychainKey(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),

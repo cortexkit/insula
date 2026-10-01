@@ -23,7 +23,8 @@ pbkdf2 = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true }
+# `process` for the bounded `ps`/`lsof`/`security` children in subprocess.rs.
+tokio = { workspace = true, features = ["process"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
