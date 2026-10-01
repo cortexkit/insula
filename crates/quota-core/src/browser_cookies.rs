@@ -748,7 +748,8 @@ fn locate_under(base: &std::path::Path) -> Result<Option<PathBuf>, CookieError> 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Single-flight slot for the Keychain read: at most one `security` child alive.
+/// Lets only one Keychain read run at a time, so at most one `security` child is
+/// alive even while one is stuck.
 #[cfg(target_os = "macos")]
 static KEYCHAIN_READ_GATE: crate::subprocess::Gate =
     crate::subprocess::Gate::new("security find-generic-password");
@@ -781,7 +782,8 @@ fn safe_storage_key() -> Result<Vec<u8>, CookieError> {
     )
     .output_blocking()
     .map_err(|error| match error {
-        // A failure to start keeps the mapping it always had.
+        // A `security` that could not be started is still `NoKeychainKey`, as it
+        // was before this read had a timeout.
         SubprocessError::Spawn { .. } => CookieError::NoKeychainKey(error.to_string()),
         // A Keychain that did not answer in time says nothing about whether the
         // key exists. Reported as a local source this lane cannot read right

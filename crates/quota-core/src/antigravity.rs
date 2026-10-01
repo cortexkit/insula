@@ -674,14 +674,17 @@ const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Single-flight slot for the process-table scan: at most one `ps` child alive.
+/// Lets only one process-table scan run at a time, so at most one `ps` child is
+/// alive even while one is stuck.
 static PROCESS_SCAN_GATE: Gate = Gate::new("/bin/ps -ax -o pid=,command=");
 
-/// Single-flight slot for the port scan: at most one `lsof` child alive.
+/// Lets only one port scan run at a time, so at most one `lsof` child is alive
+/// even while one is stuck.
 #[cfg(target_os = "macos")]
 static PORT_SCAN_GATE: Gate = Gate::new("lsof -nP -iTCP -sTCP:LISTEN");
 
-/// The production process-table scan.
+/// The process-table scan discovery runs: the real `/bin/ps`, bounded by
+/// [`PROCESS_SCAN_TIMEOUT`]. Tests substitute their own command.
 fn process_scan() -> BoundedCommand {
     BoundedCommand::new(
         &PROCESS_SCAN_GATE,
