@@ -318,6 +318,9 @@ mod tests {
     /// The helper's whole contract against a child that outlives its timeout:
     /// the caller is answered at the timeout, a second call while the child
     /// lives starts nothing, and the gate reopens once the child exits.
+    // The tests that run a real child use `/bin/sleep` and `/bin/echo`, which a
+    // Windows CI runner does not have. The two that need no child run everywhere.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_stuck_child_times_out_once_and_blocks_a_second_until_it_exits() {
         static GATE: Gate = Gate::new("/bin/sleep 2");
@@ -365,6 +368,7 @@ mod tests {
         assert_eq!(GATE.spawns(), 2);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_is_collected_and_the_gate_reopens_after_a_normal_run() {
         static GATE: Gate = Gate::new("/bin/echo");
@@ -393,6 +397,7 @@ mod tests {
         assert_eq!(GATE.spawns(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_blocking_form_times_out_from_a_blocking_thread() {
         static GATE: Gate = Gate::new("/bin/sleep 2 blocking");

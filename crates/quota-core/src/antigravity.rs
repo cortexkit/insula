@@ -3912,6 +3912,7 @@ mod plugin_lane_tests {
 
     /// A provider whose process scan is `command`, with no endpoints and no
     /// plugin accounts, so the implicit handle runs real discovery against it.
+    #[cfg(unix)]
     fn provider_scanning_with(command: BoundedCommand) -> AntigravityProvider {
         let mut provider = AntigravityProvider::new();
         provider.process_scan = command;
@@ -3919,6 +3920,7 @@ mod plugin_lane_tests {
         provider
     }
 
+    #[cfg(unix)]
     fn local_unavailable_reason(attempt: FetchAttempt) -> String {
         match attempt.usage {
             Err(FetchError::LocalSourceUnavailable(reason)) => reason,
@@ -3934,6 +3936,10 @@ mod plugin_lane_tests {
     /// is closed, which a stalled process table does not establish. The first
     /// fetch's scan outlives its timeout; a second provider then finds the stuck
     /// scan still running and must report the skip without starting another.
+    ///
+    /// Unix only: the stand-in scans are `/usr/bin/true` and `/bin/sleep`, which
+    /// a Windows CI runner does not have.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_scan_that_could_not_look_is_never_reported_as_no_server_running() {
         // Control: a scan that RUNS and lists nothing is "no server running".
