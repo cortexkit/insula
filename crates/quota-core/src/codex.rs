@@ -1005,8 +1005,21 @@ impl CodexProvider {
         // HERE, BEFORE ANY ELIGIBILITY CHECK. An account holding no banked credit
         // returns below without ever reaching the coordinator, and that is exactly
         // the account whose headroom should stop a walled sibling spending one.
+        //
+        // The credit half asks the same question the tick below asks before it
+        // reaches the coordinator -- armed, and holding a credit it may safely
+        // spend -- so an account the policy picks to redeem is one that would.
         if let Ok(coordinator) = &self.reset_coordinator {
-            coordinator.observe_headroom(account_id, &facts, std::time::Instant::now());
+            let redeemable_credit = reset_eligible
+                && credits_snapshot
+                    .as_ref()
+                    .is_ok_and(|(credits, now)| reset_trigger_expiry(credits, *now).is_some());
+            coordinator.observe_headroom(
+                account_id,
+                &facts,
+                redeemable_credit,
+                std::time::Instant::now(),
+            );
         }
         let (credits, now) = match credits_snapshot {
             Ok(snapshot) => snapshot,

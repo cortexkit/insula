@@ -4934,6 +4934,7 @@ fn reset_facts(percent: f64, at_wall: bool) -> UsageFacts {
         any_used_floor: percent >= 1.0,
         at_wall,
         wall_clear: !at_wall,
+        wall_lifts_at: None,
     }
 }
 
@@ -5749,7 +5750,12 @@ async fn a_walled_account_keeps_its_banked_reset_while_a_sibling_has_room() {
     let temp = ResetTempDir::new("sibling-has-room");
     let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
-    coordinator.observe_headroom("roomy-account", &reset_facts(44.0, false), Instant::now());
+    coordinator.observe_headroom(
+        "roomy-account",
+        &reset_facts(44.0, false),
+        false,
+        Instant::now(),
+    );
 
     let result = coordinator
         .process_tick(
@@ -5787,6 +5793,7 @@ async fn a_walled_account_still_resets_when_no_sibling_has_proven_room() {
                     any_used_floor: true,
                     at_wall: false,
                     wall_clear: false,
+                    wall_lifts_at: None,
                 },
                 now,
             )),
@@ -5805,7 +5812,7 @@ async fn a_walled_account_still_resets_when_no_sibling_has_proven_room() {
         let transport =
             MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
         if let Some((facts, at)) = sibling {
-            coordinator.observe_headroom("other-account", &facts, at);
+            coordinator.observe_headroom("other-account", &facts, false, at);
         }
         coordinator
             .process_tick(
@@ -5830,17 +5837,691 @@ fn an_account_is_never_its_own_sibling() {
     let temp = ResetTempDir::new("own-sibling");
     let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
     let now = Instant::now();
-    coordinator.observe_headroom("walled-account", &reset_facts(44.0, false), now);
+    coordinator.observe_headroom("walled-account", &reset_facts(44.0, false), false, now);
     assert_eq!(
         coordinator.sibling_with_headroom("walled-account", now),
         None
     );
-    coordinator.observe_headroom("other-account", &reset_facts(44.0, false), now);
+    coordinator.observe_headroom("other-account", &reset_facts(44.0, false), false, now);
     assert_eq!(
         coordinator
             .sibling_with_headroom("walled-account", now)
             .as_deref(),
         Some("other-account")
+    );
+}
+
+// ---- One banked reset at a time, by the account whose wall lifts latest ----
+//
+// The owner's rule for Codex accounts that hit their wall with auto-use on:
+// never redeem two accounts' resets at once, and redeem on the account whose
+// natural reset is furthest away. These drive the coordinator directly, one
+// tick per account, and count consume POSTs.
+
+const ACCOUNT_A: &str = "acct-a";
+const ACCOUNT_B: &str = "acct-b";
+
+fn lifts_in_days(days: i64) -> Option<chrono::DateTime<Utc>> {
+    Some(reset_now() + chrono::Duration::days(days))
+}
+
+/// An account at its wall until `lifts`.
+fn walled_until(lifts: Option<chrono::DateTime<Utc>>) -> UsageFacts {
+    UsageFacts {
+        wall_lifts_at: lifts,
+        ..reset_facts(100.0, true)
+    }
+}
+
+/// A walled account whose only route to firing is the exhaustion trigger.
+fn exhaustion_tick(lifts: Option<chrono::DateTime<Utc>>) -> ResetTickInput {
+    ResetTickInput {
+        facts: walled_until(lifts),
+        ..walled_tick_far_from_expiry(reset_now())
+    }
+}
+
+fn request_for(account_id: &str) -> ResetRequest {
+    ResetRequest {
+        base_url: "https://example.invalid/backend-api".to_string(),
+        bearer: format!("{account_id}-token"),
+        account_id: account_id.to_string(),
+        auth_failure: None,
+    }
+}
+
+/// Record a fresh reading of a walled account holding a credit it would spend.
+fn observe_walled(
+    coordinator: &ResetCoordinator,
+    account_id: &str,
+    lifts: Option<chrono::DateTime<Utc>>,
+) {
+    coordinator.observe_headroom(account_id, &walled_until(lifts), true, Instant::now());
+}
+
+async fn tick_account(
+    coordinator: &ResetCoordinator,
+    transport: &MockResetTransport,
+    account_id: &str,
+    input: ResetTickInput,
+) -> crate::codex_resets::ResetTickResult {
+    coordinator
+        .process_tick(account_id, input, transport, &request_for(account_id))
+        .await
+}
+
+/// Move every journal record `seconds` into the past, which is how these tests
+/// let time pass: the journal reads the wall clock, not the tick's `now`.
+fn age_journal(journal: &RedemptionJournal, seconds: i64) {
+    let shift = |value: &str| {
+        (chrono::DateTime::parse_from_rfc3339(value).unwrap() - chrono::Duration::seconds(seconds))
+            .to_rfc3339()
+    };
+    let mut records = journal.records().unwrap();
+    for record in &mut records {
+        record.created_at = shift(&record.created_at);
+        record.last_attempt_at = record.last_attempt_at.as_deref().map(shift);
+    }
+    std::fs::write(journal.path(), serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+}
+
+fn journal_accounts(journal: &RedemptionJournal) -> Vec<String> {
+    journal
+        .records()
+        .unwrap()
+        .into_iter()
+        .map(|record| record.account_id)
+        .collect()
+}
+
+/// Both accounts walled with a credit each; tick them in `order`. Returns the
+/// accounts that POSTed and each account's withheld line.
+async fn tick_two_walled(
+    a_lifts: Option<chrono::DateTime<Utc>>,
+    b_lifts: Option<chrono::DateTime<Utc>>,
+    order: [&str; 2],
+) -> (Vec<String>, HashMap<String, Option<String>>) {
+    let temp = ResetTempDir::new("two-walled");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&coordinator, ACCOUNT_A, a_lifts);
+    observe_walled(&coordinator, ACCOUNT_B, b_lifts);
+    let mut withheld = HashMap::new();
+    for account_id in order {
+        let lifts = if account_id == ACCOUNT_A {
+            a_lifts
+        } else {
+            b_lifts
+        };
+        let result =
+            tick_account(&coordinator, &transport, account_id, exhaustion_tick(lifts)).await;
+        withheld.insert(account_id.to_string(), result.withheld);
+    }
+    let posted = transport.consume_accounts.lock().unwrap().clone();
+    (posted, withheld)
+}
+
+/// Asserts the rule for one pair of reset times, in BOTH tick orders: the
+/// account ticked first must not win just by being first.
+async fn assert_only_the_latest_lifting_account_redeems(
+    a_lifts: Option<chrono::DateTime<Utc>>,
+    b_lifts: Option<chrono::DateTime<Utc>>,
+    chosen: &str,
+    kept: &str,
+) {
+    for order in [[ACCOUNT_A, ACCOUNT_B], [ACCOUNT_B, ACCOUNT_A]] {
+        let (posted, withheld) = tick_two_walled(a_lifts, b_lifts, order).await;
+        assert_eq!(
+            posted,
+            vec![chosen.to_string()],
+            "order {order:?}: exactly one POST, for the account whose wall lifts latest"
+        );
+        let line = withheld[kept]
+            .as_deref()
+            .unwrap_or_else(|| panic!("order {order:?}: {kept} must be reported withheld"));
+        assert!(
+            line.contains(&format!("account_id={chosen} ")),
+            "order {order:?}: the withheld line must name {chosen}: {line}"
+        );
+        if order[0] == kept {
+            // Ticked before anyone redeemed, so held back by the choice itself,
+            // and the line says why: both reset times.
+            for lifts in [a_lifts, b_lifts] {
+                let lifts = crate::rfc3339_canonical(lifts.unwrap());
+                assert!(
+                    line.contains(&lifts),
+                    "order {order:?}: {line} lacks {lifts}"
+                );
+            }
+        }
+        assert_eq!(withheld[chosen], None, "order {order:?}");
+    }
+}
+
+#[tokio::test]
+async fn both_walled_only_the_account_whose_wall_lifts_latest_redeems() {
+    assert_only_the_latest_lifting_account_redeems(
+        lifts_in_days(5),
+        lifts_in_days(2),
+        ACCOUNT_A,
+        ACCOUNT_B,
+    )
+    .await;
+}
+
+/// The control: the same accounts with the reset times swapped. Without it the
+/// test above would also pass for a choice made by account id.
+#[tokio::test]
+async fn both_walled_with_reset_times_swapped_the_other_account_redeems() {
+    assert_only_the_latest_lifting_account_redeems(
+        lifts_in_days(2),
+        lifts_in_days(5),
+        ACCOUNT_B,
+        ACCOUNT_A,
+    )
+    .await;
+}
+
+/// After A redeems, its last reading still shows it walled until A is read
+/// again. B must not take that as "nobody has room" and redeem as well -- not on
+/// the same tick, and not on the next, even though B is now the account whose
+/// wall lifts latest.
+#[tokio::test]
+async fn after_one_account_redeems_no_other_redeems_until_it_is_read_again() {
+    let temp = ResetTempDir::new("after-redemption");
+    let journal = temp.journal();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(2));
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_A,
+        exhaustion_tick(lifts_in_days(2)),
+    )
+    .await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "A redeems");
+
+    // Not aged between ticks: the reading table cannot be aged with the journal,
+    // and A's pre-redemption reading would then look newer than its redemption.
+    for tick_number in 0..2 {
+        observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(5));
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            ACCOUNT_B,
+            exhaustion_tick(lifts_in_days(5)),
+        )
+        .await;
+        assert_eq!(
+            *transport.consume_accounts.lock().unwrap(),
+            vec![ACCOUNT_A.to_string()],
+            "tick {tick_number}: B redeemed while A's redemption was unconfirmed"
+        );
+        assert!(result
+            .withheld
+            .is_some_and(|line| line.contains(&format!("account_id={ACCOUNT_A} "))));
+    }
+}
+
+/// The cross-account fence must outlive the process: a restart between A's
+/// redemption and A's next reading is exactly the window it exists for. A's
+/// record is older than the provider-wide floor, so only this fence is left.
+#[tokio::test]
+async fn the_cross_account_bound_survives_a_restart() {
+    let temp = ResetTempDir::new("cross-account-restart");
+    let journal = temp.journal();
+    {
+        let before_restart = ResetCoordinator::new(journal.clone()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        observe_walled(&before_restart, ACCOUNT_A, lifts_in_days(2));
+        tick_account(
+            &before_restart,
+            &transport,
+            ACCOUNT_A,
+            exhaustion_tick(lifts_in_days(2)),
+        )
+        .await;
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "A redeems");
+    }
+    // Past the floor, inside the cross-account bound.
+    age_journal(
+        &journal,
+        crate::codex_resets::PROVIDER_REDEMPTION_FLOOR_SECS + 5 * 60,
+    );
+
+    let restarted = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&restarted, ACCOUNT_B, lifts_in_days(5));
+    let result = tick_account(
+        &restarted,
+        &transport,
+        ACCOUNT_B,
+        exhaustion_tick(lifts_in_days(5)),
+    )
+    .await;
+
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "after a restart B redeemed while A's redemption was still inside the bound"
+    );
+    assert!(result
+        .withheld
+        .is_some_and(|line| line.contains(&format!("account_id={ACCOUNT_A} "))));
+    assert_eq!(journal_accounts(&journal), vec![ACCOUNT_A.to_string()]);
+}
+
+/// The fence is not permanent: once the bound has passed, a walled B whose
+/// wall lifts later than A's redeems.
+#[tokio::test]
+async fn once_the_cross_account_bound_has_elapsed_the_chosen_account_redeems() {
+    let temp = ResetTempDir::new("cross-account-elapsed");
+    let journal = temp.journal();
+    {
+        let first = ResetCoordinator::new(journal.clone()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        observe_walled(&first, ACCOUNT_A, lifts_in_days(2));
+        tick_account(
+            &first,
+            &transport,
+            ACCOUNT_A,
+            exhaustion_tick(lifts_in_days(2)),
+        )
+        .await;
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "A redeems");
+    }
+    // The journal's own verdict on either side of the bound, so this test shows
+    // the bound elapsing and not only A being read again.
+    let bound = crate::codex_resets::CROSS_ACCOUNT_BOUND_SECS;
+    age_journal(&journal, bound - 60);
+    let inside = journal.inspect_account(ACCOUNT_B, Utc::now()).unwrap();
+    assert_eq!(
+        inside.recent_elsewhere.len(),
+        1,
+        "inside the bound A still fences"
+    );
+    age_journal(&journal, 61);
+    let past = journal.inspect_account(ACCOUNT_B, Utc::now()).unwrap();
+    assert!(
+        past.recent_elsewhere.is_empty(),
+        "past the bound A no longer fences"
+    );
+
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(2));
+    observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(5));
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_B,
+        exhaustion_tick(lifts_in_days(5)),
+    )
+    .await;
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec![ACCOUNT_B.to_string()]
+    );
+}
+
+/// A fresh reading of the redeemed account, taken after its redemption
+/// resolved, releases the fence early. Here A is read again still walled (its
+/// reset did not clear every window) and B's wall lifts later, so B redeems --
+/// but only after that reading, never before it.
+#[tokio::test]
+async fn a_fresh_reading_of_the_redeemed_account_releases_the_cross_account_fence() {
+    let temp = ResetTempDir::new("cross-account-release");
+    let journal = temp.journal();
+    redeem_on_a_then_restart(&journal, lifts_in_days(2)).await;
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(5));
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_B,
+        exhaustion_tick(lifts_in_days(5)),
+    )
+    .await;
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "B redeemed before A was read again"
+    );
+
+    observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(2));
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_B,
+        exhaustion_tick(lifts_in_days(5)),
+    )
+    .await;
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec![ACCOUNT_B.to_string()]
+    );
+}
+
+/// A redeems through one coordinator, which is then dropped, and the journal is
+/// aged past the provider-wide floor but kept inside the cross-account bound.
+/// Starting the next coordinator empty is the only way to have A's redemption
+/// on record with no reading of A taken since: the table cannot be aged along
+/// with the journal, so a reading kept from before would look newer than it is.
+async fn redeem_on_a_then_restart(
+    journal: &RedemptionJournal,
+    a_lifts: Option<chrono::DateTime<Utc>>,
+) {
+    let first = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&first, ACCOUNT_A, a_lifts);
+    tick_account(&first, &transport, ACCOUNT_A, exhaustion_tick(a_lifts)).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "A redeems");
+    age_journal(
+        journal,
+        crate::codex_resets::PROVIDER_REDEMPTION_FLOOR_SECS + 60,
+    );
+}
+
+/// An account with nothing it would spend is never the one chosen to spend:
+/// choosing it would hold every other walled account back for nothing.
+#[tokio::test]
+async fn an_account_without_a_usable_credit_is_never_the_chosen_candidate() {
+    let temp = ResetTempDir::new("no-credit-candidate");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    // A's wall lifts later, so A would be chosen -- but A holds no credit.
+    coordinator.observe_headroom(
+        ACCOUNT_A,
+        &walled_until(lifts_in_days(5)),
+        false,
+        Instant::now(),
+    );
+    observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(2));
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_B,
+        exhaustion_tick(lifts_in_days(2)),
+    )
+    .await;
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec![ACCOUNT_B.to_string()]
+    );
+}
+
+/// Use-it-or-lose-it: a credit about to expire is redeemed even while another
+/// account is walled and chosen, or has just redeemed and not been read since.
+/// Only the provider-wide floor spaces it, so A's redemption is placed past
+/// that floor. Two cases, because one reading cannot show both: a fresh
+/// reading of A after its redemption is what releases the cross-account fence.
+#[tokio::test]
+async fn an_expiring_credit_still_redeems_while_another_account_is_walled_and_chosen() {
+    for a_read_again in [true, false] {
+        let temp = ResetTempDir::new("expiry-ungated");
+        let journal = temp.journal();
+        redeem_on_a_then_restart(&journal, lifts_in_days(5)).await;
+        let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        if a_read_again {
+            // Walled with a later lift and a credit: A is the chosen account.
+            observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(5));
+        }
+        observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(2));
+
+        // B's credit expires in five minutes, inside its ten-minute window.
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            ACCOUNT_B,
+            ResetTickInput {
+                facts: walled_until(lifts_in_days(2)),
+                ..reset_tick_input(reset_now(), reset_facts(100.0, true))
+            },
+        )
+        .await;
+        assert!(result.trigger.expiry_trigger, "a_read_again={a_read_again}");
+        assert!(
+            !result.trigger.exhaustion_trigger,
+            "a_read_again={a_read_again}: precondition: B's exhaustion trigger is held \
+             back, so expiry alone fires"
+        );
+        assert_eq!(
+            *transport.consume_accounts.lock().unwrap(),
+            vec![ACCOUNT_B.to_string()],
+            "a_read_again={a_read_again}"
+        );
+    }
+}
+
+/// Regression: one account walled, the other with room. Nobody redeems.
+#[tokio::test]
+async fn one_walled_account_and_one_with_room_redeem_nothing() {
+    let temp = ResetTempDir::new("one-walled");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(2));
+    coordinator.observe_headroom(ACCOUNT_B, &reset_facts(67.0, false), true, Instant::now());
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_A,
+        exhaustion_tick(lifts_in_days(2)),
+    )
+    .await;
+    tick_account(
+        &coordinator,
+        &transport,
+        ACCOUNT_B,
+        ResetTickInput {
+            facts: reset_facts(67.0, false),
+            ..walled_tick_far_from_expiry(reset_now())
+        },
+    )
+    .await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+}
+
+// ---- The provider-wide floor: one redemption per ten minutes, of any kind ----
+
+/// The floor holds ON ITS OWN. Two walled accounts, ticked every minute for
+/// the ten minutes after the first redemption: exactly one POST. With the
+/// candidate choice and the cross-account fence both disabled this must still
+/// pass, and removing the floor as well must fail it.
+#[tokio::test]
+async fn at_most_one_redemption_per_floor_across_all_accounts() {
+    let temp = ResetTempDir::new("provider-floor");
+    let journal = temp.journal();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let floor_minutes = crate::codex_resets::PROVIDER_REDEMPTION_FLOOR_SECS / 60;
+    for minute in 0..floor_minutes {
+        if minute > 0 {
+            age_journal(&journal, 60);
+        }
+        for account_id in [ACCOUNT_A, ACCOUNT_B] {
+            observe_walled(&coordinator, ACCOUNT_A, lifts_in_days(5));
+            observe_walled(&coordinator, ACCOUNT_B, lifts_in_days(2));
+            let lifts = if account_id == ACCOUNT_A {
+                lifts_in_days(5)
+            } else {
+                lifts_in_days(2)
+            };
+            tick_account(&coordinator, &transport, account_id, exhaustion_tick(lifts)).await;
+        }
+    }
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "two redemptions inside the provider-wide floor"
+    );
+    assert_eq!(
+        journal_accounts(&journal).len(),
+        1,
+        "a refused redemption must leave no record behind"
+    );
+}
+
+/// The floor is read from the journal, so a restart does not reopen it, and a
+/// refusal names the account that redeemed last and when. An EXPIRING credit
+/// is used here because the candidate choice and the cross-account fence do
+/// not apply to it: only the floor stands between it and a POST.
+#[tokio::test]
+async fn the_provider_floor_survives_a_restart_and_names_the_last_redemption() {
+    let temp = ResetTempDir::new("provider-floor-restart");
+    let journal = temp.journal();
+    {
+        let before_restart = ResetCoordinator::new(journal.clone()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        observe_walled(&before_restart, ACCOUNT_A, lifts_in_days(2));
+        tick_account(
+            &before_restart,
+            &transport,
+            ACCOUNT_A,
+            exhaustion_tick(lifts_in_days(2)),
+        )
+        .await;
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 1, "A redeems");
+    }
+    age_journal(
+        &journal,
+        crate::codex_resets::PROVIDER_REDEMPTION_FLOOR_SECS - 60,
+    );
+    let last_at = journal.records().unwrap()[0]
+        .last_attempt_at
+        .clone()
+        .unwrap();
+    let last_at = crate::rfc3339_canonical(
+        chrono::DateTime::parse_from_rfc3339(&last_at)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+
+    let restarted = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let result = tick_account(
+        &restarted,
+        &transport,
+        ACCOUNT_B,
+        reset_tick_input(reset_now(), reset_facts(50.0, false)),
+    )
+    .await;
+
+    assert!(
+        result.trigger.fire,
+        "precondition: B's expiring credit fires"
+    );
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "after a restart B redeemed inside the provider-wide floor"
+    );
+    assert!(!result.pending, "a refusal is not a pending redemption");
+    assert_eq!(
+        journal_accounts(&journal),
+        vec![ACCOUNT_A.to_string()],
+        "a refused redemption must leave no record behind"
+    );
+    let line = result.withheld.expect("the refusal is reported");
+    assert!(
+        line.contains(&format!("account_id={ACCOUNT_A} ")) && line.contains(&last_at),
+        "the refusal must name the last redemption and when: {line}"
+    );
+}
+
+/// The provider-wide floor checked on the journal directly, with no coordinator
+/// and so none of its account-selection rules: a second account's reservation
+/// inside the floor is refused and writes nothing.
+#[test]
+fn the_journal_refuses_a_second_accounts_reservation_inside_the_floor() {
+    let temp = ResetTempDir::new("journal-floor");
+    let journal = temp.journal();
+    let now = Utc::now();
+    let Reservation::New(first) = journal.reserve(ACCOUNT_A, now).unwrap() else {
+        panic!("the first reservation is new");
+    };
+    journal
+        .resolve(ACCOUNT_A, &first, ConsumeOutcome::Reset)
+        .unwrap();
+
+    let refused = journal
+        .reserve(ACCOUNT_B, now + chrono::Duration::seconds(9 * 60))
+        .unwrap();
+    let Reservation::ProviderFloor(last) = refused else {
+        panic!("expected the floor to refuse, got {refused:?}");
+    };
+    assert_eq!(last.account_id, ACCOUNT_A);
+    assert_eq!(
+        journal.records().unwrap().len(),
+        1,
+        "refused, nothing written"
+    );
+
+    assert!(matches!(
+        journal
+            .reserve(ACCOUNT_B, now + chrono::Duration::seconds(10 * 60))
+            .unwrap(),
+        Reservation::New(_)
+    ));
+}
+
+/// Two credits on different accounts expiring five minutes apart, with the
+/// expiry trigger opening an hour out: the floor spaces them, and both are
+/// still redeemed before they expire.
+#[tokio::test]
+async fn two_credits_expiring_close_together_are_both_redeemed_ten_minutes_apart() {
+    let temp = ResetTempDir::new("expiry-spacing");
+    let journal = temp.journal();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let start = reset_now();
+    let expiries = [
+        (ACCOUNT_A, start + chrono::Duration::minutes(60)),
+        (ACCOUNT_B, start + chrono::Duration::minutes(65)),
+    ];
+    let mut redeemed_at: HashMap<&str, i64> = HashMap::new();
+    for minute in 0..=70 {
+        if minute > 0 {
+            age_journal(&journal, 60);
+        }
+        let now = start + chrono::Duration::minutes(minute);
+        for (account_id, expiry) in expiries {
+            if redeemed_at.contains_key(account_id) || now >= expiry {
+                continue;
+            }
+            let posts_before = transport.posts.load(Ordering::SeqCst);
+            tick_account(
+                &coordinator,
+                &transport,
+                account_id,
+                ResetTickInput {
+                    earliest_expiry: Some(expiry),
+                    auto_use_resets_secs: 60 * 60,
+                    ..reset_tick_input(now, reset_facts(50.0, false))
+                },
+            )
+            .await;
+            if transport.posts.load(Ordering::SeqCst) > posts_before {
+                redeemed_at.insert(account_id, minute);
+            }
+        }
+    }
+    let (Some(&a), Some(&b)) = (redeemed_at.get(ACCOUNT_A), redeemed_at.get(ACCOUNT_B)) else {
+        panic!("both credits must be redeemed before they expire: {redeemed_at:?}");
+    };
+    assert!(
+        a < 60 && b < 65,
+        "each before its own expiry: {redeemed_at:?}"
+    );
+    assert!(
+        (b - a).abs() >= crate::codex_resets::PROVIDER_REDEMPTION_FLOOR_SECS / 60,
+        "redemptions must be at least the floor apart: {redeemed_at:?}"
     );
 }
 
@@ -5858,6 +6539,7 @@ fn codex_reset_trigger_truth_table_is_fully_fenced() {
         spend_bound_allows: true,
         before_post_cutoff: true,
         sibling_has_headroom: false,
+        exhaustion_deferred: false,
     };
     let mut cases = Vec::new();
     cases.push(("expiry", base.clone(), true));
@@ -5891,13 +6573,26 @@ fn codex_reset_trigger_truth_table_is_fully_fenced() {
 
     // The 2026-09-20 incident: walled here, room on another account. Keep the
     // credit; work continues on the sibling.
-    let mut exhaustion_with_sibling = exhaustion;
+    let mut exhaustion_with_sibling = exhaustion.clone();
     exhaustion_with_sibling.sibling_has_headroom = true;
     cases.push((
         "exhaustion-with-sibling-headroom",
         exhaustion_with_sibling,
         false,
     ));
+
+    // Every account walled, and a different account is the one to redeem (its
+    // wall lifts later, or it just redeemed): this account keeps its credit.
+    let mut exhaustion_deferred = exhaustion;
+    exhaustion_deferred.exhaustion_deferred = true;
+    cases.push(("exhaustion-deferred", exhaustion_deferred, false));
+
+    // Use-it-or-lose-it again: `exhaustion_deferred` holds back the exhaustion
+    // trigger only, so an expiring credit still fires.
+    let mut expiry_despite_deferral = base.clone();
+    expiry_despite_deferral.at_wall = true;
+    expiry_despite_deferral.exhaustion_deferred = true;
+    cases.push(("expiry-despite-deferral", expiry_despite_deferral, true));
 
     let mut pending = base.clone();
     pending.pending = true;
@@ -7111,6 +7806,7 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
         spend_bound_allows: true,
         before_post_cutoff: true,
         sibling_has_headroom: false,
+        exhaustion_deferred: false,
     });
     assert!(!mixed_trigger.expiry_trigger);
     assert!(!mixed_trigger.fire);
@@ -7136,6 +7832,7 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
             spend_bound_allows: true,
             before_post_cutoff: true,
             sibling_has_headroom: false,
+            exhaustion_deferred: false,
         })
         .fire
     );
