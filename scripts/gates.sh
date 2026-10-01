@@ -184,6 +184,46 @@ cargo fmt --check || fail "formatting"
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings || fail "clippy"
 
+step "clippy on the newest stable (what CI runs)"
+# CI installs `dtolnay/rust-toolchain@stable`, so it lints with the NEWEST stable
+# the day it runs, while this machine lints with whatever stable was installed
+# last. Every six weeks a release adds lints, and until someone updates locally the
+# gates pass here and fail in CI on code nobody touched. It happened with Rust 1.99
+# (2026-09-28): clippy::double_must_use fired on async-trait 0.1.89's generated
+# code, ten errors, all gates green on 1.98.
+#
+# So when a newer stable exists, clippy also runs on it, as a separate toolchain.
+# The default stable is left alone: every module on this host builds with it, and
+# moving it would make all of them recompile at once.
+#
+# If rustup cannot reach the network, this step says so and continues. The
+# default-toolchain clippy above has already run, and CI checks the newest stable
+# anyway; refusing here would make the gates unusable offline for coverage CI
+# already provides.
+#
+# DECIDED BY THE OUTPUT, NOT THE EXIT CODE. `rustup check` exits 100 when an update
+# IS available, which is exactly the case this step exists for. The first version
+# of this step branched on the exit code, read 100 as "could not check", and
+# printed the offline note on the one day it mattered. The stable line is present
+# when rustup reached the network and absent when it did not.
+newest_check="$(rustup check 2>/dev/null)"
+stable_line="$(printf '%s\n' "$newest_check" | grep '^stable-' | head -1)"
+if [ -n "$stable_line" ]; then
+    newest="$(printf '%s\n' "$stable_line" \
+        | sed -n 's/^stable-[^ ]* - update available: .* -> \([0-9][0-9.]*\) .*/\1/p')"
+    if [ -z "$newest" ]; then
+        echo "  local stable is the newest stable: ${stable_line#*- }"
+    else
+        echo "  local stable is behind; CI lints with $newest, so clippy runs on it too"
+        rustup toolchain install "$newest" --profile minimal -c clippy >/dev/null 2>&1 \
+            || fail "could not install Rust $newest to lint with what CI uses"
+        cargo "+$newest" clippy --workspace --all-targets -- -D warnings \
+            || fail "clippy on Rust $newest (CI's toolchain)"
+    fi
+else
+    echo "  NOTE: rustup could not check for a newer stable (offline?); CI will lint with it"
+fi
+
 step "cargo test --workspace --lib --bins"
 cargo test --workspace --lib --bins || fail "unit tests"
 
