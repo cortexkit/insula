@@ -2145,7 +2145,8 @@ the seven it accepts as answered are the same seven as last round.
 **Recommended ports** (none built this round; for the owner to choose):
 1. **OpenCode Go API-key lane.** In `opencodego.rs`, add a lane reading
    `GET https://opencode.ai/zen/go/v1/usage` with
-   `Authorization: Bearer <OPENCODE_API_KEY>` (401/403 mean invalid credentials),
+   `Authorization: Bearer <OPENCODE_API_KEY>` (401/403 mean invalid credentials,
+   except a parsed 403 `error.type == "EntitlementError"`, which means no Go subscription),
    parsed as upstream's `parseAPIUsage`. Upstream path:
    `Sources/CodexBarCore/Providers/OpenCodeGo/OpenCodeGoUsageFetcher.swift`
    (`fetchAPIUsage`, `parseAPIUsage`), with the token-account routing in
@@ -2159,8 +2160,9 @@ the seven it accepts as answered are the same seven as last round.
    `go/status`. Upstream has had this lane since `v0.54.0`, so it is a gap that
    predates this round rather than a change in it.
 
-   **Built 2026-09-24; NOT live-verified** (no OpenCode API key on this host, so
-   it is fixture-verified against upstream's tests only). The key comes from the
+   **Built 2026-09-24; seen live 2026-10-01**: the key authenticates, but this
+   account has no Go subscription (HTTP 403 `EntitlementError`). Successful usage
+   payloads remain fixture-verified against upstream's tests. The key comes from the
    `OPENCODE_API_KEY` environment variable or a vault `apikey:opencode-go` credential
    (a new family, routed to `opencodego` only; a second deposit is refused like
    every identity-less family). The ordering rule: a present key is the ONLY lane
@@ -2168,9 +2170,9 @@ the seven it accepts as answered are the same seven as last round.
    console and legacy lanes are exactly as before. Two deliberate differences from
    upstream: the key is recognised by its vault family, not by sniffing a stored
    value's shape, and upstream's extra "Renews" window is not published. The API
-   lane has no "no subscription" verdict, because upstream's has none either: a
-   body without `usage.rolling` is `decode_failed` until someone captures what an
-   unsubscribed key actually receives.
+   lane reports `no_quota_reported` for HTTP 403 with the parsed JSON field
+   `error.type` exactly equal to `EntitlementError`; other 401/403 responses remain
+   rejected credentials. A success body without `usage.rolling` remains `decode_failed`.
 
 Nothing else in this release is worth porting.
 
