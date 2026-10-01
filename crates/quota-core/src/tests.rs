@@ -6435,8 +6435,9 @@ async fn the_provider_floor_survives_a_restart_and_names_the_last_redemption() {
     );
 }
 
-/// The floor in the journal itself, below every policy: a second account's
-/// reservation inside the floor is refused and writes nothing.
+/// The provider-wide floor checked on the journal directly, with no coordinator
+/// and so none of its account-selection rules: a second account's reservation
+/// inside the floor is refused and writes nothing.
 #[test]
 fn the_journal_refuses_a_second_accounts_reservation_inside_the_floor() {
     let temp = ResetTempDir::new("journal-floor");
@@ -6580,13 +6581,14 @@ fn codex_reset_trigger_truth_table_is_fully_fenced() {
         false,
     ));
 
-    // Every account walled: another one redeems instead (its wall lifts later,
-    // or it just redeemed). Keep this credit.
+    // Every account walled, and a different account is the one to redeem (its
+    // wall lifts later, or it just redeemed): this account keeps its credit.
     let mut exhaustion_deferred = exhaustion;
     exhaustion_deferred.exhaustion_deferred = true;
     cases.push(("exhaustion-deferred", exhaustion_deferred, false));
 
-    // Use-it-or-lose-it again: deferral binds the exhaustion trigger only.
+    // Use-it-or-lose-it again: `exhaustion_deferred` holds back the exhaustion
+    // trigger only, so an expiring credit still fires.
     let mut expiry_despite_deferral = base.clone();
     expiry_despite_deferral.at_wall = true;
     expiry_despite_deferral.exhaustion_deferred = true;

@@ -1462,8 +1462,9 @@ impl ResetCoordinator {
     /// A redemption stops holding back once its account has been read AFTER it
     /// resolved: that reading shows the account's room again, and the sibling
     /// rule takes over. Until then the journal is the only evidence, which is
-    /// the point -- after a restart this table is empty, so nothing releases
-    /// early and the journal record alone fences for the whole bound. A pending
+    /// the point -- after a restart the in-memory `headroom` readings are empty,
+    /// so nothing releases early and the journal record alone fences for the
+    /// whole bound. A pending
     /// record never releases early: its outcome is unknown, and a reading taken
     /// while its POST is in flight shows the account as it was before.
     fn unreleased_redemption<'a>(
