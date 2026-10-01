@@ -44,6 +44,43 @@ pub const PENDING_OLD_AFTER_SECS: i64 = 24 * 60 * 60;
 pub const SPEND_BOUND_SECS: i64 = 30 * 60;
 pub const RESOLVED_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// How long one account's redemption holds back every OTHER account's
+/// exhaustion redemption, unless the redeemed account is read again first.
+///
+/// The same half hour as the per-account spend bound, on purpose. Both answer
+/// "how long may a redemption go unconfirmed before this module acts again",
+/// and the window this one covers is short in practice: the redeemed account
+/// is normally read again within a minute, and that fresh reading (showing its
+/// room) releases the fence early. The bound only matters when that reading
+/// never arrives -- a restart, or the account failing to read -- and then a
+/// shorter value would let a second account spend a credit on the strength of
+/// no evidence at all, while a longer one would only delay a sibling that is
+/// walled for days anyway.
+pub const CROSS_ACCOUNT_BOUND_SECS: i64 = SPEND_BOUND_SECS;
+
+/// At most one banked-reset redemption per this many seconds across ALL codex
+/// accounts on this host, whatever triggered it.
+///
+/// A DELIBERATE SECOND FENCE, NOT THE RULE. The rule that decides which account
+/// redeems lives in the trigger, the candidate choice and the cross-account
+/// bound. This floor exists so that a bug in any of those still cannot spend
+/// two accounts' credits back to back: it is enforced in
+/// [`RedemptionJournal::reserve`], which every redemption passes before its
+/// POST, and it reads the durable journal, so it survives a restart.
+///
+/// It also spaces EXPIRY redemptions, which nothing else does across accounts.
+/// Two credits on different accounts expiring close together are still both
+/// redeemed, ten minutes apart, as long as the expiry trigger opens early
+/// enough: with the trigger window `auto_use_resets` seconds before expiry and
+/// credits expiring `gap` seconds apart, the second one needs
+/// `auto_use_resets > PROVIDER_REDEMPTION_FLOOR_SECS + CREDIT_SAFETY_MARGIN_SECS - gap`
+/// (plus a poll interval). With the usual window of an hour or more that holds
+/// comfortably; with a window of a few minutes the second credit can lapse.
+pub const PROVIDER_REDEMPTION_FLOOR_SECS: i64 = 10 * 60;
+
+/// The used percent at which a window counts as at its wall.
+const WALL_PERCENT: f64 = 99.0;
+
 /// One verifiably available reset credit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetCredit {
@@ -189,6 +226,11 @@ pub struct UsageFacts {
     pub any_used_floor: bool,
     pub at_wall: bool,
     pub wall_clear: bool,
+    /// When the account's wall lifts on its own: the latest stated reset among
+    /// the windows at the wall, since the account stays blocked until every one
+    /// of them has reset. `None` when no walled window states a reset (or none
+    /// is walled), which callers must treat as "unknown", not "soon".
+    pub wall_lifts_at: Option<DateTime<Utc>>,
 }
 
 impl UsageFacts {
@@ -200,12 +242,22 @@ impl UsageFacts {
         let raw_percents: Vec<f64> = crate::model::windows(usage)
             .map(|window| window.used_percent)
             .collect();
+        // The same windows and the same threshold as `at_wall` below, so the
+        // question "which windows are walled" has one answer. A reset that does
+        // not parse is treated as unstated rather than guessed.
+        let wall_lifts_at = crate::model::windows(usage)
+            .filter(|window| window.used_percent >= WALL_PERCENT)
+            .filter_map(|window| window.resets_at.as_deref())
+            .filter_map(|resets_at| DateTime::parse_from_rfc3339(resets_at).ok())
+            .map(|resets_at| resets_at.with_timezone(&Utc))
+            .max();
         Self {
             any_used_floor: raw_percents.iter().any(|percent| *percent >= 1.0),
             at_wall: limit_reached == Some(true)
-                || raw_percents.iter().any(|percent| *percent >= 99.0),
+                || raw_percents.iter().any(|percent| *percent >= WALL_PERCENT),
             wall_clear: limit_reached == Some(false),
             raw_percents,
+            wall_lifts_at,
         }
     }
 
@@ -230,6 +282,10 @@ pub struct TriggerInput {
     /// which the upstream affirmed `limit_reached: false` and no window sat at the
     /// wall. Suppresses the exhaustion trigger only -- see `evaluate_trigger`.
     pub sibling_has_headroom: bool,
+    /// Another walled account redeems instead: either it is the chosen
+    /// candidate (its wall lifts later), or it redeemed recently and has not
+    /// been read since. Suppresses the exhaustion trigger only.
+    pub exhaustion_deferred: bool,
 }
 
 /// Individual trigger reasons and the fully fenced fire decision.
@@ -261,7 +317,14 @@ pub fn evaluate_trigger(input: &TriggerInput) -> TriggerDecision {
     // reading suppresses; a sibling that is unknown, stale, degraded or merely
     // unaffirmed does not. Withholding on a guess would leave every account walled
     // at once with a credit sitting unspent, which is the worse of the two errors.
-    let exhaustion_trigger = input.at_wall && !input.sibling_has_headroom;
+    //
+    // ONE ACCOUNT AT A TIME, AND THE RIGHT ONE. When several accounts are walled
+    // together, `exhaustion_deferred` holds back all but the account whose wall
+    // lifts latest, and holds everyone back for a while after any account
+    // redeems -- see `ResetCoordinator::process_tick_with_timeout`. The expiry
+    // trigger ignores that too, for the same use-it-or-lose-it reason.
+    let exhaustion_trigger =
+        input.at_wall && !input.sibling_has_headroom && !input.exhaustion_deferred;
     let fire = input.armed
         && (expiry_trigger || exhaustion_trigger)
         && !input.pending
@@ -366,6 +429,18 @@ impl std::error::Error for JournalError {}
 pub struct AccountJournalState {
     pub pending_id: Option<String>,
     pub spend_bound_allows: bool,
+    /// Redemptions by OTHER accounts, pending or resolved, inside
+    /// [`CROSS_ACCOUNT_BOUND_SECS`], newest first.
+    pub recent_elsewhere: Vec<RecentRedemption>,
+}
+
+/// One account's redemption as the journal last recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRedemption {
+    pub account_id: String,
+    /// The record's latest time: its last attempt, or its creation.
+    pub at: DateTime<Utc>,
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +448,9 @@ pub enum Reservation {
     New(String),
     ExistingPending(String),
     SpendBound,
+    /// Refused by [`PROVIDER_REDEMPTION_FLOOR_SECS`]: some account redeemed
+    /// too recently. Carries that redemption so the refusal can name it.
+    ProviderFloor(RecentRedemption),
     NoAction,
 }
 
@@ -587,9 +665,29 @@ impl RedemptionJournal {
                     now.signed_duration_since(latest).num_seconds() < SPEND_BOUND_SECS
                 })
         });
+        // The cross-account fence. Any record counts, pending or resolved and
+        // whatever its outcome, for the reason the spend bound above is
+        // outcome-blind; and a record dated in the future counts too, so a
+        // clock step backwards cannot open it.
+        let mut recent_elsewhere = Vec::new();
+        for record in records
+            .iter()
+            .filter(|record| record.account_id != account_id)
+        {
+            let at = parse_record_latest_time(record)?;
+            if now.signed_duration_since(at).num_seconds() < CROSS_ACCOUNT_BOUND_SECS {
+                recent_elsewhere.push(RecentRedemption {
+                    account_id: record.account_id.clone(),
+                    at,
+                    resolved: record.status == JournalStatus::Resolved,
+                });
+            }
+        }
+        recent_elsewhere.sort_by_key(|redemption| std::cmp::Reverse(redemption.at));
         Ok(AccountJournalState {
             pending_id,
             spend_bound_allows,
+            recent_elsewhere,
         })
     }
 
@@ -608,8 +706,37 @@ impl RedemptionJournal {
             return Ok(Reservation::SpendBound);
         }
 
-        let id = Uuid::new_v4().to_string();
         let mut records = self.load()?;
+        // THE PROVIDER-WIDE FLOOR, checked here because every redemption passes
+        // this point before its POST, whatever triggered it and whatever the
+        // policy above decided. Deliberately written against the raw records
+        // rather than reusing `recent_elsewhere` or anything else the policy
+        // reads: a bug shared with the cross-account fence would open both at
+        // once, and this exists to hold when that fence does not.
+        //
+        // Every account counts, pending or resolved. Checked after the pending
+        // case above on purpose: retrying a pending id is the SAME redemption
+        // (the server is idempotent on it), and refusing it would leave the
+        // record unresolved. Refused before anything is written, so a refusal
+        // leaves no pending record behind.
+        let mut last_redemption: Option<RecentRedemption> = None;
+        for record in &records {
+            let at = parse_record_latest_time(record)?;
+            let inside_floor =
+                now.signed_duration_since(at).num_seconds() < PROVIDER_REDEMPTION_FLOOR_SECS;
+            if inside_floor && last_redemption.as_ref().is_none_or(|last| at > last.at) {
+                last_redemption = Some(RecentRedemption {
+                    account_id: record.account_id.clone(),
+                    at,
+                    resolved: record.status == JournalStatus::Resolved,
+                });
+            }
+        }
+        if let Some(last) = last_redemption {
+            return Ok(Reservation::ProviderFloor(last));
+        }
+
+        let id = Uuid::new_v4().to_string();
         records.push(RedemptionRecord {
             account_id: account_id.to_string(),
             redeem_request_id: id.clone(),
@@ -1104,6 +1231,10 @@ pub struct ResetTickResult {
     pub journal_ok: bool,
     pub outcome: Option<ConsumeOutcome>,
     pub trigger: TriggerDecision,
+    /// Why a redemption this account would otherwise make was held back this
+    /// tick, in the words of the log line announcing it. `None` when nothing
+    /// was held back.
+    pub withheld: Option<String>,
 }
 
 impl ResetTickResult {
@@ -1126,7 +1257,9 @@ impl ResetTickResult {
                 spend_bound_allows: false,
                 before_post_cutoff: false,
                 sibling_has_headroom: false,
+                exhaustion_deferred: false,
             }),
+            withheld: None,
         }
     }
 }
@@ -1135,10 +1268,52 @@ impl ResetTickResult {
 struct AccountMutationState {
     in_flight: bool,
     last_post_at: Option<Instant>,
-    /// Whether the last tick withheld an exhaustion reset because a sibling had
-    /// room. Kept only so the log line fires on the transition rather than once a
-    /// minute for as long as the account stays walled.
-    withheld_for_sibling: bool,
+}
+
+/// The latest usage reading of one account, as the reset policy needs it.
+#[derive(Debug, Clone)]
+struct HeadroomReading {
+    below_wall: bool,
+    at_wall: bool,
+    wall_lifts_at: Option<DateTime<Utc>>,
+    redeemable_credit: bool,
+    observed: Instant,
+    /// The same moment on the wall clock, comparable with journal timestamps.
+    observed_utc: DateTime<Utc>,
+}
+
+/// The account chosen to spend its banked reset instead of the one asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenCandidate {
+    pub account_id: String,
+    pub wall_lifts_at: Option<DateTime<Utc>>,
+}
+
+/// Which of two walled accounts should redeem first: `Less` means `left`.
+///
+/// The account whose wall lifts LATEST redeems; one that will reset soon on its
+/// own should wait for that. An unknown lift time (`None`) is ordered as the
+/// latest of all. That is a choice, not a fact: an account with no stated reset
+/// could stay blocked longest, and spending on it is the cheaper mistake than
+/// leaving it walled indefinitely. Ties go to the smaller account id, so the
+/// choice is the same on every tick and every host.
+fn redeems_first(
+    left: (&str, Option<DateTime<Utc>>),
+    right: (&str, Option<DateTime<Utc>>),
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_lift = match (left.1, right.1) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left_lift), Some(right_lift)) => right_lift.cmp(&left_lift),
+    };
+    by_lift.then_with(|| left.0.cmp(right.0))
+}
+
+fn describe_lift(lift: Option<DateTime<Utc>>) -> String {
+    lift.map(crate::rfc3339_canonical)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[derive(Default)]
@@ -1165,10 +1340,15 @@ pub struct ResetCoordinator {
     journal: RedemptionJournal,
     journal_io: Mutex<()>,
     accounts: Mutex<HashMap<String, Arc<AccountMutation>>>,
-    /// Latest headroom verdict per account, with when it was observed. Fed from
-    /// EVERY codex fetch, including accounts that hold no credit and so never
-    /// reach `process_tick` -- those are the siblings that matter most.
-    headroom: Mutex<HashMap<String, (bool, Instant)>>,
+    /// Latest reading per account, with when it was observed. Fed from EVERY
+    /// codex fetch, including accounts that hold no credit and so never reach
+    /// `process_tick` -- those are the siblings that matter most.
+    headroom: Mutex<HashMap<String, HeadroomReading>>,
+    /// The withheld-redemption line last announced per account. Kept apart
+    /// from `accounts`, whose entries are pruned after every tick for an
+    /// account with no journal records, so a flag kept there would be lost and
+    /// the line repeated every minute.
+    announced: Mutex<HashMap<String, String>>,
 }
 
 impl ResetCoordinator {
@@ -1179,20 +1359,46 @@ impl ResetCoordinator {
             journal_io: Mutex::new(()),
             accounts: Mutex::new(HashMap::new()),
             headroom: Mutex::new(HashMap::new()),
+            announced: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Record whether `account_id` has proven headroom as of `at`.
+    /// Record `account_id`'s reading as of `at`: whether it has proven
+    /// headroom, whether and until when it is walled, and whether it holds a
+    /// banked reset this host could spend.
     ///
     /// Call this for every successful usage read, BEFORE deciding whether the
     /// account is eligible for a reset at all. An account with no banked credit
     /// returns early and never reaches `process_tick`, and it is exactly such an
     /// account whose room should stop a sibling from spending a credit.
-    pub fn observe_headroom(&self, account_id: &str, facts: &UsageFacts, at: Instant) {
+    ///
+    /// `redeemable_credit` must mean "this host would actually spend it": a
+    /// usable credit on an account armed for resets. An account that can never
+    /// redeem, if chosen as the one to redeem, would hold every other walled
+    /// account back for nothing.
+    pub fn observe_headroom(
+        &self,
+        account_id: &str,
+        facts: &UsageFacts,
+        redeemable_credit: bool,
+        at: Instant,
+    ) {
+        let age = chrono::Duration::from_std(Instant::now().saturating_duration_since(at))
+            .unwrap_or_default();
         self.headroom
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(account_id.to_string(), (facts.below_wall(), at));
+            .insert(
+                account_id.to_string(),
+                HeadroomReading {
+                    below_wall: facts.below_wall(),
+                    at_wall: facts.at_wall,
+                    wall_lifts_at: facts.wall_lifts_at,
+                    redeemable_credit,
+                    observed: at,
+                    observed_utc: Utc::now() - age,
+                },
+            );
     }
 
     /// Another account with a fresh, affirmed-clear reading, if any.
@@ -1203,16 +1409,102 @@ impl ResetCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut roomy: Vec<&String> = table
             .iter()
-            .filter(|(other, (below_wall, at))| {
+            .filter(|(other, reading)| {
                 other.as_str() != account_id
-                    && *below_wall
-                    && now.saturating_duration_since(*at) <= SIBLING_HEADROOM_HORIZON
+                    && reading.below_wall
+                    && now.saturating_duration_since(reading.observed) <= SIBLING_HEADROOM_HORIZON
             })
             .map(|(other, _)| other)
             .collect();
         // Sorted only so the log names the same sibling every time.
         roomy.sort();
         roomy.first().map(|other| (*other).clone())
+    }
+
+    /// The walled account that should spend its banked reset instead of
+    /// `account_id`, if it is not `account_id` itself.
+    ///
+    /// The candidates are `account_id` (walled, with its wall lifting at
+    /// `own_lift`) and every OTHER account freshly read at its wall and holding
+    /// a credit it would spend. Only fresh readings count, as for sibling
+    /// headroom: an account last seen walled an hour ago may have reset since,
+    /// and withholding on its account would be acting on a guess.
+    pub fn chosen_instead_of(
+        &self,
+        account_id: &str,
+        own_lift: Option<DateTime<Utc>>,
+        now: Instant,
+    ) -> Option<ChosenCandidate> {
+        let table = self
+            .headroom
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chosen = table
+            .iter()
+            .filter(|(other, reading)| {
+                other.as_str() != account_id
+                    && reading.at_wall
+                    && reading.redeemable_credit
+                    && now.saturating_duration_since(reading.observed) <= SIBLING_HEADROOM_HORIZON
+            })
+            .map(|(other, reading)| (other.as_str(), reading.wall_lifts_at))
+            .chain(std::iter::once((account_id, own_lift)))
+            .min_by(|left, right| redeems_first(*left, *right))?;
+        (chosen.0 != account_id).then(|| ChosenCandidate {
+            account_id: chosen.0.to_string(),
+            wall_lifts_at: chosen.1,
+        })
+    }
+
+    /// The first of `recent` (another account's recent redemption) that still
+    /// holds this account's exhaustion redemption back.
+    ///
+    /// A redemption stops holding back once its account has been read AFTER it
+    /// resolved: that reading shows the account's room again, and the sibling
+    /// rule takes over. Until then the journal is the only evidence, which is
+    /// the point -- after a restart this table is empty, so nothing releases
+    /// early and the journal record alone fences for the whole bound. A pending
+    /// record never releases early: its outcome is unknown, and a reading taken
+    /// while its POST is in flight shows the account as it was before.
+    fn unreleased_redemption<'a>(
+        &self,
+        recent: &'a [RecentRedemption],
+        now: Instant,
+    ) -> Option<&'a RecentRedemption> {
+        let table = self
+            .headroom
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recent.iter().find(|redemption| {
+            let read_since = redemption.resolved
+                && table.get(&redemption.account_id).is_some_and(|reading| {
+                    reading.observed_utc > redemption.at
+                        && now.saturating_duration_since(reading.observed)
+                            <= SIBLING_HEADROOM_HORIZON
+                });
+            !read_since
+        })
+    }
+
+    /// Log `reason` for `account_id` if it differs from the last line logged
+    /// for that account, and forget it when `reason` is `None`. Returns whether
+    /// it logged. A walled account stays walled for days, so a line every tick
+    /// would bury the one transition that matters.
+    fn announce_withheld(&self, account_id: &str, reason: Option<&str>) -> bool {
+        let mut announced = self
+            .announced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(reason) = reason else {
+            announced.remove(account_id);
+            return false;
+        };
+        if announced.get(account_id).is_some_and(|last| last == reason) {
+            return false;
+        }
+        eprintln!("{LOG_TAG} {reason}");
+        announced.insert(account_id.to_string(), reason.to_string());
+        true
     }
 
     pub fn from_env() -> Result<Self, JournalError> {
@@ -1259,6 +1551,29 @@ impl ResetCoordinator {
 
         let coordinator_started = Instant::now();
         let sibling = self.sibling_with_headroom(account_id, coordinator_started);
+        // ONE EXHAUSTION REDEMPTION ACROSS ALL ACCOUNTS, BY THE RIGHT ACCOUNT.
+        // The sibling rule above holds a walled account back only while some
+        // other account has room. Once every account is walled each of them
+        // sees no roomy sibling, so without the two rules below all of them
+        // would redeem, on the same tick or on neighbouring ones.
+        //
+        // First, only one walled account is the candidate: the one whose wall
+        // lifts latest (see `redeems_first`). The others wait; the one that
+        // resets soon by itself keeps its credit.
+        //
+        // Second, after any account redeems, no other account's exhaustion
+        // redemption fires until the redeemed account is read again or
+        // `CROSS_ACCOUNT_BOUND_SECS` passes. Until that reading, the table still
+        // holds the redeemed account's pre-reset reading (at its wall), and a
+        // restart empties the table altogether, so this fence reads the
+        // journal, the one record that survives both. In-process state can only
+        // RELEASE it early, on positive evidence.
+        //
+        // Neither rule touches the expiry trigger: a credit about to lapse is
+        // lost whether or not anyone needs capacity. Both kinds of redemption
+        // are still spaced by `PROVIDER_REDEMPTION_FLOOR_SECS` in the journal.
+        let chosen_instead =
+            self.chosen_instead_of(account_id, input.facts.wall_lifts_at, coordinator_started);
         let account = self.account_mutation(account_id);
         let (request_id, trigger, no_post_result) = {
             let mut account_state = account
@@ -1300,6 +1615,7 @@ impl ResetCoordinator {
                     spend_bound_allows: false,
                     before_post_cutoff: input.elapsed_since_attempt_start < PRE_POST_CUTOFF,
                     sibling_has_headroom: sibling.is_some(),
+                    exhaustion_deferred: chosen_instead.is_some(),
                 });
                 return ResetTickResult {
                     armed: true,
@@ -1309,6 +1625,7 @@ impl ResetCoordinator {
                     journal_ok: true,
                     outcome: None,
                     trigger,
+                    withheld: None,
                 };
             }
 
@@ -1333,6 +1650,8 @@ impl ResetCoordinator {
                 .elapsed_since_attempt_start
                 .saturating_add(coordinator_started.elapsed())
                 < PRE_POST_CUTOFF;
+            let redeemed_elsewhere =
+                self.unreleased_redemption(&journal_state.recent_elsewhere, coordinator_started);
             let trigger = evaluate_trigger(&TriggerInput {
                 armed: true,
                 now: input.now,
@@ -1344,18 +1663,37 @@ impl ResetCoordinator {
                 spend_bound_allows: journal_state.spend_bound_allows,
                 before_post_cutoff,
                 sibling_has_headroom: sibling.is_some(),
+                exhaustion_deferred: chosen_instead.is_some() || redeemed_elsewhere.is_some(),
             });
-            // Announce on the transition, not every tick: a walled account stays
-            // walled for days, and a line a minute would bury the one that matters.
-            let withheld = input.facts.at_wall && !trigger.expiry_trigger && sibling.is_some();
-            if withheld && !account_state.withheld_for_sibling {
-                eprintln!(
-                    "{LOG_TAG} codex reset withheld for account_id={account_id}: at its wall, \
-                     but account_id={} has room, so the banked reset is kept",
-                    sibling.as_deref().unwrap_or_default()
-                );
-            }
-            account_state.withheld_for_sibling = withheld;
+            // Only an exhaustion redemption is held back by these, so a walled
+            // account whose credit is expiring anyway is not reported withheld.
+            let mut withheld = if !input.facts.at_wall || trigger.expiry_trigger {
+                None
+            } else if let Some(sibling) = sibling.as_deref() {
+                Some(format!(
+                    "codex reset withheld for account_id={account_id}: at its wall, \
+                     but account_id={sibling} has room, so the banked reset is kept"
+                ))
+            } else if let Some(redeemed) = redeemed_elsewhere {
+                Some(format!(
+                    "codex reset withheld for account_id={account_id}: at its wall, but \
+                     account_id={} redeemed a banked reset at {} and has not been read \
+                     since, so only one account redeems at a time",
+                    redeemed.account_id,
+                    crate::rfc3339_canonical(redeemed.at)
+                ))
+            } else {
+                chosen_instead.as_ref().map(|chosen| {
+                    format!(
+                        "codex reset withheld for account_id={account_id}: at its wall \
+                         until {}, but account_id={} is walled until {}, later, so only \
+                         that account redeems and this banked reset is kept",
+                        describe_lift(input.facts.wall_lifts_at),
+                        chosen.account_id,
+                        describe_lift(chosen.wall_lifts_at)
+                    )
+                })
+            };
             // A pending id represents an already-triggered logical redemption. Retry
             // that same id even if the current usage no longer triggers, so a crash
             // after a landed POST can promptly resolve as `already_redeemed` instead
@@ -1392,6 +1730,17 @@ impl ResetCoordinator {
                     return ResetTickResult::disarmed(&input);
                 }
             };
+            if let Reservation::ProviderFloor(last) = &reservation {
+                withheld = Some(format!(
+                    "codex reset refused for account_id={account_id}: account_id={} redeemed \
+                     a banked reset at {}, and at most one redemption per {}s is allowed \
+                     across all codex accounts",
+                    last.account_id,
+                    crate::rfc3339_canonical(last.at),
+                    PROVIDER_REDEMPTION_FLOOR_SECS
+                ));
+            }
+            self.announce_withheld(account_id, withheld.as_deref());
 
             let reservation_is_pending = matches!(
                 &reservation,
@@ -1420,6 +1769,7 @@ impl ResetCoordinator {
                     journal_ok: true,
                     outcome: None,
                     trigger,
+                    withheld: withheld.clone(),
                 }
             });
             if let Some(request_id) = request_id.as_deref() {
@@ -1512,6 +1862,7 @@ impl ResetCoordinator {
             journal_ok,
             outcome,
             trigger,
+            withheld: None,
         }
     }
 
@@ -1608,6 +1959,7 @@ mod tests {
             any_used_floor: true,
             at_wall: false,
             wall_clear: true,
+            wall_lifts_at: None,
         }
     }
 
@@ -2347,5 +2699,62 @@ mod tests {
         assert!(facts.at_wall, "an exhausted weekly window is a wall");
         // Not vacuous: the headline window alone would not have tripped it.
         assert!(!UsageFacts::from_usage(&usage_at(4.0), None).at_wall);
+    }
+
+    fn window(percent: f64, resets_at: Option<&str>) -> Option<RateWindow> {
+        Some(RateWindow {
+            resets_at: resets_at.map(str::to_string),
+            ..usage_at(percent).primary.unwrap()
+        })
+    }
+
+    /// An account's wall lifts when the LAST of its walled windows resets, and
+    /// a window with room does not count however late it resets.
+    #[test]
+    fn the_wall_lifts_when_the_last_walled_window_resets() {
+        let usage = Usage {
+            primary: window(100.0, Some("2026-10-03T16:58:00Z")),
+            secondary: window(99.5, Some("2026-10-06T05:49:00Z")),
+            tertiary: window(40.0, Some("2026-12-01T00:00:00Z")),
+            ..Usage::default()
+        };
+        assert_eq!(
+            UsageFacts::from_usage(&usage, None)
+                .wall_lifts_at
+                .map(crate::rfc3339_canonical),
+            Some(crate::rfc3339_canonical(
+                DateTime::parse_from_rfc3339("2026-10-06T05:49:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ))
+        );
+
+        // No walled window states a reset: unknown, not a guess.
+        let unstated = Usage {
+            primary: window(100.0, None),
+            secondary: window(40.0, Some("2026-12-01T00:00:00Z")),
+            ..Usage::default()
+        };
+        assert_eq!(UsageFacts::from_usage(&unstated, None).wall_lifts_at, None);
+    }
+
+    /// A withheld line is logged on the transition, not on every tick.
+    #[test]
+    fn a_withheld_line_is_announced_once_per_change() {
+        let scratch = scratch_dir("announce-once");
+        let coordinator =
+            ResetCoordinator::new(RedemptionJournal::new(scratch.path().join("r.json"))).unwrap();
+        assert!(coordinator.announce_withheld("acct", Some("held by a")));
+        assert!(!coordinator.announce_withheld("acct", Some("held by a")));
+        assert!(
+            coordinator.announce_withheld("other", Some("held by a")),
+            "accounts are announced independently"
+        );
+        assert!(coordinator.announce_withheld("acct", Some("held by b")));
+        assert!(!coordinator.announce_withheld("acct", None));
+        assert!(
+            coordinator.announce_withheld("acct", Some("held by b")),
+            "withheld again after a tick that was not"
+        );
     }
 }
