@@ -14,9 +14,9 @@
 //! workspace) and `ck-subc` (the sibling `../subconscious` workspace). The test is
 //! `#[ignore]` by default because it shells out to `cargo build` in a sibling repo
 //! and binds real loopback ports — run it explicitly with
-//! `cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture`.
+//! `cargo test -p quota-module --test it -- --ignored --nocapture real_daemon_e2e::`.
 
-mod common;
+use crate::common;
 
 use std::{
     path::{Path, PathBuf},

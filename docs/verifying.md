@@ -44,13 +44,13 @@ predate a change".
 
 ### Integration tests need their binaries built first
 
-`cargo test -p quota-module --test skeleton_e2e` does **not** rebuild the
+`cargo test -p quota-module --test it skeleton_e2e::` does **not** rebuild the
 `ck-insula` binary the harness spawns. A stale binary fails registration with no
 error output at all, which reads as a hang rather than a build problem:
 
 ```bash
 cargo build -p quota-module --bins
-cargo test -p quota-module --test skeleton_e2e
+cargo test -p quota-module --test it skeleton_e2e::
 ```
 
 That suite is slow by nature — around 80 seconds, one test alone taking 60 — and
@@ -143,9 +143,9 @@ both the local gate and CI missed the same break.
 | --- | --- | --- |
 | lib + bin unit tests | gate and CI | |
 | doctests | gate and CI | added 2026-08-26; neither had it before |
-| `skeleton_e2e` | gate and CI | |
-| `real_daemon_e2e` | CI only | `#[ignore]`d, needs a live daemon |
-| `*_live` provider tests | NEITHER | `#[ignore]`d by design, hit real providers |
+| `skeleton_e2e::` (quota-module `--test it`) | gate and CI | |
+| `real_daemon_e2e::` (quota-module `--test it`) | CI only | `#[ignore]`d, needs a live daemon |
+| `*_live::` provider tests (quota-core `--test it`) | NEITHER | `#[ignore]`d by design, hit real providers |
 | examples: compile | gate and CI | via `clippy --all-targets` |
 | examples: run | CI only | `completeness-envelopes` alone |
 
