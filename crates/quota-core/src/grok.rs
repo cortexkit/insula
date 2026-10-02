@@ -23,7 +23,7 @@
 //! selection heuristic are ported from CodexBar
 //! `Sources/CodexBarCore/Providers/Grok/GrokWebBillingFetcher.swift:50-122,159-219`
 //! (grpc-web framing, `scanProtobuf`, percent = shallowest `path.last==1` fixed32 in
-//! 0..100, reset = future varint preferring path `[1,5,1]`). `tests/grok_live.rs`
+//! 0..100, reset = future varint preferring path `[1,5,1]`). `tests/it/grok_live.rs`
 //! is the ignored live proof; the unit test below decodes a REAL captured wire frame.
 //! Frame flags follow upstream's stricter v0.69.0 rule (`grpcWebDataFrames`,
 //! `b9ea0da7b`): only `0x00` (data) and `0x80` (trailer) are accepted, and any

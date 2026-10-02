@@ -34,7 +34,7 @@
 //! VERIFICATION: LIVE-verified — the real local-probe chain (discover `agy` →
 //! loopback port → POST quota summary → parse) returns real windows on a machine
 //! running the Antigravity CLI (Gemini + Claude/GPT weekly + 5-hour buckets with real
-//! resets; see `tests/antigravity_live.rs`). The live wire revealed three details a
+//! resets; see `tests/it/antigravity_live.rs`). The live wire revealed three details a
 //! fixture alone would have missed, now matched: the CLI serves HTTP (not HTTPS) on
 //! loopback (so [`probe`] tries both schemes), the summary is wrapped in a
 //! `{"response": {...}}` envelope, and each bucket carries an explicit `window`

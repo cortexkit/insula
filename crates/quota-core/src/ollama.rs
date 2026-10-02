@@ -24,7 +24,7 @@
 //!
 //! VERIFICATION: LIVE-verified — the real cookie→GET→parse chain was proven on a
 //! machine with a logged-in Chrome session (returns real Session/Weekly windows;
-//! see `tests/ollama_live.rs`). The HTML parse is also unit-tested against a
+//! see `tests/it/ollama_live.rs`). The HTML parse is also unit-tested against a
 //! captured real settings fixture. Decryption recipe + HTML field names ported from
 //! CodexBar `Sources/CodexBarCore/Providers/Ollama/OllamaUsageFetcher.swift` +
 //! `OllamaUsageParser.swift:28-131` (labels, `N% used` / `width:N%`, `data-time`).
