@@ -28,13 +28,61 @@
 # Override with CK_DEPLOY_ALLOW_DIRTY=1, loudly: deploying a work-in-progress to
 # watch it run is legitimate, and a guard with no escape gets deleted rather than
 # respected.
+#
+# `--stage` builds, signs and checks the same binary but places nothing and
+# restarts nothing: it writes a card under the fleet staging directory for the
+# daemon owner to place during a combined restart window, so insula restarts once
+# with everyone else instead of on its own.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 BIN=ck-insula
 DEST="$HOME/.local/share/cortexkit/bin/$BIN"
+STAGING="$HOME/.local/share/cortexkit/staging"
 ALLOW_DIRTY="${CK_DEPLOY_ALLOW_DIRTY:-0}"
+MODE=deploy
+case "${1:-}" in
+  "") ;;
+  --stage) MODE=stage ;;
+  *) echo "usage: $0 [--stage]" >&2; exit 2 ;;
+esac
+
+# Sign with the hardened runtime, under a fixed identifier, and refuse if either
+# did not take.
+#
+# HARDENED because this process holds secrets in memory: the launch token the
+# supervisor hands it at start, and the provider credentials it fetches from
+# the vault. macOS lets any process running as the same user attach a debugger
+# and read another process's memory unless that binary is signed with the
+# hardened runtime. The ad-hoc signature the linker applies does not set it.
+#
+# THE IDENTIFIER IS NAMED, NOT DEFAULTED, because `codesign` otherwise takes it
+# from the FILE NAME, and this signs a scratch copy (`ck-insula.new` or a
+# staging name). macOS keys privacy grants such as Full Disk Access on the
+# signing identifier, so a binary signed under a scratch name silently stops
+# matching a grant the user gave to `ck-insula`; the fleet daemon lost its grant
+# exactly this way.
+#
+# Ad-hoc is enough: the protection is the runtime flag, not a team identity.
+# insula needs no entitlements -- it links only system libraries, uses no JIT,
+# and reaches the Keychain through the Apple-signed `security` tool.
+harden() {
+  local file="$1" info
+  codesign --force --sign - --options runtime --identifier "$BIN" "$file"
+  info="$(codesign -dvv "$file" 2>&1)"
+  if ! grep -q "^Identifier=$BIN\$" <<<"$info"; then
+    echo "REFUSING: signed identifier is not $BIN:" >&2
+    grep '^Identifier=' <<<"$info" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  if ! grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<<"$info"; then
+    echo "REFUSING: the hardened runtime flag did not take:" >&2
+    grep '^CodeDirectory' <<<"$info" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  codesign --verify --strict "$file"
+}
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
 dirty="$(git status --porcelain)"
@@ -71,13 +119,40 @@ if [ "$ALLOW_DIRTY" != "1" ] && [ "$head_sha" != "$origin_sha" ]; then
   exit 1
 fi
 
-echo "  deploying $head_sha (branch $branch)"
+echo "  ${MODE}ing $head_sha (branch $branch)"
 cargo build --release -q
+
+if [ "$MODE" = "stage" ]; then
+  full_sha="$(git rev-parse HEAD)"
+  card="$STAGING/$BIN.${full_sha:0:8}"
+  mkdir -p "$STAGING"
+  cp "target/release/$BIN" "$card.new"
+  harden "$card.new"
+  if ! "$card.new" --version >/dev/null 2>&1; then
+    echo "REFUSING: the signed binary will not execute." >&2
+    rm -f "$card.new"
+    exit 1
+  fi
+  mv "$card.new" "$card"
+  (cd "$STAGING" && shasum -a 256 "$(basename "$card")" >"$(basename "$card").sha256")
+  {
+    echo "stage=$card"
+    echo "revision=$full_sha"
+    echo "declared_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$STAGING/$BIN.current.new"
+  mv "$STAGING/$BIN.current.new" "$STAGING/$BIN.current"
+  echo "  staged: $card"
+  echo "  sha256: $(cut -d' ' -f1 "$card.sha256")"
+  codesign -dvv "$card" 2>&1 | grep -E '^(Identifier|CodeDirectory)' | sed 's/^/  /'
+  echo "  card:   $STAGING/$BIN.current (nothing placed, nothing restarted)"
+  exit 0
+fi
 
 # Copy to scratch and mv, never cp over the destination: macOS caches the code
 # signature per VNODE, so writing new bytes into the existing inode gets the
 # process SIGKILLed on exec while the supervisor keeps the old image running.
 cp "target/release/$BIN" "$DEST.new"
+harden "$DEST.new"
 if ! "$DEST.new" --version >/dev/null 2>&1; then
   echo "REFUSING: the freshly built binary will not execute." >&2
   rm -f "$DEST.new"
