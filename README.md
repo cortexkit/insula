@@ -107,13 +107,13 @@ Live and real-daemon proofs are `#[ignore]` (need real sessions / a built
 
 ```sh
 # real provider windows through the wire (needs the provider's real session):
-cargo test -p quota-core --test gemini_live    -- --ignored --nocapture
-cargo test -p quota-core --test grok_live      -- --ignored --nocapture
-cargo test -p quota-module --test skeleton_e2e -- --ignored --nocapture
+cargo test -p quota-core --test it   -- --ignored --nocapture gemini_live::
+cargo test -p quota-core --test it   -- --ignored --nocapture grok_live::
+cargo test -p quota-module --test it -- --ignored --nocapture skeleton_e2e::
 
 # real-daemon supervision: a standalone ck-subc daemon spawns the module from
 # subc.jsonc and routes usage.get (builds ck-subc in ../subconscious):
-cargo test -p quota-module --test real_daemon_e2e -- --ignored --nocapture
+cargo test -p quota-module --test it -- --ignored --nocapture real_daemon_e2e::
 ```
 
 Two examples run the real fetchers against this machine's credentials — they

@@ -24,7 +24,7 @@
 //! provider, never a stub. `skeleton_round_trips_usage_get_over_the_wire` runs in
 //! CI and proves the full wire path regardless of whether a session exists.
 
-mod common;
+use crate::common;
 
 use std::{
     collections::HashMap, net::Ipv4Addr, path::Path, path::PathBuf, process, time::Duration,
@@ -592,8 +592,23 @@ fn spawn_quota_module(
 
 /// Set on the probe process `f1_…` spawns; see [`env_probe_prints_its_environment_when_asked`].
 const ENV_PROBE_MARKER: &str = "INSULA_E2E_ENV_PROBE";
-const ENV_PROBE_TEST: &str = "env_probe_prints_its_environment_when_asked";
 const ENV_PROBE_LINE: &str = "env-probe ";
+
+/// The probe's name as the test harness spells it, which `--exact` must match.
+///
+/// The harness names a test by its module path without the crate name, so a
+/// test in this module is `skeleton_e2e::env_probe_…` while this file is a
+/// module of the shared integration binary, and the bare function name when it
+/// is the crate root. Deriving it from `module_path!()` keeps the filter right
+/// wherever the file sits; a stale literal selects no test, and the probe then
+/// prints nothing.
+fn env_probe_test_name() -> String {
+    const NAME: &str = "env_probe_prints_its_environment_when_asked";
+    match module_path!().split_once("::") {
+        Some((_crate_name, module)) => format!("{module}::{NAME}"),
+        None => NAME.to_owned(),
+    }
+}
 
 /// Not a test on its own: a no-op unless [`ENV_PROBE_MARKER`] is set. `f1_…`
 /// re-runs this test binary filtered to this one test, under the same
@@ -782,7 +797,7 @@ fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
     }
     isolate_env(&mut probe, rig);
     probe.env(ENV_PROBE_MARKER, "1").args([
-        ENV_PROBE_TEST,
+        env_probe_test_name().as_str(),
         "--exact",
         "--nocapture",
         "--test-threads=1",

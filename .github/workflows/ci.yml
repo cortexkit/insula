@@ -238,7 +238,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           HOME="$rig" XDG_CONFIG_HOME="$rig/config" CK_QUOTA_STATE_DIR="$rig/state" \
-            cargo test -p quota-module --test real_daemon_e2e -- --ignored
+            cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
 
       # `--all-targets` above COMPILES the examples but never RUNS them, so an
       # example's own assertions are unexecuted by every other step here.

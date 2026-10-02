@@ -242,8 +242,8 @@ if [ "$WITH_E2E" -eq 1 ]; then
     step "cargo build -p quota-module --bins (the e2e harness spawns it)"
     cargo build -p quota-module --bins || fail "building the module binary"
 
-    step "cargo test -p quota-module --test skeleton_e2e"
-    cargo test -p quota-module --test skeleton_e2e || fail "skeleton_e2e"
+    step "cargo test -p quota-module --test it skeleton_e2e::"
+    cargo test -p quota-module --test it skeleton_e2e:: || fail "skeleton_e2e"
 fi
 
 # A .rs file that no `mod` declaration reaches is compiled by NOTHING: cargo never

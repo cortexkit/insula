@@ -429,7 +429,7 @@ What the suite can and cannot tell you about that line:
   explicitly:
 
   ```sh
-  cargo test -p quota-module --test real_daemon_e2e -- --ignored
+  cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
   ```
 
 Rehearse by making the edit, running that test, and restoring the file. That
