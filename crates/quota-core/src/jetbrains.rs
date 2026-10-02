@@ -497,6 +497,7 @@ pub fn normalize(xml_bytes: &[u8]) -> Result<Normalized, FetchError> {
     Ok(Normalized {
         usage: Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent: used,
                 raw_used_percent: None,
                 resets_at: Some(resets_at),

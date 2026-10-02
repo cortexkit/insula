@@ -250,6 +250,7 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
     let used_percent = detail_used_percent(detail)?;
     let resets_at = parse_reset_time(detail.reset_time.as_deref());
     Some(RateWindow {
+        window_kind: None,
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -309,6 +310,7 @@ fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<Ex
         title: Some("Monthly".to_string()),
         id: Some("kimi-monthly".to_string()),
         window: Some(RateWindow {
+            window_kind: None,
             used_percent: (ratio * 100.0).clamp(0.0, 100.0),
             raw_used_percent: None,
             resets_at: parse_reset_time(balance.expire_time.as_deref()),
@@ -331,6 +333,7 @@ fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option
         title: Some("Code 7-day".to_string()),
         id: Some("kimi-code-7d".to_string()),
         window: Some(RateWindow {
+            window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
             used_percent: (ratio * 100.0).clamp(0.0, 100.0),
             raw_used_percent: None,
             resets_at: parse_reset_time(limit.reset_time.as_deref()),
@@ -579,6 +582,7 @@ mod tests {
             code_weekly_window.resets_at.as_deref(),
             Some("2026-07-09T06:56:36Z")
         );
+        assert_eq!(code_weekly_window.window_kind.as_deref(), Some("weekly"));
         assert_eq!(code_weekly_window.window_minutes, Some(10_080));
     }
 

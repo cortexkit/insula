@@ -133,7 +133,11 @@ fn normalize_reset(raw: &str) -> String {
     trimmed.to_string()
 }
 
-fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
+fn window(
+    snapshot: &QuotaSnapshot,
+    reset: Option<&str>,
+    named_monthly: bool,
+) -> Option<RateWindow> {
     if snapshot.unlimited || !snapshot.usable() {
         return None;
     }
@@ -141,6 +145,8 @@ fn window(snapshot: &QuotaSnapshot, reset: Option<&str>) -> Option<RateWindow> {
     // A usable quota with no reset date drops the window (never fabricated).
     let resets_at = normalize_reset(reset?);
     Some(RateWindow {
+        window_kind: named_monthly
+            .then(|| cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
         used_percent,
         raw_used_percent: None,
         resets_at: Some(resets_at),
@@ -158,6 +164,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .map_err(|e| FetchError::Decode(format!("copilot usage not decodable: {e}")))?;
 
     // Prefer the direct quota_snapshots; fall back to monthly/limited counts.
+    let named_monthly = response.quota_snapshots.is_none() && response.monthly_quotas.is_some();
     let (premium, chat) = match response.quota_snapshots {
         Some(snapshots) => (snapshots.premium_interactions, snapshots.chat),
         None => {
@@ -178,8 +185,10 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     };
 
     let reset = response.quota_reset_date.as_deref();
-    let premium_window = premium.as_ref().and_then(|s| window(s, reset));
-    let chat_window = chat.as_ref().and_then(|s| window(s, reset));
+    let premium_window = premium
+        .as_ref()
+        .and_then(|s| window(s, reset, named_monthly));
+    let chat_window = chat.as_ref().and_then(|s| window(s, reset, named_monthly));
 
     // Premium → primary, chat → secondary; on a chat-only plan, chat stays in
     // secondary so the labels remain accurate (CodexBar parity).
@@ -269,6 +278,7 @@ mod tests {
         }"#;
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
+        assert_eq!(primary.window_kind, None);
         assert_eq!(primary.used_percent, 20.0); // 100 - 80
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z")); // YYYY-MM-DD normalized
         assert_eq!(primary.window_minutes, Some(43200)); // monthly
@@ -283,6 +293,14 @@ mod tests {
             "limited_user_quotas": { "completions": 150, "chat": 1000 }
         }"#;
         let usage = normalize_usage(body).unwrap();
+        assert_eq!(
+            usage.primary.as_ref().unwrap().window_kind.as_deref(),
+            Some("monthly")
+        );
+        assert_eq!(
+            usage.secondary.as_ref().unwrap().window_kind.as_deref(),
+            Some("monthly")
+        );
         // premium: 150/300 remaining = 50% remaining → 50% used.
         assert_eq!(usage.primary.unwrap().used_percent, 50.0);
         // chat: 1000/1000 = 100% remaining → 0% used.

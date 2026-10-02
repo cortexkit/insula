@@ -1001,6 +1001,27 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         .to_string();
     Some(ResolvedWindow {
         window: RateWindow {
+            window_kind: {
+                let candidates = quota_cadence_candidates(bucket);
+                if ["5h", "5-hour", "five hour", "five-hour"]
+                    .iter()
+                    .any(|alias| candidates.contains(*alias))
+                {
+                    Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string())
+                } else if [
+                    "weekly",
+                    "weekly-limit",
+                    "weekly limit remaining",
+                    "weekly-limit-remaining",
+                ]
+                .iter()
+                .any(|label| candidates.contains(*label))
+                {
+                    Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string())
+                } else {
+                    None
+                }
+            },
             used_percent,
             raw_used_percent: None,
             resets_at: reset,
@@ -1312,6 +1333,7 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
         };
         resolved.push(ResolvedWindow {
             window: RateWindow {
+                window_kind: None,
                 used_percent,
                 raw_used_percent: None,
                 window_minutes: None,
@@ -2248,6 +2270,12 @@ mod tests {
         )
         .expect("the cache payload parses");
         let cache = parse_cached_quota(&cached).expect("the cache normalises");
+        for usage in [&cloud, &cache] {
+            assert_eq!(
+                pool_window(usage, "gemini-weekly").window_kind.as_deref(),
+                Some("weekly")
+            );
+        }
 
         let named = |usage: &Usage| -> Vec<(String, String)> {
             usage
@@ -2408,6 +2436,18 @@ mod tests {
     #[test]
     fn every_bucket_is_published_as_its_own_named_window() {
         let usage = parse_quota_summary(SUMMARY_FIXTURE).unwrap();
+        assert_eq!(
+            pool_window(&usage, "gemini-5h").window_kind.as_deref(),
+            Some("five_hour")
+        );
+        assert_eq!(
+            pool_window(&usage, "gemini-weekly").window_kind.as_deref(),
+            Some("weekly")
+        );
+        assert_eq!(
+            pool_window(&usage, "3p-5h").window_kind.as_deref(),
+            Some("five_hour")
+        );
 
         // Each bucket keeps its own figure rather than being folded into one
         // headline: the Gemini pool meters 20% at five hours and 47% weekly, and
@@ -2416,6 +2456,7 @@ mod tests {
         let weekly = super::tests::pool_window(&usage, "gemini-weekly");
         assert_eq!(weekly.used_percent, 47.0);
         assert_eq!(weekly.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
         assert_eq!(weekly.window_minutes, Some(10080));
 
         assert_eq!(usage.extra_rate_windows.as_ref().unwrap().len(), 3);
@@ -2445,6 +2486,10 @@ mod tests {
         ]}]}"#;
         let usage = parse_quota_summary(body).unwrap();
         let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(
+            extras[0].window.as_ref().unwrap().window_kind.as_deref(),
+            None
+        );
         assert_eq!(extras[0].window.as_ref().unwrap().window_minutes, Some(300));
         assert_eq!(
             extras[1].window.as_ref().unwrap().window_minutes,
@@ -2710,6 +2755,7 @@ mod tests {
         let usage = parse_quota_summary(body).unwrap();
         let window = pool_window(&usage, "g-weekly");
         assert_eq!(window.used_percent, 75.0);
+        assert_eq!(window.window_kind.as_deref(), Some("weekly"));
         assert_eq!(window.window_minutes, Some(10080));
     }
 
@@ -3438,6 +3484,7 @@ mod plugin_lane_tests {
         // Asserts LOCAL lane served (58.4% used, 2026-09-10 reset) rather than cloud (7.15%, 2026-09-08).
         assert_eq!(primary.resets_at.as_deref(), Some("2026-09-10T18:41:37Z"));
         assert_eq!(primary.used_percent, 58.4);
+        assert_eq!(primary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(primary.window_minutes, Some(10080));
         assert_eq!(
             attempt

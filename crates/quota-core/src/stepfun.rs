@@ -247,6 +247,7 @@ fn rate_window_from_left_and_reset(
     left_rate: Option<f64>,
     reset_secs: Option<i64>,
     window_minutes: i64,
+    kind: &str,
 ) -> Option<RateWindow> {
     let left = left_rate?;
     // Credit plans report zero reset times for these legacy fields: no window is
@@ -254,6 +255,7 @@ fn rate_window_from_left_and_reset(
     let reset = reset_secs.filter(|&s| s > 0)?;
     let resets_at = env::epoch_to_iso8601(reset)?;
     Some(RateWindow {
+        window_kind: Some(kind.to_string()),
         used_percent: used_percent_from_left_rate(left),
         raw_used_percent: None,
         resets_at: Some(resets_at),
@@ -272,6 +274,7 @@ fn credit_window(credit: Option<&CreditRateLimit>) -> Option<RateWindow> {
         return None;
     }
     Some(RateWindow {
+        window_kind: None,
         used_percent: ((1.0 - credit_rate) * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: credit.reset_time().and_then(env::epoch_to_iso8601),
@@ -309,11 +312,13 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         response.five_hour_usage_left_rate,
         response.five_hour_usage_reset_time,
         300,
+        cortexkit_provider_usage::window_kind::FIVE_HOUR,
     );
     let secondary = rate_window_from_left_and_reset(
         response.weekly_usage_left_rate,
         response.weekly_usage_reset_time,
         10080,
+        cortexkit_provider_usage::window_kind::WEEKLY,
     );
 
     Ok(Usage {
@@ -430,10 +435,12 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 0.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-29T13:44:39Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
     }
 
@@ -647,9 +654,11 @@ mod tests {
 
         let primary = usage.primary.expect("the live five-hour window");
         assert!((primary.used_percent - 20.0).abs() < 1e-9);
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.expect("the live weekly window");
         assert!((secondary.used_percent - 40.0).abs() < 1e-9);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
     }
 

@@ -109,6 +109,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     // depleted it is without saying when it refills is still real pressure, and
     // dropping it would make an exhausted account read as no signal at all.
     let primary = binding.map(|(remaining, resets_at)| RateWindow {
+        window_kind: None,
         used_percent: (100.0 - remaining).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: resets_at.map(str::to_string),

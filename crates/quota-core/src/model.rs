@@ -390,6 +390,7 @@ mod tests {
 
     fn window(used_percent: f64) -> RateWindow {
         RateWindow {
+            window_kind: None,
             used_percent,
             raw_used_percent: None,
             resets_at: None,

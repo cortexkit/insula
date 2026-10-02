@@ -290,13 +290,20 @@ fn parse_console_go_status(text: &str, now_secs: i64) -> Option<Usage> {
     let period_end = access.get("endsAt").and_then(parse_date_value);
 
     let encoding = DirectPercent::FractionOrPercent;
-    let primary =
-        console_meter_window(five_hour, now_secs, ROLLING_WINDOW_MINUTES, None, encoding)?;
+    let primary = console_meter_window(
+        five_hour,
+        now_secs,
+        ROLLING_WINDOW_MINUTES,
+        Some(cortexkit_provider_usage::window_kind::FIVE_HOUR),
+        None,
+        encoding,
+    )?;
     let secondary = match meters.get("week").and_then(Value::as_object) {
         Some(week) => Some(console_meter_window(
             week,
             now_secs,
             WEEKLY_WINDOW_MINUTES,
+            Some(cortexkit_provider_usage::window_kind::WEEKLY),
             None,
             encoding,
         )?),
@@ -310,6 +317,7 @@ fn parse_console_go_status(text: &str, now_secs: i64) -> Option<Usage> {
                 month,
                 now_secs,
                 MONTHLY_WINDOW_MINUTES,
+                Some(cortexkit_provider_usage::window_kind::MONTHLY),
                 period_end,
                 encoding,
             )
@@ -347,6 +355,7 @@ fn console_meter_window(
     meter: &serde_json::Map<String, Value>,
     now_secs: i64,
     window_minutes: i64,
+    kind: Option<&str>,
     fallback_reset_epoch: Option<i64>,
     encoding: DirectPercent,
 ) -> Option<RateWindow> {
@@ -381,6 +390,7 @@ fn console_meter_window(
         })
         .or(fallback_reset_epoch);
     Some(RateWindow {
+        window_kind: kind.map(str::to_string),
         used_percent: percent.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reset_epoch.and_then(crate::env::epoch_to_iso8601),
@@ -698,12 +708,26 @@ fn parse_api_usage(text: &str, now_secs: i64) -> Result<Usage, FetchError> {
         .and_then(Value::as_object)
         .ok_or_else(missing)?;
     let encoding = DirectPercent::Percent;
-    let primary = console_meter_window(rolling, now_secs, ROLLING_WINDOW_MINUTES, None, encoding)
-        .ok_or_else(missing)?;
+    let primary = console_meter_window(
+        rolling,
+        now_secs,
+        ROLLING_WINDOW_MINUTES,
+        None,
+        None,
+        encoding,
+    )
+    .ok_or_else(missing)?;
     let secondary = match usage.get("weekly").and_then(Value::as_object) {
         Some(weekly) => Some(
-            console_meter_window(weekly, now_secs, WEEKLY_WINDOW_MINUTES, None, encoding)
-                .ok_or_else(missing)?,
+            console_meter_window(
+                weekly,
+                now_secs,
+                WEEKLY_WINDOW_MINUTES,
+                Some(cortexkit_provider_usage::window_kind::WEEKLY),
+                None,
+                encoding,
+            )
+            .ok_or_else(missing)?,
         ),
         None => None,
     };
@@ -711,7 +735,14 @@ fn parse_api_usage(text: &str, now_secs: i64) -> Result<Usage, FetchError> {
         .get("monthly")
         .and_then(Value::as_object)
         .and_then(|monthly| {
-            console_meter_window(monthly, now_secs, MONTHLY_WINDOW_MINUTES, None, encoding)
+            console_meter_window(
+                monthly,
+                now_secs,
+                MONTHLY_WINDOW_MINUTES,
+                Some(cortexkit_provider_usage::window_kind::MONTHLY),
+                None,
+                encoding,
+            )
         });
     Ok(Usage {
         primary: Some(primary),
@@ -1309,13 +1340,16 @@ mod tests {
             .expect("the console lane must serve the fetch");
 
         let primary = usage.primary.expect("the five-hour meter is the primary");
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.expect("the week meter is the secondary");
         assert_eq!(secondary.used_percent, 40.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
         let tertiary = usage.tertiary.expect("the month meter is the tertiary");
         assert_eq!(tertiary.used_percent, 10.0);
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
         // The month meter carries no reset, so the billing period end stands in.
         assert_eq!(
@@ -1843,7 +1877,9 @@ mod tests {
                 (rolling, weekly, monthly),
                 "percents must be published in the units the API sends"
             );
+            assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
             assert_eq!(secondary.window_minutes, Some(10_080));
+            assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
             assert_eq!(tertiary.window_minutes, Some(43_200));
             assert_eq!(secondary.resets_at, iso(WEEKLY_RESET));
             assert_eq!(tertiary.resets_at, iso(MONTHLY_RESET));

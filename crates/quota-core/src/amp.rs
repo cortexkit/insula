@@ -176,6 +176,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
             resets_at.map(|resets_at| RateWindow {
+                window_kind: None,
                 used_percent,
                 raw_used_percent: None,
                 // PROJECTED, and the wire cannot say so. Amp replenishes

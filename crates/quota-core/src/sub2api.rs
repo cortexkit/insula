@@ -231,6 +231,12 @@ fn rate_limit_to_extra(rate_limit: RateLimitResponse) -> Option<ExtraWindow> {
         title: Some(rate_limit_title(&rate_limit.window)),
         id: Some(rate_limit.window.clone()),
         window: Some(RateWindow {
+            window_kind: match rate_limit.window.as_str() {
+                "5h" => Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
+                "1d" => Some(cortexkit_provider_usage::window_kind::DAILY.to_string()),
+                "7d" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+                _ => None,
+            },
             used_percent: used_percent.clamp(0.0, 100.0),
             raw_used_percent: None,
             resets_at: reported_reset_at(rate_limit.reset_at),
@@ -390,6 +396,7 @@ mod tests {
         let five_hour = windows[0].window.as_ref().unwrap();
         assert_eq!(five_hour.used_percent, 25.0);
         assert_eq!(five_hour.resets_at.as_deref(), Some("2026-07-11T12:30:00Z"));
+        assert_eq!(five_hour.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(five_hour.window_minutes, Some(300));
 
         assert_eq!(windows[1].id.as_deref(), Some("1d"));
@@ -397,6 +404,7 @@ mod tests {
         let daily = windows[1].window.as_ref().unwrap();
         assert_eq!(daily.used_percent, 25.0);
         assert_eq!(daily.resets_at.as_deref(), Some("2026-07-12T12:30:00Z"));
+        assert_eq!(daily.window_kind.as_deref(), Some("daily"));
         assert_eq!(daily.window_minutes, Some(1440));
 
         assert_eq!(windows[2].id.as_deref(), Some("7d"));
@@ -404,6 +412,7 @@ mod tests {
         let weekly = windows[2].window.as_ref().unwrap();
         assert_eq!(weekly.used_percent, 20.0);
         assert_eq!(weekly.resets_at.as_deref(), Some("2026-07-18T12:30:00Z"));
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
         assert_eq!(weekly.window_minutes, Some(10080));
     }
 
@@ -426,6 +435,7 @@ mod tests {
             .unwrap();
         assert_eq!(weekly.used_percent, 20.0);
         assert_eq!(weekly.resets_at, None);
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
         assert_eq!(weekly.window_minutes, Some(10080));
     }
 

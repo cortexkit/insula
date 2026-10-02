@@ -701,10 +701,12 @@ fn window_from_map(
     map: &serde_json::Map<String, Value>,
     now_secs: i64,
     window_minutes: i64,
+    kind: Option<&str>,
 ) -> Option<RateWindow> {
     let used_percent = percent_from_map(map)?;
     let resets_at = reset_epoch_for_map(map, now_secs).and_then(env::epoch_to_iso8601);
     Some(RateWindow {
+        window_kind: kind.map(str::to_string),
         used_percent,
         raw_used_percent: None,
         resets_at,
@@ -755,10 +757,24 @@ fn parse_usage_dict(
     let weekly = first_window_dict(dict, &weekly_keys);
     let monthly = first_window_dict(dict, &monthly_keys);
 
-    let primary = rolling.and_then(|m| window_from_map(m, now_secs, ROLLING_WINDOW_MINUTES));
-    let secondary = weekly.and_then(|m| window_from_map(m, now_secs, WEEKLY_WINDOW_MINUTES));
+    let primary = rolling.and_then(|m| window_from_map(m, now_secs, ROLLING_WINDOW_MINUTES, None));
+    let secondary = weekly.and_then(|m| {
+        window_from_map(
+            m,
+            now_secs,
+            WEEKLY_WINDOW_MINUTES,
+            Some(cortexkit_provider_usage::window_kind::WEEKLY),
+        )
+    });
     let tertiary = if include_monthly {
-        monthly.and_then(|m| window_from_map(m, now_secs, MONTHLY_WINDOW_MINUTES))
+        monthly.and_then(|m| {
+            window_from_map(
+                m,
+                now_secs,
+                MONTHLY_WINDOW_MINUTES,
+                Some(cortexkit_provider_usage::window_kind::MONTHLY),
+            )
+        })
     } else {
         None
     };
@@ -854,10 +870,16 @@ fn parse_windows_regex(text: &str, now_secs: i64, include_monthly: bool) -> Opti
         let weekly_r = RESET_IN_KEYS
             .iter()
             .find_map(|k| field_after_key_i64(weekly_block, k))?;
-        window_from_parts(weekly_p, weekly_r, now_secs, WEEKLY_WINDOW_MINUTES)
+        window_from_parts(
+            weekly_p,
+            weekly_r,
+            now_secs,
+            WEEKLY_WINDOW_MINUTES,
+            Some(cortexkit_provider_usage::window_kind::WEEKLY),
+        )
     });
 
-    let primary = window_from_parts(rolling_p, rolling_r, now_secs, ROLLING_WINDOW_MINUTES);
+    let primary = window_from_parts(rolling_p, rolling_r, now_secs, ROLLING_WINDOW_MINUTES, None);
     let secondary = weekly;
     let tertiary = if include_monthly {
         window_block(text, "monthlyUsage").and_then(|block| {
@@ -865,7 +887,13 @@ fn parse_windows_regex(text: &str, now_secs: i64, include_monthly: bool) -> Opti
             let r = RESET_IN_KEYS
                 .iter()
                 .find_map(|k| field_after_key_i64(block, k))?;
-            window_from_parts(p, r, now_secs, MONTHLY_WINDOW_MINUTES)
+            window_from_parts(
+                p,
+                r,
+                now_secs,
+                MONTHLY_WINDOW_MINUTES,
+                Some(cortexkit_provider_usage::window_kind::MONTHLY),
+            )
         })
     } else {
         None
@@ -887,6 +915,7 @@ fn window_from_parts(
     reset_in_sec: i64,
     now_secs: i64,
     window_minutes: i64,
+    kind: Option<&str>,
 ) -> Option<RateWindow> {
     let mut p = percent;
     if (0.0..=1.0).contains(&p) {
@@ -895,6 +924,7 @@ fn window_from_parts(
     let reset_epoch = now_secs + reset_in_sec.max(0);
     let resets_at = env::epoch_to_iso8601(reset_epoch)?;
     Some(RateWindow {
+        window_kind: kind.map(str::to_string),
         used_percent: p.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: Some(resets_at),
@@ -1255,6 +1285,7 @@ mod tests {
         assert_eq!(primary.resets_at, env::epoch_to_iso8601(now + 7200));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 10.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
         assert!(usage.tertiary.is_none());
     }
@@ -1267,6 +1298,7 @@ mod tests {
         assert!(usage.secondary.is_some());
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 55.0);
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
     }
 

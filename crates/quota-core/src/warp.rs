@@ -162,6 +162,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     let primary = if info.is_unlimited == Some(true) {
         // Unlimited plan: 0% used, no reset window.
         Some(RateWindow {
+            window_kind: None,
             used_percent: 0.0,
             raw_used_percent: None,
             resets_at: None,
@@ -182,6 +183,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             .map(|limit| {
                 let used = info.requests_used.unwrap_or(0.0);
                 RateWindow {
+                    window_kind: None,
                     used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
                     raw_used_percent: None,
                     resets_at: info.next_refresh_time,

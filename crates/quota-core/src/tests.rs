@@ -1927,6 +1927,7 @@ impl UsageProvider for PairedDropProvider {
             "test",
             Usage {
                 primary: Some(RateWindow {
+                    window_kind: None,
                     used_percent: percent,
                     raw_used_percent: None,
                     resets_at: None,
@@ -2076,6 +2077,7 @@ async fn a_verdict_discloses_no_staleness_while_a_stale_served_window_does() {
                     "vault",
                     Usage {
                         primary: Some(RateWindow {
+                            window_kind: None,
                             used_percent: 10.0,
                             raw_used_percent: None,
                             resets_at: None,
@@ -3949,6 +3951,7 @@ impl UsageProvider for EmptyBodyProvider {
         if *calls == 1 {
             let usage = Usage {
                 primary: Some(RateWindow {
+                    window_kind: None,
                     used_percent: 42.0,
                     raw_used_percent: None,
                     resets_at: Some("2026-08-01T00:00:00Z".to_string()),
@@ -7225,6 +7228,7 @@ fn primary_percent(entry: &ProviderUsage) -> f64 {
 
 fn full_usage(percent: f64) -> Usage {
     let window = |used_percent: f64, label: &str, minutes| RateWindow {
+        window_kind: None,
         used_percent,
         raw_used_percent: None,
         resets_at: Some(format!("2026-07-15T{label}:00Z")),
@@ -8376,6 +8380,7 @@ impl UsageProvider for StaleDuplicateProvider {
         };
         let usage = Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent,
                 raw_used_percent: None,
                 resets_at: None,
@@ -8417,6 +8422,7 @@ impl UsageProvider for ResetDuplicateProvider {
         };
         let usage = Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent,
                 raw_used_percent: None,
                 resets_at: None,
@@ -8687,6 +8693,7 @@ fn named_window(id: &str) -> Usage {
             id: Some(id.to_string()),
             title: Some(id.to_string()),
             window: Some(crate::model::RateWindow {
+                window_kind: None,
                 used_percent: 10.0,
                 raw_used_percent: None,
                 resets_at: None,

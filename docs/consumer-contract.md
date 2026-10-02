@@ -1223,15 +1223,31 @@ rather than merely lower.
 
 The slots are also not stable across providers. One provider's `primary` may be
 a five-hour window and another's a monthly one, so `primary` is not comparable
-between providers. Read `windowMinutes` — the window's length — when the cadence
-matters, rather than inferring it from the slot.
+between providers. Read `windowKind` when present, falling back to
+`windowMinutes` — the window's length — rather than inferring the period from
+its slot.
 
 ### The other window fields
 
 `windowMinutes` is the window's length, and it is optional. It is set when the
 upstream states a cadence or the field name implies one; it is absent when the
-upstream reports usage without saying over what period. Absent means unknown —
-not "unlimited", and not a default worth inventing.
+upstream reports usage without a stated length (including a calendar month).
+Absent means no stated length — not "unlimited", and not a default worth inventing.
+
+`windowKind` is the period **named by the upstream's own label, key or field**,
+mapped by period onto `hourly`, `five_hour`, `daily`, `weekly`, or `monthly`.
+For example Anthropic's `seven_day` maps to `weekly`. It is optional: absence
+means **not named**, never "some other kind". A numeric duration alone does not
+name a period: Codex's `limit_window_seconds` leaves `windowKind` absent even
+when `windowMinutes` is 300. Consumers needing an unnamed window's period fall
+back to `windowMinutes`. The wire type is an open string so a future unknown kind
+survives decoding; producers here emit only the five vocabulary values.
+
+Ollama's `Monthly usage` publishes `windowKind: "monthly"` with `windowMinutes`
+absent because calendar months vary in length. Its legacy `Session usage` can
+occupy the same slot but names the five-hour allowance (`windowKind: "five_hour"`).
+Use the kind to distinguish them and to match a refusal naming the monthly limit;
+slot position or missing minutes cannot distinguish these windows.
 
 `usedCount` and `totalCount` are the absolute figures behind the percentage,
 carried only where the upstream supplies them, which is a small minority of

@@ -2511,6 +2511,7 @@ mod tests {
     fn a_window_at_its_limit_blocks_relaxation_even_when_the_upstream_reports_clear() {
         let mut usage = usage_at(4.0);
         usage.secondary = Some(RateWindow {
+            window_kind: None,
             used_percent: 99.5,
             raw_used_percent: None,
             window_minutes: Some(10080),
@@ -2600,6 +2601,7 @@ mod tests {
     fn usage_at(percent: f64) -> Usage {
         Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent: percent,
                 raw_used_percent: None,
                 window_minutes: Some(10080),
@@ -2674,6 +2676,7 @@ mod tests {
     fn a_wall_in_a_later_window_is_still_a_wall() {
         let usage = Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent: 4.0,
                 raw_used_percent: None,
                 window_minutes: Some(300),
@@ -2684,6 +2687,7 @@ mod tests {
                 breakdown: None,
             }),
             secondary: Some(RateWindow {
+                window_kind: None,
                 used_percent: 99.4,
                 raw_used_percent: None,
                 window_minutes: Some(10080),

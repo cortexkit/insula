@@ -108,6 +108,12 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         };
 
         let window = RateWindow {
+            window_kind: match limit.limit_type.as_str() {
+                "five_hour" => Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
+                "weekly" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+                "monthly" => Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
+                _ => None,
+            },
             used_percent: limit.percent_used.clamp(0.0, 100.0),
             raw_used_percent: None,
             resets_at,
@@ -246,16 +252,19 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.5);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-11T12:30:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 50.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-18T12:30:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 75.0);
         assert_eq!(tertiary.resets_at.as_deref(), Some("2026-08-11T12:30:00Z"));
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
     }
 

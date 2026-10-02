@@ -217,6 +217,20 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             * 100.0)
             .clamp(0.0, 100.0);
         Some(RateWindow {
+            window_kind: match response
+                .refresh_interval
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "hourly" => Some(cortexkit_provider_usage::window_kind::HOURLY.to_string()),
+                "daily" => Some(cortexkit_provider_usage::window_kind::DAILY.to_string()),
+                "weekly" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+                "monthly" => Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
+                _ => None,
+            },
             used_percent,
             raw_used_percent: None,
             resets_at: Some(resets_at),
@@ -353,6 +367,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert!((primary.used_percent - 90.0).abs() < 0.01);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-04-13T00:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("daily"));
         assert_eq!(primary.window_minutes, Some(1440));
         assert!(usage.secondary.is_none());
     }
