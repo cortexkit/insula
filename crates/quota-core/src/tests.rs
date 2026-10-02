@@ -690,12 +690,6 @@ fn production_stderr_emissions_do_not_hard_code_ck_tags() {
 /// the rule can be written down beside the code; a trailing comment is not, which
 /// errs towards a false alarm rather than a missed read.
 fn launch_nonce_reads_in(dirs: &[std::path::PathBuf]) -> (Vec<String>, Vec<String>) {
-    const LITERALS: [&str; 2] = ["\"SUBC_LAUNCH_NONCE\"", "\"SUBC_LAUNCH_NONCE_FD\""];
-    const CONSTANTS: [&str; 3] = [
-        "SUBC_LAUNCH_NONCE_ENV",
-        "LAUNCH_NONCE_ENV",
-        "LAUNCH_NONCE_FD_ENV",
-    ];
     let mut offenders = Vec::new();
     let mut examined = Vec::new();
 
@@ -712,22 +706,75 @@ fn launch_nonce_reads_in(dirs: &[std::path::PathBuf]) -> (Vec<String>, Vec<Strin
             let source = std::fs::read_to_string(&path).expect("a readable source file");
             examined.push(path.display().to_string());
             for (number, line) in production_lines(&source) {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                // Whole identifiers only: `LAUNCH_NONCE_ENV` is a suffix of
-                // `SUBC_LAUNCH_NONCE_ENV`, and both are listed in their own right.
-                let names_a_constant = line
-                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .any(|token| CONSTANTS.contains(&token));
-                let names_a_literal = LITERALS.iter().any(|literal| line.contains(literal));
-                if names_a_constant || names_a_literal {
+                if line_reads_launch_nonce(line) {
                     offenders.push(format!("{}:{number}: {}", path.display(), line.trim()));
                 }
             }
         }
     }
     (offenders, examined)
+}
+
+/// Whether one source line reads the launch nonce: a string literal naming
+/// either nonce variable, or one of the constants that name them.
+fn line_reads_launch_nonce(line: &str) -> bool {
+    const LITERALS: [&str; 2] = ["\"SUBC_LAUNCH_NONCE\"", "\"SUBC_LAUNCH_NONCE_FD\""];
+    const CONSTANTS: [&str; 3] = [
+        "SUBC_LAUNCH_NONCE_ENV",
+        "LAUNCH_NONCE_ENV",
+        "LAUNCH_NONCE_FD_ENV",
+    ];
+    if line.trim_start().starts_with("//") {
+        return false;
+    }
+    // Whole identifiers only: `LAUNCH_NONCE_ENV` is a suffix of
+    // `SUBC_LAUNCH_NONCE_ENV`, and both are listed in their own right.
+    let names_a_constant = line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| CONSTANTS.contains(&token));
+    names_a_constant || LITERALS.iter().any(|literal| line.contains(literal))
+}
+
+/// The launch-nonce matcher flags every read shape and nothing else.
+///
+/// The tree scan below asserts which files it read, so it cannot pass by
+/// reading nothing. It can still pass with a matcher that matches nothing:
+/// every line would come back clean and the offender list would be empty for
+/// the wrong reason. This plants each read shape the matcher claims to catch,
+/// and the lines it must leave alone, so a blind or over-wide matcher fails here
+/// before the scan's empty result is trusted.
+#[test]
+fn the_launch_nonce_matcher_flags_planted_reads_and_nothing_else() {
+    let reads = [
+        r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE");"#,
+        r#"let fd = std::env::var_os("SUBC_LAUNCH_NONCE_FD");"#,
+        "let nonce = std::env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);",
+        "let nonce = lookup(LAUNCH_NONCE_ENV);",
+        "let fd = lookup(LAUNCH_NONCE_FD_ENV);",
+    ];
+    let clean = [
+        "let launch_nonce = subc_os::launch_nonce()?;",
+        "// SUBC_LAUNCH_NONCE is read through the accessor, never directly",
+        "let token = OTHER_LAUNCH_NONCE_ENV_X;",
+        r#"let name = "SUBC_LAUNCH_NONCE_SOMETHING";"#,
+    ];
+    let missed: Vec<_> = reads
+        .iter()
+        .filter(|line| !line_reads_launch_nonce(line))
+        .collect();
+    let flagged: Vec<_> = clean
+        .iter()
+        .filter(|line| line_reads_launch_nonce(line))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the matcher misses these planted reads, so the tree scan's clean result \
+         proves nothing: {missed:?}"
+    );
+    assert!(
+        flagged.is_empty(),
+        "the matcher flags lines that read nothing: {flagged:?}"
+    );
 }
 
 /// Nothing in production reads the launch nonce except `subc_os::launch_nonce()`.
@@ -849,7 +896,7 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
         };
         // Production only, matching the walk above: a reference inside a
         // provider's own test module is not a call on the fetch path.
-        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        let production = production_body(&source);
         examined += 1;
         if production.contains("report_auth_failure") {
             offenders.push(provider.name.clone());
@@ -910,11 +957,7 @@ fn no_vault_lane_rebuilds_the_shared_credential_helpers() {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("a readable source file");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let production = production_body(&source);
         examined += 1;
         // The gate's own shape, not the function name: a copy under any name is
         // the thing that matters. Matched on the BINDING rather than on one
@@ -1784,7 +1827,8 @@ fn every_cookie_provider_publishes_the_cookie_source_label() {
             ));
             continue;
         };
-        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let runtime = production_body(source);
+        let runtime = runtime.as_str();
         // The healthy() constructor is where the label reaches the wire.
         for line in runtime.lines().filter(|line| line.contains("healthy(")) {
             if line.contains("SOURCE_LABEL") {
