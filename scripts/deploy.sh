@@ -135,16 +135,19 @@ if [ "$MODE" = "stage" ]; then
   fi
   mv "$card.new" "$card"
   (cd "$STAGING" && shasum -a 256 "$(basename "$card")" >"$(basename "$card").sha256")
+  # The placement gate looks for `<binary name without ck->.current`, so this
+  # is `insula.current`, not `ck-insula.current`.
+  current="$STAGING/${BIN#ck-}.current"
   {
     echo "stage=$card"
     echo "revision=$full_sha"
     echo "declared_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >"$STAGING/$BIN.current.new"
-  mv "$STAGING/$BIN.current.new" "$STAGING/$BIN.current"
+  } >"$current.new"
+  mv "$current.new" "$current"
   echo "  staged: $card"
   echo "  sha256: $(cut -d' ' -f1 "$card.sha256")"
   codesign -dvv "$card" 2>&1 | grep -E '^(Identifier|CodeDirectory)' | sed 's/^/  /'
-  echo "  card:   $STAGING/$BIN.current (nothing placed, nothing restarted)"
+  echo "  card:   $current (nothing placed, nothing restarted)"
   exit 0
 fi
 
