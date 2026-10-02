@@ -588,6 +588,10 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
+    /// A provider with no credential source, so it reads only the local Chrome
+    /// session and never a vault deposit. Kept for the live probe in
+    /// `tests/it/ollama_live.rs`; the default registry uses
+    /// `new_with_handle_loader` so deposits reach it.
     pub fn new() -> Self {
         Self::new_with_handle_loader(
             None,
