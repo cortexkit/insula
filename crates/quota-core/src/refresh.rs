@@ -1741,6 +1741,7 @@ mod tests {
             "oauth",
             Usage {
                 primary: Some(RateWindow {
+                    window_kind: None,
                     used_percent: 21.0,
                     raw_used_percent: None,
                     resets_at: None,

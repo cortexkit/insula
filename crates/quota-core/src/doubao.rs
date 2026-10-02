@@ -156,6 +156,7 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
     };
 
     let primary = Some(RateWindow {
+        window_kind: None,
         used_percent,
         raw_used_percent: None,
         resets_at: Some(resets_at),
@@ -203,6 +204,14 @@ fn coding_plan_window(
         .and_then(|timestamp| env::epoch_to_iso8601(timestamp as i64));
 
     Some(RateWindow {
+        window_kind: match quota.level.to_ascii_lowercase().as_str() {
+            "5-hour" | "five_hour" => {
+                Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string())
+            }
+            "weekly" | "week" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+            "monthly" | "month" => Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
+            _ => None,
+        },
         used_percent: quota.percent.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -672,6 +681,7 @@ mod tests {
         assert_eq!(
             usage.primary,
             Some(RateWindow {
+                window_kind: None,
                 used_percent: 37.5,
                 raw_used_percent: None,
                 resets_at: Some("2023-11-14T22:13:20Z".to_string()),
@@ -685,6 +695,7 @@ mod tests {
         assert_eq!(
             usage.secondary,
             Some(RateWindow {
+                window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
                 used_percent: 0.0,
                 raw_used_percent: None,
                 resets_at: Some("2027-01-15T08:00:00Z".to_string()),
@@ -698,6 +709,7 @@ mod tests {
         assert_eq!(
             usage.tertiary,
             Some(RateWindow {
+                window_kind: Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
                 used_percent: 100.0,
                 raw_used_percent: None,
                 resets_at: Some("2030-03-17T17:46:40Z".to_string()),
@@ -709,6 +721,16 @@ mod tests {
             })
         );
         assert_eq!(usage.extra_rate_windows, None);
+    }
+
+    #[test]
+    fn coding_plan_five_hour_label_names_its_period() {
+        let payload = br#"{"Result":{"QuotaUsage":[{"Level":"5-hour","Percent":10.0}]}}"#;
+        let usage = normalize_coding_plan_usage(payload).unwrap();
+        assert_eq!(
+            usage.primary.unwrap().window_kind.as_deref(),
+            Some("five_hour")
+        );
     }
 
     #[test]

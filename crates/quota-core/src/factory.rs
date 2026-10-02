@@ -212,6 +212,7 @@ fn reset_state_for_window(window: &FactoryBillingWindow, now: DateTime<Utc>) -> 
 fn rate_window_from(
     window: &FactoryBillingWindow,
     window_minutes: i64,
+    kind: &str,
     now: DateTime<Utc>,
 ) -> Option<RateWindow> {
     let used_percent = window.used_percent?;
@@ -235,6 +236,7 @@ fn rate_window_from(
         ResetState::Absent => (None, used_percent),
     };
     Some(RateWindow {
+        window_kind: Some(kind.to_string()),
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -273,25 +275,28 @@ fn core_extra_windows(
             "Core 5h",
             core.five_hour.as_ref(),
             FIVE_HOUR_MINUTES,
+            cortexkit_provider_usage::window_kind::FIVE_HOUR,
         ),
         (
             "factory-core-7d",
             "Core 7-day",
             core.weekly.as_ref(),
             WEEKLY_MINUTES,
+            cortexkit_provider_usage::window_kind::WEEKLY,
         ),
         (
             "factory-core-monthly",
             "Core Monthly",
             core.monthly.as_ref(),
             MONTHLY_MINUTES,
+            cortexkit_provider_usage::window_kind::MONTHLY,
         ),
     ];
 
     let extras: Vec<ExtraWindow> = windows
         .into_iter()
-        .filter_map(|(id, title, window, minutes)| {
-            let window = rate_window_from(window?, minutes, now)?;
+        .filter_map(|(id, title, window, minutes, kind)| {
+            let window = rate_window_from(window?, minutes, kind, now)?;
             Some(ExtraWindow {
                 title: Some(title.to_string()),
                 id: Some(id.to_string()),
@@ -316,18 +321,30 @@ pub fn normalize_billing_limits(value: &Value, now: DateTime<Utc>) -> Result<Usa
         FetchError::Decode("factory: limits missing standard and core pools".to_string())
     })?;
 
-    let primary = pool
-        .five_hour
-        .as_ref()
-        .and_then(|w| rate_window_from(w, FIVE_HOUR_MINUTES, now));
-    let secondary = pool
-        .weekly
-        .as_ref()
-        .and_then(|w| rate_window_from(w, WEEKLY_MINUTES, now));
-    let tertiary = pool
-        .monthly
-        .as_ref()
-        .and_then(|w| rate_window_from(w, MONTHLY_MINUTES, now));
+    let primary = pool.five_hour.as_ref().and_then(|w| {
+        rate_window_from(
+            w,
+            FIVE_HOUR_MINUTES,
+            cortexkit_provider_usage::window_kind::FIVE_HOUR,
+            now,
+        )
+    });
+    let secondary = pool.weekly.as_ref().and_then(|w| {
+        rate_window_from(
+            w,
+            WEEKLY_MINUTES,
+            cortexkit_provider_usage::window_kind::WEEKLY,
+            now,
+        )
+    });
+    let tertiary = pool.monthly.as_ref().and_then(|w| {
+        rate_window_from(
+            w,
+            MONTHLY_MINUTES,
+            cortexkit_provider_usage::window_kind::MONTHLY,
+            now,
+        )
+    });
 
     if primary.is_none() && secondary.is_none() && tertiary.is_none() {
         return Err(FetchError::Decode(
@@ -498,14 +515,17 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 12.5);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T08:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 40.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-25T17:20:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 5.0);
         assert_eq!(tertiary.resets_at, None);
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
     }
 
@@ -518,6 +538,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 50.0);
         assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
     }
 
@@ -530,6 +551,7 @@ mod tests {
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 100.0);
         assert_eq!(tertiary.resets_at, None);
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
     }
 
@@ -600,6 +622,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 10.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
     }
 
@@ -690,9 +713,18 @@ mod tests {
             100.0,
             "the core wall is the fact this test exists to keep visible"
         );
-        assert!(extras
+        assert_eq!(
+            core_5h.window.as_ref().unwrap().window_kind.as_deref(),
+            Some("five_hour")
+        );
+        let monthly = extras
             .iter()
-            .any(|e| e.id.as_deref() == Some("factory-core-monthly")));
+            .find(|e| e.id.as_deref() == Some("factory-core-monthly"))
+            .unwrap();
+        assert_eq!(
+            monthly.window.as_ref().unwrap().window_kind.as_deref(),
+            Some("monthly")
+        );
         assert!(
             !extras
                 .iter()

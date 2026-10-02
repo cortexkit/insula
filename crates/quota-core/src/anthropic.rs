@@ -424,6 +424,7 @@ fn scoped_weekly_extras(
                 title: Some(format!("7 Day ({display_name})")),
                 id: Some(identity),
                 window: Some(RateWindow {
+                    window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
                     used_percent: percent.clamp(0.0, 100.0),
                     raw_used_percent: None,
                     resets_at: entry.resets_at.clone(),
@@ -439,7 +440,7 @@ fn scoped_weekly_extras(
     (!extras.is_empty()).then_some(extras)
 }
 
-fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWindow> {
+fn to_window(window: Option<&OAuthWindow>, window_minutes: i64, kind: &str) -> Option<RateWindow> {
     let window = window?;
     // CodexBar's makeWindow (ClaudeUsageFetcher.swift:945-956) builds a window
     // from `utilization` alone and leaves resetsAt nil when absent — an idle
@@ -448,6 +449,7 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64) -> Option<RateWi
     // reset through when present, omit it otherwise. Never fabricate a reset.
     let used_percent = window.utilization?;
     Some(RateWindow {
+        window_kind: Some(kind.to_string()),
         used_percent,
         raw_used_percent: None,
         resets_at: window.resets_at.clone(),
@@ -498,10 +500,19 @@ fn normalize_with_overage(
             .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
-        primary: to_window(response.five_hour.as_ref(), FIVE_HOUR_MINUTES),
+        primary: to_window(
+            response.five_hour.as_ref(),
+            FIVE_HOUR_MINUTES,
+            cortexkit_provider_usage::window_kind::FIVE_HOUR,
+        ),
         // The split describes `seven_day` only, so it goes on that window and
         // nowhere else.
-        secondary: to_window(response.seven_day.as_ref(), SEVEN_DAY_MINUTES).map(|mut window| {
+        secondary: to_window(
+            response.seven_day.as_ref(),
+            SEVEN_DAY_MINUTES,
+            cortexkit_provider_usage::window_kind::WEEKLY,
+        )
+        .map(|mut window| {
             window.breakdown = weekly_breakdown(response.seven_day_breakdown);
             window
         }),
@@ -511,6 +522,7 @@ fn normalize_with_overage(
                 .as_ref()
                 .or(response.seven_day_sonnet.as_ref()),
             SEVEN_DAY_MINUTES,
+            cortexkit_provider_usage::window_kind::WEEKLY,
         ),
         extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
     };
@@ -1078,10 +1090,19 @@ mod tests {
         assert!(usage.tertiary.as_ref().unwrap().breakdown.is_none());
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 16.0); // already a percent, NOT /100
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         assert_eq!(
             primary.resets_at.as_deref(),
             Some("2026-06-22T17:00:00.175593+00:00")
+        );
+        assert_eq!(
+            usage.secondary.as_ref().unwrap().window_kind.as_deref(),
+            Some("weekly")
+        );
+        assert_eq!(
+            usage.tertiary.as_ref().unwrap().window_kind.as_deref(),
+            Some("weekly")
         );
         assert_eq!(usage.secondary.unwrap().used_percent, 48.0);
         assert!(usage.extra_rate_windows.is_none());
@@ -1244,6 +1265,7 @@ mod tests {
         assert_eq!(extras[0].id.as_deref(), Some("Fable"));
         let window = extras[0].window.as_ref().unwrap();
         assert_eq!(window.used_percent, 100.0);
+        assert_eq!(window.window_kind.as_deref(), Some("weekly"));
         assert_eq!(window.window_minutes, Some(SEVEN_DAY_MINUTES));
     }
 
@@ -1379,6 +1401,7 @@ mod tests {
         let primary = usage.primary.expect("idle 0% window kept");
         assert_eq!(primary.used_percent, 0.0);
         assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         // The active weekly window is unaffected.
         assert_eq!(usage.secondary.unwrap().used_percent, 91.0);

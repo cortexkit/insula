@@ -222,6 +222,7 @@ fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> 
     };
     let resets_at = pick_reset_field(detail).and_then(parse_reset);
     Some(RateWindow {
+        window_kind: None,
         used_percent,
         raw_used_percent: None,
         resets_at,
@@ -295,6 +296,7 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                         id: Some("kimi-monthly".to_string()),
                         title: Some("Monthly".to_string()),
                         window: Some(RateWindow {
+                            window_kind: None,
                             used_percent: round_2dp(used_percent),
                             raw_used_percent: None,
                             resets_at,
@@ -320,6 +322,9 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                         id: Some("kimi-code-7d".to_string()),
                         title: Some("Code 7-day".to_string()),
                         window: Some(RateWindow {
+                            window_kind: Some(
+                                cortexkit_provider_usage::window_kind::WEEKLY.to_string(),
+                            ),
                             used_percent: round_2dp(used_percent),
                             raw_used_percent: None,
                             resets_at,
@@ -793,6 +798,7 @@ mod tests {
 
         let code_7d = extras[1].window.as_ref().expect("7d window");
         assert_eq!(code_7d.used_percent, 16.21);
+        assert_eq!(code_7d.window_kind.as_deref(), Some("weekly"));
         assert_eq!(code_7d.window_minutes, Some(WEEKLY_MINUTES));
         assert!(code_7d.resets_at.is_some());
     }

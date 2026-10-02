@@ -396,9 +396,11 @@ fn window_from_fraction(
     used_fraction: Option<f64>,
     reset_epoch_ms: Option<i64>,
     window_minutes: i64,
+    kind: &str,
 ) -> Option<RateWindow> {
     let used_percent = used_fraction.filter(|value| value.is_finite())? * 100.0;
     Some(RateWindow {
+        window_kind: Some(kind.to_string()),
         used_percent: used_percent.clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reset_epoch_ms.and_then(epoch_ms_to_iso8601),
@@ -541,16 +543,19 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         quota.per_five_hour_percentage,
         quota.per_five_hour_reset_time,
         FIVE_HOUR_WINDOW_MINUTES,
+        cortexkit_provider_usage::window_kind::FIVE_HOUR,
     );
     let secondary = window_from_fraction(
         quota.per_week_percentage,
         quota.per_week_reset_time,
         WEEKLY_WINDOW_MINUTES,
+        cortexkit_provider_usage::window_kind::WEEKLY,
     );
     let monthly = window_from_fraction(
         quota.per_month_percentage,
         quota.per_month_reset_time,
         MONTHLY_WINDOW_MINUTES,
+        cortexkit_provider_usage::window_kind::MONTHLY,
     );
     if primary.is_none() && secondary.is_none() && monthly.is_none() {
         // The same discriminator one level down. A plan block that NAMES its
@@ -920,6 +925,7 @@ mod tests {
         let usage = normalize_usage(&usage_body(UPSTREAM_MONTHLY)).unwrap();
         let primary = usage.primary.expect("the monthly window leads when alone");
         assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(43_200));
         assert_eq!(primary.resets_at.as_deref(), Some("2026-10-03T16:00:00Z"));
         assert!(usage.secondary.is_none());
@@ -940,9 +946,11 @@ mod tests {
         .unwrap();
         let primary = usage.primary.expect("five-hour window");
         assert_eq!(primary.used_percent, 10.0);
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.expect("weekly window");
         assert_eq!(secondary.used_percent, 20.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert!(usage.tertiary.is_none());
         let extras = usage
@@ -953,6 +961,7 @@ mod tests {
         assert_eq!(extras[0].title.as_deref(), Some("Monthly"));
         let monthly = extras[0].window.as_ref().expect("monthly window");
         assert!((monthly.used_percent - 30.0).abs() < 1e-9);
+        assert_eq!(monthly.window_kind.as_deref(), Some("monthly"));
         assert_eq!(monthly.window_minutes, Some(43_200));
     }
 
@@ -975,9 +984,8 @@ mod tests {
         assert_eq!(extras[0].id.as_deref(), Some("monthly"));
     }
 
-    /// Without a monthly field the output is exactly what it was before the
-    /// monthly window existed: the live-shaped fixture serializes to the same
-    /// bytes, with no extra-window key at all.
+    /// Without a monthly field the live-shaped fixture has only its two named
+    /// windows, with no extra-window key at all.
     ///
     /// The percentages are pinned as serde_json parses the fixture (its default
     /// float parser, not Rust's literal parser, so the weekly value's last digits
@@ -987,7 +995,7 @@ mod tests {
         let usage = normalize_usage(HAR_RESPONSE.as_bytes()).unwrap();
         assert_eq!(
             serde_json::to_string(&usage).unwrap(),
-            r#"{"primary":{"usedPercent":13.117665718963334,"resetsAt":"2026-07-20T00:09:00Z","windowMinutes":300},"secondary":{"usedPercent":5.3834972282899995,"resetsAt":"2026-07-26T14:09:00Z","windowMinutes":10080}}"#
+            r#"{"primary":{"usedPercent":13.117665718963334,"resetsAt":"2026-07-20T00:09:00Z","windowMinutes":300,"windowKind":"five_hour"},"secondary":{"usedPercent":5.3834972282899995,"resetsAt":"2026-07-26T14:09:00Z","windowMinutes":10080,"windowKind":"weekly"}}"#
         );
     }
 
@@ -1074,11 +1082,13 @@ mod tests {
         let primary = usage.primary.expect("five-hour quota window");
         assert!((primary.used_percent - 13.1177).abs() < 0.001);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-20T00:09:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.expect("weekly quota window");
         assert!((secondary.used_percent - 5.3835).abs() < 0.001);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-26T14:09:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
     }
 
@@ -1126,6 +1136,7 @@ mod tests {
             .secondary
             .expect("the weekly window is still reported");
         assert_eq!(secondary.used_percent, 30.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert_eq!(secondary.resets_at, None);
 
@@ -1373,6 +1384,7 @@ mod tests {
     fn usage_at(five_hour: f64, weekly: f64) -> Usage {
         Usage {
             primary: Some(RateWindow {
+                window_kind: None,
                 used_percent: five_hour,
                 raw_used_percent: None,
                 resets_at: None,
@@ -1383,6 +1395,7 @@ mod tests {
                 breakdown: None,
             }),
             secondary: Some(RateWindow {
+                window_kind: None,
                 used_percent: weekly,
                 raw_used_percent: None,
                 resets_at: None,

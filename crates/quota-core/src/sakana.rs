@@ -232,6 +232,11 @@ fn parse_window(
         .and_then(parse_reset_date);
 
     Ok(Some(RateWindow {
+        window_kind: match label {
+            "5-hour" => Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
+            "Weekly" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+            _ => None,
+        },
         used_percent: percent,
         raw_used_percent: None,
         resets_at,
@@ -499,11 +504,13 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 92.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-23T14:53:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 32.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-29T00:00:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
         assert!(usage.tertiary.is_none());
         assert!(usage.extra_rate_windows.is_none());

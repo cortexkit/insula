@@ -307,6 +307,7 @@ fn normalize_quota_at(body: &[u8], now: DateTime<Utc>) -> Result<Usage, FetchErr
             continue;
         }
         let window = RateWindow {
+            window_kind: None,
             used_percent: (1.0 - fraction).mul_add(100.0, 0.0).clamp(0.0, 100.0),
             raw_used_percent: None,
             resets_at: bucket.reset_time.clone(),

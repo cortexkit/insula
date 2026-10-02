@@ -153,6 +153,7 @@ fn credits_window(usage: &serde_json::Value) -> Option<RateWindow> {
 
     let resets_at = field_str(usage, "next_quota_reset");
     Some(RateWindow {
+        window_kind: None,
         used_percent: ((used / total) * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -173,6 +174,10 @@ fn weekly_window(subscription: &serde_json::Value) -> Option<RateWindow> {
         .max(0.0);
     let resets_at = field_str(rate, "weeklyResetsAt");
     Some(RateWindow {
+        window_kind: ["weeklyLimit", "weeklyUsed", "weeklyResetsAt"]
+            .iter()
+            .any(|key| rate.get(key).is_some())
+            .then(|| cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
         used_percent: ((used / limit) * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -284,6 +289,7 @@ mod tests {
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
         let secondary = result.secondary.unwrap();
         assert_eq!(secondary.used_percent, 30.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
     }
 

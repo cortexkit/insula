@@ -433,6 +433,21 @@ fn window_for(
         if let Some(block) = block_after(html, label) {
             if let Some(used_percent) = parse_percent(block) {
                 return Some(RateWindow {
+                    window_kind: match *label {
+                        "Monthly usage" => {
+                            Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string())
+                        }
+                        "Session usage" => {
+                            Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string())
+                        }
+                        "Hourly usage" => {
+                            Some(cortexkit_provider_usage::window_kind::HOURLY.to_string())
+                        }
+                        "Weekly usage" => {
+                            Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string())
+                        }
+                        _ => None,
+                    },
                     used_percent,
                     raw_used_percent: None,
                     resets_at: plausible_reset(block, *window_minutes, now),
@@ -1169,6 +1184,7 @@ mod tests {
         let usage = normalize_usage(html).unwrap();
         let session = usage.primary.unwrap();
         assert_eq!(session.used_percent, 2.5);
+        assert_eq!(session.window_kind.as_deref(), Some("hourly"));
         assert_eq!(session.window_minutes, None, "hourly has no fixed length");
         assert_eq!(usage.secondary.unwrap().window_minutes, Some(10080));
     }
@@ -1195,6 +1211,7 @@ mod tests {
         let monthly = usage
             .primary
             .expect("the monthly block must publish -- an unpublished window reads as headroom");
+        assert_eq!(monthly.window_kind.as_deref(), Some("monthly"));
         assert_eq!(monthly.used_percent, 61.5);
         assert_eq!(
             monthly.window_minutes, None,
@@ -1386,11 +1403,13 @@ mod tests {
 
         let session = usage.primary.expect("session stays primary");
         assert_eq!(session.used_percent, 0.1);
+        assert_eq!(session.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(session.window_minutes, Some(SESSION_WINDOW_MINUTES));
         assert_eq!(session.resets_at.as_deref(), Some("2026-01-30T18:00:00Z"));
 
         let weekly = usage.secondary.expect("weekly stays secondary");
         assert_eq!(weekly.used_percent, 0.7);
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
         assert_eq!(weekly.window_minutes, Some(WEEKLY_WINDOW_MINUTES));
         assert_eq!(weekly.resets_at.as_deref(), Some("2026-02-02T00:00:00Z"));
 
@@ -1427,6 +1446,7 @@ mod tests {
 
         let session = usage.tertiary.expect("session is published too");
         assert_eq!(session.used_percent, 88.0);
+        assert_eq!(session.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(session.window_minutes, Some(SESSION_WINDOW_MINUTES));
         assert_eq!(session.resets_at.as_deref(), Some("2026-09-03T04:00:00Z"));
 

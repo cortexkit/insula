@@ -178,6 +178,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
     Ok(Usage {
         primary: Some(RateWindow {
+            window_kind: None,
             used_percent,
             raw_used_percent: None,
             resets_at,
@@ -489,6 +490,7 @@ mod tests {
             usage,
             Usage {
                 primary: Some(RateWindow {
+                    window_kind: None,
                     used_percent: 37.5,
                     raw_used_percent: None,
                     resets_at: Some("2024-09-01T00:00:00Z".to_string()),
@@ -554,6 +556,7 @@ mod tests {
             usage,
             Usage {
                 primary: Some(RateWindow {
+                    window_kind: None,
                     used_percent: 15.0,
                     raw_used_percent: None,
                     resets_at: None,

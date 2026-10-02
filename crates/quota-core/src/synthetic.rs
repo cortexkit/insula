@@ -328,6 +328,22 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
     let window_minutes = window_minutes(map);
 
     Some(RateWindow {
+        window_kind: first_string(map, WINDOW_STRING_KEYS).and_then(|text| {
+            match text.trim().to_ascii_lowercase().as_str() {
+                "hourly" => Some(cortexkit_provider_usage::window_kind::HOURLY.to_string()),
+                "daily" => Some(cortexkit_provider_usage::window_kind::DAILY.to_string()),
+                "weekly" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+                "monthly" => Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
+                "5h" | "5hr" | "5 hours" => {
+                    Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string())
+                }
+                "5-hour" => Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
+                "five_hour" => Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
+                "1d" => Some(cortexkit_provider_usage::window_kind::DAILY.to_string()),
+                "7d" | "7 days" => Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
+                _ => None,
+            }
+        }),
         used_percent: clamped,
         raw_used_percent: None,
         resets_at,
@@ -339,10 +355,13 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
     })
 }
 
-fn named_quota(val: &serde_json::Value, _label: &str) -> Option<RateWindow> {
+fn named_quota(val: &serde_json::Value, kind: &str) -> Option<RateWindow> {
     let map = val.as_object()?;
     if is_quota_payload(map) {
-        parse_quota(map)
+        parse_quota(map).map(|mut window| {
+            window.window_kind = Some(kind.to_string());
+            window
+        })
     } else {
         None
     }
@@ -356,12 +375,12 @@ fn prioritized_quota_slots(
     let rolling = root
         .get("rollingFiveHourLimit")
         .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
-        .and_then(|v| named_quota(v, "Rolling five-hour limit"));
+        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::FIVE_HOUR));
 
     let weekly = root
         .get("weeklyTokenLimit")
         .or_else(|| data_dict.and_then(|d| d.get("weeklyTokenLimit")))
-        .and_then(|v| named_quota(v, "Weekly token limit"));
+        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::WEEKLY));
 
     let search_hourly = root
         .get("search")
@@ -374,7 +393,7 @@ fn prioritized_quota_slots(
                     .and_then(|s| s.get("hourly"))
             })
         })
-        .and_then(|v| named_quota(v, "Search hourly"));
+        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::HOURLY));
 
     if rolling.is_some() || weekly.is_some() || search_hourly.is_some() {
         Some(vec![rolling, weekly, search_hourly])
@@ -842,16 +861,19 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 20.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T15:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 45.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T16:00:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 20.0); // remaining 80 -> used 20
         assert_eq!(tertiary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
+        assert_eq!(tertiary.window_kind.as_deref(), Some("hourly"));
         assert_eq!(tertiary.window_minutes, Some(60));
     }
 
@@ -875,11 +897,13 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 10.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T15:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 30.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-06-22T16:00:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         assert!(usage.tertiary.is_none());

@@ -208,6 +208,7 @@ fn window_from_used_total_reset(
     total_keys: &[&str],
     reset_keys: &[&str],
     window_minutes: i64,
+    kind: &str,
     quota: &serde_json::Map<String, Value>,
 ) -> Option<RateWindow> {
     let used = any_int(used_keys, quota)?;
@@ -217,6 +218,7 @@ fn window_from_used_total_reset(
     }
     let resets_at = any_date(reset_keys, quota);
     Some(RateWindow {
+        window_kind: Some(kind.to_string()),
         used_percent: (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at,
@@ -264,6 +266,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             "perFiveHourQuotaNextRefreshTime",
         ],
         300,
+        cortexkit_provider_usage::window_kind::FIVE_HOUR,
         quota,
     );
     let secondary = window_from_used_total_reset(
@@ -271,6 +274,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         &["perWeekTotalQuota"],
         &["perWeekQuotaNextRefreshTime"],
         10_080,
+        cortexkit_provider_usage::window_kind::WEEKLY,
         quota,
     );
     let tertiary = window_from_used_total_reset(
@@ -281,6 +285,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             "perMonthQuotaNextRefreshTime",
         ],
         43_200,
+        cortexkit_provider_usage::window_kind::MONTHLY,
         quota,
     );
 
@@ -502,13 +507,16 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 20.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 20.0);
+        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43_200));
     }
 

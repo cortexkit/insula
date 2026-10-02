@@ -290,6 +290,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         }
 
         return Some(RateWindow {
+            window_kind: None,
             used_percent: remaining_percent_to_used(remaining_percent),
             raw_used_percent: None,
             resets_at: resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs),
@@ -308,6 +309,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     }
     let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs);
     Some(RateWindow {
+        window_kind: None,
         used_percent: used_percent(total, remaining),
         raw_used_percent: None,
         resets_at,
@@ -329,6 +331,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         if opt_int(&m.current_weekly_status) == Some(3) && remaining_percent >= 100.0 {
             if is_general_model(m) {
                 return Some(RateWindow {
+                    window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
                     used_percent: 0.0,
                     raw_used_percent: None,
                     resets_at: None,
@@ -345,6 +348,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         }
 
         return Some(RateWindow {
+            window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
             used_percent: remaining_percent_to_used(remaining_percent),
             raw_used_percent: None,
             resets_at: resets_at_iso(
@@ -371,6 +375,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         now_secs,
     )?;
     Some(RateWindow {
+        window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
         used_percent: used_percent(total, remaining),
         raw_used_percent: None,
         resets_at: Some(resets_at),
@@ -858,6 +863,7 @@ mod tests {
             .primary
             .expect("the account is metered, so a window must be published");
         assert_eq!(primary.used_percent, 75.0);
+        assert_eq!(primary.window_kind, None);
         assert_eq!(primary.window_minutes, Some(300));
     }
 
@@ -920,6 +926,7 @@ mod tests {
         let usage = normalize_usage_at(json.as_bytes(), NOW).unwrap();
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 75.0);
+        assert_eq!(primary.window_kind, None);
         assert_eq!(primary.window_minutes, Some(300));
         let expected_end_secs = end / 1000;
         assert_eq!(primary.resets_at, env::epoch_to_iso8601(expected_end_secs));
@@ -1041,16 +1048,19 @@ mod tests {
 
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 4.0);
+        assert_eq!(primary.window_kind, None);
         assert_eq!(primary.window_minutes, Some(300));
         assert_eq!(primary.resets_at, env::epoch_to_iso8601(1_780_297_200));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 1.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert_eq!(secondary.resets_at, env::epoch_to_iso8601(1_780_848_000));
 
         let tertiary = usage.tertiary.unwrap();
         assert_eq!(tertiary.used_percent, 70.0);
+        assert_eq!(tertiary.window_kind, None);
         assert_eq!(tertiary.window_minutes, Some(1_440));
         assert_eq!(tertiary.resets_at, env::epoch_to_iso8601(1_780_329_600));
     }
@@ -1081,6 +1091,7 @@ mod tests {
         let secondary = usage.secondary.unwrap();
 
         assert_eq!(secondary.used_percent, 0.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
         assert_eq!(secondary.resets_at, None);
     }

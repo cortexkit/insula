@@ -425,6 +425,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         .filter(|s| *s > 0)
         .map(|s| s / 60);
     Some(RateWindow {
+        window_kind: None,
         used_percent,
         raw_used_percent: None,
         resets_at,
@@ -2175,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_real_shaped_payload() {
+    fn duration_only_windows_stay_unnamed() {
         // Shaped exactly like the live HTTP 200 we captured.
         let body = br#"{
             "plan_type": "pro",
@@ -2189,9 +2190,11 @@ mod tests {
         let usage = snapshot.usage;
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 41.0);
+        assert_eq!(primary.window_kind, None);
         assert_eq!(primary.window_minutes, Some(300)); // 18000s / 60 = 300m (5h)
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.window_kind, None);
         assert_eq!(secondary.window_minutes, Some(10080)); // weekly
         assert!(usage.tertiary.is_none());
     }

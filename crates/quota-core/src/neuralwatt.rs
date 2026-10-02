@@ -271,6 +271,26 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             .and_then(|s| parse_iso8601(&s).map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
 
         Some(RateWindow {
+            window_kind: match sub
+                .billing_interval
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "month" | "monthly" => {
+                    Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string())
+                }
+                "week" | "weekly" => {
+                    Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string())
+                }
+                "day" | "daily" => Some(cortexkit_provider_usage::window_kind::DAILY.to_string()),
+                "hour" | "hourly" => {
+                    Some(cortexkit_provider_usage::window_kind::HOURLY.to_string())
+                }
+                _ => None,
+            },
             used_percent,
             raw_used_percent: None,
             resets_at,
@@ -308,6 +328,21 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             id: Some("key-allowance".to_string()),
             title: Some(format!("Key {}", period_title)),
             window: Some(RateWindow {
+                window_kind: match period.trim().to_ascii_lowercase().as_str() {
+                    "hour" | "hourly" => {
+                        Some(cortexkit_provider_usage::window_kind::HOURLY.to_string())
+                    }
+                    "day" | "daily" => {
+                        Some(cortexkit_provider_usage::window_kind::DAILY.to_string())
+                    }
+                    "week" | "weekly" => {
+                        Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string())
+                    }
+                    "month" | "monthly" => {
+                        Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string())
+                    }
+                    _ => None,
+                },
                 used_percent: percent,
                 raw_used_percent: None,
                 resets_at: None,
@@ -494,6 +529,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 50.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-08-24T12:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(44640));
 
         let extras = usage.extra_rate_windows.unwrap();
@@ -504,6 +540,7 @@ mod tests {
         let extra_win = extra.window.as_ref().unwrap();
         assert_eq!(extra_win.used_percent, 50.0);
         assert_eq!(extra_win.resets_at, None);
+        assert_eq!(extra_win.window_kind.as_deref(), Some("monthly"));
         assert_eq!(extra_win.window_minutes, None);
     }
 

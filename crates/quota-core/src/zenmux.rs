@@ -160,6 +160,7 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
 
     let (used_5h, total_5h) = crate::model::window_counts(quota_5h.used_flows, quota_5h.max_flows);
     let primary = RateWindow {
+        window_kind: Some(cortexkit_provider_usage::window_kind::FIVE_HOUR.to_string()),
         used_percent: (quota_5h.usage_percentage * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_5h.resets_at),
@@ -172,6 +173,7 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
 
     let (used_7d, total_7d) = crate::model::window_counts(quota_7d.used_flows, quota_7d.max_flows);
     let secondary = RateWindow {
+        window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
         used_percent: (quota_7d.usage_percentage * 100.0).clamp(0.0, 100.0),
         raw_used_percent: None,
         resets_at: reported_reset_at(quota_7d.resets_at),
@@ -317,11 +319,13 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-11T12:30:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 40.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-18T12:30:00Z"));
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
 
         let info = account_info.unwrap();

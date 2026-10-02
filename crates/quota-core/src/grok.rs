@@ -348,6 +348,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
     Ok(Usage {
         primary: Some(RateWindow {
+            window_kind: None,
             used_percent,
             raw_used_percent: None,
             resets_at: Some(resets_at),

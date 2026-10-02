@@ -139,6 +139,7 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
     // period end is missing, and a consumer reads an absent window as unused
     // capacity rather than as a wall.
     let primary = used_percent.map(|pct| RateWindow {
+        window_kind: Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string()),
         used_percent: pct,
         raw_used_percent: None,
         resets_at,
@@ -369,6 +370,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 45.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 
@@ -391,6 +393,7 @@ mod tests {
             .primary
             .expect("a real percent is a real window even with no reset reported");
         assert_eq!(primary.resets_at, None);
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 
@@ -400,6 +403,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(43200));
     }
 

@@ -745,6 +745,20 @@ pub fn plausible_window_length(minutes: i64) -> bool {
 
 fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings: &mut Vec<String>) {
     let percent = window.used_percent;
+    if let Some(kind) = window.window_kind.as_deref() {
+        if !matches!(
+            kind,
+            cortexkit_provider_usage::window_kind::HOURLY
+                | cortexkit_provider_usage::window_kind::FIVE_HOUR
+                | cortexkit_provider_usage::window_kind::DAILY
+                | cortexkit_provider_usage::window_kind::WEEKLY
+                | cortexkit_provider_usage::window_kind::MONTHLY
+        ) {
+            findings.push(format!(
+                "{where_}: windowKind is not in the producer vocabulary: {kind}"
+            ));
+        }
+    }
 
     // Checked in its own right, not only where it is used as a bound. A window
     // length is a claim about cadence that consumers read directly -- and it is
@@ -885,6 +899,7 @@ mod tests {
 
     fn window(percent: f64) -> RateWindow {
         RateWindow {
+            window_kind: None,
             used_percent: percent,
             raw_used_percent: None,
             window_minutes: Some(300),
@@ -1268,6 +1283,39 @@ mod tests {
         // result *from having checked*, not from having skipped.
         assert_eq!(report.windows_checked, 1);
         assert!(!report.examined_nothing());
+    }
+
+    #[test]
+    fn window_kind_vocabulary_rejects_typos() {
+        for kind in ["weeky", "fortnightly", "", "MONTHLY"] {
+            let mut w = window(40.0);
+            w.window_kind = Some(kind.to_string());
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+            assert_eq!(report.findings.len(), 1, "{kind}: {:?}", report.findings);
+            assert!(report.findings[0].contains("windowKind"));
+        }
+    }
+
+    #[test]
+    fn window_kind_vocabulary_accepts_named_and_unnamed_windows() {
+        for kind in [
+            None,
+            Some("hourly"),
+            Some("five_hour"),
+            Some("daily"),
+            Some("weekly"),
+            Some("monthly"),
+        ] {
+            let mut w = window(40.0);
+            w.window_kind = kind.map(str::to_string);
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+            assert!(
+                report.findings.is_empty(),
+                "{kind:?}: {:?}",
+                report.findings
+            );
+            assert_eq!(report.windows_checked, 1);
+        }
     }
 
     /// The defect this whole checker exists for: a reset that belongs to a

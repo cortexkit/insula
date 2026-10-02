@@ -86,6 +86,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 .next_character_count_reset_unix
                 .and_then(env::epoch_to_iso8601);
             Some(RateWindow {
+                window_kind: None,
                 used_percent,
                 raw_used_percent: None,
                 resets_at,
