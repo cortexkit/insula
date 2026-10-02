@@ -1505,6 +1505,159 @@ fn every_cookie_provider_can_be_reached_by_a_deposit() {
     );
 }
 
+/// Every provider with a vault credential family is BUILT to read the vault.
+///
+/// `every_cookie_provider_can_be_reached_by_a_deposit` checks the routing table,
+/// and the table is only half of the lane. A provider's vault lane is also gated
+/// on the credential source it was constructed with, and a provider built
+/// without one has a family entry, a loader mapping and a granted deposit, and
+/// still never enumerates that deposit. Ollama shipped that way: the default
+/// registry built it with `new()`, its `CookieVault` returned the Chrome lane
+/// before consulting the loader, and a granted `cookie:ollama.com:<account>`
+/// deposit was ignored -- served from Chrome where Chrome was readable, and dark
+/// where it was not. The table test passed throughout.
+///
+/// So this builds the real default registry with a source wired and asks each
+/// provider, through `handles()`, whether a deposit in its family reaches it.
+/// The population is derived from the registry and the families table, so a
+/// provider added to either is checked without editing this test.
+///
+/// ONE FAMILY PER SNAPSHOT. Several providers rank their lanes, and a snapshot
+/// holding every family at once would let the ranking, not the wiring, decide
+/// what `handles()` returns: cursor ignores `cookie:cursor.com` deposits when an
+/// `oauth:cursor` one is present, and opencodego serves only its API key when
+/// one is deposited beside a cookie. Those rules have their own tests.
+/// Installing one deposit at a time leaves each provider exactly one vault
+/// credential to show, so one assertion holds for all of them: a vault handle
+/// for that id is AMONG the handles. "Among" rather than "only", because codex
+/// and antigravity legitimately list a local lane beside their vault handles.
+#[test]
+fn every_provider_with_a_vault_family_enumerates_a_deposit_in_it() {
+    use crate::vault_handles::CREDENTIAL_FAMILIES;
+    use std::collections::BTreeSet;
+
+    let registry = Registry::with_defaults(
+        crate::config::QuotaConfig::default(),
+        Some(Arc::new(DefaultListSource)),
+    );
+    let loader = Arc::clone(
+        registry
+            .vault_handle_loader
+            .as_ref()
+            .expect("the default registry wires a vault handle loader"),
+    );
+
+    // The denominator. A family naming a provider the registry does not hold
+    // is its own defect (a deposit routed to nothing), and it would also shrink
+    // the population below without anything failing.
+    let family_providers: BTreeSet<&str> = CREDENTIAL_FAMILIES
+        .iter()
+        .map(|(_, provider)| *provider)
+        .collect();
+    let registered: BTreeSet<&str> = registry
+        .providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .filter(|name| family_providers.contains(name))
+        .collect();
+    assert_eq!(
+        registered, family_providers,
+        "every provider in CREDENTIAL_FAMILIES must be in the default registry"
+    );
+
+    // OpenCode Go serves an API key from the environment ahead of any cookie
+    // deposit (`OpenCodeGoProvider::handles`), so on a host that sets one the
+    // cookie family cannot show for that provider. Its wiring is still proved
+    // by the `apikey:opencode-go` round, which goes through the same source.
+    let opencode_env_key = crate::env::first_env(&["OPENCODE_API_KEY"]).is_some();
+
+    let mut families: Vec<&str> = Vec::new();
+    for (family, _) in CREDENTIAL_FAMILIES {
+        if !families.contains(family) {
+            families.push(family);
+        }
+    }
+
+    let mut pairs_checked = 0usize;
+    let mut providers_proved: BTreeSet<&str> = BTreeSet::new();
+    let mut shadowed_by_env = Vec::new();
+    let mut unwired = Vec::new();
+    for family in families {
+        let deposit = format!("{family}:fence");
+        let credential_type = if family.starts_with("cookie:") {
+            "cookie"
+        } else if family.starts_with("apikey:") || family == "kimi-for-coding" {
+            "apikey"
+        } else {
+            "oauth"
+        };
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(&deposit, credential_type, 1, "active")]),
+            Instant::now(),
+        );
+
+        for (_, provider_name) in CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(prefix, _)| *prefix == family)
+        {
+            pairs_checked += 1;
+            let provider = registry
+                .providers
+                .iter()
+                .find(|provider| provider.name == *provider_name)
+                .expect("registered, asserted above");
+            let handles = match provider.fetcher.handles() {
+                Ok(handles) => handles,
+                Err(error) => {
+                    unwired.push(format!("{provider_name} ({deposit}): error {error:?}"));
+                    continue;
+                }
+            };
+            let enumerated = handles.iter().any(|handle| {
+                handle.is_vault() && handle.vault_credential_id() == Some(deposit.as_str())
+            });
+            if enumerated {
+                providers_proved.insert(provider_name);
+                continue;
+            }
+            let env_lane_only = handles.len() == 1 && handles[0] == CredentialHandle::implicit();
+            if opencode_env_key
+                && *provider_name == crate::opencodego::PROVIDER_NAME
+                && family.starts_with("cookie:")
+                && env_lane_only
+            {
+                shadowed_by_env.push(format!("{provider_name} ({deposit})"));
+                continue;
+            }
+            let listed: Vec<&str> = handles.iter().map(CredentialHandle::stable_id).collect();
+            unwired.push(format!("{provider_name} ({deposit}): handles {listed:?}"));
+        }
+    }
+
+    assert!(
+        unwired.is_empty(),
+        "these providers did not enumerate a granted deposit in their own family, so \
+         the default registry built them without the credential source (or the \
+         lane is otherwise cut) and the deposit is never served: {unwired:?} \
+         (checked {pairs_checked} family/provider pairs across {} providers)",
+        family_providers.len()
+    );
+    assert_eq!(
+        providers_proved, family_providers,
+        "every family-bearing provider must be proved through at least one family; \
+         {pairs_checked} pairs checked, shadowed by the environment: {shadowed_by_env:?}"
+    );
+    // An empty families table would pass both checks above while proving
+    // nothing, so the population itself is asserted too.
+    assert!(
+        !family_providers.is_empty() && pairs_checked == CREDENTIAL_FAMILIES.len(),
+        "every row of CREDENTIAL_FAMILIES must be checked: {pairs_checked} of {} pairs, \
+         {} providers",
+        CREDENTIAL_FAMILIES.len(),
+        family_providers.len()
+    );
+}
+
 /// Every cookie-cohort provider publishes the cookie source label.
 ///
 /// `source` is observability only, but its job is to tell a reader how a figure
