@@ -406,7 +406,7 @@ async fn check_health_identity(stream: &mut tokio::net::TcpStream) -> Vec<String
 /// Every attributed drop record must name an account `usage.get` publishes for the
 /// same provider.
 ///
-/// Silent on records with no account: a browser-cookie lane resolves no identity,
+/// Silent on records with no account: a cookie lane resolves no identity,
 /// and those records genuinely cannot be attributed or collapsed. Silent too when
 /// the provider publishes no accounts at all right now -- the ring outlives the
 /// slots that wrote it, so a credential removed since a drop was recorded leaves a
@@ -516,7 +516,7 @@ fn check_drop_page(page: &serde_json::Value) {
         // credential, so a provider reached through several credentials emits one
         // record per credential for a single reset, and only this field lets a
         // consumer collapse them. Absent is legal and load-bearing -- a
-        // browser-cookie lane resolves no identity, and those records genuinely
+        // cookie lane resolves no identity, and those records genuinely
         // cannot be collapsed -- so the check is on the value when present, not on
         // presence.
         //

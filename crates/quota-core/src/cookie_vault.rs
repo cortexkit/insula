@@ -1,14 +1,14 @@
-//! Vault cookie lanes for the browser-cookie provider cohort.
+//! Vault cookie lanes for the cookie provider cohort.
 //!
-//! Nine providers publish quota only on a logged-in web page and read the
-//! session cookie from the live Chrome store. That route is CLOSED ON WINDOWS BY
-//! DESIGN -- Chrome 127+ App-Bound Encryption hands the cookie key only to
-//! Chrome, validating the calling executable -- and absent on headless hosts.
-//! The vault lane is how those hosts get quota at all: a human inside Chrome
-//! copies the header, which is the only trusted path left.
+//! Nine providers publish quota only on a logged-in web page, so their
+//! credential is a session cookie. Insula never reads a browser to get one: the
+//! cookie arrives as a deposit in the credential vault, `cookie:<domain>` or
+//! `cookie:<domain>:<account>`, captured by Cerebellum in a throwaway browser.
+//! A deposit is the only cookie source. A host with no deposit has no cookie
+//! lane, and the provider is unconfigured there.
 //!
 //! THIS EXISTS BECAUSE THE DUPLICATION COST WAS MEASURED, NOT PREDICTED. The
-//! precedence rule below was specified wrongly, corrected in 1a17528, and the
+//! precedence rule below was once specified wrongly, corrected, and the
 //! correction was applied to `opencode` and MISSED `opencodego` -- in the same
 //! session, by the person who had just written it. Two copies were enough to
 //! lose a fix; nine would be a rule that is right in some providers and wrong in
@@ -17,10 +17,24 @@
 use std::sync::Arc;
 
 use crate::{
+    cookie_jar::CookieJar,
     credential_source::CredentialSource,
     provider::{CredentialHandle, FetchError, HandlesError},
     vault_handles::{cookie_lane, CookieLane, VaultHandleLoader},
 };
+
+/// The `source` every cookie lane publishes: the cookie came from a vault
+/// deposit, because no other cookie source exists.
+pub(crate) const SOURCE: &str = "vault";
+
+/// Where a cookie provider's jar came from, for a "no session cookie ..."
+/// diagnosis.
+///
+/// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE. These providers report a
+/// missing session from a point AFTER the jar was resolved, and the operator's
+/// next action is to re-capture the login and re-deposit it, so the message
+/// names the deposit rather than a browser.
+pub(crate) const DEPOSIT_PHRASE: &str = "in the deposited cookie";
 
 /// The vault half of one cookie provider's credential story.
 ///
@@ -36,47 +50,16 @@ pub(crate) struct CookieVault {
     family: &'static str,
 }
 
-/// Name the place a jar came from, for an operator's next action.
+/// The precedence rule of [`CookieVault::handles`] over a list of deposits.
 ///
-/// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE, and because the wrong answer is
-/// worse than a vague one. These providers all reported "no session cookie in
-/// browser" from a point AFTER the jar was resolved -- true when the browser
-/// store was the only lane, and false the moment a deposit answers instead. It
-/// sends the operator to check a browser session that is not what failed.
-///
-/// It is worst on exactly the hosts the deposit lane exists for. Windows cannot
-/// read Chrome's cookie store at all (App-Bound Encryption hands the key only to
-/// chrome.exe), so "in browser" there names a lane that cannot work, about a
-/// credential the operator pasted in by hand.
-/// NOT THREADED INTO UPSTREAM-FAILURE MESSAGES, deliberately, and this is where
-/// the next person will weigh that.
-///
-/// A rejected cookie reports "<provider> session expired" from a pure parse
-/// function with no source in scope, and a degraded entry publishes no `source`
-/// field either -- so on a host where BOTH lanes work, an operator cannot tell
-/// whether to re-login in Chrome or re-capture and re-deposit.
-///
-/// The cheap implementation exists: `FetchError::stage()` prefixes a message
-/// while preserving the variant, so `.map_err(|e| e.stage(source_phrase(src)))`
-/// at the call site where `source` is already bound would do it in one line per
-/// provider with no signature changes.
-///
-/// It is not built because the ambiguity is narrow. Where the deposit lane is
-/// the ONLY lane -- Windows, headless -- there is nothing to confuse it with, and
-/// those are the hosts this lane exists for. On macOS and Linux the local store
-/// takes precedence unless an account-suffixed deposit exists, so the ambiguous
-/// case is specifically: bare deposit, no browser session, fallback fires, and
-/// the deposit later expires. An operator there settles it by asking whether
-/// they have a browser session at all.
-///
-/// Measured before deciding, rather than reasoned about: a deposited cookie with
-/// a recognised name reaches a real upstream request and returns
-/// `credential_rejected` -- "amp session expired (settings page served a login)"
-/// -- which is correct, and silent about which lane carried it.
-pub(crate) fn source_phrase(source: &str) -> &'static str {
-    match source {
-        "vault" => "in the deposited cookie",
-        _ => "in browser",
+/// Separate from the loader because the loader already refuses a domain with
+/// two deposits outright (cookies carry no identity, so two deposits are
+/// ambiguous). This rule is the second line behind that refusal, and it has to
+/// be testable on its own input.
+fn deposit_lanes(deposits: Vec<CredentialHandle>, family: &str) -> Vec<CredentialHandle> {
+    match cookie_lane(deposits, family) {
+        CookieLane::Suffixed(handles) => handles,
+        CookieLane::Bare(bare) => bare.into_iter().collect(),
     }
 }
 
@@ -93,150 +76,82 @@ impl CookieVault {
         }
     }
 
-    /// Which lanes this provider exposes.
+    /// Which deposits this provider fetches with.
     ///
     /// PRECEDENCE IS EXPRESSED BY WHICH LANES EXIST, not by a choice made during
-    /// the fetch, and that distinction is the whole design. Every handle a
-    /// provider returns becomes its own SLOT and is fetched independently, so
-    /// enumerating a local lane beside a vault lane does not mean "prefer one" --
-    /// both fetch, both produce identity-less entries (a cookie session
-    /// discloses no account), and the emission gate collapses them to a single
-    /// representative chosen by a tie-break no operator can see. `anthropic.rs`
-    /// states the same consequence at its own `handles()`.
+    /// the fetch. Every handle a provider returns becomes its own SLOT and is
+    /// fetched independently, so enumerating a bare deposit beside a suffixed
+    /// one does not mean "prefer one" -- both fetch, both produce identity-less
+    /// entries (a cookie session discloses no account), and the emission gate
+    /// collapses them to a single representative chosen by a tie-break no
+    /// operator can see. `anthropic.rs` states the same consequence at its own
+    /// `handles()`.
     ///
-    /// - An ACCOUNT-SUFFIXED deposit takes the provider vault-only. The operator
-    ///   named an account; the ambient browser session must not answer instead
-    ///   of the one they named.
-    /// - Otherwise the local lane is the only lane, with a bare deposit
-    ///   consulted as a fallback INSIDE that one fetch (see [`Self::cookie_for`]).
-    ///
-    /// One slot either way, so there is no tie-break to lose.
+    /// - ACCOUNT-SUFFIXED deposits win. The operator named an account; an
+    ///   unnamed deposit must not answer instead of the one they named.
+    /// - Otherwise a bare `cookie:<domain>` deposit is the one lane.
+    /// - No deposit, or no credential source at all, is NO lane. The provider
+    ///   is unconfigured on this host and counts as having no handles, rather
+    ///   than publishing a degraded "credential absent" entry for a login
+    ///   nobody deposited.
     ///
     /// The asymmetry that makes suffixed-wins correct: a stale deposit FAILS
     /// LOUDLY (401, marked, prompt to re-capture) while a wrong account
     /// SUCCEEDS, reporting a real current figure for somebody else's quota.
+    ///
+    /// A vault that has not answered yet is an enumeration ERROR, not an empty
+    /// inventory, so the scheduler keeps the provider unfinished instead of
+    /// forgetting the accounts it was serving.
     pub(crate) fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         if self.credential_source.is_none() {
-            return Ok(vec![CredentialHandle::implicit()]);
+            return Ok(Vec::new());
         }
-        Ok(match cookie_lane(self.deposits()?, self.family) {
-            CookieLane::VaultOnly(handles) => handles,
-            CookieLane::LocalWithFallback(_) => vec![CredentialHandle::implicit()],
-        })
+        Ok(deposit_lanes(self.deposits()?, self.family))
     }
 
     /// The cookie header to fetch with, and the `source` label to publish.
-    ///
-    /// `local` is the provider's own live-store read, passed as a closure because
-    /// each provider names its own domain. It is only invoked on the local lane,
-    /// so a vault-only provider never touches the browser store.
-    ///
-    /// THE FALLBACK IS INSIDE THIS ONE FETCH rather than a second slot: a host
-    /// that cannot read the live store at all would otherwise have no lane,
-    /// while a host that can keeps the fresher source. The local handle is
-    /// `ImplicitLocal` and carries no capability, so which bare deposit to fall
-    /// back to is a property of the PROVIDER's configuration, not of the handle.
-    pub(crate) async fn cookie_for<F, Fut>(
+    pub(crate) async fn cookie_for(
         &self,
         handle: &CredentialHandle,
-        local: F,
-    ) -> Result<(String, &'static str), FetchError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<String, FetchError>>,
-    {
-        if handle.is_vault() {
-            return Ok((self.fetch(handle).await?, "vault"));
-        }
-        match local().await {
-            Ok(cookie) => Ok((cookie, crate::browser_cookies::SOURCE_LABEL)),
-            Err(local_error) => match self.bare_deposit()? {
-                Some(handle) => Ok((self.fetch(&handle).await?, "vault")),
-                // No fallback configured: report what the live store said. The
-                // local failure is the true one and already carries the right
-                // class -- inventing a credential-absent verdict here would
-                // replace a specific diagnosis with a vaguer one.
-                None => Err(local_error),
-            },
-        }
+    ) -> Result<(String, &'static str), FetchError> {
+        Ok((self.fetch(handle).await?, SOURCE))
     }
 
     /// The cookie JAR to fetch with, and the `source` label to publish.
     ///
-    /// Same precedence as [`Self::cookie_for`]; the difference is shape. Seven
-    /// of the nine cookie providers work from a jar rather than a header string,
+    /// Same lane as [`Self::cookie_for`]; the difference is shape. Seven of the
+    /// nine cookie providers work from a jar rather than a header string,
     /// because they ask it whether a recognised session cookie is present and
     /// give a different diagnosis when it is not.
     ///
-    /// THAT DIAGNOSIS IS WHY THE VAULT LANE RETURNS A JAR RATHER THAN A STRING.
-    /// A pasted header full of tracking cookies and no session is well-formed to
-    /// the vault, deposits cleanly, and fails on first use. "Your session
-    /// expired, sign in again" sends the operator to repeat the action that just
-    /// failed; "no session was captured, make sure you are signed in before
-    /// copying" sends them to the actual cause. Handing back an opaque string
-    /// would lose that distinction for exactly the hosts this lane exists for.
-    pub(crate) async fn jar_for<F, Fut>(
+    /// THAT DIAGNOSIS IS WHY THIS RETURNS A JAR RATHER THAN A STRING. A captured
+    /// header full of tracking cookies and no session is well-formed to the
+    /// vault, deposits cleanly, and fails on first use. "Your session expired,
+    /// sign in again" sends the operator to repeat the action that just failed;
+    /// "no session was captured, make sure you are signed in before capturing"
+    /// sends them to the actual cause.
+    pub(crate) async fn jar_for(
         &self,
         handle: &CredentialHandle,
-        local: F,
-    ) -> Result<(crate::browser_cookies::CookieJar, &'static str), FetchError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<crate::browser_cookies::CookieJar, FetchError>>,
-    {
-        if handle.is_vault() {
-            let header = self.fetch(handle).await?;
-            return Ok((
-                crate::browser_cookies::CookieJar::from_header(&header),
-                "vault",
-            ));
-        }
-        match local().await {
-            Ok(jar) => Ok((jar, crate::browser_cookies::SOURCE_LABEL)),
-            Err(local_error) => match self.bare_deposit()? {
-                Some(handle) => {
-                    let header = self.fetch(&handle).await?;
-                    Ok((
-                        crate::browser_cookies::CookieJar::from_header(&header),
-                        "vault",
-                    ))
-                }
-                None => Err(local_error),
-            },
-        }
+    ) -> Result<(CookieJar, &'static str), FetchError> {
+        let header = self.fetch(handle).await?;
+        Ok((CookieJar::from_header(&header), SOURCE))
     }
 
-    /// Name the place a jar came from, for an operator's next action.
-    ///
-    /// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE, and because the wrong answer
-    /// is worse than a vague one. These providers all reported "no session cookie
-    /// in browser" from a point AFTER the jar was resolved -- true when the
-    /// browser store was the only lane, and false the moment a deposit answers
-    /// instead. It sends the operator to check a browser session that is not what
-    /// failed.
-    ///
-    /// It is worst on exactly the hosts the deposit lane exists for. Windows
-    /// cannot read Chrome's cookie store at all (App-Bound Encryption hands the
-    /// key only to chrome.exe), so "in browser" there names a lane that cannot
-    /// work, about a credential the operator pasted in by hand.
     fn deposits(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.handle_loader.cookie_handles(self.family)
     }
 
-    fn bare_deposit(&self) -> Result<Option<CredentialHandle>, FetchError> {
-        if self.credential_source.is_none() {
-            return Ok(None);
-        }
-        let deposits = self
-            .deposits()
-            .map_err(|error| FetchError::Internal(error.to_string()))?;
-        Ok(match cookie_lane(deposits, self.family) {
-            CookieLane::LocalWithFallback(Some(handle)) => Some(handle),
-            _ => None,
-        })
-    }
-
     async fn fetch(&self, handle: &CredentialHandle) -> Result<String, FetchError> {
+        // Only a deposit carries a cookie. `handles()` never enumerates any
+        // other kind, so this is a caller's mistake reported as absence rather
+        // than a vault failure the provider did not have.
+        if !handle.is_vault() {
+            return Err(FetchError::NoSession(format!(
+                "no {} deposit for this handle",
+                self.family
+            )));
+        }
         let source = self
             .credential_source
             .as_ref()
@@ -255,67 +170,160 @@ impl CookieVault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser_cookies::SOURCE_LABEL;
+    use crate::credential_source::{VaultCapability, VaultCredential, VaultGetError};
+    use async_trait::async_trait;
 
-    /// The absence diagnosis names the lane that actually answered.
+    const FAMILY: &str = "cookie:ollama.com";
+
+    /// Serves `session=<credential id>` for any scoped id, so a test can tell
+    /// which deposit a fetch actually read.
+    struct EchoSource;
+
+    #[async_trait]
+    impl CredentialSource for EchoSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            Err(VaultGetError::FailClosed)
+        }
+
+        async fn get_scoped(
+            &self,
+            credential_id: &str,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            Ok(VaultCredential {
+                payload: format!("session={credential_id}").into_bytes(),
+                expires_at_ms: None,
+                record_version: 1,
+                account_id: None,
+                email: None,
+                org_name: None,
+                project_id: None,
+            })
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            _provider_status: u16,
+            _record_version: u64,
+        ) {
+        }
+    }
+
+    fn vault_with(rows: &[(&str, &str)]) -> CookieVault {
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(rows);
+        CookieVault::new(Some(Arc::new(EchoSource)), loader, FAMILY)
+    }
+
+    fn ids(handles: &[CredentialHandle]) -> Vec<&str> {
+        handles
+            .iter()
+            .map(|handle| handle.vault_credential_id().unwrap_or("<not a deposit>"))
+            .collect()
+    }
+
+    /// No deposit is no lane: the provider is unconfigured here.
     ///
-    /// These providers report "no session cookie ..." from a point AFTER the jar
-    /// is resolved, so the phrase has to follow the lane. Saying "in browser"
-    /// about a deposited cookie sends an operator to re-check a browser session
-    /// that is not what failed -- and on Windows it names a lane that CANNOT
-    /// work, since App-Bound Encryption hands Chrome's cookie key only to
-    /// chrome.exe. The wrong word lands hardest on the platform the deposit lane
-    /// exists for.
-    ///
-    /// Pinned because a revert here is otherwise silent: nothing parses this
-    /// message, so no other test in the suite would notice it going wrong.
+    /// Not an implicit handle that fetches and fails. That would publish a
+    /// degraded "credential absent" entry on every host for nine providers
+    /// nobody set up, and there is no other cookie source it could ever read.
+    /// The vault has answered with another provider's row, so the empty result
+    /// comes from the rule, not from an empty snapshot.
     #[test]
-    fn the_absence_message_names_the_lane_that_answered() {
-        assert_eq!(source_phrase("vault"), "in the deposited cookie");
-        assert_eq!(source_phrase(SOURCE_LABEL), "in browser");
-    }
-
-    /// The shared lane publishes the cohort's cookie label on the local branch.
-    ///
-    /// Load-bearing because the per-provider source-walk in `tests.rs` now
-    /// accepts delegation to this type INSTEAD of a literal in the provider
-    /// file. That widening is only sound if the delegate actually produces the
-    /// label, so this is the other half of that check -- without it, a cohort
-    /// that all delegate would satisfy the walk while publishing nothing.
-    #[tokio::test]
-    async fn the_local_branch_publishes_the_cookie_label() {
-        let vault = CookieVault::new(None, Arc::new(VaultHandleLoader::new(None)), "cookie:test");
-        let (cookie, source) = vault
-            .cookie_for(&CredentialHandle::implicit(), || async {
-                Ok("session=abc".to_string())
-            })
-            .await
-            .expect("the local branch answers");
-        assert_eq!(cookie, "session=abc");
-        assert_eq!(
-            source, SOURCE_LABEL,
-            "a cookie fetched from the live browser store must publish the cookie label"
-        );
-    }
-
-    /// A local failure with no bare deposit reports the LOCAL error.
-    ///
-    /// Not a credential-absent verdict invented here: the live-store failure
-    /// already carries the right class, and replacing it would trade a specific
-    /// diagnosis for a vaguer one at the moment a reader most needs the specific
-    /// one.
-    #[tokio::test]
-    async fn a_local_failure_without_a_deposit_reports_the_local_error() {
-        let vault = CookieVault::new(None, Arc::new(VaultHandleLoader::new(None)), "cookie:test");
-        let error = vault
-            .cookie_for(&CredentialHandle::implicit(), || async {
-                Err(FetchError::Unauthorized("signed out".to_string()))
-            })
-            .await
-            .expect_err("no lane can answer");
+    fn no_deposit_enumerates_no_handle() {
+        let vault = vault_with(&[("cookie:ampcode.com", "cookie")]);
+        let handles = vault.handles().expect("an answered vault enumerates");
         assert!(
-            matches!(error, FetchError::Unauthorized(ref message) if message == "signed out"),
-            "the live-store failure must survive, got {error:?}"
+            handles.is_empty(),
+            "no deposit must mean no lane, got {handles:?}"
         );
+    }
+
+    /// No credential source is no lane either, for the same reason.
+    #[test]
+    fn no_credential_source_enumerates_no_handle() {
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[(FAMILY, "cookie")]);
+        let vault = CookieVault::new(None, loader, FAMILY);
+        let handles = vault.handles().expect("enumeration needs no I/O");
+        assert!(
+            handles.is_empty(),
+            "nothing can fetch a deposit without a source, got {handles:?}"
+        );
+    }
+
+    /// A bare deposit alone is served, as one vault handle.
+    #[test]
+    fn a_bare_deposit_alone_is_one_vault_handle() {
+        let vault = vault_with(&[(FAMILY, "cookie")]);
+        let handles = vault.handles().expect("an answered vault enumerates");
+        assert_eq!(ids(&handles), vec![FAMILY]);
+        assert!(handles[0].is_vault());
+    }
+
+    /// An account-suffixed deposit outranks a bare one, which is not enumerated.
+    ///
+    /// Both as separate slots would fetch twice and collapse to one row by a
+    /// tie-break nobody can see; the operator named an account, so that is the
+    /// one that answers.
+    #[test]
+    fn an_account_suffixed_deposit_outranks_a_bare_one() {
+        let bare = CredentialHandle::scoped(FAMILY, "cookie");
+        let named = CredentialHandle::scoped("cookie:ollama.com:ufuk", "cookie");
+        // Both orders, so the rule cannot pass by taking whichever came first.
+        for deposits in [
+            vec![bare.clone(), named.clone()],
+            vec![named.clone(), bare.clone()],
+        ] {
+            let lanes = deposit_lanes(deposits, FAMILY);
+            assert_eq!(ids(&lanes), vec!["cookie:ollama.com:ufuk"]);
+        }
+        // Another domain's deposit is never a lane here.
+        let other = CredentialHandle::scoped("cookie:ollama.community", "cookie");
+        assert!(deposit_lanes(vec![other], FAMILY).is_empty());
+    }
+
+    /// A vault that has not answered yet is an error, not "no deposit".
+    ///
+    /// Reading it as empty would unconfigure every cookie provider on a cold
+    /// start and forget the accounts the next answer would have served.
+    #[test]
+    fn an_unanswered_vault_is_an_enumeration_error() {
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.await_first_answer();
+        let vault = CookieVault::new(Some(Arc::new(EchoSource)), loader, FAMILY);
+        assert!(vault.handles().is_err());
+    }
+
+    /// The jar comes from the deposit the handle names, labelled `vault`.
+    #[tokio::test]
+    async fn the_jar_is_the_deposit_and_publishes_the_vault_label() {
+        let vault = vault_with(&[("cookie:ollama.com:ufuk", "cookie")]);
+        let handle = vault.handles().unwrap().remove(0);
+        let (jar, source) = vault.jar_for(&handle).await.expect("the deposit answers");
+        assert_eq!(jar.header(), "session=cookie:ollama.com:ufuk");
+        assert_eq!(source, "vault");
+        let (header, source) = vault
+            .cookie_for(&handle)
+            .await
+            .expect("the deposit answers");
+        assert_eq!(header, "session=cookie:ollama.com:ufuk");
+        assert_eq!(source, "vault");
+    }
+
+    /// A handle that is not a deposit reads nothing and reports absence.
+    #[tokio::test]
+    async fn a_non_deposit_handle_reads_nothing() {
+        let vault = vault_with(&[(FAMILY, "cookie")]);
+        let error = vault
+            .cookie_for(&CredentialHandle::implicit())
+            .await
+            .expect_err("only a deposit carries a cookie");
+        assert!(matches!(error, FetchError::NoSession(_)), "{error:?}");
     }
 }

@@ -532,8 +532,8 @@ So the counter is honest about what it counts and misleading about what it
 implies: **a provider with a graceful fallback accrues episodes faster than one
 with a single brittle lane**, and the metric ranks the better-designed provider
 worse. Before treating a concentration as a provider problem, check whether that
-provider has a lane whose absence is ordinary — a local process probe, an editor,
-a browser session. Read this one against `errorClass` on the entry: episodes
+provider has a lane whose absence is ordinary — a local process probe, an
+editor. Read this one against `errorClass` on the entry: episodes
 paired with a healthy served entry are a fallback working, and only episodes
 paired with a degraded entry are a lane in trouble.
 
@@ -585,7 +585,7 @@ one increment here. Without that fold the counter doubled on every reset of such
 an account, which a reader could not distinguish from a busier account.
 
 The fold needs an identity to key on, so it **never applies to lanes that resolve
-none** (the browser-cookie providers). Two unidentified slots cannot be shown to
+none** (the cookie providers). Two unidentified slots cannot be shown to
 be the same account, and collapsing two genuinely different ones would hide a
 real reset — the expensive direction. Those records stay separate, as does any
 second decrease more than 60 seconds after the first.
@@ -627,14 +627,14 @@ seen transient failure at all", never as a population count: it is an event
 tally and is deliberately excluded from the conservation identity.
 
 A provider's `account` does not depend on which credential lane fetched the
-usage. `cursor` has two — a browser cookie and Cursor.app's local token store —
-and only the second carries an identity. Signing into the vendor's website used
-to make the browser lane win and the account silently lose its name, which read
-downstream as an account disappearing and an unlabelled row appearing, and
-dropped the provider out of `completeProviders`.
+usage. `cursor` has two — a deposited session cookie and Cursor.app's local token
+store — and only the second carries an identity. A cookie session used to win
+and the account silently lose its name, which read downstream as an account
+disappearing and an unlabelled row appearing, and dropped the provider out of
+`completeProviders`.
 
 Identity is now resolved independently of the fetching lane, **and only on
-proof**: the browser session cookie and the local store both name a user id, and
+proof**: the deposited session cookie and the local store both name a user id, and
 the email is attached only when those ids are equal. Different ids mean two
 different accounts signed in, and an unlabelled entry is the honest answer — a
 wrong name is worse than no name, because a consumer cannot tell them apart.
@@ -810,10 +810,10 @@ is EASIER to commit than the cross-account one, because the account labels diffe
 legitimately and that difference is what a genuine change would also look like.
 
 The tell is available and is not in the changed rows. A host's credential surface
-is structural: whether a Chrome cookie store exists, which environment variables
-are set, which vault handles are configured. Four providers serving in one array
-and reporting `credential_absent` in the other — including an entire nine-provider
-cookie cohort — is not something that can change in ninety minutes. Before
+is structural: which environment variables are set, which vault handles are
+configured. Four providers serving in one array and absent from the other —
+including an entire nine-provider cookie cohort with no deposits on one host —
+is not something that can change in ninety minutes. Before
 reading two arrays as one series, check the rows that DID NOT change; they carry
 the machine's fingerprint, and the rows under study do not.
 
@@ -1954,7 +1954,7 @@ four events occurred.
 
 `account` is the same key `usage.get` entries carry, so drops join to entries
 without a second mapping. It is **absent** where the credential resolves no
-identity — browser-cookie lanes, a token with no account claim — and that absence
+identity — cookie lanes, a token with no account claim — and that absence
 is load-bearing rather than incidental: two identity-less credentials for one
 provider genuinely cannot be told apart here, so records that lack it cannot be
 collapsed, and treating them as one event would under-count in the same way
@@ -2118,13 +2118,23 @@ The values in use are:
 | `vault` | served by the credential vault | re-authenticate that vault record |
 | `oauth` | an OAuth token or session found on this machine | log in with the tool that owns it |
 | `api` | an API key from the environment or a config file | supply or replace the key |
-| `cookie` | a browser session cookie read from the local Chrome store | log into the provider's site in Chrome, on this machine |
 
-Treat the set as open: a new lane adds a value without warning. The distinction
-worth acting on is that `cookie` providers cannot work headless and break when a
-**browser session** expires, which is a different remedy from every other value
-here — so a fleet that runs without a desktop browser should expect them absent
-rather than treat it as a fault.
+Treat the set as open: a new lane adds a value without warning.
+
+**Cookie providers publish `vault`.** The nine providers that read quota from a
+logged-in web page (amp, cursor, factory, mimo, ollama, opencode, opencodego,
+qoder, qwen-cloud) take their session cookie only from a vault deposit,
+`cookie:<domain>` or `cookie:<domain>:<account>`, captured by Cerebellum. This
+module reads no browser store, so it needs no Full Disk Access or Keychain
+access. A host with no deposit for such a provider has no lane for it: the
+provider is absent and counted as unconfigured, not published as a
+`credential_absent` entry. When a deposited session expires the entry degrades
+with `credential_rejected`, and the fix is to capture the login again and
+re-deposit it. Cursor alone can also serve from Cursor.app's own sign-in on this
+machine when it has no deposit, and publishes `oauth` then.
+
+Earlier releases read these cookies from the local Chrome store and published
+`cookie`. A consumer that matched on that value should treat it as retired.
 
 **Four health metrics describe CONSUMPTION rather than production.**
 `usageRequestsServed` and `usageRequestsRefused` count route requests this process
@@ -2231,18 +2241,18 @@ up. If you want "is this provider usable right now", read `fresh + stale`
 
 **The remaining metrics are diagnostics, not a second capacity axis.**
 
-`cookieCohortTotal` counts the providers whose credential is a browser cookie —
-the ones coupled to a desktop login rather than a stored token.
-`cookieLoginsStale` names the subset whose login **stopped working**: a cookie
-was found and the upstream rejected it, or the page it scrapes no longer parses.
+`cookieCohortTotal` counts the providers whose credential is a web session
+cookie — the ones that need a captured login deposited in the vault rather than
+a stored token. `cookieLoginsStale` names the subset whose login **stopped
+working**: a deposited cookie was sent and the upstream rejected it, or the page
+it scrapes no longer parses.
 
 Read them together as "N of C logins stale". Do **not** read
 `cookieLoginsStale` as the cookie providers that are degraded — it is a
-deliberately narrower set, excluding every service this host never logged into,
-because not being logged into something you do not use is the correct state and
-counting it would pin the number at the cohort size on every machine. The two
-diverge sharply in practice: this host currently has eight degraded cookie
-providers and two stale logins.
+deliberately narrower set. A cookie provider with no deposit publishes no entry
+at all (it is unconfigured on that host), because not being logged into
+something you do not use is the correct state and counting it would pin the
+number at the cohort size on every machine.
 
 `refresherStalled` is the boolean behind a `degraded` module status: the
 refresher's heartbeat is older than its stall horizon. Windows already fetched

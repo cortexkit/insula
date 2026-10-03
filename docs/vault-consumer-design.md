@@ -318,11 +318,12 @@ lines; then kill -9 ck-credentials and verify fail-closed labels.
 
 ## Depositing a session cookie: which URL to capture against
 
-A cookie-backed provider can read its session from the vault instead of the
-user's browser. The deposit is `cookie:<domain>:<account>`. The account suffix
-makes the provider read the vault only and never touch Chrome, and one domain
-takes ONE deposit: cookies carry no identity, so a second deposit for the same
-domain is refused at load time. Re-capturing replaces the same id
+A cookie-backed provider reads its session from the vault and nowhere else:
+insula reads no browser store. Cerebellum captures the login in a throwaway
+browser and deposits it as `cookie:<domain>:<account>` (or a bare
+`cookie:<domain>`). With no deposit the provider is unconfigured on that host.
+One domain takes ONE deposit: cookies carry no identity, so a second deposit
+for the same domain is refused at load time. Re-capturing replaces the same id
 (`ck auth put --replace`) rather than adding a new suffix.
 
 The captured value must be a REQUEST `Cookie:` header (`name=value; ...`) for
@@ -342,6 +343,11 @@ until this table follows.
 | `cookie:xiaomimimo.com:<account>` | mimo | `https://platform.xiaomimimo.com/api/v1/tokenPlan/usage` |
 | `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
 | `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
+| `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
+
+The `kimi.com` deposit is not a lane: kimi-for-coding reads its usage with the
+coding API key and uses the web session's `kimi-auth` cookie only to fetch two
+optional subscription extras. Without the deposit those extras are skipped.
 
 The login page can be any page on the site where the user signs in; it does not
 have to be the fetch URL, and for factory it is not (sign-in is on

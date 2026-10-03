@@ -682,6 +682,117 @@ fn production_stderr_emissions_do_not_hard_code_ck_tags() {
     );
 }
 
+/// The marks a browser-store reader leaves in source, and what each one is.
+///
+/// Insula reads cookies only from vault deposits; Cerebellum is the one module
+/// that reads browsers. Each string here is something a reader of Chrome's own
+/// store cannot avoid naming: the Keychain item holding the cookie key and the
+/// `security` verb that fetches it, the file holding the Windows/Linux key, and
+/// the cookie database's path.
+const BROWSER_STORE_MARKS: &[(&str, &str)] = &[
+    (
+        "Chrome Safe Storage",
+        "the Keychain item holding Chrome's cookie key",
+    ),
+    (
+        "find-generic-password",
+        "the `security` verb that reads a Keychain item",
+    ),
+    (
+        "Local State",
+        "Chrome's file holding its cookie encryption key",
+    ),
+    (
+        "/Cookies",
+        "Chrome's cookie database path (`Default/Cookies`)",
+    ),
+    ("\\Cookies", "Chrome's cookie database path on Windows"),
+];
+
+/// The browser-store marks found in one production body, by name.
+fn browser_store_marks(production: &str) -> Vec<&'static str> {
+    BROWSER_STORE_MARKS
+        .iter()
+        .filter(|(mark, _)| production.contains(mark))
+        .map(|(mark, _)| *mark)
+        .collect()
+}
+
+/// Every `.rs` file under `dir`, recursively, so a module in a subdirectory
+/// cannot sit outside the walk.
+fn rust_sources_under(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("the source directory must be readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.is_dir() {
+            rust_sources_under(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            found.push(path);
+        }
+    }
+}
+
+/// No production code in either crate reads a browser's cookie store.
+///
+/// The Chrome reader was removed because a deposit captured by Cerebellum is the
+/// only cookie source: reading Chrome needed Full Disk Access, Keychain prompts,
+/// and per-platform decryption, and could not work at all where App-Bound
+/// Encryption seals the store. A reader added back would compile, pass every
+/// provider test (they use deposits), and quietly reintroduce all of that, so
+/// this fence looks for the names such a reader cannot avoid.
+///
+/// Comments count: a comment describing a browser-store read as current
+/// behaviour is the same mistake in prose. This file is skipped because it
+/// holds the marks themselves, for the control below.
+#[test]
+fn no_production_source_reads_a_browser_cookie_store() {
+    // The control first: each mark planted in a snippet must be flagged, so a
+    // matcher that can never match cannot pass this fence.
+    for (mark, what) in BROWSER_STORE_MARKS {
+        let planted = format!("fn reader() {{\n    let _ = \"{mark}\";\n}}\n");
+        assert_eq!(
+            browser_store_marks(&production_body(&planted)),
+            vec![*mark],
+            "the fence must flag {what}"
+        );
+    }
+    assert!(browser_store_marks(&production_body("fn clean() {}\n")).is_empty());
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let module = root
+        .join("../quota-module/src")
+        .canonicalize()
+        .expect("the sibling module crate must be present in this workspace");
+    let mut files = Vec::new();
+    rust_sources_under(&root.join("src"), &mut files);
+    let core_files = files.len();
+    rust_sources_under(&module, &mut files);
+
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+    for path in &files {
+        if path.file_name().is_some_and(|name| name == "tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).expect("a readable source file");
+        examined += 1;
+        for mark in browser_store_marks(&production_body(&source)) {
+            offenders.push(format!("{}: {mark}", path.display()));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "production code must not read a browser cookie store; cookies come from \
+         vault deposits only: {offenders:#?}"
+    );
+    // Both crates, so a walk that lost one fails here instead of passing over half.
+    assert!(
+        core_files > 40 && files.len() >= core_files + 3 && examined > 55,
+        "expected to examine both crates' production modules; examined {examined} \
+         ({core_files} in quota-core)"
+    );
+}
+
 /// Every read of the launch nonce in production source, as `path:line: text`,
 /// with the files examined.
 ///
@@ -1167,7 +1278,7 @@ async fn only_a_failed_cookie_counts_as_a_stale_login() {
     let registry = Registry::new(vec![
         Box::new(CookieProvider {
             name: "not-logged-in",
-            error: || FetchError::NoSession("no session cookie in browser".into()),
+            error: || FetchError::NoSession("no session cookie in the deposited cookie".into()),
         }),
         Box::new(CookieProvider {
             name: "login-expired",
@@ -1494,27 +1605,16 @@ fn every_api_provider_key_names_a_registered_provider() {
 
 /// Every cookie-cohort provider has a vault lane it can be deposited into.
 ///
-/// THE FAILURE THIS PREVENTS IS SILENT ON THE ONLY PLATFORM THAT CAN SEE IT.
-/// A cookie provider with no `cookie:` entry in `CREDENTIAL_FAMILIES` still works
-/// perfectly here: it reads the live Chrome store, publishes real windows, emits
-/// the right source label, and passes every other test in this file. It simply
-/// cannot be reached by a deposit -- `cookie_family_for` returns None, so no
-/// pasted header can ever route to it.
-///
-/// Which means it is dark on Windows and on any headless host, permanently, with
-/// no error anywhere. App-Bound Encryption refuses the live store to every
-/// non-Chrome process by design, so the deposit lane is not a fallback there, it
-/// is the ONLY lane. A macOS-only test matrix cannot observe the difference,
-/// because macOS is exactly where the local path still works.
-///
-/// WRITTEN AFTER NOTICING THE SHAPE ELSEWHERE. I warned another seat that if both
-/// capture paths get built the good one hides the broken one, and a team testing
-/// on Macs would ship a feature that is complete for them and degraded for the
-/// users it was built for. That warning already described this test's absence.
+/// THE FAILURE THIS PREVENTS IS SILENT. A deposit is the only cookie source, so a
+/// cookie provider with no `cookie:` entry in `CREDENTIAL_FAMILIES` can never be
+/// reached: `cookie_family_for` returns None, no captured header can route to it,
+/// and the provider is unconfigured on every host with no error anywhere. Every
+/// other test in this file still passes, because each one constructs the
+/// provider's lane directly rather than through the routing table.
 ///
 /// Derived from `is_cookie_based` rather than from a list, so adding the tenth
 /// cookie provider fails here until it is routable, instead of failing for an
-/// operator on a platform none of us develops on.
+/// operator who deposited a login that nothing reads.
 #[test]
 fn every_cookie_provider_can_be_reached_by_a_deposit() {
     let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
@@ -1554,11 +1654,10 @@ fn every_cookie_provider_can_be_reached_by_a_deposit() {
 /// and the table is only half of the lane. A provider's vault lane is also gated
 /// on the credential source it was constructed with, and a provider built
 /// without one has a family entry, a loader mapping and a granted deposit, and
-/// still never enumerates that deposit. Ollama shipped that way: the default
-/// registry built it with `new()`, its `CookieVault` returned the Chrome lane
-/// before consulting the loader, and a granted `cookie:ollama.com:<account>`
-/// deposit was ignored -- served from Chrome where Chrome was readable, and dark
-/// where it was not. The table test passed throughout.
+/// still never enumerates that deposit. Ollama once shipped that way: the
+/// default registry built it without a credential source, and a granted
+/// `cookie:ollama.com:<account>` deposit was ignored while the table test
+/// passed throughout.
 ///
 /// So this builds the real default registry with a source wired and asks each
 /// provider, through `handles()`, whether a deposit in its family reaches it.
@@ -1701,21 +1800,6 @@ fn every_provider_with_a_vault_family_enumerates_a_deposit_in_it() {
     );
 }
 
-/// Every cookie-cohort provider publishes the cookie source label.
-///
-/// `source` is observability only, but its job is to tell a reader how a figure
-/// was obtained so they know what to do when it stops arriving. These providers
-/// authenticate with a browser session cookie, which is fixed only by logging
-/// into the site in Chrome on this machine -- a different remedy from every
-/// other provider here, and the reason this cohort cannot work headless.
-///
-/// The label is the only field that separates them once a fetch SUCCEEDS. A
-/// failure names the cookie in its error text, but a healthy entry carries no
-/// other evidence of how it was authenticated.
-///
-/// Checked against `is_cookie_based`, which the registry already uses to size
-/// its stale-login metric, so the two cannot disagree about who is in the
-/// cohort. A provider added to one and not the other fails here.
 /// Every shipped provider must enumerate the same handles twice in a row.
 ///
 /// The scheduler calls `handles()` on all providers at the start of every turn
@@ -1780,8 +1864,18 @@ fn every_provider_enumerates_the_same_handles_twice() {
     );
 }
 
+/// Every cookie-cohort provider publishes the shared deposit source label.
+///
+/// `source` is observability only, but its job is to tell a reader how a figure
+/// was obtained so they know what to do when it stops arriving. These providers
+/// authenticate with a deposited web session cookie, which is fixed by capturing
+/// the login again and re-depositing it -- the remedy for any vault credential.
+///
+/// Checked against `is_cookie_based`, which the registry already uses to size
+/// its stale-login metric, so the two cannot disagree about who is in the
+/// cohort. A provider added to one and not the other fails here.
 #[test]
-fn every_cookie_provider_publishes_the_cookie_source_label() {
+fn every_cookie_provider_publishes_the_vault_source_label() {
     // The cohort by behaviour, not by a list written here: taken from the same
     // predicate the health metric counts.
     let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
@@ -1831,32 +1925,19 @@ fn every_cookie_provider_publishes_the_cookie_source_label() {
         let runtime = runtime.as_str();
         // The healthy() constructor is where the label reaches the wire.
         for line in runtime.lines().filter(|line| line.contains("healthy(")) {
-            if line.contains("SOURCE_LABEL") {
-                continue;
-            }
             // The call may span lines; only a literal on the same line is
             // decidable here, and that is the shape being guarded against.
             if line.contains('"') {
                 wrong.push(format!("{provider}: {}", line.trim()));
             }
         }
-        // A provider satisfies this either by naming the label itself, or by
-        // delegating its credential lane to CookieVault, which returns the label
-        // for the local branch. Delegation is not a loophole: the shared lane is
-        // the ONLY other producer of a cookie provider's source string, and it
-        // is asserted separately in cookie_vault::tests.
-        //
-        // Widened when the cohort moved onto the shared lane. Before that, every
-        // provider carried its own copy and the literal was the only mechanism;
-        // leaving the check as-written would have failed a provider that now
-        // publishes the label through one reader instead of nine.
-        let names_label = runtime.contains("SOURCE_LABEL");
-        let delegates = runtime.contains("CookieVault");
-        if !names_label && !delegates {
+        // A cookie provider's source string comes from the shared CookieVault
+        // lane, which is the only place a deposit is read and returns the label
+        // with it; the label itself is asserted in cookie_vault::tests.
+        if !runtime.contains("CookieVault") {
             wrong.push(format!(
-                "{provider}: publishes no SOURCE_LABEL and delegates to no shared \
-                 cookie lane, so its healthy entries are indistinguishable from a \
-                 key-based provider's"
+                "{provider}: delegates to no shared cookie lane, so nothing says \
+                 where its source label comes from"
             ));
         }
     }
@@ -1865,9 +1946,9 @@ fn every_cookie_provider_publishes_the_cookie_source_label() {
         "cookie providers must publish the shared cookie label: {wrong:#?}"
     );
 
-    // Not vacuous: the constant must be the cookie label, so this cannot pass by
-    // every provider agreeing on the wrong string.
-    assert_eq!(crate::browser_cookies::SOURCE_LABEL, "cookie");
+    // Not vacuous: a deposit is the only cookie source, so the label is `vault`,
+    // and this cannot pass by every provider agreeing on the wrong string.
+    assert_eq!(crate::cookie_vault::SOURCE, "vault");
 }
 
 struct LabelProvider {
@@ -10704,6 +10785,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("opencodego", include_str!("opencodego.rs")),
         ("qoder", include_str!("qoder.rs")),
         ("qwen-cloud", include_str!("qwen_cloud.rs")),
+        ("kimi-for-coding", include_str!("kimi_for_coding.rs")),
     ]
     .into_iter()
     .collect();
@@ -10750,14 +10832,21 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         }
     }
 
+    // Lane families and enrichment families alike: a capture tool needs the URL
+    // for both, since both are deposits insula reads.
     let families: std::collections::BTreeSet<(String, String)> =
         crate::vault_handles::CREDENTIAL_FAMILIES
             .iter()
+            .chain(crate::vault_handles::ENRICHMENT_FAMILIES)
             .filter(|(prefix, _)| prefix.starts_with("cookie:"))
             .map(|(prefix, provider)| (prefix.to_string(), provider.to_string()))
             .collect();
     assert!(
-        families.len() >= 9,
+        families.contains(&("cookie:kimi.com".to_string(), "kimi-for-coding".to_string())),
+        "the kimi.com enrichment deposit must be in the capture table's population"
+    );
+    assert!(
+        families.len() >= 10,
         "expected the nine cookie-backed provider routes; found {} -- the filter broke",
         families.len()
     );

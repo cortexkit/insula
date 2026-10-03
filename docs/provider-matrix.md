@@ -14,6 +14,14 @@
 > What stays useful is the per-provider research: endpoints, auth archetypes,
 > response shapes, and the reasoning behind each deferral. Read it as a study of
 > upstream, and check the registry for what we actually serve.
+>
+> **Cookie providers read vault deposits only.** amp, cursor, factory, mimo,
+> ollama, opencode, opencodego, qoder and qwen-cloud take their web session
+> from a `cookie:<domain>[:<account>]` deposit that Cerebellum captures in a
+> throwaway browser; insula reads no browser store, so rows below that say
+> "browser cookie" describe the credential, not where this module gets it. With
+> no deposit such a provider is unconfigured on the host. Cursor additionally
+> reads the Cursor app's own `state.vscdb` sign-in when it has no deposit.
 
 Reverse-engineered from [CodexBar](https://github.com/steipete/CodexBar) source
 (`Sources/CodexBarCore/Providers/*`),
@@ -225,7 +233,7 @@ Constants first, per the procedure: all four present at v0.50.1.
 presentation — accent colours, branding, descriptors. The rest:
 
 - `ollama` fetcher: parses a pasted `curl`/`Cookie:` capture as an override. A
-  CodexBar UI affordance; this module's cookie comes from the browser store and
+  CodexBar UI affordance; this module's cookie comes from a vault deposit and
   never from a pasted string.
 - `CodexTokenRefresher`: threads two existing fields through a struct. No parse
   or wire change.
@@ -843,8 +851,9 @@ so every fetch made a request the console rejected, and the failure was swallowe
 as best-effort. The monthly and code-7d extras had therefore never reached the
 wire. Probing the console with a browser cookie returned exactly the shape the
 parser already expected, so nothing about the parsing was wrong; only the
-credential was. The enrichment is now skipped when no browser session exists
-rather than attempted with the wrong one.
+credential was. The enrichment is now skipped when no web session exists
+rather than attempted with the wrong one; the session comes from a
+`cookie:kimi.com` vault deposit, read for the extras only and never as a lane.
 
 The general lesson is worth more than the fix: **a best-effort call that has
 never once succeeded is indistinguishable from one that succeeds and finds
@@ -1149,7 +1158,9 @@ Connect behind browser local-storage (desktop-only) — so port the SQLite read,
 the protobuf web fetch.
 
 **3B — DESKTOP-ONLY (browser-cookie scrape / short-lived JWT, NO native headless
-origin) → DEFER (same antigravity wall, report-don't-force):**
+origin) → DEFER (same antigravity wall, report-don't-force):** (since built: all
+seven now read a vault-deposited session cookie, which is what made them
+headless.)
 | provider | cb_id | why deferred |
 |---|---|---|
 | cursor | cursor | browser cookie (cursor.com), short-lived JWT, NO CLI file. Real window `billingCycleEnd`. |

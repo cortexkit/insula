@@ -1308,7 +1308,7 @@ fn manifest(
         // this module had to state a storage binding whether or not it had storage.
         // It declared `StorageKind::Sqlite` with `scope: Project`. That was FALSE:
         // insula owns exactly one file, `redemptions.json`, written by temp-file
-        // and rename, and reads Chrome's SQLite cookie store READ-ONLY as somebody
+        // and rename, and reads Cursor's SQLite app store READ-ONLY as somebody
         // else's database. There has never been a SQLite database of ours to bind.
         // `StorageKind` has one variant, so under the old signature there was no
         // honest value available. Now that the field is optional, ABSENT is the
@@ -1728,7 +1728,7 @@ mod tests {
     /// argument about content. Restored at 1452f38.
     ///
     /// The storage binding is the opposite: this module owns one JSON file written
-    /// by temp-file-and-rename and reads Chrome's SQLite store READ-ONLY, so there
+    /// by temp-file-and-rename and reads Cursor's SQLite app store READ-ONLY, so there
     /// is no database of ours to bind. `StorageKind` has a single variant, so the
     /// old required field forced a false claim for months.
     ///
@@ -1751,7 +1751,7 @@ mod tests {
 
         assert!(
             m.bindings.is_none(),
-            "insula owns no SQLite database -- one JSON journal, and Chrome's cookie \
+            "insula owns no SQLite database -- one JSON journal, and Cursor's app \
              store read-only -- so any storage binding here is a fabricated claim"
         );
     }

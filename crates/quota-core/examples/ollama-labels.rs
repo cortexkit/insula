@@ -22,10 +22,13 @@
 //!
 //! Reports which strings are PRESENT. Never prints page content, since the
 //! settings page carries account identifiers.
+//!
+//! Run with a signed-in ollama.com `Cookie:` header in a file:
+//!     cargo run -p quota-core --example ollama-labels -- --cookie-file <path>
 
-use quota_core::browser_cookies;
+#[path = "support/cookie_file.rs"]
+mod cookie_file;
 
-const DOMAIN: &str = "ollama.com";
 const SETTINGS_URL: &str = "https://ollama.com/settings";
 
 /// Every label either parser knows about, ours first.
@@ -48,18 +51,7 @@ const PLAN_HEADINGS: &[&str] = &["Cloud Usage", "Included usage"];
 
 #[tokio::main]
 async fn main() {
-    let jar = match browser_cookies::chrome_cookies_for(DOMAIN) {
-        Ok(jar) => jar,
-        Err(error) => {
-            eprintln!("  cannot check: no {DOMAIN} cookie on this host ({error})");
-            eprintln!("  a missing cookie is not evidence about the page");
-            std::process::exit(2);
-        }
-    };
-    if jar.cookies.is_empty() {
-        eprintln!("  cannot check: the {DOMAIN} jar is empty");
-        std::process::exit(2);
-    }
+    let cookie = cookie_file::cookie_header_from_args("ollama-labels");
 
     // Requests directly rather than through this crate's `JsonRequest`, whose
     // send helpers are crate-private. Deliberately NOT widening that privacy for
@@ -73,7 +65,7 @@ async fn main() {
     let final_url;
     let html = match client
         .get(SETTINGS_URL)
-        .header("Cookie", jar.header())
+        .header("Cookie", cookie)
         .send()
         .await
     {

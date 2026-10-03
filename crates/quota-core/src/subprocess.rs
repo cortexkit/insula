@@ -1,6 +1,5 @@
 //! Bounded subprocesses for the children this crate spawns to look at the
-//! machine: `ps` and `lsof` for the Antigravity local probe, and `security` for
-//! Chrome's storage key.
+//! machine: `ps` and `lsof` for the Antigravity local probe.
 //!
 //! Two guarantees, and each one exists because its absence was observed:
 //!
@@ -11,8 +10,7 @@
 //!    deadline its future was dropped, but the pool thread stayed parked in
 //!    `wait` on the stuck child, so every refresh tick leaked one blocking thread
 //!    and one child. Tokio caps that pool, and once it fills, every other
-//!    `spawn_blocking` user in the process (the cookie-store reads and the
-//!    Keychain read) queues behind it. Here the child is awaited on the async
+//!    `spawn_blocking` user in the process queues behind it. Here the child is awaited on the async
 //!    runtime instead, so no pool thread waits on it, and the caller walks away
 //!    at its timeout while tokio reaps the child whenever it finally exits.
 //!
@@ -32,8 +30,8 @@
 //! insula thread uninterruptibly on the same stall. A child is something we can
 //! walk away from; a thread of our own is not.
 
-// The only production callers are macOS paths (the Antigravity probe and the
-// Keychain read). On other platforms this module is exercised by its tests alone,
+// The only production caller is a macOS path (the Antigravity probe). On other
+// platforms this module is exercised by its tests alone,
 // and the build denies warnings.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -43,15 +41,6 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::LOG_TAG;
-
-/// Extra time a synchronous caller waits beyond the command's own timeout before
-/// concluding the runtime never ran the command at all.
-///
-/// Only reachable when the caller is blocking the very thread that would drive
-/// the command, for example synchronous code on a single-threaded runtime. The
-/// async path enforces the real timeout; this is a backstop so such a caller
-/// still returns.
-const BLOCKING_GRACE: Duration = Duration::from_secs(1);
 
 /// The single-flight slot for one kind of command.
 ///
@@ -281,34 +270,6 @@ impl BoundedCommand {
             }),
         }
     }
-
-    /// [`Self::output`] for synchronous code that runs inside a tokio runtime,
-    /// such as a `spawn_blocking` closure.
-    ///
-    /// The command is still awaited on the runtime, so this thread is held only
-    /// until the timeout, never for as long as a stuck child lives. Outside any
-    /// runtime there is nothing to supervise the child after a timeout, and
-    /// walking away from it there would quietly reopen the gate, so that case is
-    /// refused rather than run.
-    pub(crate) fn output_blocking(&self) -> Result<Output, SubprocessError> {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return Err(SubprocessError::Spawn {
-                command: self.gate.label,
-                detail: "no async runtime is available to supervise it".to_string(),
-            });
-        };
-        let (answer, answer_received) = std::sync::mpsc::sync_channel(1);
-        let command = self.clone();
-        runtime.spawn(async move {
-            let _ = answer.send(command.output().await);
-        });
-        answer_received
-            .recv_timeout(self.timeout + BLOCKING_GRACE)
-            .unwrap_or(Err(SubprocessError::Timeout {
-                command: self.gate.label,
-                after: self.timeout,
-            }))
-    }
 }
 
 #[cfg(test)]
@@ -394,30 +355,6 @@ mod tests {
             Err(SubprocessError::Spawn { .. })
         ));
         assert!(!GATE.is_occupied());
-        assert_eq!(GATE.spawns(), 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_blocking_form_times_out_from_a_blocking_thread() {
-        static GATE: Gate = Gate::new("/bin/sleep 2 blocking");
-        let sleep = BoundedCommand::new(&GATE, "/bin/sleep", ["2"], Duration::from_millis(200));
-        let began = Instant::now();
-        let result = tokio::task::spawn_blocking(move || sleep.output_blocking())
-            .await
-            .expect("the blocking task completes");
-        assert!(matches!(result, Err(SubprocessError::Timeout { .. })));
-        assert!(began.elapsed() < Duration::from_millis(1500));
-    }
-
-    #[test]
-    fn the_blocking_form_refuses_without_a_runtime() {
-        static GATE: Gate = Gate::new("no runtime");
-        let echo = BoundedCommand::new(&GATE, "/bin/echo", ["x"], Duration::from_secs(5));
-        assert!(matches!(
-            echo.output_blocking(),
-            Err(SubprocessError::Spawn { .. })
-        ));
         assert_eq!(GATE.spawns(), 0);
     }
 }

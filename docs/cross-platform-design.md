@@ -1,6 +1,15 @@
 # Cross-platform credential discovery — design
 
-Status: PARTLY SHIPPED. The Linux half is on master — profile discovery,
+**The browser-cookie reader this document designs has been REMOVED.** Insula
+no longer reads any browser store, Keychain item, Secret Service secret or DPAPI
+key: the nine cookie providers take their session only from a vault deposit
+(`cookie:<domain>[:<account>]`) that Cerebellum captures in a throwaway browser.
+Every section below about Chrome profiles, cookie encryption schemes, key
+sources, store locations and App-Bound Encryption is a historical record of why
+that reader was hard to make portable, not a description of the code. The
+non-cookie parts (config paths, JetBrains lookup) still apply.
+
+Status before that removal: PARTLY SHIPPED. The Linux half is on master — profile discovery,
 `v10` and `v11` decryption with their per-platform PBKDF2 rounds, sealed-scheme
 classification, and the both-layouts probe are all live and verified against a
 real Chrome on a Linux host. Windows is not: the daemon's config path resolution

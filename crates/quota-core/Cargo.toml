@@ -17,25 +17,11 @@ chrono = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
-aes = { workspace = true }
-cbc = { workspace = true }
-pbkdf2 = { workspace = true }
 hmac = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
-# `process` for the bounded `ps`/`lsof`/`security` children in subprocess.rs.
+# `process` for the bounded `ps`/`lsof` children in subprocess.rs.
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
-libc = "0.2"
 serde_ignored = "0.1"
-
-# Linux only: reading a `v11` cookie needs Chrome's storage password, which
-# lives in the Secret Service and is reachable only over D-Bus. Gated to Linux
-# so no other platform pays for the zbus stack, and pinned to the pure-Rust
-# crypto feature to avoid dragging in a C OpenSSL build.
-[target.'cfg(target_os = "linux")'.dependencies]
-secret-service = { version = "5.1", default-features = false, features = [
-    "rt-tokio-crypto-rust",
-] }

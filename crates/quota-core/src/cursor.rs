@@ -1,10 +1,16 @@
-//! Cursor usage — browser-cookie or local app-auth scrape of cursor.com/api/usage-summary.
+//! Cursor usage — session-cookie or local app-auth scrape of cursor.com/api/usage-summary.
 //!
-//! A browser session remains the first credential surface. When it has no recognized
-//! session cookie, Cursor's local app store supplies an access-token-backed cookie.
-//! Browser usage gets an account ID and optional cached email only when the user ID
-//! in its WorkOS session cookie matches the ID decoded from Cursor's local app-auth
-//! access token.
+//! Three lanes, in precedence order:
+//! - an `oauth:cursor` vault deposit (the Cursor app's access token);
+//! - a `cookie:cursor.com` vault deposit (a browser session captured by
+//!   Cerebellum). When the deposit holds no recognized session cookie, Cursor's
+//!   local app store supplies an access-token-backed cookie instead;
+//! - with neither deposit, Cursor's own app store on this machine
+//!   (`state.vscdb`, the editor's file, not a browser's).
+//!
+//! Deposited-session usage gets an account ID and optional cached email only when
+//! the user ID in its WorkOS session cookie matches the ID decoded from Cursor's
+//! local app-auth access token.
 
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +24,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar},
+    cookie_jar::CookieJar,
     http::{Header, JsonRequest},
     model::{AccountInfo, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -29,7 +35,9 @@ pub const PROVIDER_NAME: &str = "cursor";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:cursor.com";
 
-const DOMAIN: &str = "cursor.com";
+/// The `source` published when the credential is Cursor's own app sign-in on
+/// this machine: a session found locally, fixed by signing in to the Cursor app.
+const APP_STORE_SOURCE: &str = "oauth";
 const USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
@@ -90,8 +98,8 @@ struct CursorAppAuth {
     email: Option<String>,
 }
 
-/// Browser account identity retained only after the app-auth access-token ID matches
-/// the user ID in the browser's WorkOS session cookie.
+/// Session account identity retained only after the app-auth access-token ID matches
+/// the user ID in the deposited WorkOS session cookie.
 struct CursorBrowserIdentity {
     user_id: String,
     email: Option<String>,
@@ -190,10 +198,10 @@ fn workos_session_cookie_value(jar: &CookieJar) -> Option<&str> {
         .map(|cookie| cookie.value.as_str())
 }
 
-/// Attach the browser cookie's account ID and the app store's optional cached email
+/// Attach the deposited cookie's account ID and the app store's optional cached email
 /// only when the ID decoded from the access token matches the WorkOS cookie's ID.
 ///
-/// The app store only enriches browser usage; if it is missing, unreadable, or
+/// The app store only enriches deposited-session usage; if it is missing, unreadable, or
 /// belongs to another user, leave usage unlabelled instead of returning an error.
 ///
 /// RETURNING `None` HERE ALSO WITHHOLDS A PRUNING AUTHORISATION, AND THAT IS
@@ -204,21 +212,21 @@ fn workos_session_cookie_value(jar: &CookieJar) -> Option<&str> {
 /// provider's stored account set, and a provider is complete only when EVERY
 /// handle resolved an identity. Cursor is the one cookie provider that resolves
 /// one at all (the other eight are identity-less by contract and can never be
-/// complete), so cursor is the only one where a cookie read that comes back
-/// ambiguous -- a sealed store on Windows returns SUCCESS WITH NO COOKIES, which
-/// is indistinguishable from a signed-out browser -- is in reach of a destructive
+/// complete), so cursor is the only one where a cookie that comes back
+/// ambiguous -- a deposit captured with no session cookie in it, which is
+/// indistinguishable from a signed-out account -- is in reach of a destructive
 /// act.
 ///
 /// What prevents it is this `None`: no identity, so not complete, so no prune.
 /// But the refusal is for an unrelated reason. Nothing here knows it is standing
-/// between an unreadable cookie store and someone deleting a live account, and a
+/// between an ambiguous cookie and someone deleting a live account, and a
 /// change that made identity resolution succeed more often -- a fallback to the
 /// app store's user when the cookie has none, say -- would remove that cover
 /// silently while looking like an improvement.
 ///
 /// So if this ever grows a path that yields an identity WITHOUT a confirmed
-/// browser session, the completeness gate needs its own reason to refuse a
-/// provider whose credential source could not be read.
+/// session cookie, the completeness gate needs its own reason to refuse a
+/// provider whose credential could not be read.
 fn browser_identity_from_app_auth(
     browser_user_id: Option<&str>,
     app_auth: Result<Option<CursorAppAuth>, FetchError>,
@@ -329,30 +337,44 @@ fn resolve_cursor_credential(
         .map(CursorCredential::App)
         .ok_or_else(|| {
             FetchError::NoSession(format!(
-                // NOT "in browser": this jar may have come from a deposited
-                // cookie rather than the local store, and on Windows it can
-                // only have. Naming a lane we did not necessarily read sends
-                // the operator to check a session that is not what failed.
-                // The source is threaded into the other cookie providers'
-                // messages, but here it would cross three signatures and a
-                // spawn_blocking boundary to replace one word -- and this
-                // message already tells the operator both places were tried,
-                // which is the part that changes what they do next.
-                "no cursor session cookie ({}); Cursor app store was also checked",
+                // Tells the operator both places were tried, which is the part
+                // that changes what they do next.
+                "no cursor session cookie {} ({}); Cursor app store was also checked",
+                crate::cookie_vault::DEPOSIT_PHRASE,
                 jar.session_absence_detail()
             ))
         })
 }
 
+/// The app-store lane on its own: Cursor's sign-in on this machine, used when no
+/// cookie deposit exists.
+fn resolve_app_store_credential(
+    app_auth_path: Option<&Path>,
+) -> Result<CursorCredential, FetchError> {
+    load_app_auth_from_path(app_auth_path)?
+        .map(CursorCredential::App)
+        .ok_or_else(|| {
+            FetchError::NoSession(
+                "no cursor cookie deposit and no Cursor app sign-in on this host".to_string(),
+            )
+        })
+}
+
+/// Resolve off the async runtime, because the app store is a SQLite read.
+/// `None` for the jar means there is no cookie deposit, so only the app store
+/// can answer.
 async fn resolve_cursor_credential_async(
-    jar: CookieJar,
+    jar: Option<CookieJar>,
     app_auth_path: Option<PathBuf>,
 ) -> Result<CursorCredential, FetchError> {
-    tokio::task::spawn_blocking(move || resolve_cursor_credential(&jar, app_auth_path.as_deref()))
-        .await
-        .map_err(|_| {
-            FetchError::CredentialUnusable("cursor app auth store read task failed".to_string())
-        })?
+    tokio::task::spawn_blocking(move || match jar {
+        Some(jar) => resolve_cursor_credential(&jar, app_auth_path.as_deref()),
+        None => resolve_app_store_credential(app_auth_path.as_deref()),
+    })
+    .await
+    .map_err(|_| {
+        FetchError::CredentialUnusable("cursor app auth store read task failed".to_string())
+    })?
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,7 +551,15 @@ impl UsageProvider for CursorProvider {
                 return Ok(oauth);
             }
         }
-        self.vault.handles()
+        let deposits = self.vault.handles()?;
+        if !deposits.is_empty() {
+            return Ok(deposits);
+        }
+        // No deposit of either kind: the one remaining lane is Cursor's own app
+        // store on this machine. Never beside a deposit -- every lane here
+        // becomes its own slot, and two slots for one account would collapse to
+        // a single row by a tie-break nobody can see.
+        Ok(vec![CredentialHandle::implicit()])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -592,14 +622,12 @@ impl UsageProvider for CursorProvider {
         }
 
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = if handle.is_vault() {
+                let (jar, source) = self.vault.jar_for(handle).await?;
+                (Some(jar), source)
+            } else {
+                (None, APP_STORE_SOURCE)
+            };
             let credential = resolve_cursor_credential_async(jar, app_auth_db_path()).await?;
             let cookie = credential.cookie_header();
 
@@ -627,7 +655,7 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use crate::browser_cookies::SOURCE_LABEL;
+    use crate::cookie_vault::SOURCE as DEPOSIT_SOURCE;
 
     use super::*;
 
@@ -653,10 +681,10 @@ mod tests {
 
     fn browser_jar(session_cookie_value: &str) -> CookieJar {
         CookieJar {
-            cookies: vec![browser_cookies::Cookie {
+            cookies: vec![crate::cookie_jar::Cookie {
                 name: "WorkosCursorSessionToken".to_string(),
                 value: session_cookie_value.to_string(),
-                host_key: DOMAIN.to_string(),
+                host_key: "cursor.com".to_string(),
             }],
         }
     }
@@ -789,10 +817,10 @@ mod tests {
     fn absent_app_auth_store_keeps_browser_detail_in_no_session() {
         let path = test_path("missing.vscdb");
         let jar = CookieJar {
-            cookies: vec![browser_cookies::Cookie {
+            cookies: vec![crate::cookie_jar::Cookie {
                 name: "analytics".to_string(),
                 value: "synthetic".to_string(),
-                host_key: DOMAIN.to_string(),
+                host_key: "cursor.com".to_string(),
             }],
         };
 
@@ -834,10 +862,10 @@ mod tests {
         let path = test_path("unusable-directory");
         fs::create_dir(&path).unwrap();
         let jar = CookieJar {
-            cookies: vec![browser_cookies::Cookie {
+            cookies: vec![crate::cookie_jar::Cookie {
                 name: "WorkosCursorSessionToken".to_string(),
                 value: "synthetic-browser-session".to_string(),
-                host_key: DOMAIN.to_string(),
+                host_key: "cursor.com".to_string(),
             }],
         };
 
@@ -862,10 +890,10 @@ mod tests {
         )
         .unwrap();
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
         assert_eq!(provider_usage.account.as_deref(), Some("user-id"));
-        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
         assert_eq!(
             provider_usage
                 .account_info
@@ -889,13 +917,13 @@ mod tests {
         )
         .unwrap();
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
             "browser usage must still publish"
         );
-        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
         assert!(
             provider_usage.account.is_none(),
             "different accounts must not label usage"
@@ -914,13 +942,13 @@ mod tests {
         )
         .unwrap();
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
             "browser usage must still publish"
         );
-        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
         assert!(provider_usage.account.is_none());
         assert!(provider_usage.account_info.is_none());
     }
@@ -936,13 +964,13 @@ mod tests {
         )
         .unwrap();
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
             "browser usage must still publish"
         );
-        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
         assert!(provider_usage.account.is_none());
         assert!(provider_usage.account_info.is_none());
 
@@ -957,13 +985,13 @@ mod tests {
 
         let credential = resolve_cursor_credential(&browser_jar("user-id"), Some(&path)).unwrap();
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
         assert!(
             provider_usage.usage.is_some(),
             "browser usage must still publish"
         );
-        assert_eq!(provider_usage.source.as_deref(), Some(SOURCE_LABEL));
+        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
         assert!(provider_usage.account.is_none());
         assert!(provider_usage.account_info.is_none());
 
@@ -978,7 +1006,7 @@ mod tests {
             email: Some("account@example.test".to_string()),
         });
         let provider_usage =
-            provider_usage_from_credential(&credential, SOURCE_LABEL, healthy_usage());
+            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
         assert_eq!(provider_usage.account.as_deref(), Some("user-id"));
         assert_eq!(
             provider_usage
@@ -1046,14 +1074,59 @@ mod tests {
         assert!(matches!(res, Err(FetchError::Decode(_))));
     }
 
+    /// With no deposit, the one lane is Cursor's own app store on this machine.
+    ///
+    /// Cursor is the cookie provider with a local lane that is not a browser:
+    /// `state.vscdb` is the editor's own file, so it survives the vault-only
+    /// rule the other eight follow.
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn without_a_deposit_the_app_store_is_the_only_lane() {
         let provider = CursorProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
+    }
+
+    /// A cookie deposit replaces the app-store lane instead of sitting beside it.
+    ///
+    /// Two lanes for one account would be two slots collapsed to one row by a
+    /// tie-break nobody can see; the deposit is what the operator configured.
+    #[test]
+    fn a_cookie_deposit_replaces_the_app_store_lane() {
+        let loader = std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("cookie:cursor.com", "cookie")]);
+        let provider = CursorProvider::new_with_handle_loader(
+            Some(std::sync::Arc::new(ScopedCursorSource::default())),
+            loader,
+        );
+        let handles = provider.handles().unwrap();
+        let ids: Vec<_> = handles
+            .iter()
+            .map(|handle| handle.vault_credential_id())
+            .collect();
+        assert_eq!(ids, vec![Some("cookie:cursor.com")]);
+    }
+
+    /// The app-store lane alone reads Cursor's sign-in, and says so when absent.
+    #[test]
+    fn the_app_store_lane_reads_the_app_sign_in_or_reports_absence() {
+        let path = test_path("app-only.vscdb");
+        let access_token = synthetic_jwt("organization|user-id");
+        create_state_db(&path, &access_token, None);
+        let credential = resolve_app_store_credential(Some(&path)).unwrap();
+        assert!(matches!(credential, CursorCredential::App(ref auth) if auth.user_id == "user-id"));
+        fs::remove_file(&path).unwrap();
+
+        let error = match resolve_app_store_credential(Some(&path)) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing app store must not resolve a credential"),
+        };
+        assert!(
+            matches!(error, FetchError::NoSession(ref message) if message.contains("no cursor cookie deposit")),
+            "{error:?}"
+        );
     }
 
     #[derive(Default)]

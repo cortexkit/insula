@@ -421,7 +421,8 @@ pub trait UsageProvider: Send + Sync {
     /// Resolve and fetch one credential handle.
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt;
 
-    /// Whether this provider authenticates via a scraped local browser cookie.
+    /// Whether this provider authenticates with a web session cookie, which it
+    /// reads from a `cookie:<domain>` vault deposit.
     fn is_cookie_based(&self) -> bool {
         false
     }

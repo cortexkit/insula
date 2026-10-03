@@ -39,9 +39,11 @@ refreshes-into-storage, or transmits new ones:
 
 - OAuth tokens written by provider CLIs, read from their own files;
 - API keys from environment variables and from an existing local auth store;
-- browser session cookies, decrypted locally for providers that publish quota
-  only to a logged-in web session;
-- credentials served by a local vault module over a loopback socket.
+- credentials served by a local vault module over a loopback socket, including
+  the web session cookies of providers that publish quota only to a logged-in
+  web session. Those cookies are captured by a separate module and deposited in
+  the vault; this module never reads a browser's cookie store, the Keychain, or
+  any other application's data directory.
 
 Credentials travel to exactly one place: the provider's own endpoint, over TLS.
 They are not logged, not written anywhere new, and not included in the module's

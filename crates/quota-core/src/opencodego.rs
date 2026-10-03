@@ -4,8 +4,7 @@
 //! API-KEY LANE. `GET https://opencode.ai/zen/go/v1/usage` with
 //! `Authorization: Bearer <key>`, the key coming from a vault `apikey:opencode-go`
 //! credential or the `OPENCODE_API_KEY` environment variable. It needs no
-//! browser, so it is the lane for Windows and headless hosts that cannot read
-//! Chrome's cookie store. When a key is present it is the ONLY lane this
+//! captured web session. When a key is present it is the ONLY lane this
 //! provider enumerates (see [`OpenCodeGoProvider::handles`]).
 //! Ported from CodexBar v0.65.0 `OpenCodeGoUsageFetcher.fetchAPIUsage` /
 //! `parseAPIUsage` (present upstream since v0.54.0); payload shapes come from
@@ -30,9 +29,11 @@
 //! from `/console/api/orgs`, Go meters from `/console/api/go/status`. The legacy
 //! scrape stays as the fallback for workspaces that have not migrated.
 //!
+//! The cookie lanes read the `cookie:opencode.ai` deposit that `opencode` also
+//! reads, through the shared [`crate::cookie_vault`] lane.
+//!
 //! VERIFICATION: fixture-verified against CodexBar v0.64.1, NOT live-verified --
-//! the cookie lane is blocked on this host by a macOS permission, so no live
-//! check is available. Ported from
+//! no live check of the cookie lane was available when it was written. Ported from
 //! `OpenCodeGo/OpenCodeGoUsageFetcher.swift` (console API :428-575, legacy page
 //! :402-426, micro-cent meters :533-575), `OpenCodeGo/OpenCodeGoLegacyFallback.swift`
 //! (when the legacy page is tried and which error wins), and
@@ -51,10 +52,10 @@ use crate::{
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     opencode::{
-        fetch_workspace_id_at, load_cookie_header_async, looks_signed_out, parse_date_value,
-        parse_windows, CONSOLE_SESSION_COOKIE_NAMES, LEGACY_SESSION_COOKIE_NAMES,
-        MONTHLY_WINDOW_MINUTES, PERCENT_KEYS, RESET_AT_KEYS, RESET_IN_KEYS, ROLLING_WINDOW_MINUTES,
-        USER_AGENT, WEEKLY_WINDOW_MINUTES,
+        fetch_workspace_id_at, looks_signed_out, parse_date_value, parse_windows,
+        CONSOLE_SESSION_COOKIE_NAMES, LEGACY_SESSION_COOKIE_NAMES, MONTHLY_WINDOW_MINUTES,
+        PERCENT_KEYS, RESET_AT_KEYS, RESET_IN_KEYS, ROLLING_WINDOW_MINUTES, USER_AGENT,
+        WEEKLY_WINDOW_MINUTES,
     },
     provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider},
     vault_handles::{handle_id_names_family, VaultHandleLoader},
@@ -487,7 +488,7 @@ fn redirected_off_go_page(final_url: &str, workspace_id: &str) -> bool {
 ///   cannot help, because the fault is that the old endpoint no longer serves
 ///   the workspace. Only the console API's 401 proves an expired session now.
 /// * signed out: the page itself carries login markers -- the session is gone
-///   and a browser login fixes it.
+///   and capturing a fresh login fixes it.
 /// * no Go plan: the login is fine and there is nothing to report, which is not
 ///   a failure at all.
 /// * anything else that yields no windows: our parser and the page disagree,
@@ -541,7 +542,7 @@ fn classify_go_page(
 ///
 /// Distinguishing it matters beyond the wording. Without this the page falls
 /// through to the parser, fails to yield windows, and reports `decode_failed` —
-/// which classifies as a stale browser login and tells an operator to sign in
+/// which classifies as a stale cookie login and tells an operator to sign in
 /// again, when signing in changes nothing. The remedy for one is a login and for
 /// the other is a subscription, so collapsing them sends people to the wrong
 /// one.
@@ -939,11 +940,10 @@ impl UsageProvider for OpenCodeGoProvider {
     /// Every handle becomes its own slot and every lane here is identity-less,
     /// so enumerating the key beside a cookie lane would publish two unlabelled
     /// rows that the registry's emission gate collapses to one by a tie-break
-    /// nobody can see. An explicitly configured key beats an ambient browser
-    /// session, the same rule `CookieVault` applies to a named deposit and the
-    /// static-key providers apply to a vault key. A vault key comes before the
-    /// environment's, as in `deepseek`. With no key, the cookie lanes are
-    /// exactly what they were before the API lane existed.
+    /// nobody can see. An explicitly configured key beats a deposited cookie
+    /// session, which may belong to any account that shares the deposit. A
+    /// vault key comes before the environment's, as in `deepseek`. With no key,
+    /// the cookie lanes are `CookieVault`'s: a deposit or nothing.
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         let vault_keys = self.vault_api_key_handles()?;
         if !vault_keys.is_empty() {
@@ -967,10 +967,7 @@ impl UsageProvider for OpenCodeGoProvider {
             }
         }
         let result: Result<ProviderUsage, FetchError> = async {
-            let (cookie, source) = self
-                .vault
-                .cookie_for(handle, load_cookie_header_async)
-                .await?;
+            let (cookie, source) = self.vault.cookie_for(handle).await?;
             let usage = fetch_go_usage(&self.http, &cookie, &self.endpoints).await?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
@@ -1694,7 +1691,7 @@ mod tests {
     /// Asserted through the classifier rather than the predicate, because the
     /// predicate being right is not the claim that matters -- the claim is that
     /// a page like this produces this error. Classified as a decode failure
-    /// instead, it reads as a stale browser login and sends an operator to sign
+    /// instead, it reads as a stale cookie login and sends an operator to sign
     /// in again, which changes nothing.
     #[test]
     fn a_workspace_without_a_go_plan_reports_no_quota() {
@@ -1942,8 +1939,8 @@ mod tests {
             .collect()
     }
 
-    /// An API key is the only lane; without one, the cookie lanes are exactly
-    /// what they were.
+    /// An API key is the only lane; without one, the cookie lanes are the
+    /// shared vault-only ones.
     ///
     /// A named cookie deposit is present in the key cases because it is the
     /// cookie lane that would otherwise enumerate as a vault handle of its own:
@@ -1972,12 +1969,12 @@ mod tests {
             ids(provider.handles().unwrap()),
             vec!["cookie:opencode.ai:acct"]
         );
-        // No key and only a bare cookie deposit: the local lane, as before.
+        // No key and only a bare cookie deposit: that deposit, as a vault handle.
         let provider = provider_with_rows(&[("cookie:opencode.ai", "cookie")], "");
-        assert_eq!(
-            provider.handles().unwrap(),
-            vec![CredentialHandle::implicit()]
-        );
+        assert_eq!(ids(provider.handles().unwrap()), vec!["cookie:opencode.ai"]);
+        // No key and no deposit: no lane at all.
+        let provider = provider_with_rows(&[], "");
+        assert_eq!(ids(provider.handles().unwrap()), Vec::<String>::new());
     }
 
     /// An env-key fetch sends the bearer key to the usage path and publishes

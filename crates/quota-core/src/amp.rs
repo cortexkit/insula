@@ -1,4 +1,5 @@
-//! Amp usage — browser-cookie scrape of ampcode.com/settings.
+//! Amp usage — session-cookie scrape of ampcode.com/settings, with the cookie
+//! read from a `cookie:ampcode.com` vault deposit.
 //!
 //! VERIFICATION: FIXTURE-VERIFIED — this port is fixture-verified against CodexBar source.
 //! Ported from CodexBar `Sources/CodexBarCore/Providers/Amp/AmpUsageFetcher.swift` (lines 45-48, 103, 265-269, 302-310, 316-321, 360-367),
@@ -13,7 +14,6 @@ use chrono::{DateTime, Utc};
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -24,7 +24,6 @@ pub const PROVIDER_NAME: &str = "amp";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:ampcode.com";
 
-const DOMAIN: &str = "ampcode.com";
 const SETTINGS_URL: &str = "https://ampcode.com/settings";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -270,19 +269,12 @@ impl UsageProvider for AmpProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
                     "no amp session cookie {} ({})",
-                    crate::cookie_vault::source_phrase(source),
+                    crate::cookie_vault::DEPOSIT_PHRASE,
                     jar.session_absence_detail()
                 )));
             }
@@ -520,12 +512,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn handles_without_credential_source_are_empty() {
         let provider = AmpProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

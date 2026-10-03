@@ -59,14 +59,14 @@ esac
 #
 # THE IDENTIFIER IS NAMED, NOT DEFAULTED, because `codesign` otherwise takes it
 # from the FILE NAME, and this signs a scratch copy (`ck-insula.new` or a
-# staging name). macOS keys privacy grants such as Full Disk Access on the
-# signing identifier, so a binary signed under a scratch name silently stops
-# matching a grant the user gave to `ck-insula`; the fleet daemon lost its grant
-# exactly this way.
+# staging name). macOS keys privacy grants on the signing identifier, so a
+# binary signed under a scratch name silently stops matching any grant the user
+# gave to `ck-insula`; the fleet daemon lost its Full Disk Access grant exactly
+# this way. insula itself reads no other application's data and needs no such
+# grant, but the identifier stays stable so a future one keeps matching.
 #
 # Ad-hoc is enough: the protection is the runtime flag, not a team identity.
-# insula needs no entitlements -- it links only system libraries, uses no JIT,
-# and reaches the Keychain through the Apple-signed `security` tool.
+# insula needs no entitlements -- it links only system libraries and uses no JIT.
 harden() {
   local file="$1" info
   codesign --force --sign - --options runtime --identifier "$BIN" "$file"

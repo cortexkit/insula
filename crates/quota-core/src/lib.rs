@@ -14,12 +14,12 @@ pub mod alibaba;
 pub mod amp;
 pub mod anthropic;
 pub mod antigravity;
-pub mod browser_cookies;
 pub mod clinepass;
 pub mod codebuff;
 pub mod codex;
 pub mod codex_resets;
 pub mod config;
+pub mod cookie_jar;
 mod cookie_lifetime;
 mod cookie_vault;
 pub mod copilot;
@@ -755,7 +755,7 @@ impl Registry {
             .collect()
     }
 
-    /// Names of the providers that authenticate with a browser session cookie.
+    /// Names of the providers that authenticate with a web session cookie.
     ///
     /// Derived from the same predicate the stale-login health metric counts, so
     /// a caller asking "who is in the cookie cohort" cannot get a different

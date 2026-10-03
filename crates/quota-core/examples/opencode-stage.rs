@@ -13,9 +13,14 @@
 //! live host rather than by reasoning: it runs the stages one at a time and then
 //! asks the billing server function whether it answers with the same cookie.
 //!
-//! Reads the real Chrome cookie for opencode.ai. Prints no cookie material.
+//! Reads a signed-in opencode.ai `Cookie:` header from a file. Prints no cookie
+//! material.
+//!     cargo run -p quota-core --example opencode-stage -- --cookie-file <path>
 
-use quota_core::browser_cookies;
+#[path = "support/cookie_file.rs"]
+mod cookie_file;
+
+use quota_core::cookie_jar::CookieJar;
 use quota_core::opencode;
 
 /// What the workspaces call actually answered, when the provider called it
@@ -64,15 +69,9 @@ async fn main() {
         .build()
         .expect("client");
 
-    let jar = match browser_cookies::chrome_cookies_for("opencode.ai") {
-        Ok(jar) => jar,
-        Err(error) => {
-            eprintln!("cookie store unreadable ({error}): the question is unanswered.");
-            std::process::exit(2);
-        }
-    };
+    let jar = CookieJar::from_header(&cookie_file::cookie_header_from_args("opencode-stage"));
     let Some(cookie) = opencode::request_cookie_header(&jar) else {
-        eprintln!("no opencode.ai session cookie in the Chrome store: nothing to probe.");
+        eprintln!("no opencode.ai session cookie in the cookie file: nothing to probe.");
         eprintln!("this is not a clean result -- the question is unanswered.");
         std::process::exit(2);
     };

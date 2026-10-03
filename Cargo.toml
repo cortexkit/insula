@@ -38,13 +38,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
-# Browser-cookie extraction (the 7-provider cookie cohort, macOS Chrome path):
-# read Chrome's sqlite cookie store + decrypt v10 values
-# (PBKDF2-HMAC-SHA1 -> AES-128-CBC, with a SHA256(host_key) plaintext prefix).
+# Cursor's app store (`state.vscdb`) is a SQLite file.
 rusqlite = { version = "0.32", features = ["bundled"] }
-aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
-pbkdf2 = { version = "0.12", default-features = false }
 hmac = "0.12"
-sha1 = "0.10"
 sha2 = "0.10"

@@ -1,17 +1,17 @@
-//! Factory.ai usage — browser-cookie session + billing limits API.
+//! Factory.ai usage — session cookie + billing limits API.
 //!
-//! Flow (cookie-direct path): pull `factory.ai` cookies from Chrome → resolve a
+//! Flow (cookie-direct path): read the `factory.ai` cookies from a
+//! `cookie:factory.ai` vault deposit → resolve a
 //! direct bearer from `access-token` or `session` when present → `GET
 //! https://api.factory.ai/api/billing/limits` with `Cookie:` and
 //! `Authorization: Bearer` → map `limits.standard` (or `core`) pool windows to
 //! [`Usage`].
 //!
-//! DESKTOP-COUPLED: needs a local Chrome login + OS keychain (shared
-//! [`browser_cookies`] layer). Dead/missing session, 401/403, or JSON without
-//! usable windows → [`FetchError`] (silent degrade), never a fabricated window.
+//! Needs a deposited login (shared [`crate::cookie_vault`] lane). No deposit
+//! means no lane. Dead/missing session, 401/403, or JSON without usable windows → [`FetchError`] (silent degrade), never a fabricated window.
 //!
 //! VERIFICATION: fixture-verified against CodexBar source, NOT live-verified —
-//! no logged-in Factory browser session on the build machine. Cookie domain,
+//! no logged-in Factory session was available when it was written. Cookie domain,
 //! session cookie names, billing limits URL/headers, bearer-from-cookie rules,
 //! `FactoryBillingLimitsResponse` field mapping, and `FlexibleFactoryDate` reset
 //! parsing are ported from CodexBar
@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar},
+    cookie_jar::CookieJar,
     http::{Header, JsonRequest},
     model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -46,7 +46,6 @@ pub const PROVIDER_NAME: &str = "factory";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:factory.ai";
 
-const DOMAIN: &str = "factory.ai";
 const BILLING_LIMITS_URL: &str = "https://api.factory.ai/api/billing/limits";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -423,24 +422,17 @@ impl UsageProvider for FactoryProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
 
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
                     "no factory session cookie {} ({})",
-                    crate::cookie_vault::source_phrase(source),
+                    crate::cookie_vault::DEPOSIT_PHRASE,
                     jar.session_absence_detail()
                 )));
             }
 
-            // A session cookie was found immediately above, so the browser does
+            // A session cookie was found immediately above, so the deposit does
             // hold a factory login -- it just carries no cookie this provider
             // can use as a bearer. Found and unusable, not absent.
             let bearer = resolve_direct_bearer(&jar).ok_or_else(|| {
@@ -653,12 +645,12 @@ mod tests {
     fn direct_bearer_prefers_access_token() {
         let jar = CookieJar {
             cookies: vec![
-                browser_cookies::Cookie {
+                crate::cookie_jar::Cookie {
                     name: "access-token".to_string(),
                     value: "eyJhb.header.sig".to_string(),
                     host_key: "app.factory.ai".to_string(),
                 },
-                browser_cookies::Cookie {
+                crate::cookie_jar::Cookie {
                     name: "session".to_string(),
                     value: "other".to_string(),
                     host_key: "app.factory.ai".to_string(),
@@ -772,12 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn handles_without_credential_source_are_empty() {
         let provider = FactoryProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

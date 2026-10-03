@@ -12,9 +12,11 @@ from cache so a caller never blocks on the network.
 
 **It reuses the session you already have.** No new credential is issued and no
 password is asked for: it reads the OAuth token your provider CLI already wrote,
-the API key already in your environment, the browser cookie your logged-in
-session already holds. A provider you are not signed in to simply reports that,
-rather than failing the request for the others.
+the API key already in your environment, and credentials in the local vault --
+including web session cookies that Cerebellum captures and deposits there for
+providers that publish quota only to a logged-in page. It never reads a
+browser's cookie store itself. A provider you are not signed in to simply
+reports that, or is absent, rather than failing the request for the others.
 
 It runs as a module under [subc](https://github.com/cortexkit/subconscious), a
 local supervisor that spawns it, health-checks it, and routes requests to it — so
@@ -44,7 +46,7 @@ Current, and kept true against the code:
 | `deploying.md` | how to replace a running build, and how to verify which one is live |
 | `provider-matrix.md` | per-provider auth archetype, endpoint, and verification status |
 | `codex-banked-resets-design.md` | how the one mutating feature is fenced against double-spend |
-| `cross-platform-design.md` | what Windows and Linux parity requires, and where it is not achievable |
+| `cross-platform-design.md` | what Windows and Linux parity requires, and where it is not achievable (its browser-cookie sections are historical: that reader was removed) |
 | `balance-axis-design.md` | why prepaid balances are published apart from rate windows, and how the shape was chosen |
 
 Written before the code and kept for the reasoning, **not** as descriptions of
@@ -90,8 +92,8 @@ Verification (see each module's `VERIFICATION:` doc block):
 - **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
   upgraded to live when a key is supplied): the rest.
 
-Providers that produce no real reset window (prepaid balances, fabricated resets,
-desktop-only browser-cookie sources) are deferred with rationale in
+Providers that produce no real reset window (prepaid balances, fabricated
+resets) are deferred with rationale in
 `docs/provider-matrix.md`.
 
 ## Build
@@ -166,15 +168,17 @@ cargo run -p quota-core --example completeness-envelopes
 # on any upstream parity round that touches ollama, rather than re-deriving
 # whether the page moved. Exits non-zero when the page carries a label this
 # module does not parse, and refuses when there is no cookie or the page is too
-# small to be the settings page:
-cargo run -p quota-core --example ollama-labels
+# small to be the settings page. The signed-in ollama.com `Cookie:` header is
+# read from a file (mode 600), never from argv or the environment, which leak
+# into `ps` and shell history:
+cargo run -p quota-core --example ollama-labels -- --cookie-file /tmp/ollama.cookie
 
 # run opencode's server-function calls one at a time, when its published error
 # says only that something returned 500. The provider makes three calls and any
 # of them can fail that way, so the entry alone cannot say which -- this reports
 # each stage separately and asks the billing function whether it answers on the
-# same cookie:
-cargo run -p quota-core --example opencode-stage
+# same cookie. The opencode.ai `Cookie:` header comes from a file, as above:
+cargo run -p quota-core --example opencode-stage -- --cookie-file /tmp/opencode.cookie
 
 # ask grok's GetRemainingResets endpoint whether it answers our bearer, using the
 # VAULT credential the provider actually serves from rather than whatever token a
