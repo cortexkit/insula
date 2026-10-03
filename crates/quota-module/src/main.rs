@@ -2913,4 +2913,75 @@ mod tests {
         let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
         assert!(matches!(body, ModuleControlResponse::RouteBindAck {}));
     }
+
+    /// A bind whose scope stamp carries a `flow_id` is acked, not refused.
+    ///
+    /// This module decodes every `route.bind` body, scope stamp included, and
+    /// `ScopeAttributes` refuses fields it does not know. A build linked against a
+    /// protocol without `flow_id` would fail to decode such a bind, reply
+    /// `invalid_control_body`, and refuse the route, so that consumer's
+    /// `usage.get` would fail. The stamp is built from the protocol's own types
+    /// and serialised, so its shape is the producer's rather than a hand copy.
+    #[tokio::test]
+    async fn a_bind_whose_scope_carries_a_flow_id_is_acked() {
+        use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+        use subc_protocol::Principal;
+
+        let stamp = ScopeStamp {
+            owner: Principal::Reserved {
+                module_id: "prefrontal-core".to_string(),
+            },
+            scope_ref: "head-1".to_string(),
+            scope_epoch: 3,
+            kind: ScopeKind::Worker,
+            parent: None,
+            parent_state: None,
+            attributes: ScopeAttributes {
+                flow_id: Some("flow:7".to_string()),
+                ..ScopeAttributes::default()
+            },
+            owner_authorized: true,
+        };
+        let mut bind = serde_json::json!({
+            "op": "route.bind",
+            "route_channel": 7,
+            "epoch": 1,
+            "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
+            "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
+        });
+        bind["scope"] = serde_json::to_value(&stamp).unwrap();
+        assert_eq!(
+            bind["scope"]["attributes"]["flow_id"], "flow:7",
+            "the fixture must actually carry the field under test"
+        );
+
+        let registry = Arc::new(Registry::with_defaults(QuotaConfig::default(), None));
+        let (tx, mut rx) = mpsc::channel::<Frame>(4);
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            7,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap();
+        handle_control_request(
+            frame,
+            &tx,
+            &registry,
+            &test_vault(),
+            &ServeCounters::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = rx.try_recv().expect("a response frame was sent");
+        let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(
+            matches!(body, ModuleControlResponse::RouteBindAck {}),
+            "a scope carrying flow_id must bind, got {body:?}"
+        );
+    }
 }
