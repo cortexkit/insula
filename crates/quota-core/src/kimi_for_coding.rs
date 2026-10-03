@@ -44,10 +44,9 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::browser_cookies;
-use crate::credential_source::CredentialSource;
 #[cfg(test)]
 use crate::credential_source::VaultCapability;
+use crate::credential_source::{CredentialSource, ScopedSnapshot};
 use crate::env;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
@@ -62,9 +61,10 @@ const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const SUBSCRIPTION_STATS_URL: &str =
     "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats";
 const ENV_API_KEY: &str = "KIMI_CODE_API_KEY";
-/// The browser host carrying the web console session, which is a different
-/// credential from the coding API key above.
-const WEB_COOKIE_DOMAIN: &str = "kimi.com";
+/// The vault family whose deposit carries the web console session, which is a
+/// different credential from the coding API key above. Read only for the
+/// optional subscription extras, never enumerated as a lane.
+pub(crate) const WEB_COOKIE_FAMILY: &str = "cookie:kimi.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEEKLY_MINUTES: i64 = 7 * 24 * 60;
 const FIVE_HOUR_MINUTES: i64 = 5 * 60;
@@ -378,43 +378,30 @@ fn subscription_stats_request(web_token: &str) -> JsonRequest {
         .header(Header::new("Referer", "https://www.kimi.com/code/console"))
 }
 
-/// The web console session token, when this host has one.
+/// Which `cookie:kimi.com` deposit in the installed snapshot to read, if any.
 ///
-/// The subscription extras come from the web console, which authenticates with
-/// a browser session rather than with the coding API key that serves the usage
-/// endpoint. They are two separate credentials for two separate surfaces, and
-/// the key is not accepted by the console -- so sending it there produces a
-/// rejection on every fetch, and the extras it was meant to collect never
-/// arrive.
-///
-/// Returning `None` when no browser session exists is what keeps the failure
-/// legible: the enrichment is skipped rather than attempted and swallowed, so a
-/// host without a Kimi browser login does no console request at all.
-async fn web_enrichment_token() -> Option<String> {
-    let jar = browser_cookies::chrome_cookies_for_async(WEB_COOKIE_DOMAIN)
-        .await
-        .ok()?;
-    jar.header()
-        .split("; ")
-        .find_map(|pair| pair.strip_prefix("kimi-auth="))
-        .filter(|token| !token.is_empty())
-        .map(str::to_string)
+/// An account-suffixed deposit wins over the bare one, the same precedence the
+/// cookie providers apply: the operator named an account.
+fn web_cookie_deposit(snapshot: &ScopedSnapshot) -> Option<&str> {
+    let mut bare = None;
+    for row in &snapshot.rows {
+        let id = row.credential_id.as_str();
+        if id == WEB_COOKIE_FAMILY {
+            bare = Some(id);
+        } else if crate::vault_handles::handle_id_names_family(id, WEB_COOKIE_FAMILY) {
+            return Some(id);
+        }
+    }
+    bare
 }
 
-/// Fetch the optional subscription extras and fold them in.
-///
-/// Best-effort by design: the usage windows are already resolved by the time
-/// this runs, and a console that is unreachable, logged out, or slow must not
-/// turn a good fetch into a degraded entry. The cost of skipping is two extra
-/// windows a consumer treats as optional; the cost of failing would be the
-/// provider's whole capacity signal.
-async fn merge_subscription_extras(http: &reqwest::Client, usage: &mut Usage) {
-    let Some(web_token) = web_enrichment_token().await else {
-        return;
-    };
-    if let Ok(stats_body) = subscription_stats_request(&web_token).send(http).await {
-        merge_extras(usage, parse_subscription_extras(&stats_body));
-    }
+/// The `kimi-auth` value in a deposited `Cookie:` header.
+fn kimi_auth_token(header: &str) -> Option<String> {
+    crate::cookie_jar::CookieJar::from_header(header)
+        .cookies
+        .into_iter()
+        .find(|cookie| cookie.name == "kimi-auth" && !cookie.value.is_empty())
+        .map(|cookie| cookie.value)
 }
 
 /// The kimi-for-coding usage provider.
@@ -456,6 +443,51 @@ impl KimiForCodingProvider {
         );
     }
 
+    /// The web console session token, when a `cookie:kimi.com` deposit holds one.
+    ///
+    /// The subscription extras come from the web console, which authenticates with
+    /// a web session rather than with the coding API key that serves the usage
+    /// endpoint. They are two separate credentials for two separate surfaces, and
+    /// the key is not accepted by the console -- so sending it there produces a
+    /// rejection on every fetch, and the extras it was meant to collect never
+    /// arrive.
+    ///
+    /// The deposit is looked up in the snapshot the handle loader already holds
+    /// and read by id, so it never becomes a slot of its own. Returning `None`
+    /// when no deposit exists is what keeps the failure legible: the enrichment
+    /// is skipped rather than attempted and swallowed, so a host without a Kimi
+    /// web login does no console request at all.
+    async fn web_enrichment_token(&self) -> Option<String> {
+        let source = self.credential_source.as_ref()?;
+        let snapshot = self.handle_loader.snapshot()?;
+        let id = web_cookie_deposit(&snapshot)?;
+        let mut credential = source
+            .get_scoped(id, crate::credential_source::VAULT_READ_MIN_TTL_MS)
+            .await
+            .ok()?;
+        let header = crate::credential_source::take_utf8_payload(&mut credential.payload).ok()?;
+        kimi_auth_token(&header)
+    }
+
+    /// Fetch the optional subscription extras and fold them in.
+    ///
+    /// Best-effort by design: the usage windows are already resolved by the time
+    /// this runs, and a console that is unreachable, logged out, or slow must not
+    /// turn a good fetch into a degraded entry. The cost of skipping is two extra
+    /// windows a consumer treats as optional; the cost of failing would be the
+    /// provider's whole capacity signal.
+    async fn merge_subscription_extras(&self, usage: &mut Usage) {
+        let Some(web_token) = self.web_enrichment_token().await else {
+            return;
+        };
+        if let Ok(stats_body) = subscription_stats_request(&web_token)
+            .send(&self.http)
+            .await
+        {
+            merge_extras(usage, parse_subscription_extras(&stats_body));
+        }
+    }
+
     async fn fetch_local_bearer(&self, bearer: &str) -> FetchAttempt {
         let result = usage_request(&self.usage_url, bearer)
             .send(&self.http)
@@ -463,7 +495,7 @@ impl KimiForCodingProvider {
             .and_then(|body| normalize_usage(&body));
         match result {
             Ok(mut usage) => {
-                merge_subscription_extras(&self.http, &mut usage).await;
+                self.merge_subscription_extras(&mut usage).await;
                 FetchAttempt::success(Some(AccountObservation::new(None, None)), "api", usage)
             }
             Err(error) => FetchAttempt::failure(None, None, error),
@@ -511,7 +543,7 @@ impl KimiForCodingProvider {
         }
         match result {
             Ok(mut usage) => {
-                merge_subscription_extras(&self.http, &mut usage).await;
+                self.merge_subscription_extras(&mut usage).await;
                 FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
@@ -1014,5 +1046,97 @@ mod tests {
         );
         assert_eq!(attempt.observed.unwrap().record_version, Some(8));
         assert!(matches!(attempt.usage, Err(FetchError::Decode(_))));
+    }
+
+    /// Serves a fixed cookie header for any scoped id and records which ids
+    /// were read, so a test can tell whether the enrichment touched the vault.
+    struct WebCookieSource {
+        read: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CredentialSource for WebCookieSource {
+        async fn get(
+            &self,
+            _capability: &VaultCapability,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            Err(VaultGetError::FailClosed)
+        }
+
+        async fn get_scoped(
+            &self,
+            credential_id: &str,
+            _min_ttl_ms: u64,
+        ) -> Result<VaultCredential, VaultGetError> {
+            self.read.lock().unwrap().push(credential_id.to_string());
+            Ok(credential(b"tracker=1; kimi-auth=web-token", 1))
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _capability: &VaultCapability,
+            _provider_status: u16,
+            _record_version: u64,
+        ) {
+        }
+    }
+
+    fn enrichment_provider(rows: &[(&str, &str)]) -> (KimiForCodingProvider, Arc<WebCookieSource>) {
+        let source = Arc::new(WebCookieSource {
+            read: Mutex::new(Vec::new()),
+        });
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(rows);
+        let provider = KimiForCodingProvider::new_with_handle_loader(
+            Some(Arc::clone(&source) as Arc<dyn CredentialSource>),
+            loader,
+        );
+        (provider, source)
+    }
+
+    /// A `cookie:kimi.com` deposit supplies the console token, read by id
+    /// without becoming a handle of this provider.
+    #[tokio::test]
+    async fn a_kimi_web_deposit_supplies_the_enrichment_token() {
+        let (provider, source) = enrichment_provider(&[
+            ("apikey:kimi-for-coding", "apikey"),
+            ("cookie:kimi.com", "cookie"),
+            ("cookie:kimi.com:ufuk", "cookie"),
+        ]);
+        assert_eq!(
+            provider.web_enrichment_token().await.as_deref(),
+            Some("web-token")
+        );
+        // The suffixed deposit outranks the bare one, as for the cookie providers.
+        assert_eq!(*source.read.lock().unwrap(), vec!["cookie:kimi.com:ufuk"]);
+        // Not a lane: the handles are the coding key's alone.
+        let handles = provider.handles().unwrap();
+        assert!(
+            handles
+                .iter()
+                .all(|handle| handle.vault_credential_id() == Some("apikey:kimi-for-coding")),
+            "the web deposit must not become a slot: {handles:?}"
+        );
+    }
+
+    /// No deposit, no console request: the enrichment is skipped, and the vault
+    /// is never asked.
+    #[tokio::test]
+    async fn without_a_kimi_web_deposit_the_enrichment_is_skipped() {
+        let (provider, source) = enrichment_provider(&[("apikey:kimi-for-coding", "apikey")]);
+        assert_eq!(provider.web_enrichment_token().await, None);
+        assert!(source.read.lock().unwrap().is_empty());
+    }
+
+    /// Only a non-empty `kimi-auth` pair is a token.
+    #[test]
+    fn the_token_is_the_kimi_auth_value() {
+        assert_eq!(
+            kimi_auth_token("a=1; kimi-auth=t0k=; b=2").as_deref(),
+            Some("t0k=")
+        );
+        assert_eq!(kimi_auth_token("a=1; kimi-auth="), None);
+        assert_eq!(kimi_auth_token("a=1"), None);
     }
 }

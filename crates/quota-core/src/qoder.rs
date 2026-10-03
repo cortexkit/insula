@@ -1,11 +1,11 @@
-//! Qoder credit usage — browser-cookie request to the member quota API.
+//! Qoder credit usage — session-cookie request to the member quota API.
 //!
-//! Chrome cookies for the exact `qoder.com` and `www.qoder.com` hosts are sent
-//! with Qoder's browser headers. The base quota and optional shared quota are
+//! The cookies of a `cookie:qoder.com` vault deposit are sent with Qoder's
+//! browser headers. The base quota and optional shared quota are
 //! merged into one primary percentage window.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
-//! logged-in Qoder browser session. Endpoint and request headers, base/shared
+//! logged-in Qoder session. Endpoint and request headers, base/shared
 //! quota merging, reset parsing, and snake/camel-case response aliases are from
 //! CodexBar `Sources/CodexBarCore/Providers/Qoder/QoderUsageFetcher.swift:10-17,47-129,140-207,210-315`.
 //! The primary window mapping is from `QoderUsageSnapshot.swift:30-49`; cookie
@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies::{self, CookieJar},
+    cookie_jar::CookieJar,
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -41,8 +41,6 @@ pub const PROVIDER_NAME: &str = "qoder";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:qoder.com";
 
-const DOMAIN: &str = "qoder.com";
-const COOKIE_DOMAINS: &[&str] = &["qoder.com", "www.qoder.com"];
 const USAGE_URL: &str = "https://qoder.com/api/v2/me/usages/big_model_credits";
 const ORIGIN: &str = "https://qoder.com";
 const REFERER: &str = "https://qoder.com/account/usage";
@@ -194,26 +192,16 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     })
 }
 
+/// The whole deposited header, or `None` when it holds no cookie.
+///
+/// No per-host filter: a deposit is a request header captured for qoder.com and
+/// carries no host per cookie, so every cookie in it is one the site set for
+/// this request. Filtering by host would drop all of them.
 fn request_cookie_header(jar: &CookieJar) -> Option<String> {
-    let parts: Vec<String> = jar
-        .cookies
-        .iter()
-        .filter(|cookie| {
-            let host = cookie
-                .host_key
-                .strip_prefix('.')
-                .unwrap_or(&cookie.host_key);
-            COOKIE_DOMAINS
-                .iter()
-                .any(|domain| host.eq_ignore_ascii_case(domain))
-        })
-        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
-        .collect();
-
-    (!parts.is_empty()).then(|| parts.join("; "))
+    (!jar.cookies.is_empty()).then(|| jar.header())
 }
 
-/// The Qoder browser-cookie usage provider.
+/// The Qoder session-cookie usage provider.
 pub struct QoderProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
@@ -292,7 +280,7 @@ const TRACKING_ONLY_COOKIES: &[&str] = &["_c_WBKFRo", "cna", "isg", "tfstk", "xl
 /// Requires ALL of them to be known-tracking. A single unrecognised cookie could
 /// be the session, so the jar is sent as before and the upstream decides -- the
 /// judgement stays with the only party that can actually make it.
-fn jar_is_tracking_only(jar: &browser_cookies::CookieJar) -> bool {
+fn jar_is_tracking_only(jar: &CookieJar) -> bool {
     !jar.cookies.is_empty()
         && jar
             .cookies
@@ -316,18 +304,14 @@ impl UsageProvider for QoderProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
             // Qoder's importer does not designate one session-cookie name, so send
-            // every cookie from its two exact international hosts.
+            // every deposited cookie.
             let cookie = request_cookie_header(&jar).ok_or_else(|| {
-                FetchError::NoSession("no cookies for an exact Qoder browser host".to_string())
+                FetchError::NoSession(format!(
+                    "no qoder cookies {}",
+                    crate::cookie_vault::DEPOSIT_PHRASE
+                ))
             })?;
             if jar_is_tracking_only(&jar) {
                 return Err(FetchError::NoSession(
@@ -360,17 +344,31 @@ impl UsageProvider for QoderProvider {
 mod tests {
     use super::*;
 
-    fn jar_of(names: &[&str]) -> browser_cookies::CookieJar {
-        browser_cookies::CookieJar {
+    fn jar_of(names: &[&str]) -> CookieJar {
+        CookieJar {
             cookies: names
                 .iter()
-                .map(|name| browser_cookies::Cookie {
+                .map(|name| crate::cookie_jar::Cookie {
                     name: (*name).to_string(),
                     value: "x".to_string(),
                     host_key: "qoder.com".to_string(),
                 })
                 .collect(),
         }
+    }
+
+    /// A deposited header is sent whole, although it carries no per-cookie host.
+    ///
+    /// A host filter here would see an empty host on every deposited cookie and
+    /// drop them all, so a signed-in deposit would report as nobody signed in.
+    #[test]
+    fn a_deposited_header_is_sent_whole() {
+        let jar = CookieJar::from_header("cna=1; qoder_session=abc");
+        assert_eq!(
+            request_cookie_header(&jar).as_deref(),
+            Some("cna=1; qoder_session=abc")
+        );
+        assert_eq!(request_cookie_header(&CookieJar::from_header("")), None);
     }
 
     /// A jar holding only tracking cookies means nobody signed in.
@@ -574,12 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn handles_without_credential_source_are_empty() {
         let provider = QoderProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

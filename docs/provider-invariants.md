@@ -73,10 +73,11 @@ indistinguishable from a forgotten one** — if you decide not to map something,
 say so where the field is declared.
 
 
-## A browser session is a fallback, not a requirement — check the app first
+## A web session is a fallback, not a requirement — check the app first
 
-Nine providers here read a browser cookie, and that was treated as their nature
-rather than as one available surface. It is not: `cursor` was dark on this host
+Nine providers here read a web session cookie (today only from a vault deposit
+that Cerebellum captures; this module reads no browser store), and that was
+treated as their nature rather than as one available surface. It is not: `cursor` was dark on this host
 with only anonymous analytics cookies, and it now serves a labelled account from
 a token in Cursor.app's own `state.vscdb`, with no browser involved.
 
@@ -554,7 +555,7 @@ It has no failure signal at all. A call that is rejected on **every** fetch
 produces exactly what a call that succeeds and finds nothing produces: no extra
 window, no degraded entry, no failed test, and a provider that looks healthy
 because it is. `kimi-for-coding` sent its coding API key to a web console that
-authenticates with a browser session, so the enrichment had been rejected on
+authenticates with a web session, so the enrichment had been rejected on
 every fetch since it was written and two windows had never once reached the wire.
 
 **The tell is that the two endpoints take different credentials.** One surface
@@ -570,7 +571,7 @@ sends its web token to two paths on the same web host and is correct; the one
 that crossed a credential boundary was the defect.
 
 And the fix is not to make the call loud. It is to **skip it when its credential
-is absent**, so a host with no browser session makes no request at all, and a
+is absent**, so a host with no web session deposit makes no request at all, and a
 request that does go out is one that could have worked.
 
 ### The general question, of which the credential boundary is one predictor
@@ -1477,7 +1478,8 @@ decision.
 without the other.** `locate_under` was extracted precisely so a test could
 supply a directory rather than alter a real Chrome installation, with a comment
 saying so — and the decision behind it, which cookie database to pick when a user
-has several profiles, was untested. Switching "newest wins" to "oldest wins"
+has several profiles, was untested. (That browser-store reader has since been
+removed; the lesson stands.) Switching "newest wins" to "oldest wins"
 reddened nothing. Someone did the harder part, wrote down why, and then covered
 only the branch they had in mind at the time.
 

@@ -1,15 +1,16 @@
-//! Qwen Cloud token-plan usage — browser-cookie + console-gateway scrape.
+//! Qwen Cloud token-plan usage — session-cookie + console-gateway scrape.
 //!
-//! The token-plan quota is available only to an authenticated Qwen Cloud browser
-//! session. Each scrape loads the token-plan page to obtain a fresh `SEC_TOKEN`,
-//! then posts that token with the Chrome cookie jar through the ONE_CONSOLE
+//! The token-plan quota is available only to an authenticated Qwen Cloud web
+//! session, deposited in the vault as `cookie:qwencloud.com`. Each scrape loads
+//! the token-plan page to obtain a fresh `SEC_TOKEN`, then posts that token with
+//! the deposited cookies through the ONE_CONSOLE
 //! `IntlBroadScopeAspnGateway` gateway.
 //!
 //! VERIFICATION: fixture-verified from a live browser HAR capture of
 //! `home.qwencloud.com`, not a CodexBar port (Qwen Cloud has no CodexBar
 //! equivalent). The HAR verifies the
 //! `zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage` endpoint via the
-//! `IntlBroadScopeAspnGateway` console gateway, the Chrome cookie + per-page
+//! `IntlBroadScopeAspnGateway` console gateway, the session cookie + per-page
 //! `SEC_TOKEN` authentication, and the `per5HourPercentage`,
 //! `per5HourResetTime`, `per1WeekPercentage`, and `per1WeekResetTime` response
 //! fields. `per5HourPercentage` and `per1WeekPercentage` are interpreted as USED
@@ -21,9 +22,8 @@
 //! is FIXTURE-VERIFIED ONLY: the account this was built against returns just the
 //! five-hour and weekly fields. Placement follows upstream: the monthly window is
 //! `primary` when neither rolling window is reported, and otherwise rides in
-//! `extra_rate_windows` with id `monthly`, so it is never dropped. The shared
-//! cookie transport in `browser_cookies.rs` is live-proven; the gateway call shape
-//! is HAR-verified.
+//! `extra_rate_windows` with id `monthly`, so it is never dropped. The gateway
+//! call shape is HAR-verified.
 //!
 //! Two hosts: the token-plan PAGE (`home.qwencloud.com`) is loaded only to extract
 //! the per-session `SEC_TOKEN`; the quota call itself goes to the console data
@@ -62,7 +62,7 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies, env,
+    env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -73,7 +73,6 @@ pub const PROVIDER_NAME: &str = "qwen-cloud";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:qwencloud.com";
 
-const DOMAIN: &str = "qwencloud.com";
 /// The script block the authenticated console shell emits. Its presence is what
 /// separates "we were served the real page" from "we were not signed in".
 const CONSOLE_BLOCK: &str = "ONE_CONSOLE_TOOL";
@@ -642,18 +641,11 @@ impl UsageProvider for QwenCloudProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
             if !jar.has_cookie_named(|name| name == "login_qwencloud_ticket") {
                 return Err(FetchError::NoSession(format!(
                     "no Qwen Cloud login ticket {}",
-                    crate::cookie_vault::source_phrase(source)
+                    crate::cookie_vault::DEPOSIT_PHRASE
                 )));
             }
 
@@ -1511,12 +1503,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn handles_without_credential_source_are_empty() {
         let provider = QwenCloudProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

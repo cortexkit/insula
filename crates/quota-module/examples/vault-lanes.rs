@@ -279,12 +279,23 @@ fn evaluate(
     let mut routed_providers = BTreeSet::new();
     let mut unmapped = Vec::new();
     let mut deliberately_unsupported = Vec::new();
+    let mut enrichment = Vec::new();
     let mut routed = 0;
 
     for credential_id in &installed.credential_ids {
         let providers = providers_for_id(credential_id, families);
         if providers.is_empty() {
-            if let Some((_, reason)) = unsupported
+            // Read by a provider without being a lane of its own, so it routes to
+            // no slot and is still consumed, not dark.
+            if let Some((_, reader)) =
+                quota_core::vault_handles::ENRICHMENT_FAMILIES
+                    .iter()
+                    .find(|(family, _)| {
+                        quota_core::vault_handles::handle_id_names_family(credential_id, family)
+                    })
+            {
+                enrichment.push((credential_id.clone(), *reader));
+            } else if let Some((_, reason)) = unsupported
                 .iter()
                 .find(|(unsupported_id, _)| credential_id == unsupported_id)
             {
@@ -390,6 +401,11 @@ fn evaluate(
     for (credential_id, reason) in &deliberately_unsupported {
         lines.push(format!(
             "  unsupported: {credential_id}: {reason}; no lane is expected"
+        ));
+    }
+    for (credential_id, reader) in &enrichment {
+        lines.push(format!(
+            "  enrichment: {credential_id}: read by {reader} for optional extras; no lane is expected"
         ));
     }
     for credential_id in &unmapped {
@@ -664,6 +680,37 @@ mod tests {
 
         assert_eq!(report.exit_code, 0, "{report:?}");
         assert_eq!(report.counts.unwrap().enumerated, 2);
+    }
+
+    /// The Kimi web deposit is consumed by kimi-for-coding's enrichment, so it is
+    /// neither a lane that must serve nor an unmapped id. The control is an id no
+    /// table names, which must still be a finding.
+    #[test]
+    fn an_enrichment_deposit_is_consumed_rather_than_unmapped() {
+        let report = evaluate(
+            granted(&["apikey:kimi-for-coding", "cookie:kimi.com:ufuk"]),
+            usage(vec![healthy("kimi-for-coding", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(report.exit_code, 0, "{report:?}");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("enrichment: cookie:kimi.com:ufuk")),
+            "{report:?}"
+        );
+
+        let control = evaluate(
+            granted(&["apikey:kimi-for-coding", "cookie:unknown.example"]),
+            usage(vec![healthy("kimi-for-coding", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(control.exit_code, 1, "{control:?}");
     }
 
     #[test]

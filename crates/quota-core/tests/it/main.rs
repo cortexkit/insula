@@ -13,4 +13,3 @@ mod antigravity_live;
 mod gemini_live;
 mod grok_live;
 mod jetbrains_live;
-mod ollama_live;

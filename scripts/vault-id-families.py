@@ -66,17 +66,29 @@ DELIBERATELY_UNCLAIMED = {
 }
 
 
-def families():
-    """Parse the (prefix, provider) table out of the source."""
+def table(name):
+    """Parse a (prefix, provider) table out of the source."""
     src = FAMILIES_SRC.read_text()
-    start = src.index("pub const CREDENTIAL_FAMILIES")
+    start = src.index(f"pub const {name}")
     block = src[start : src.index("];", start)]
     found = re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', block)
     if not found:
-        print("could not parse CREDENTIAL_FAMILIES: the table shape changed", file=sys.stderr)
+        print(f"could not parse {name}: the table shape changed", file=sys.stderr)
         print("exit 2: no verdict is possible about routing", file=sys.stderr)
         sys.exit(2)
     return found
+
+
+def families():
+    """The lane families: each id they claim becomes a provider's handle."""
+    return table("CREDENTIAL_FAMILIES")
+
+
+def enrichment_families():
+    """Families a provider reads WITHOUT a lane (`cookie:kimi.com` for
+    kimi-for-coding's subscription extras). Their ids route to no handle and are
+    still consumed, so they are neither findings nor unrelated."""
+    return table("ENRICHMENT_FAMILIES")
 
 
 def locate_cli():
@@ -156,6 +168,7 @@ def claims(cid, fams):
 
 def main():
     fams = families()
+    enriching = enrichment_families()
     ids = installed_snapshot_ids()
 
     # REFUSE ON AN EMPTY POPULATION rather than reporting a clean run over
@@ -174,10 +187,22 @@ def main():
     print(f"  enumerated rows: {len(ids)}   family prefixes: {len(fams)}")
 
     routed = [c for c in ids if claims(c, fams)]
-    unclaimed = [c for c in ids if not claims(c, fams)]
+    enrichment = [c for c in ids if not claims(c, fams) and claims(c, enriching)]
+    unclaimed = [c for c in ids if not claims(c, fams) and not claims(c, enriching)]
     print(f"  routed to a provider: {len(routed)}   unclaimed: {len(unclaimed)}")
+    for cid in enrichment:
+        print(f"  read for enrichment, no lane: {cid} by {claims(cid, enriching)}")
 
     findings = []
+
+    # An id claimed by a lane AND an enrichment table is read twice, once as a
+    # slot of its own; one of the two tables is wrong.
+    for cid in ids:
+        if claims(cid, fams) and claims(cid, enriching):
+            findings.append(
+                f"{cid} is claimed by the lanes {claims(cid, fams)} and by the "
+                f"enrichment of {claims(cid, enriching)} -- one of the two tables is wrong"
+            )
 
     # A STALE EXEMPTION IS A FINDING. If a family now claims something this table
     # says is deliberately unrouted, the reason above is wrong and somebody should

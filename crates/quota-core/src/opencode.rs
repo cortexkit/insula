@@ -1,13 +1,13 @@
-//! OpenCode subscription usage — browser cookies + Next.js `_server` actions.
+//! OpenCode subscription usage — session cookies + Next.js `_server` actions.
 //!
-//! Flow: Chrome cookies for `opencode.ai` → workspace id via `_server` →
-//! subscription payload → parse `rollingUsage` + `weeklyUsage`.
+//! Flow: the deposited `cookie:opencode.ai` header → workspace id via
+//! `_server` → subscription payload → parse `rollingUsage` + `weeklyUsage`.
 //!
-//! DESKTOP-COUPLED: needs a logged-in Chrome session on macOS. Dead cookie, login
-//! markers, or missing windows → [`FetchError`] (degrade-never-wrong).
+//! Needs a deposited login. Dead cookie, login markers, or missing windows →
+//! [`FetchError`] (degrade-never-wrong).
 //!
 //! VERIFICATION: fixture-verified against CodexBar source, NOT live-verified (no
-//! logged-in browser on the build machine). Ported from
+//! logged-in session was available when it was written). Ported from
 //! `OpenCode/OpenCodeUsageFetcher.swift` (cookies/headers :112-310, window keys
 //! :32-64, parse :312-756, signed-out :451-462, workspace :361-401) and
 //! `OpenCode/OpenCodeWebCookieSupport.swift` at CodexBar v0.64.1 (cookie names:
@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
-    browser_cookies::{self, CookieJar},
+    cookie_jar::CookieJar,
     env,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
@@ -48,16 +48,13 @@ use crate::{
 };
 
 /// The bare vault credential id for this domain. A suffixed deposit
-/// (`cookie:opencode.ai:work`) names an account and takes the provider
-/// vault-only; this bare one is the fallback for hosts that cannot read the live
-/// browser store at all.
+/// (`cookie:opencode.ai:work`) names an account and outranks this bare one.
 ///
 /// Note `opencode` and `opencodego` deliberately share this id: they are two
 /// plans on ONE session, so there is one record and both providers consume it.
 pub const COOKIE_FAMILY: &str = "cookie:opencode.ai";
 
 const PROVIDER_NAME: &str = "opencode";
-const DOMAIN: &str = "opencode.ai";
 pub(crate) const SERVER_BASE: &str = "https://opencode.ai/_server";
 pub(crate) const ORIGIN: &str = "https://opencode.ai";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -364,7 +361,7 @@ pub(crate) async fn fetch_workspace_id_at(
     // are different answers that both yield no ids. Without this, an account
     // with no workspace retries, fails to parse again, and is published as
     // Decode -- our parser blamed for a fact about the account, and counted as a
-    // stale browser login on an entirely working session.
+    // stale cookie login on an entirely working session.
     if is_explicit_null(&text) {
         return Err(FetchError::NoQuotaReported(
             "opencode: this account has no workspace".to_string(),
@@ -555,7 +552,7 @@ async fn fetch_subscription_text_at(
         // Not a Decode: the payload is well formed and states that this
         // workspace has no subscription, which is a fact about the account
         // rather than a failure of ours or theirs. The class is load-bearing --
-        // Decode is counted as a stale browser login, so reporting it that way
+        // Decode is counted as a stale cookie login, so reporting it that way
         // sends an operator to re-authenticate a session that is working.
         // opencodego already answers its own no-plan case this way.
         return Err(FetchError::NoQuotaReported(format!(
@@ -964,32 +961,6 @@ pub fn parse_windows(
     ))
 }
 
-pub fn load_cookie_header() -> Result<String, FetchError> {
-    let jar = browser_cookies::chrome_cookies_for(DOMAIN).map_err(FetchError::from)?;
-    cookie_header_from_jar(&jar)
-}
-
-pub async fn load_cookie_header_async() -> Result<String, FetchError> {
-    let jar = browser_cookies::chrome_cookies_for_async(DOMAIN)
-        .await
-        .map_err(FetchError::from)?;
-    cookie_header_from_jar(&jar)
-}
-
-fn cookie_header_from_jar(jar: &CookieJar) -> Result<String, FetchError> {
-    if !has_session_cookie(jar) {
-        return Err(FetchError::NoSession(format!(
-            "no opencode auth cookie in browser ({})",
-            jar.session_absence_detail()
-        )));
-    }
-    // A session cookie exists but nothing survives the filter, so the browser
-    // holds a login that cannot be used: found, not absent.
-    request_cookie_header(jar).ok_or_else(|| {
-        FetchError::CredentialUnusable("opencode auth cookies empty after filter".to_string())
-    })
-}
-
 pub struct OpenCodeProvider {
     http: reqwest::Client,
     vault: crate::cookie_vault::CookieVault,
@@ -1035,10 +1006,7 @@ impl UsageProvider for OpenCodeProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (cookie, source) = self
-                .vault
-                .cookie_for(handle, load_cookie_header_async)
-                .await?;
+            let (cookie, source) = self.vault.cookie_for(handle).await?;
             let workspace_id = fetch_workspace_id_at(
                 &self.http,
                 &cookie,
@@ -1237,7 +1205,7 @@ balance:0,monthlyLimit:null,monthlyUsage:null})(self.$R))";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser_cookies::Cookie;
+    use crate::cookie_jar::Cookie;
 
     const SUBSCRIPTION_FIXTURE: &str = r#"{
       "rollingUsage": { "usagePercent": 42.5, "resetInSec": 7200 },
@@ -1349,7 +1317,7 @@ mod tests {
 
     /// The console session cookie alone is a session, for both providers.
     ///
-    /// A migrated workspace's browser jar may carry ONLY `__Host-console_session`
+    /// A migrated workspace's cookie jar may carry ONLY `__Host-console_session`
     /// (CodexBar v0.64.1 `OpenCodeCookieImporter` accepts exactly this), so a jar
     /// holding nothing else must neither read as "no session cookie" nor be
     /// filtered out of the request header. The tracker-cookie arm is the control:

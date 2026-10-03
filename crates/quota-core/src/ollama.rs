@@ -1,12 +1,13 @@
-//! Ollama usage — browser-cookie scrape of ollama.com/settings.
+//! Ollama usage — session-cookie scrape of ollama.com/settings.
 //!
 //! Ollama has NO headless usage/quota API: its API key (OLLAMA_API_KEY) only
 //! VERIFIES Cloud access (GET /api/tags returns a model list, zero quota) — quota
 //! lives only on the authenticated settings page. CodexBar reads it by pulling the
-//! session cookie from the browser and scraping the HTML; we replicate that via the
-//! shared [`browser_cookies`] layer.
+//! session cookie from the browser and scraping the HTML; here the session cookie
+//! is a `cookie:ollama.com` vault deposit, read through the shared
+//! [`crate::cookie_vault`] lane.
 //!
-//! Flow: pull ollama.com cookies from Chrome (decrypted) → GET
+//! Flow: read the deposited ollama.com cookie header → GET
 //! `https://ollama.com/settings` with the `Cookie:` header → parse the "Monthly
 //! usage", "Session usage" and "Weekly usage" blocks (`N% used`, or a
 //! `$X of $Y used` credit pair, + a `data-time="<ISO>"` reset).
@@ -15,17 +16,15 @@
 //! `secondary` is the weekly window; `tertiary` is the session window when the
 //! monthly one holds `primary`. See `normalize_usage_at`.
 //!
-//! DESKTOP-COUPLED + BRITTLE (accepted): needs a local Chrome login + OS keychain,
-//! and the session cookie rotates (no headless refresh), so it degrades to
+//! BRITTLE (accepted): needs a deposited login, and the session cookie rotates (no headless refresh), so it degrades to
 //! unavailable when the cookie is dead/expired or the login page is served. The one
 //! hard rule: degrade NEVER means a wrong/stale number — a dead cookie, a
 //! login-redirect, or missing usage markers yield [`FetchError`] (a degraded entry),
 //! never a fabricated window.
 //!
-//! VERIFICATION: LIVE-verified — the real cookie→GET→parse chain was proven on a
-//! machine with a logged-in Chrome session (returns real Session/Weekly windows;
-//! see `tests/it/ollama_live.rs`). The HTML parse is also unit-tested against a
-//! captured real settings fixture. Decryption recipe + HTML field names ported from
+//! VERIFICATION: LIVE-verified — the real cookie→GET→parse chain has returned
+//! real Session/Weekly windows from a logged-in session. The HTML parse is also
+//! unit-tested against a captured real settings fixture. HTML field names ported from
 //! CodexBar `Sources/CodexBarCore/Providers/Ollama/OllamaUsageFetcher.swift` +
 //! `OllamaUsageParser.swift:28-131` (labels, `N% used` / `width:N%`, `data-time`).
 //! The monthly block, its `$X of $Y used` figure and the same-host `/signin`
@@ -38,7 +37,6 @@ use async_trait::async_trait;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -46,10 +44,9 @@ use crate::{
 
 pub const PROVIDER_NAME: &str = "ollama";
 /// The bare vault credential id for this domain; a suffixed deposit under it
-/// names an account and takes the provider vault-only.
+/// names an account and outranks a bare deposit.
 const COOKIE_FAMILY: &str = "cookie:ollama.com";
 
-const DOMAIN: &str = "ollama.com";
 const SETTINGS_URL: &str = "https://ollama.com/settings";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -603,17 +600,6 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    /// A provider with no credential source, so it reads only the local Chrome
-    /// session and never a vault deposit. Kept for the live probe in
-    /// `tests/it/ollama_live.rs`; the default registry uses
-    /// `new_with_handle_loader` so deposits reach it.
-    pub fn new() -> Self {
-        Self::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::from_env()),
-        )
-    }
-
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
         handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
@@ -626,12 +612,6 @@ impl OllamaProvider {
                 COOKIE_FAMILY,
             ),
         }
-    }
-}
-
-impl Default for OllamaProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -651,20 +631,13 @@ impl UsageProvider for OllamaProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
 
             // A jar without a recognized session cookie is not a usable login.
             if !jar.has_cookie_named(is_session_cookie) {
                 return Err(FetchError::NoSession(format!(
                     "no ollama session cookie {} ({})",
-                    crate::cookie_vault::source_phrase(source),
+                    crate::cookie_vault::DEPOSIT_PHRASE,
                     jar.session_absence_detail()
                 )));
             }
@@ -687,7 +660,7 @@ impl UsageProvider for OllamaProvider {
 
             // WHERE THE RESPONSE CAME FROM, CHECKED BEFORE WHAT IT SAYS.
             //
-            // A dead browser session is 303'd to an auth host and the client
+            // A dead session is 303'd to an auth host and the client
             // follows it, so a valid sign-in page arrives with a 200 and a
             // well-formed body that simply has no usage labels in it. Parsing
             // first turns that into `decode_failed` -- a verdict accusing THIS

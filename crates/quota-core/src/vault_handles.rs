@@ -47,6 +47,15 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:minimax-coding-plan", "minimax"),
 ];
 
+/// Credential-id families a provider reads WITHOUT enumerating a lane for them.
+///
+/// Kept apart from [`CREDENTIAL_FAMILIES`] because a family there becomes a
+/// handle and a slot. The Kimi web console session only enriches
+/// kimi-for-coding's usage with optional extras; it fetches no usage of its own,
+/// so as a lane it would publish a second, failing row for the same account.
+/// Listed so the snapshot mapping does not report these ids as unsupported.
+pub const ENRICHMENT_FAMILIES: &[(&str, &str)] = &[("cookie:kimi.com", "kimi-for-coding")];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ProviderKind {
     Codex,
@@ -491,11 +500,14 @@ impl VaultHandleLoader {
     }
 }
 
-/// Which credential lanes a cookie provider should expose from the installed snapshot.
+/// Which deposits a cookie provider should expose from the installed snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CookieLane {
-    VaultOnly(Vec<CredentialHandle>),
-    LocalWithFallback(Option<CredentialHandle>),
+    /// Account-suffixed deposits (`cookie:<domain>:<account>`). When any exist
+    /// they are the lanes, and a bare deposit is not enumerated beside them.
+    Suffixed(Vec<CredentialHandle>),
+    /// No suffixed deposit: the bare `cookie:<domain>` deposit, if there is one.
+    Bare(Option<CredentialHandle>),
 }
 
 pub fn cookie_lane(handles: Vec<CredentialHandle>, family: &str) -> CookieLane {
@@ -509,9 +521,9 @@ pub fn cookie_lane(handles: Vec<CredentialHandle>, family: &str) -> CookieLane {
         .cloned()
         .collect();
     if !suffixed.is_empty() {
-        return CookieLane::VaultOnly(suffixed);
+        return CookieLane::Suffixed(suffixed);
     }
-    CookieLane::LocalWithFallback(
+    CookieLane::Bare(
         handles
             .into_iter()
             .find(|handle| handle.vault_credential_id().is_some_and(|id| id == family)),
@@ -600,7 +612,12 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         }
         let providers = providers_for_id(&row.credential_id);
         if providers.is_empty() {
-            unsupported.push(row.credential_id.clone());
+            let enrichment = ENRICHMENT_FAMILIES
+                .iter()
+                .any(|(family, _)| handle_id_names_family(&row.credential_id, family));
+            if !enrichment {
+                unsupported.push(row.credential_id.clone());
+            }
             continue;
         }
         for provider in providers {
@@ -865,6 +882,26 @@ mod tests {
                 "{id} did not route to {provider}"
             );
         }
+    }
+
+    /// An enrichment id routes to no lane and is not reported as unsupported.
+    ///
+    /// The control is a genuinely unknown id in the same snapshot: it must still
+    /// be reported, so the exemption cannot have silenced the warning wholesale.
+    #[test]
+    fn an_enrichment_id_is_neither_a_lane_nor_unsupported() {
+        let loader = VaultHandleLoader::default();
+        install(
+            &loader,
+            vec![
+                row("cookie:kimi.com:ufuk", "cookie"),
+                row("apikey:unknown-vendor", "apikey"),
+            ],
+        );
+        assert!(loader.kimi_for_coding_handles().unwrap().is_empty());
+        let warning = loader.warning().unwrap_or_default();
+        assert!(warning.contains("apikey:unknown-vendor"), "{warning}");
+        assert!(!warning.contains("cookie:kimi.com"), "{warning}");
     }
 
     #[test]

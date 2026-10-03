@@ -1,4 +1,5 @@
-//! MiMo usage — browser-cookie scrape of platform.xiaomimimo.com.
+//! MiMo usage — session-cookie scrape of platform.xiaomimimo.com, with the cookie
+//! read from a `cookie:xiaomimimo.com` vault deposit.
 //!
 //! VERIFICATION:
 //! This port is fixture-verified against CodexBar source.
@@ -7,7 +8,7 @@
 //! - `Sources/CodexBarCore/Providers/MiMo/MiMoCookieImporter.swift` (lines 7-14, 106-109)
 //! - `Sources/CodexBarCore/Providers/MiMo/MiMoUsageSnapshot.swift`
 //!
-//! No live proof is implied as there is no logged-in browser session on the build machine.
+//! No live proof is implied: no logged-in MiMo session was available when it was written.
 
 use std::time::Duration;
 
@@ -17,7 +18,6 @@ use serde::Deserialize;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
-    browser_cookies,
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
@@ -28,7 +28,6 @@ pub const PROVIDER_NAME: &str = "mimo";
 /// suffix identifies each account, and these credentials are read only from the provider vault.
 const COOKIE_FAMILY: &str = "cookie:xiaomimimo.com";
 
-const DOMAIN: &str = "xiaomimimo.com";
 const DETAIL_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/detail";
 const USAGE_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -206,14 +205,7 @@ impl UsageProvider for MimoProvider {
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let (jar, source) = self
-                .vault
-                .jar_for(handle, || async {
-                    browser_cookies::chrome_cookies_for_async(DOMAIN)
-                        .await
-                        .map_err(FetchError::from)
-                })
-                .await?;
+            let (jar, source) = self.vault.jar_for(handle).await?;
 
             let has_token = jar.has_cookie_named(|n| n == "api-platform_serviceToken");
             let has_user_id = jar.has_cookie_named(|n| n == "userId");
@@ -408,12 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_without_credential_source_return_only_implicit_local() {
+    fn handles_without_credential_source_are_empty() {
         let provider = MimoProvider::new_with_handle_loader(
             None,
             std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
         );
         let handles = provider.handles().unwrap();
-        assert_eq!(handles, vec![CredentialHandle::implicit()]);
+        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

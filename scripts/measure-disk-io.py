@@ -5,14 +5,6 @@ rather than by restating the whole rusage_info_v4 struct: a field-order mistake
 in a restated struct yields plausible zeros rather than an error, which is the
 failure this measurement is trying to avoid making.
 
-This script used to also count the cookie-store copies the module makes, by
-globbing the temp root for them. It no longer can: the module deletes each copy
-the moment it opens it, so a copy exists on disk for only an instant and a
-listing almost always sees none. A count here would read 0 whatever the real
-rate, which looks like a perfect result. So the count is gone. Each copy writes
-one full cookie store, so the WRITTEN figure below carries the copy cost:
-divide it by the store's size for an approximate copy count.
-
 Usage: measure-disk-io.py <pid> <seconds>
 """
 
