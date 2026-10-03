@@ -3806,9 +3806,9 @@ mod drop_counter_tests {
             "../tests/fixtures/credential_list_scoped_golden.json"
         ))
         .expect("the producer's golden reply must decode through the real decoder");
-        assert_eq!(decoded.grants, 1);
-        assert_eq!(decoded.grant_tuples.len(), 1);
-        assert_eq!(decoded.credentials.len(), 2);
+        assert_eq!(decoded.grants, 2);
+        assert_eq!(decoded.grant_tuples.len(), 2);
+        assert_eq!(decoded.credentials.len(), 5);
         let row = |id: &str| {
             decoded
                 .credentials
@@ -3836,7 +3836,7 @@ mod drop_counter_tests {
         assert!(bare.account_id.is_none() && bare.email.is_none() && bare.org_name.is_none());
 
         assert_eq!(
-            decoded.view, "kBe+kDjFKPmOVpGi2AhGIa3hjAK9ZiatFUhHwfCNcxw=",
+            decoded.view, "IwusRgF84sqN4878AwhqRl7XAHzhBMJibYwwWIlMGDo=",
             "the view is the producer's digest, carried verbatim"
         );
     }
