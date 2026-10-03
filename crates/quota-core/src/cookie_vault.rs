@@ -7,12 +7,10 @@
 //! A deposit is the only cookie source. A host with no deposit has no cookie
 //! lane, and the provider is unconfigured there.
 //!
-//! THIS EXISTS BECAUSE THE DUPLICATION COST WAS MEASURED, NOT PREDICTED. The
-//! precedence rule below was once specified wrongly, corrected, and the
-//! correction was applied to `opencode` and MISSED `opencodego` -- in the same
-//! session, by the person who had just written it. Two copies were enough to
-//! lose a fix; nine would be a rule that is right in some providers and wrong in
-//! others, with nothing failing to say which.
+//! The rule lives here once, not in each provider, because a copy per provider
+//! drifts: a precedence fix applied to `opencode` was once missed in
+//! `opencodego`, and with nine copies the rule would be right in some providers
+//! and wrong in others with nothing failing to say which.
 
 use std::sync::Arc;
 

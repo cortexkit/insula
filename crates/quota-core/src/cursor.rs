@@ -1078,7 +1078,7 @@ mod tests {
     ///
     /// Cursor is the cookie provider with a local lane that is not a browser:
     /// `state.vscdb` is the editor's own file, so it survives the vault-only
-    /// rule the other eight follow.
+    /// rule every other cookie provider follows.
     #[test]
     fn without_a_deposit_the_app_store_is_the_only_lane() {
         let provider = CursorProvider::new_with_handle_loader(

@@ -2,7 +2,7 @@
 //!
 //! The cookie is a live login, so it never travels on the command line or in
 //! the environment: both show up in `ps` output and shell history. Only the
-//! file's PATH is an argument. Capture the cookie with Cerebellum (or copy the
+//! file's PATH is an argument. Capture the cookie with Cerebellum, the CortexKit browser module (or copy the
 //! `Cookie:` request header from a signed-in browser) into a file readable only
 //! by you, e.g. `umask 077; pbpaste > /tmp/ollama.cookie`.
 
