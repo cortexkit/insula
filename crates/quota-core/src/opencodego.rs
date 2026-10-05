@@ -40,6 +40,12 @@
 //! `OpenCode/OpenCodeWebCookieSupport.swift` (cookie names, shared with
 //! `opencode`). JSON fixtures come from
 //! `Tests/CodexBarTests/OpenCodeGoConsoleMigrationTests.swift` at the same tag.
+//!
+//! CITATION NOTE (parity-citations.py): the fallback citation above names its
+//! v0.64.1 source. At CodexBar v0.71.0 it moved to
+//! `Shared/OpenCodeLegacyFallback.swift`, shared by Go and base OpenCode. The
+//! historical line references remain tied to v0.64.1; the rename does not imply
+//! that this port implements the base provider's new console usage lane.
 
 use std::{sync::Arc, time::Duration};
 
