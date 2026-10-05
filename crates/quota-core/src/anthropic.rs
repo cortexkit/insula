@@ -676,6 +676,10 @@ pub struct AnthropicProvider {
     /// `spend` is readable or unstated has no entry. See [`refusal_needs_log`].
     overage_refusals: Mutex<HashMap<String, RefusalReason>>,
     reset_refusals: Mutex<HashMap<String, &'static str>>,
+    /// Per handle stable id, the status with which the saved-reset opt-in was
+    /// last refused; absent while the opt-in is accepted. See
+    /// [`AnthropicProvider::settle_fallback`].
+    inventory_fallbacks: Mutex<HashMap<String, u16>>,
 }
 
 impl AnthropicProvider {
@@ -690,6 +694,7 @@ impl AnthropicProvider {
             usage_url: USAGE_URL.to_string(),
             overage_refusals: Mutex::new(HashMap::new()),
             reset_refusals: Mutex::new(HashMap::new()),
+            inventory_fallbacks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -751,11 +756,41 @@ impl AnthropicProvider {
         resets.unwrap_or(None)
     }
 
+    /// Record whether this handle's saved-reset opt-in was refused, logging only
+    /// when that changes. A refused opt-in costs a second request on every poll
+    /// against Anthropic's per-account rate limit, and nothing on the wire shows
+    /// it: the windows still publish and `savedResets` is simply absent, which
+    /// is also what an account with no resets looks like.
+    fn settle_fallback(&self, handle_id: &str, refused_with: Option<u16>) {
+        let mut fallbacks = self
+            .inventory_fallbacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fallbacks.get(handle_id).copied() == refused_with {
+            return;
+        }
+        match refused_with {
+            Some(status) => {
+                eprintln!("{LOG_TAG} anthropic ({handle_id}): the saved-reset opt-in was refused with HTTP {status}; each poll now makes a second, ordinary usage request");
+                fallbacks.insert(handle_id.to_string(), status);
+            }
+            None => {
+                eprintln!("{LOG_TAG} anthropic ({handle_id}): the saved-reset opt-in is accepted again; one usage request per poll");
+                fallbacks.remove(handle_id);
+            }
+        }
+    }
+
     /// The optional query and CLI identity are rejected by some accounts or tiers.
     /// Retry only 400 and non-profile-scope 403, once, with the ordinary identity.
     /// 401 cannot change authentication; retrying 429 would spend Anthropic's
     /// per-account usage endpoint rate limit without helping the caller.
-    async fn inventory_body(&self, bearer: &str, vault: bool) -> Result<Vec<u8>, FetchError> {
+    async fn inventory_body(
+        &self,
+        handle_id: &str,
+        bearer: &str,
+        vault: bool,
+    ) -> Result<Vec<u8>, FetchError> {
         let url = format!("{}?cedar_ember=1", self.usage_url);
         let cli_ua = format!(
             "{} (external, cli)",
@@ -768,9 +803,19 @@ impl AnthropicProvider {
         // If a 403's missing user:profile permission appears later, retry once:
         // the ordinary request cannot change token permissions, so it returns
         // and publishes the same refusal. Anthropic's real scope error is shorter.
-        let retry = matches!(&result, Err(FetchError::ProviderStatus(400, _)))
-            || matches!(&result, Err(FetchError::ProviderStatus(403, excerpt)) if !excerpt.contains("user:profile"));
-        if retry {
+        let refused_with = match &result {
+            Err(FetchError::ProviderStatus(400, _)) => Some(400),
+            Err(FetchError::ProviderStatus(403, excerpt)) if !excerpt.contains("user:profile") => {
+                Some(403)
+            }
+            _ => None,
+        };
+        // Only a decided outcome moves the record: a 401, 429 or transport
+        // failure says nothing about whether the opt-in is accepted.
+        if refused_with.is_some() || result.is_ok() {
+            self.settle_fallback(handle_id, refused_with);
+        }
+        if refused_with.is_some() {
             result = usage_request(&self.usage_url, bearer, CLAUDE_CODE_UA)
                 .send_provider_status_first(&self.http, PROVIDER_NAME)
                 .await;
@@ -801,7 +846,7 @@ impl AnthropicProvider {
 
     async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {
         let result = self
-            .inventory_body(bearer, false)
+            .inventory_body(handle_id, bearer, false)
             .await
             .and_then(|body| normalize_inventory(&body));
         match result {
@@ -853,7 +898,7 @@ impl AnthropicProvider {
         };
 
         let result = self
-            .inventory_body(&bearer, true)
+            .inventory_body(handle_id, &bearer, true)
             .await
             .and_then(|body| normalize_inventory(&body));
         if let Err(error) = &result {
@@ -1316,6 +1361,42 @@ mod tests {
         assert!(!json.contains("redemption-handle"));
         assert!(!json.contains("private grant"));
         assert!(!json.contains("cedar_ember"));
+    }
+
+    /// A refused opt-in is recorded per handle and cleared when a later poll's
+    /// opt-in succeeds, so the log line marks each transition once rather than
+    /// every poll. 401 and 429 must not move the record either way.
+    #[tokio::test]
+    async fn opt_in_refusal_is_recorded_per_handle_and_cleared_when_accepted() {
+        let (unused_source, _) = source(Err(VaultGetError::Permanent));
+        let provider = test_provider(unused_source, "unused".into());
+        provider.settle_fallback("account-a", Some(400));
+        provider.settle_fallback("account-b", Some(403));
+        assert_eq!(
+            provider
+                .inventory_fallbacks
+                .lock()
+                .unwrap()
+                .get("account-a"),
+            Some(&400)
+        );
+        provider.settle_fallback("account-a", None);
+        assert_eq!(
+            *provider.inventory_fallbacks.lock().unwrap(),
+            HashMap::from([("account-b".to_string(), 403)])
+        );
+
+        // Through the real request path: an accepted opt-in clears nothing it
+        // never set, and a 429 leaves an existing refusal record in place.
+        let (url, _) = serve_once(429, b"per-account rate limit".to_vec()).await;
+        let (token_source, _) = source(Ok(credential(b"token", 1)));
+        let provider = test_provider(token_source, url);
+        provider.settle_fallback("h", Some(400));
+        let _ = provider.inventory_body("h", "token", true).await;
+        assert_eq!(
+            provider.inventory_fallbacks.lock().unwrap().get("h"),
+            Some(&400)
+        );
     }
 
     #[test]
