@@ -27,18 +27,6 @@ jobs:
         with:
           path: insula
 
-      # `cargo metadata` resolves the whole dependency graph, including the
-      # path-dep sibling -- so this job needs the same checkout the build legs
-      # do. Without it the command fails to load the workspace manifest and this
-      # gate refuses for a reason that has nothing to do with the version, which
-      # is how the first v0.1.0 attempt failed: correctly closed, wrongly
-      # explained. The sibling is public, so no token is needed.
-      - name: Checkout subconscious
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/subconscious
-          path: subconscious
-
       # Read the version from the manifest rather than from anywhere it is
       # restated. `cargo metadata` resolves the same value the binary compiles
       # into itself via CARGO_PKG_VERSION, so agreement here IS agreement with
@@ -90,14 +78,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: insula
-
-      # Same single-sibling checkout as CI: quota-module path-deps the public
-      # cortexkit/subconscious for subc-protocol and subc-transport.
-      - name: Checkout subconscious
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/subconscious
-          path: subconscious
 
       - uses: dtolnay/rust-toolchain@stable
 

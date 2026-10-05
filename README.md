@@ -278,12 +278,6 @@ python3 scripts/vault-id-families.py
 # run every gate in the order that makes them mean something:
 scripts/gates.sh
 
-# refuse a cargo gate result that may have come from cache. This workspace
-# path-depends on a sibling repo, so that repo can change while nothing here
-# does -- cargo then has nothing to redo and reports clean, and CI, which always
-# builds cold, fails. Exits 1 when a sibling moved after the last local build:
-python3 scripts/sibling-freshness.py
-
 # tests count as production code:
 python3 scripts/prod_body.py crates/quota-core/src/*.rs
 

@@ -5,21 +5,21 @@ members = ["crates/quota-core", "crates/quota-module"]
 # ai-provider-quota — a subc-supervised module serving per-provider usage/quota
 # windows, replacing the external CodexBar dependency. See docs/charter.md.
 #
-# The subc wire contract crates are PATH dependencies on the sibling subconscious
-# monorepo (same arrangement AFT uses): subc-protocol/subc-transport are the
-# module-facing wire, subc-daemon is a dev-only dep for the in-process daemon used
-# in the end-to-end skeleton test. The TS @cortexkit/subc-client (Alfonso's
-# consumer transport) is owned by subc, NOT built here.
+# The subc crates come from crates.io: a sibling release cannot rewrite our lock.
+# We take upgrades deliberately with `cargo update -p <crate>` (and bump the
+# requirement for a new minor). subc-protocol/subc-transport are the module-facing
+# wire; subc-daemon is dev-only for the in-process skeleton test. The TS
+# @cortexkit/subc-client consumer transport is owned by subc, NOT built here.
 [workspace.dependencies]
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-daemon = { path = "../subconscious/crates/subc-daemon" }
-subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
+subc-protocol = "0.29"
+subc-transport = "0.10"
+subc-daemon = "0.32"
+subc-jsonc = "0.1"
 # `subc_os::launch_nonce()` is the one reader of the launch nonce the daemon hands
 # a supervised module on descriptor 3. It must be the only reader in the process:
 # it closes the descriptor after reading, so a second reader would hit whatever
 # the process opened next at that number.
-subc-os = { path = "../subconscious/crates/subc-os" }
+subc-os = "0.1"
 
 # The shared usage.get wire types (ProviderUsage/Usage/RateWindow + account/reset
 # metadata), extracted to cortexkit/commons so every consumer (ALF's router,

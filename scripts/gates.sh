@@ -1,18 +1,7 @@
 #!/usr/bin/env bash
 #
-# Run this workspace's gates in the order that makes them mean something.
-#
-# WHY THIS EXISTS RATHER THAN A LIST IN A DOC. docs/verifying.md has always said
-# the freshness check comes first. On 2026-08-16 a sibling repo made three
-# breaking protocol changes, and two of them reached master because the gates
-# were run in the wrong order -- build first, measure after -- by which point
-# cargo had already absorbed the change and the check could only say "not
-# stale". The check was correct all three times. The ORDERING was the defect,
-# and an ordering that depends on remembering is not an ordering.
-#
-# The other half is that a stale sibling now triggers the forced recompile HERE
-# instead of printing advice for a human to follow. Advice at the moment of
-# least suspicion is what failed twice.
+# Run this workspace's checks together so local verification covers the same
+# source, tooling and test targets every time.
 #
 # Usage:
 #   scripts/gates.sh          fmt, clippy, unit tests
@@ -36,85 +25,43 @@ done
 step() { printf '\n  == %s\n' "$1"; }
 fail() { printf '\n  GATE FAILED: %s\n' "$1" >&2; exit 1; }
 
-# THE GATE CAN REWRITE Cargo.lock, AND HAS.
-#
-# `cargo` without `--locked` is a WRITER: when a path-dependency sibling moves,
-# any build or test command updates the lock in place as a side effect. That is
-# fine on its own -- and then `git add -A` sweeps it into whatever commit is being
-# made, so a lock bump lands under a subject line about something else entirely.
-#
-# It happened here at c2b45c8, a comment-only change to kimi.rs whose diff
-# silently carried subc-transport 0.5.2 -> 0.6.0 and subc-core 0.17.17 -> 0.17.18.
-# The versions were CORRECT, which is why nothing complained and why it would have
-# gone unnoticed: the audit trail says a comment commit, and a later reader
-# bisecting a dependency change lands on a message that never mentions one.
-#
-# So the lock's digest is taken before the gates run and compared after. This does
-# not prevent the write -- forbidding it would break the ordinary absorb path --
-# it makes the write ANNOUNCE ITSELF while the operator is still looking, which is
-# the difference between an absorb and an accident.
+step "repository path dependencies"
+# Python 3.11's standard TOML parser also sees unused Cargo patches, which
+# resolved metadata omits. Select an installed parser rather than fetching one.
+TOML_PYTHON=""
+for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+    if "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+        TOML_PYTHON="$candidate"
+        break
+    fi
+done
+[ -n "$TOML_PYTHON" ] || fail "path dependency check requires Python 3.11 or newer"
+"$TOML_PYTHON" --version
+"$TOML_PYTHON" scripts/path-dependencies.py || fail "repository path dependencies"
+
+# Cargo commands without --locked can rewrite Cargo.lock after a local manifest
+# edit. Announce any write so it is reviewed as a dependency change rather than
+# swept into an unrelated commit. Deliberate upgrades use cargo update -p <crate>
+# before the gates.
 LOCK_BEFORE="$(shasum -a 256 Cargo.lock 2>/dev/null | cut -d' ' -f1)"
 
 announce_lock_write() {
     local after
     after="$(shasum -a 256 Cargo.lock 2>/dev/null | cut -d' ' -f1)"
     [ "$after" = "$LOCK_BEFORE" ] && return 0
-        printf '\n  NOTE: the gates rewrote Cargo.lock (a sibling moved).\n' >&2
-        printf '  Commit it as its own lock change, or restore it -- do NOT let it\n' >&2
-        printf '  ride along in a commit about something else:\n' >&2
-        git --no-pager diff --stat -- Cargo.lock >&2
-        # The operator's next question is "should I absorb this?", and the answer
-        # is not in the diff. For a PATH dependency cargo records whatever the
-        # sibling's manifest says ON DISK, so an uncommitted version bump in
-        # someone's working tree rewrites this lock as a side effect -- and CI,
-        # which checks the sibling out at its committed ref, then refuses under
-        # --locked. Local green, CI red, invisible from either side alone.
-        #
-        # CHECK THE MANIFEST, NOT THE REPOSITORY. "Is the sibling dirty" is the
-        # wrong granularity: in a fleet this size someone is nearly always editing
-        # something, so a repo-level rule refuses every legitimate wave and gets
-        # switched off. The only question is whether the MANIFEST THAT MOVED is
-        # published.
-        printf '  Before absorbing, verify the version exists at the published ref:\n' >&2
-        printf '    (cd ../<sibling> && git fetch -q origin \\\n' >&2
-        printf '       && git show origin/master:crates/<pkg>/Cargo.toml | grep "^version")\n' >&2
-        printf '  Match: absorb. Mismatch: someone has an uncommitted bump -- restore\n' >&2
-        printf '  the lock and land without it. A dirty sibling is NOT the test; only\n' >&2
-        printf '  that package manifest is.\n' >&2
+    printf '\n  NOTE: the gates rewrote Cargo.lock.\n' >&2
+    printf '  Review and commit it as a deliberate dependency change, or restore it;\n' >&2
+    printf '  do NOT let it ride along in a commit about something else:\n' >&2
+    git --no-pager diff --stat -- Cargo.lock >&2
 }
 trap announce_lock_write EXIT
 
-step "sibling freshness"
-python3 scripts/sibling-freshness.py
-freshness=$?
-if [ "$freshness" -eq 2 ]; then
-    # Could not check. Refusing rather than continuing: every gate after this
-    # would carry an unknown, and a green run that could not verify its own
-    # premise is the failure this script exists to prevent.
-    fail "the freshness check could not run, so no later result can be trusted"
-elif [ "$freshness" -eq 1 ]; then
-    # A sibling moved after the last build, so cargo may answer from cache.
-    # Forcing the recompile rather than advising it: the advice is correct and
-    # was skipped twice in one day.
-    printf '\n  sibling moved -- forcing a recompile before any gate runs\n'
-    # No depth limit. The first version capped at 3 and missed two files --
-    # including tests/common/mod.rs, the e2e harness's own wire driver, which is
-    # exactly where a protocol change lands. A partial recompile that reports
-    # clean is the failure this script exists to stop.
-    find crates -name '*.rs' -exec touch {} + || fail "could not touch sources"
-fi
-
 step "python instruments compile"
-# Eleven Python instruments live under scripts/ and exactly ONE of them was
-# executed by any automated step, so a syntax error in the other ten would have
-# been discovered by the person who reached for one during an incident. That is
-# the worst possible moment: the tools most likely to sit unrun for weeks are the
-# diagnostic ones, and they are wanted precisely when something else is already
-# wrong. Sub-second, and it fails closed.
+# Compile every Python instrument so diagnostic tools do not first reveal a
+# syntax error when someone needs them during an incident. Sub-second and fails
+# closed when no instruments are found.
 #
-# Compilation only, deliberately. This proves the file will start, not that it is
-# correct -- a linter here would be a second opinion about style, while this
-# answers the one question an incident asks.
+# Compilation only: this checks syntax, not runtime behavior or imports.
 python3 - <<'PYGATE' || fail "a python instrument does not compile"
 import pathlib, py_compile, sys, tempfile
 broken = []
