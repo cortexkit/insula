@@ -37,8 +37,11 @@ def main():
                     for name, spec in dependencies.items():
                         if isinstance(spec, dict) and "path" in spec:
                             record(manifest, name, spec["path"])
-            else:
+            elif section == "workspace":
                 declarations(manifest, values)
+            elif section == "target":
+                for target in values.values():
+                    declarations(manifest, target)
 
     for manifest in manifests:
         with manifest.open("rb") as source:
