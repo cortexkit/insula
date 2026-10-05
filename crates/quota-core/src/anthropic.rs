@@ -656,14 +656,14 @@ fn canonical_account_id(account_id: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn usage_request(url: &str, bearer: &str) -> JsonRequest {
+fn usage_request(url: &str, bearer: &str, user_agent: &str) -> JsonRequest {
     JsonRequest::get(url)
         .timeout(REQUEST_TIMEOUT)
         .bearer(bearer)
         .header(Header::new("Accept", "application/json"))
         .header(Header::new("Content-Type", "application/json"))
         .header(Header::new("anthropic-beta", BETA_HEADER))
-        .header(Header::new("User-Agent", CLAUDE_CODE_UA))
+        .header(Header::new("User-Agent", user_agent))
 }
 
 /// The anthropic usage provider.
@@ -761,113 +761,28 @@ impl AnthropicProvider {
             "{} (external, cli)",
             CLAUDE_CODE_UA.replace("claude-code/", "claude-cli/")
         );
-        let mut response = self
-            .http
-            .get(url)
-            .timeout(REQUEST_TIMEOUT)
-            .bearer_auth(bearer)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .header("anthropic-beta", BETA_HEADER)
-            .header("User-Agent", cli_ua)
-            .send()
-            .await
-            .map_err(crate::http::transport_error)?;
-        let status = response.status().as_u16();
-        // Inspect missing user:profile permission before excerpting a 403: its
-        // diagnosis may occur beyond the 200 characters the shared HTTP helper
-        // publishes. Retain the HTTP status even if
-        // reading a rejected body fails: it still establishes a provider refusal.
-        let mut body = Vec::new();
-        let mut read_error = None;
-        const MAX_BODY: usize = 32 * 1024 * 1024;
-        if (200..300).contains(&status)
-            && response
-                .content_length()
-                .is_some_and(|length| length > MAX_BODY as u64)
-        {
-            return Err(FetchError::Decode(format!(
-                "HTTP response body exceeds {MAX_BODY}-byte safety limit"
-            )));
-        }
-        loop {
-            let chunk = match response.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(error) => {
-                    read_error = Some(crate::http::transport_error(error));
-                    break;
-                }
-            };
-            if chunk.len() > MAX_BODY - body.len() {
-                read_error = Some(FetchError::Decode(format!(
-                    "HTTP response body exceeds {MAX_BODY}-byte safety limit"
-                )));
-                break;
-            }
-            body.extend_from_slice(&chunk);
-            // Read 400/403 bodies before deciding whether ordinary usage is
-            // still permitted. Other refusals keep the shared 8 KiB drain cap.
-            if !(200..300).contains(&status) && status != 400 && status != 403 && body.len() >= 8192
-            {
-                body.truncate(8192);
-                break;
-            }
-        }
-        let retry = status == 400
-            || (status == 403
-                && read_error.is_none()
-                && !std::str::from_utf8(&body).is_ok_and(|body| body.contains("user:profile")));
+        let mut result = usage_request(&url, bearer, &cli_ua)
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await;
+        // The HTTP helper exposes only the first 200 characters of a refusal.
+        // If a 403's missing user:profile permission appears later, retry once:
+        // the ordinary request cannot change token permissions, so it returns
+        // and publishes the same refusal. Anthropic's real scope error is shorter.
+        let retry = matches!(&result, Err(FetchError::ProviderStatus(400, _)))
+            || matches!(&result, Err(FetchError::ProviderStatus(403, excerpt)) if !excerpt.contains("user:profile"));
         if retry {
-            let request = usage_request(&self.usage_url, bearer);
-            return if vault {
-                request
-                    .send_provider_status_first(&self.http, PROVIDER_NAME)
-                    .await
-                    .map(|response| response.body)
-            } else {
-                request.send(&self.http).await
-            };
+            result = usage_request(&self.usage_url, bearer, CLAUDE_CODE_UA)
+                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .await;
         }
-        if !(200..300).contains(&status) {
+        result.map(|response| response.body).map_err(|error| {
             if !vault {
-                if let Some(error) = read_error {
-                    return Err(error);
+                if let FetchError::ProviderStatus(status, excerpt) = error {
+                    return crate::http::status_error(status, excerpt.as_bytes());
                 }
             }
-            let excerpt: String = if read_error.is_some() {
-                String::new()
-            } else {
-                String::from_utf8_lossy(&body)
-                    .trim()
-                    .chars()
-                    .take(200)
-                    .collect()
-            };
-            if vault {
-                return Err(FetchError::ProviderStatus(status, excerpt));
-            }
-            let detail = if excerpt.is_empty() {
-                format!("HTTP {status} (no response body)")
-            } else {
-                format!("HTTP {status}: {excerpt}")
-            };
-            return Err(if status == 401 || status == 403 {
-                FetchError::Unauthorized(detail)
-            } else {
-                FetchError::Upstream(detail)
-            });
-        }
-        if let Some(error) = read_error {
-            return Err(error);
-        }
-        if body.is_empty() {
-            return Err(FetchError::Upstream(format!(
-                "HTTP {status}: {}",
-                crate::http::EMPTY_BODY_MARKER
-            )));
-        }
-        Ok(body)
+            error
+        })
     }
 
     fn report_auth_failure(
@@ -1213,14 +1128,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inventory_403_with_profile_scope_never_retries_even_after_excerpt_boundary() {
-        let body = format!("{} missing user:profile", "scope diagnosis ".repeat(20));
+    async fn inventory_403_with_profile_scope_never_retries() {
+        // This missing user:profile permission error fits the HTTP helper's
+        // 200-character excerpt. A diagnosis beyond that boundary deliberately
+        // incurs one extra ordinary retry without changing token permissions.
+        let body = SCOPE_REFUSAL.to_string();
         let (attempt, requests, reports) = inventory_fetch(vec![(403, body.clone())]).await;
         assert_eq!(requests.len(), 1);
         assert!(reports.lock().unwrap().is_empty());
         assert!(
-            matches!(attempt.usage, Err(FetchError::ProviderStatus(403, excerpt)) if excerpt == body.chars().take(200).collect::<String>())
+            matches!(attempt.usage, Err(FetchError::ProviderStatus(403, excerpt)) if excerpt == body)
         );
+    }
+
+    const SCOPE_REFUSAL: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement user:profile"}}"#;
+
+    #[tokio::test]
+    async fn local_inventory_403_keeps_unauthorized_classification_and_scope_refusal() {
+        let (url, request) = serve_once(403, SCOPE_REFUSAL.as_bytes().to_vec()).await;
+        let (source, reports) = source(Ok(credential(b"synthetic-reset-token", 44)));
+        let attempt = test_provider(source, url)
+            .fetch_local_bearer("implicit", "synthetic-reset-token")
+            .await;
+        assert!(
+            matches!(attempt.usage, Err(FetchError::Unauthorized(detail)) if detail == format!("HTTP 403: {SCOPE_REFUSAL}"))
+        );
+        assert!(request
+            .await
+            .unwrap()
+            .starts_with("GET /usage?cedar_ember=1 HTTP/1.1\r\n"));
+        assert!(reports.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
