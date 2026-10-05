@@ -159,6 +159,18 @@ fn status_detail(status: u16, body: &[u8]) -> String {
     }
 }
 
+/// Classify a rejected HTTP response using the same policy as `JsonRequest::send`.
+/// Status-first callers can apply this after making their provider-specific retry
+/// decision, without duplicating authentication classification or excerpt wording.
+pub(crate) fn status_error(status: u16, body: &[u8]) -> FetchError {
+    let detail = status_detail(status, body);
+    if status == 401 || status == 403 {
+        FetchError::Unauthorized(detail)
+    } else {
+        FetchError::Upstream(detail)
+    }
+}
+
 fn refusal_excerpt(body: &[u8]) -> String {
     String::from_utf8_lossy(body)
         .trim()
@@ -501,9 +513,7 @@ impl JsonRequest {
             // the rejected credential back, so the obligation stated there -- check
             // what a new provider's non-2xx bodies contain -- now covers the auth
             // statuses too, and matters more there.
-            return Err(FetchError::Unauthorized(status_detail(
-                raw.status, &raw.body,
-            )));
+            return Err(status_error(raw.status, &raw.body));
         }
         if !(200..300).contains(&raw.status) {
             // THE EXCERPT IS UNREDACTED BY CONSTRUCTION, and it reaches the wire
@@ -528,7 +538,7 @@ impl JsonRequest {
             // people to distrust the field. The rule instead is a REVIEW POINT --
             // when adding a provider whose payload carries credentials, check
             // what its non-2xx bodies contain before routing it through here.
-            return Err(FetchError::Upstream(status_detail(raw.status, &raw.body)));
+            return Err(status_error(raw.status, &raw.body));
         }
         raw.body_for_parsing()?;
         Ok(raw)
