@@ -462,11 +462,13 @@ Commits touching only tests or documentation change no runtime behaviour, and
 `buildCommit` will legitimately lag `HEAD` after them, so a difference is not
 by itself a pending deploy.
 
-To decide, use the pinned-stamp hash comparison above. Do not filter the file
-list by name: which paths hold test code is exactly the judgement that section
-explains is unreliable here, and a filter that misses one arrangement reports a
-runtime change as tests. Reading the diff is for understanding *what* changed
-once the hashes already say *whether* it matters.
+To decide, compare runtime source, not binary hashes: see "The pinned-stamp hash
+comparison is BROKEN and must not be used" below, which explains why two builds
+at different commits always hash differently and gives the source comparison to
+use instead. Count changed non-comment lines outside test modules in
+`crates/*/src/`, and confirm the counter can return non-zero, because a failed
+filter also prints `0`. For a dependency change, ask whether the crate appears in
+`cargo tree -e normal -p quota-module` at all.
 
 If you do glance at the file list first, read it — do not gate on it. A pipeline
 like `git diff --name-only … | grep -v tests.rs` returns **grep's** exit status,
