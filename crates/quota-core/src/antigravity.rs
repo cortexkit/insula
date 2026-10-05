@@ -3327,13 +3327,9 @@ mod plugin_lane_tests {
         }
     }
 
-    /// The masked OAuth constants unmask to the plugin's real client.
-    ///
-    /// A refresh token is bound to the client that minted it, so an unmasking
-    /// error does not degrade gracefully -- it returns 401 from a healthy
-    /// credential, which reads as a dead login. Pinned against literals rather
-    /// than against the masking function, or the test would pass for any pair
-    /// that round-trips.
+    /// The Hub user agent's platform and architecture spellings, including the
+    /// two choices CodexBar doesn't make: `windows`, and the fallbacks for
+    /// targets it never names.
     #[test]
     fn hub_identity_maps_supported_platforms_and_architectures() {
         assert_eq!(hub_target("macos", "aarch64"), ("darwin", "arm64"));
@@ -3366,6 +3362,13 @@ mod plugin_lane_tests {
         );
     }
 
+    /// The masked OAuth constants unmask to the plugin's real client.
+    ///
+    /// A refresh token is bound to the client that minted it, so an unmasking
+    /// error does not degrade gracefully -- it returns 401 from a healthy
+    /// credential, which reads as a dead login. Pinned against literals rather
+    /// than against the masking function, or the test would pass for any pair
+    /// that round-trips.
     #[test]
     fn the_masked_oauth_client_unmasks_to_the_plugin_pair() {
         assert_eq!(
