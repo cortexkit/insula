@@ -14,33 +14,32 @@ scripts/gates.sh          # fmt, clippy, unit tests
 scripts/gates.sh --e2e    # also the integration suites, ~80s more
 ```
 
-That runs the steps below in order and stops at the first failure. **Use it
-rather than the individual commands**: the ordering is load-bearing and this
-document said so for weeks while two breaks still reached master, because an
-ordering that depends on remembering is not an ordering. A stale sibling now
-triggers the forced recompile inside the script instead of printing advice at
-the moment of least suspicion.
+That runs the checks together and stops at the first failure. Use it rather
+than a partial list of individual commands: it also checks Python and shell
+instruments, repository path dependencies (using Python 3.11+ for TOML),
+endpoint hosts, CI push triggers for `master` and `train/**` branches (which
+must both produce checks before a tested train can land), the newest stable clippy,
+unit tests, doctests, and orphan modules.
 
-What it runs:
+### Updating subc dependencies
+
+`subc-protocol`, `subc-transport`, `subc-daemon`, `subc-jsonc`, and `subc-os`
+come from crates.io, pinned by `Cargo.lock`.
+A sibling release does not change this workspace's dependency graph. To take
+an upgrade, run `cargo update -p <crate>`; for a new minor, bump its requirement
+in the root `Cargo.toml` first. Review the lock diff and the runtime versions in
+`cargo tree -e normal -p quota-module`, then run:
 
 ```bash
-python3 scripts/sibling-freshness.py                              # see below
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings             # must be 0
-cargo test --workspace --lib --bins
+scripts/gates.sh
+cargo check --locked --workspace --all-targets
+cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
 ```
 
-### Why the freshness check comes first
-
-This workspace path-depends on `../subconscious`. That repo can change while
-nothing in this tree does, and then cargo has nothing to redo and reports a
-cached `0` — which is not the same as nothing being wrong. That put a compile
-break on master on 2026-08-16, found by CI, which always builds cold.
-
-`scripts/sibling-freshness.py` exits 1 when a sibling's HEAD is newer than this
-workspace's newest build artifact, and prints the forced-recompile command. It
-does not claim the sibling change breaks anything — the answer is "your cache may
-predate a change".
+Land the manifest/lock change only after these pass. The real-daemon test still
+needs `../subconscious`: it builds that checkout's `ck-subc` daemon binary to
+verify process supervision and routing against the current daemon, not just the registry's dev-only in-process
+`subc-daemon`. Ordinary builds and non-ignored tests need no sibling checkout.
 
 ### Integration tests need their binaries built first
 

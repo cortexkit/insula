@@ -199,7 +199,7 @@ echo "$out" | grep -E '\->|GH006|required status' | sed 's/^/  /'
       #
       # This printed only `origin/master` after the push, which is a TRUE sha
       # answering a question nobody asked. A train usually carries more than one
-      # commit -- a change plus a lock absorb is the common shape here -- and the
+      # commit -- a change plus a dependency update, for example -- and the
       # tip is whichever went last, not the one the run was about.
       #
       # I quoted that tip to a peer as the sha carrying a wire pin. It was the lock

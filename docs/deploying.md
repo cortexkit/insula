@@ -102,32 +102,28 @@ what production publishes.
 
 ## Before claiming a gate result
 
-`cargo clippy --workspace --all-targets -- -D warnings` reporting `0` means
-cargo found nothing to redo, which is not the same as nothing being wrong. This
-workspace path-depends on `../subconscious`, so that repo can change while
-nothing in this tree does — and then a cached clean answer is reported as a gate
-result while CI, which always builds cold, fails on a compile error. That
-happened on 2026-08-16 and put a compile break on master.
-
-Run `python3 scripts/sibling-freshness.py` first. It exits 1 when a sibling
-repository's HEAD is newer than this workspace's newest build artifact, and
-prints the forced-recompile command. It does not check whether the sibling
-change breaks anything — it cannot, and the honest answer is "your cache may
-predate a change", not "you are broken".
+Run `scripts/gates.sh` and `cargo check --locked --workspace --all-targets`.
+The published subc crates are registry dependencies pinned in `Cargo.lock`, so
+changes in `../subconscious` no longer require a freshness check or forced
+recompile. To upgrade, run `cargo update -p <crate>` (bump the root manifest
+requirement for a new minor), review the runtime dependency tree, then run the
+gates and `cargo test -p quota-module --test it -- --ignored real_daemon_e2e::`
+before landing. Only that real-daemon test needs the sibling checkout to build
+`ck-subc`; see [Verifying a change](verifying.md).
 
 Related trap, same family: `cargo test --test <name>` does NOT rebuild the
 binaries an integration test spawns. A stale `ck-insula` fails registration with
 no error output at all, which reads as a hang rather than a build problem. Build
 the bins before running the e2e suites.
 
-### Absorbing a lock wave: do NOT reach for a hash comparison here
+### Updating dependencies: do NOT reach for a hash comparison here
 
 This is the step where the retired pinned-stamp check gets reinvented, and it was
 reinvented HERE on 2026-09-04 by the author of the section that retires it -- see
 "The pinned-stamp hash comparison is BROKEN" below, which already names every
 reason it cannot work AND already says not to substitute the lock digest.
 
-The pull is specific to this step. A wave notice says "no code change", the
+The pull is specific to this step. A dependency update says "no code change", the
 question "then does my binary change?" is exactly the right one to ask, and a
 hash comparison looks like the way to answer it. It is not: two embedded stamps
 move on their own. `CK_QUOTA_PROVENANCE_SHA` differs between a dirty tree and a
@@ -139,7 +135,8 @@ the lock differs, which is the premise of the comparison.
 SO A LOCK BUMP ALWAYS CHANGES THE BINARY, trivially and by construction, and that
 fact carries no information about whether behaviour changed.
 
-The question a lock wave actually poses is whether anything that SHIPS moved:
+The question a dependency update actually poses is whether runtime code or a
+dependency included in the shipped module changed:
 
     cargo tree -p quota-module -e normal | grep <crate>   # zero edges = it does not ship
     git diff <deployed>..HEAD -- crates/                  # did our own runtime code move

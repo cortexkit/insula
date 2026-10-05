@@ -15,24 +15,10 @@ on:
     # ruling, so nothing would trigger.
     branches: [master, 'train/**']
   pull_request:
-  # A DAILY RUN ASKS A QUESTION NO PUSH GATE CAN ASK.
-  #
-  # The push gate asks "is this change good". This asks "is what already landed
-  # still good against the world as it is now" -- and only the second has an
-  # answer that changes on its own. This workflow checks out `cortexkit/subconscious`
-  # with NO `ref:`, so every run resolves that sibling's default branch at the
-  # moment it runs, and `--locked` refuses when the committed lock no longer
-  # matches. A green sha therefore means green AGAINST THE SIBLINGS AT RUN TIME,
-  # which is a narrower guarantee than "this sha is good".
-  #
-  # Not hypothetical here: four lock waves landed in a single day, and each one is
-  # a window in which master goes red with no commit of mine responsible. Without
-  # this, that red first appears on my NEXT push, attached to an unrelated change,
-  # and reads as that change having broken something.
-  #
-  # Evidence from a peer on the same fleet: identical sha, push run success at
-  # 07:59 and scheduled run failure at 11:14, nothing in their repository moved.
-  # The scheduled run is the only thing that re-asks the question.
+  # Daily runs check landed code against the world as it is now: a new stable
+  # Rust/clippy can add lints (as on 2026-09-28), and real_daemon_e2e builds ck-subc
+  # from subconscious's current default branch. Registry dependencies stay pinned
+  # in Cargo.lock; sibling releases no longer invalidate the committed lock.
   schedule:
     - cron: '17 6 * * *'
   workflow_call:
@@ -80,8 +66,8 @@ jobs:
   # The #[ignore] tests split into two groups for two different reasons, and only
   # one of them is a CI limit. The live provider proofs need real credentials and
   # macOS desktop state, so they cannot run here. real_daemon_e2e needs only the
-  # sibling daemon, which this job already checks out and already compiles since
-  # subc-core is a dev-dep, so it runs in its own step below.
+  # sibling's ck-subc binary, built by the test from the checkout below, so it
+  # runs in its own step.
   #
   # Runners are GitHub-hosted. They were Blacksmith while this repo was private,
   # because GitHub bills private-repo Actions minutes against a free-plan org that
@@ -150,10 +136,9 @@ jobs:
         working-directory: insula
         run: ./scripts/check-train-preconditions.sh
 
-      # quota-module path-deps the cortexkit/subconscious sibling (subc-protocol,
-      # subc-transport, plus subc-core as a dev-dep), and only that sibling. It is
-      # public, so no token is needed. The path-dep layout is ../subconscious
-      # relative to the workspace, so check the sibling out next to insula.
+      # Only real_daemon_e2e needs this public sibling checkout: it builds the
+      # ck-subc binary from ../subconscious to test against subconscious master.
+      # Compiling insula itself uses crates.io and does not need the sibling.
       - name: Checkout subconscious
         uses: actions/checkout@v5
         with:
@@ -167,25 +152,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      # NOTHING ELSE HERE VERIFIES THE COMMITTED LOCK, which was invisible until
-      # someone asked where the lock check lives in CI. Every cargo invocation
-      # below runs WITHOUT `--locked`, so each one silently RESOLVES a fresh
-      # dependency graph -- a green run is evidence that some graph builds, not
-      # that the graph this repository pins builds.
-      #
-      # The gap has two halves and neither was covered. A lock left behind by an
-      # unabsorbed sibling bump passes; and a lock the local gate REWROTE and a
-      # commit swept in (ten times in this history) also passes, because CI
-      # re-resolves to the same answer the sweep produced.
-      #
-      # Its own step rather than `--locked` on the test job, deliberately. A
-      # stale lock is a LOCK-BEHIND fact, which is not the same as the code being
-      # wrong -- folding it into the test run would report a dependency-freshness
-      # condition as a test failure and send a reader to the wrong place.
-      #
-      # Measured before adding: over the last twelve commits here, exactly one
-      # was pushed with a lock behind its sibling. So this fires rarely enough to
-      # mean something when it does, and the fix is one `cargo update -p <crate>`.
+      # NOTHING ELSE HERE VERIFIES THE COMMITTED LOCK. The cargo invocations below
+      # run without --locked and can resolve a new graph if a manifest requirement
+      # changes. Check that the graph we actually commit resolves, independently
+      # of test results. After a deliberate dependency update, regenerate the lock
+      # with `cargo update -p <crate>` and commit it with the requirement change.
       - name: Committed lock resolves
         run: cargo check --locked --workspace --all-targets
 
