@@ -1,15 +1,14 @@
-//! Anthropic (claude) usage fetcher — the OAuth-bearer archetype, 2nd instance.
+//! Anthropic (Claude) OAuth usage fetcher.
 //!
-//! This is the deliberate 2nd spike: it shares codex's "OAuth bearer → one GET →
-//! decode JSON" skeleton but differs on every detail that could break the
-//! abstraction, which is exactly why it validates it:
+//! Reads account-specific rate windows and optional display inventory:
 //!   - Implicit-local session source: opencode's unified auth.json (`anthropic`
 //!     OAuth entry), NOT a provider-native file. Vault handles use the bare bearer
 //!     bytes served by the injected credential source. CodexBar reads the macOS
 //!     Keychain; we prefer
 //!     opencode's cross-platform store, which already holds the same token.
-//!   - Endpoint: `GET https://api.anthropic.com/api/oauth/usage` with the beta
-//!     header `anthropic-beta: oauth-2025-04-20` and a `claude-code/<ver>` UA.
+//!   - Endpoint: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`
+//!     with the beta header and a Claude CLI identity; unsupported inventory
+//!     requests fall back once to the ordinary Claude Code identity.
 //!   - Response: NAMED windows (`five_hour`, `seven_day`, `seven_day_sonnet`, ...)
 //!     where `utilization` is ALREADY a 0-100 percent and `resets_at` is ALREADY
 //!     ISO 8601 — unlike codex's int-percent + epoch. So normalization is a
@@ -33,7 +32,8 @@ use crate::LOG_TAG;
 use crate::{
     http::{Header, JsonRequest},
     model::{
-        Amount, BreakdownRow, Pool, PoolBasis, PoolFunding, RateWindow, Usage, UsageBreakdown,
+        Amount, BreakdownRow, CreditExpiry, Pool, PoolBasis, PoolFunding, RateWindow, SavedResets,
+        Usage, UsageBreakdown,
     },
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
@@ -82,6 +82,8 @@ struct OAuthUsageResponse {
     /// Held as raw JSON for the same reason as `spend`: a shape this decoder
     /// does not expect costs the split and never the rate windows.
     seven_day_breakdown: Option<serde_json::Value>,
+    /// Optional display inventory; unreadable data never invalidates windows.
+    cedar_ember: Option<serde_json::Value>,
 }
 
 /// The `seven_day_breakdown` object. Every field is optional because none of
@@ -495,9 +497,20 @@ fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> 
 fn normalize_with_overage(
     body: &[u8],
 ) -> Result<(Usage, Result<Option<Pool>, OverageRefusal>), FetchError> {
+    normalize_inventory(body).map(|(usage, pool, _)| (usage, pool))
+}
+
+type NormalizedInventory = (
+    Usage,
+    Result<Option<Pool>, OverageRefusal>,
+    Result<Option<SavedResets>, &'static str>,
+);
+
+fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
     let response: OAuthUsageResponse =
         crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
             .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
+    let resets = saved_resets(response.cedar_ember, chrono::Utc::now());
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
         primary: to_window(
@@ -526,7 +539,7 @@ fn normalize_with_overage(
         ),
         extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
     };
-    Ok((usage, pool))
+    Ok((usage, pool, resets))
 }
 
 /// A successful attempt carrying the windows and, when there is one, the pool.
@@ -545,6 +558,98 @@ fn success_attempt(
     attempt
 }
 
+/// Count unpaused, started, unexpired resets on eligible accounts, bounded to
+/// 200 grant records and 50 resets as in CodexBar v0.72.0. Identifiers and
+/// `usable_now` are not read: this is inventory, not redemption eligibility.
+fn saved_resets(
+    raw: Option<serde_json::Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<SavedResets>, &'static str> {
+    let Some(raw) = raw else { return Ok(None) };
+    let eligible = raw
+        .get("eligible")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("eligible")?;
+    let grants = raw
+        .get("grants")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("grants")?;
+    if grants.len() > 200 {
+        return Err("grants");
+    }
+    if !eligible {
+        return Ok(None);
+    }
+    let mut count = 0u32;
+    let mut expiries = Vec::new();
+    for raw in grants {
+        let Ok(grant) = serde_json::from_value::<ResetGrant>(raw.clone()) else {
+            continue;
+        };
+        if grant.resets_left < 0
+            || grant
+                .resets_total
+                .is_some_and(|total| total < grant.resets_left)
+        {
+            continue;
+        }
+        let (Ok(starts), Ok(ends)) = (reset_bound(grant.starts_at), reset_bound(grant.ends_at))
+        else {
+            continue;
+        };
+        // Paused, future and expired grants are unavailable; usable_now does not
+        // affect the saved inventory, even when redemption is currently gated.
+        if grant.paused
+            || grant.resets_left == 0
+            || starts.is_some_and(|date| date > now)
+            || ends.is_some_and(|date| date <= now)
+        {
+            continue;
+        }
+        if grant.resets_left > i64::from(50 - count) {
+            return Err("resets_left");
+        }
+        count += grant.resets_left as u32;
+        if let Some(end) = ends {
+            expiries.extend(std::iter::repeat_n(end, grant.resets_left as usize));
+        }
+    }
+    // CodexBar omits empty usable inventories. Keep that absence on the wire
+    // instead of turning an unknown or unusable grant count into a zero claim.
+    if count == 0 {
+        return Ok(None);
+    }
+    expiries.sort_unstable();
+    Ok(Some(SavedResets {
+        available_count: count,
+        soonest_expires_at: expiries.first().copied().map(crate::rfc3339_canonical),
+        credits: expiries
+            .into_iter()
+            .map(|date| CreditExpiry {
+                expires_at: crate::rfc3339_canonical(date),
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ResetGrant {
+    resets_left: i64,
+    resets_total: Option<i64>,
+    starts_at: Option<String>,
+    ends_at: Option<String>,
+    paused: bool,
+}
+
+fn reset_bound(raw: Option<String>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
+    raw.map(|raw| {
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|date| date.with_timezone(&chrono::Utc))
+            .map_err(|_| ())
+    })
+    .transpose()
+}
+
 fn canonical_account_id(account_id: Option<String>) -> Option<String> {
     account_id
         .map(|value| value.trim().to_string())
@@ -555,6 +660,8 @@ fn usage_request(url: &str, bearer: &str) -> JsonRequest {
     JsonRequest::get(url)
         .timeout(REQUEST_TIMEOUT)
         .bearer(bearer)
+        .header(Header::new("Accept", "application/json"))
+        .header(Header::new("Content-Type", "application/json"))
         .header(Header::new("anthropic-beta", BETA_HEADER))
         .header(Header::new("User-Agent", CLAUDE_CODE_UA))
 }
@@ -568,6 +675,7 @@ pub struct AnthropicProvider {
     /// The last `spend` refusal logged per handle stable id; a handle whose
     /// `spend` is readable or unstated has no entry. See [`refusal_needs_log`].
     overage_refusals: Mutex<HashMap<String, RefusalReason>>,
+    reset_refusals: Mutex<HashMap<String, &'static str>>,
 }
 
 impl AnthropicProvider {
@@ -581,6 +689,7 @@ impl AnthropicProvider {
             handle_loader,
             usage_url: USAGE_URL.to_string(),
             overage_refusals: Mutex::new(HashMap::new()),
+            reset_refusals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -616,6 +725,151 @@ impl AnthropicProvider {
         overage.unwrap_or(None)
     }
 
+    fn settle_resets(
+        &self,
+        handle_id: &str,
+        resets: Result<Option<SavedResets>, &'static str>,
+    ) -> Option<SavedResets> {
+        let current = resets.as_ref().err().copied();
+        let mut refusals = self
+            .reset_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refusals.get(handle_id).copied() != current {
+            if let Some(field) = current {
+                eprintln!("{LOG_TAG} warning: anthropic cedar_ember unreadable ({handle_id}): {field}; no saved resets published");
+            }
+        }
+        match current {
+            Some(field) => {
+                refusals.insert(handle_id.to_string(), field);
+            }
+            None => {
+                refusals.remove(handle_id);
+            }
+        }
+        resets.unwrap_or(None)
+    }
+
+    /// The optional query and CLI identity are rejected by some accounts or tiers.
+    /// Retry only 400 and non-profile-scope 403, once, with the ordinary identity.
+    /// 401 cannot change authentication; retrying 429 would spend Anthropic's
+    /// per-account usage endpoint rate limit without helping the caller.
+    async fn inventory_body(&self, bearer: &str, vault: bool) -> Result<Vec<u8>, FetchError> {
+        let url = format!("{}?cedar_ember=1", self.usage_url);
+        let cli_ua = format!(
+            "{} (external, cli)",
+            CLAUDE_CODE_UA.replace("claude-code/", "claude-cli/")
+        );
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .bearer_auth(bearer)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("anthropic-beta", BETA_HEADER)
+            .header("User-Agent", cli_ua)
+            .send()
+            .await
+            .map_err(crate::http::transport_error)?;
+        let status = response.status().as_u16();
+        // Inspect missing user:profile permission before excerpting a 403: its
+        // diagnosis may occur beyond the 200 characters the shared HTTP helper
+        // publishes. Retain the HTTP status even if
+        // reading a rejected body fails: it still establishes a provider refusal.
+        let mut body = Vec::new();
+        let mut read_error = None;
+        const MAX_BODY: usize = 32 * 1024 * 1024;
+        if (200..300).contains(&status)
+            && response
+                .content_length()
+                .is_some_and(|length| length > MAX_BODY as u64)
+        {
+            return Err(FetchError::Decode(format!(
+                "HTTP response body exceeds {MAX_BODY}-byte safety limit"
+            )));
+        }
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => {
+                    read_error = Some(crate::http::transport_error(error));
+                    break;
+                }
+            };
+            if chunk.len() > MAX_BODY - body.len() {
+                read_error = Some(FetchError::Decode(format!(
+                    "HTTP response body exceeds {MAX_BODY}-byte safety limit"
+                )));
+                break;
+            }
+            body.extend_from_slice(&chunk);
+            // Read 400/403 bodies before deciding whether ordinary usage is
+            // still permitted. Other refusals keep the shared 8 KiB drain cap.
+            if !(200..300).contains(&status) && status != 400 && status != 403 && body.len() >= 8192
+            {
+                body.truncate(8192);
+                break;
+            }
+        }
+        let retry = status == 400
+            || (status == 403
+                && read_error.is_none()
+                && !std::str::from_utf8(&body).is_ok_and(|body| body.contains("user:profile")));
+        if retry {
+            let request = usage_request(&self.usage_url, bearer);
+            return if vault {
+                request
+                    .send_provider_status_first(&self.http, PROVIDER_NAME)
+                    .await
+                    .map(|response| response.body)
+            } else {
+                request.send(&self.http).await
+            };
+        }
+        if !(200..300).contains(&status) {
+            if !vault {
+                if let Some(error) = read_error {
+                    return Err(error);
+                }
+            }
+            let excerpt: String = if read_error.is_some() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&body)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect()
+            };
+            if vault {
+                return Err(FetchError::ProviderStatus(status, excerpt));
+            }
+            let detail = if excerpt.is_empty() {
+                format!("HTTP {status} (no response body)")
+            } else {
+                format!("HTTP {status}: {excerpt}")
+            };
+            return Err(if status == 401 || status == 403 {
+                FetchError::Unauthorized(detail)
+            } else {
+                FetchError::Upstream(detail)
+            });
+        }
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        if body.is_empty() {
+            return Err(FetchError::Upstream(format!(
+                "HTTP {status}: {}",
+                crate::http::EMPTY_BODY_MARKER
+            )));
+        }
+        Ok(body)
+    }
+
     fn report_auth_failure(
         &self,
         handle: &CredentialHandle,
@@ -631,17 +885,18 @@ impl AnthropicProvider {
     }
 
     async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {
-        let result = usage_request(&self.usage_url, bearer)
-            .send(&self.http)
+        let result = self
+            .inventory_body(bearer, false)
             .await
-            .and_then(|body| normalize_with_overage(&body));
+            .and_then(|body| normalize_inventory(&body));
         match result {
-            Ok((usage, overage)) => success_attempt(
+            Ok((usage, overage, resets)) => success_attempt(
                 Some(AccountObservation::new(None, None)),
                 "oauth",
                 usage,
                 self.settle_overage(handle_id, overage),
-            ),
+            )
+            .with_saved_resets(self.settle_resets(handle_id, resets)),
             Err(error) => FetchAttempt::failure(None, None, error),
         }
     }
@@ -682,18 +937,19 @@ impl AnthropicProvider {
             Err(error) => return FetchAttempt::failure(observed, None, error),
         };
 
-        let result = usage_request(&self.usage_url, &bearer)
-            .send_provider_status_first(&self.http, PROVIDER_NAME)
+        let result = self
+            .inventory_body(&bearer, true)
             .await
-            .map(|response| response.body)
-            .and_then(|body| normalize_with_overage(&body));
+            .and_then(|body| normalize_inventory(&body));
         if let Err(error) = &result {
             self.report_auth_failure(handle, record_version, error);
         }
         match result {
-            Ok((usage, overage)) => {
+            Ok((usage, overage, resets)) => {
                 let pool = self.settle_overage(handle_id, overage);
-                success_attempt(observed, "vault", usage, pool).with_account_info(account_info)
+                success_attempt(observed, "vault", usage, pool)
+                    .with_account_info(account_info)
+                    .with_saved_resets(self.settle_resets(handle_id, resets))
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
@@ -847,6 +1103,302 @@ mod tests {
     async fn serve_once(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
         let (base, task) = crate::loopback::serve_once(status, body).await;
         (format!("{base}/usage"), task)
+    }
+
+    async fn inventory_fetch(
+        responses: Vec<(u16, String)>,
+    ) -> (FetchAttempt, Vec<String>, Reports) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let server_stop = stop.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = server_stop.cancelled() => break,
+                    result = listener.accept() => result.unwrap(),
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                let (status, body) = responses
+                    .get(requests.len())
+                    .cloned()
+                    .unwrap_or((500, "unexpected retry".into()));
+                requests.push(request);
+                let response = format!("HTTP/1.1 {status} Response\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let (source, reports) = source(Ok(credential(b"synthetic-reset-token", 44)));
+        let attempt = test_provider(source, url)
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ))
+            .await;
+        // Yield so the asynchronously dispatched vault auth-failure report
+        // can reach the mock before the test examines its recorded calls.
+        tokio::task::yield_now().await;
+        stop.cancel();
+        (attempt, server.await.unwrap(), reports)
+    }
+
+    fn inventory_payload(block: Option<serde_json::Value>) -> String {
+        let mut body = serde_json::json!({
+            "five_hour": {"utilization":12,"resets_at":"2099-01-01T00:00:00Z"},
+            "seven_day": {"utilization":48,"resets_at":"2099-01-02T00:00:00Z"},
+            "seven_day_breakdown": {"rows":[{"key":"claude_code","percent":100}]},
+            "extra_usage": {"is_enabled":true,"monthly_limit":1000,"used_credits":300}
+        });
+        if let Some(block) = block {
+            body["cedar_ember"] = block;
+        }
+        body.to_string()
+    }
+
+    // Synthetic eligible grants, including paused, expired and future grants,
+    // derived from CodexBar v0.72.0
+    // Tests/CodexBarTests/ClaudeOAuthResetCreditsTests.swift's eligibleBlock.
+    // No live cedar_ember capture is available yet.
+    fn eligible_inventory() -> serde_json::Value {
+        serde_json::json!({"eligible":true,"grants":[
+            {"id":"redemption-handle","label":"private grant","resets_left":2,"resets_total":2,
+             "starts_at":"2020-01-01T00:00:00Z","ends_at":"2099-01-01T00:00:00Z","paused":false,"usable_now":false},
+            {"resets_left":1,"paused":true},
+            {"resets_left":1,"paused":false,"ends_at":"2020-01-01T00:00:00Z"},
+            {"resets_left":1,"paused":false,"starts_at":"2099-01-01T00:00:00Z"}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn first_request_opts_into_inventory_with_external_cli_identity() {
+        let (attempt, requests, _) =
+            inventory_fetch(vec![(200, inventory_payload(Some(eligible_inventory())))]).await;
+        assert!(attempt.usage.is_ok());
+        assert_eq!(requests.len(), 1);
+        let request = requests[0].to_ascii_lowercase();
+        assert!(request.starts_with("get /usage?cedar_ember=1 http/1.1\r\n"));
+        assert!(request.contains("user-agent: claude-cli/2.1.0 (external, cli)\r\n"));
+        assert!(request.contains("authorization: bearer synthetic-reset-token\r\n"));
+        assert!(request.contains("anthropic-beta: oauth-2025-04-20\r\n"));
+        assert!(request.contains("accept: application/json\r\n"));
+        assert!(request.contains("content-type: application/json\r\n"));
+    }
+
+    async fn assert_inventory_fallback(status: u16) {
+        let (attempt, requests, _) = inventory_fetch(vec![
+            (status, "unsupported inventory".into()),
+            (200, inventory_payload(None)),
+        ])
+        .await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /usage HTTP/1.1\r\n"));
+        assert!(requests[1].contains("user-agent: claude-code/2.1.0\r\n"));
+        assert!(requests[1].contains("authorization: Bearer synthetic-reset-token\r\n"));
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
+    }
+
+    #[tokio::test]
+    async fn inventory_400_retries_once_with_ordinary_identity_and_publishes_retry_windows() {
+        assert_inventory_fallback(400).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_403_without_profile_scope_retries_once() {
+        assert_inventory_fallback(403).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_403_with_profile_scope_never_retries_even_after_excerpt_boundary() {
+        let body = format!("{} missing user:profile", "scope diagnosis ".repeat(20));
+        let (attempt, requests, reports) = inventory_fetch(vec![(403, body.clone())]).await;
+        assert_eq!(requests.len(), 1);
+        assert!(reports.lock().unwrap().is_empty());
+        assert!(
+            matches!(attempt.usage, Err(FetchError::ProviderStatus(403, excerpt)) if excerpt == body.chars().take(200).collect::<String>())
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_401_never_retries_and_reports_vault_auth_failure_once() {
+        let (attempt, requests, reports) =
+            inventory_fetch(vec![(401, "expired token".into())]).await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(attempt.usage, Err(FetchError::ProviderStatus(401, body)) if body == "expired token")
+        );
+        assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
+    }
+
+    #[tokio::test]
+    async fn inventory_429_never_retries_and_keeps_rate_limit_status_and_excerpt() {
+        let (attempt, requests, reports) = inventory_fetch(vec![
+            (429, "per-account rate limit".into()),
+            (200, inventory_payload(None)),
+        ])
+        .await;
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(attempt.usage, Err(FetchError::ProviderStatus(429, body)) if body == "per-account rate limit")
+        );
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inventory_fallback_refusal_publishes_retry_status_and_never_retries_twice() {
+        for status in [400, 403, 401, 429, 500] {
+            let (attempt, requests, reports) = inventory_fetch(vec![
+                (400, "optional inventory refused".into()),
+                (status, "ordinary usage refused".into()),
+            ])
+            .await;
+            assert_eq!(requests.len(), 2);
+            assert!(
+                matches!(attempt.usage, Err(FetchError::ProviderStatus(code, body)) if code == status && body == "ordinary usage refused")
+            );
+            assert_eq!(reports.lock().unwrap().len(), usize::from(status == 401));
+        }
+    }
+
+    #[tokio::test]
+    async fn present_inventory_publishes_available_count_and_expiries_without_relaxing_windows() {
+        let (attempt, _, _) =
+            inventory_fetch(vec![(200, inventory_payload(Some(eligible_inventory())))]).await;
+        let saved = attempt.saved_resets.unwrap();
+        assert_eq!(saved.available_count, 2);
+        assert_eq!(
+            saved.soonest_expires_at.as_deref(),
+            Some("2099-01-01T00:00:00.000000000+00:00")
+        );
+        assert_eq!(saved.credits.len(), 2);
+        assert!(saved
+            .credits
+            .iter()
+            .all(|credit| credit.expires_at == "2099-01-01T00:00:00.000000000+00:00"));
+        let primary = attempt.usage.unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 12.0);
+        assert_eq!(primary.raw_used_percent, None);
+    }
+
+    #[tokio::test]
+    async fn absent_inventory_publishes_no_saved_resets_not_zero() {
+        let (attempt, _, _) = inventory_fetch(vec![(200, inventory_payload(None))]).await;
+        assert!(attempt.saved_resets.is_none());
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
+    }
+
+    #[tokio::test]
+    async fn malformed_inventory_publishes_no_saved_resets_and_preserves_rate_windows() {
+        for block in [
+            serde_json::json!({}),
+            serde_json::json!({"eligible":true}),
+            serde_json::json!({"eligible":true,"grants":"unreadable"}),
+            serde_json::json!({"eligible":"yes","grants":[]}),
+        ] {
+            let (attempt, _, _) =
+                inventory_fetch(vec![(200, inventory_payload(Some(block)))]).await;
+            assert!(attempt.saved_resets.is_none());
+            assert_eq!(
+                serde_json::to_value(attempt.usage.unwrap()).unwrap(),
+                serde_json::to_value(normalize_usage(inventory_payload(None).as_bytes()).unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_grants_are_skipped_without_hiding_valid_grants() {
+        let mut block = eligible_inventory();
+        block["grants"].as_array_mut().unwrap().extend([
+            serde_json::json!({"resets_left":1}),
+            serde_json::json!({"resets_left":-1,"paused":false}),
+            serde_json::json!({"resets_left":3,"resets_total":2,"paused":false}),
+            serde_json::json!({"resets_left":1,"paused":false,"ends_at":"invalid"}),
+            serde_json::json!({"resets_left":1,"paused":false,"starts_at":42}),
+            serde_json::json!("broken grant"),
+        ]);
+        assert_eq!(
+            saved_resets(Some(block), chrono::Utc::now())
+                .unwrap()
+                .unwrap()
+                .available_count,
+            2
+        );
+    }
+
+    #[test]
+    fn inventory_bounds_and_unknown_counts_never_become_zero() {
+        let now = chrono::Utc::now();
+        for block in [
+            serde_json::json!({"eligible":true,"grants":vec![serde_json::json!({});201]}),
+            serde_json::json!({"eligible":true,"grants":[{"resets_left":51,"paused":false}]}),
+        ] {
+            assert!(saved_resets(Some(block), now).is_err());
+        }
+        for block in [
+            serde_json::json!({"eligible":false,"grants":[]}),
+            serde_json::json!({"eligible":true,"grants":[]}),
+            serde_json::json!({"eligible":true,"grants":[{}]}),
+        ] {
+            assert!(saved_resets(Some(block), now).unwrap().is_none());
+        }
+        let block =
+            serde_json::json!({"eligible":true,"grants":[{"resets_left":50,"paused":false}]});
+        let saved = saved_resets(Some(block), now).unwrap().unwrap();
+        assert_eq!(saved.available_count, 50);
+        assert!(saved.credits.is_empty());
+        assert!(saved.soonest_expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn grant_ids_never_appear_in_serialized_account_entry() {
+        let (url, _) = serve_once(
+            200,
+            inventory_payload(Some(eligible_inventory())).into_bytes(),
+        )
+        .await;
+        let (source, _) = source(Ok(credential(b"synthetic-reset-token", 44)));
+        let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
+            provider: test_provider(source, url),
+            handle: CredentialHandle::vault(
+                "oauth:anthropic",
+                VaultCapability::new("ckh_anthropic"),
+            ),
+        })]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
+        let wire = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(wire["savedResets"]["availableCount"], 2);
+        let json = wire.to_string();
+        assert!(!json.contains("redemption-handle"));
+        assert!(!json.contains("private grant"));
+        assert!(!json.contains("cedar_ember"));
+    }
+
+    #[test]
+    fn inventory_refusal_state_is_per_handle_and_clears_when_readable() {
+        let (source, _) = source(Err(VaultGetError::Permanent));
+        let provider = test_provider(source, "unused".into());
+        for _ in 0..2 {
+            assert!(provider.settle_resets("account-a", Err("grants")).is_none());
+        }
+        assert_eq!(
+            provider.reset_refusals.lock().unwrap().get("account-a"),
+            Some(&"grants")
+        );
+        provider.settle_resets("account-b", Err("eligible"));
+        provider.settle_resets("account-a", Ok(None));
+        assert_eq!(provider.reset_refusals.lock().unwrap().len(), 1);
+        assert_eq!(
+            provider.reset_refusals.lock().unwrap().get("account-b"),
+            Some(&"eligible")
+        );
     }
 
     #[test]

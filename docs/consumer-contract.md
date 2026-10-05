@@ -1420,10 +1420,16 @@ it as the identity would attribute one account's windows to a set of accounts
 this response is deliberately declining to enumerate. Render it; never resolve
 with it.
 
-`savedResets` describes banked quota-reset credits, which exactly one upstream
-grants. `availableCount` is how many are held, `soonestExpiresAt` when the next
+`savedResets` describes banked quota-reset credits published by Codex and Claude.
+`availableCount` is how many are held, `soonestExpiresAt` when the next
 one lapses, and `credits` lists each with its own `expiresAt`. They are granted
 to **one account**, never to a provider — see the field-scope table below.
+
+Claude's inventory is **display-only**: there is no known redemption path. It
+never relaxes Claude's rate windows; `rawUsedPercent` and reset relaxation remain
+Codex-only. Paused, future, expired, or ineligible Claude grants are not counted;
+`usable_now` does not change the saved inventory. Credits without a stated expiry
+contribute to `availableCount` but have no expiry row to publish.
 
 Its absence means this account has no credit inventory to report — either the
 upstream does not grant them, or the lookup did not succeed on that fetch. It
