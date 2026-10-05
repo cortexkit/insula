@@ -103,8 +103,40 @@ const REMOTE_QUOTA_SUMMARY_URL: &str =
 /// only on permissionDenied, and pane comments its summary call "Authoritative
 /// endpoint first: merged pools + weekly windows".
 const REMOTE_QUOTA_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-/// Identifies the calling product on that shared endpoint.
-const REMOTE_USER_AGENT: &str = "antigravity";
+/// The Hub user-agent version is pinned to CodexBar 2.9.1; change it only with a version verified against CodexBar.
+const HUB_USER_AGENT_VERSION: &str = "2.9.1";
+
+/// Map Rust target identifiers to the spellings used by the Hub user agent.
+/// Like CodexBar, unlisted architectures map to `amd64`; `windows` is our explicit
+/// platform extension because CodexBar does not build Windows targets.
+fn hub_target(platform: &str, architecture: &str) -> (&'static str, &'static str) {
+    let platform = match platform {
+        "macos" => "darwin",
+        "linux" => "linux",
+        "windows" => "windows",
+        _ => "darwin",
+    };
+    let architecture = match architecture {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        _ => "amd64",
+    };
+    (platform, architecture)
+}
+
+fn hub_user_agent_for(platform: &str, architecture: &str) -> String {
+    let (platform, architecture) = hub_target(platform, architecture);
+    format!("antigravity/hub/{HUB_USER_AGENT_VERSION} {platform}/{architecture}")
+}
+
+/// Identifies Cloud Code requests as the Antigravity Hub client.
+fn remote_user_agent() -> String {
+    hub_user_agent_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn remote_user_agent_header() -> Header {
+    Header::new("User-Agent", remote_user_agent())
+}
 
 /// Where the opencode `antigravity-auth` plugin keeps its logged-in accounts.
 ///
@@ -266,7 +298,7 @@ impl AntigravityProvider {
             // this endpoint is known to resolve entitlement from.
             let mut request = JsonRequest::post_json(&self.quota_summary_url, body)
                 .bearer(access_token)
-                .header(Header::new("User-Agent", REMOTE_USER_AGENT));
+                .header(remote_user_agent_header());
             for (name, value) in extra_headers {
                 request = request.header(Header::new(name, value.clone()));
             }
@@ -1703,9 +1735,8 @@ impl AntigravityProvider {
     ) -> Result<crate::http::HttpResponse, FetchError> {
         JsonRequest::post_json(url, body)
             .bearer(access_token)
-            // Identifies the calling product to the shared endpoint, matching
-            // what the Antigravity client sends.
-            .header(Header::new("User-Agent", REMOTE_USER_AGENT))
+            // This User-Agent identifies the client making the Cloud Code quota request.
+            .header(remote_user_agent_header())
             .timeout(REQUEST_TIMEOUT)
             .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
             .await
@@ -3303,6 +3334,38 @@ mod plugin_lane_tests {
     /// credential, which reads as a dead login. Pinned against literals rather
     /// than against the masking function, or the test would pass for any pair
     /// that round-trips.
+    #[test]
+    fn hub_identity_maps_supported_platforms_and_architectures() {
+        assert_eq!(hub_target("macos", "aarch64"), ("darwin", "arm64"));
+        assert_eq!(hub_target("macos", "x86_64"), ("darwin", "amd64"));
+        assert_eq!(hub_target("linux", "aarch64"), ("linux", "arm64"));
+        assert_eq!(hub_target("linux", "x86_64"), ("linux", "amd64"));
+        assert_eq!(hub_target("windows", "aarch64"), ("windows", "arm64"));
+        assert_eq!(hub_target("windows", "x86_64"), ("windows", "amd64"));
+        assert_eq!(hub_target("freebsd", "riscv64"), ("darwin", "amd64"));
+    }
+
+    #[test]
+    fn hub_identity_pins_the_host_user_agent() {
+        let platform = match std::env::consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "windows",
+            _ => "darwin",
+        };
+        let architecture = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            _ => "amd64",
+        };
+        let header = remote_user_agent_header();
+        assert_eq!(header.name, "User-Agent");
+        assert_eq!(
+            header.value,
+            format!("antigravity/hub/2.9.1 {platform}/{architecture}")
+        );
+    }
+
     #[test]
     fn the_masked_oauth_client_unmasks_to_the_plugin_pair() {
         assert_eq!(
