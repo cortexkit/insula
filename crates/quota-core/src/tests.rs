@@ -6055,59 +6055,32 @@ async fn a_walled_account_keeps_its_banked_reset_while_a_sibling_has_room() {
     assert!(!result.trigger.exhaustion_trigger);
 }
 
-/// The must-still-fire arm, and the one that keeps the guard from being an
-/// opinion. Each sibling below lacks POSITIVE proof of room, so the walled
-/// account must spend exactly as it did before siblings were considered --
-/// otherwise every account could sit walled with a credit unspent.
+/// Exhaustion requires a fresh wall reading, not merely absence of proven room.
 #[tokio::test]
-async fn a_walled_account_still_resets_when_no_sibling_has_proven_room() {
-    let now = Instant::now();
-    let cases: [(&str, Option<(UsageFacts, Instant)>); 4] = [
-        ("no sibling at all", None),
-        ("sibling also walled", Some((reset_facts(100.0, true), now))),
-        (
-            // Under 99% but the upstream never affirmed `limit_reached: false`.
-            "sibling unaffirmed",
-            Some((
-                UsageFacts {
-                    raw_percents: vec![40.0],
-                    any_used_floor: true,
-                    at_wall: false,
-                    wall_clear: false,
-                    wall_lifts_at: None,
-                },
-                now,
-            )),
-        ),
-        (
-            "sibling reading stale",
-            Some((
-                reset_facts(44.0, false),
-                now - crate::codex_resets::SIBLING_HEADROOM_HORIZON - Duration::from_secs(1),
-            )),
-        ),
-    ];
-    for (name, sibling) in cases {
+async fn a_walled_account_withholds_when_sibling_is_stale_or_unaffirmed() {
+    for stale in [false, true] {
         let temp = ResetTempDir::new("sibling-no-proof");
         let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
         let transport =
             MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
-        if let Some((facts, at)) = sibling {
-            coordinator.observe_headroom("other-account", &facts, false, at);
-        }
-        coordinator
-            .process_tick(
-                "walled-account",
-                walled_tick_far_from_expiry(reset_now()),
-                &transport,
-                &walled_account_request(),
-            )
-            .await;
-        assert_eq!(
-            transport.posts.load(Ordering::SeqCst),
-            1,
-            "case {name}: with no proven room elsewhere the walled account must reset"
+        let handles = reset_test_handles(&coordinator, 2);
+        coordinator.observe_handle(
+            &handles[0],
+            "walled-account",
+            &reset_facts(100.0, true),
+            true,
+            Instant::now(),
         );
+        let mut facts = reset_facts(40.0, false);
+        facts.wall_clear = false;
+        let at = if stale {
+            Instant::now() - crate::codex_resets::SIBLING_HEADROOM_HORIZON - Duration::from_secs(1)
+        } else {
+            Instant::now()
+        };
+        coordinator.observe_handle(&handles[1], "other-account", &facts, false, at);
+        reset_test_tick(&coordinator, &transport, "walled-account", false).await;
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -11207,4 +11180,281 @@ async fn a_stale_local_login_for_an_account_the_vault_lacks_still_publishes_its_
         }),
         "the local account's rejection is published: {during_flux:?}"
     );
+}
+
+fn reset_test_handles(coordinator: &ResetCoordinator, count: usize) -> Vec<CredentialHandle> {
+    let handles: Vec<_> = (0..count)
+        .map(|i| CredentialHandle::new(format!("reset-lane-{i}")))
+        .collect();
+    coordinator.register_handles(&handles);
+    handles
+}
+
+async fn reset_test_tick(
+    coordinator: &ResetCoordinator,
+    transport: &MockResetTransport,
+    account: &str,
+    expiry: bool,
+) -> crate::codex_resets::ResetTickResult {
+    let input = if expiry {
+        reset_tick_input(reset_now(), reset_facts(100.0, true))
+    } else {
+        walled_tick_far_from_expiry(reset_now())
+    };
+    let request = ResetRequest {
+        account_id: account.to_string(),
+        ..walled_account_request()
+    };
+    coordinator
+        .process_tick(account, input, transport, &request)
+        .await
+}
+
+#[tokio::test]
+async fn restart_unknown_sibling_then_roomy_sibling_never_consumes() {
+    let temp = ResetTempDir::new("restart-unknown");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let handles = reset_test_handles(&coordinator, 2);
+    coordinator.observe_handle(
+        &handles[0],
+        "a",
+        &reset_facts(100.0, true),
+        true,
+        Instant::now(),
+    );
+    let withheld = reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "restart must not spend before sibling is read"
+    );
+    assert!(withheld.withheld.unwrap().contains("never read"));
+    coordinator.observe_handle(
+        &handles[1],
+        "b",
+        &reset_facts(76.0, false),
+        true,
+        Instant::now(),
+    );
+    reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn all_siblings_read_at_wall_consumes_only_latest_wall_lift() {
+    let temp = ResetTempDir::new("restart-all-walled");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let handles = reset_test_handles(&coordinator, 2);
+    let mut a = reset_facts(100.0, true);
+    a.wall_lifts_at = Some(reset_now() + chrono::Duration::hours(1));
+    coordinator.observe_handle(&handles[0], "a", &a, true, Instant::now());
+    reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    let mut b = a.clone();
+    b.wall_lifts_at = Some(reset_now() + chrono::Duration::hours(8));
+    coordinator.observe_handle(&handles[1], "b", &b, true, Instant::now());
+    let request_a = ResetRequest {
+        account_id: "a".into(),
+        ..walled_account_request()
+    };
+    coordinator
+        .process_tick(
+            "a",
+            ResetTickInput {
+                facts: a,
+                ..walled_tick_far_from_expiry(reset_now())
+            },
+            &transport,
+            &request_a,
+        )
+        .await;
+    let request_b = ResetRequest {
+        account_id: "b".into(),
+        ..walled_account_request()
+    };
+    coordinator
+        .process_tick(
+            "b",
+            ResetTickInput {
+                facts: b,
+                ..walled_tick_far_from_expiry(reset_now())
+            },
+            &transport,
+            &request_b,
+        )
+        .await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec!["b".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn failing_sibling_without_fresh_reading_withholds_exhaustion() {
+    for stale in [false, true] {
+        let temp = ResetTempDir::new("failing-sibling");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let handles = reset_test_handles(&coordinator, 2);
+        coordinator.observe_handle(
+            &handles[0],
+            "a",
+            &reset_facts(100.0, true),
+            true,
+            Instant::now(),
+        );
+        if stale {
+            coordinator.observe_handle(
+                &handles[1],
+                "b",
+                &reset_facts(100.0, true),
+                false,
+                Instant::now()
+                    - crate::codex_resets::SIBLING_HEADROOM_HORIZON
+                    - Duration::from_secs(1),
+            );
+            let withheld = reset_test_tick(&coordinator, &transport, "a", false).await;
+            assert!(withheld.withheld.unwrap().contains("stale since"));
+        }
+        coordinator.observe_handle_failure(&handles[1]);
+        let withheld = reset_test_tick(&coordinator, &transport, "a", false).await;
+        assert!(withheld.withheld.unwrap().contains("last fetch failed"));
+        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn expiry_consumes_even_while_sibling_is_unknown() {
+    let temp = ResetTempDir::new("expiry-unknown");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let handles = reset_test_handles(&coordinator, 2);
+    coordinator.observe_handle(
+        &handles[0],
+        "a",
+        &reset_facts(100.0, true),
+        true,
+        Instant::now(),
+    );
+    let result = reset_test_tick(&coordinator, &transport, "a", true).await;
+    assert!(result.trigger.expiry_trigger);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_account_handles_share_freshness_but_never_cover_unread_identity() {
+    for fresh_lane in [1, 2] {
+        let temp = ResetTempDir::new("duplicate-unknown");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let handles = reset_test_handles(&coordinator, 4);
+        coordinator.observe_handle(
+            &handles[0],
+            "a",
+            &reset_facts(100.0, true),
+            true,
+            Instant::now(),
+        );
+        for lane in [1, 2] {
+            coordinator.observe_handle(
+                &handles[lane],
+                "b",
+                &reset_facts(100.0, true),
+                false,
+                Instant::now()
+                    - crate::codex_resets::SIBLING_HEADROOM_HORIZON
+                    - Duration::from_secs(1),
+            );
+        }
+        coordinator.observe_handle(
+            &handles[fresh_lane],
+            "b",
+            &reset_facts(100.0, true),
+            false,
+            Instant::now(),
+        );
+        reset_test_tick(&coordinator, &transport, "a", false).await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "an unread identity cannot borrow another account's observation"
+        );
+        coordinator.register_handles(&handles[..3]);
+        reset_test_tick(&coordinator, &transport, "a", false).await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            1,
+            "either duplicate lane's fresh reading proves the account is known"
+        );
+    }
+}
+
+#[tokio::test]
+async fn removed_handle_no_longer_withholds_exhaustion() {
+    let temp = ResetTempDir::new("removed-sibling");
+    let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+    let transport = MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+    let handles = reset_test_handles(&coordinator, 2);
+    coordinator.observe_handle(
+        &handles[0],
+        "a",
+        &reset_facts(100.0, true),
+        true,
+        Instant::now(),
+    );
+    reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    coordinator.observe_handle(
+        &handles[1],
+        "b",
+        &reset_facts(40.0, false),
+        false,
+        Instant::now(),
+    );
+    reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    coordinator.register_handles(&handles[..1]);
+    // A late completion from the removed lane cannot put it back in the served set.
+    coordinator.observe_handle(
+        &handles[1],
+        "b",
+        &reset_facts(40.0, false),
+        false,
+        Instant::now(),
+    );
+    reset_test_tick(&coordinator, &transport, "a", false).await;
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn changed_handle_identity_cannot_reuse_previous_accounts_wall_reading() {
+    for new_identity in [Some("b"), None] {
+        let temp = ResetTempDir::new("changed-reset-identity");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let handles = reset_test_handles(&coordinator, 2);
+        for handle in &handles {
+            coordinator.observe_handle(
+                handle,
+                "a",
+                &reset_facts(100.0, true),
+                true,
+                Instant::now(),
+            );
+        }
+        coordinator.observe_handle_identity(&handles[1], new_identity);
+        coordinator.observe_handle_failure(&handles[1]);
+        reset_test_tick(&coordinator, &transport, "a", false).await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "a changed credential needs a reading for its new identity"
+        );
+    }
 }

@@ -910,6 +910,15 @@ impl CodexProvider {
             .canonical_account_id
             .as_deref()
             .filter(|account_id| context.is_oauth && !account_id.trim().is_empty());
+        if let Ok(coordinator) = &self.reset_coordinator {
+            coordinator.observe_handle_identity(
+                &context
+                    .vault_handle
+                    .clone()
+                    .unwrap_or_else(CredentialHandle::implicit),
+                account_id,
+            );
+        }
         let reset_eligible = account_id.is_some_and(|account_id| {
             reset_credentials_eligible(&self.reset_config, &credentials)
                 && !account_id.trim().is_empty()
@@ -1015,7 +1024,11 @@ impl CodexProvider {
                 && credits_snapshot
                     .as_ref()
                     .is_ok_and(|(credits, now)| reset_trigger_expiry(credits, *now).is_some());
-            coordinator.observe_headroom(
+            coordinator.observe_handle(
+                &context
+                    .vault_handle
+                    .clone()
+                    .unwrap_or_else(CredentialHandle::implicit),
                 account_id,
                 &facts,
                 redeemable_credit,
@@ -1164,81 +1177,101 @@ impl UsageProvider for CodexProvider {
             handles.push(CredentialHandle::implicit());
         }
         handles.extend(vault);
+        if let Ok(coordinator) = &self.reset_coordinator {
+            coordinator.register_handles(&handles);
+        }
         Ok(handles)
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        let attempt_started = Instant::now();
-        let codex_home = self.resolved_codex_home();
-        if handle.is_vault() {
-            let Some(credential_source) = self.credential_source.as_ref() else {
-                return FetchAttempt::unverified_vault_failure(
-                    crate::credential_source::VaultGetError::Permanent,
-                );
-            };
-            let credential = match crate::credential_source::get_vault_credential(
-                credential_source,
-                handle,
-                crate::credential_source::VAULT_READ_MIN_TTL_MS,
-            )
-            .await
-            {
-                Ok(credential) => credential,
-                Err(error) => return FetchAttempt::unverified_vault_failure(error),
-            };
-            let fallback_observation = Some(AccountObservation::new(
-                canonical_account_id(credential.account_id.clone()),
-                Some(credential.record_version),
-            ));
-            let context = match ServedCodexContext::vault(handle.clone(), credential) {
-                Ok(context) => context,
-                Err(error) => {
-                    return FetchAttempt::failure(fallback_observation, None, error);
-                }
-            };
-            let config_toml = tokio::task::spawn_blocking(move || {
-                codex_home.and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
-            })
-            .await
-            .unwrap_or(None);
-            self.fetch_context(context, config_toml, attempt_started)
-                .await
-        } else {
-            let resolved = tokio::task::spawn_blocking(move || {
-                let home = codex_home.ok_or_else(|| {
-                    FetchError::NoSession("cannot resolve CODEX_HOME or $HOME/.codex".to_string())
-                })?;
-                let auth_path = home.join("auth.json");
-                let data = crate::env::read_credential_file(&auth_path, "codex auth.json")?;
-                let credentials = parse_credentials(&data)?;
-                let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
-                Ok::<_, FetchError>((ServedCodexContext::local(credentials), config_toml))
-            })
-            .await;
-            let (context, config_toml) = match resolved {
-                Ok(Ok(resolved)) => resolved,
-                Ok(Err(error)) => {
-                    if self.reset_config.is_enabled() {
-                        self.reset_tick_logger
-                            .emit(None, None, None, None, false, false);
-                    }
-                    return FetchAttempt::failure(None, None, error);
-                }
-                Err(_) => {
-                    if self.reset_config.is_enabled() {
-                        self.reset_tick_logger
-                            .emit(None, None, None, None, false, false);
-                    }
-                    return FetchAttempt::failure(
-                        None,
-                        None,
-                        FetchError::Decode("codex credential resolution task panicked".to_string()),
+        let attempt = async {
+            let attempt_started = Instant::now();
+            let codex_home = self.resolved_codex_home();
+            if handle.is_vault() {
+                let Some(credential_source) = self.credential_source.as_ref() else {
+                    return FetchAttempt::unverified_vault_failure(
+                        crate::credential_source::VaultGetError::Permanent,
                     );
-                }
-            };
-            self.fetch_context(context, config_toml, attempt_started)
+                };
+                let credential = match crate::credential_source::get_vault_credential(
+                    credential_source,
+                    handle,
+                    crate::credential_source::VAULT_READ_MIN_TTL_MS,
+                )
                 .await
+                {
+                    Ok(credential) => credential,
+                    Err(error) => return FetchAttempt::unverified_vault_failure(error),
+                };
+                let fallback_observation = Some(AccountObservation::new(
+                    canonical_account_id(credential.account_id.clone()),
+                    Some(credential.record_version),
+                ));
+                let context = match ServedCodexContext::vault(handle.clone(), credential) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        return FetchAttempt::failure(fallback_observation, None, error);
+                    }
+                };
+                let config_toml = tokio::task::spawn_blocking(move || {
+                    codex_home
+                        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
+                })
+                .await
+                .unwrap_or(None);
+                self.fetch_context(context, config_toml, attempt_started)
+                    .await
+            } else {
+                let resolved = tokio::task::spawn_blocking(move || {
+                    let home = codex_home.ok_or_else(|| {
+                        FetchError::NoSession(
+                            "cannot resolve CODEX_HOME or $HOME/.codex".to_string(),
+                        )
+                    })?;
+                    let auth_path = home.join("auth.json");
+                    let data = crate::env::read_credential_file(&auth_path, "codex auth.json")?;
+                    let credentials = parse_credentials(&data)?;
+                    let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
+                    Ok::<_, FetchError>((ServedCodexContext::local(credentials), config_toml))
+                })
+                .await;
+                let (context, config_toml) = match resolved {
+                    Ok(Ok(resolved)) => resolved,
+                    Ok(Err(error)) => {
+                        if self.reset_config.is_enabled() {
+                            self.reset_tick_logger
+                                .emit(None, None, None, None, false, false);
+                        }
+                        return FetchAttempt::failure(None, None, error);
+                    }
+                    Err(_) => {
+                        if self.reset_config.is_enabled() {
+                            self.reset_tick_logger
+                                .emit(None, None, None, None, false, false);
+                        }
+                        return FetchAttempt::failure(
+                            None,
+                            None,
+                            FetchError::Decode(
+                                "codex credential resolution task panicked".to_string(),
+                            ),
+                        );
+                    }
+                };
+                self.fetch_context(context, config_toml, attempt_started)
+                    .await
+            }
         }
+        .await;
+        if attempt.usage.is_err() {
+            if let Ok(coordinator) = &self.reset_coordinator {
+                if let Some(observed) = &attempt.observed {
+                    coordinator.observe_handle_identity(handle, observed.account_id.as_deref());
+                }
+                coordinator.observe_handle_failure(handle);
+            }
+        }
+        attempt
     }
 }
 
