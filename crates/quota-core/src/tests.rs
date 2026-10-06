@@ -11458,3 +11458,184 @@ async fn changed_handle_identity_cannot_reuse_previous_accounts_wall_reading() {
         );
     }
 }
+
+#[tokio::test]
+async fn real_codex_restart_waits_for_delayed_sibling_then_consumes_latest_wall_lift() {
+    let temp = ResetTempDir::new("real-provider-restart-delayed-sibling");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let release_sibling = Arc::new(Semaphore::new(0));
+    let server_release = Arc::clone(&release_sibling);
+    let a_lift = (Utc::now() + chrono::Duration::days(1)).timestamp();
+    let b_lift = (Utc::now() + chrono::Duration::days(4)).timestamp();
+    let http_server = tokio::spawn(async move {
+        let mut requests = tokio::task::JoinSet::new();
+        let mut b_reads = 0;
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            let is_a = request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: restart-a"));
+            let is_b = request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: restart-b"));
+            assert!(is_a || is_b, "unexpected usage request: {request}");
+            assert!(request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(if is_a {
+                    "authorization: Bearer restart-a-token"
+                } else {
+                    "authorization: Bearer restart-b-token"
+                })));
+            if is_b {
+                b_reads += 1;
+            }
+            let delayed_roomy_read = is_b && b_reads == 1;
+            let release = Arc::clone(&server_release);
+            // Serve connections independently so B cannot block A even if B arrives first.
+            requests.spawn(async move {
+                if delayed_roomy_read {
+                    release.acquire().await.unwrap().forget();
+                }
+                let body = serde_json::json!({
+                    "rate_limit": {
+                        "limit_reached": !delayed_roomy_read,
+                        "primary_window": {
+                            "used_percent": if delayed_roomy_read { 76.0 } else { 100.0 },
+                            "reset_at": if is_a { a_lift } else { b_lift },
+                            "limit_window_seconds": 604_800
+                        }
+                    }
+                }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result.unwrap();
+        }
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"restart-a-token","account_id":"restart-a"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    let handle_loader = VaultHandleLoader::default();
+    handle_loader.install_rows_for_test(&[("chatgpt:openai", "oauth")]);
+    let source = Arc::new(SameAccountVaultSource {
+        gets: AtomicUsize::new(0),
+        account_id: "restart-b",
+        token: b"restart-b-token",
+    });
+    let credits = serde_json::json!({
+        "credits": [{"id": "credit-1", "status": "available", "expires_at": (Utc::now() + chrono::Duration::days(20)).to_rfc3339()}],
+        "available_count": 1
+    }).to_string().into_bytes();
+    let transport = Arc::new(
+        MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+            .with_account_credits("restart-a", credits.clone())
+            .with_account_credits("restart-b", credits),
+    );
+    let provider = crate::codex::CodexProvider::new_for_test(
+        crate::config::CodexConfig {
+            auto_use_resets: 3600,
+        },
+        Some(source.clone()),
+        transport.clone(),
+        Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+        handle_loader,
+        codex_home,
+    );
+    let registry = Arc::new(Registry::new(vec![Box::new(provider)]));
+    let first_registry = Arc::clone(&registry);
+    let first_tick = tokio::spawn(async move {
+        tick(&first_registry).await;
+    });
+    // A published success proves its whole provider fetch (including reset policy)
+    // completed. B's HTTP response remains blocked until after this assertion.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let a_processed = registry
+                .store
+                .lock()
+                .unwrap()
+                .get(&SlotKey::new("codex", CredentialHandle::implicit()))
+                .is_some_and(|slot| slot.last_success_at.is_some());
+            if a_processed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A must finish while B's first usage response is withheld");
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "restart must not spend before the enumerated sibling is read"
+    );
+    release_sibling.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(15), first_tick)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "B's fresh 76% reading must preserve both credits"
+    );
+    assert_eq!(registry.get_usage(Some("codex")).await.len(), 2);
+    assert!(
+        registry
+            .store
+            .lock()
+            .unwrap()
+            .get(&SlotKey::new(
+                "codex",
+                CredentialHandle::scoped("chatgpt:openai", "oauth")
+            ))
+            .unwrap()
+            .last_success_at
+            .is_some(),
+        "B must publish a successful usage read"
+    );
+
+    force_due(&registry, "codex");
+    tokio::time::timeout(Duration::from_secs(15), tick(&registry))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), http_server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.gets.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.gets.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "fresh wall readings from both registered handles must allow exhaustion"
+    );
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec!["restart-b".to_string()],
+        "B's natural reset is later, so only B should spend its credit"
+    );
+}
