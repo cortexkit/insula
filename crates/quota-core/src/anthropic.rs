@@ -497,20 +497,25 @@ fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> 
 fn normalize_with_overage(
     body: &[u8],
 ) -> Result<(Usage, Result<Option<Pool>, OverageRefusal>), FetchError> {
-    normalize_inventory(body).map(|(usage, pool, _)| (usage, pool))
+    normalize_inventory(body).map(|(usage, pool, _, _)| (usage, pool))
 }
 
+/// Windows, overage pool, saved resets, and -- when a saved-reset block was
+/// present but counted nothing -- a description of why (see [`inventory_shape`]).
 type NormalizedInventory = (
     Usage,
     Result<Option<Pool>, OverageRefusal>,
     Result<Option<SavedResets>, &'static str>,
+    Option<String>,
 );
 
 fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
     let response: OAuthUsageResponse =
         crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
             .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
-    let resets = saved_resets(response.cedar_ember, chrono::Utc::now());
+    let now = chrono::Utc::now();
+    let shape = inventory_shape(response.cedar_ember.as_ref(), now);
+    let resets = saved_resets(response.cedar_ember, now);
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
         primary: to_window(
@@ -539,7 +544,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
         ),
         extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
     };
-    Ok((usage, pool, resets))
+    Ok((usage, pool, resets, shape))
 }
 
 /// A successful attempt carrying the windows and, when there is one, the pool.
@@ -583,35 +588,15 @@ fn saved_resets(
     let mut count = 0u32;
     let mut expiries = Vec::new();
     for raw in grants {
-        let Ok(grant) = serde_json::from_value::<ResetGrant>(raw.clone()) else {
+        let Ok((resets_left, ends)) = grant_outcome(raw, now) else {
             continue;
         };
-        if grant.resets_left < 0
-            || grant
-                .resets_total
-                .is_some_and(|total| total < grant.resets_left)
-        {
-            continue;
-        }
-        let (Ok(starts), Ok(ends)) = (reset_bound(grant.starts_at), reset_bound(grant.ends_at))
-        else {
-            continue;
-        };
-        // Paused, future and expired grants are unavailable; usable_now does not
-        // affect the saved inventory, even when redemption is currently gated.
-        if grant.paused
-            || grant.resets_left == 0
-            || starts.is_some_and(|date| date > now)
-            || ends.is_some_and(|date| date <= now)
-        {
-            continue;
-        }
-        if grant.resets_left > i64::from(50 - count) {
+        if resets_left > i64::from(50 - count) {
             return Err("resets_left");
         }
-        count += grant.resets_left as u32;
+        count += resets_left as u32;
         if let Some(end) = ends {
-            expiries.extend(std::iter::repeat_n(end, grant.resets_left as usize));
+            expiries.extend(std::iter::repeat_n(end, resets_left as usize));
         }
     }
     // CodexBar omits empty usable inventories. Keep that absence on the wire
@@ -632,22 +617,118 @@ fn saved_resets(
     }))
 }
 
-#[derive(Deserialize)]
-struct ResetGrant {
-    resets_left: i64,
-    resets_total: Option<i64>,
-    starts_at: Option<String>,
-    ends_at: Option<String>,
-    paused: bool,
+/// The resets one grant contributes and its expiry, or why it contributes none.
+///
+/// Mirrors CodexBar's `ClaudeLimitResetGrantResponse`: `resets_left` and `paused`
+/// are required, `resets_total` and both bounds are optional, a bound that is
+/// present but unreadable makes the grant malformed, and paused, used-up,
+/// not-yet-started and expired grants are unavailable. `usable_now` is not read:
+/// a saved reset counts even while Claude gates redemption.
+///
+/// The reason names a field and the JSON type it held, plus the date for a
+/// timing exclusion. It never carries a grant's id or label: the id is a
+/// redemption handle, and the label is the account's own text.
+fn grant_outcome(
+    raw: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(i64, Option<chrono::DateTime<chrono::Utc>>), String> {
+    let Some(grant) = raw.as_object() else {
+        return Err(format!("grant is {}", json_kind(Some(raw))));
+    };
+    let resets_left = grant
+        .get("resets_left")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("resets_left is {}", json_kind(grant.get("resets_left"))))?;
+    let paused = grant
+        .get("paused")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("paused is {}", json_kind(grant.get("paused"))))?;
+    let resets_total = match grant.get("resets_total") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .ok_or_else(|| format!("resets_total is {}", json_kind(Some(value))))?,
+        ),
+    };
+    let starts = reset_bound(grant, "starts_at")?;
+    let ends = reset_bound(grant, "ends_at")?;
+    if resets_left < 0 || resets_total.is_some_and(|total| total < resets_left) {
+        return Err("resets_left outside 0..=resets_total".to_string());
+    }
+    if paused {
+        return Err("paused".to_string());
+    }
+    if resets_left == 0 {
+        return Err("used up".to_string());
+    }
+    if let Some(start) = starts.filter(|start| *start > now) {
+        return Err(format!("starts {}", crate::rfc3339_canonical(start)));
+    }
+    if let Some(end) = ends.filter(|end| *end <= now) {
+        return Err(format!("expired {}", crate::rfc3339_canonical(end)));
+    }
+    Ok((resets_left, ends))
 }
 
-fn reset_bound(raw: Option<String>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
-    raw.map(|raw| {
-        chrono::DateTime::parse_from_rfc3339(&raw)
-            .map(|date| date.with_timezone(&chrono::Utc))
-            .map_err(|_| ())
-    })
-    .transpose()
+/// An absent or null bound is open; a present one must be an RFC 3339 string.
+fn reset_bound(
+    grant: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    match grant.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|date| Some(date.with_timezone(&chrono::Utc)))
+            .map_err(|_| format!("{field} {raw:?} is not RFC 3339")),
+        Some(other) => Err(format!("{field} is {}", json_kind(Some(other)))),
+    }
+}
+
+fn json_kind(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        None => "absent",
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Bool(_)) => "a boolean",
+        Some(serde_json::Value::Number(_)) => "a number",
+        Some(serde_json::Value::String(_)) => "a string",
+        Some(serde_json::Value::Array(_)) => "an array",
+        Some(serde_json::Value::Object(_)) => "an object",
+    }
+}
+
+/// Why a readable saved-reset block counted nothing, or `None` when it counted
+/// something, was absent, or was unreadable (that case is logged by
+/// [`AnthropicProvider::settle_resets`]).
+///
+/// Without this, "no saved resets" on the wire is a disjunction nobody can
+/// read: an ineligible account, an account with none, and a grant shape this
+/// decoder rejects all publish the same absence.
+fn inventory_shape(
+    raw: Option<&serde_json::Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let raw = raw?;
+    let eligible = raw.get("eligible")?.as_bool()?;
+    let grants = raw.get("grants")?.as_array()?;
+    if !eligible {
+        return Some(format!("eligible=false, {} grant(s)", grants.len()));
+    }
+    if grants.is_empty() {
+        return Some("eligible=true, no grants".to_string());
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    for grant in grants {
+        match grant_outcome(grant, now) {
+            Ok(_) => return None,
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    Some(format!(
+        "eligible=true, {} grant(s), none counted: {}",
+        grants.len(),
+        reasons.join("; ")
+    ))
 }
 
 fn canonical_account_id(account_id: Option<String>) -> Option<String> {
@@ -680,6 +761,9 @@ pub struct AnthropicProvider {
     /// last refused; absent while the opt-in is accepted. See
     /// [`AnthropicProvider::settle_fallback`].
     inventory_fallbacks: Mutex<HashMap<String, u16>>,
+    /// Per handle stable id, the last logged reason a readable saved-reset
+    /// block counted nothing. See [`inventory_shape`].
+    inventory_shapes: Mutex<HashMap<String, String>>,
 }
 
 impl AnthropicProvider {
@@ -695,6 +779,7 @@ impl AnthropicProvider {
             overage_refusals: Mutex::new(HashMap::new()),
             reset_refusals: Mutex::new(HashMap::new()),
             inventory_fallbacks: Mutex::new(HashMap::new()),
+            inventory_shapes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -754,6 +839,28 @@ impl AnthropicProvider {
             }
         }
         resets.unwrap_or(None)
+    }
+
+    /// Log, once per change, why this handle's saved-reset block counted
+    /// nothing, and log once when it starts counting again.
+    fn settle_shape(&self, handle_id: &str, shape: Option<String>) {
+        let mut shapes = self
+            .inventory_shapes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shapes.get(handle_id) == shape.as_ref() {
+            return;
+        }
+        match shape {
+            Some(shape) => {
+                eprintln!("{LOG_TAG} anthropic ({handle_id}): the saved-reset block counted nothing: {shape}");
+                shapes.insert(handle_id.to_string(), shape);
+            }
+            None => {
+                eprintln!("{LOG_TAG} anthropic ({handle_id}): the saved-reset block counts again");
+                shapes.remove(handle_id);
+            }
+        }
     }
 
     /// Record whether this handle's saved-reset opt-in was refused, logging only
@@ -850,13 +957,16 @@ impl AnthropicProvider {
             .await
             .and_then(|body| normalize_inventory(&body));
         match result {
-            Ok((usage, overage, resets)) => success_attempt(
-                Some(AccountObservation::new(None, None)),
-                "oauth",
-                usage,
-                self.settle_overage(handle_id, overage),
-            )
-            .with_saved_resets(self.settle_resets(handle_id, resets)),
+            Ok((usage, overage, resets, shape)) => {
+                self.settle_shape(handle_id, shape);
+                success_attempt(
+                    Some(AccountObservation::new(None, None)),
+                    "oauth",
+                    usage,
+                    self.settle_overage(handle_id, overage),
+                )
+                .with_saved_resets(self.settle_resets(handle_id, resets))
+            }
             Err(error) => FetchAttempt::failure(None, None, error),
         }
     }
@@ -905,7 +1015,8 @@ impl AnthropicProvider {
             self.report_auth_failure(handle, record_version, error);
         }
         match result {
-            Ok((usage, overage, resets)) => {
+            Ok((usage, overage, resets, shape)) => {
+                self.settle_shape(handle_id, shape);
                 let pool = self.settle_overage(handle_id, overage);
                 success_attempt(observed, "vault", usage, pool)
                     .with_account_info(account_info)
@@ -1334,6 +1445,49 @@ mod tests {
         assert_eq!(saved.available_count, 50);
         assert!(saved.credits.is_empty());
         assert!(saved.soonest_expires_at.is_none());
+    }
+
+    /// A readable block that counts nothing says why, grant by grant, so an
+    /// account with no resets can be told apart from a grant shape this decoder
+    /// rejects. The description must never carry a grant's id or label.
+    #[test]
+    fn a_block_that_counts_nothing_names_each_grants_reason_without_ids() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let block = serde_json::json!({"eligible":true,"grants":[
+            {"id":"redemption-handle","label":"private grant","resets_left":1,"paused":true},
+            {"id":"redemption-handle","resets_left":1},
+            {"resets_left":1,"paused":false,"ends_at":"Oct 12"},
+            {"resets_left":1,"paused":false,"starts_at":"2026-10-07T00:00:00Z"},
+            {"resets_left":0,"paused":false}
+        ]});
+        let shape = inventory_shape(Some(&block), now).unwrap();
+        assert_eq!(
+            shape,
+            "eligible=true, 5 grant(s), none counted: paused; paused is absent; \
+             ends_at \"Oct 12\" is not RFC 3339; \
+             starts 2026-10-07T00:00:00.000000000+00:00; used up"
+        );
+        assert!(!shape.contains("redemption-handle") && !shape.contains("private grant"));
+        // The same grants publish no inventory, which is what the line explains.
+        assert!(saved_resets(Some(block), now).unwrap().is_none());
+
+        assert_eq!(
+            inventory_shape(
+                Some(&serde_json::json!({"eligible":false,"grants":[{}]})),
+                now
+            )
+            .as_deref(),
+            Some("eligible=false, 1 grant(s)")
+        );
+        // Any counted grant means there is nothing to explain.
+        let counted = serde_json::json!({"eligible":true,"grants":[
+            {"resets_left":1,"paused":true},
+            {"resets_left":1,"paused":false}
+        ]});
+        assert_eq!(inventory_shape(Some(&counted), now), None);
+        assert_eq!(inventory_shape(None, now), None);
     }
 
     #[tokio::test]
