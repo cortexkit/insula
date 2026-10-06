@@ -313,10 +313,12 @@ pub fn evaluate_trigger(input: &TriggerInput) -> TriggerDecision {
     // lost whether or not anyone needs capacity, so use-it-or-lose-it stands on
     // its own.
     //
-    // SCOPED BY POSITIVE EVIDENCE. Only a sibling with a fresh, affirmed-clear
-    // reading suppresses; a sibling that is unknown, stale, degraded or merely
-    // unaffirmed does not. Withholding on a guess would leave every account walled
-    // at once with a credit sitting unspent, which is the worse of the two errors.
+    // Exhaustion requires fresh usage readings showing every enumerated sibling
+    // at its quota limit. Unknown siblings may have room, so the coordinator
+    // defers exhaustion. The waiting account regains capacity at its natural
+    // quota reset without spending a credit. Expiry remains ungated: even if a
+    // sibling credential lane cannot be read, a credit within auto_use_resets
+    // of expiring can still be used, so waiting cannot cost a lost credit.
     //
     // ONE ACCOUNT AT A TIME, AND THE RIGHT ONE. When several accounts are walled
     // together, `exhaustion_deferred` holds back all but the account whose wall
@@ -1282,6 +1284,13 @@ struct HeadroomReading {
     observed_utc: DateTime<Utc>,
 }
 
+#[derive(Default)]
+struct HandleReading {
+    account_id: Option<String>,
+    reading: Option<HeadroomReading>,
+    failed: bool,
+}
+
 /// The account chosen to spend its banked reset instead of the one asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChosenCandidate {
@@ -1344,6 +1353,7 @@ pub struct ResetCoordinator {
     /// codex fetch, including accounts that hold no credit and so never reach
     /// `process_tick` -- those are the siblings that matter most.
     headroom: Mutex<HashMap<String, HeadroomReading>>,
+    handles: Mutex<HashMap<crate::provider::CredentialHandle, HandleReading>>,
     /// The withheld-redemption line last announced per account. Kept apart
     /// from `accounts`, whose entries are pruned after every tick for an
     /// account with no journal records, so a flag kept there would be lost and
@@ -1359,6 +1369,7 @@ impl ResetCoordinator {
             journal_io: Mutex::new(()),
             accounts: Mutex::new(HashMap::new()),
             headroom: Mutex::new(HashMap::new()),
+            handles: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashMap::new()),
         })
     }
@@ -1399,6 +1410,134 @@ impl ResetCoordinator {
                     observed_utc: Utc::now() - age,
                 },
             );
+    }
+
+    /// Replace the served set before any fetch in the turn can redeem.
+    pub fn register_handles(&self, served: &[crate::provider::CredentialHandle]) {
+        let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        handles.retain(|handle, _| served.contains(handle));
+        for handle in served {
+            handles.entry(handle.clone()).or_default();
+        }
+        self.rebuild_headroom(&handles);
+    }
+
+    fn rebuild_headroom(
+        &self,
+        handles: &HashMap<crate::provider::CredentialHandle, HandleReading>,
+    ) {
+        let mut table = self.headroom.lock().unwrap_or_else(|p| p.into_inner());
+        table.clear();
+        for state in handles.values() {
+            if let (Some(id), Some(reading)) = (&state.account_id, &state.reading) {
+                let entry = table.entry(id.clone()).or_insert_with(|| reading.clone());
+                if reading.observed > entry.observed {
+                    *entry = reading.clone();
+                }
+            }
+        }
+    }
+
+    /// A credential can change accounts even when the subsequent usage read fails.
+    pub fn observe_handle_identity(
+        &self,
+        handle: &crate::provider::CredentialHandle,
+        account_id: Option<&str>,
+    ) {
+        let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = handles.get_mut(handle) {
+            if state.account_id.as_deref() != account_id {
+                state.account_id = account_id.map(str::to_string);
+                state.reading = None;
+                state.failed = false;
+                self.rebuild_headroom(&handles);
+            }
+        }
+    }
+
+    /// Associate a successful usage reading with both its lane and its account.
+    pub fn observe_handle(
+        &self,
+        handle: &crate::provider::CredentialHandle,
+        account_id: &str,
+        facts: &UsageFacts,
+        redeemable_credit: bool,
+        at: Instant,
+    ) {
+        self.observe_handle_identity(handle, Some(account_id));
+        let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        // An in-flight fetch for a removed lane must not re-enumerate it.
+        let Some(state) = handles.get_mut(handle) else {
+            return;
+        };
+        self.observe_headroom(account_id, facts, redeemable_credit, at);
+        state.account_id = Some(account_id.to_string());
+        state.reading = self
+            .headroom
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(account_id)
+            .cloned();
+        state.failed = false;
+        self.rebuild_headroom(&handles);
+    }
+
+    /// Keep a still-fresh reading on failure; a different lane may also know the account.
+    pub fn observe_handle_failure(&self, handle: &crate::provider::CredentialHandle) {
+        if let Some(state) = self
+            .handles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(handle)
+        {
+            state.failed = true;
+        }
+    }
+
+    fn unknown_sibling(&self, account_id: &str, now: Instant) -> Option<String> {
+        let handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        let mut unknown = Vec::new();
+        for (handle, state) in handles.iter() {
+            if state.account_id.as_deref() == Some(account_id) {
+                continue;
+            }
+            // Until a handle yields an identity it could be a different account
+            // with room. Never let an unrelated account's reading speak for it.
+            let known = state.account_id.as_ref().is_some_and(|id| {
+                handles.values().any(|other| {
+                    other.account_id.as_ref() == Some(id)
+                        && other.reading.as_ref().is_some_and(|r| {
+                            r.at_wall
+                                && now.saturating_duration_since(r.observed)
+                                    <= SIBLING_HEADROOM_HORIZON
+                        })
+                })
+            });
+            if known {
+                continue;
+            }
+            let reason = if state.failed {
+                "last fetch failed".to_string()
+            } else if let Some(reading) = &state.reading {
+                if now.saturating_duration_since(reading.observed) > SIBLING_HEADROOM_HORIZON {
+                    format!(
+                        "stale since {}",
+                        crate::rfc3339_canonical(reading.observed_utc)
+                    )
+                } else {
+                    "not proven at its wall".to_string()
+                }
+            } else {
+                "never read".to_string()
+            };
+            unknown.push(format!(
+                "handle={} account_id={}: {reason}",
+                handle.stable_id(),
+                state.account_id.as_deref().unwrap_or("unknown")
+            ));
+        }
+        unknown.sort();
+        unknown.into_iter().next()
     }
 
     /// Another account with a fresh, affirmed-clear reading, if any.
@@ -1552,10 +1691,11 @@ impl ResetCoordinator {
 
         let coordinator_started = Instant::now();
         let sibling = self.sibling_with_headroom(account_id, coordinator_started);
+        let unknown_sibling = self.unknown_sibling(account_id, coordinator_started);
         // ONE EXHAUSTION REDEMPTION ACROSS ALL ACCOUNTS, BY THE RIGHT ACCOUNT.
-        // The sibling rule above holds a walled account back only while some
-        // other account has room. Once every account is walled each of them
-        // sees no roomy sibling, so without the two rules below all of them
+        // The sibling rule holds an account at its quota limit back until every
+        // other served account has a fresh reading showing the same. Once true each
+        // sees no roomy or unknown sibling, so without the two rules below all of them
         // would redeem, on the same tick or on neighbouring ones.
         //
         // First, only one walled account is the candidate: the one whose wall
@@ -1567,8 +1707,9 @@ impl ResetCoordinator {
         // `CROSS_ACCOUNT_BOUND_SECS` passes. Until that reading, the table still
         // holds the redeemed account's pre-reset reading (at its wall), and a
         // restart empties the table altogether, so this fence reads the
-        // journal, the one record that survives both. In-process state can only
-        // RELEASE it early, on positive evidence.
+        // durable redemption journal, whose spend records survive a restart.
+        // A fresh usage reading taken after redemption is the evidence that can
+        // release this cross-account restriction early.
         //
         // Neither rule touches the expiry trigger: a credit about to lapse is
         // lost whether or not anyone needs capacity. Both kinds of redemption
@@ -1616,7 +1757,7 @@ impl ResetCoordinator {
                     spend_bound_allows: false,
                     before_post_cutoff: input.elapsed_since_attempt_start < PRE_POST_CUTOFF,
                     sibling_has_headroom: sibling.is_some(),
-                    exhaustion_deferred: chosen_instead.is_some(),
+                    exhaustion_deferred: chosen_instead.is_some() || unknown_sibling.is_some(),
                 });
                 return ResetTickResult {
                     armed: true,
@@ -1664,7 +1805,9 @@ impl ResetCoordinator {
                 spend_bound_allows: journal_state.spend_bound_allows,
                 before_post_cutoff,
                 sibling_has_headroom: sibling.is_some(),
-                exhaustion_deferred: chosen_instead.is_some() || redeemed_elsewhere.is_some(),
+                exhaustion_deferred: chosen_instead.is_some()
+                    || redeemed_elsewhere.is_some()
+                    || unknown_sibling.is_some(),
             });
             // Only an exhaustion redemption is held back by these, so a walled
             // account whose credit is expiring anyway is not reported withheld.
@@ -1675,6 +1818,8 @@ impl ResetCoordinator {
                     "codex reset withheld for account_id={account_id}: at its wall, \
                      but account_id={sibling} has room, so the banked reset is kept"
                 ))
+            } else if let Some(unknown) = unknown_sibling.as_deref() {
+                Some(format!("codex reset withheld for account_id={account_id}: sibling unknown ({unknown}), so the banked reset is kept"))
             } else if let Some(redeemed) = redeemed_elsewhere {
                 Some(format!(
                     "codex reset withheld for account_id={account_id}: at its wall, but \
