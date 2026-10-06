@@ -47,7 +47,20 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Dated opt-in header. Dated values get superseded, and the supersession is
 /// invisible here until a request is refused.
 const BETA_HEADER: &str = "oauth-2025-04-20";
-const CLAUDE_CODE_UA: &str = "claude-code/2.1.0";
+/// The Claude Code version this module identifies as. Anthropic gates the
+/// saved-reset inventory on it.
+///
+/// Measured 2026-10-06 on five accounts, four of which hold a reset: as
+/// `claude-code/2.1.0` (CodexBar's fallback when no Claude Code is installed)
+/// every account answered `cedar_ember: {eligible: false, grants: []}`; as
+/// `claude-code/2.1.282` (the version installed on that host) four answered
+/// eligible with one reset each and the fifth eligible with its one grant used
+/// up. The usage windows were the same under both.
+///
+/// So an old version here silently hides every saved reset. If it ever happens
+/// again, the "saved-reset block counted nothing: eligible=false" log line is
+/// the signal; raise this to the current Claude Code release.
+const CLAUDE_CODE_UA: &str = "claude-code/2.1.282";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FIVE_HOUR_MINUTES: i64 = 5 * 60;
@@ -1253,7 +1266,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = requests[0].to_ascii_lowercase();
         assert!(request.starts_with("get /usage?cedar_ember=1 http/1.1\r\n"));
-        assert!(request.contains("user-agent: claude-cli/2.1.0 (external, cli)\r\n"));
+        assert!(request.contains("user-agent: claude-cli/2.1.282 (external, cli)\r\n"));
         assert!(request.contains("authorization: bearer synthetic-reset-token\r\n"));
         assert!(request.contains("anthropic-beta: oauth-2025-04-20\r\n"));
         assert!(request.contains("accept: application/json\r\n"));
@@ -1268,7 +1281,7 @@ mod tests {
         .await;
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("GET /usage HTTP/1.1\r\n"));
-        assert!(requests[1].contains("user-agent: claude-code/2.1.0\r\n"));
+        assert!(requests[1].contains("user-agent: claude-code/2.1.282\r\n"));
         assert!(requests[1].contains("authorization: Bearer synthetic-reset-token\r\n"));
         assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
     }
