@@ -527,11 +527,36 @@ fn write_owner_only(path: &Path, body: &[u8]) {
 
 struct ModuleProcess {
     child: Child,
+    stderr_reader: tokio::task::JoinHandle<()>,
+}
+
+impl ModuleProcess {
+    fn new(mut child: Child) -> Self {
+        let mut stderr = child.stderr.take().expect("module stderr is piped");
+        let stderr_reader = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(size) => eprint!("{}", String::from_utf8_lossy(&buffer[..size])),
+                    Err(error) => {
+                        eprintln!("could not read module stderr: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            child,
+            stderr_reader,
+        }
+    }
 }
 
 impl Drop for ModuleProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        self.stderr_reader.abort();
     }
 }
 
@@ -574,7 +599,10 @@ fn quota_module_command_for(
         .arg("--subc")
         .arg(subc_connection_file)
         .env("SUBC_MODULE_ID", MODULE_ID)
-        .stderr(process::Stdio::inherit())
+        // A child's inherited stderr bypasses libtest capture and can interrupt
+        // a `test NAME ... ok` status line. Drain it through the test instead,
+        // retaining diagnostics without corrupting machine-readable results.
+        .stderr(process::Stdio::piped())
         .kill_on_drop(true);
     command
 }
@@ -587,7 +615,7 @@ fn spawn_quota_module(
     let child = quota_module_command_for(subc_connection_file, test_temp_dir, sessions)
         .spawn()
         .expect("spawn quota-module");
-    ModuleProcess { child }
+    ModuleProcess::new(child)
 }
 
 /// Set on the probe process `f1_…` spawns; see [`env_probe_prints_its_environment_when_asked`].
@@ -967,7 +995,7 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
         .env_remove("KIMI_CODE_API_KEY")
         .spawn()
         .expect("spawn quota-module with the seventeen-row scoped inventory");
-    let _module = ModuleProcess { child };
+    let _module = ModuleProcess::new(child);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = daemon.temp_dir.join("project");
@@ -1121,7 +1149,7 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
         .env("CODEX_HOME", &codex_home)
         .spawn()
         .expect("spawn vault-wired quota-module");
-    let _module = ModuleProcess { child };
+    let _module = ModuleProcess::new(child);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
     let project_root = daemon.temp_dir.join("project");

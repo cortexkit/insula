@@ -2200,8 +2200,14 @@ mod tests {
         )
         .expect("a supervised environment yields an identity");
 
-        assert_eq!(identity["module_id"], "insula");
-        assert_eq!(identity["launch_nonce"], "nonce-value");
+        assert_eq!(
+            identity["module_id"], "insula",
+            "route.open must emit module_id"
+        );
+        assert_eq!(
+            identity["launch_nonce"], "nonce-value",
+            "route.open must emit launch_nonce"
+        );
 
         let mut keys: Vec<&str> = identity
             .as_object()

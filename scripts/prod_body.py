@@ -148,6 +148,15 @@ def production_body(source: str) -> tuple[str, float]:
     return body, fraction
 
 
+def self_check() -> None:
+    # A real corpus can be clean with a broken stripper. Plant test code between
+    # two production items; neither leakage nor truncation is a valid reading.
+    source = "fn before() {}\n#[cfg(test)]\nmod checks {\n    #[test]\n    fn violation() {}\n}\nfn after() {}\n"
+    body, _ = production_body(source)
+    assert "violation" not in body, "planted test code must be stripped"
+    assert "fn before()" in body and "fn after()" in body, "production after a test module must survive"
+
+
 def test_only_items(body: str) -> list[int]:
     """Line numbers of test-only items left inside a production body.
 
@@ -166,6 +175,7 @@ def test_only_items(body: str) -> list[int]:
 
 
 def main() -> int:
+    self_check()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("files", nargs="+", type=Path)
     parser.add_argument(

@@ -95,23 +95,97 @@ mechanisms are sized for a problem this repo does not have.
 
 ## Mutation proofs
 
-Use `scripts/probe.py`. It stages first, restores in a `finally` and from signal
-handlers, and classifies the outcome as reddened / undefended / NOT REACHED /
-HUNG.
+Use the fleet runner **ck-mutate 0.7.0** to prove and replay costly guards.
+The checked-in [`mutations.toml`](../mutations.toml) records source edits and
+the exact tests that must catch them. Catalogue crash safety, exactly-once,
+authorization/trust, wire contracts and data loss, not every ordinary logic test.
+An exactly-once claim needs a row through the production provider/scheduler path,
+not just its helper. Use `expect_message` to distinguish the intended assertion
+from a timeout, fixture failure or unrelated panic.
 
 ```bash
-python3 scripts/probe.py <file> '<original>' '<mutated>' -- -p quota-core --lib
+cargo install --locked --git https://github.com/cortexkit/commons \
+  --rev 7d08e73722fa3e79bbcc2607753978ab768f1c6b cortexkit-mutate
+mkdir -p target/mutations
+ck-mutate check
+ck-mutate run --all --report target/mutations/all.json
+ck-mutate run --diff origin/master --report target/mutations/diff.json
+ck-mutate run --all --broad --report target/mutations/broad.json
+python3 scripts/mutation-report.py target/mutations/broad.json
 ```
 
-**Do not hand-roll the restore with `git checkout --`.** It restores from the
-index, so with uncommitted work in the tree it reverts the whole file rather than
-the mutation — and a proof run against a hand-rebuilt copy of the code under test
-proves nothing about the code that ships.
+Create rows from code with `ck-mutate prove`, never by transcribing old evidence:
+
+```bash
+ck-mutate prove --id my-guard --guards 'the costly property protected' \
+  --file crates/quota-core/src/example.rs --old 'live unique anchor' \
+  --new 'independent break /* NON-VACUITY BREAK */' \
+  --test-file crates/quota-core/src/example.rs --package quota-core \
+  --target=--lib --expect-red example::tests::the_guard \
+  --expect-message 'the intended assertion message' \
+  --report target/mutations/proof.json
+```
+
+`prove` appends only on a named catch; `explore --append` discovers the guarding
+tests when they are unknown. Replay a new row with `--broad` before committing.
+Narrow cross-target catches, or record a reviewed HUB with the shared property
+and the **other** stable target names. HUB is not a waiver for an unrelated red.
+UNREACHABLE needs a reason showing no production caller; EQUIVALENT needs both
+an explanation and the code fact that preserves behavior. Neither counts as a
+catch. Use `platforms` for OS-specific tests instead of quietly skipping them.
+Every scanner must exercise a planted violation on every pass. Deadlines stop
+hangs; assertions prove order and outcome, never elapsed time. The pinned runner's
+default deadlines are not measured performance budgets. Set budgets only from
+clean CI measurements, not a loaded development Mac.
+
+Read the [pinned runner README](https://github.com/cortexkit/commons/blob/7d08e73722fa3e79bbcc2607753978ab768f1c6b/crates/cortexkit-mutate/README.md)
+for multi-file edits, dispositions and prerequisites. Our root `prebuild`
+refreshes `ck-insula` before baselines, after mutant builds and on restoration;
+the broad module audit spawns that binary. These rows need no real-daemon test
+or sibling checkout (the daemon tests remain ignored).
+
+Run on a clean tree. ck-mutate refuses even staged edit targets differing from
+HEAD unless explicitly passed `--allow-dirty`; with that opt-in it restores saved
+local bytes, **not** HEAD or the index. It locks the tree, checks exact-once
+anchors and `Cargo.lock`, separates build and test deadlines, kills child process
+groups on timeout/interruption, restores bytes and refreshes mtimes. Never edit
+or check out a target mid-run. A SIGKILL/power loss cannot be recovered in-process;
+use disposable CI checkouts and inspect the tree before resuming.
+
+`scripts/probe.py` remains a legacy one-off Cargo diagnostic, not a catalogue or
+replay mechanism. ck-mutate now covers its safe restoration, mtime refresh and
+named-outcome classification, and adds test identity/message checking, baselines,
+platform gates and replay. The legacy tool still **stages all changes** before
+editing, accepts arbitrary Cargo test arguments (including filters/ignored tests),
+builds without a deadline and uses the old exit convention (1 means a named red,
+0 means undefended, 2 means no proof/hung). ck-mutate never stages anything, uses
+locked builds with a build deadline, and exits 0 when a proof succeeds. These are
+different interfaces, not missing safety features; prefer ck-mutate for durable
+proofs. If using the legacy tool, inspect its staging side effect and do not
+hand-roll a restore that could discard unstaged implementation.
 
 Read WHICH test reddened, not merely that something did. A mutation that reddens
 an unrelated test says the mutation was wrong, not that the guard is defended;
 one that reddens nothing may mean the mutation missed rather than that the guard
 is unguarded. Both cases are findings about the proof, not about the code.
+
+### Mutation CI
+
+`.github/workflows/mutations.yml` adds four advisory jobs named
+`Mutation replay (1/4)` through `Mutation replay (4/4)`. It does not rename or
+add required checks: branch protection remains `Test (ubuntu)` and
+`Test (windows)`. Each job has its own checkout and pinned, cached runner.
+Pull requests and `train/**` pushes replay touched rows; `master` pushes replay
+the full catalogue. Nightly and manual runs audit `--broad`. Diff selection sees
+committed edit targets, test files and changed catalogue rows, not unlisted
+helper/fixture dependencies; the nightly full audit covers that limitation.
+The report gate refuses unreviewed CAUGHT_BROADLY even though 0.7.0 only warns.
+
+CI artifacts carry disposition counts and each shard's measured wall duration
+in `ci-timing.txt` and the step summary. No full-run CI duration is claimed yet:
+the first run after landing establishes it. For a sharded run report both the
+job-span wall time and the sum of shard durations; do not call a single shard
+the full catalogue's time.
 
 ## Checkers, after deploying
 

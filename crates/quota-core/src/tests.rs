@@ -569,6 +569,15 @@ fn every_antigravity_plugin_lane_publishes_the_account_email() {
 /// and it must leak no test code (the reason a cheap rule is tempting at all).
 #[test]
 fn the_production_boundary_removes_test_modules() {
+    // Plant a violation before trusting the source walk: arbitrary test module
+    // names must be stripped without dropping the production item after them.
+    let planted = "fn before() {}\n#[cfg(test)]\nmod checks {\n    #[test]\n    fn violation() {}\n}\nfn after() {}\n";
+    let body = production_body(planted);
+    assert!(
+        !body.contains("violation"),
+        "planted test code must be stripped"
+    );
+    assert!(body.contains("fn before()") && body.contains("fn after()"));
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let refresh = std::fs::read_to_string(src.join("refresh.rs")).expect("refresh.rs is readable");
@@ -989,6 +998,15 @@ fn no_production_source_reads_the_launch_nonce_directly() {
 /// cookie provider is covered without anyone remembering to add it.
 #[test]
 fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
+    // The real cohort is clean today. Exercise the same predicate on a planted
+    // call so a matcher that silently stops matching cannot report it as clean.
+    assert!(
+        cookie_provider_reports_auth_failure("fn fetch() { source.report_auth_failure(); }\n"),
+        "the cookie fence must flag a planted auth-failure call"
+    );
+    assert!(!cookie_provider_reports_auth_failure(
+        "fn fetch() {}\n#[cfg(test)]\nmod checks {\n    fn helper() { report_auth_failure(); }\n}\n"
+    ));
     let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
@@ -1007,9 +1025,8 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
         };
         // Production only, matching the walk above: a reference inside a
         // provider's own test module is not a call on the fetch path.
-        let production = production_body(&source);
         examined += 1;
-        if production.contains("report_auth_failure") {
+        if cookie_provider_reports_auth_failure(&source) {
             offenders.push(provider.name.clone());
         }
     }
@@ -1027,6 +1044,10 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
         examined >= 9,
         "expected to read every cookie provider's source; read only {examined}"
     );
+}
+
+fn cookie_provider_reports_auth_failure(source: &str) -> bool {
+    production_body(source).contains("report_auth_failure")
 }
 
 /// No vault lane hand-rolls the auth report or the payload scrub.
@@ -5712,7 +5733,7 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let http_server = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = vec![0; 16 * 1024];
             let size = stream.read(&mut request).await.unwrap();
@@ -5784,18 +5805,29 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
     let registry = Registry::new(vec![Box::new(provider)]);
 
     tick(&registry).await;
-    // Bounded: the server expects exactly two usage requests, one per lane. If a
-    // change removes a lane, an unbounded wait hangs the whole suite instead of
-    // failing this test by name -- which is how it surfaced, as a hung run with
-    // no test named, when the codex local lane learned to step aside for a vault
-    // row carrying the same account id.
+    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "same-account real Codex lanes must spend at most once"
+    );
+    // Move past the independent ten-minute provider floor, but stay inside the
+    // thirty-minute account bound. A same-tick fixture alone cannot distinguish
+    // the durable bound from the shorter floor that also prevents a second POST.
+    age_journal(&temp.journal(), 11 * 60);
+    force_due(&registry, "codex");
+    tokio::time::timeout(Duration::from_secs(15), tick(&registry))
+        .await
+        .expect("the second real-provider refresh must finish");
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "the thirty-minute bound must outlive the provider floor on real Codex lanes"
+    );
     tokio::time::timeout(Duration::from_secs(10), http_server)
         .await
-        .expect("expected two usage requests, one from each lane for the shared account")
+        .expect("expected two usage requests per refresh, one from each real Codex lane")
         .unwrap();
-
-    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
-    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
     assert_eq!(
         *transport.consume_accounts.lock().unwrap(),
         vec!["real-provider-account".to_string()]
@@ -5996,10 +6028,27 @@ async fn registry_scheduler_two_codex_units_same_account_send_one_consume_post()
 
     tick(&registry).await;
 
-    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "same-account scheduled Codex lanes must spend at most once"
+    );
     let usage = registry.get_usage(Some("codex")).await;
     assert_eq!(usage.len(), 1, "same-account slots must deduplicate");
     assert_eq!(usage[0].account.as_deref(), Some("same-codex-account"));
+    // This second refresh distinguishes the account spend bound from the shorter
+    // provider-wide floor. Rewrite the journal's own timestamps, never wait for
+    // wall time or derive the fixture from the constant being checked.
+    age_journal(&temp.journal(), 11 * 60);
+    force_due(&registry, "codex");
+    tokio::time::timeout(Duration::from_secs(15), tick(&registry))
+        .await
+        .expect("the second scheduled refresh must finish");
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "the thirty-minute bound must outlive the provider floor on scheduled Codex lanes"
+    );
 }
 
 /// A walled account whose ONLY route to firing is the exhaustion trigger.
@@ -11341,8 +11390,15 @@ async fn expiry_consumes_even_while_sibling_is_unknown() {
         Instant::now(),
     );
     let result = reset_test_tick(&coordinator, &transport, "a", true).await;
-    assert!(result.trigger.expiry_trigger);
-    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert!(
+        result.trigger.expiry_trigger,
+        "expiry must remain ungated by unknown siblings"
+    );
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "expiry must consume despite an unknown sibling"
+    );
 }
 
 #[tokio::test]

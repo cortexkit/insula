@@ -1,0 +1,102 @@
+name: Mutation proofs
+
+on:
+  push:
+    branches: [master, 'train/**']
+  pull_request:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+
+# A master push must not cancel the nightly breadth audit.
+concurrency:
+  group: mutations-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
+
+jobs:
+  replay:
+    # Separate, advisory contexts: branch protection still requires exactly
+    # Test (ubuntu) and Test (windows) from ci.yml.
+    name: Mutation replay (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - run: python3 -m pip install PyYAML
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-mutation-cargo-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/cache@v4
+        id: mutate-cache
+        with:
+          path: ~/.cargo/bin/ck-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+      - name: Install pinned mutation runner
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - name: Replay selected proofs and measure on CI
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          SHARD: ${{ matrix.shard }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ck-mutate --version
+          cargo --version
+          mkdir -p target/mutations
+          selection=(--all)
+          if [[ "$EVENT" == pull_request ]]; then
+            selection=(--diff "$PR_BASE")
+          elif [[ "$EVENT" == push && "$REF" != refs/heads/master ]]; then
+            # A newly created train has no before SHA. Compare it to master,
+            # rather than silently selecting no proofs on its first push.
+            base="$PUSH_BASE"
+            if [[ "$base" == 0000000000000000000000000000000000000000 ]]; then
+              base=origin/master
+            fi
+            selection=(--diff "$base")
+          fi
+          breadth=()
+          if [[ "$EVENT" == schedule || "$EVENT" == workflow_dispatch ]]; then
+            breadth=(--broad)
+          fi
+          start=$(date +%s)
+          set +e
+          ck-mutate run "${selection[@]}" "${breadth[@]}" --shard "$SHARD/4" --report target/mutations/replay.json
+          result=$?
+          set -e
+          elapsed=$(( $(date +%s) - start ))
+          printf 'CI mutation replay: shard %s/4, %ss, exit %s\n' "$SHARD" "$elapsed" "$result" | tee target/mutations/ci-timing.txt
+          cat target/mutations/ci-timing.txt >> "$GITHUB_STEP_SUMMARY"
+          # Broad catches are findings, not green-by-default in our catalogue.
+          # The pinned runner only warns; this gate requires narrowing or a
+          # reviewed HUB whose shared property names the approved targets.
+          python3 scripts/mutation-report.py target/mutations/replay.json
+          exit "$result"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutations-${{ github.event_name }}-${{ matrix.shard }}
+          path: target/mutations/
