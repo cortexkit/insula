@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Named controls for the Python/shell scanners, replayable by ck-mutate."""
+"""Feed each Python and shell scanner a deliberately planted violation.
+
+These tests check that each scanner refuses the violation. The mutations.toml
+rows break each scanner to prove these tests catch it.
+"""
 
 import importlib.util
 from pathlib import Path

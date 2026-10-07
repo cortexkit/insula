@@ -133,10 +133,15 @@ and the **other** stable target names. HUB is not a waiver for an unrelated red.
 UNREACHABLE needs a reason showing no production caller; EQUIVALENT needs both
 an explanation and the code fact that preserves behavior. Neither counts as a
 catch. Use `platforms` for OS-specific tests instead of quietly skipping them.
-Every scanner must exercise a planted violation on every pass. Deadlines stop
-hangs; assertions prove order and outcome, never elapsed time. The pinned runner's
-default deadlines are not measured performance budgets. Set budgets only from
-clean CI measurements, not a loaded development Mac.
+Here, scanners are the source-walk tests and scripts that check code for forbidden
+patterns, such as outside path dependencies, cookie providers reporting auth
+failures, or direct launch-nonce environment reads. Each scanner must also run on
+a deliberately planted violation on every run, so one that stops matching anything
+fails instead of passing over apparently clean code.
+
+Deadlines stop hangs; assertions prove order and outcome, never elapsed time. The
+pinned runner's default deadlines are not measured performance budgets. Set budgets
+only from clean CI measurements, not a loaded development Mac.
 
 Read the [pinned runner README](https://github.com/cortexkit/commons/blob/7d08e73722fa3e79bbcc2607753978ab768f1c6b/crates/cortexkit-mutate/README.md)
 for multi-file edits, dispositions and prerequisites. Our root `prebuild`
@@ -179,7 +184,11 @@ Pull requests and `train/**` pushes replay touched rows; `master` pushes replay
 the full catalogue. Nightly and manual runs audit `--broad`. Diff selection sees
 committed edit targets, test files and changed catalogue rows, not unlisted
 helper/fixture dependencies; the nightly full audit covers that limitation.
-The report gate refuses unreviewed CAUGHT_BROADLY even though 0.7.0 only warns.
+With `--broad`, tests outside a row's named test target can also catch its mutant.
+ck-mutate 0.7.0 reports `CAUGHT_BROADLY` and only warns.
+`scripts/mutation-report.py` fails the job unless the mutant was narrowed to its
+own test target or the row is marked `HUB`: a deliberately shared catch listing
+the other allowed test targets and the property all those tests assert.
 
 CI artifacts carry disposition counts and each shard's measured wall duration
 in `ci-timing.txt` and the step summary. No full-run CI duration is claimed yet:

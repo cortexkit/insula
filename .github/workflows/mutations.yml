@@ -90,9 +90,12 @@ jobs:
           elapsed=$(( $(date +%s) - start ))
           printf 'CI mutation replay: shard %s/4, %ss, exit %s\n' "$SHARD" "$elapsed" "$result" | tee target/mutations/ci-timing.txt
           cat target/mutations/ci-timing.txt >> "$GITHUB_STEP_SUMMARY"
-          # Broad catches are findings, not green-by-default in our catalogue.
-          # The pinned runner only warns; this gate requires narrowing or a
-          # reviewed HUB whose shared property names the approved targets.
+          # With --broad, tests outside a row's named test target can also catch
+          # its mutant. ck-mutate 0.7.0 reports CAUGHT_BROADLY and only warns.
+          # scripts/mutation-report.py fails the job unless the mutant was
+          # narrowed to its own test target or the row is marked HUB: a
+          # deliberately shared catch that lists the other test targets allowed
+          # to catch it and the property all those tests assert.
           python3 scripts/mutation-report.py target/mutations/replay.json
           exit "$result"
       - uses: actions/upload-artifact@v4
