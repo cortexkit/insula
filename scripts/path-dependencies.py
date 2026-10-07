@@ -8,7 +8,51 @@ import sys
 import tomllib
 
 
+def outside_repository(root, path):
+    return not path.resolve().is_relative_to(root.resolve())
+
+
+def declarations(table):
+    for section, values in table.items():
+        if not isinstance(values, dict):
+            continue
+        if section in ("dependencies", "dev-dependencies", "build-dependencies", "replace"):
+            for name, spec in values.items():
+                if isinstance(spec, dict) and "path" in spec:
+                    yield name, spec["path"]
+        elif section == "patch":
+            for dependencies in values.values():
+                for name, spec in dependencies.items():
+                    if isinstance(spec, dict) and "path" in spec:
+                        yield name, spec["path"]
+        elif section == "workspace":
+            yield from declarations(values)
+        elif section == "target":
+            for target in values.values():
+                yield from declarations(target)
+
+
+def self_check():
+    # No real sibling is needed: containment is a property of resolved paths,
+    # including paths that do not exist. Test both directions on every scan.
+    root = Path(__file__).resolve().parent.parent
+    planted = tomllib.loads('''
+[dependencies]
+inside = { path = "crates/quota-core" }
+outside = { path = "../planted-sibling" }
+[patch.crates-io]
+unused = { path = "../planted-unused" }
+[workspace.dependencies]
+shared = { path = "../planted-shared" }
+[target.'cfg(unix)'.build-dependencies]
+build = { path = "../planted-build" }
+''')
+    refused = {name for name, path in declarations(planted) if outside_repository(root, root / path)}
+    assert refused == {"outside", "unused", "shared", "build"}, "planted outside dependencies must be refused, inside must pass"
+
+
 def main():
+    self_check()
     root = Path(__file__).resolve().parent.parent
     # Metadata describes resolved dependencies, but omits unused patches and
     # manifests outside the workspace. Parse every versioned/unignored manifest
@@ -24,31 +68,13 @@ def main():
         resolved = (manifest.parent / path).resolve()
         examined.add((str(manifest.relative_to(root)), name, str(resolved)))
 
-    def declarations(manifest, table):
-        for section, values in table.items():
-            if not isinstance(values, dict):
-                continue
-            if section in ("dependencies", "dev-dependencies", "build-dependencies", "replace"):
-                for name, spec in values.items():
-                    if isinstance(spec, dict) and "path" in spec:
-                        record(manifest, name, spec["path"])
-            elif section == "patch":
-                for dependencies in values.values():
-                    for name, spec in dependencies.items():
-                        if isinstance(spec, dict) and "path" in spec:
-                            record(manifest, name, spec["path"])
-            elif section == "workspace":
-                declarations(manifest, values)
-            elif section == "target":
-                for target in values.values():
-                    declarations(manifest, target)
-
     for manifest in manifests:
         with manifest.open("rb") as source:
-            declarations(manifest, tomllib.load(source))
+            for name, path in declarations(tomllib.load(source)):
+                record(manifest, name, path)
 
     def report():
-        outside = [entry for entry in sorted(examined) if not Path(entry[2]).is_relative_to(root)]
+        outside = [entry for entry in sorted(examined) if outside_repository(root, Path(entry[2]))]
         print(f"path dependencies: {len(examined)} examined, {len(examined) - len(outside)} inside the repo, {len(outside)} outside ({len(manifests)} manifests)", flush=True)
         for manifest, name, path in outside:
             print(f"  REFUSED: {manifest}: {name} resolves outside the repository: {path}", flush=True)
@@ -77,6 +103,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (AssertionError, OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"path dependencies: could not check: {error}", file=sys.stderr)
         sys.exit(2)

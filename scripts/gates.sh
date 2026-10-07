@@ -39,6 +39,9 @@ done
 "$TOML_PYTHON" --version
 "$TOML_PYTHON" scripts/path-dependencies.py || fail "repository path dependencies"
 
+step "mutation scan controls"
+bash scripts/mutation-scans.sh || fail "planted scanner violations"
+
 # Cargo commands without --locked can rewrite Cargo.lock after a local manifest
 # edit. Announce any write so it is reviewed as a dependency change rather than
 # swept into an unrelated commit. Deliberate upgrades use cargo update -p <crate>
