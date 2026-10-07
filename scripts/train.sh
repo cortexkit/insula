@@ -97,14 +97,20 @@ if ! git push -q origin "$sha:refs/heads/$branch"; then
   exit 2
 fi
 
-# SELECT THE RUN BY SHA AND RECENCY, NOT `gh run list --limit 1`.
+# SELECT THE RUN BY WORKFLOW, SHA AND RECENCY, NOT `gh run list --limit 1`.
 # Branch protection reads the newest run for the sha. Watching an older one
 # reports success while the push is rejected for "required status checks are
 # cancelled" -- which is exactly what happened, with a green run I had watched.
+#
+# Only ci.yml produces the required checks. The mutation-proofs workflow starts
+# on the same push, often in the same second, and can finish first when a change
+# touches no catalogue row; watching it pushed a sha whose required checks were
+# still running, and protection refused it.
+CI_WORKFLOW=ci.yml
 run=""
 for _ in $(seq 1 15); do
   sleep 4
-  run=$(gh api "repos/$REPO/actions/runs?head_sha=$sha" \
+  run=$(gh api "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$sha" \
         --jq '[.workflow_runs[]] | sort_by(.created_at) | last | .id' 2>/dev/null)
   [ -n "$run" ] && [ "$run" != "null" ] && break
 done
@@ -132,7 +138,7 @@ if [ "$conclusion" != "success" ]; then
   exit 1
 fi
 
-# EVERY REQUIRED CHECK MUST BE A NAME THIS SHA ACTUALLY PRODUCED.
+# EVERY REQUIRED CHECK MUST BE A NAME THIS SHA PRODUCED, AND IT MUST HAVE PASSED.
 #
 # Branch protection matches required checks BY NAME. A matrix leg renamed in the
 # workflow produces a new name, the old one is never reported again, and the rule
@@ -154,25 +160,27 @@ if [ -z "$required" ]; then
   # nothing, so a silent skip is not mistaken for a clean check.
   echo "  (no required checks readable for the default branch -- protection off, or the token lacks admin)"
 else
+  # Only checks that finished green count. A check that exists but is still
+  # running is not one protection will accept.
   produced=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
-             --jq '.check_runs[].name' 2>/dev/null | sort -u)
+             --jq '.check_runs[] | select(.conclusion == "success") | .name' 2>/dev/null | sort -u)
   missing=""
   while IFS= read -r name; do
     [ -z "$name" ] && continue
     printf '%s\n' "$produced" | grep -qxF "$name" || missing="$missing$name\n"
   done <<< "$required"
   if [ -n "$missing" ]; then
-    echo "  REFUSED: a required check was never produced by this sha" >&2
+    echo "  REFUSED: a required check has not passed on this sha" >&2
     printf "$missing" | sed 's/^/    missing: /' >&2
     echo "  Produced names:" >&2
     printf '%s\n' "$produced" | sed 's/^/      /' >&2
-    echo "  A renamed job is the usual cause. Fix the workflow name or the" >&2
-    echo "  protection rule BEFORE pushing -- the push would otherwise hang on a" >&2
-    echo "  status nobody will ever report." >&2
+    echo "  Either it is still running or failed, or its job was renamed. For a" >&2
+    echo "  rename, fix the workflow name or the protection rule BEFORE pushing --" >&2
+    echo "  the push would otherwise hang on a status nobody will ever report." >&2
     echo "  NOT LANDED: the branch is left at $branch for inspection" >&2
     exit 1
   fi
-  echo "  required checks produced: $(printf '%s\n' "$required" | grep -c .) of $(printf '%s\n' "$required" | grep -c .)"
+  echo "  required checks passed: $(printf '%s\n' "$required" | grep -c .) of $(printf '%s\n' "$required" | grep -c .)"
 fi
 
 # PUSH THE SHA THAT WAS TESTED, NOT WHATEVER LOCAL MASTER POINTS AT NOW.
