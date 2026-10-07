@@ -282,20 +282,20 @@ scripts/gates.sh
 python3 scripts/prod_body.py crates/quota-core/src/*.rs
 
 # Prove and replay costly guards with the fleet mutation catalogue. Create new
-# rows with ck-mutate prove or explore --append, not from old evidence. See
+# rows with ckdev-mutate prove or explore --append, not from old evidence. See
 # docs/verifying.md for exact test names, messages, HUB review and safe restore.
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 7d08e73722fa3e79bbcc2607753978ab768f1c6b cortexkit-mutate
+  --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
 mkdir -p target/mutations
-ck-mutate check
-ck-mutate run --all --report target/mutations/all.json
-ck-mutate run --diff origin/master --report target/mutations/diff.json
-ck-mutate run --all --broad --report target/mutations/broad.json
+ckdev-mutate check
+ckdev-mutate run --all --report target/mutations/all.json
+ckdev-mutate run --diff origin/master --report target/mutations/diff.json
+ckdev-mutate run --all --broad --report target/mutations/broad.json
 python3 scripts/mutation-report.py target/mutations/broad.json
 
 # Legacy one-off diagnostic with arbitrary Cargo filters/ignored-test arguments.
-# It stages ALL changes first and uses 1 for a named red (ck-mutate uses 0 for a
-# successful proof). It does not record replayable rows; prefer ck-mutate above:
+# It stages ALL changes first and uses 1 for a named red (ckdev-mutate uses 0 for a
+# successful proof). It does not record replayable rows; prefer ckdev-mutate above:
 python3 scripts/probe.py <file> <before> <after>
 
 # print every published health metric with its raw value. A metric asked for by

@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
+  CK_MUTATE_REV: 46cc166b0df2edcfd14b3eb54ed6eeac588fed69
 
 jobs:
   replay:
@@ -48,8 +48,8 @@ jobs:
       - uses: actions/cache@v4
         id: mutate-cache
         with:
-          path: ~/.cargo/bin/ck-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+          path: ~/.cargo/bin/ckdev-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CK_MUTATE_REV }}
       - name: Install pinned mutation runner
         if: steps.mutate-cache.outputs.cache-hit != 'true'
         run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ck-mutate --version
+          ckdev-mutate --version
           cargo --version
           mkdir -p target/mutations
           selection=(--all)
@@ -84,14 +84,14 @@ jobs:
           fi
           start=$(date +%s)
           set +e
-          ck-mutate run "${selection[@]}" "${breadth[@]}" --shard "$SHARD/4" --report target/mutations/replay.json
+          ckdev-mutate run "${selection[@]}" "${breadth[@]}" --shard "$SHARD/4" --report target/mutations/replay.json
           result=$?
           set -e
           elapsed=$(( $(date +%s) - start ))
           printf 'CI mutation replay: shard %s/4, %ss, exit %s\n' "$SHARD" "$elapsed" "$result" | tee target/mutations/ci-timing.txt
           cat target/mutations/ci-timing.txt >> "$GITHUB_STEP_SUMMARY"
           # With --broad, tests outside a row's named test target can also catch
-          # its mutant. ck-mutate 0.7.0 reports CAUGHT_BROADLY and only warns.
+          # its mutant. ckdev-mutate 0.8.0 reports CAUGHT_BROADLY and only warns.
           # scripts/mutation-report.py fails the job unless the mutant was
           # narrowed to its own test target or the row is marked HUB: a
           # deliberately shared catch that lists the other test targets allowed

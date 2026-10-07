@@ -95,7 +95,7 @@ mechanisms are sized for a problem this repo does not have.
 
 ## Mutation proofs
 
-Use the fleet runner **ck-mutate 0.7.0** to prove and replay costly guards.
+Use the fleet runner **ckdev-mutate 0.8.0** to prove and replay costly guards.
 The checked-in [`mutations.toml`](../mutations.toml) records source edits and
 the exact tests that must catch them. Catalogue crash safety, exactly-once,
 authorization/trust, wire contracts and data loss, not every ordinary logic test.
@@ -105,19 +105,19 @@ from a timeout, fixture failure or unrelated panic.
 
 ```bash
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 7d08e73722fa3e79bbcc2607753978ab768f1c6b cortexkit-mutate
+  --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
 mkdir -p target/mutations
-ck-mutate check
-ck-mutate run --all --report target/mutations/all.json
-ck-mutate run --diff origin/master --report target/mutations/diff.json
-ck-mutate run --all --broad --report target/mutations/broad.json
+ckdev-mutate check
+ckdev-mutate run --all --report target/mutations/all.json
+ckdev-mutate run --diff origin/master --report target/mutations/diff.json
+ckdev-mutate run --all --broad --report target/mutations/broad.json
 python3 scripts/mutation-report.py target/mutations/broad.json
 ```
 
-Create rows from code with `ck-mutate prove`, never by transcribing old evidence:
+Create rows from code with `ckdev-mutate prove`, never by transcribing old evidence:
 
 ```bash
-ck-mutate prove --id my-guard --guards 'the costly property protected' \
+ckdev-mutate prove --id my-guard --guards 'the costly property protected' \
   --file crates/quota-core/src/example.rs --old 'live unique anchor' \
   --new 'independent break /* NON-VACUITY BREAK */' \
   --test-file crates/quota-core/src/example.rs --package quota-core \
@@ -143,13 +143,13 @@ Deadlines stop hangs; assertions prove order and outcome, never elapsed time. Th
 pinned runner's default deadlines are not measured performance budgets. Set budgets
 only from clean CI measurements, not a loaded development Mac.
 
-Read the [pinned runner README](https://github.com/cortexkit/commons/blob/7d08e73722fa3e79bbcc2607753978ab768f1c6b/crates/cortexkit-mutate/README.md)
+Read the [pinned runner README](https://github.com/cortexkit/commons/blob/46cc166b0df2edcfd14b3eb54ed6eeac588fed69/crates/cortexkit-mutate/README.md)
 for multi-file edits, dispositions and prerequisites. Our root `prebuild`
 refreshes `ck-insula` before baselines, after mutant builds and on restoration;
 the broad module audit spawns that binary. These rows need no real-daemon test
 or sibling checkout (the daemon tests remain ignored).
 
-Run on a clean tree. ck-mutate refuses even staged edit targets differing from
+Run on a clean tree. ckdev-mutate refuses even staged edit targets differing from
 HEAD unless explicitly passed `--allow-dirty`; with that opt-in it restores saved
 local bytes, **not** HEAD or the index. It locks the tree, checks exact-once
 anchors and `Cargo.lock`, separates build and test deadlines, kills child process
@@ -158,14 +158,14 @@ or check out a target mid-run. A SIGKILL/power loss cannot be recovered in-proce
 use disposable CI checkouts and inspect the tree before resuming.
 
 `scripts/probe.py` remains a legacy one-off Cargo diagnostic, not a catalogue or
-replay mechanism. ck-mutate now covers its safe restoration, mtime refresh and
+replay mechanism. ckdev-mutate now covers its safe restoration, mtime refresh and
 named-outcome classification, and adds test identity/message checking, baselines,
 platform gates and replay. The legacy tool still **stages all changes** before
 editing, accepts arbitrary Cargo test arguments (including filters/ignored tests),
 builds without a deadline and uses the old exit convention (1 means a named red,
-0 means undefended, 2 means no proof/hung). ck-mutate never stages anything, uses
+0 means undefended, 2 means no proof/hung). ckdev-mutate never stages anything, uses
 locked builds with a build deadline, and exits 0 when a proof succeeds. These are
-different interfaces, not missing safety features; prefer ck-mutate for durable
+different interfaces, not missing safety features; prefer ckdev-mutate for durable
 proofs. If using the legacy tool, inspect its staging side effect and do not
 hand-roll a restore that could discard unstaged implementation.
 
@@ -185,7 +185,7 @@ the full catalogue. Nightly and manual runs audit `--broad`. Diff selection sees
 committed edit targets, test files and changed catalogue rows, not unlisted
 helper/fixture dependencies; the nightly full audit covers that limitation.
 With `--broad`, tests outside a row's named test target can also catch its mutant.
-ck-mutate 0.7.0 reports `CAUGHT_BROADLY` and only warns.
+ckdev-mutate 0.8.0 reports `CAUGHT_BROADLY` and only warns.
 `scripts/mutation-report.py` fails the job unless the mutant was narrowed to its
 own test target or the row is marked `HUB`: a deliberately shared catch listing
 the other allowed test targets and the property all those tests assert.
