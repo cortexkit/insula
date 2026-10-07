@@ -52,8 +52,8 @@ use tokio::{
 };
 
 use common::{
-    catalog_list, connect_consumer, isolate_env, isolated_env, raw_route_frame, route_open,
-    unique_temp_dir, usage_get, Route, MODULE_ID, SETUP_TIMEOUT,
+    catalog_list, ckdev_binary, connect_consumer, isolate_env, isolated_env, raw_route_frame,
+    route_open, unique_temp_dir, usage_get, Route, MODULE_ID, SETUP_TIMEOUT,
 };
 
 // ---- in-process daemon -----------------------------------------------------
@@ -586,7 +586,11 @@ fn quota_module_command_for(
     test_temp_dir: &Path,
     sessions: HostSessions,
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-insula"));
+    let mut command = Command::new(ckdev_binary(
+        Path::new(env!("CARGO_BIN_EXE_ck-insula")),
+        test_temp_dir,
+        "insula",
+    ));
     isolate_env(&mut command, test_temp_dir);
     if let HostSessions::Real = sessions {
         for name in REAL_SESSION_ENV {
@@ -722,7 +726,10 @@ fn provider_secret_env_names() -> std::collections::BTreeSet<String> {
 
 #[test]
 fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
-    let rig = Path::new("/isolated-test-rig");
+    // A real scratch directory, because building the module command exposes the
+    // binary inside the rig under its ckdev name.
+    let rig_dir = unique_temp_dir("f1-isolated-rig");
+    let rig = rig_dir.as_path();
     let command = quota_module_command(Path::new("/isolated/connection.json"), rig);
     let env: HashMap<String, Option<String>> = command
         .as_std()
@@ -864,6 +871,7 @@ fn f1_module_process_cannot_inherit_real_reset_config_or_state() {
             "{name} reached the spawned process although the isolation does not set it: {received:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(&rig_dir);
 }
 
 async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {

@@ -20,6 +20,7 @@
 // The shared wire driver stays at `tests/common/mod.rs` rather than moving in
 // here: the `vault-lanes` and `deployed-sanity` examples include that exact
 // path too. Cargo builds no target from it, since it is not `tests/*.rs`.
+mod ckdev_names;
 #[path = "../common/mod.rs"]
 mod common;
 mod real_daemon_e2e;

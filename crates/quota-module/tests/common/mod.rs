@@ -56,6 +56,42 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
 }
 
+/// Expose `binary` to a test under the development name `ckdev-<name>`, inside
+/// `rig`, and return that path to spawn.
+///
+/// macOS shows a process by its executable's file name, and a `ck-<name>`
+/// process is taken to be the production fleet binary from
+/// `~/.local/share/cortexkit/bin`. A test that spawns cargo's
+/// `target/debug/ck-insula` or a sibling's `ck-subc` directly would sit in
+/// Activity Monitor indistinguishable from the live module, so every binary a
+/// test spawns goes through here instead.
+///
+/// A hard link is preferred: it adds a name without new bytes, so macOS reuses
+/// the code-signature check it already did for that file instead of validating a
+/// fresh copy on first run. A copy is the fallback when the rig is on another
+/// volume, where a hard link can't reach.
+///
+/// Each rig is unique to one test, so a name already present was exposed earlier
+/// in the same test from the same build and is reused. Replacing it could fail on
+/// Windows while a module spawned from it is still running.
+pub fn ckdev_binary(binary: &Path, rig: &Path, name: &str) -> PathBuf {
+    std::fs::create_dir_all(rig).expect("create the rig for a ckdev binary");
+    let exposed = rig.join(format!("ckdev-{name}{}", std::env::consts::EXE_SUFFIX));
+    if exposed.exists() {
+        return exposed;
+    }
+    if std::fs::hard_link(binary, &exposed).is_err() {
+        std::fs::copy(binary, &exposed).unwrap_or_else(|error| {
+            panic!(
+                "expose {} as {}: {error}",
+                binary.display(),
+                exposed.display()
+            )
+        });
+    }
+    exposed
+}
+
 /// Variables a spawned test process inherits from the test runner, and why.
 ///
 /// Everything else is cleared. These are the Windows system locations the OS

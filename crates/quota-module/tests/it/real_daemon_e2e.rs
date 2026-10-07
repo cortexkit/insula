@@ -27,8 +27,8 @@ use std::{
 use tokio::process::{Child, Command};
 
 use common::{
-    connect_consumer, isolate_env, raw_route_frame, route_open, unique_temp_dir, usage_get,
-    wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
+    ckdev_binary, connect_consumer, isolate_env, raw_route_frame, route_open, unique_temp_dir,
+    usage_get, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
@@ -76,11 +76,9 @@ fn build_subc_daemon() -> PathBuf {
 /// Launch a real ck-subc daemon with an isolated rig whose subc.jsonc supervises
 /// our freshly-built quota-module binary. Waits for the connection file.
 async fn start_real_daemon() -> RealDaemon {
-    let subc_daemon = build_subc_daemon();
-    let quota_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-insula"));
-    assert!(quota_module.exists());
-
     let rig = unique_temp_dir("quota-real-daemon");
+    let subc_daemon = ckdev_binary(&build_subc_daemon(), &rig, "subc");
+    let quota_module = ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-insula")), &rig, "insula");
     // Both locations are the ones `isolate_env` gives the daemon below, which
     // is how the daemon finds this subc.jsonc and where it publishes its
     // connection file.
