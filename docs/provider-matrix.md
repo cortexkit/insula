@@ -1166,7 +1166,7 @@ headless.)
 | cursor | cursor | browser cookie (cursor.com), short-lived JWT, NO CLI file. Real window `billingCycleEnd`. |
 | factory | factory | WorkOS/next-auth browser session (cookie + local-storage scrape), NO CLI file. Real window `windowEnd`/`secondsRemaining`. |
 | mimo | mimo | browser cookie (`api-platform_serviceToken`+`userId`), desktop-only. Real window `currentPeriodEnd`. |
-| ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. LIVE-PROVEN dead-end: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
+| ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. Included credits use `Monthly usage` or free-plan `Free usage` (CodexBar v0.73.0); labels match standalone text nodes, not explanatory prose. Both take `primary`, but only `Monthly usage` states a `windowKind`. LIVE-PROVEN dead-end: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
 | opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |
 | opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
 | amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |

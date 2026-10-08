@@ -9,12 +9,12 @@
 //!
 //! Flow: read the deposited ollama.com cookie header → GET
 //! `https://ollama.com/settings` with the `Cookie:` header → parse the "Monthly
-//! usage", "Session usage" and "Weekly usage" blocks (`N% used`, or a
+//! usage" / "Free usage", "Session usage" and "Weekly usage" blocks (`N% used`, or a
 //! `$X of $Y used` credit pair, + a `data-time="<ISO>"` reset).
 //!
-//! Slots: `primary` is the monthly window when present, else the session window;
+//! Slots: `primary` is the included-credit window when present, else the session window;
 //! `secondary` is the weekly window; `tertiary` is the session window when the
-//! monthly one holds `primary`. See `normalize_usage_at`.
+//! included-credit one holds `primary`. See `normalize_usage_at`.
 //!
 //! BRITTLE (accepted): needs a deposited login, and the session cookie rotates (no headless refresh), so it degrades to
 //! unavailable when the cookie is dead/expired or the login page is served. The one
@@ -29,7 +29,9 @@
 //! `OllamaUsageParser.swift:28-131` (labels, `N% used` / `width:N%`, `data-time`).
 //! The monthly block, its `$X of $Y used` figure and the same-host `/signin`
 //! redirect are ported from the same two files at v0.65.0 and are
-//! fixture-verified, not live-verified (see `MONTHLY_LABEL`).
+//! fixture-verified, not live-verified (see `MONTHLY_LABELS`). The "Free usage"
+//! alias and text-node label matching are ported from CodexBar v0.73.0 and
+//! fixture-verified, not live-verified.
 
 use std::time::Duration;
 
@@ -93,16 +95,29 @@ fn is_session_cookie(name: &str) -> bool {
 
 /// All usage-block labels, used to bound one block's window at the next block.
 ///
-/// `Monthly usage` is listed so that a session or weekly block ends where the
-/// monthly one begins; without it a legacy block could read the monthly block's
+/// Included-credit labels are listed so a session or weekly block ends where the
+/// included-credit one begins; without them a legacy block could read that block's
 /// percent or reset as its own. Upstream bounds blocks the same way
-/// (`usageLabels` in `OllamaUsageParser.swift` at v0.65.0).
+/// (`usageLabels` in `OllamaUsageParser.swift` at v0.73.0).
 const ALL_LABELS: &[&str] = &[
     "Monthly usage",
+    "Free usage",
     "Session usage",
     "Hourly usage",
     "Weekly usage",
 ];
+
+/// Match the label's own text node (`>\s*Label\s*<`), including its delimiters.
+/// Prose such as "Free usage credits can be used with the following cloud models:"
+/// is neither a meter label nor a boundary that may cut off a preceding reset.
+/// Scanning delimiters and trimming whitespace avoids a regex dependency.
+fn label_text_node_range(html: &str, label: &str) -> Option<std::ops::Range<usize>> {
+    html.match_indices('>').find_map(|(start, _)| {
+        let tail = &html[start + 1..];
+        let end = tail.find('<')?;
+        (tail[..end].trim() == label).then_some(start..start + 1 + end + 1)
+    })
+}
 
 /// Slice from just after `label` to the next other-label, or to the end of the
 /// page when no other label follows.
@@ -118,12 +133,12 @@ const ALL_LABELS: &[&str] = &[
 /// slicing mid-character panics, and a panicking fetch is classified non-transient,
 /// so a working provider would read as absent rather than degraded.
 fn block_after<'a>(html: &'a str, label: &str) -> Option<&'a str> {
-    let start = html.find(label)? + label.len();
+    let start = label_text_node_range(html, label)?.end;
     let tail = &html[start..];
     let end = ALL_LABELS
         .iter()
         .filter(|l| **l != label)
-        .filter_map(|l| tail.find(l))
+        .filter_map(|l| label_text_node_range(tail, l).map(|range| range.start))
         .min()
         .unwrap_or(tail.len());
     Some(&tail[..crate::text::floor_char_boundary(tail, end)])
@@ -469,6 +484,7 @@ fn window_for(
                         "Weekly usage" => {
                             Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string())
                         }
+                        // "Free usage" names no period, so it has no window kind.
                         _ => None,
                     },
                     used_percent,
@@ -511,14 +527,16 @@ fn session_block_reports_weekly_limit(html: &str) -> bool {
 /// it nil). The page has used one caption or the other, so the first that yields
 /// a percent is the session window.
 ///
-/// `Monthly usage` is NOT here. It is its own window, parsed from its own block
-/// ([`MONTHLY_LABEL`]); see there.
+/// Included credits are NOT here. They are their own window, parsed from their own
+/// block ([`MONTHLY_LABELS`]); see there.
 const SESSION_LABELS: &[(&str, Option<i64>)] = &[
     ("Session usage", Some(SESSION_WINDOW_MINUTES)),
     ("Hourly usage", None),
 ];
 
-/// The monthly-credit window, a block of its own rather than a session caption.
+/// The included-credit window, a block of its own rather than a session caption.
+/// Free plans use "Free usage" for the same meter (CodexBar v0.73.0), so both
+/// labels share parsing and slots. Only "Monthly usage" states a window kind.
 ///
 /// WHAT CHANGED. Ollama moved paid accounts from the 5-hour + weekly quota to
 /// monthly included credits, and the settings page renders a "Monthly usage"
@@ -541,8 +559,10 @@ const SESSION_LABELS: &[(&str, Option<i64>)] = &[
 /// percent is load-bearing and publishes; the cadence is metadata and is
 /// omitted, which is the standing rule for every reset-optional window here. Its
 /// reset is therefore bounded by `MAX_RESET_HORIZON_MINUTES` (31 days), which
-/// admits a reset anywhere in the longest month.
-const MONTHLY_LABEL: (&str, Option<i64>) = ("Monthly usage", None);
+/// admits a reset anywhere in the longest month. "Free usage" keeps that same
+/// reset horizon because it is the same included-credit meter, even though its
+/// label names no period.
+const MONTHLY_LABELS: &[(&str, Option<i64>)] = &[("Monthly usage", None), ("Free usage", None)];
 
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
@@ -560,7 +580,7 @@ pub fn normalize_usage_at(
     html: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Usage, FetchError> {
-    let monthly = window_for(html, &[MONTHLY_LABEL], now);
+    let monthly = window_for(html, MONTHLY_LABELS, now);
     let mut session = window_for(html, SESSION_LABELS, now);
     let mut weekly = window_for(html, &[("Weekly usage", Some(WEEKLY_WINDOW_MINUTES))], now);
 
@@ -591,9 +611,9 @@ pub fn normalize_usage_at(
         ));
     }
 
-    // SLOTS. `primary` is the monthly window when the page has one, else the
+    // SLOTS. `primary` is the included-credit window (monthly or free), else the
     // session window; `secondary` is always the weekly window; `tertiary` holds
-    // the session window only when monthly took `primary`.
+    // the session window only when included credits took `primary`.
     //
     // Consumers key on these slot ids, so a legacy page (session + weekly, no
     // monthly) must publish exactly what it did before the monthly block was
@@ -1299,6 +1319,149 @@ mod tests {
         </div>
     "#;
 
+    /// Sanitized free-plan settings fragment from CodexBar v0.73.0,
+    /// `Tests/CodexBarTests/OllamaUsageParserTests.swift`, commit 1f61b436b
+    /// (introduced in 65f0a5432), test "parses free usage meter as the primary
+    /// monthly window". Explanatory prose is not a meter label.
+    const FREE_USAGE_FIXTURE: &str = r#"
+        <div>
+          <h2 class="text-xl font-medium flex items-center space-x-2">
+            <span>Included usage</span>
+            <span
+              class="text-xs font-normal px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-600 capitalize"
+              >free</span
+            >
+          </h2>
+          <h2 id="header-email">user@example.com</h2>
+          <div id="free-plan-models">
+            <p>Free usage credits can be used with the following cloud models:</p>
+          </div>
+          <div>
+            <div class="flex justify-between mb-2">
+              <span class="text-sm">Free usage</span>
+              <span class="text-sm">69.5% used</span>
+            </div>
+            <div class="relative group" data-usage-meter>
+              <div
+                class="relative h-3 overflow-hidden rounded-full bg-neutral-200"
+                data-usage-track
+                aria-label="Free usage 69.5% used"
+              >
+                <div class="flex h-full overflow-hidden bg-neutral-950" style="width: 69.5%; "></div>
+              </div>
+            </div>
+            <div class="text-xs text-neutral-500 mt-1 local-time" data-time="2026-10-26T15:19:11Z">
+              Resets in 2 weeks.
+            </div>
+          </div>
+        </div>
+    "#;
+
+    #[test]
+    fn upstream_free_usage_meter_publishes_percent_and_reset_in_primary_without_a_window_kind() {
+        let usage = normalize_usage_at(FREE_USAGE_FIXTURE, at("2026-10-12T15:19:11Z"))
+            .expect("the upstream free-plan page parses");
+        let free = usage.primary.expect("included credits take primary");
+        assert_eq!(free.used_percent, 69.5);
+        assert_eq!(free.resets_at.as_deref(), Some("2026-10-26T15:19:11Z"));
+        assert_eq!(free.window_kind, None, "Free usage names no period");
+        assert_eq!(free.window_minutes, None, "no fixed cadence is stated");
+        assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+    }
+
+    #[test]
+    fn usage_label_prose_neither_starts_a_meter_nor_truncates_the_preceding_reset() {
+        // Based on the monthly dollar/prose regression in CodexBar's
+        // Tests/CodexBarTests/OllamaUsageParserTests.swift at 1f61b436b.
+        // A session block lets both its reset and the following free meter publish;
+        // the prose's distinct percent exposes a meter incorrectly started there.
+        let html = format!(
+            r#"
+              <span>Session usage</span><span>12% used</span>
+              <p>Free usage credits can be used with the following cloud models:</p>
+              <p>A model reports 91% used.</p>
+              <div data-time="2026-10-12T17:19:11Z">Resets in 2 hours.</div>
+              {FREE_USAGE_FIXTURE}
+            "#
+        );
+        let usage = normalize_usage_at(&html, at("2026-10-12T15:19:11Z")).unwrap();
+        let free = usage.primary.expect("free meter takes primary");
+        assert_eq!(free.used_percent, 69.5, "the meter, not the prose, is read");
+        assert_eq!(free.resets_at.as_deref(), Some("2026-10-26T15:19:11Z"));
+        let session = usage.tertiary.expect("session moves to tertiary");
+        assert_eq!(session.used_percent, 12.0);
+        assert_eq!(
+            session.resets_at.as_deref(),
+            Some("2026-10-12T17:19:11Z"),
+            "prose must not bound the preceding session block"
+        );
+
+        for label in ALL_LABELS {
+            let html = format!(
+                "<p>{label} credits are included.</p><div aria-label=\"{label}\"></div>\
+                 <span>\n  {label}\t </span>"
+            );
+            let range = label_text_node_range(&html, label).expect("a standalone text node");
+            assert_eq!(&html[range], format!(">\n  {label}\t <"));
+
+            // Every label must ignore prose as a boundary, not just Free usage.
+            let preceding = if *label == "Session usage" {
+                "Weekly usage"
+            } else {
+                "Session usage"
+            };
+            let html = format!(
+                r#"<span>{preceding}</span><span>12% used</span>
+                    <p>{label} credits are included.</p>
+                    <div data-time="2026-10-12T17:19:11Z">Resets in 2 hours.</div>
+                    <span>{label}</span><span>69.5% used</span>"#
+            );
+            assert_eq!(
+                parse_reset(block_after(&html, preceding).unwrap()).as_deref(),
+                Some("2026-10-12T17:19:11Z"),
+                "{label} prose must not truncate the preceding reset"
+            );
+        }
+    }
+
+    #[test]
+    fn free_usage_reset_uses_the_same_longest_month_horizon_as_monthly_usage() {
+        let reset = "2026-10-26T15:19:11Z";
+        for (now, expected) in [
+            ("2026-09-25T15:19:11Z", Some(reset)),
+            ("2026-09-25T15:19:10Z", None),
+        ] {
+            let usage = normalize_usage_at(FREE_USAGE_FIXTURE, at(now)).unwrap();
+            assert_eq!(usage.primary.unwrap().resets_at.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn included_credit_labels_share_dollar_parsing_and_slots_without_inventing_a_period() {
+        for (label, kind) in [("Monthly usage", Some("monthly")), ("Free usage", None)] {
+            let html = format!(
+                r#"
+                  <span>Session usage</span><span>88% used</span>
+                  <div data-time="2026-10-12T17:19:11Z">Resets in 2 hours.</div>
+                  <span>{label}</span><span>$7.50 of $60 used</span>
+                  <div data-time="2026-10-26T15:19:11Z">Resets in 2 weeks.</div>
+                  <span>Weekly usage</span><span>30% used</span>
+                "#
+            );
+            let usage = normalize_usage_at(&html, at("2026-10-12T15:19:11Z")).unwrap();
+            let included = usage.primary.expect("included credits take primary");
+            assert_eq!(included.used_percent, 12.5);
+            assert_eq!(included.window_kind.as_deref(), kind);
+            assert_eq!(included.window_minutes, None);
+            assert_eq!(included.resets_at.as_deref(), Some("2026-10-26T15:19:11Z"));
+            let session = usage.tertiary.expect("session moves to tertiary");
+            assert_eq!(session.used_percent, 88.0);
+            assert_eq!(session.window_kind.as_deref(), Some("five_hour"));
+            assert_eq!(session.resets_at.as_deref(), Some("2026-10-12T17:19:11Z"));
+            assert_eq!(usage.secondary.unwrap().used_percent, 30.0);
+        }
+    }
+
     /// A dollar-only monthly block publishes the credit used as a percent.
     ///
     /// Before the dollar read this page had no `% used` anywhere, and the bar's
@@ -1316,6 +1479,7 @@ mod tests {
             let usage = normalize_usage_at(page, now).expect("a monthly-credit page parses");
             let monthly = usage.primary.expect("monthly takes primary");
             assert_eq!(monthly.used_percent, 12.5, "$7.50 of $60 is 12.5%");
+            assert_eq!(monthly.window_kind.as_deref(), Some("monthly"));
             assert_eq!(monthly.window_minutes, None);
             assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-30T15:14:29Z"));
             assert_eq!(
