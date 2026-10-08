@@ -1,10 +1,12 @@
-//! JetBrains AI Assistant usage — read from the IDE's own local config XML.
+//! JetBrains AI Assistant usage — read from the IDE's local quota XML and log.
 //!
 //! No network: JetBrains IDEs persist the AI quota to
 //! `<config>/<IDE>/options/AIAssistantQuotaManager2.xml`, where two `<option>`
 //! values (`quotaInfo`, `nextRefill`) hold HTML-entity-encoded JSON. We discover
 //! the most-recently-written such file across installed IDEs, extract + entity-decode
-//! the two JSON blobs, and map quota usage + next refill to a window.
+//! the two JSON blobs, and map quota usage + next refill to a window. A newer valid
+//! `idea.log` record from that same installation takes precedence. Without XML,
+//! the newest valid log from the discovered installations supplies the window.
 //!
 //! quotaInfo JSON: `{ "type", "current", "maximum", "until", "tariffQuota": {
 //! "current", "maximum", "available" }, "topUpQuota": { same } }` (numbers are
@@ -51,9 +53,12 @@
 //! is a string scan (the real `"` delimiters are unambiguous because the inner JSON
 //! quotes are `&quot;`), mirroring CodexBar's own regex-free Linux path.
 
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::Deserialize;
 
 use crate::money::parse_amount;
@@ -124,15 +129,72 @@ fn config_base_dirs_from(
 
 const QUOTA_FILE_REL: &str = "options/AIAssistantQuotaManager2.xml";
 
-/// Find the most-recently-modified AIAssistantQuotaManager2.xml across installed
-/// IDEs (mtime as a proxy for the active IDE, matching CodexBar's "latest IDE").
-fn discover_quota_file() -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for base in config_base_dirs() {
-        let Ok(entries) = std::fs::read_dir(&base) else {
+/// Map only recognized config roots to the same product/version's log.
+/// macOS Application Support maps to Library/Logs; Linux .config/.local/share
+/// maps to .cache; Windows roaming APPDATA maps to local LOCALAPPDATA. Each
+/// mapping retains the product/version directory, never just the product name.
+/// macOS/Linux: CodexBar v0.73.0, JetBrainsQuotaLogReader.swift::logFilePath.
+/// Windows and default log roots: JetBrains IntelliJ IDEA 2026.2 Help,
+/// https://www.jetbrains.com/help/idea/2026.2/directories-used-by-the-ide-to-store-settings-caches-plugins-and-logs.html
+/// (Logs directory). Custom/copied config roots cannot establish log ownership.
+fn log_file_path_from(
+    ide: &Path,
+    home: Option<PathBuf>,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let vendor = ide.parent()?;
+    let product = ide.file_name()?;
+    if let Some(home) = home {
+        if vendor == home.join("Library/Application Support/JetBrains") {
+            return Some(
+                home.join("Library/Logs/JetBrains")
+                    .join(product)
+                    .join("idea.log"),
+            );
+        }
+        if vendor == home.join(".config/JetBrains") || vendor == home.join(".local/share/JetBrains")
+        {
+            return Some(
+                home.join(".cache/JetBrains")
+                    .join(product)
+                    .join("log/idea.log"),
+            );
+        }
+    }
+    let profile = lookup("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let roaming = lookup("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| profile.as_ref().map(|p| p.join("AppData/Roaming")))?;
+    if vendor != roaming.join("JetBrains") {
+        return None;
+    }
+    let local = lookup("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| profile.map(|p| p.join("AppData/Local")))?;
+    Some(local.join("JetBrains").join(product).join("log/idea.log"))
+}
+
+/// Select XML by mtime first; only that installation may replace it with a log.
+/// Log-only discovery is allowed only when no XML was found in any config root.
+fn discover_usage_from(
+    bases: &[PathBuf],
+    log_path: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<Normalized, FetchError> {
+    let mut installations = Vec::new();
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for base in bases {
+        let Ok(entries) = std::fs::read_dir(base) else {
             continue;
         };
         for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            installations.push(entry.path());
             let candidate = entry.path().join(QUOTA_FILE_REL);
             let Ok(meta) = std::fs::metadata(&candidate) else {
                 continue;
@@ -145,7 +207,223 @@ fn discover_quota_file() -> Option<PathBuf> {
             }
         }
     }
-    best.map(|(_, path)| path)
+    let read_log = |ide: &Path| log_path(ide).and_then(|path| latest_log_entry(&path));
+    if let Some((mtime, path)) = best {
+        let ide = path
+            .parent()
+            .and_then(Path::parent)
+            .expect("quota path has options parent");
+        let log = read_log(ide);
+        let xml = crate::env::read_credential_file(&path, "JetBrains quota XML")
+            .and_then(|bytes| normalize(&bytes));
+        // No active quota is an account state, not corrupt XML. An older log
+        // must not revive an account superseded by a newer no-quota XML state.
+        let xml_invalid = xml.is_err() && !matches!(&xml, Err(FetchError::NoQuotaReported(_)));
+        if let Some(log) = log {
+            if log.timestamp > mtime || xml_invalid {
+                return Ok(log.normalized);
+            }
+        }
+        return xml;
+    }
+    installations
+        .iter()
+        .filter_map(|ide| read_log(ide))
+        .max_by_key(|entry| entry.timestamp)
+        .map(|entry| entry.normalized)
+        .ok_or_else(|| {
+            FetchError::NoSession("no JetBrains quota XML or valid log found".to_string())
+        })
+}
+
+// Read at most 4 MiB of complete UTF-8 lines and accept only recognized Available
+// quota / Known refill records with finite, nonnegative counters. Ported from
+// CodexBar v0.73.0 JetBrainsQuotaLogReader.swift.
+// There is no line-age cutoff upstream: quota-line time is compared to XML mtime,
+// not log mtime (which unrelated IDE activity also updates).
+const LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const QUOTA_MARKER: &str = "QuotaManager2Impl - New quota state is: ";
+const REFILL_MARKER: &str = "QuotaManager2Impl - New quota refill state is: ";
+
+struct LogEntry {
+    timestamp: SystemTime,
+    normalized: Normalized,
+}
+
+fn latest_log_entry(path: &Path) -> Option<LogEntry> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let end = file.seek(SeekFrom::End(0)).ok()?;
+    latest_log_entry_in(&read_log_tail(&mut file, end)?)
+}
+
+fn read_log_tail(reader: &mut (impl Read + Seek), end: u64) -> Option<String> {
+    let count = end.min(LOG_TAIL_BYTES);
+    let offset = end - count;
+    reader.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = vec![0; count as usize];
+    reader.read_exact(&mut bytes).ok()?;
+    if bytes.last() != Some(&b'\n') {
+        return None;
+    }
+    // A captured end prevents appends growing the read. Drop a partial first
+    // line (possibly split UTF-8); an unfinished final write rejects the tail.
+    let start = if offset > 0 {
+        bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    String::from_utf8(bytes.split_off(start)).ok()
+}
+
+fn latest_log_entry_in(content: &str) -> Option<LogEntry> {
+    let mut quota = None;
+    let mut refill = None;
+    let mut found_refill = false;
+    for line in content.lines().rev() {
+        if line.contains(QUOTA_MARKER) {
+            let Some(parsed) = parse_log_quota(line) else {
+                // An unparseable quota-state line is an account boundary. Never
+                // resurrect an older quota or carry its refill across it.
+                quota.as_ref()?;
+                break;
+            };
+            if quota.is_none() {
+                quota = Some(parsed);
+            }
+        } else if !found_refill && line.contains(REFILL_MARKER) {
+            found_refill = true;
+            refill = parse_log_refill(line);
+        }
+        if quota.is_some() && found_refill {
+            break;
+        }
+    }
+    let (timestamp, quota) = quota?;
+    // Insula requires an explicit reset from the log's own refill record.
+    // Never borrow XML refill data: the XML may belong to a previous account.
+    let normalized = normalize_quota(quota, refill).ok()?;
+    Some(LogEntry {
+        timestamp,
+        normalized,
+    })
+}
+
+fn log_record<'a>(line: &'a str, marker: &str) -> Option<(SystemTime, &'a str)> {
+    let prefix = line.get(..23)?;
+    let naive = NaiveDateTime::parse_from_str(prefix, "%Y-%m-%d %H:%M:%S,%3f").ok()?;
+    if naive.format("%Y-%m-%d %H:%M:%S,%3f").to_string() != prefix {
+        return None;
+    }
+    let timestamp = Local.from_local_datetime(&naive).single()?;
+    Some((timestamp.into(), line.split_once(marker)?.1))
+}
+
+fn log_field<'a>(state: &mut &'a str, prefix: &str, delimiter: &str) -> Option<&'a str> {
+    let (field, rest) = state.strip_prefix(prefix)?.split_once(delimiter)?;
+    *state = rest;
+    Some(field)
+}
+
+/// Validate unsigned decimal/exponent numbers and reject non-finite values.
+fn log_number(raw: &str) -> Option<String> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = raw.split(['e', 'E']);
+    let mut mantissa = parts.next()?.split('.');
+    if !digits(mantissa.next()?)
+        || mantissa.next().is_some_and(|fraction| !digits(fraction))
+        || mantissa.next().is_some()
+    {
+        return None;
+    }
+    if parts
+        .next()
+        .is_some_and(|exponent| !digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent)))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    let value: f64 = raw.parse().ok()?;
+    (value.is_finite() && value >= 0.0).then(|| raw.to_string())
+}
+
+fn log_details(state: &mut &str) -> Option<SubQuota> {
+    Some(SubQuota {
+        current: Some(log_number(log_field(
+            state,
+            "QuotaDetails(current=",
+            ", ",
+        )?)?),
+        maximum: Some(log_number(log_field(state, "maximum=", ", ")?)?),
+        available: Some(log_number(log_field(state, "available=", ")")?)?),
+    })
+}
+
+fn log_date(raw: &str) -> Option<String> {
+    if raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(raw.to_string())
+}
+
+fn parse_log_quota(line: &str) -> Option<(SystemTime, QuotaInfo)> {
+    let (timestamp, mut state) = log_record(line, QUOTA_MARKER)?;
+    let current = log_number(log_field(&mut state, "Available(current=", ", ")?)?;
+    let maximum = log_number(log_field(&mut state, "maximum=", ", ")?)?;
+    log_date(log_field(&mut state, "until=", ", ")?)?;
+    state = state.strip_prefix("tariffQuota=")?;
+    let tariff = log_details(&mut state)?;
+    if tariff.maximum.as_deref()?.parse::<f64>().ok()? <= 0.0 {
+        return None;
+    }
+    let top_up = if let Some(rest) = state.strip_prefix(", topUpQuota=") {
+        state = rest;
+        Some(log_details(&mut state)?)
+    } else {
+        None
+    };
+    if state != ")" {
+        return None;
+    }
+    Some((
+        timestamp,
+        QuotaInfo {
+            kind: Some("Available".to_string()),
+            current: Some(current),
+            maximum: Some(maximum),
+            tariff_quota: Some(tariff),
+            top_up_quota: top_up,
+        },
+    ))
+}
+
+fn parse_log_refill(line: &str) -> Option<NextRefill> {
+    let (_, mut state) = log_record(line, REFILL_MARKER)?;
+    let next = log_date(log_field(&mut state, "Known(next=", ", ")?)?;
+    let amount = log_number(log_field(
+        &mut state,
+        "tariff=QuotaRefillInfoTariff(amount=",
+        ", ",
+    )?)?;
+    let duration = log_field(&mut state, "duration=", "))")?;
+    if !state.is_empty()
+        || duration.is_empty()
+        || duration
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'))
+    {
+        return None;
+    }
+    Some(NextRefill {
+        next: Some(next),
+        tariff: Some(Tariff {
+            amount: Some(amount),
+            duration: Some(duration.to_string()),
+        }),
+    })
 }
 
 /// Decode the small set of XML/HTML entities JetBrains writes (CodexBar `:212-220`).
@@ -419,6 +697,13 @@ pub fn normalize(xml_bytes: &[u8]) -> Result<Normalized, FetchError> {
     let quota: QuotaInfo = serde_json::from_str(&decode_html_entities(&quota_raw))
         .map_err(|e| FetchError::Decode(format!("jetbrains quotaInfo not JSON: {e}")))?;
 
+    let refill = extract_option_value(xml, "nextRefill")
+        .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok());
+    normalize_quota(quota, refill)
+}
+
+/// XML and log snapshots share tariff/top-up math, but never share refill data.
+fn normalize_quota(quota: QuotaInfo, refill: Option<NextRefill>) -> Result<Normalized, FetchError> {
     // The figures the window is measured against. When the payload splits the
     // balance, the window is the tariff alone: it is the only part that refills
     // at `nextRefill`, so it is the only part a window's percent and length can
@@ -443,12 +728,6 @@ pub fn normalize(xml_bytes: &[u8]) -> Result<Normalized, FetchError> {
             quota.kind.as_deref().unwrap_or("?")
         ))
     })?;
-
-    // Parsed ONCE and both halves kept. The reset instant and the stated
-    // mechanic come out of the same object, so reading it twice would let them
-    // disagree about a payload they both describe.
-    let refill = extract_option_value(xml, "nextRefill")
-        .and_then(|raw| serde_json::from_str::<NextRefill>(&decode_html_entities(&raw)).ok());
 
     let regeneration = refill.as_ref().and_then(regeneration_from);
 
@@ -544,11 +823,9 @@ impl UsageProvider for JetBrainsProvider {
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
         let result: Result<ProviderUsage, FetchError> = async {
-            let path = discover_quota_file().ok_or_else(|| {
-                FetchError::NoSession("no JetBrains AIAssistantQuotaManager2.xml found".to_string())
+            let normalized = discover_usage_from(&config_base_dirs(), |ide| {
+                log_file_path_from(ide, crate::env::home_dir(), |key| std::env::var_os(key))
             })?;
-            let bytes = crate::env::read_credential_file(&path, "JetBrains quota XML")?;
-            let normalized = normalize(&bytes)?;
             let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", normalized.usage);
             // Absent rather than empty when there is no top-up: an empty list
             // would state that the provider reports none.
@@ -1031,6 +1308,463 @@ mod tests {
     }
 
     use super::*;
+
+    // CodexBar v0.73.0 Tests/CodexBarTests/JetBrainsQuotaLogReaderTests.swift:
+    // olderQuotaLine, latestQuotaLine and refillLine, kept verbatim.
+    const OLDER_QUOTA_LINE: &str = concat!(
+        "2026-10-05 15:06:48,538 [1828154]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota state is: ",
+        "Available(current=300000, maximum=6489986.397, until=2028-09-22T21:00:00Z, ",
+        "tariffQuota=QuotaDetails(current=300000, maximum=1000000, available=700000), ",
+        "topUpQuota=QuotaDetails(current=0, maximum=5489986.397, available=5489986.397))"
+    );
+    const LATEST_QUOTA_LINE: &str = concat!(
+        "2026-10-05 15:27:49,811 [   8326]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota state is: ",
+        "Available(current=346495.294, maximum=6489986.397, until=2028-09-22T21:00:00Z, ",
+        "tariffQuota=QuotaDetails(current=346495.294, maximum=1000000, available=653504.706), ",
+        "topUpQuota=QuotaDetails(current=0, maximum=5489986.397, available=5489986.397))"
+    );
+    const REFILL_LINE: &str = concat!(
+        "2026-10-05 15:21:27,386 [2707002]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota refill state is: ",
+        "Known(next=2026-10-11T17:00:30.231Z, tariff=QuotaRefillInfoTariff(amount=1000000, duration=30d))"
+    );
+
+    fn log_fixture() -> String {
+        format!("{OLDER_QUOTA_LINE}\n{REFILL_LINE}\n{LATEST_QUOTA_LINE}\n")
+    }
+
+    fn log_fixture_time() -> SystemTime {
+        (Local
+            .with_ymd_and_hms(2026, 10, 5, 15, 27, 49)
+            .single()
+            .unwrap()
+            + chrono::Duration::milliseconds(811))
+        .into()
+    }
+
+    struct IdeFiles {
+        home: PathBuf,
+    }
+
+    impl IdeFiles {
+        fn new() -> Self {
+            let home =
+                std::env::temp_dir().join(format!("insula-jetbrains-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&home).unwrap();
+            Self { home }
+        }
+
+        fn base(&self) -> PathBuf {
+            self.home.join(".config/JetBrains")
+        }
+
+        fn install(&self, product: &str) -> PathBuf {
+            let ide = self.base().join(product);
+            std::fs::create_dir_all(ide.join("options")).unwrap();
+            ide
+        }
+
+        fn xml(&self, product: &str, xml: &str, mtime: SystemTime) {
+            let path = self.install(product).join(QUOTA_FILE_REL);
+            std::fs::write(&path, xml).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+        }
+
+        fn log_path(&self, ide: &Path) -> Option<PathBuf> {
+            log_file_path_from(ide, Some(self.home.clone()), |_| None)
+        }
+
+        fn log(&self, product: &str, content: impl AsRef<[u8]>) -> PathBuf {
+            let path = self.log_path(&self.install(product)).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        fn fetch(&self) -> Result<Normalized, FetchError> {
+            discover_usage_from(&[self.base()], |ide| self.log_path(ide))
+        }
+    }
+
+    impl Drop for IdeFiles {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.home).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_newer_log_wins_over_an_older_xml() {
+        let files = IdeFiles::new();
+        files.xml(
+            "DataGrip2026.2",
+            ACTIVE_XML,
+            log_fixture_time() - std::time::Duration::from_secs(86400),
+        );
+        let path = files.log("DataGrip2026.2", log_fixture());
+        // Log mtime is deliberately older; only the quota-line time proves freshness.
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let normalized = files.fetch().unwrap();
+        let primary = normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 34.6495294).abs() < 0.000001);
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-10-11T17:00:30.231Z")
+        );
+        assert_eq!(primary.used_count, None);
+        assert_eq!(primary.total_count, None);
+        let pool = normalized.top_up.unwrap();
+        assert_eq!(pool.funding, PoolFunding::Purchased);
+        assert_eq!(pool.remaining.as_ref().unwrap().minor, 5489986397);
+        assert_eq!(pool.remaining.as_ref().unwrap().exponent, 3);
+        assert_eq!(pool.remaining.as_ref().unwrap().unit, "jetbrains-ai-quota");
+    }
+
+    #[test]
+    fn an_older_or_equal_log_loses_to_a_newer_xml() {
+        for delay in [0, 86400] {
+            let files = IdeFiles::new();
+            files.xml(
+                "DataGrip2026.2",
+                ACTIVE_XML,
+                log_fixture_time() + std::time::Duration::from_secs(delay),
+            );
+            files.log("DataGrip2026.2", log_fixture());
+            assert_eq!(
+                files.fetch().unwrap().usage,
+                normalize_usage(ACTIVE_XML.as_bytes()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn no_xml_plus_a_valid_log_publishes_the_log() {
+        let files = IdeFiles::new();
+        files.log("DataGrip2026.2", log_fixture());
+        files.log(
+            "PhpStorm2026.2",
+            format!("{REFILL_LINE}\n{OLDER_QUOTA_LINE}\n"),
+        );
+        let primary = files.fetch().unwrap().usage.primary.unwrap();
+        assert!((primary.used_percent - 34.6495294).abs() < 0.000001);
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-10-11T17:00:30.231Z")
+        );
+    }
+
+    #[test]
+    fn an_invalid_absent_or_unreadable_log_publishes_xml_unchanged() {
+        let files = IdeFiles::new();
+        files.xml("DataGrip2026.2", ACTIVE_XML, SystemTime::UNIX_EPOCH);
+        let expected = normalize_usage(ACTIVE_XML.as_bytes()).unwrap();
+        assert_eq!(files.fetch().unwrap().usage, expected);
+        let path = files.log("DataGrip2026.2", "invalid\n");
+        assert_eq!(files.fetch().unwrap().usage, expected);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(files.fetch().unwrap().usage, expected);
+    }
+
+    // Port of v0.73.0 JetBrainsStatusProbeTests.swift:
+    // `auto-detect does not combine another IDE log with selected XML`.
+    #[test]
+    fn a_log_from_a_different_installation_is_never_used() {
+        for selected_has_log in [false, true] {
+            let files = IdeFiles::new();
+            files.xml(
+                "DataGrip2026.2",
+                ACTIVE_XML,
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            );
+            files.xml("PhpStorm2026.2", UNKNOWN_XML, SystemTime::UNIX_EPOCH);
+            files.log("PhpStorm2026.2", log_fixture());
+            if selected_has_log {
+                files.log(
+                    "DataGrip2026.2",
+                    format!("{REFILL_LINE}\n{OLDER_QUOTA_LINE}\n"),
+                );
+            }
+            let primary = files.fetch().unwrap().usage.primary.unwrap();
+            assert_eq!(
+                primary.used_percent,
+                if selected_has_log { 30.0 } else { 25.0 }
+            );
+            assert_eq!(
+                primary.resets_at.as_deref(),
+                Some(if selected_has_log {
+                    "2026-10-11T17:00:30.231Z"
+                } else {
+                    "2026-07-01T00:00:00Z"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_xml_can_fall_back_to_its_own_valid_log() {
+        let files = IdeFiles::new();
+        files.xml(
+            "DataGrip2026.2",
+            "not xml",
+            log_fixture_time() + std::time::Duration::from_secs(86400),
+        );
+        files.log("DataGrip2026.2", log_fixture());
+        assert!(
+            (files.fetch().unwrap().usage.primary.unwrap().used_percent - 34.6495294).abs()
+                < 0.000001
+        );
+    }
+
+    #[test]
+    fn newer_no_quota_xml_does_not_revive_an_old_account_log() {
+        let files = IdeFiles::new();
+        files.xml(
+            "DataGrip2026.2",
+            UNKNOWN_XML,
+            log_fixture_time() + std::time::Duration::from_secs(86400),
+        );
+        files.log("DataGrip2026.2", log_fixture());
+        assert_eq!(
+            files.fetch().unwrap_err().error_class(),
+            "no_quota_reported"
+        );
+    }
+
+    #[test]
+    fn log_roots_resolve_for_macos_linux_and_windows_on_any_host() {
+        let home = PathBuf::from("/users/test");
+        for (config, log) in [
+            (
+                "Library/Application Support/JetBrains",
+                "Library/Logs/JetBrains/DataGrip2026.2/idea.log",
+            ),
+            (
+                ".config/JetBrains",
+                ".cache/JetBrains/DataGrip2026.2/log/idea.log",
+            ),
+            (
+                ".local/share/JetBrains",
+                ".cache/JetBrains/DataGrip2026.2/log/idea.log",
+            ),
+        ] {
+            assert_eq!(
+                log_file_path_from(
+                    &home.join(config).join("DataGrip2026.2"),
+                    Some(home.clone()),
+                    |_| None
+                ),
+                Some(home.join(log))
+            );
+        }
+        let lookup = |key: &str| match key {
+            "APPDATA" => Some(std::ffi::OsString::from("R:/roaming")),
+            "LOCALAPPDATA" => Some(std::ffi::OsString::from("L:/local")),
+            "USERPROFILE" => Some(std::ffi::OsString::from("C:/Users/test")),
+            _ => None,
+        };
+        assert_eq!(
+            log_file_path_from(
+                Path::new("R:/roaming/JetBrains/DataGrip2026.2"),
+                None,
+                lookup
+            ),
+            Some(PathBuf::from(
+                "L:/local/JetBrains/DataGrip2026.2/log/idea.log"
+            ))
+        );
+        assert_eq!(
+            log_file_path_from(
+                Path::new("C:/Users/test/AppData/Roaming/JetBrains/DataGrip2026.2"),
+                None,
+                |key| { (key == "USERPROFILE").then(|| std::ffi::OsString::from("C:/Users/test")) }
+            ),
+            Some(PathBuf::from(
+                "C:/Users/test/AppData/Local/JetBrains/DataGrip2026.2/log/idea.log"
+            ))
+        );
+        assert!(log_file_path_from(
+            Path::new("/copy/JetBrains/DataGrip2026.2"),
+            Some(home.clone()),
+            lookup
+        )
+        .is_none());
+        assert!(log_file_path_from(
+            Path::new("/users/test/.config/JetBrains/../DataGrip2026.2"),
+            Some(home),
+            |_| None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_big_log_reads_only_the_bounded_tail() {
+        struct CountedReader {
+            cursor: std::io::Cursor<Vec<u8>>,
+            bytes_read: usize,
+        }
+        impl Read for CountedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.cursor.read(buf)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        impl Seek for CountedReader {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(pos)
+            }
+        }
+        let mut bytes = log_fixture().into_bytes();
+        bytes.extend(vec![b'x'; 2 * LOG_TAIL_BYTES as usize]);
+        bytes.push(b'\n');
+        let end = bytes.len() as u64;
+        let mut reader = CountedReader {
+            cursor: std::io::Cursor::new(bytes),
+            bytes_read: 0,
+        };
+        let tail = read_log_tail(&mut reader, end).unwrap();
+        assert_eq!(reader.bytes_read, 4 * 1024 * 1024);
+        assert_eq!(reader.cursor.position(), end);
+        assert!(
+            latest_log_entry_in(&tail).is_none(),
+            "quota before the tail must not publish"
+        );
+    }
+
+    #[test]
+    fn a_growing_log_is_read_only_through_the_captured_end() {
+        // Port of upstream `tail stops at captured file size even when the file grows`.
+        let files = IdeFiles::new();
+        let path = files.log("DataGrip2026.2", "unrelated\n");
+        let mut file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let end = file.seek(SeekFrom::End(0)).unwrap();
+        std::io::Write::write_all(&mut file, log_fixture().as_bytes()).unwrap();
+        assert_eq!(read_log_tail(&mut file, end).unwrap(), "unrelated\n");
+        assert_eq!(file.stream_position().unwrap(), end);
+    }
+
+    #[test]
+    fn the_tail_discards_split_utf8_and_refuses_incomplete_or_invalid_writes() {
+        // Port of upstream split UTF-8 / incomplete final write fixtures.
+        let files = IdeFiles::new();
+        let suffix = format!("\n{}", log_fixture());
+        let cap = LOG_TAIL_BYTES as usize;
+        let mut bytes = vec![b'x'; cap];
+        bytes.extend([0xF0, 0x9F, 0xA6, 0x9E]);
+        bytes.extend(vec![b'x'; cap - suffix.len() - 3]);
+        bytes.extend(suffix.as_bytes());
+        let path = files.log("DataGrip2026.2", bytes);
+        assert!(latest_log_entry(&path).is_some());
+        files.log("DataGrip2026.2", log_fixture().trim_end());
+        assert!(latest_log_entry(&path).is_none());
+        files.log("DataGrip2026.2", [0xff, b'\n']);
+        assert!(latest_log_entry(&path).is_none());
+    }
+
+    #[test]
+    fn an_invalid_latest_quota_never_resurrects_older_account_records() {
+        // Invalid-state variants from CodexBar v0.73.0 JetBrainsQuotaLogReaderTests.swift.
+        let files = IdeFiles::new();
+        files.xml("DataGrip2026.2", ACTIVE_XML, SystemTime::UNIX_EPOCH);
+        for invalid in [
+            LATEST_QUOTA_LINE.replace("current=346495.294", "current=346..495"),
+            LATEST_QUOTA_LINE
+                .split_once("Available(")
+                .unwrap()
+                .0
+                .to_string()
+                + "Available(current=346495.294, maximum=6489986.397",
+            LATEST_QUOTA_LINE.replace(
+                "tariffQuota=QuotaDetails(current=",
+                "tariffQuota=QuotaDetails(spent=",
+            ),
+            LATEST_QUOTA_LINE.replace("maximum=1000000", "maximum=1e999"),
+            LATEST_QUOTA_LINE.replace("maximum=1000000", "maximum=0"),
+            LATEST_QUOTA_LINE.replace("current=346495.294", "current=-1"),
+            LATEST_QUOTA_LINE.replace("2026-10-05", "2026-02-30"),
+            LATEST_QUOTA_LINE.replace("2028-09-22T21:00:00Z", "invalid"),
+            LATEST_QUOTA_LINE
+                .split_once("Available(")
+                .unwrap()
+                .0
+                .to_string()
+                + "Unknown",
+        ] {
+            files.log(
+                "DataGrip2026.2",
+                format!("{OLDER_QUOTA_LINE}\n{REFILL_LINE}\n{invalid}\n"),
+            );
+            assert_eq!(
+                files.fetch().unwrap().usage,
+                normalize_usage(ACTIVE_XML.as_bytes()).unwrap(),
+                "invalid latest state: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_reset_is_not_borrowed_from_xml_or_a_superseded_account() {
+        let files = IdeFiles::new();
+        files.xml("DataGrip2026.2", ACTIVE_XML, SystemTime::UNIX_EPOCH);
+        let unknown = OLDER_QUOTA_LINE
+            .split_once("Available(")
+            .unwrap()
+            .0
+            .to_string()
+            + "Unknown";
+        let bad_refill = REFILL_LINE.replace("amount=1000000", "amount=1..0");
+        for content in [
+            format!("{LATEST_QUOTA_LINE}\n"),
+            format!("{REFILL_LINE}\n{unknown}\n{LATEST_QUOTA_LINE}\n"),
+            format!("{REFILL_LINE}\n{LATEST_QUOTA_LINE}\n{bad_refill}\n"),
+        ] {
+            files.log("DataGrip2026.2", content);
+            assert_eq!(
+                files.fetch().unwrap().usage,
+                normalize_usage(ACTIVE_XML.as_bytes()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_log_top_up_stays_unknown_and_tariff_math_stays_monthly() {
+        let line = LATEST_QUOTA_LINE
+            .split_once(", topUpQuota=")
+            .unwrap()
+            .0
+            .to_string()
+            + ")";
+        let entry = latest_log_entry_in(&format!("{REFILL_LINE}\n{line}\n")).unwrap();
+        assert!(entry.normalized.top_up.is_none());
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 34.6495294).abs() < 0.000001);
+        assert_eq!(
+            primary.window_minutes, None,
+            "30d is not an ISO-8601 duration"
+        );
+        assert_eq!(primary.regeneration.unwrap().rate, None);
+        let iso_refill = REFILL_LINE.replace("duration=30d", "duration=PT720H");
+        let entry = latest_log_entry_in(&format!("{iso_refill}\n{line}\n")).unwrap();
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert_eq!(primary.window_minutes, Some(43200));
+        assert_eq!(
+            primary.regeneration.unwrap().rate.unwrap().amount,
+            1000000.0
+        );
+    }
 
     /// CodexBar-shaped active quota: numbers are STRINGS, JSON is HTML-entity
     /// encoded inside the option value, dates are ISO8601.
