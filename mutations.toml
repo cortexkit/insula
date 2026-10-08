@@ -723,3 +723,37 @@ expect_message = "different reset periods must retain the ratio"
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "antigravity-consumer-client-placeholder"
+guards = "Projectless consumer-client refusals withhold placeholder quota and surface reauthentication before any quota request"
+file = "crates/quota-core/src/antigravity.rs"
+old = "if code_assist.rejects_client_for_consumer_tier() {"
+new = "if false && code_assist.rejects_client_for_consumer_tier() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::tests::consumer_client_refusal_rejects_credentials_without_requesting_quota"]
+expect_message = "consumer-client refusal must withhold placeholder quota"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "antigravity-consumer-client-current-tier"
+guards = "An existing currentTier keeps working accounts serving quota despite a consumer-client ineligible reason"
+file = "crates/quota-core/src/antigravity.rs"
+old = "self.current_tier.is_none()"
+new = "true /* NON-VACUITY BREAK: ignore currentTier */"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::tests::consumer_client_refusal_with_a_current_tier_still_requests_quota"]
+expect_message = "a preflight without an affirmative consumer-client refusal must serve quota"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

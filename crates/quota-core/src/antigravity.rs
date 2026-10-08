@@ -86,6 +86,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// cannot describe one account differently.
 const REMOTE_QUOTA_SUMMARY_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const LOAD_CODE_ASSIST_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
 /// The per-model fallback, used only when the summary endpoint refuses.
 ///
@@ -1400,6 +1401,52 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadCodeAssistResponse {
+    current_tier: Option<Value>,
+    cloudaicompanion_project: Option<CodeAssistProject>,
+    // Optional inventory must not make an otherwise usable quota lane fail to decode.
+    ineligible_tiers: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodeAssistProject {
+    Id(String),
+    Reference {
+        id: Option<String>,
+        #[serde(rename = "projectId")]
+        project_id: Option<String>,
+    },
+}
+
+impl LoadCodeAssistResponse {
+    fn rejects_client_for_consumer_tier(&self) -> bool {
+        let project = self
+            .cloudaicompanion_project
+            .as_ref()
+            .and_then(|project| match project {
+                CodeAssistProject::Id(id) => Some(id.as_str()),
+                CodeAssistProject::Reference { id, project_id } => {
+                    id.as_deref().or(project_id.as_deref())
+                }
+            });
+        self.current_tier.is_none()
+            && project.is_none_or(|id| id.trim().is_empty())
+            && self
+                .ineligible_tiers
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|tiers| {
+                    tiers.iter().any(|tier| {
+                        tier.get("reasonCode").and_then(Value::as_str)
+                            == Some("GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT")
+                    })
+                })
+    }
+}
+
 // ---- provider ---------------------------------------------------------------
 
 /// The Antigravity usage provider: a local-process probe and a cloud lane.
@@ -1417,6 +1464,7 @@ pub struct AntigravityProvider {
     handle_loader: Arc<VaultHandleLoader>,
     quota_url: String,
     quota_summary_url: String,
+    load_code_assist_url: String,
     token_url: String,
     /// The last local probe and when it was taken. A failed probe is cached as
     /// its reason, for the same two seconds, so every handle in one tick gets the
@@ -1469,6 +1517,7 @@ impl AntigravityProvider {
             handle_loader,
             quota_url: REMOTE_QUOTA_URL.to_string(),
             quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
+            load_code_assist_url: LOAD_CODE_ASSIST_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
             local_cache: tokio::sync::Mutex::new(None),
             process_scan: process_scan(),
@@ -1692,6 +1741,40 @@ impl AntigravityProvider {
         access_token: &str,
         project: Option<&str>,
     ) -> Result<Usage, FetchError> {
+        if project.is_none() {
+            // Google can return a successful placeholder quota for the wrong OAuth
+            // client. Only an explicit consumer-tier refusal withholds it; a failed
+            // preflight leaves the existing quota lane usable, even on HTTP 401.
+            // This request shares the quota calls' bearer, Hub identity and timeout.
+            let body = serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "ideType": "ANTIGRAVITY",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI"
+                }
+            }))
+            .map_err(|e| FetchError::Decode(e.to_string()))?;
+            if let Ok(response) = self
+                .post_quota(&self.load_code_assist_url, body, access_token)
+                .await
+            {
+                if let Ok(code_assist) =
+                    serde_json::from_slice::<LoadCodeAssistResponse>(&response.body)
+                {
+                    // CodexBar AntigravityRemoteUsageFetcher.swift, 1c70e8966:
+                    // no stored project, no current tier, no response project,
+                    // and GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT mean sign in again.
+                    if code_assist.rejects_client_for_consumer_tier() {
+                        // Unauthorized publishes credential_rejected without claiming
+                        // an HTTP 401, so this semantic refusal is not reported to the vault.
+                        return Err(FetchError::Unauthorized(
+                            "Google rejected this login's OAuth client for the account's tier; sign in again to restore quota access".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // The project scopes the query where one is known. The endpoint also
         // answers without it, so an absent project is not a failure.
         let body = match project {
@@ -2239,6 +2322,314 @@ impl UsageProvider for AntigravityProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // From CodexBar Tests/CodexBarTests/AntigravityRemoteUsageFetcherTests.swift,
+    // "remote fetch asks for sign in again when the oauth client cannot read consumer quota",
+    // commit 837d30dff34ba4bd7a7b99abd120c37e2ae44c9f.
+    fn consumer_client_refusal() -> Value {
+        serde_json::json!({
+            "allowedTiers": [{
+                "id": "standard-tier",
+                "isDefault": true,
+                "userDefinedCloudaicompanionProject": true
+            }],
+            "ineligibleTiers": [{
+                "reasonCode": "GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT",
+                "reasonMessage": "Client does not support Google TOS.",
+                "tierId": "free-tier"
+            }]
+        })
+    }
+
+    struct CloudPreflightMock {
+        provider: AntigravityProvider,
+        preflight_requests: Arc<AtomicUsize>,
+        quota_requests: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for CloudPreflightMock {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn cloud_preflight_mock(status: u16, body: Vec<u8>) -> CloudPreflightMock {
+        let preflight_requests = Arc::new(AtomicUsize::new(0));
+        let quota_requests = Arc::new(AtomicUsize::new(0));
+        let preflights = Arc::clone(&preflight_requests);
+        let quotas = Arc::clone(&quota_requests);
+        let (port, server) =
+            super::plugin_lane_tests::spawn_mock_server_with_request(move |request| {
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let (headers, request_body) = request.split_once("\r\n\r\n").unwrap();
+                let headers = headers.to_ascii_lowercase();
+                assert!(headers
+                    .lines()
+                    .any(|line| line == "authorization: bearer mock-token"));
+                assert!(headers.lines().any(|line| line
+                    == format!("user-agent: {}", remote_user_agent().to_ascii_lowercase())));
+                assert!(headers
+                    .lines()
+                    .any(|line| line == "content-type: application/json"));
+                let request_body: Value = serde_json::from_str(request_body).unwrap();
+                match path {
+                    "/load" => {
+                        preflights.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(
+                            request_body,
+                            serde_json::json!({
+                                "metadata": {
+                                    "ideType": "ANTIGRAVITY",
+                                    "platform": "PLATFORM_UNSPECIFIED",
+                                    "pluginType": "GEMINI"
+                                }
+                            })
+                        );
+                        (status, body.clone())
+                    }
+                    "/summary" | "/quota" => {
+                        quotas.fetch_add(1, Ordering::Relaxed);
+                        (
+                            200,
+                            super::plugin_lane_tests::CLOUD_MOCK_QUOTA
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    }
+                    "/quota-unauthorized" => {
+                        quotas.fetch_add(1, Ordering::Relaxed);
+                        (401, b"unauthorized".to_vec())
+                    }
+                    _ => panic!("unexpected request: {path}"),
+                }
+            })
+            .await;
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_accounts(Vec::new());
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
+        provider.quota_summary_url = format!("http://127.0.0.1:{port}/summary");
+        provider.quota_url = format!("http://127.0.0.1:{port}/quota");
+        CloudPreflightMock {
+            provider,
+            preflight_requests,
+            quota_requests,
+            server,
+        }
+    }
+
+    async fn assert_preflight_serves_quota(status: u16, body: Vec<u8>) {
+        let mock = cloud_preflight_mock(status, body).await;
+        let usage = mock
+            .provider
+            .fetch_remote_quota("mock-token", None)
+            .await
+            .expect("a preflight without an affirmative consumer-client refusal must serve quota");
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn consumer_client_refusal_rejects_credentials_without_requesting_quota() {
+        let mut mock =
+            cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
+        let reports = Arc::new(AtomicUsize::new(0));
+        let handle = attach_vault(&mut mock.provider, None, Arc::clone(&reports));
+        let error = mock
+            .provider
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect_err("consumer-client refusal must withhold placeholder quota");
+        assert_eq!(error.error_class(), "credential_rejected");
+        assert!(matches!(error, FetchError::Unauthorized(_)));
+        assert!(error.to_string().contains("OAuth client"));
+        assert!(error.to_string().contains("sign in again"));
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            reports.load(Ordering::Relaxed),
+            0,
+            "a semantic refusal is not an HTTP 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_client_refusal_with_a_current_tier_still_requests_quota() {
+        let mut body = consumer_client_refusal();
+        body["currentTier"] = serde_json::json!({"id": "free-tier"});
+        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn consumer_client_refusal_with_a_response_project_still_requests_quota() {
+        for project in [
+            serde_json::json!("existing-project"),
+            serde_json::json!({"id": "existing-project"}),
+            serde_json::json!({"projectId": "existing-project"}),
+        ] {
+            let mut body = consumer_client_refusal();
+            body["cloudaicompanionProject"] = project;
+            assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_different_ineligible_reason_still_requests_quota() {
+        let mut body = consumer_client_refusal();
+        body["ineligibleTiers"][0]["reasonCode"] = serde_json::json!("OTHER_REASON");
+        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn absent_ineligible_tiers_preserve_quota_fetching() {
+        let mut body = consumer_client_refusal();
+        body.as_object_mut().unwrap().remove("ineligibleTiers");
+        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_ineligible_tiers_preserve_quota_fetching() {
+        for inventory in [
+            Value::Null,
+            serde_json::json!("not an array"),
+            serde_json::json!({}),
+            serde_json::json!([null, false, {"reasonCode": 123}, {}]),
+        ] {
+            let mut body = consumer_client_refusal();
+            body["ineligibleTiers"] = inventory;
+            assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_preflight_http_500_still_requests_quota() {
+        assert_preflight_serves_quota(500, consumer_client_refusal().to_string().into_bytes())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_preflight_still_requests_quota() {
+        assert_preflight_serves_quota(200, b"not JSON".to_vec()).await;
+    }
+
+    #[tokio::test]
+    async fn a_preflight_transport_failure_still_requests_quota() {
+        let mut mock =
+            cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        mock.provider.load_code_assist_url = format!(
+            "http://127.0.0.1:{}/load",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let usage = mock
+            .provider
+            .fetch_remote_quota("mock-token", None)
+            .await
+            .unwrap();
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    struct PreflightVaultSource {
+        project: Option<String>,
+        reports: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CredentialSource for PreflightVaultSource {
+        async fn get(
+            &self,
+            _: &crate::credential_source::VaultCapability,
+            _: u64,
+        ) -> Result<crate::credential_source::VaultCredential, VaultGetError> {
+            Ok(crate::credential_source::VaultCredential {
+                payload: b"mock-token".to_vec(),
+                expires_at_ms: None,
+                record_version: 1,
+                account_id: None,
+                email: None,
+                org_name: None,
+                project_id: self.project.clone(),
+            })
+        }
+
+        async fn report_auth_failure(
+            &self,
+            _: &crate::credential_source::VaultCapability,
+            _: u16,
+            _: u64,
+        ) {
+            self.reports.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn attach_vault(
+        provider: &mut AntigravityProvider,
+        project: Option<&str>,
+        reports: Arc<AtomicUsize>,
+    ) -> CredentialHandle {
+        provider.credential_source = Some(Arc::new(PreflightVaultSource {
+            project: project.map(str::to_string),
+            reports,
+        }));
+        CredentialHandle::vault(
+            "antigravity:test",
+            crate::credential_source::VaultCapability::new("ckh_test"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stored_project_handle_fetches_quota_without_a_preflight() {
+        let mut mock =
+            cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
+        let handle = attach_vault(
+            &mut mock.provider,
+            Some("existing-project"),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let usage = mock.provider.fetch_handle(&handle).await.usage.unwrap();
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_preflight_http_401_still_serves_quota_without_reporting_to_the_vault() {
+        let mut mock =
+            cloud_preflight_mock(401, consumer_client_refusal().to_string().into_bytes()).await;
+        let reports = Arc::new(AtomicUsize::new(0));
+        let handle = attach_vault(&mut mock.provider, None, Arc::clone(&reports));
+        let usage = mock.provider.fetch_handle(&handle).await.usage.unwrap();
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(reports.load(Ordering::Relaxed), 0);
+        // A real quota 401 still reaches the report hook; only the preflight is ignored.
+        mock.provider.quota_summary_url = mock
+            .provider
+            .quota_url
+            .replace("/quota", "/quota-unauthorized");
+        let error = mock.provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "credential_rejected");
+        tokio::task::yield_now().await;
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
+    }
 
     /// The named window for one pool-and-cadence, which is how this provider
     /// publishes every limit it meters.
@@ -3410,7 +3801,7 @@ mod plugin_lane_tests {
       }
     }"#;
 
-    const CLOUD_MOCK_QUOTA: &str = r#"{
+    pub(super) const CLOUD_MOCK_QUOTA: &str = r#"{
       "response": {
         "groups": [
           {
@@ -3433,6 +3824,20 @@ mod plugin_lane_tests {
     where
         F: Fn(&str) -> (u16, Vec<u8>) + Send + Sync + 'static,
     {
+        spawn_mock_server_with_request(move |request| {
+            let first_line = request.lines().next().unwrap_or("");
+            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+            handler(path)
+        })
+        .await
+    }
+
+    pub(super) async fn spawn_mock_server_with_request<F>(
+        handler: F,
+    ) -> (u16, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(&str) -> (u16, Vec<u8>) + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -3447,9 +3852,7 @@ mod plugin_lane_tests {
                 if request.is_empty() {
                     break;
                 }
-                let first_line = request.lines().next().unwrap_or("");
-                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
-                let (status, body) = handler(path);
+                let (status, body) = handler(&request);
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let headers = format!(
                     "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -3538,6 +3941,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
@@ -3604,6 +4008,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
@@ -3660,6 +4065,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
@@ -3705,6 +4111,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
@@ -3753,6 +4160,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
@@ -3922,6 +4330,7 @@ mod plugin_lane_tests {
         )]);
         provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
         let attempt = provider
             .fetch_handle(&CredentialHandle::Named(
