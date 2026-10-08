@@ -1223,9 +1223,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.0"
+version = "0.32.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31d918768ab1eac0a41afc4c1379538d2fe6a2bc5a81920996637d29434f7a5"
+checksum = "257b083e9371709bd0be8915de8acb670dc628c9824bd32b5c6647187186a10d"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1270,9 +1270,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.6"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e60f23e1c51148c8a0db750481a5659726583bd05bff5bdd3b97cee4b59c6a"
+checksum = "eea891f779b39c29351ab135eaa75c8d64215e6181ca9bc5ba8d195cfca6806e"
 dependencies = [
  "libc",
  "rustix",
@@ -1280,9 +1280,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.29.1"
+version = "0.29.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bcb6c2bd02e6ab43479ae87791eb3cd5eb98d9a23ef8e12f1077248fd480a85"
+checksum = "690bf351aca00d04ee2a491571b645948173568cfd5e0493c44f91771e536440"
 dependencies = [
  "serde",
  "serde_json",
