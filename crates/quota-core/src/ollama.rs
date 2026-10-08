@@ -365,6 +365,32 @@ fn redirected_off_settings(final_url: &str) -> bool {
     true
 }
 
+/// Say what page a parse failure was looking at.
+///
+/// "No usage windows" alone can't tell a renamed label from a client-rendered
+/// shell, a page that moved, or an account with nothing to show, and the
+/// cookie behind it lives in the vault, out of reach of the live probe. So the
+/// published error carries the page's location and size and how often a few
+/// usage words occur. It never carries page text, and the URL is cut to host
+/// and path, since its query can hold per-session identifiers.
+fn describe_unparsed_page(error: FetchError, final_url: &str, html: &str) -> FetchError {
+    let FetchError::Decode(message) = error else {
+        return error;
+    };
+    let location = match (host_of(final_url), path_of(final_url)) {
+        (Some(host), Some(path)) => format!("{host}{path}"),
+        _ => "unknown page".to_string(),
+    };
+    let lower = html.to_ascii_lowercase();
+    FetchError::Decode(format!(
+        "{message} ({location}, {} bytes; 'usage' x{}, 'used' x{}, '$' x{})",
+        html.len(),
+        lower.matches("usage").count(),
+        lower.matches("used").count(),
+        html.matches('$').count(),
+    ))
+}
+
 /// Heuristic: the settings page was replaced by a sign-in page (dead cookie).
 fn looks_signed_out(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
@@ -691,7 +717,8 @@ impl UsageProvider for OllamaProvider {
             }
 
             let html = String::from_utf8_lossy(&html_bytes.body);
-            let usage = normalize_usage(&html)?;
+            let usage = normalize_usage(&html)
+                .map_err(|error| describe_unparsed_page(error, &html_bytes.final_url, &html))?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
@@ -702,6 +729,38 @@ impl UsageProvider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page with no usage windows names where it was fetched from and how it
+    /// looked, without its query string or any of its text.
+    #[test]
+    fn an_unparsed_page_is_described_by_location_and_counts_only() {
+        let html = "<html><body>Plan usage: $0 used of $20</body></html>";
+        let error = normalize_usage(html).expect_err("no windows on this page");
+        let described =
+            describe_unparsed_page(error, "https://ollama.com/settings?session=secret-id", html);
+        let FetchError::Decode(message) = described else {
+            panic!("the class must stay decode_failed: {described:?}");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "ollama: no usage windows in settings HTML (ollama.com/settings, {} bytes; \
+                 'usage' x1, 'used' x1, '$' x2)",
+                html.len()
+            )
+        );
+        assert!(!message.contains("secret-id") && !message.contains("Plan"));
+    }
+
+    /// Other errors pass through unchanged, so a sign-in verdict keeps its class.
+    #[test]
+    fn describing_leaves_a_non_decode_error_alone() {
+        let unauthorized = FetchError::Unauthorized("ollama session expired".to_string());
+        assert!(matches!(
+            describe_unparsed_page(unauthorized, "https://ollama.com/settings", ""),
+            FetchError::Unauthorized(message) if message == "ollama session expired"
+        ));
+    }
 
     /// A captured-real ollama.com/settings usage section (collapsed but structurally
     /// faithful: `N% used` spans + a `data-time` local-time div per window).
