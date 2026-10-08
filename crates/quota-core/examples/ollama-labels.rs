@@ -19,6 +19,8 @@
 //! v0.65.0 made from upstream's fixtures, not from this host's page. This probe
 //! prints the pair it finds next to the percent the parser derives from it, so
 //! one run against the live page confirms or refutes that port.
+//! Free plans call the same meter `Free usage` (CodexBar v0.73.0). Usage labels
+//! must be standalone text nodes: explanatory prose containing a label is not a meter.
 //!
 //! Reports which strings are PRESENT. Never prints page content, since the
 //! settings page carries account identifiers.
@@ -39,12 +41,13 @@ const SETTINGS_URL: &str = "https://ollama.com/settings";
 /// window that has gone away, which is a different and less dangerous fact.
 const OUR_LABELS: &[&str] = &[
     "Monthly usage",
+    "Free usage",
     "Session usage",
     "Hourly usage",
     "Weekly usage",
 ];
-/// Upstream labels this module does not parse. Empty since the monthly block
-/// was ported; kept so the next label upstream adds has somewhere to go.
+/// Labels CodexBar parses that this module doesn't. Currently none; when CodexBar
+/// adds one, list it here so the probe reports whether this page carries it.
 const THEIR_ADDED_LABELS: &[&str] = &[];
 const MONTHLY_LABEL: &str = "Monthly usage";
 const PLAN_HEADINGS: &[&str] = &["Cloud Usage", "Included usage"];
@@ -114,13 +117,17 @@ async fn main() {
     let mut dropped = Vec::new();
     println!("  labels this module parses:");
     for label in OUR_LABELS {
-        println!("      {:<16} {}", label, mark(html.contains(label)));
+        println!(
+            "      {:<16} {}",
+            label,
+            mark(label_text_node_range(&html, label).is_some())
+        );
     }
     // The dollar figure the monthly percent is derived from. Printed because the
     // derivation is the unverified part of the port: if the page words it
     // differently, the parser falls back to the bar or publishes nothing, and
     // this line shows the wording it would have had to read.
-    if html.contains(MONTHLY_LABEL) {
+    if label_text_node_range(&html, MONTHLY_LABEL).is_some() {
         match monthly_dollar_pair(&html) {
             Some(pair) => println!("  monthly figure: {pair}"),
             None => println!(
@@ -131,7 +138,7 @@ async fn main() {
     }
     println!("  labels upstream has that this module does not parse:");
     for label in THEIR_ADDED_LABELS {
-        let present = html.contains(label);
+        let present = label_text_node_range(&html, label).is_some();
         println!("      {:<16} {}", label, mark(present));
         if present {
             dropped.push(*label);
@@ -193,7 +200,10 @@ async fn main() {
     // The two states are opposite and the distinction cannot come from the label
     // list: "no labels I ignore" and "no labels at all" are the same emptiness
     // counted differently. So the denominator is checked explicitly.
-    let recognised = OUR_LABELS.iter().filter(|l| html.contains(**l)).count();
+    let recognised = OUR_LABELS
+        .iter()
+        .filter(|l| label_text_node_range(&html, l).is_some())
+        .count();
     if recognised == 0 {
         eprintln!("  FINDING: the page carries NONE of the labels this module parses.");
         eprintln!("  That is total drift, not a healthy page -- every window this");
@@ -256,6 +266,16 @@ async fn main() {
     std::process::exit(1);
 }
 
+/// Match `>\s*Label\s*<` just as the production parser does, so neither prose
+/// nor an aria-label can make the probe claim a meter is present.
+fn label_text_node_range(html: &str, label: &str) -> Option<std::ops::Range<usize>> {
+    html.match_indices('>').find_map(|(start, _)| {
+        let tail = &html[start + 1..];
+        let end = tail.find('<')?;
+        (tail[..end].trim() == label).then_some(start..start + 1 + end + 1)
+    })
+}
+
 /// The first `$... of $... used` text after the monthly label, whitespace
 /// collapsed.
 ///
@@ -264,7 +284,7 @@ async fn main() {
 /// within 600 bytes of the label so it cannot report a figure from another
 /// block, and prints at most 60 characters.
 fn monthly_dollar_pair(html: &str) -> Option<String> {
-    let start = html.find(MONTHLY_LABEL)? + MONTHLY_LABEL.len();
+    let start = label_text_node_range(html, MONTHLY_LABEL)?.end;
     let tail = &html[start..];
     let mut end = tail.len().min(600);
     while !tail.is_char_boundary(end) {
@@ -313,5 +333,35 @@ fn mark(present: bool) -> &'static str {
         "PRESENT"
     } else {
         "absent"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_recognises_free_usage_and_ignores_label_prose_and_attributes() {
+        assert!(OUR_LABELS.contains(&"Free usage"));
+        for label in OUR_LABELS {
+            let prose = format!(
+                "<p>{label} credits can be used with the following cloud models:</p>\
+                 <div aria-label=\"{label} 91% used\"></div>"
+            );
+            assert!(label_text_node_range(&prose, label).is_none());
+            let html = format!("{prose}<span>\n  {label}\t </span>");
+            let range = label_text_node_range(&html, label).expect("a real meter label");
+            assert_eq!(&html[range], format!(">\n  {label}\t <"));
+        }
+    }
+
+    #[test]
+    fn monthly_figure_is_read_after_the_meter_label_not_label_prose() {
+        let html = "<p>Monthly usage credits: $59 of $60 used</p>\
+                    <span>Monthly usage</span><span>$7.50 of $60 used</span>";
+        assert_eq!(
+            monthly_dollar_pair(html).as_deref(),
+            Some("$7.50 of $60 used")
+        );
     }
 }
