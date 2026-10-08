@@ -2127,8 +2127,8 @@ The values in use are:
 
 Treat the set as open: a new lane adds a value without warning.
 
-**Cookie providers publish `vault`.** The nine providers that read quota from a
-logged-in web page (amp, cursor, factory, mimo, ollama, opencode, opencodego,
+**Cookie providers publish `vault`.** The ten providers that read quota from a
+logged-in web page (amp, cursor, factory, langdock, mimo, ollama, opencode, opencodego,
 qoder, qwen-cloud) take their session cookie only from a vault deposit,
 `cookie:<domain>` or `cookie:<domain>:<account>`, captured by Cerebellum. This
 module reads no browser store, so it needs no Full Disk Access or Keychain

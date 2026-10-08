@@ -15,7 +15,7 @@
 > response shapes, and the reasoning behind each deferral. Read it as a study of
 > upstream, and check the registry for what we actually serve.
 >
-> **Cookie providers read vault deposits only.** amp, cursor, factory, mimo,
+> **Cookie providers read vault deposits only.** amp, cursor, factory, langdock, mimo,
 > ollama, opencode, opencodego, qoder and qwen-cloud take their web session
 > from a `cookie:<domain>[:<account>]` deposit that Cerebellum captures in a
 > throwaway browser; insula reads no browser store, so rows below that say
@@ -36,7 +36,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-37 providers registered.
+38 providers registered.
 
 **Current parity: the newest "Parity round" section below names the tag.** This
 line used to state a tag, and it went stale for six rounds because each round
@@ -1165,6 +1165,7 @@ headless.)
 |---|---|---|
 | cursor | cursor | browser cookie (cursor.com), short-lived JWT, NO CLI file. Real window `billingCycleEnd`. |
 | factory | factory | WorkOS/next-auth browser session (cookie + local-storage scrape), NO CLI file. Real window `windowEnd`/`secondsRemaining`. |
+| langdock | langdock | **Built, fixture-verified, not live-verified** (no Langdock account here). Source: CodexBar v0.73.0 (`1d313fe50a361fc0a12383da0cdc11a75f59daa5`), `Sources/CodexBarCore/Resources/Plugins/langdock.ts`, `Providers/Langdock/LangdockProviderDescriptor.swift`, and inline `Tests/CodexBarTests/LangdockPluginTests.swift` / `LangdockUsageTests.swift` fixtures. Vault `cookie:langdock.com[:<account>]` request header with `auth_token`, never browser extraction. GET `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` with tRPC `batch=1`/null input; personal session/weekly percentages with optional resets, no invented counts or identity. No included limits is `no_quota_reported`, not an idle window. Weekly keys name the period; session's 300-minute duration comes from the plugin, not a response-stated five-hour kind. Capture this fetch URL after login at `https://app.langdock.com/settings/account/usage`; replace the single deposit on account switching. No models.dev `langdock` counterpart was present, so `apiProvider` is unset. |
 | mimo | mimo | browser cookie (`api-platform_serviceToken`+`userId`), desktop-only. Real window `currentPeriodEnd`. |
 | ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. Included credits use `Monthly usage` or free-plan `Free usage` (CodexBar v0.73.0); labels match standalone text nodes, not explanatory prose. Both take `primary`, but only `Monthly usage` states a `windowKind`. No API-key route exists: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
 | opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |

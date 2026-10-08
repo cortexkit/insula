@@ -343,7 +343,10 @@ until this table follows.
 | `cookie:xiaomimimo.com:<account>` | mimo | `https://platform.xiaomimimo.com/api/v1/tokenPlan/usage` |
 | `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
 | `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
+| `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
+
+The Langdock capture target is fixture-verified, not live-verified; no Langdock account was available.
 
 The `kimi.com` deposit is not a lane: kimi-for-coding reads its usage with the
 coding API key and uses the web session's `kimi-auth` cookie only to fetch two

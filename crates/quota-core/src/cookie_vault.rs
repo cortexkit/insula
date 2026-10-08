@@ -1,6 +1,6 @@
 //! Vault cookie lanes for the cookie provider cohort.
 //!
-//! Nine providers publish quota only on a logged-in web page, so their
+//! Cookie providers publish quota only on a logged-in web page, so their
 //! credential is a session cookie. Insula never reads a browser to get one: the
 //! cookie arrives as a deposit in the credential vault, `cookie:<domain>` or
 //! `cookie:<domain>:<account>`, captured by Cerebellum in a throwaway browser.
@@ -9,7 +9,7 @@
 //!
 //! The rule lives here once, not in each provider, because a copy per provider
 //! drifts: a precedence fix applied to `opencode` was once missed in
-//! `opencodego`, and with nine copies the rule would be right in some providers
+//! `opencodego`, and with separate copies the rule would be right in some providers
 //! and wrong in others with nothing failing to say which.
 
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub(crate) const SOURCE: &str = "vault";
 /// Where a cookie provider's jar came from, for a "no session cookie ..."
 /// diagnosis.
 ///
-/// SHARED SO THE NINE PROVIDERS CANNOT DISAGREE. These providers report a
+/// SHARED SO COOKIE PROVIDERS CANNOT DISAGREE. These providers report a
 /// missing session from a point AFTER the jar was resolved, and the operator's
 /// next action is to re-capture the login and re-deposit it, so the message
 /// names the deposit rather than a browser.
@@ -117,8 +117,8 @@ impl CookieVault {
 
     /// The cookie JAR to fetch with, and the `source` label to publish.
     ///
-    /// Same lane as [`Self::cookie_for`]; the difference is shape. Seven of the
-    /// nine cookie providers work from a jar rather than a header string,
+    /// Same lane as [`Self::cookie_for`]; the difference is shape. Most
+    /// cookie providers work from a jar rather than a header string,
     /// because they ask it whether a recognised session cookie is present and
     /// give a different diagnosis when it is not.
     ///
