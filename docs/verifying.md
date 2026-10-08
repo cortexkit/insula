@@ -95,7 +95,7 @@ mechanisms are sized for a problem this repo does not have.
 
 ## Mutation proofs
 
-Use the fleet runner **ckdev-mutate 0.8.0** to prove and replay costly guards.
+Use the fleet runner **ckdev-mutate 0.9.5** to prove and replay costly guards.
 The checked-in [`mutations.toml`](../mutations.toml) records source edits and
 the exact tests that must catch them. Catalogue crash safety, exactly-once,
 authorization/trust, wire contracts and data loss, not every ordinary logic test.
@@ -105,7 +105,7 @@ from a timeout, fixture failure or unrelated panic.
 
 ```bash
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+  --rev 73c7e66145e131eadffdd874c82d93548868b668 cortexkit-mutate
 mkdir -p target/mutations
 ckdev-mutate check
 ckdev-mutate run --all --report target/mutations/all.json
@@ -143,7 +143,7 @@ Deadlines stop hangs; assertions prove order and outcome, never elapsed time. Th
 pinned runner's default deadlines are not measured performance budgets. Set budgets
 only from clean CI measurements, not a loaded development Mac.
 
-Read the [pinned runner README](https://github.com/cortexkit/commons/blob/46cc166b0df2edcfd14b3eb54ed6eeac588fed69/crates/cortexkit-mutate/README.md)
+Read the [pinned runner README](https://github.com/cortexkit/commons/blob/73c7e66145e131eadffdd874c82d93548868b668/crates/cortexkit-mutate/README.md)
 for multi-file edits, dispositions and prerequisites. Our root `prebuild`
 refreshes `ck-insula` before baselines, after mutant builds and on restoration;
 the broad module audit spawns that binary. These rows need no real-daemon test
@@ -185,7 +185,7 @@ the full catalogue. Nightly and manual runs audit `--broad`. Diff selection sees
 committed edit targets, test files and changed catalogue rows, not unlisted
 helper/fixture dependencies; the nightly full audit covers that limitation.
 With `--broad`, tests outside a row's named test target can also catch its mutant.
-ckdev-mutate 0.8.0 reports `CAUGHT_BROADLY` and only warns.
+ckdev-mutate 0.9.5 reports `CAUGHT_BROADLY` and only warns.
 `scripts/mutation-report.py` fails the job unless the mutant was narrowed to its
 own test target or the row is marked `HUB`: a deliberately shared catch listing
 the other allowed test targets and the property all those tests assert.

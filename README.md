@@ -285,7 +285,7 @@ python3 scripts/prod_body.py crates/quota-core/src/*.rs
 # rows with ckdev-mutate prove or explore --append, not from old evidence. See
 # docs/verifying.md for exact test names, messages, HUB review and safe restore.
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+  --rev 73c7e66145e131eadffdd874c82d93548868b668 cortexkit-mutate
 mkdir -p target/mutations
 ckdev-mutate check
 ckdev-mutate run --all --report target/mutations/all.json
