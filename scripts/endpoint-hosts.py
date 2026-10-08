@@ -55,6 +55,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "anthropic": {"USAGE_URL": "api.anthropic.com"},
     "antigravity": {
         "REMOTE_QUOTA_URL": "cloudcode-pa.googleapis.com",
+        "LOAD_CODE_ASSIST_URL": "cloudcode-pa.googleapis.com",
         "TOKEN_URL": "oauth2.googleapis.com",
     },
     "codebuff": {"BASE_URL": "www.codebuff.com"},

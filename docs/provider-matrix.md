@@ -977,7 +977,7 @@ Read an OAuth bearer from a local file (or opencode store) → one GET → decod
 |---|---|---|---|---|
 | **codex** ✅ | codex | `~/.codex/auth.json` (oauth access_token) | GET chatgpt.com/backend-api/wham/usage | 5h + weekly |
 | **claude** ✅ | claude | opencode `anthropic` / Keychain | GET api.anthropic.com/api/oauth/usage | 5h + weekly + sonnet/opus |
-| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server via `ps` + `lsof` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary` | per-pool (resetTime) |
+| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server via `ps` + `lsof` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary`; wrong-client placeholder fence ported via projectless `loadCodeAssist` preflight → `credential_rejected`, with stored-project/local/cache lanes unchanged | per-pool (resetTime) |
 | gemini | gemini | `~/.gemini/oauth_creds.json` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model 24h |
 Notes — the Google-OAuth sub-archetype (gemini/antigravity, cloudcode-pa quota):
 the fetch is a clean POST (loadCodeAssist→retrieveUserQuota, per-model windows),
