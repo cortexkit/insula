@@ -706,3 +706,20 @@ expect_message = "an overdue needs_reauth slot must not spin"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "kimi-coding-reset-tolerance"
+guards = "Kimi coding ratio pools must not borrow more-exhausted counters from a different reset period"
+file = "crates/quota-core/src/kimi_for_coding.rs"
+old = "chrono::Duration::seconds(2)"
+new = "chrono::Duration::seconds(3600) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/quota-core/src/kimi_for_coding.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["kimi_for_coding::tests::same_duration_resets_three_seconds_apart_do_not_merge"]
+expect_message = "different reset periods must retain the ratio"
+only = true
+timeout_s = 600
+build_timeout_s = 1800

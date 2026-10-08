@@ -18,7 +18,9 @@
 //!     (`https://api.kimi.com`) and keep the path construction simple — the
 //!     `/coding`/`/coding/v1` base-override forms are not used by this lane.
 //!   - `KimiModels.swift:7-10` (`KimiCodeAPIUsageResponse`): the JSON shape we
-//!     decode is `{ "usage": KimiUsageDetail, "limits": [KimiRateLimit]? }`.
+//!     originally decoded is `{ "usage": KimiUsageDetail, "limits": [KimiRateLimit]? }`.
+//!     The current decoder also accepts optional `usages` ratio pools without
+//!     requiring a weekly counter.
 //!   - `KimiModels.swift` `KimiUsageDetail`: `limit` (string-or-number, required),
 //!     `used`, `remaining` (string-or-number, optional), `resetTime` with
 //!     fallbacks `resetTime` / `resetAt` / `reset_time` / `reset_at` (first
@@ -26,12 +28,13 @@
 //!     parse both. The local `string_or_number` helper handles this; we copy it
 //!     here rather than importing from `kimi.rs` (kimi.rs is a different product
 //!     surface and stays untouched).
-//!   - `KimiUsageFetcher.swift:204-...` (`parseCodeAPIUsage`): the `usage` object
-//!     maps to the WEEKLY window; `limits[0].detail` is a secondary rate-limit
-//!     detail that CodexBar surfaces as a secondary window. We SKIP `limits`
-//!     for v1: CodexBar surfaces only the weekly as the primary window in its
-//!     primary flow, and fabricating a second window from `limits` without a
-//!     reset would violate the percent-required-reset-optional rule.
+//!   - Coding ratio pools and reconciliation follow CodexBar v0.73.0
+//!     (`8ab81e2eb`), `KimiModels.swift`, `KimiUsageFetcher.swift` and
+//!     `KimiUsageSnapshot.swift::resolvedRatioWindow`. `limit_7d` stays primary,
+//!     `limit_5h` stays secondary, and `limit_month_total` is a separate extra.
+//!     Reliable counters win only when more exhausted and describing the same
+//!     duration and reset (within two seconds, inclusive). Optional malformed
+//!     pools are skipped without discarding usable counters or sibling pools.
 //!
 //! Window: primary, `window_minutes: Some(10080)` (weekly per CodexBar's
 //! `weekly:` naming), `resets_at`: RFC3339 passthrough when the reset field is
@@ -39,7 +42,11 @@
 //! handling), omitted otherwise. Provider name on the wire: `kimi-for-coding`
 //! (matches ALF's model-handle id).
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -92,7 +99,9 @@ struct KimiUsageDetail {
 /// `parseCodeAPIUsage` line 184).
 #[derive(Debug, Deserialize)]
 struct KimiCodeApiResponse {
-    usage: KimiUsageDetail,
+    usage: Option<KimiUsageDetail>,
+    // Keep optional pool schema drift outside the required-window decoder.
+    usages: Option<serde_json::Value>,
     #[serde(default)]
     limits: Option<Vec<KimiRateLimit>>,
 }
@@ -100,6 +109,82 @@ struct KimiCodeApiResponse {
 #[derive(Debug, Deserialize)]
 struct KimiRateLimit {
     detail: Option<KimiUsageDetail>,
+    window: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KimiWindow {
+    duration: i64,
+    #[serde(rename = "timeUnit")]
+    time_unit: String,
+}
+
+impl KimiWindow {
+    fn duration_minutes(&self) -> Option<i64> {
+        if self.duration <= 0 {
+            return None;
+        }
+        let multiplier = match self.time_unit.as_str() {
+            "TIME_UNIT_MINUTE" => 1,
+            "TIME_UNIT_HOUR" => 60,
+            "TIME_UNIT_DAY" => 24 * 60,
+            _ => return None,
+        };
+        self.duration.checked_mul(multiplier)
+    }
+}
+
+/// CodexBar's `KimiModels.swift::KimiRatioPool` reads only `used_ratio` and
+/// `reset_time`: the ratio is already the used fraction, not a count to divide.
+#[derive(Debug, Deserialize)]
+struct KimiRatioPool {
+    used_ratio: Option<f64>,
+    reset_time: Option<String>,
+}
+
+#[derive(Default)]
+struct CodingPools {
+    session: Option<KimiRatioPool>,
+    weekly: Option<KimiRatioPool>,
+    monthly: Option<KimiRatioPool>,
+}
+
+fn decode_pool(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    refusals: &mut Vec<&'static str>,
+) -> Option<KimiRatioPool> {
+    let value = value.filter(|value| !value.is_null())?;
+    let pool = serde_json::from_value::<KimiRatioPool>(value.clone()).ok();
+    if pool.as_ref().is_some_and(|pool| {
+        pool.used_ratio
+            .is_some_and(|ratio| ratio.is_finite() && ratio >= 0.0)
+    }) {
+        pool
+    } else {
+        refusals.push(field);
+        None
+    }
+}
+
+fn decode_pools(value: Option<&serde_json::Value>) -> (CodingPools, Vec<&'static str>) {
+    let mut refusals = Vec::new();
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return (CodingPools::default(), refusals);
+    };
+    let Some(object) = value.as_object() else {
+        return (CodingPools::default(), vec!["usages"]);
+    };
+    let pools = CodingPools {
+        session: decode_pool(object.get("limit_5h"), "usages.limit_5h", &mut refusals),
+        weekly: decode_pool(object.get("limit_7d"), "usages.limit_7d", &mut refusals),
+        monthly: decode_pool(
+            object.get("limit_month_total"),
+            "usages.limit_month_total",
+            &mut refusals,
+        ),
+    };
+    (pools, refusals)
 }
 
 /// Response from `GetSubscriptionStats` — carries the monthly subscription
@@ -234,33 +319,137 @@ fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> 
     })
 }
 
-/// Decode the coding-API usage body to [`Usage`]. Pure — unit-testable.
-///
-/// Maps `usage` → primary (weekly/7d), `limits[0].detail` → secondary (5h).
-/// The monthly + code-7d extras come from a separate `GetSubscriptionStats`
-/// call and are merged by the caller.
+fn ratio_window(pool: &KimiRatioPool, minutes: Option<i64>) -> RateWindow {
+    RateWindow {
+        window_kind: None,
+        used_percent: pool.used_ratio.unwrap_or_default().min(1.0) * 100.0,
+        raw_used_percent: None,
+        resets_at: pool.reset_time.as_deref().and_then(parse_reset),
+        window_minutes: minutes,
+        used_count: None,
+        total_count: None,
+        regeneration: None,
+        breakdown: None,
+    }
+}
+
+/// A nonnegative used count remains reliable even above the limit. Only use
+/// remaining as a fallback when it lies between zero and the total limit.
+fn reliable_count_percent(detail: &KimiUsageDetail) -> Option<f64> {
+    let limit = string_or_number(detail.limit.as_ref()).filter(|limit| *limit > 0)?;
+    let used = string_or_number(detail.used.as_ref())
+        .filter(|used| *used >= 0)
+        .or_else(|| {
+            string_or_number(detail.remaining.as_ref())
+                .filter(|remaining| (0..=limit).contains(remaining))
+                .map(|remaining| limit - remaining)
+        })?;
+    Some((used as f64 / limit as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+fn reset_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Published legacy resets omit fractions; compare the original clock values
+    // so a 2.9-second separation cannot become a two-second match by truncation.
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|date| date.to_utc())
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(&parse_reset(value)?)
+                .ok()
+                .map(|date| date.to_utc())
+        })
+}
+
+fn resolved_ratio_window(
+    pool: Option<&KimiRatioPool>,
+    detail: Option<&KimiUsageDetail>,
+    minutes: i64,
+    count_window_minutes: Option<i64>,
+) -> Option<RateWindow> {
+    let pool = pool?;
+    let window = ratio_window(pool, Some(minutes));
+    if count_window_minutes == Some(minutes) {
+        if let Some(detail) = detail {
+            if let (Some(percent), Some(count_reset), Some(ratio_reset)) = (
+                reliable_count_percent(detail),
+                pick_reset_field(detail).and_then(reset_instant),
+                pool.reset_time.as_deref().and_then(reset_instant),
+            ) {
+                if percent > window.used_percent
+                    && (count_reset - ratio_reset).abs() <= chrono::Duration::seconds(2)
+                {
+                    let mut counter = window_from_detail(detail, count_window_minutes)?;
+                    counter.used_percent = percent;
+                    return Some(counter);
+                }
+            }
+        }
+    }
+    Some(window)
+}
+
+/// Publish weekly usage in primary and five-hour usage in secondary, so
+/// consumers keep the same slot identities whether readings are ratios or counts.
+/// Optional malformed pools never discard sibling pools or count-based windows.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+    normalize_with_pool_refusals(body).map(|(usage, _)| usage)
+}
+
+fn normalize_with_pool_refusals(body: &[u8]) -> Result<(Usage, Vec<&'static str>), FetchError> {
     let response: KimiCodeApiResponse =
         crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
             .map_err(|e| FetchError::Decode(format!("kimi coding usage not decodable: {e}")))?;
 
-    let primary = window_from_detail(&response.usage, Some(WEEKLY_MINUTES)).ok_or_else(|| {
-        FetchError::Decode("kimi coding usage missing valid weekly window".to_string())
-    })?;
-
-    let secondary = response
-        .limits
-        .as_ref()
-        .and_then(|limits| limits.first())
-        .and_then(|rate_limit| rate_limit.detail.as_ref())
-        .and_then(|detail| window_from_detail(detail, Some(FIVE_HOUR_MINUTES)));
-
-    Ok(Usage {
-        primary: Some(primary),
-        secondary,
-        tertiary: None,
-        extra_rate_windows: None,
-    })
+    let (pools, refusals) = decode_pools(response.usages.as_ref());
+    let weekly = response.usage.as_ref();
+    let primary = resolved_ratio_window(
+        pools.weekly.as_ref(),
+        weekly,
+        WEEKLY_MINUTES,
+        Some(WEEKLY_MINUTES),
+    )
+    .or_else(|| weekly.and_then(|detail| window_from_detail(detail, Some(WEEKLY_MINUTES))));
+    let rate_limit = response.limits.as_ref().and_then(|limits| limits.first());
+    let detail = rate_limit.and_then(|limit| limit.detail.as_ref());
+    // Responses without window metadata use the existing five-hour fallback.
+    // Supplied but unsupported metadata cannot establish a duration to compare.
+    let count_minutes = match rate_limit.and_then(|limit| limit.window.as_ref()) {
+        None => Some(FIVE_HOUR_MINUTES),
+        Some(value) => serde_json::from_value::<KimiWindow>(value.clone())
+            .ok()
+            .and_then(|window| window.duration_minutes()),
+    };
+    let secondary = resolved_ratio_window(
+        pools.session.as_ref(),
+        detail,
+        FIVE_HOUR_MINUTES,
+        count_minutes,
+    )
+    .or_else(|| detail.and_then(|detail| window_from_detail(detail, count_minutes)));
+    let monthly = pools.monthly.as_ref().map(|pool| {
+        let mut window = ratio_window(pool, None);
+        // The wire key explicitly names a month, but states no duration in days.
+        window.window_kind = Some(cortexkit_provider_usage::window_kind::MONTHLY.to_string());
+        crate::model::ExtraWindow {
+            id: Some("kimi-monthly".to_string()),
+            title: Some("Total usage".to_string()),
+            window: Some(window),
+        }
+    });
+    if primary.is_none() && pools.session.is_none() && monthly.is_none() {
+        return Err(FetchError::Decode(
+            "kimi coding usage missing valid weekly window".to_string(),
+        ));
+    }
+    Ok((
+        Usage {
+            primary,
+            secondary,
+            tertiary: None,
+            extra_rate_windows: monthly.map(|window| vec![window]),
+        },
+        refusals,
+    ))
 }
 
 /// Parse the `GetSubscriptionStats` response into extra windows (monthly
@@ -349,7 +538,15 @@ fn merge_extras(usage: &mut Usage, extras: Vec<crate::model::ExtraWindow>) {
         return;
     }
     match usage.extra_rate_windows {
-        Some(ref mut existing) => existing.extend(extras),
+        Some(ref mut existing) => {
+            // Coding pools are authoritative; web enrichment may supply the same
+            // monthly id and must not duplicate or replace that reading.
+            for extra in extras {
+                if !existing.iter().any(|window| window.id == extra.id) {
+                    existing.push(extra);
+                }
+            }
+        }
         None => usage.extra_rate_windows = Some(extras),
     }
 }
@@ -410,6 +607,7 @@ pub struct KimiForCodingProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     usage_url: String,
+    pool_refusals: Mutex<HashMap<String, Vec<&'static str>>>,
 }
 
 impl KimiForCodingProvider {
@@ -426,7 +624,38 @@ impl KimiForCodingProvider {
             credential_source,
             handle_loader,
             usage_url: USAGE_URL.to_string(),
+            pool_refusals: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn update_pool_refusals(&self, handle_id: &str, current: &[&'static str]) -> bool {
+        let mut refusals = self
+            .pool_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = refusals
+            .get(handle_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if previous == current {
+            return false;
+        }
+        if current.is_empty() {
+            refusals.remove(handle_id);
+        } else {
+            refusals.insert(handle_id.to_string(), current.to_vec());
+        }
+        true
+    }
+
+    fn normalize_for_handle(&self, handle_id: &str, body: &[u8]) -> Result<Usage, FetchError> {
+        let (usage, refusals) = normalize_with_pool_refusals(body)?;
+        if self.update_pool_refusals(handle_id, &refusals) {
+            for field in refusals {
+                eprintln!("{} warning: kimi-for-coding optional pool unreadable ({handle_id}): {field}; pool skipped", crate::LOG_TAG);
+            }
+        }
+        Ok(usage)
     }
 
     fn report_auth_failure(
@@ -492,7 +721,9 @@ impl KimiForCodingProvider {
         let result = usage_request(&self.usage_url, bearer)
             .send(&self.http)
             .await
-            .and_then(|body| normalize_usage(&body));
+            .and_then(|body| {
+                self.normalize_for_handle(CredentialHandle::implicit().stable_id(), &body)
+            });
         match result {
             Ok(mut usage) => {
                 self.merge_subscription_extras(&mut usage).await;
@@ -537,7 +768,7 @@ impl KimiForCodingProvider {
             .send_provider_status_first(&self.http, PROVIDER_NAME)
             .await
             .map(|response| response.body)
-            .and_then(|body| normalize_usage(&body));
+            .and_then(|body| self.normalize_for_handle(handle.stable_id(), &body));
         if let Err(error) = &result {
             self.report_auth_failure(handle, record_version, error);
         }
@@ -716,6 +947,392 @@ mod tests {
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-01T12:00:00Z"));
         assert_eq!(primary.window_minutes, Some(10_080));
         assert!(usage.secondary.is_none());
+    }
+
+    // CodexBar 8ab81e2eb, Tests/CodexBarTests/KimiRatioPoolTests.swift,
+    // `ratio weekly and session retain established lane ordering`. The fixture
+    // places weekly usage in primary and session usage in secondary without counts.
+    const RATIO_LANES: &[u8] = br#"{"usages": {
+        "limit_7d": {"used_ratio": 0.125, "reset_time": "2026-09-20T00:00:00Z"},
+        "limit_5h": {"used_ratio": 0.625}
+    }}"#;
+
+    // CodexBar 8ab81e2eb, Tests/CodexBarTests/KimiContradictoryUsageTests.swift,
+    // exact quota response from #4306, without credentials or account identifiers.
+    // The session counter is exhausted while its matching ratio is zero, and
+    // monthly usage is independent of both.
+    const CONTRADICTORY_POOLS: &[u8] = br#"{
+        "limits": [{ "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+            "detail": { "limit": "100", "used": "100", "resetTime": "2026-10-06T13:23:46.915474Z" } }],
+        "usages": {
+            "limit_5h": { "used_ratio": 0, "reset_time": "2026-10-06T13:23:46Z" },
+            "limit_month_total": { "used_ratio": 0.5531, "reset_time": "2026-10-22T14:26:29Z" },
+            "limit_month_code": { "used_ratio": 0, "reset_time": "2026-10-22T14:26:29Z" }
+        }
+    }"#;
+
+    fn mixed_weekly(counter_reset: &str, ratio_reset: &str, ratio: f64) -> Vec<u8> {
+        // Based on the matching-nonzero fixture in KimiRatioPoolTests.swift
+        // at CodexBar 8ab81e2eb. Vary the resets to distinguish matching clocks
+        // within two seconds from unrelated reset periods.
+        serde_json::to_vec(&serde_json::json!({
+            "usage": {"limit": "100", "used": "19", "resetTime": counter_reset},
+            "usages": {"limit_7d": {"used_ratio": ratio, "reset_time": ratio_reset}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn weekly_ratio_pool_decodes_upstream_fixture_in_primary() {
+        let usage = normalize_usage(RATIO_LANES).unwrap();
+        let weekly = usage.primary.unwrap();
+        assert_eq!(weekly.used_percent, 12.5);
+        assert_eq!(weekly.window_minutes, Some(WEEKLY_MINUTES));
+        assert_eq!(weekly.window_kind, None);
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-09-20T00:00:00Z"));
+    }
+
+    #[test]
+    fn session_ratio_pool_decodes_upstream_fixture_in_secondary() {
+        let usage = normalize_usage(RATIO_LANES).unwrap();
+        let session = usage.secondary.unwrap();
+        assert_eq!(session.used_percent, 62.5);
+        assert_eq!(session.window_minutes, Some(FIVE_HOUR_MINUTES));
+        assert_eq!(session.window_kind, None);
+        assert_eq!(session.resets_at, None);
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn monthly_ratio_pool_decodes_upstream_fixture() {
+        let usage = normalize_usage(CONTRADICTORY_POOLS).unwrap();
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        let monthly = &extras[0];
+        assert_eq!(monthly.id.as_deref(), Some("kimi-monthly"));
+        assert_eq!(monthly.title.as_deref(), Some("Total usage"));
+        let window = monthly.window.as_ref().unwrap();
+        assert!((window.used_percent - 55.31).abs() < 0.00001);
+        assert_eq!(window.resets_at.as_deref(), Some("2026-10-22T14:26:29Z"));
+        assert_eq!(window.window_kind.as_deref(), Some("monthly"));
+        assert_eq!(window.window_minutes, None);
+    }
+
+    #[test]
+    fn same_duration_resets_one_second_apart_publish_higher_counter() {
+        let body = mixed_weekly("2026-09-19T16:45:59Z", "2026-09-19T16:45:58Z", 0.1869);
+        let primary = normalize_usage(&body).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 19.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-19T16:45:59Z"));
+    }
+
+    #[test]
+    fn same_duration_resets_three_seconds_apart_do_not_merge() {
+        // Fractional clocks must also remain distinct just beyond two seconds.
+        for reset in ["2026-09-19T16:46:02Z", "2026-09-19T16:46:01.001Z"] {
+            let body = mixed_weekly(reset, "2026-09-19T16:45:59Z", 0.1);
+            let primary = normalize_usage(&body).unwrap().primary.unwrap();
+            assert_eq!(
+                primary.used_percent, 10.0,
+                "different reset periods must retain the ratio"
+            );
+            assert_eq!(primary.resets_at.as_deref(), Some("2026-09-19T16:45:59Z"));
+            let decoded: KimiCodeApiResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                window_from_detail(decoded.usage.as_ref().unwrap(), Some(WEEKLY_MINUTES))
+                    .unwrap()
+                    .used_percent,
+                19.0
+            );
+        }
+    }
+
+    #[test]
+    fn reset_tolerance_includes_exactly_two_seconds() {
+        let body = mixed_weekly("2026-09-19T16:46:01Z", "2026-09-19T16:45:59Z", 0.1);
+        assert_eq!(
+            normalize_usage(&body)
+                .unwrap()
+                .primary
+                .unwrap()
+                .used_percent,
+            19.0
+        );
+    }
+
+    #[test]
+    fn different_duration_does_not_merge_session_counter() {
+        let body = br#"{
+            "usage": {"limit": "100", "used": "19"},
+            "limits": [{"window": {"duration": 120, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {"limit": "100", "used": "80", "resetTime": "2026-09-19T14:45:59Z"}}],
+            "usages": {"limit_5h": {"used_ratio": 0.1, "reset_time": "2026-09-19T14:45:59Z"}}
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 19.0);
+        let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 10.0);
+        assert_eq!(secondary.window_minutes, Some(300));
+    }
+
+    #[test]
+    fn unparseable_reset_does_not_merge_counter() {
+        for (counter_reset, ratio_reset) in [
+            ("invalid", "2026-09-19T16:45:59Z"),
+            ("2026-09-19T16:45:59Z", "invalid"),
+        ] {
+            let body = mixed_weekly(counter_reset, ratio_reset, 0.1);
+            assert_eq!(
+                normalize_usage(&body)
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .used_percent,
+                10.0
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_higher_than_counter_stays_authoritative() {
+        let body = mixed_weekly("2026-09-19T16:45:59Z", "2026-09-19T16:45:58Z", 0.5);
+        let primary = normalize_usage(&body).unwrap().primary.unwrap();
+        assert_eq!(
+            primary.used_percent, 50.0,
+            "higher ratio must not be replaced by the counter"
+        );
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-19T16:45:58Z"));
+    }
+
+    #[test]
+    fn monthly_pool_does_not_suppress_weekly_or_session_correction() {
+        // Weekly fixture from KimiRatioPoolTests.swift at CodexBar 8ab81e2eb:
+        // monthly usage must not suppress the higher matching weekly counter.
+        let weekly = normalize_usage(
+            br#"{
+            "usage":{"limit":"100","used":"19","resetTime":"2026-09-19T16:45:59Z"},
+            "usages":{"limit_7d":{"used_ratio":0,"reset_time":"2026-09-19T16:45:59Z"},
+                      "limit_month_total":{"used_ratio":0.0313}}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(weekly.primary.unwrap().used_percent, 19.0);
+        let session = normalize_usage(CONTRADICTORY_POOLS).unwrap();
+        assert!(session.primary.is_none());
+        assert_eq!(session.secondary.unwrap().used_percent, 100.0);
+    }
+
+    #[test]
+    fn monthly_pool_publishes_separately_without_weekly_or_session() {
+        // Monthly-only fixture from KimiRatioPoolTests.swift at CodexBar 8ab81e2eb:
+        // no weekly or session reading exists to fill those slots.
+        let usage =
+            normalize_usage(br#"{"usages":{"limit_month_total":{"used_ratio":1.05}}}"#).unwrap();
+        assert!(
+            usage.primary.is_none(),
+            "monthly pool must not become the weekly primary"
+        );
+        assert!(usage.secondary.is_none());
+        assert!(usage.tertiary.is_none());
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].id.as_deref(), Some("kimi-monthly"));
+        assert_eq!(extras[0].window.as_ref().unwrap().used_percent, 100.0);
+    }
+
+    #[test]
+    fn no_usages_retains_complete_legacy_fixture() {
+        // Extend the existing string-valued weekly counter fixture with the
+        // first limits entry, and pin every published field without ratio pools.
+        let usage = normalize_usage(br#"{
+            "usage": {"limit":"100","used":"25","remaining":"75","resetTime":"2026-07-01T12:00:00Z"},
+            "limits": [{"detail":{"limit":"200","used":"50","resetTime":"2026-07-01T13:00:00Z"}}]
+        }"#).unwrap();
+        let expected_window = |minutes, reset: &str| RateWindow {
+            window_kind: None,
+            used_percent: 25.0,
+            raw_used_percent: None,
+            resets_at: Some(reset.to_string()),
+            window_minutes: Some(minutes),
+            used_count: None,
+            total_count: None,
+            regeneration: None,
+            breakdown: None,
+        };
+        let expected = Usage {
+            primary: Some(expected_window(WEEKLY_MINUTES, "2026-07-01T12:00:00Z")),
+            secondary: Some(expected_window(FIVE_HOUR_MINUTES, "2026-07-01T13:00:00Z")),
+            tertiary: None,
+            extra_rate_windows: None,
+        };
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        // Preserve the legacy rounding and overage behavior when no pools exist.
+        assert_eq!(
+            normalize_usage(br#"{"usage":{"limit":3,"used":4}}"#)
+                .unwrap()
+                .primary
+                .unwrap()
+                .used_percent,
+            133.33
+        );
+    }
+
+    #[test]
+    fn malformed_pool_is_skipped_without_discarding_windows() {
+        let base = serde_json::json!({
+            "usage": {"limit": "100", "used": "25"},
+            "usages": {
+                "limit_5h": {"used_ratio": 0.625},
+                "limit_7d": {"used_ratio": 0.125},
+                "limit_month_total": {"used_ratio": 0.42}
+            }
+        });
+        for field in ["limit_5h", "limit_7d", "limit_month_total"] {
+            for malformed in [
+                serde_json::json!(false),
+                serde_json::json!({"used_ratio":"bad"}),
+                serde_json::json!({"used_ratio":-0.5}),
+                serde_json::json!({"used_ratio":0.2, "reset_time":{}}),
+                serde_json::json!({}),
+            ] {
+                let mut body = base.clone();
+                body["usages"][field] = malformed;
+                let (usage, refusals) =
+                    normalize_with_pool_refusals(&serde_json::to_vec(&body).unwrap()).unwrap();
+                assert_eq!(
+                    refusals,
+                    vec![match field {
+                        "limit_5h" => "usages.limit_5h",
+                        "limit_7d" => "usages.limit_7d",
+                        _ => "usages.limit_month_total",
+                    }]
+                );
+                assert_eq!(
+                    usage.primary.unwrap().used_percent,
+                    if field == "limit_7d" { 25.0 } else { 12.5 }
+                );
+                assert_eq!(usage.secondary.is_some(), field != "limit_5h");
+                assert_eq!(
+                    usage.extra_rate_windows.is_some(),
+                    field != "limit_month_total"
+                );
+            }
+        }
+        for usages in [
+            serde_json::json!(null),
+            serde_json::json!("bad"),
+            serde_json::json!({}),
+        ] {
+            let mut body = base.clone();
+            body["usages"] = usages;
+            assert_eq!(
+                normalize_usage(&serde_json::to_vec(&body).unwrap())
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .used_percent,
+                25.0
+            );
+        }
+    }
+
+    #[test]
+    fn pool_refusals_change_once_and_are_scoped_to_handle() {
+        let provider = KimiForCodingProvider::new();
+        assert!(!provider.update_pool_refusals("a", &[]));
+        assert!(provider.update_pool_refusals("a", &["usages.limit_7d"]));
+        assert!(!provider.update_pool_refusals("a", &["usages.limit_7d"]));
+        assert!(provider.update_pool_refusals("b", &["usages.limit_7d"]));
+        assert!(provider.update_pool_refusals("a", &["usages.limit_5h"]));
+        assert!(provider.update_pool_refusals("a", &[]));
+        assert!(!provider.update_pool_refusals("a", &[]));
+        assert!(provider.update_pool_refusals("a", &["usages.limit_5h"]));
+        assert!(!provider.update_pool_refusals("b", &["usages.limit_7d"]));
+    }
+
+    #[test]
+    fn legacy_limit_window_uses_stated_duration_and_units() {
+        for (duration, unit, expected) in [
+            (120, "TIME_UNIT_MINUTE", Some(120)),
+            (5, "TIME_UNIT_HOUR", Some(300)),
+            (1, "TIME_UNIT_DAY", Some(1440)),
+            (0, "TIME_UNIT_MINUTE", None),
+            (300, "TIME_UNIT_UNKNOWN", None),
+            (i64::MAX, "TIME_UNIT_DAY", None),
+        ] {
+            let body = serde_json::json!({
+                "usage": {"limit": 100, "used": 25},
+                "limits": [{"window":{"duration":duration,"timeUnit":unit},
+                    "detail":{"limit":100,"used":50}}]
+            });
+            let secondary = normalize_usage(&serde_json::to_vec(&body).unwrap())
+                .unwrap()
+                .secondary
+                .unwrap();
+            assert_eq!(secondary.used_percent, 50.0);
+            assert_eq!(secondary.window_minutes, expected);
+        }
+    }
+
+    #[test]
+    fn unreliable_counter_does_not_override_ratio_and_overage_is_clamped() {
+        for (counts, expected) in [
+            (serde_json::json!({"used":-1}), 10.0),
+            (serde_json::json!({"remaining":-1}), 10.0),
+            (serde_json::json!({"remaining":101}), 10.0),
+            (serde_json::json!({"used":150}), 100.0),
+            (serde_json::json!({"used":-1,"remaining":20}), 80.0),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_slice(&mixed_weekly(
+                "2026-09-19T16:45:59Z",
+                "2026-09-19T16:45:59Z",
+                0.1,
+            ))
+            .unwrap();
+            body["usage"].as_object_mut().unwrap().remove("used");
+            body["usage"]
+                .as_object_mut()
+                .unwrap()
+                .extend(counts.as_object().unwrap().clone());
+            assert_eq!(
+                normalize_usage(&serde_json::to_vec(&body).unwrap())
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .used_percent,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn equal_readings_keep_ratio_reset_metadata() {
+        let body = mixed_weekly("2026-09-19T16:45:59Z", "2026-09-19T16:45:58Z", 0.19);
+        let primary = normalize_usage(&body).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 19.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-19T16:45:58Z"));
+    }
+
+    #[test]
+    fn web_enrichment_cannot_duplicate_or_replace_coding_monthly_pool() {
+        let mut usage = normalize_usage(CONTRADICTORY_POOLS).unwrap();
+        merge_extras(
+            &mut usage,
+            parse_subscription_extras(
+                br#"{
+            "subscriptionBalance":{"amountUsedRatio":0.99},
+            "ratelimitCode7d":{"ratio":0.2}
+        }"#,
+            ),
+        );
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 2);
+        assert_eq!(extras[0].id.as_deref(), Some("kimi-monthly"));
+        assert!((extras[0].window.as_ref().unwrap().used_percent - 55.31).abs() < 0.00001);
+        assert_eq!(extras[1].id.as_deref(), Some("kimi-code-7d"));
     }
 
     #[test]
