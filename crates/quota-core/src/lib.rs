@@ -39,6 +39,7 @@ mod json_scan;
 pub mod kilo;
 pub mod kimi;
 pub mod kimi_for_coding;
+pub mod langdock;
 pub mod llmproxy;
 #[cfg(test)]
 pub mod loopback;
@@ -665,6 +666,10 @@ impl Registry {
                 ),
             ),
             Box::new(clinepass::ClinePassProvider::new()),
+            Box::new(langdock::LangdockProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
             Box::new(llmproxy::LlmProxyProvider::new()),
             Box::new(manus::ManusProvider::new()),
             Box::new(mimo::MimoProvider::new_with_handle_loader(

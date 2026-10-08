@@ -74,6 +74,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "grok": {"USAGE_URL": "grok.com"},
     "kilo": {"DEFAULT_TRPC_BASE": "app.kilo.ai"},
     "kimi_for_coding": {"USAGE_URL": "api.kimi.com"},
+    "langdock": {"USAGE_URL": "app.langdock.com", "REFERER_URL": "app.langdock.com"},
     "manus": {"CREDITS_URL": "api.manus.im"},
     "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
     "minimax": {"CHINA_API_BASE": "api.minimaxi.com", "GLOBAL_API_BASE": "api.minimax.io"},

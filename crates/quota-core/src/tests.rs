@@ -1041,7 +1041,7 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
     // Not vacuous: a broken name mapping or an unreadable directory would leave
     // this passing while inspecting nothing.
     assert!(
-        examined >= 9,
+        examined >= 10,
         "expected to read every cookie provider's source; read only {examined}"
     );
 }
@@ -1633,7 +1633,7 @@ fn every_api_provider_key_names_a_registered_provider() {
 /// other test in this file still passes, because each one constructs the
 /// provider's lane directly rather than through the routing table.
 ///
-/// Derived from `is_cookie_based` rather than from a list, so adding the tenth
+/// Derived from `is_cookie_based` rather than from a list, so adding another
 /// cookie provider fails here until it is routable, instead of failing for an
 /// operator who deposited a login that nothing reads.
 #[test]
@@ -1656,7 +1656,7 @@ fn every_cookie_provider_can_be_reached_by_a_deposit() {
     // emptiness check below while proving nothing -- the same vacuity this repo
     // requires every checker to refuse.
     assert!(
-        cohort >= 9,
+        cohort >= 10,
         "expected the cookie cohort to be enumerable, found {cohort} providers; \
          if is_cookie_based stopped reporting, this test is vacuous"
     );
@@ -1667,6 +1667,53 @@ fn every_cookie_provider_can_be_reached_by_a_deposit() {
          permanently dark on Windows and headless hosts with no error: \
          {unroutable:?} (of {cohort} in the cohort)"
     );
+}
+
+#[tokio::test]
+async fn langdock_is_registered_as_cookie_based_without_a_guessed_catalog_slug() {
+    let defaults = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    assert!(defaults.provider_names().contains(&"langdock"));
+    assert!(defaults.cookie_based_provider_names().contains(&"langdock"));
+    let registry = registry(&[("langdock", true, true)]);
+    tick(&registry).await;
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].api_provider, None);
+}
+
+#[test]
+fn langdock_replacement_changes_the_single_deposit_and_two_deposits_are_refused() {
+    let registry = Registry::with_defaults(
+        crate::config::QuotaConfig::default(),
+        Some(Arc::new(DefaultListSource)),
+    );
+    let loader = registry.vault_handle_loader.as_ref().unwrap();
+    let provider = registry
+        .providers
+        .iter()
+        .find(|provider| provider.name == "langdock")
+        .unwrap();
+    for id in ["cookie:langdock.com", "cookie:langdock.com:second"] {
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(id, "cookie", 1, "active")]),
+            Instant::now(),
+        );
+        let handles = provider.fetcher.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].vault_credential_id(), Some(id));
+    }
+    loader.install_snapshot(
+        scoped_snapshot(
+            1,
+            vec![
+                scoped_row("cookie:langdock.com", "cookie", 1, "active"),
+                scoped_row("cookie:langdock.com:second", "cookie", 1, "active"),
+            ],
+        ),
+        Instant::now(),
+    );
+    assert!(provider.fetcher.handles().unwrap().is_empty());
+    assert!(loader.warning().unwrap().contains("cookie:langdock.com"));
 }
 
 /// Every provider with a vault credential family is BUILT to read the vault.
@@ -1923,6 +1970,7 @@ fn every_cookie_provider_publishes_the_vault_source_label() {
         ("amp", include_str!("amp.rs")),
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),
+        ("langdock", include_str!("langdock.rs")),
         ("mimo", include_str!("mimo.rs")),
         ("ollama", include_str!("ollama.rs")),
         ("opencode", include_str!("opencode.rs")),
@@ -11022,6 +11070,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("amp", include_str!("amp.rs")),
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),
+        ("langdock", include_str!("langdock.rs")),
         ("mimo", include_str!("mimo.rs")),
         ("ollama", include_str!("ollama.rs")),
         ("opencode", include_str!("opencode.rs")),
@@ -11089,8 +11138,8 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         "the kimi.com enrichment deposit must be in the capture table's population"
     );
     assert!(
-        families.len() >= 10,
-        "expected the nine cookie-backed provider routes; found {} -- the filter broke",
+        families.len() >= 11,
+        "expected the ten cookie-backed provider routes plus enrichment; found {} -- the filter broke",
         families.len()
     );
     assert!(
