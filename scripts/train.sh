@@ -108,8 +108,8 @@ fi
 # still running, and protection refused it.
 CI_WORKFLOW=ci.yml
 run=""
-for _ in $(seq 1 15); do
-  sleep 4
+for _ in $(seq 1 6); do
+  sleep 10
   run=$(gh api "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$sha" \
         --jq '[.workflow_runs[]] | sort_by(.created_at) | last | .id' 2>/dev/null)
   [ -n "$run" ] && [ "$run" != "null" ] && break
@@ -124,8 +124,11 @@ if [ -z "$run" ] || [ "$run" = "null" ]; then
   exit 2
 fi
 
+# --interval 60: the default polls every 3 s, and the whole fleet shares one
+# GitHub rate limit, which tripped GitHub's per-minute abuse limit on
+# 2026-10-08. A CI run takes minutes, so a minute of extra latency costs nothing.
 echo "  watching run $run"
-gh run watch "$run" --exit-status >/dev/null 2>&1
+gh run watch "$run" --exit-status --interval 60 >/dev/null 2>&1
 watch_rc=$?
 
 # Read the conclusion back rather than trusting the exit code, for the same

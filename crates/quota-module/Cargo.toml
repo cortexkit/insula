@@ -41,4 +41,7 @@ sha2 = { workspace = true }
 [dev-dependencies]
 # For the diagnostic examples only: the module itself makes no HTTP calls.
 reqwest = { workspace = true }
+# Content-addresses the ckdev copies the integration tests spawn
+# (tests/common/mod.rs). Already in the graph, so no new third-party surface.
+sha2 = { workspace = true }
 subc-daemon = { workspace = true }

@@ -56,8 +56,8 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
 }
 
-/// Expose `binary` to a test under the development name `ckdev-<name>`, inside
-/// `rig`, and return that path to spawn.
+/// Expose `binary` to a test under the development name `ckdev-<name>`, and
+/// return that path to spawn.
 ///
 /// macOS shows a process by its executable's file name, and a `ck-<name>`
 /// process is taken to be the production fleet binary from
@@ -66,28 +66,72 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
 /// Activity Monitor indistinguishable from the live module, so every binary a
 /// test spawns goes through here instead.
 ///
-/// A hard link is preferred: it adds a name without new bytes, so macOS reuses
-/// the code-signature check it already did for that file instead of validating a
-/// fresh copy on first run. A copy is the fallback when the rig is on another
-/// volume, where a hard link can't reach.
-///
-/// Each rig is unique to one test, so a name already present was exposed earlier
-/// in the same test from the same build and is reused. Replacing it could fail on
-/// Windows while a module spawned from it is still running.
+/// The name is a COPY beside the artifact, at
+/// `<artifact dir>/ckdev-exec/<sha256 prefix>/ckdev-<name>`, never a hard link.
+/// On a loaded Mac, processes spawned through a fresh hard link to cargo's
+/// binary were killed with signal 9 at startup: about 1 run in 7 for SUBC's
+/// daemon tests, and 6 of 15 for claustrum's, with nothing in macOS's log saying
+/// why. Switching to a copy took claustrum's runs to 15 of 15. The copy is keyed
+/// by its content and published once by atomic rename, so every later spawn of
+/// the same build reuses one file, and macOS validates it once rather than on
+/// every test. The copy itself is made by a `cp` child on Unix (see below).
+/// `rig` only guarantees the test's scratch directory exists.
 pub fn ckdev_binary(binary: &Path, rig: &Path, name: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
     std::fs::create_dir_all(rig).expect("create the rig for a ckdev binary");
-    let exposed = rig.join(format!("ckdev-{name}{}", std::env::consts::EXE_SUFFIX));
+    let bytes =
+        std::fs::read(binary).unwrap_or_else(|error| panic!("read {}: {error}", binary.display()));
+    let digest = Sha256::digest(&bytes);
+    let prefix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let dir = binary
+        .parent()
+        .expect("a binary path has a parent directory")
+        .join("ckdev-exec")
+        .join(prefix);
+    let exposed = dir.join(format!("ckdev-{name}{}", std::env::consts::EXE_SUFFIX));
     if exposed.exists() {
         return exposed;
     }
-    if std::fs::hard_link(binary, &exposed).is_err() {
-        std::fs::copy(binary, &exposed).unwrap_or_else(|error| {
-            panic!(
-                "expose {} as {}: {error}",
-                binary.display(),
-                exposed.display()
-            )
-        });
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+    // Write under a name unique to this call, then rename into place. Tests run
+    // in parallel, and a reader must never find a half-written binary.
+    let staging = dir.join(format!(
+        ".ckdev-{name}.{}.{}",
+        process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // On Unix a separate `cp` process writes the copy. If this test process held
+    // the file open for writing, another test thread forking at that moment would
+    // carry the open descriptor into its child until that child execs, and the
+    // first exec of the copy would fail with ETXTBSY ("text file busy") on Linux.
+    // `cp` keeps the source's mode, so the copy stays executable.
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("cp")
+            .arg(binary)
+            .arg(&staging)
+            .status()
+            .unwrap_or_else(|error| panic!("spawn cp for {}: {error}", binary.display()));
+        assert!(
+            status.success(),
+            "cp {} {} failed: {status}",
+            binary.display(),
+            staging.display()
+        );
+    }
+    #[cfg(not(unix))]
+    std::fs::copy(binary, &staging)
+        .unwrap_or_else(|error| panic!("copy to {}: {error}", staging.display()));
+    // Another test may have published the same content first. That copy is
+    // byte-identical, so losing the race is fine: keep theirs, drop ours.
+    if std::fs::rename(&staging, &exposed).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        assert!(exposed.exists(), "could not publish {}", exposed.display());
     }
     exposed
 }
