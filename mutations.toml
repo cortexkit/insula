@@ -684,3 +684,25 @@ expect_message = "unreviewed broad catch must be refused"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "refresher-overdue-reauth-sleep"
+guards = "An overdue needs_reauth handle cannot spin the refresher; bounded discovery continues without fetching or changing the degraded slot"
+file = "crates/quota-core/src/lib.rs"
+old = """
+            .filter(|(key, _)| {
+                !key.handle
+                    .vault_credential_id()
+                    .is_some_and(|id| latched_ids.contains(id))
+            })"""
+new = "            .filter(|_| true) // NON-VACUITY BREAK: all slots wake the loop"
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["tests::refresh_loop_overdue_needs_reauth_is_bounded_by_discovery_interval"]
+expect_message = "an overdue needs_reauth slot must not spin"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

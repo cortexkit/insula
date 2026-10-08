@@ -25,3 +25,6 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
 serde_ignored = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
