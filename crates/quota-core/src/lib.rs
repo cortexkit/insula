@@ -116,6 +116,12 @@ use refresh::{
 };
 use store::{AuthoritativeHandles, SlotKey, SlotStore};
 
+/// Use the timer's monotonic clock for slot scheduling and age comparisons.
+/// Outside a paused test runtime, Tokio uses the ordinary std clock.
+fn scheduler_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 #[cfg(test)]
 thread_local! {
     static BEFORE_FETCHED_AT_FORMAT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
@@ -490,6 +496,9 @@ pub struct Registry {
     providers: Vec<RegisteredProvider>,
     store: Mutex<SlotStore>,
     last_admitted_provider: Mutex<Option<usize>>,
+    /// Credential ids suppressed by the last turn's vault snapshot. Their due
+    /// times cannot wake the loop, but bounded discovery still checks for login.
+    latched_vault_ids: Mutex<HashSet<String>>,
     /// Which slot last won the read-time dedup, for identities several slots
     /// compete for. Diagnostic only: nothing branches on it.
     ///
@@ -539,8 +548,9 @@ impl Registry {
             .collect();
         Self {
             providers,
-            store: Mutex::new(SlotStore::new(Instant::now())),
+            store: Mutex::new(SlotStore::new(scheduler_now())),
             last_admitted_provider: Mutex::new(None),
+            latched_vault_ids: Mutex::new(HashSet::new()),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
             cookie_lifetimes: Mutex::new(cookie_lifetime::CookieLifetimes::default()),
             backoffs_cleared: std::sync::atomic::AtomicU64::new(0),
@@ -592,7 +602,7 @@ impl Registry {
             record_version,
             served,
             rejected,
-            Instant::now(),
+            scheduler_now(),
         ) {
             eprintln!(
                 "{LOG_TAG} deposited cookie {credential_id} (version {}) first rejected after \
@@ -897,7 +907,7 @@ impl Registry {
                 .then_with(|| left.handle.sort_cmp(&right.handle))
         });
 
-        let read_now = Instant::now();
+        let read_now = scheduler_now();
         let mut out = Vec::new();
         let mut complete_providers = Vec::new();
         for (index, provider) in self.providers.iter().enumerate() {
@@ -1329,7 +1339,7 @@ impl Registry {
         cancel: &CancellationToken,
         fetch_deadline: Duration,
     ) {
-        let turn_start = Instant::now();
+        let turn_start = scheduler_now();
         let existing_vault: HashMap<String, Vec<CredentialHandle>> = {
             let store = self
                 .store
@@ -1509,6 +1519,10 @@ impl Registry {
             *cursor = last_admitted;
             candidates
         };
+        *self
+            .latched_vault_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = latched_ids;
         let due: Vec<_> = {
             let mut store = self
                 .store
@@ -1535,7 +1549,7 @@ impl Registry {
         let mut fetches = stream::iter(due.into_iter().map(|unit| {
             let provider = Arc::clone(&self.providers[unit.provider_index].fetcher);
             async move {
-                let attempt_start = Instant::now();
+                let attempt_start = scheduler_now();
                 let handle = unit.key.handle.clone();
                 // Broader blocking-I/O isolation is deferred until providers use the future credential store.
                 let mut task = tokio::spawn(async move { provider.fetch_handle(&handle).await });
@@ -1556,7 +1570,7 @@ impl Registry {
                         }
                     },
                 };
-                (unit, attempt_start, Instant::now(), outcome)
+                (unit, attempt_start, scheduler_now(), outcome)
             }
         }))
         .buffer_unordered(refresh::CONCURRENCY_CAP);
@@ -1689,7 +1703,7 @@ impl Registry {
             if cancel.is_cancelled() {
                 return;
             }
-            let sleep_for = self.sleep_until_next_due(Instant::now());
+            let sleep_for = self.sleep_until_next_due(scheduler_now());
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
@@ -1698,8 +1712,8 @@ impl Registry {
         }
     }
 
-    /// Sleep until the earliest active handle is due, bounded so discovery keeps
-    /// running even when every known handle is backed off.
+    /// Sleep until the earliest admissible handle is due, bounded so discovery
+    /// keeps running even when every known handle is backed off or needs login.
     fn sleep_until_next_due(&self, now: Instant) -> Duration {
         let snapshot = {
             let store = self
@@ -1708,8 +1722,17 @@ impl Registry {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.snapshot()
         };
+        let latched_ids = self
+            .latched_vault_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         snapshot
             .iter()
+            .filter(|(key, _)| {
+                !key.handle
+                    .vault_credential_id()
+                    .is_some_and(|id| latched_ids.contains(id))
+            })
             .map(|(_, slot)| slot.next_due_at)
             .min()
             .map(|due| {
@@ -1757,7 +1780,7 @@ impl Registry {
             ),
             Err(_) => return HealthSnapshot::poisoned(providers_total, cookie_cohort_total),
         };
-        let now = Instant::now();
+        let now = scheduler_now();
         let mut fresh = 0;
         let mut stale = 0;
         let mut pending = 0;

@@ -10230,6 +10230,227 @@ async fn enumeration_version_and_reactivation_accelerate_while_needs_reauth_supp
     );
 }
 
+/// Reuse the scoped listing and provider fixtures, with a previously rejected
+/// credential whose five-minute backoff has already expired.
+async fn overdue_reauth_registry(
+    mut other_providers: Vec<Box<dyn UsageProvider>>,
+) -> (Registry, Arc<ScriptedScopedSource>, Arc<AtomicUsize>) {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let listing = |state| {
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row("oauth:anthropic", "oauth", 1, state)],
+        ))
+    };
+    let mut replies = vec![listing("active")];
+    // Enough successful listings for the discovery budget; an exhausted script
+    // retains the same latched snapshot, so a spin still remains observable.
+    replies.extend((0..64).map(|_| listing("needs_reauth")));
+    let source = Arc::new(ScriptedScopedSource::new(replies));
+    let (provider, fetches, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    other_providers.insert(0, provider);
+    let registry = scoped_registry(other_providers, loader, source.clone());
+    tick(&registry).await;
+
+    let rejected_at = scheduler_now() - refresh::NON_TRANSIENT_BACKOFF - Duration::from_secs(1);
+    let mut store = registry.store.lock().unwrap();
+    let (key, slot) = store
+        .snapshot()
+        .into_iter()
+        .find(|(key, _)| key.provider == "claude")
+        .unwrap();
+    let rejected = refresh::next_slot_after_attempt(
+        &slot,
+        "claude",
+        FetchAttempt::failure(
+            slot.observation.clone(),
+            Some("vault".to_string()),
+            FetchError::Unauthorized("session expired".to_string()),
+        ),
+        rejected_at,
+        rejected_at,
+    );
+    assert_eq!(rejected.status, SlotStatus::Degraded);
+    assert!(rejected.next_due_at < scheduler_now());
+    assert!(store.publish_if_current(&key, slot.incarnation, slot.attempt_sequence, rejected));
+    drop(store);
+    source.list_calls.store(0, Ordering::SeqCst);
+    (registry, source, fetches)
+}
+
+/// Keep the test runnable while giving the loop and its fetch tasks a bounded
+/// number of scheduling opportunities. A zero-sleep mutant can accumulate turns
+/// here but cannot starve the test or hang it waiting for an idle runtime.
+async fn settle_refresh_loop() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_loop_overdue_needs_reauth_is_bounded_by_discovery_interval() {
+    let (registry, source, fetches) = overdue_reauth_registry(Vec::new()).await;
+    let registry = Arc::new(registry);
+    let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
+    let slot_before = slot_for(&registry, &handle);
+    let cancel = CancellationToken::new();
+    let loop_task = {
+        let registry = Arc::clone(&registry);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { registry.refresh_loop(cancel).await })
+    };
+    settle_refresh_loop().await;
+    let published_before = registry.usage_snapshot(Some("claude")).await.to_envelope();
+    let mut turns = vec![source.list_calls.load(Ordering::SeqCst)];
+    // Step through a minute in five-second increments, letting each timer fire
+    // before advancing again rather than jumping over intermediate wake-ups.
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle_refresh_loop().await;
+        turns.push(source.list_calls.load(Ordering::SeqCst));
+    }
+    cancel.cancel();
+    loop_task.await.unwrap();
+
+    let count = source.list_calls.load(Ordering::SeqCst);
+    assert!(
+        count <= 20,
+        "an overdue needs_reauth slot must not spin: observed {count} list_scoped calls in 60s virtual time"
+    );
+    assert_eq!(
+        turns,
+        (1..=13).collect::<Vec<_>>(),
+        "one discovery turn every 5s"
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "a latched handle is not fetched"
+    );
+    let slot_after = slot_for(&registry, &handle);
+    assert_eq!(slot_after.next_due_at, slot_before.next_due_at);
+    assert_eq!(slot_after.attempt_sequence, slot_before.attempt_sequence);
+    assert_eq!(slot_after.status, SlotStatus::Degraded);
+    assert_eq!(
+        registry.usage_snapshot(Some("claude")).await.to_envelope(),
+        published_before,
+        "the degraded entry and completeProviders must not change while latched"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_loop_reactivated_handle_is_admitted_within_one_discovery_interval() {
+    let (registry, source, fetches) = overdue_reauth_registry(Vec::new()).await;
+    let registry = Arc::new(registry);
+    let cancel = CancellationToken::new();
+    let loop_task = {
+        let registry = Arc::clone(&registry);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { registry.refresh_loop(cancel).await })
+    };
+    settle_refresh_loop().await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(source.list_calls.load(Ordering::SeqCst), 1);
+
+    // Flip the row one second after discovery, without changing its version.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_refresh_loop().await;
+    *source.replies.lock().unwrap() = VecDeque::from([Ok(scoped_snapshot(
+        1,
+        vec![scoped_row("oauth:anthropic", "oauth", 1, "active")],
+    ))]);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    settle_refresh_loop().await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "no turn before the discovery wake"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_refresh_loop().await;
+    cancel.cancel();
+    loop_task.await.unwrap();
+
+    assert_eq!(source.list_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "reactivation must fetch at the next discovery wake"
+    );
+    let slot = slot_for(
+        &registry,
+        &CredentialHandle::scoped("oauth:anthropic", "oauth"),
+    );
+    assert_eq!(slot.status, SlotStatus::Fresh);
+    assert_eq!(slot.next_due_at, scheduler_now() + refresh::BASE_INTERVAL);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_loop_normal_slot_wakes_at_due_time_beside_overdue_reauth() {
+    let (registry, source, _) = overdue_reauth_registry(vec![Box::new(StubProvider {
+        name: "normal",
+        cookie: false,
+        ok: true,
+    })])
+    .await;
+    let registry = Arc::new(registry);
+    let start = scheduler_now();
+    {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            if key.provider == "normal" {
+                slot.next_due_at = start + Duration::from_secs(2);
+                assert!(store.publish_if_current(
+                    &key,
+                    slot.incarnation,
+                    slot.attempt_sequence,
+                    slot
+                ));
+            }
+        }
+    }
+    let cancel = CancellationToken::new();
+    let loop_task = {
+        let registry = Arc::clone(&registry);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { registry.refresh_loop(cancel).await })
+    };
+    settle_refresh_loop().await;
+    let mut turns = vec![source.list_calls.load(Ordering::SeqCst)];
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_refresh_loop().await;
+        turns.push(source.list_calls.load(Ordering::SeqCst));
+    }
+    cancel.cancel();
+    loop_task.await.unwrap();
+
+    let normal = registry
+        .store
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .find(|(key, _)| key.provider == "normal")
+        .unwrap()
+        .1;
+    assert_eq!(
+        normal.last_attempt_at,
+        Some(start + Duration::from_secs(2)),
+        "an unlatched slot must wake at its own due time, not at the 5s discovery cap"
+    );
+    assert_eq!(
+        normal.next_due_at,
+        start + Duration::from_secs(2) + refresh::BASE_INTERVAL
+    );
+    assert_eq!(
+        turns,
+        vec![1, 1, 2],
+        "only the due-time wake runs another turn"
+    );
+}
+
 #[tokio::test]
 async fn handles_without_account_uses_scoped_type_and_registry_provider_names() {
     let loader = Arc::new(VaultHandleLoader::default());
