@@ -1284,6 +1284,269 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.72.0 → v0.73.0
+
+Checked against v0.73.0, tagged 2026-10-07 (`1d313fe50`). **Documentation only;
+no provider behaviour changed.** The comparison uses
+`git diff v0.72.0 v0.73.0 -- <path>` and `git show v0.73.0:<path>`, not the
+upstream working tree. For each implemented directory, changed lines were
+checked for URLs, cookies, headers, JSON keys, sign-in/redirect handling, parsing
+rules and error mapping; bundled plugins were checked separately. Release labels
+come from `git log v0.72.0..v0.73.0 -- <path>` and tag containment: all new changes
+below first land in **v0.73.0**. “Already ported” describes the current insula
+source, not a new live-account verification; no live probe was run in this round.
+
+**Constants first.** All EIGHT tracked values are **PRESENT**, at the same paths
+as v0.72.0. Each was located by its literal value with
+`git grep -l -F <value> v0.73.0 -- Sources Resources`, not by its constant name.
+None rotated, moved or disappeared. Paths in the table and provider paragraphs
+are under `Sources/CodexBarCore/Providers/`; plugin filenames are under
+`Sources/CodexBarCore/Resources/Plugins/`.
+
+| Constant | Literal value searched | Present in (`v0.73.0`) |
+|---|---|---|
+| `WORKSPACES_SERVER_ID` | `def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `SUBSCRIPTION_SERVER_ID` | `7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4` | `OpenCode/OpenCodeUsageFetcher.swift` |
+| `BILLING_SERVER_ID` | `c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `BETA_HEADER` | `oauth-2025-04-20` | `Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift` |
+| `OASIS_WEB_ID` | `c8a1002d2c457e758785a9979832217c7c0b884c` | `StepFun/StepFunUsageFetcher.swift` |
+| `CONSOLE_WORKSPACES_PATH` | `/console/api/orgs` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift`, `OpenCode/OpenCodeConsoleUsageFetcher.swift` |
+| `CONSOLE_GO_STATUS_PATH` | `/console/api/go/status` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_WORKSPACE_HEADER` | `x-org-id` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+
+**Size and directory census.** Core changed in 77 files (+3657/−1584), Providers
+in 34 (+1743/−453), with no Core renames or deletions. Changed implemented
+directories: Antigravity (5), Codex (4), JetBrains (3), Claude (3), Kimi (2),
+OpenRouter (1), ClinePass (1) and Ollama (1). Unchanged implemented directories:
+Alibaba, Amp, Codebuff, Copilot, Cursor, DeepSeek, Doubao, ElevenLabs, Factory,
+Gemini, Grok, Kilo, LLMProxy, Manus, MiMo, MiniMax, NeuralWatt, OpenCode,
+OpenCodeGo, Qoder, QwenCloud, Sakana, StepFun, Sub2API, Synthetic, Warp, Zai and
+ZenMux. Both `kimi` and `kimi-for-coding` map to Kimi. These 36 directories cover
+our 37 registered providers. Every implemented plugin is unchanged; only the
+new Langdock plugin and shared plugin type declarations changed in Resources.
+Unchanged providers have **no effect** from this release, subject to the
+lane-specific checks below.
+
+**Claude (3 files): no OAuth wire or saved-reset drift.** Compared against
+`anthropic.rs`: `ClaudeOAuth/ClaudeOAuthUsageFetcher.swift`,
+`ClaudeRateLimitResetCredits.swift`, `ClaudeCloudCreditsSnapshot.swift` and
+`ClaudeScopedWeeklyLimitMapper.swift` are unchanged. The v0.72.0
+`?cedar_ember=1` opt-in, `claude-cli/<version> (external, cli)` first request and
+one retry on 400 or a 403 without `user:profile` are **already ported**. There is
+still no retry on 401/429. Saved-reset decoding retains the bounded optional
+`eligible`/`grants[]` inventory, pause/start/expiry handling and no published grant
+handles; insula reads those counts, not a Claude redemption API. Named windows,
+`limits[]`, `extra_usage` and the `iguana_necktie` promotional-credit block have
+no changed decoding or units. The last round's promotional-credit coverage gap
+remains a backlog item, not a v0.73.0 regression.
+
+Upstream still detects the installed Claude Code version and falls back to
+**2.1.0**, not 2.1.282. Insula deliberately pins **2.1.282** after the recorded
+saved-reset measurement; do not copy upstream's old fallback and silently hide
+that inventory. The three changed files instead concern other mechanisms:
+- `ClaudeCLISession.swift` disables all user hooks in the isolated `/usage`
+  probe's inline settings (`96504f357`). **Declined:** insula does not spawn
+  Claude, so there is no SessionStart hook to suppress here.
+- `ClaudeOAuth/ClaudeOAuthCredentials.swift` keeps rejected Keychain writes
+  attached to the credential/profile that produced them, retains recovery through
+  refresh and checks the persisted token before recovery (`6af7c228d`,
+  `fe3f4391d`, `6162025a2`). **No effect:** insula reads the opencode store or
+  vault bearer; it neither refreshes Claude tokens nor owns a Keychain cache.
+- `ClaudeUsageFetcher.swift` permits prompt-capable credential repair only on
+  explicit user action with an allowing policy (`d934f6a4c`). **Declined:**
+  headless polling must remain noninteractive. The shared diagnostic change
+  categorizes quota-less CLI subscription notices as configuration, before the
+  word “token” can trigger auth classification (`b719ddaef`, `b37a61213`); it
+  does not change an OAuth HTTP error or our usage parser.
+
+**Antigravity (5 files): a new false-quota fence, not a Hub version bump.**
+`AntigravityOAuthCredentialsStore.swift` prefers the consumer sign-in client
+`1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`
+when a binary contains several adjacent client-id/secret pairs; the secret still
+comes from that same record (`837d30dff`). None of the eight tracked constants
+rotated: this is a new client-selection rule. **Decline a blind client swap** in
+insula, whose existing refresh credential is bound to the opencode plugin's
+different client. A refresh token cannot simply be reassigned to a new client.
+
+`AntigravityRemoteUsageFetcher.swift` now reads `loadCodeAssist.ineligibleTiers`
+and rejects an account before onboarding/quota fetching when the stored project
+is absent, `currentTier` and the response project are absent, and a reason code
+is `GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT` (`837d30dff`, hardened in `1c70e8966`).
+It returns `reauthenticationRequired` rather than publishing the placeholder
+100% quota summary returned to the wrong OAuth client. **Port candidate:**
+insula's cloud lane goes straight to quota and has no equivalent refusal check.
+Its paid-account fence is already present, but it cannot detect this distinct
+client rejection for free/unknown accounts with no authoritative local/cache
+reading. A successful quota HTTP status alone does not establish real capacity.
+
+Compared with `antigravity.rs`, summary-first `retrieveUserQuotaSummary`, the
+`retrieveUserQuota` fallback, request metadata, **Hub 2.9.1** identity, bucket ids,
+duration-label precedence and quota math are unchanged. The v0.71.0 Hub UA is
+**already ported**. Tier/onboarding precedence is only refactored; selected-account
+email trimming/case-insensitive comparison is preserved. Keep insula's stricter
+refusal-only fallback and its paid-tier/account-attribution guard: the new
+consumer fence does not prove our plugin-bound token sees a paid account's pool.
+
+`AntigravityProviderDescriptor.swift` shares one `agy --version` result between
+spawn and print fallbacks, preserves cancellation and the existing agy 1.2.2
+CSRF gate, and consolidates selected-account credential persistence
+(`855fd18d5`, `507b7d2e7`, `1c70e8966`). `AntigravityScopedPrintFetch.swift`
+shares that resolver and trims tokens through a common helper; account matching
+is not relaxed. **No effect:** insula probes an already-running local server and
+reads the plugin cache, not a spawned `/usage` print lane.
+`AntigravityLocalReader.swift` prices the exact `gpt-oss-120b-medium` model from
+Google Vertex's `openai/gpt-oss-120b-maas` catalog entry, including refresh lookup
+(`1824ba98c`, `6cd4376f5`). **Declined:** local consumption/cost estimation is
+not our quota surface.
+
+**Codex (4 new files): account promotion, not reset redemption.**
+`CodexAccountPromotion{Preparation,Planning,Execution,Transaction}.swift`
+extracts shared app/CLI managed-account promotion (`4e71c3535`, `b08124b9b`).
+It preserves displaced auth before a private atomic live-file swap, resolves the
+target under a shared lock, rejects divergent destinations and rechecks target,
+live and preserved credentials before the destructive swap (`942574725`,
+`67fdcc9d8`, `98f8e123c`). **Declined:** insula serves local/vault credentials;
+it must not promote accounts or overwrite Codex's auth file.
+
+Against `codex.rs` and `codex_resets.rs`, the OAuth usage fetcher, additional
+limits, reconciled state and spend-control helpers are unchanged. No new
+`wham/usage`, `spend_control`, credit balance, `plan_type` or banked-reset
+request/response parsing landed here. Upstream still reads
+`GET /wham/rate-limit-reset-credits` with the same beta/originator/account headers
+and `credits[]`/`available_count` decode; it adds **no consume request**. Insula's
+journalled automatic `POST /wham/rate-limit-reset-credits/consume`, with
+`redeem_request_id`, remains its own lane. **No effect** on redemption; do not
+mistake “promotion” for spending a saved reset.
+
+**Grok and Cursor: unchanged, including the live lanes.** Neither directory
+changed. Against `grok.rs`, `GetGrokCreditsConfig` gRPC-web framing, protobuf
+percent/reset selection, OAuth bearer and token-subject identity have no drift;
+the proxy purchased-balance and read-only `GetRemainingResets` surfaces remain
+unchanged too. Against `cursor.rs`, `/api/usage-summary` fields/units, app-token
+WorkOS cookie construction and deposited-session identity matching have no new
+change. **No effect** in v0.73.0; the prior Grok proxy-wallet coverage candidate
+is not a new gRPC field, and no Cursor auth/browser port is warranted.
+
+**Kimi (2 files): more-exhausted matching windows, not new endpoints.**
+`KimiUsageSnapshot.swift::resolvedRatioWindow` now takes reliable legacy counters
+over a ratio pool whenever their clamped used percentage is higher, but only for
+the same duration and parseable reset timestamps within **two seconds**
+(`8ab81e2eb`). Previously the override required a zero ratio, no monthly ratio
+pool and reliable weekly counters; those restrictions are removed. Monthly-pool
+presence no longer suppresses the weekly/session correction. Unrelated periods
+must not be merged. `KimiProviderDescriptor.swift` exposes existing extra
+windows to CLI/text presentation, including monthly “Total usage”; that pool is
+not newly introduced in v0.73.0.
+
+**Port candidate, with a prerequisite:** insula's live `kimi-for-coding` decoder
+reads legacy `usage`/`limits[0].detail` only; it ignores the coding API's existing
+`usages.limit_5h`, `limit_7d` and `limit_month_total` ratio pools. Those fields and
+their `used_ratio`/`reset_time` decoding predate this release; implementing only
+the new max rule would not reach them. Counters alone already win when they are
+more exhausted, but can understate usage when a matching ratio is higher, and
+ratio-only answers remain a decode failure. Port ratio support and the bounded
+same-period reconciliation together, after a same-account capture. `kimi.rs`
+uses the separate web `GetUsages` lane, which supplies no coding ratio pools;
+its fetch contract is unchanged. Both providers' optional
+`GetSubscriptionStats` monthly/shared and code-7d enrichment is already present.
+No API-key, web-cookie, URL, header or HTTP error mapping changed this round.
+
+**JetBrains (3 files): monthly math already covered; stale XML is not.**
+`JetBrainsStatusProbe.swift` now selects `tariffQuota.current` and `.maximum`
+together when both are finite, rather than mixing combined monthly-plus-top-up
+figures with tariff availability (`4894f35b7`, `1e4febb37`). **Already ported:**
+`jetbrains.rs::normalize` uses a readable tariff for the recurring window and
+keeps purchased top-ups in a separate pool. Its validity check is stricter than
+upstream's finite-only selection; do not weaken it to accept a zero denominator.
+Nested `nextRefill.tariff` amount/duration fallback was already supported.
+
+**Port candidate — freshness:** new `JetBrainsQuotaLogReader.swift` reads at
+most a **4 MiB** `idea.log` tail from the same recognized JetBrains/Google
+installation, mapping `QuotaManager2Impl` quota/refill records. The status probe
+prefers a log quota timestamp newer than XML mtime, can recover an unreadable XML
+from a valid log and supports log-only IDEs (`bb498c362`, `06c432cd8`,
+`3d802d9fa`). Custom/copied config roots do not authorize a log join; truncated
+final lines reject the tail, and an unsupported latest quota state must not
+resurrect an older account's record. Log quota math uses tariff counters, not
+totals containing top-ups. Insula still discovers only XML by mtime: it can
+publish a stale number as fresh, or miss quota when XML is absent. Preserve our
+explicit reset requirement and keep log-derived top-up absence unknown, not
+zero. IDE detector and regex XML helper refactors otherwise have **no effect**.
+
+**OpenRouter (1 file): no effect.** `OpenRouterProviderDescriptor.swift` adds
+“Remaining” as a menu-bar balance detail label (`bb9d1688c`), not a new credit
+request or units. `openrouter.js` is unchanged; insula already publishes the
+`/api/v1/credits` balance separately from optional `/api/v1/key` identity.
+
+**ClinePass (1 file): credential coverage, no wire drift.**
+`ClinePassProviderDescriptor.swift` adds labeled API-key accounts, with the
+selected key overriding configured/env key and `cline auth` session
+(`5dd4d00f3`); the plugin still calls the same usage-limits endpoint. **Declined
+for this round:** insula's env-key lane stays valid; vault/multi-key account
+enumeration is a separate coverage port, not a parser fix or a reason to copy
+CodexBar's account store.
+
+**Ollama:** Free usage/text-node label matching (v0.73.0, `65f0a5432`, `1f61b436b`) is **being ported in parallel**; no Ollama edits in this round.
+
+**Shared and top-level: no quota-contract effect.** `Providers.swift`,
+`ProviderManifest.swift` and the generated alias register Langdock;
+`ProviderDescriptor.swift` adds unavailable history capability and metadata
+controls widget eligibility. `ProviderSettingsSnapshot.swift` and
+`Shared/ProviderCookieSettings.swift` carry a selected browser profile for that
+new provider. Its plugin broker binds one profile, revalidates session ownership
+before publication and hides response cookie headers from plugin JS; this is not
+a mandate to read browser stores in insula. `ProviderUsagePresentation.swift`
+adds detail-backed menu-bar balances, and the diagnostic export fixes the Claude
+CLI configuration category described above. Cost/history/pricing and PTY
+infrastructure account for much of the rest of Core; none changes our HTTP quota
+lanes.
+
+**Changed/new providers we do not implement.** All deltas here land in v0.73.0.
+“Headless with deposit” means a vault-held cookie from a separate login, not
+headless login or browser-store harvesting; these are coverage candidates:
+- **VertexAI** (`VertexAI/VertexAIOAuth/VertexAIUsageFetcher.swift`, `ff31fc290`, `36409c740`): gcloud ADC OAuth/service-account access token plus project for Cloud Monitoring `projects/<id>/timeSeries`; headless with provisioned auth/IAM. Repeated page tokens now stop after retaining samples, with a 100-page bound that errors rather than truncates unbounded pagination.
+- **Vercel** (`vercel.js`): `AI_GATEWAY_API_KEY` bearer for `ai-gateway.vercel.sh/v1/credits`; headless with key. Only the “Available balance” menu mapping changed, not balance/lifetime-spend fetch.
+- **Nous** (`nous.ts`): Hermes-owned or deposited `NOUS_PORTAL_ACCESS_TOKEN` bearer for trusted Portal `/api/oauth/account`, subscription/top-up/total credits; headless with token and validated host. Only menu-bar credit-row selection changed (`bb9d1688c`), not token renewal or billing decode.
+- **Langdock** (new, `langdock.ts`, `60083ab2e`, `52aa99a08`): selected Edge profile's `auth_token` cookie for `app.langdock.com/api/trpc/usageSettings.getPersonalUsage`, session 300-minute and weekly 10,080-minute percentages with optional resets; headless fetching is feasible with an account-bound deposit, although upstream requires its selected-profile broker and does not offer manual-cookie mode. Respect `hasIncludedUsageLimits: false`/absent plan as no included limits and distinguish auth, forbidden and rate-limit errors, not zero usage.
+- **DevPass** (`devpass.ts`): regular `DEVPASS_API_KEY` gateway bearer for `api.llmgateway.io/v1/key`, cycle credits and premium-weekly limits; headless with key. Only “Cycle remaining” menu mapping changed.
+- **AtlasCloud** (`atlascloud.js`): `ATLASCLOUD_API_KEY` bearer for `api.atlascloud.ai/public/v1/balance`, USD account balance; headless with key. Only “Available balance” menu mapping changed.
+
+**Citations.** `python3 scripts/parity-citations.py` at the new v0.73.0 anchor
+reports 84 cited files: 69 present, 15 already answered, no outstanding findings.
+No new cited file disappeared, so no source-comment repair or annotation is
+needed. Existing tagged provenance is retained rather than rewritten to imply
+fresh fixture/live verification.
+
+**Recommended ports** — ranked by risk of a wrong capacity reading before new
+coverage. This source-only round establishes mechanisms, not a newly observed
+wrong number on this host; retain the existing live-account and paid-tier fences.
+1. **Antigravity — reject consumer-client placeholder quota before publication.**
+   Upstream `Antigravity/AntigravityRemoteUsageFetcher.swift` (`CodeAssistResponse`
+   and fetch guard) and `AntigravityOAuthCredentialsStore.swift` (v0.73.0).
+   Check the explicit `GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT` refusal on the cloud
+   lane and surface reauthentication; do not rotate plugin-bound refresh clients,
+   auto-onboard or relax paid/account guards. Risk: high if entitlement or client
+   identity is guessed; a nominally successful placeholder can claim false
+   headroom on a live account. Capture matching local/cache/cloud evidence first.
+2. **Kimi for Coding — ratio pools plus same-period conservative reconciliation.**
+   Upstream `Kimi/KimiModels.swift`, `KimiUsageFetcher.swift` and
+   `KimiUsageSnapshot.swift::resolvedRatioWindow` (v0.73.0 rule over pre-existing
+   ratio support). Decode all three coding ratio pools and choose the more-used
+   reading only for reliable counters with matching duration/reset (two-second
+   tolerance); preserve monthly separately. Risk: medium; ignoring a higher ratio
+   understates exhaustion, while merging unrelated pools invents a limit.
+3. **JetBrains — bounded, installation-scoped log freshness fallback.** Upstream
+   `JetBrains/JetBrainsQuotaLogReader.swift` and `JetBrainsStatusProbe.swift`
+   (v0.73.0). Prefer a newer valid log, support absent XML and retain XML fallback
+   without reviving superseded account records. Risk: medium; stale XML looks like
+   fresh capacity, and a cross-installation/log join can attribute another account's
+   quota. The monthly tariff/top-up split needs no port.
+4. **Langdock — optional new cookie-deposit provider.** Upstream `langdock.ts` and
+   `Langdock/LangdockProviderDescriptor.swift` (v0.73.0). Use a vault deposit and
+   preserve account ownership, no-included-limits and optional-reset semantics,
+   not upstream browser extraction. Risk: medium; cookie expiry/account switching
+   can misattribute usage. This is coverage, not a fix to an existing live row.
+
 ### Parity round: CodexBar v0.70.0 → v0.72.0
 
 Checked 2026-10-05 across v0.71.0, v0.71.1 and v0.72.0. **Documentation and
