@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  CK_MUTATE_REV: 73c7e66145e131eadffdd874c82d93548868b668
+  CK_MUTATE_REV: 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
 
 jobs:
   replay:
@@ -91,7 +91,7 @@ jobs:
           printf 'CI mutation replay: shard %s/4, %ss, exit %s\n' "$SHARD" "$elapsed" "$result" | tee target/mutations/ci-timing.txt
           cat target/mutations/ci-timing.txt >> "$GITHUB_STEP_SUMMARY"
           # With --broad, tests outside a row's named test target can also catch
-          # its mutant. ckdev-mutate 0.9.5 reports CAUGHT_BROADLY and only warns.
+          # its mutant. ckdev-mutate 0.9.8 reports CAUGHT_BROADLY and only warns.
           # scripts/mutation-report.py fails the job unless the mutant was
           # narrowed to its own test target or the row is marked HUB: a
           # deliberately shared catch that lists the other test targets allowed
