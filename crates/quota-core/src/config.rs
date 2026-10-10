@@ -104,4 +104,24 @@ mod tests {
             CodexConfig::default()
         );
     }
+
+    /// Banked resets must default to disabled (0 seconds).
+    ///
+    /// Comparing against `CodexConfig::default()` alone only asserts agreement;
+    /// if the default is raised above zero, both sides move together and the
+    /// test passes while the feature arms unconditionally on every unconfigured
+    /// account -- spending real user credit without opt-in.
+    #[test]
+    fn codex_banked_resets_default_to_disabled_and_zero_seconds() {
+        assert_eq!(CodexConfig::default().auto_use_resets, 0);
+        assert!(!CodexConfig::default().is_enabled());
+
+        let empty = parse("{}");
+        assert_eq!(empty.codex.auto_use_resets, 0);
+        assert!(!empty.codex.is_enabled());
+
+        let explicit_empty = parse(r#"{"codex":{}}"#);
+        assert_eq!(explicit_empty.codex.auto_use_resets, 0);
+        assert!(!explicit_empty.codex.is_enabled());
+    }
 }

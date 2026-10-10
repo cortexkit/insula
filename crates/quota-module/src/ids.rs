@@ -48,3 +48,26 @@ pub const CREDENTIALS_MODULE_ID: &str = "claustrum";
 /// id from the environment. This constant should follow that flip rather than
 /// lead it, so the fallback never disagrees with a live config.
 pub const DEFAULT_MODULE_ID: &str = "insula";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_vault_module_id_matches_daemon_registration() {
+        assert_eq!(
+            CREDENTIALS_MODULE_ID, "claustrum",
+            "the vault module id is dialled directly, so renaming it here without \
+             daemon coordination leaves all vault credential requests failing"
+        );
+    }
+
+    #[test]
+    fn default_module_id_matches_daemon_registration() {
+        assert_eq!(
+            DEFAULT_MODULE_ID, "insula",
+            "the fallback module id is announced to the daemon when SUBC_MODULE_ID \
+             is not set; changing it breaks registration and routing"
+        );
+    }
+}

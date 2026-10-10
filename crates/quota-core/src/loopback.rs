@@ -154,4 +154,62 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert!(request.await.unwrap().starts_with("GET /usage "));
     }
+
+    /// The test server binds strictly to the loopback interface.
+    ///
+    /// Binding to `0.0.0.0` (UNSPECIFIED) would expose the test HTTP server on
+    /// all network interfaces, allowing peers on the local network to intercept
+    /// requests carrying provider tokens and credentials.
+    #[tokio::test]
+    async fn serve_once_binds_strictly_to_loopback() {
+        let (url, _task) = serve_once(200, Vec::new()).await;
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.host_str(),
+            Some("127.0.0.1"),
+            "server must bind strictly to loopback (127.0.0.1), not an open interface"
+        );
+    }
+
+    /// A request with title-case `Content-Length` is read whole across segments.
+    ///
+    /// HTTP header names are case-insensitive. Standard clients send
+    /// `Content-Length`, and if the case-insensitive check rots to an exact
+    /// lowercase match, the reader treats `content_length` as 0, truncates the
+    /// body, and allows negative credential checks (`!request.contains(token)`)
+    /// to pass vacuously.
+    #[tokio::test]
+    async fn a_request_with_titlecase_content_length_is_read_whole() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await
+        });
+
+        let body = r#"{"secret":"titlecase-content-length-guarded"}"#;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /quota HTTP/1.1\r\nhost: x\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.write_all(body.as_bytes()).await.unwrap();
+
+        let request = server.await.unwrap();
+        assert!(
+            request.contains(body),
+            "the body was lost when Content-Length was title-cased: {request:?}"
+        );
+    }
 }
