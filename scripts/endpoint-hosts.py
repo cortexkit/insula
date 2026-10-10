@@ -94,6 +94,13 @@ EXPECTED: dict[str, dict[str, str]] = {
         "QUOTA_CONFIG_URL": "cs-data.qwencloud.com",
         "SUBSCRIPTION_URL": "cs-data.qwencloud.com",
         "USAGE_URL": "cs-data.qwencloud.com",
+        # Team discovery uses /tool/user/info.json and /data/api.json for
+        # LoadHumanInfo and GetSeatSubscriptionSummary on home.qwencloud.com,
+        # rather than the personal usage gateway on cs-data.qwencloud.com.
+        "TEAM_INFO_URL": "home.qwencloud.com",
+        "TEAM_HUMAN_URL": "home.qwencloud.com",
+        "TEAM_SUMMARY_URL": "home.qwencloud.com",
+        "TEAM_REFERER_URL": "home.qwencloud.com",
     },
     "sakana": {"BILLING_URL": "console.sakana.ai"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},
