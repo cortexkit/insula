@@ -176,4 +176,29 @@ mod tests {
             );
         }
     }
+
+    /// Explicit positive sign and surrounding whitespace are parsed cleanly.
+    ///
+    /// An upstream that sends an explicit `+` prefix (e.g. `+1.50`) or whitespace
+    /// padding must not fail to parse. Failing returns `None`, unpublishing the
+    /// pool and hiding a spendable credit balance.
+    #[test]
+    fn explicit_positive_sign_and_whitespace_are_parsed() {
+        assert_eq!(
+            parse_amount("+1.50", "USD"),
+            Some(Amount {
+                minor: 150,
+                exponent: 2,
+                unit: "USD".to_string()
+            })
+        );
+        assert_eq!(
+            parse_amount("  10.00  ", "USD"),
+            Some(Amount {
+                minor: 1_000,
+                exponent: 2,
+                unit: "USD".to_string()
+            })
+        );
+    }
 }

@@ -130,4 +130,24 @@ mod tests {
         let object = map(r#"{ "count": "NaN", "other": 7 }"#);
         assert_eq!(first_i64(&object, &["count", "other"]), Some(7));
     }
+
+    /// A null alias must not stop the scan or be mistaken for zero.
+    #[test]
+    fn null_aliases_are_skipped_so_a_later_one_is_found() {
+        let object =
+            map(r#"{ "usedPercent": null, "percentUsed": 73.5, "count": null, "other": 7 }"#);
+        assert_eq!(
+            first_finite_f64(&object, &["usedPercent", "percentUsed"]),
+            Some(73.5)
+        );
+        assert_eq!(first_i64(&object, &["count", "other"]), Some(7));
+    }
+
+    /// Negative integers are preserved and not rejected as unsigned.
+    #[test]
+    fn negative_integers_are_preserved() {
+        let object = map(r#"{ "balance": -42, "quoted": " -100 " }"#);
+        assert_eq!(first_i64(&object, &["balance"]), Some(-42));
+        assert_eq!(first_i64(&object, &["quoted"]), Some(-100));
+    }
 }
