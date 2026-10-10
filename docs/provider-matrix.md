@@ -1285,6 +1285,259 @@ not parallel workers:
   all, or do NO-WINDOW providers simply stay "no signal"? (affects whether Group 6
   is worth any effort.)
 
+### Parity round: CodexBar v0.73.0 → v0.74.0
+
+Checked against v0.74.0, tagged 2026-10-09 (`c2f22ccf8`). **Documentation only;
+no provider behaviour changed.** The comparison uses
+`git diff v0.73.0 v0.74.0 -- <path>` and `git show v0.74.0:<path>`, not the
+upstream working tree. For each implemented directory, changed lines were
+checked for URLs, cookies, headers, JSON keys, sign-in/redirect handling, parsing
+rules and error mapping; bundled plugins were checked separately. Release labels
+come from `git log v0.73.0..v0.74.0 -- <path>` and tag containment: all new changes
+below first land in **v0.74.0**. “Already ported” describes the current insula
+source, not a new live-account verification; no live probe was run in this round.
+
+**Constants first.** All EIGHT tracked values are **PRESENT**, at the same paths
+as v0.73.0. Each was located by its literal value with
+`git grep -l -F <value> v0.74.0 -- Sources Resources`, not by its constant name.
+None rotated, moved or disappeared. Paths in the table and provider paragraphs
+are under `Sources/CodexBarCore/Providers/`; plugin filenames are under
+`Sources/CodexBarCore/Resources/Plugins/`.
+
+| Constant | Literal value searched | Present in (`v0.74.0`) |
+|---|---|---|
+| `WORKSPACES_SERVER_ID` | `def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `SUBSCRIPTION_SERVER_ID` | `7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4` | `OpenCode/OpenCodeUsageFetcher.swift` |
+| `BILLING_SERVER_ID` | `c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d` | `OpenCode/OpenCodeUsageFetcher.swift`, `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `BETA_HEADER` | `oauth-2025-04-20` | `Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift` |
+| `OASIS_WEB_ID` | `c8a1002d2c457e758785a9979832217c7c0b884c` | `StepFun/StepFunUsageFetcher.swift` |
+| `CONSOLE_WORKSPACES_PATH` | `/console/api/orgs` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift`, `OpenCode/OpenCodeConsoleUsageFetcher.swift` |
+| `CONSOLE_GO_STATUS_PATH` | `/console/api/go/status` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+| `CONSOLE_WORKSPACE_HEADER` | `x-org-id` | `OpenCodeGo/OpenCodeGoUsageFetcher.swift` |
+
+**Size and directory census.** Core changed in 110 files (+4498/−1053), Providers
+in 55 (+1339/−468), with no Core renames or deletions. Changed implemented
+directories: Claude (12), Codex (7), Ollama (4), Cursor (4), JetBrains (3),
+QwenCloud (2), Grok (1), Antigravity (1), OpenCodeGo (1), Langdock (1), plus
+`Shared` (1) and the top-level `Providers.swift`, `ProviderManifest.swift`,
+`ProviderDescriptor.swift`, `ProviderSettingsSnapshot.swift`,
+`ProviderVersionDetector.swift` and `ProviderInstanceIDAliases.generated.swift`.
+Unchanged implemented directories: Alibaba, Amp, ClinePass, Codebuff, Copilot,
+DeepSeek, Doubao, ElevenLabs, Factory, Gemini, Kilo, Kimi, LLMProxy, Manus,
+MiMo, MiniMax, NeuralWatt, OpenCode, OpenRouter, Qoder, Sakana, StepFun, Sub2API,
+Synthetic, Warp, Zai and ZenMux. Both `kimi` and `kimi-for-coding` map to Kimi.
+These 36 directories cover our 38 registered providers. Implemented plugin
+changes: `ollama-api.ts`/`ollama-api.js` and `qwencloud-team.ts`/`qwencloud-team.js`.
+Unchanged providers have **no effect** from this release, subject to the
+lane-specific checks below.
+
+**Claude (12 files): no OAuth wire or saved-reset drift; monthly API credits unread.**
+Compared against `anthropic.rs`: `ClaudeOAuth/ClaudeOAuthUsageFetcher.swift`,
+`ClaudeRateLimitResetCredits.swift`, `ClaudeCloudCreditsSnapshot.swift` and
+`ClaudeScopedWeeklyLimitMapper.swift` have no wire changes (`ClaudeOAuthUsageFetcher.swift`
+was not modified at all). The `?cedar_ember=1` opt-in, `claude-cli/<version> (external, cli)`
+first request, and single retry on 400 or a 403 without `user:profile` are
+**already ported**. There remains no retry on 401/429. Saved-reset decoding retains
+the optional `eligible`/`grants[]` counts, pause/start/expiry handling, and
+no published grant handles. Named windows, `limits[]`, `extra_usage`, and the
+weekly breakdown are unchanged. Upstream still falls back to installed Claude Code
+detection or **2.1.0** (line 67 of `ClaudeOAuthUsageFetcher.swift`), whereas insula
+deliberately pins **2.1.282** so Anthropic does not hide saved resets.
+
+**Claude API credits on linked Console:** since 2026-10-07 Max and Team plans include
+monthly Claude API credits, held in a linked Claude Console organization
+(`platform.claude.com`, Settings → Billing, "Promotional credits"). CodexBar v0.74.0
+does **NOT** read this balance anywhere: there is no endpoint, credential, or
+request for `platform.claude.com` billing in the tree. (The promotional credit UI
+landed in v0.74.0 menu and CLI output describes only the pre-existing `iguana_necktie`
+cloud-session credit payload from `GET /api/oauth/usage`, which insula already models).
+Upstream changes in the 12 files instead concern:
+- `ClaudeWeb/ClaudeSubscriptionMetadata.swift`: new web billing fetcher for
+  `GET https://claude.ai/api/organizations/{org_id}/subscription_details` using
+  an existing web session cookie (`sessionKey`), decoding `renews` / `expires`
+  dates (supporting YYYY-MM-DD date-only strings and ISO-8601 timestamps) for
+  active, trialing, and canceled subscriptions (`5349f629a`). **Declined / backlog
+  candidate:** insula reads OAuth `/api/oauth/usage` directly with bearer tokens
+  and has no web session cookie lane for Claude.
+- `ClaudeCLIScreen.swift`: expands PTY replay screen to 200 rows (`static let rows = 200`,
+  160 columns) to prevent truncating tall inline `/usage` panels (2.1.270–2.1.294)
+  containing session stats above and usage insights below quota rows (`d82f195bd`).
+  **Declined:** insula does not spawn Claude PTY sessions.
+- `ClaudeCLISession.swift`: strips `ANTHROPIC_*` env vars, sets `DISABLE_AUTOUPDATER=1`,
+  and invokes `ProcessExitRelease.afterExit(proc)` (`96bfd9a91`). **No effect.**
+- `ClaudeOAuth/ClaudeOAuthCredentials.swift` and `ClaudeOAuthCredentialModels.swift`:
+  detects credentials modified on disk after a missing-credentials failure
+  (`credentialsChanged`), guiding the user to Refresh (`44702dc72`); replaces
+  slow query backoff with timing logging. **No effect:** insula reads opencode
+  store or vault bearer tokens, not Keychain items.
+- `ClaudeProviderDescriptor.swift`: registers `nativeAppBundleIdentifiers: ["com.anthropic.claudefordesktop"]`,
+  handles fallback errors, and passes `includeSubscriptionMetadata` (`44702dc72`).
+  **No effect.**
+- `ClaudeStatusProbe.swift` and `ClaudeUsageFetcher.swift`: recognizes the tall CLI
+  insights marker (`usageInsightsMarker`), preserves PTY errors over insights-only
+  summaries, and enriches OAuth snapshots with web subscription dates when cookies
+  are available (`36bf01ace`). **Declined.**
+- `ClaudeUsageSnapshot+WebExtras.swift` and `ClaudeVerifiedAccountOwner.swift`:
+  preserves subscription metadata across snapshot transformations. **No effect.**
+
+**Codex (7 files): base URL comment fix already ported; no wire or reset drift.**
+Against `codex.rs` and `codex_resets.rs`: the OAuth usage fetcher, additional
+limits, reconciled state and spend-control helpers have no wire drift. No changes
+landed for `wham/usage` request or response parsing, `rate_limit`, `limit_reached`,
+`spend_control`, credits, plan types, or banked resets (`/wham/rate-limit-reset-credits`).
+Upstream still sends `GET /wham/rate-limit-reset-credits` and adds no consume endpoint;
+insula's automatic `POST /wham/rate-limit-reset-credits/consume` remains its own lane.
+`rate_limit_reached_type` remains an optional `String?` decoded in `RPCRateLimitSnapshot`
+in `UsageFetcher.swift` (local CLI RPC only); upstream does not enumerate or branch
+on its values anywhere, and neither OAuth nor web usage paths read it.
+- `CodexOAuthUsageFetcher.swift`: fixes `parseChatGPTBaseURL` so comment lines starting
+  with `#` produce an empty substring before `#` rather than being treated as URL
+  overrides (`765869ff6`). **Already ported:** insula's `codex.rs::parse_chatgpt_base_url`
+  uses `raw_line.split('#').next().unwrap_or("").trim()`, which already ignores
+  comment lines starting with `#`.
+- `CodexAccountPromotionExecution.swift` and `CodexAccountPromotionPreparation.swift`:
+  managed account promotion rethrows typed errors and avoids unlinking managed home
+  directories that remain referenced (`79a43f741`, `767aa2b0d`). **Declined:**
+  insula serves local/vault credentials and does not mutate Codex account directories.
+- `CodexIdentity.swift`: introduces `CodexNativeCredentialOwnerIdentity` to extract
+  normalized email from JWT ID token claims (`profile["email"]`, `payload["email"]`)
+  as consistency evidence (`8242ed969`). **No effect.**
+- `ManagedCodexAccountCredentialResolver.swift`: access-only credential wrapper
+  `ManagedCodexAccessCredential` preventing bearer token leakage in logging and
+  reflection (`767aa2b0d`). **No effect.**
+- `CodexProviderDescriptor.swift`: registers `nativeAppBundleIdentifiers: ["com.openai.codex"]`
+  (`72b6e6600`). **No effect.**
+- `CodexCLISession.swift`: adds `ProcessExitRelease.afterExit(proc)` (`78c5834c0`).
+  **No effect.**
+
+**Ollama (4 files + 2 plugins): settings wallet parsing & API key balance strategy.**
+`OllamaUsageParser.swift` adds `parseCreditDetails` to parse the "Usage credits"
+wallet section from `https://ollama.com/settings` (`f38ba0e5e`): extracts `Credit balance`
+(`$X.XX`), `Monthly credits used` (`$X.XX`), and `Next refill` (`Refills to $... in ...`).
+In `parseClassified`, accounts with credit details but no percentage usage blocks
+are now accepted as valid logged-in accounts. `monthlyUsageLabels` retains
+`["Monthly usage", "Free usage"]`. `parsePlanName` adds a pattern for
+`<h[1-6]> Usage credits <span>...`.
+New plugin `ollama-api.ts`/`ollama-api.js` uses `OLLAMA_API_KEY` to fetch
+`GET https://ollama.com/api/balance` (`08f42ab06`), returning `purchased.balance_usd` as
+`Credit balance`, and `included.allowance_usd` / `included.balance_usd` as `Monthly credits used`
+and a 30-day primary rate window (43200 mins).
+`OllamaUsageFetcher.swift` and `OllamaUsageSnapshot.swift` attach details sections
+to `UsageSnapshot`. `OllamaProviderDescriptor.swift` registers the API strategy
+and `menuBarBalanceDetailLabels: ["Credit balance"]` (`08f42ab06`).
+**Port candidate:** insula currently parses only percentage usage blocks ("Free usage",
+"Monthly usage", etc.) in `ollama.rs`. Adding wallet credit parsing will surface
+credit balances and monthly credit spend for paid accounts and prevent classifying
+credit-only accounts as parse failures.
+
+**Cursor (4 files): Linux cursor-agent store; no HTTP wire drift.**
+`CursorAppAuth.swift` adds `CursorAgentAuthStore` to read `cursor/auth.json` on Linux
+machines without `Cursor.app` under `XDG_CONFIG_HOME` or `~/.config` (`0b0652ad1`).
+`CursorStatusProbe` iterates both app SQLite DB and agent JSON store on Linux
+(`bcc1f8c22`, `2fbc66388`). `CursorProviderDescriptor.swift` registers
+`nativeAppBundleIdentifiers: ["com.todesktop.230313mzl4w4u92"]` (`59d2c5b55`).
+Against `cursor.rs`: `/api/usage-summary` endpoint, cookie headers, and response
+parsing are completely unchanged. **No effect.**
+
+**Grok (1 file): RPC process output cleanup; no wire drift.**
+`GrokRPCClient.swift` refactors stdout/stderr pipe handling to `RPCChildProcessOutput`
+and `ProcessExitRelease.afterExit(self.process)` (`6e79304e7`). Against `grok.rs`:
+`GetGrokCreditsConfig` gRPC-web framing, protobuf parsing, OAuth bearer, and
+token identity are unchanged. **No effect.**
+
+**Antigravity (1 file): bundle ID annotation only.**
+`AntigravityProviderDescriptor.swift` registers `nativeAppBundleIdentifiers: ["com.google.antigravity"]`
+(`72b6e6600`). Against `antigravity.rs`: `retrieveUserQuotaSummary`, `retrieveUserQuota`,
+Hub 2.9.1 identity, bucket IDs, and duration precedence are unchanged. **No effect.**
+
+**JetBrains (3 files): top-up credits parsed upstream; already ported in insula.**
+`JetBrainsStatusProbe.swift` and `JetBrainsQuotaLogReader.swift` add `JetBrainsTopUpQuota`
+(100,000 quota units = 1.00 credit) to parse purchased top-up credits from `topUpQuota`
+in JSON status probe (`maximum`, `available`) or from `idea.log` (8-value tuple),
+exposed as a "Top-up credits" detail section with row "Remaining" format "%.2f credits",
+and presentation `menuBarBalanceDetailLabels: ["Remaining"]` (`53356d4b8`).
+**Already ported:** `jetbrains.rs` already parses `topUpQuota` from both XML and `idea.log`
+and publishes it as a separate `Purchased` spend pool (`top_up_pool`).
+
+**QwenCloud (2 files + 2 plugins): Team Token Plan coverage.**
+`QwenCloudTeamFetchStrategy.swift` and `qwencloud-team.ts`/`qwencloud-team.js` fetch
+Qwen Cloud Team Token Plan (`sfm_tokenplanteams_dp_intl`) via `home.qwencloud.com`
+session cookies (`9fae8c8e4`): `GET /tool/user/info.json` for `secToken`,
+`POST /data/api.json?product=ea-service&action=LoadHumanInfo` for `SellerInfoDto.Nbid`,
+and `POST /data/api.json?product=BssOpenAPI-V3&action=GetSeatSubscriptionSummary` for
+credit pools (`credit_value`, total/surplus, seats). Primary rate window label is "Team".
+Falls back to personal web strategy if no active team plan is found.
+**Port candidate:** insula currently implements personal token plan scraping via
+`cs-data.qwencloud.com` in `qwen_cloud.rs`. Adding Team plan support expands
+coverage for enterprise accounts.
+
+**OpenCodeGo (1 file): presentation only.**
+`OpenCodeGoProviderDescriptor.swift` adds `switcherUsesAutomaticMenuBarWindow: true`
+and `menuBarWindowResolver` for menu-bar presentation of the most-constrained window
+(`c3c6ce061`). **No effect.**
+
+**Langdock (1 file): multi-browser profile selection.**
+`LangdockProviderDescriptor.swift` expands browser profile settings from Edge only to
+`["edge", "chrome", "safari"]` (`3c02274fd`). **No effect:** insula uses vault
+deposits (`cookie:langdock.com`).
+
+**Shared and top-level: no quota-contract effect.**
+`Shared/AliyunOneConsole/AliyunOneConsoleChromiumCookieFallbackImporter.swift` adds
+`BrowserCookieAccessGate.shouldAttempt(browser)` (`3c02274fd`).
+`Providers.swift`, `ProviderManifest.swift`, `ProviderInstanceIDAliases.generated.swift`
+register 9 new providers (`xapi`, `tavily`, `linkup`, `tinyapi`, `exa`, `cosmic`,
+`aerostack`, `sailresearch`, `sofya`).
+`ProviderDescriptor.swift` adds `nativeAppBundleIdentifiers: Set<String>`.
+`ProviderSettingsSnapshot.swift` adds `selectedProfileBrowsers: [String]?`.
+`ProviderVersionDetector.swift` adds `ProcessExitRelease.afterExit(proc)`.
+`UsageFetcher.swift` adds `subscriptionRenewsAtIsDateOnly` and `subscriptionExpiresAtIsDateOnly`
+to `UsageSnapshot`. None changes our quota fetch contracts.
+
+**Changed/new providers we do not implement.** All deltas here land in v0.74.0.
+“Headless with deposit” means a vault-held cookie/token from a separate login;
+these are coverage candidates:
+- **Kiro** (`Kiro/KiroStatusProbe.swift`, `KiroProviderDescriptor.swift`, `fbbbff0b0`): AWS CodeWhisperer / Amazon Q usage limits API (`https://codewhisperer.us-east-1.amazonaws.com/` / `https://q.eu-central-1.amazonaws.com/`) via local SQLite CLI credentials; adds `pace: .calendarMonthResetWindow` and monthly sentinel minutes to RateWindow; headless with deposited AWS bearer/SSO token.
+- **XAPI** (new, `xapi.js`, `8a7b0ff2b`): Browser session cookies (`auth_token`, `ct0` with `X-CSRF-Token` header echo) for `https://console.x.com`; headless with vault-deposited cookie pair.
+- **TinyApi** (new, `tinyapi.js`, `fca039015`): Browser session cookie for `https://tinyapi.rest/api/user/credits`; headless with deposited session cookie.
+- **Tavily** (new, `tavily.js`, `fca039015`): Bearer `TAVILY_API_KEY` for `https://api.tavily.com/usage`; headless with API key.
+- **Sofya** (new, `sofya.ts`, `81438267f`): Bearer `SOFYA_API_KEY` for `https://sofya.co/v1/auth/me`; headless with API key.
+- **SailResearch** (new, `sailresearch.ts`, `81438267f`): Bearer `SAIL_API_KEY` for `https://api.sailresearch.com/v2/usage/summary?range=30d`; headless with API key.
+- **Notion** (`notion.ts`, `02d586c2a`): Browser cookie `token_v2` for `https://app.notion.com`; headless with deposited cookie.
+- **Linkup** (new, `linkup.js`, `fca039015`): Bearer `LINKUP_API_KEY` for `https://api.linkup.so/v1/credits/balance`; headless with API key.
+- **Exa** (new, `exa.js`, `fca039015`): `x-api-key: EXA_SERVICE_KEY` and `EXA_API_KEY_ID` for `https://admin-api.exa.ai/team-management/api-keys/{id}/usage`; headless with service key and key ID.
+- **Cosmic** (new, `cosmic.ts`, `81438267f`): Bearer `COSMIC_TOKEN` (PAT) plus `COSMIC_PROJECT_ID` for `https://dapi.cosmicjs.com/v3/projects/usage?project_id=...`; headless with token and project ID.
+- **Aerostack** (new, `aerostack.ts`, `81438267f`): Bearer `AEROSTACK_TOKEN` (account JWT) for `https://api.aerostack.dev/api/billing/usage`; headless with JWT token.
+
+**Citations.** `python3 scripts/parity-citations.py` at the new v0.74.0 anchor
+reports 95 cited files: 80 present, 15 already answered, no outstanding findings.
+No cited file disappeared or was renamed, so no source-comment repair or annotation is
+needed. Existing tagged provenance is retained rather than rewritten to imply
+fresh fixture/live verification.
+
+**Recommended ports** — ranked by risk of a wrong capacity reading before new
+coverage. This source-only round establishes mechanisms, not a newly observed
+wrong number on this host; retain the existing live-account and paid-tier fences.
+1. **Ollama — parse "Usage credits" wallet section and API key balance.** Upstream
+   `Ollama/OllamaUsageParser.swift` (`parseCreditDetails`) and `Resources/Plugins/ollama-api.ts`
+   (v0.74.0). Parse `Credit balance`, `Monthly credits used`, and `Next refill`
+   from the settings page, and accept accounts with credit details even when standard
+   usage percentage meters are omitted. Also support `OLLAMA_API_KEY` for
+   `GET https://ollama.com/api/balance`. Risk: low; prevents parse errors on credit-only
+   accounts and adds paid credit visibility without altering free usage parsing.
+2. **Qwen Cloud — Team Token Plan coverage.** Upstream
+   `QwenCloud/QwenCloudTeamFetchStrategy.swift` and `Resources/Plugins/qwencloud-team.ts`
+   (v0.74.0). Add team token plan support (`sfm_tokenplanteams_dp_intl`) via
+   `ea-service:LoadHumanInfo` and `BssOpenAPI-V3:GetSeatSubscriptionSummary` from the web
+   session cookie. Risk: medium; multi-step gateway RPC with region-specific endpoints
+   and seat attribution. Coverage candidate, does not affect existing personal token
+   plan scrape.
+3. **Claude — subscription renewal and expiration dates from web billing.** Upstream
+   `Claude/ClaudeWeb/ClaudeSubscriptionMetadata.swift` (v0.74.0). Optionally query
+   `GET https://claude.ai/api/organizations/{org_id}/subscription_details` with deposited
+   session cookie to obtain `renews_at` and `expires_at`. Risk: low; supplementary
+   billing metadata. Note: does NOT provide monthly Claude API credits on
+   `platform.claude.com` (which upstream does not read anywhere).
+
 ### Parity round: CodexBar v0.72.0 → v0.73.0
 
 Checked against v0.73.0, tagged 2026-10-07 (`1d313fe50`). **Documentation only;
