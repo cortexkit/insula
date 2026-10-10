@@ -193,8 +193,12 @@ Evaluated per handle per tick, with FRESH same-tick usage + credits:
   auto_use_resets` AND at least one served window has `used_percent >= 1.0`
   (a credit cannot be harvested into an unused window — the server would
   return `nothing_to_reset` and keep the credit while it marches to expiry).
-- `exhaustion_trigger` = `rate_limit.limit_reached == true` OR any served
-  window `used_percent >= 99.0`.
+- `exhaustion_trigger` = `rate_limit.limit_reached == true`, and nothing else.
+  A window at 99% or 100% with the limit not reported as reached is not the
+  wall, and neither is a response without the field. The upstream reports whole
+  percentages, so 99 can still hold most of a percent of a weekly window. (This
+  was `limit_reached == true OR any window >= 99.0` until 2026-10-10.) A sibling
+  has room unless its fresh reading reports `limit_reached == true`.
 - Fire iff `armed && (expiry_trigger || exhaustion_trigger)` AND no pending
   journal record for the account AND the 30-min spend bound allows it AND the
   pre-POST time cutoff allows it (below).
@@ -238,8 +242,9 @@ Mechanism:
 
 `relax_eligible` is set by the codex fetch iff ALL hold:
 - armed this tick (all arming requirements above), AND
-- fresh usage is BELOW the wall (`!limit_reached` and every window
-  `used_percent < 99.0`), AND
+- fresh usage is clear of the wall by a margin (`limit_reached == false` and
+  every window `used_percent < 99.0`). This 99% ceiling guards only the
+  relaxation and is not the wall, AND
 - no consume was attempted this tick, AND no pending/unresolved journal
   record exists for the account.
 
