@@ -78,8 +78,16 @@ pub const CROSS_ACCOUNT_BOUND_SECS: i64 = SPEND_BOUND_SECS;
 /// comfortably; with a window of a few minutes the second credit can lapse.
 pub const PROVIDER_REDEMPTION_FLOOR_SECS: i64 = 10 * 60;
 
-/// The used percent at which a window counts as at its wall.
-const WALL_PERCENT: f64 = 99.0;
+/// The used percent at or above which a window is too close to its limit for
+/// its published figure to be relaxed to zero.
+///
+/// NOT the wall. An account is at its wall only when the upstream reports its
+/// limit reached (see [`UsageFacts::from_usage`]); a percent never spends a
+/// banked reset. This ceiling guards only the read-time relaxation, where the
+/// cautious direction is the opposite one: publishing the real figure for an
+/// account at 99% costs nothing, while publishing zero for it tells a consumer
+/// that an account with almost nothing left is idle.
+const RELAX_CEILING_PERCENT: f64 = 99.0;
 
 /// One verifiably available reset credit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,45 +232,85 @@ pub fn response_now(date_header: Option<&str>, local_now: DateTime<Utc>) -> Date
 pub struct UsageFacts {
     pub raw_percents: Vec<f64>,
     pub any_used_floor: bool,
+    /// The upstream reports this account's limit as reached. Nothing else puts
+    /// an account at its wall -- see [`UsageFacts::from_usage`].
     pub at_wall: bool,
+    /// The upstream affirmed the limit is NOT reached (`limit_reached: false`).
+    /// Distinct from `!at_wall`, which also covers a response that said nothing.
     pub wall_clear: bool,
     /// When the account's wall lifts on its own: the latest stated reset among
-    /// the windows at the wall, since the account stays blocked until every one
-    /// of them has reset. `None` when no walled window states a reset (or none
-    /// is walled), which callers must treat as "unknown", not "soon".
+    /// its windows. `None` when the account is not at its wall or no window
+    /// states a reset, which callers must treat as "unknown", not "soon".
     pub wall_lifts_at: Option<DateTime<Utc>>,
 }
 
 impl UsageFacts {
     pub fn from_usage(usage: &Usage, limit_reached: Option<bool>) -> Self {
         // Enumerated through the shared helper so a slot added to the wire type
-        // cannot be missed here. These percents decide whether the account is at
-        // its wall, and a missed slot reads as *lower* usage than the account
-        // really has -- reporting a walled account as having room.
+        // cannot be missed here. These percents decide the used floor, the
+        // relaxation ceiling and the lift time, and a missed slot reads as
+        // *lower* usage than the account really has.
         let raw_percents: Vec<f64> = crate::model::windows(usage)
             .map(|window| window.used_percent)
             .collect();
-        // The same windows and the same threshold as `at_wall` below, so the
-        // question "which windows are walled" has one answer. A reset that does
-        // not parse is treated as unstated rather than guessed.
+        // THE WALL IS THE UPSTREAM'S OWN STATEMENT AND NOTHING ELSE. Codex sends
+        // `rate_limit.limit_reached` on `/wham/usage`, decoded as an optional
+        // bool (`crate::codex::RateLimit`). Only an explicit `true` is the wall.
+        //
+        // A percent near 100 is not: the upstream reports whole percentages, so
+        // "99" can be anything up to 99.99, and spending a banked reset there
+        // threw away up to 1% of a weekly window (owner's decision, 2026-10-10,
+        // after a reset fired on an account at 99% whose limit was not reported
+        // as reached).
+        //
+        // An ABSENT field is not the wall either. That is the safe direction:
+        // an account wrongly read as having room keeps its credit (and the
+        // expiry trigger still spends one about to lapse), while an account
+        // wrongly read as walled spends a credit that cannot be got back.
+        let at_wall = limit_reached == Some(true);
+        // When the wall lifts: the latest reset among ALL the windows, not just
+        // the limited one. This only orders walled accounts against each other
+        // (see `redeems_first`) and never permits a spend, so the simplest rule
+        // that is right for the live shape wins: Codex now sends one weekly
+        // window, and there it is exactly that window's reset. With several
+        // windows it can name a later reset than the limited window's, which
+        // at worst picks the wrong one of two walled accounts to redeem.
+        //
+        // The response does carry a top-level `rate_limit_reached_type`, which
+        // may say which window is limited, but its values have never been
+        // captured here (it is logged only as an unread key name), so reading
+        // it would mean guessing its vocabulary.
+        //
+        // A reset that does not parse is treated as unstated rather than guessed.
         let wall_lifts_at = crate::model::windows(usage)
-            .filter(|window| window.used_percent >= WALL_PERCENT)
+            .filter(|_| at_wall)
             .filter_map(|window| window.resets_at.as_deref())
             .filter_map(|resets_at| DateTime::parse_from_rfc3339(resets_at).ok())
             .map(|resets_at| resets_at.with_timezone(&Utc))
             .max();
         Self {
             any_used_floor: raw_percents.iter().any(|percent| *percent >= 1.0),
-            at_wall: limit_reached == Some(true)
-                || raw_percents.iter().any(|percent| *percent >= WALL_PERCENT),
+            at_wall,
             wall_clear: limit_reached == Some(false),
             raw_percents,
             wall_lifts_at,
         }
     }
 
+    /// Clear of the wall by a margin: the upstream affirmed the limit is not
+    /// reached AND every window is below [`RELAX_CEILING_PERCENT`].
+    ///
+    /// Used only to decide whether output may be relaxed, never whether a
+    /// banked reset is spent. The percent stays in here on purpose: relaxing
+    /// publishes zero, and `limit_reached: false` beside a window at 99% is an
+    /// account a consumer should see as nearly spent, not idle.
     pub fn below_wall(&self) -> bool {
-        self.wall_clear && !self.at_wall
+        self.wall_clear
+            && !self.at_wall
+            && self
+                .raw_percents
+                .iter()
+                .all(|percent| *percent < RELAX_CEILING_PERCENT)
     }
 }
 
@@ -278,9 +326,9 @@ pub struct TriggerInput {
     pub pending: bool,
     pub spend_bound_allows: bool,
     pub before_post_cutoff: bool,
-    /// Another codex account has PROVEN headroom right now: a fresh reading in
-    /// which the upstream affirmed `limit_reached: false` and no window sat at the
-    /// wall. Suppresses the exhaustion trigger only -- see `evaluate_trigger`.
+    /// Another codex account may have room right now: a fresh reading in which
+    /// the upstream did not report its limit reached, whatever its percent.
+    /// Suppresses the exhaustion trigger only -- see `evaluate_trigger`.
     pub sibling_has_headroom: bool,
     /// Another walled account redeems instead: either it is the chosen
     /// candidate (its wall lifts later), or it redeemed recently and has not
@@ -314,7 +362,10 @@ pub fn evaluate_trigger(input: &TriggerInput) -> TriggerDecision {
     // its own.
     //
     // Exhaustion requires fresh usage readings showing every enumerated sibling
-    // at its quota limit. Unknown siblings may have room, so the coordinator
+    // at its quota limit, by the same definition as this account's own wall:
+    // the upstream reports the limit reached. A sibling at 99% that is not
+    // reported as reached still has room, and so does one whose reading says
+    // nothing either way. Unknown siblings may have room, so the coordinator
     // defers exhaustion. The waiting account regains capacity at its natural
     // quota reset without spending a credit. Expiry remains ungated: even if a
     // sibling credential lane cannot be read, a credit within auto_use_resets
@@ -1275,7 +1326,8 @@ struct AccountMutationState {
 /// The latest usage reading of one account, as the reset policy needs it.
 #[derive(Debug, Clone)]
 struct HeadroomReading {
-    below_wall: bool,
+    /// [`UsageFacts::at_wall`]: the upstream reported the limit reached. A
+    /// fresh reading without it is a sibling with room.
     at_wall: bool,
     wall_lifts_at: Option<DateTime<Utc>>,
     redeemable_credit: bool,
@@ -1374,8 +1426,8 @@ impl ResetCoordinator {
         })
     }
 
-    /// Record `account_id`'s reading as of `at`: whether it has proven
-    /// headroom, whether and until when it is walled, and whether it holds a
+    /// Record `account_id`'s reading as of `at`: whether and until when it is
+    /// walled (anything else is room), and whether it holds a
     /// banked reset this host could spend.
     ///
     /// Call this for every successful usage read, BEFORE deciding whether the
@@ -1402,7 +1454,6 @@ impl ResetCoordinator {
             .insert(
                 account_id.to_string(),
                 HeadroomReading {
-                    below_wall: facts.below_wall(),
                     at_wall: facts.at_wall,
                     wall_lifts_at: facts.wall_lifts_at,
                     redeemable_credit,
@@ -1540,7 +1591,15 @@ impl ResetCoordinator {
         unknown.into_iter().next()
     }
 
-    /// Another account with a fresh, affirmed-clear reading, if any.
+    /// Another account with a fresh reading that does not report its limit
+    /// reached, if any.
+    ///
+    /// Room is the exact complement of the wall in [`UsageFacts::from_usage`],
+    /// so the two cannot disagree about an account: a sibling at 99% whose
+    /// limit is not reported as reached has room, and so does one whose
+    /// reading does not say (`limit_reached` absent). Both keep a walled
+    /// account's banked reset. A sibling with no fresh reading at all is not
+    /// judged here; `unknown_sibling` withholds for it.
     pub fn sibling_with_headroom(&self, account_id: &str, now: Instant) -> Option<String> {
         let table = self
             .headroom
@@ -1550,7 +1609,7 @@ impl ResetCoordinator {
             .iter()
             .filter(|(other, reading)| {
                 other.as_str() != account_id
-                    && reading.below_wall
+                    && !reading.at_wall
                     && now.saturating_duration_since(reading.observed) <= SIBLING_HEADROOM_HORIZON
             })
             .map(|(other, _)| other)
@@ -2674,8 +2733,10 @@ mod tests {
             "the fixture must model an upstream reporting itself unlimited"
         );
         assert!(
-            facts.at_wall,
-            "the fixture must model a window that has reached its limit"
+            !facts.at_wall,
+            "the fixture must model an account that is not at its wall: only a \
+             reported limit is the wall, so the refusal below comes from the \
+             relaxation ceiling alone"
         );
 
         assert!(
@@ -2760,38 +2821,39 @@ mod tests {
         }
     }
 
-    /// The at-wall threshold decides whether an account is treated as having hit
-    /// its limit, which is one of the two conditions that spend a banked credit.
+    /// Only the upstream's own `limit_reached: true` puts an account at its
+    /// wall. A percent, however close to 100, never does.
     ///
-    /// Driven from percentages rather than by handing `at_wall` in directly. The
+    /// Driven from usage rather than by handing `at_wall` in directly. The
     /// trigger tests take it as a parameter, so they exercise what the gate does
     /// with the answer and never how the answer is reached -- and the derivation
-    /// is where a mis-set threshold would live.
+    /// is where a wrong rule would live.
     ///
-    /// Both sides are asserted because the two directions fail differently and
-    /// each survives a test of the other. Too high and a walled account is never
-    /// relieved, so the credits it holds expire unspent while it sits blocked.
-    /// Too low and a credit is spent on an account that still had room, which
-    /// cannot be undone.
+    /// Both directions are asserted because they fail differently. Reading a
+    /// percent as the wall spends a credit on an account that still had room,
+    /// which cannot be undone: the upstream reports whole percentages, so 99
+    /// can hide most of a percent of a weekly window. Ignoring a reported limit
+    /// leaves a walled account unrelieved while its credits expire unspent.
     #[test]
-    fn the_at_wall_threshold_holds_on_both_sides() {
-        let below = UsageFacts::from_usage(&usage_at(98.9), None);
-        assert!(!below.at_wall, "98.9% must not read as walled");
+    fn only_a_reported_limit_is_the_wall() {
+        for percent in [98.9, 99.0, 99.5, 100.0] {
+            for limit_reached in [Some(false), None] {
+                assert!(
+                    !UsageFacts::from_usage(&usage_at(percent), limit_reached).at_wall,
+                    "{percent}% with limit_reached {limit_reached:?} must not read as walled"
+                );
+            }
+        }
 
-        let at = UsageFacts::from_usage(&usage_at(99.0), None);
-        assert!(at.at_wall, "99.0% is the wall");
-
-        let above = UsageFacts::from_usage(&usage_at(99.5), None);
-        assert!(above.at_wall, "99.5% must read as walled");
-
-        // The upstream saying so outranks the percentages: a provider that
-        // reports a limit reached is believed even when its figures look low,
-        // because it knows its own enforcement and the percentages are inference.
-        let stated = UsageFacts::from_usage(&usage_at(3.0), Some(true));
-        assert!(
-            stated.at_wall,
-            "a stated limit is the wall regardless of percent"
-        );
+        // A reported `limit_reached: true` is the wall even when the percent
+        // looks low: the upstream knows its own enforcement, and the percent is
+        // only an inference from its accounting.
+        for percent in [3.0, 100.0] {
+            assert!(
+                UsageFacts::from_usage(&usage_at(percent), Some(true)).at_wall,
+                "a reported limit is the wall at {percent}%"
+            );
+        }
     }
 
     /// The used floor stops a credit being spent on an account that has consumed
@@ -2812,45 +2874,6 @@ mod tests {
         );
     }
 
-    /// The facts read every window, not only the headline slot.
-    ///
-    /// An account is walled when *any* of its windows is exhausted, and the
-    /// exhausted one is routinely not the first: the headline slot is the
-    /// shortest window, while the weekly limit is the one that blocks work.
-    #[test]
-    fn a_wall_in_a_later_window_is_still_a_wall() {
-        let usage = Usage {
-            primary: Some(RateWindow {
-                window_kind: None,
-                used_percent: 4.0,
-                raw_used_percent: None,
-                window_minutes: Some(300),
-                resets_at: None,
-                used_count: None,
-                total_count: None,
-                regeneration: None,
-                breakdown: None,
-            }),
-            secondary: Some(RateWindow {
-                window_kind: None,
-                used_percent: 99.4,
-                raw_used_percent: None,
-                window_minutes: Some(10080),
-                resets_at: None,
-                used_count: None,
-                total_count: None,
-                regeneration: None,
-                breakdown: None,
-            }),
-            ..Usage::default()
-        };
-
-        let facts = UsageFacts::from_usage(&usage, None);
-        assert!(facts.at_wall, "an exhausted weekly window is a wall");
-        // Not vacuous: the headline window alone would not have tripped it.
-        assert!(!UsageFacts::from_usage(&usage_at(4.0), None).at_wall);
-    }
-
     fn window(percent: f64, resets_at: Option<&str>) -> Option<RateWindow> {
         Some(RateWindow {
             resets_at: resets_at.map(str::to_string),
@@ -2858,10 +2881,13 @@ mod tests {
         })
     }
 
-    /// An account's wall lifts when the LAST of its walled windows resets, and
-    /// a window with room does not count however late it resets.
+    /// A walled account's wall lifts at the LATEST reset among all its windows,
+    /// whatever their percents: the wall is the upstream's statement, which
+    /// does not say which window it is about, so every window counts. The
+    /// later slot is the one that decides here, so a lookup that read only the
+    /// headline window would fail.
     #[test]
-    fn the_wall_lifts_when_the_last_walled_window_resets() {
+    fn the_wall_lifts_when_the_latest_window_resets() {
         let usage = Usage {
             primary: window(100.0, Some("2026-10-03T16:58:00Z")),
             secondary: window(99.5, Some("2026-10-06T05:49:00Z")),
@@ -2869,23 +2895,36 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(
-            UsageFacts::from_usage(&usage, None)
+            UsageFacts::from_usage(&usage, Some(true))
                 .wall_lifts_at
                 .map(crate::rfc3339_canonical),
             Some(crate::rfc3339_canonical(
-                DateTime::parse_from_rfc3339("2026-10-06T05:49:00Z")
+                DateTime::parse_from_rfc3339("2026-12-01T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc)
             ))
         );
 
-        // No walled window states a reset: unknown, not a guess.
+        // An account that is not at its wall has no wall to lift, even with a
+        // window at 100%.
+        for limit_reached in [Some(false), None] {
+            assert_eq!(
+                UsageFacts::from_usage(&usage, limit_reached).wall_lifts_at,
+                None,
+                "limit_reached {limit_reached:?}"
+            );
+        }
+
+        // No window states a reset, so the lift time is unknown (`None`)
+        // rather than guessed.
         let unstated = Usage {
             primary: window(100.0, None),
-            secondary: window(40.0, Some("2026-12-01T00:00:00Z")),
             ..Usage::default()
         };
-        assert_eq!(UsageFacts::from_usage(&unstated, None).wall_lifts_at, None);
+        assert_eq!(
+            UsageFacts::from_usage(&unstated, Some(true)).wall_lifts_at,
+            None
+        );
     }
 
     /// A withheld line is logged on the transition, not on every tick.

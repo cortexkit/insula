@@ -11965,3 +11965,345 @@ async fn real_codex_restart_waits_for_delayed_sibling_then_consumes_latest_wall_
         "B's natural reset is later, so only B should spend its credit"
     );
 }
+
+// ---- The wall is the upstream's `limit_reached: true`, never a percent ----
+//
+// Owner's decision, 2026-10-10: a banked reset fired on an account at 99% whose
+// limit was not reported as reached, which threw away up to 1% of a weekly
+// window. A saved reset is used only once the upstream says the limit is
+// reached, and a sibling has room unless its own fresh reading says the same.
+//
+// These derive their facts through `UsageFacts::from_usage`, the way the Codex
+// provider does. `reset_facts` hands `at_wall` in directly, so a test built on
+// it could not notice the rule itself changing.
+
+/// One weekly window at `percent`, the live Codex shape, as the provider
+/// derives its facts.
+fn weekly_facts(percent: f64, limit_reached: Option<bool>) -> UsageFacts {
+    let usage = Usage {
+        primary: Some(RateWindow {
+            window_kind: None,
+            used_percent: percent,
+            raw_used_percent: None,
+            resets_at: Some("2026-07-18T12:00:00Z".to_string()),
+            window_minutes: Some(10_080),
+            used_count: None,
+            total_count: None,
+            regeneration: None,
+            breakdown: None,
+        }),
+        ..Usage::default()
+    };
+    UsageFacts::from_usage(&usage, limit_reached)
+}
+
+/// A tick that can POST a consume only through the exhaustion trigger (the
+/// account at its wall): the credit expires in twenty days, far outside the
+/// `auto_use_resets` window in which an expiring credit is spent anyway.
+fn exhaustion_only_tick(facts: UsageFacts) -> ResetTickInput {
+    ResetTickInput {
+        facts,
+        ..walled_tick_far_from_expiry(reset_now())
+    }
+}
+
+/// A walled account (reported limit reached, holding a credit) and one sibling
+/// with `sibling` as its fresh reading, both on served lanes.
+fn walled_beside_sibling(coordinator: &ResetCoordinator, sibling: &UsageFacts) {
+    let handles = reset_test_handles(coordinator, 2);
+    coordinator.observe_handle(
+        &handles[0],
+        "walled",
+        &weekly_facts(100.0, Some(true)),
+        true,
+        Instant::now(),
+    );
+    coordinator.observe_handle(&handles[1], "sibling", sibling, false, Instant::now());
+}
+
+#[tokio::test]
+async fn an_account_near_its_limit_without_a_reported_limit_keeps_its_reset() {
+    for percent in [99.0, 99.99, 100.0] {
+        let temp = ResetTempDir::new("near-limit-not-reported");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "near-limit",
+            exhaustion_only_tick(weekly_facts(percent, Some(false))),
+        )
+        .await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "an account at {percent}% whose limit is not reported as reached must keep its banked reset"
+        );
+        assert!(!result.trigger.exhaustion_trigger, "{percent}%");
+    }
+}
+
+/// Control for the no-POST tests in this group: with the same fixture, a
+/// reported limit on the account and on its sibling spends exactly one reset.
+/// So when those tests see no POST, it is because of their limit readings,
+/// not because the fixture can never POST.
+#[tokio::test]
+async fn a_reported_limit_with_every_sibling_at_its_reported_limit_spends_one_reset() {
+    for percent in [99.0, 100.0] {
+        let temp = ResetTempDir::new("reported-limit-spends");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        walled_beside_sibling(&coordinator, &weekly_facts(100.0, Some(true)));
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "walled",
+            exhaustion_only_tick(weekly_facts(percent, Some(true))),
+        )
+        .await;
+        assert!(result.trigger.exhaustion_trigger, "{percent}%");
+        assert_eq!(
+            *transport.consume_accounts.lock().unwrap(),
+            vec!["walled".to_string()],
+            "a reported limit at {percent}% with every sibling at its reported limit must spend exactly one reset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sibling_near_its_limit_without_a_reported_limit_still_has_room() {
+    for percent in [99.0, 100.0] {
+        let temp = ResetTempDir::new("sibling-near-limit-has-room");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        walled_beside_sibling(&coordinator, &weekly_facts(percent, Some(false)));
+        assert_eq!(
+            coordinator
+                .sibling_with_headroom("walled", Instant::now())
+                .as_deref(),
+            Some("sibling"),
+            "a sibling at {percent}% whose limit is not reported as reached has room"
+        );
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "walled",
+            exhaustion_only_tick(weekly_facts(100.0, Some(true))),
+        )
+        .await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "a sibling at {percent}% without a reported limit still has room, so the walled account keeps its reset"
+        );
+        let withheld = result.withheld.expect("the held-back reset is announced");
+        assert!(
+            withheld.contains("account_id=sibling has room"),
+            "withheld because the sibling has room, not as an unknown: {withheld}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_absent_limit_reached_is_not_the_wall() {
+    for percent in [60.0, 99.0, 100.0] {
+        let temp = ResetTempDir::new("absent-limit-not-wall");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "unstated",
+            exhaustion_only_tick(weekly_facts(percent, None)),
+        )
+        .await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "an account at {percent}% whose response does not state limit_reached is not at its wall"
+        );
+        assert!(!result.trigger.exhaustion_trigger, "{percent}%");
+    }
+}
+
+#[tokio::test]
+async fn a_sibling_with_an_absent_limit_reached_counts_as_room() {
+    for percent in [40.0, 99.0, 100.0] {
+        let temp = ResetTempDir::new("absent-sibling-limit-is-room");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        walled_beside_sibling(&coordinator, &weekly_facts(percent, None));
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "walled",
+            exhaustion_only_tick(weekly_facts(100.0, Some(true))),
+        )
+        .await;
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            0,
+            "a sibling at {percent}% that does not state limit_reached may have room, so the walled account keeps its reset"
+        );
+        let withheld = result.withheld.expect("the held-back reset is announced");
+        assert!(
+            withheld.contains("account_id=sibling has room"),
+            "{withheld}"
+        );
+    }
+}
+
+/// A credit inside the `auto_use_resets` window before its expiry is spent
+/// even on an account that is not at its wall and beside a sibling with room:
+/// an expired credit is lost whether or not anyone needed the capacity.
+#[tokio::test]
+async fn the_expiry_trigger_still_spends_on_an_account_not_at_its_wall() {
+    for limit_reached in [Some(false), None] {
+        let temp = ResetTempDir::new("expiry-not-at-wall");
+        let coordinator = ResetCoordinator::new(temp.journal()).unwrap();
+        let transport =
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset));
+        let handles = reset_test_handles(&coordinator, 2);
+        coordinator.observe_handle(
+            &handles[1],
+            "sibling",
+            &weekly_facts(40.0, Some(false)),
+            false,
+            Instant::now(),
+        );
+        let facts = weekly_facts(99.0, limit_reached);
+        coordinator.observe_handle(&handles[0], "expiring", &facts, true, Instant::now());
+        // `reset_tick_input` sets `auto_use_resets` to ten minutes and the
+        // credit's expiry five minutes out, so the expiry trigger fires.
+        let result = tick_account(
+            &coordinator,
+            &transport,
+            "expiring",
+            reset_tick_input(reset_now(), facts),
+        )
+        .await;
+        assert!(
+            result.trigger.expiry_trigger,
+            "limit_reached {limit_reached:?}"
+        );
+        assert!(
+            !result.trigger.exhaustion_trigger,
+            "limit_reached {limit_reached:?}: the account is not at its wall"
+        );
+        assert_eq!(
+            *transport.consume_accounts.lock().unwrap(),
+            vec!["expiring".to_string()],
+            "an expiring credit must still be spent on an account not at its wall (limit_reached {limit_reached:?})"
+        );
+    }
+}
+
+/// A reported limit, never a percent, spends a banked reset -- checked through
+/// the real Codex provider: its `/wham/usage` decode, its fact derivation and
+/// its coordinator call. The last case (`limit_reached: true`) is the control
+/// showing this fixture can spend at all.
+#[tokio::test]
+async fn real_codex_account_spends_its_reset_only_once_its_limit_is_reported() {
+    let cases: [(f64, Option<bool>, usize); 4] = [
+        (99.0, Some(false), 0),
+        (100.0, Some(false), 0),
+        (99.0, None, 0),
+        (99.0, Some(true), 1),
+    ];
+    for (percent, limit_reached, expected_posts) in cases {
+        let temp = ResetTempDir::new("real-provider-reported-limit");
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("chatgpt-account-id: near-limit")));
+            let mut rate_limit = serde_json::json!({
+                "primary_window": {
+                    "used_percent": percent,
+                    "reset_at": (Utc::now() + chrono::Duration::days(3)).timestamp(),
+                    "limit_window_seconds": 604_800
+                }
+            });
+            // Absent means the key is not sent at all, not sent as null.
+            if let Some(limit_reached) = limit_reached {
+                rate_limit["limit_reached"] = serde_json::Value::Bool(limit_reached);
+            }
+            let body = serde_json::json!({ "rate_limit": rate_limit }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let codex_home = temp.dir.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_owner_only_test_file(
+            &codex_home.join("auth.json"),
+            br#"{"tokens":{"access_token":"near-limit-token","account_id":"near-limit"}}"#,
+        );
+        write_owner_only_test_file(
+            &codex_home.join("config.toml"),
+            format!(
+                "chatgpt_base_url = {:?}\n",
+                format!("http://{address}/backend-api")
+            )
+            .as_bytes(),
+        );
+        let credits = serde_json::json!({
+            "credits": [{
+                "id": "credit-1",
+                "status": "available",
+                "expires_at": (Utc::now() + chrono::Duration::days(20)).to_rfc3339()
+            }],
+            "available_count": 1
+        })
+        .to_string()
+        .into_bytes();
+        let transport = Arc::new(
+            MockResetTransport::new(MockConsumeBehavior::Outcome(ConsumeOutcome::Reset))
+                .with_account_credits("near-limit", credits),
+        );
+        let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+        let provider = crate::codex::CodexProvider::new_for_test(
+            // `auto_use_resets` of one hour: the credit expires in twenty days,
+            // so the expiry trigger cannot fire and only the wall can spend it.
+            crate::config::CodexConfig {
+                auto_use_resets: 3600,
+            },
+            None,
+            reset_transport,
+            Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+            VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+            codex_home,
+        );
+        let registry = Registry::new(vec![Box::new(provider)]);
+
+        tokio::time::timeout(Duration::from_secs(15), tick(&registry))
+            .await
+            .expect("the real-provider refresh must finish");
+        tokio::time::timeout(Duration::from_secs(5), http_server)
+            .await
+            .expect("one usage request")
+            .unwrap();
+        assert_eq!(registry.get_usage(Some("codex")).await.len(), 1);
+        assert_eq!(
+            transport.posts.load(Ordering::SeqCst),
+            expected_posts,
+            "real Codex account at {percent}% with limit_reached {limit_reached:?}: a banked reset is spent only once the limit is reported"
+        );
+    }
+}
