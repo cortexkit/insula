@@ -1255,8 +1255,11 @@ available, but no invented duration/kind, derived counts, or duplicate spend poo
 Seat allocation is not a second allowance and has no field in this wire schema.
 No active Team plan or a failed Team discovery falls back to personal windows
 (five-hour primary, weekly secondary, monthly primary when alone or the named
-`monthly` extra otherwise). Explicit sign-in refusals remain
-`credential_rejected`; request failures never assert that a Team plan is absent.
+`monthly` extra otherwise). Team refusals (401/403, sign-in redirects and login
+codes) also fall back: permission to call a Team billing API is not proof that a
+personal session has expired. Only the personal path classifies an expired
+session as `credential_rejected`. Request failures never assert that a Team plan
+is absent.
 Team coverage has been checked against test fixtures, not a live Qwen Cloud
 account; no account is available on this host.
 

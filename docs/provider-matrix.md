@@ -1170,7 +1170,7 @@ headless.)
 | ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. Included credits use `Monthly usage` or free-plan `Free usage` (CodexBar v0.73.0); labels match standalone text nodes, not explanatory prose. Both take `primary`, but only `Monthly usage` states a `windowKind`. No API-key route exists: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
 | opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |
 | opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
-| qwen-cloud | qwencloud | **Built; Team fixture-verified only, no Qwen Cloud account on this host.** Vault `cookie:qwencloud.com[:<account>]` with `login_qwencloud_ticket`. Team Token Plan support follows CodexBar v0.74.0 (upstream implementation commit `9fae8c8e4`): `home.qwencloud.com/tool/user/info.json` → `secToken`, then `/data/api.json` `ea-service:LoadHumanInfo` (ap-southeast-1) → `SellerInfoDto.Nbid`, then `BssOpenAPI-V3:GetSeatSubscriptionSummary` (cn-hangzhou, zh-CN) for `sfm_tokenplanteams_dp_intl`. One named extra window `team` / `Team`, slots empty: percent derived only from valid positive total and stated surplus in the single `credit_value` equity. No derived counts, duplicate spend pool, invented period or seat count. Affirmed absent/inactive Team plan or failed discovery falls back to the existing personal five-hour/weekly/monthly path and logs the skip once per change; a failed request is not evidence of an absent Team plan. Missing `secToken` or `Nbid` also falls back; explicit login codes, 401/403 and sign-in redirects are `credential_rejected`. Personal request shapes and error classes remain unchanged. |
+| qwen-cloud | qwencloud | **Built; Team fixture-verified only, no Qwen Cloud account on this host.** Vault `cookie:qwencloud.com[:<account>]` with `login_qwencloud_ticket`. Team Token Plan support follows CodexBar v0.74.0 (upstream implementation commit `9fae8c8e4`): `home.qwencloud.com/tool/user/info.json` → `secToken`, then `/data/api.json` `ea-service:LoadHumanInfo` (ap-southeast-1) → `SellerInfoDto.Nbid`, then `BssOpenAPI-V3:GetSeatSubscriptionSummary` (cn-hangzhou, zh-CN) for `sfm_tokenplanteams_dp_intl`. One named extra window `team` / `Team`, slots empty: percent derived only from valid positive total and stated surplus in the single `credit_value` equity. No derived counts, duplicate spend pool, invented period or seat count. Affirmed absent/inactive Team plan or failed discovery falls back to the existing personal five-hour/weekly/monthly path and logs the skip once per change; a failed request is not evidence of an absent Team plan. Missing `secToken` or `Nbid` also falls back. Team 401/403, sign-in redirects and login codes fall back with a named skip reason; a Team billing permission refusal is not a dead personal session. Only the personal path classifies `credential_rejected`. Personal request shapes and error classes remain unchanged. |
 | amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |
 
 **3C — manus → BUILD (copilot test PASSED against source).** `MANUS_SESSION_TOKEN`
@@ -1473,9 +1473,11 @@ Falls back to personal web strategy if no active team plan is found.
 on this host. The shared wire has no slot labels, so Team is published only as
 `extraRateWindows[id="team", title="Team"]`, not duplicated in `primary` or a
 spend pool. Its percent is derived from the single credit equity's positive total
-and stated surplus; counts stay absent. Explicit expired-session signals reject
-the credential; failed discovery (including missing token/selector) logs once on
-change and leaves personal usage serving. Unlike upstream's optional selector,
+and stated surplus; counts stay absent. Failed or refused Team discovery
+(including 401/403, login codes, sign-in redirects and missing token/selector)
+logs its step and refusal once on change and leaves personal usage serving. Only
+the personal path decides whether a session is expired: a Team billing API's
+permission refusal is not a dead credential. Unlike upstream's optional selector,
 an absent `Nbid` is not sent to the summary API without attribution.
 
 **OpenCodeGo (1 file): presentation only.**

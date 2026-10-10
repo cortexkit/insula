@@ -29,8 +29,8 @@
 //! `QwenCloudTeamFetchStrategy.swift` and `qwencloud-team.ts` (9fae8c8e4).
 //! Team coverage is checked against test fixtures, not a live account: no Qwen
 //! Cloud account is available on this host.
-//! Failed discovery falls back to the unchanged personal path; explicit login
-//! refusals instead report an expired session.
+//! Failed or refused discovery falls back to the unchanged personal path. Only
+//! that personal path decides whether the session really needs to be renewed.
 //!
 //! The personal path uses two hosts: its token-plan PAGE (`home.qwencloud.com`)
 //! supplies the per-session `SEC_TOKEN`; the quota call itself goes to the console data
@@ -629,17 +629,22 @@ struct TeamPlan {
 
 #[derive(Debug)]
 enum TeamError {
-    Expired(FetchError),
-    Skipped(&'static str),
+    Skipped(String),
+}
+
+impl TeamError {
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped(reason.into())
+    }
 }
 
 /// Discovery failures say nothing about entitlement. Only an affirmative empty
 /// summary or an inactive period means no active team plan; both allow personal
-/// usage to serve. Login refusals report `credential_rejected`, as the personal
-/// path does, so consumers know the session needs to be renewed.
+/// usage to serve. Even a Team login refusal may be specific to the billing API,
+/// so the personal path remains responsible for classifying an expired session.
 fn select_team(
     result: Result<Option<TeamPlan>, TeamError>,
-    settle: impl FnOnce(Option<&'static str>),
+    settle: impl FnOnce(Option<&str>),
 ) -> Result<Option<TeamPlan>, FetchError> {
     match result {
         Ok(Some(plan)) => {
@@ -651,12 +656,8 @@ fn select_team(
             Ok(None)
         }
         Err(TeamError::Skipped(reason)) => {
-            settle(Some(reason));
+            settle(Some(&reason));
             Ok(None)
-        }
-        Err(TeamError::Expired(error)) => {
-            settle(None);
-            Err(error)
         }
     }
 }
@@ -674,7 +675,7 @@ async fn team_json(
         .header(Header::new("Referer", TEAM_REFERER_URL))
         .send_raw(client)
         .await
-        .map_err(|_| TeamError::Skipped(stage))?;
+        .map_err(|_| TeamError::skipped(format!("{stage} request failed")))?;
     let sign_in_redirect = (300..400).contains(&response.status)
         && response.header("location").is_some_and(|location| {
             let lower = location.to_ascii_lowercase();
@@ -682,31 +683,35 @@ async fn team_json(
                 .iter()
                 .any(|s| lower.contains(s))
         });
-    if response.status == 401 || response.status == 403 || sign_in_redirect {
-        return Err(TeamError::Expired(FetchError::Unauthorized(
-            "qwen-cloud Team session expired; sign in again".into(),
+    if sign_in_redirect {
+        return Err(TeamError::skipped(format!(
+            "{stage} refused (sign-in redirect)"
         )));
     }
     if response.status != 200 {
-        return Err(TeamError::Skipped(stage));
+        return Err(TeamError::skipped(format!(
+            "{stage} refused ({})",
+            response.status
+        )));
     }
     let root: serde_json::Value = serde_json::from_slice(
         response
             .body_for_parsing()
-            .map_err(|_| TeamError::Skipped(stage))?,
+            .map_err(|_| TeamError::skipped(format!("{stage} response unreadable")))?,
     )
-    .map_err(|_| TeamError::Skipped(stage))?;
+    .map_err(|_| TeamError::skipped(format!("{stage} response unreadable")))?;
     if matches!(
         root.get("code").and_then(serde_json::Value::as_str),
         Some("ConsoleNeedLogin" | "BailianGateway.Login.NotLogined" | "NO_LOGIN")
     ) {
-        return Err(TeamError::Expired(FetchError::Unauthorized(
-            "qwen-cloud Team login required".into(),
+        return Err(TeamError::skipped(format!(
+            "{stage} refused ({})",
+            root["code"].as_str().unwrap()
         )));
     }
     root.is_object()
         .then_some(root)
-        .ok_or(TeamError::Skipped(stage))
+        .ok_or_else(|| TeamError::skipped(format!("{stage} response unreadable")))
 }
 
 fn team_rpc_data(root: &serde_json::Value) -> Result<&serde_json::Value, TeamError> {
@@ -720,7 +725,7 @@ fn team_rpc_data(root: &serde_json::Value) -> Result<&serde_json::Value, TeamErr
             .and_then(serde_json::Value::as_bool)
             == Some(false)
     {
-        return Err(TeamError::Skipped("team RPC reported failure"));
+        return Err(TeamError::skipped("team RPC reported failure"));
     }
     if root
         .get("successResponse")
@@ -728,9 +733,9 @@ fn team_rpc_data(root: &serde_json::Value) -> Result<&serde_json::Value, TeamErr
         != Some(true)
         && root.get("code").and_then(serde_json::Value::as_str) != Some("200")
     {
-        return Err(TeamError::Skipped("unreadable team gateway envelope"));
+        return Err(TeamError::skipped("unreadable team gateway envelope"));
     }
-    data.ok_or(TeamError::Skipped("unreadable team gateway envelope"))
+    data.ok_or(TeamError::skipped("unreadable team gateway envelope"))
 }
 
 /// Accept nonnegative finite JSON numbers or digit-only decimal strings, up to
@@ -745,7 +750,7 @@ fn team_number(value: Option<&serde_json::Value>) -> Result<f64, TeamError> {
                 .map_or((s.as_str(), None), |(w, f)| (w, Some(f)));
             let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
             if !digits(whole) || fraction.is_some_and(|f| !digits(f)) {
-                return Err(TeamError::Skipped("invalid team credit count"));
+                return Err(TeamError::skipped("invalid team credit count"));
             }
             s.parse().ok()
         }
@@ -753,13 +758,13 @@ fn team_number(value: Option<&serde_json::Value>) -> Result<f64, TeamError> {
     };
     number
         .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0)
-        .ok_or(TeamError::Skipped("missing or invalid team credit count"))
+        .ok_or(TeamError::skipped("missing or invalid team credit count"))
 }
 
 fn team_millis(value: Option<&serde_json::Value>) -> Result<i64, TeamError> {
     let millis = team_number(value)?;
     if millis <= 0.0 || millis.fract() != 0.0 {
-        return Err(TeamError::Skipped("invalid team timestamp"));
+        return Err(TeamError::skipped("invalid team timestamp"));
     }
     Ok(millis as i64)
 }
@@ -774,33 +779,33 @@ fn normalize_team_summary(
     let data = summary
         .get("Data")
         .filter(|data| data.is_object())
-        .ok_or(TeamError::Skipped("unreadable team subscription"))?;
+        .ok_or(TeamError::skipped("unreadable team subscription"))?;
     let groups = data
         .get("SubscriptionGroupList")
         .and_then(serde_json::Value::as_array)
-        .ok_or(TeamError::Skipped("unreadable team subscription groups"))?;
+        .ok_or(TeamError::skipped("unreadable team subscription groups"))?;
     if groups.is_empty() {
         return Ok(None);
     }
     let start = team_millis(data.get("StartTime"))?;
     let end = team_millis(data.get("EndTime"))?;
     if end <= start {
-        return Err(TeamError::Skipped("invalid team subscription period"));
+        return Err(TeamError::skipped("invalid team subscription period"));
     }
     if now_ms < start || now_ms >= end {
         return Ok(None);
     }
     if data.get("ProductCode").and_then(serde_json::Value::as_str) != Some(TEAM_PRODUCT) {
-        return Err(TeamError::Skipped("unexpected team subscription product"));
+        return Err(TeamError::skipped("unexpected team subscription product"));
     }
     if groups.len() != 1 {
-        return Err(TeamError::Skipped("multiple team credit pools"));
+        return Err(TeamError::skipped("multiple team credit pools"));
     }
     let group = &groups[0];
     let equities = group
         .get("EquityList")
         .and_then(serde_json::Value::as_array)
-        .ok_or(TeamError::Skipped("unreadable team credit equity"))?;
+        .ok_or(TeamError::skipped("unreadable team credit equity"))?;
     let credits: Vec<_> = equities
         .iter()
         .filter(|equity| {
@@ -808,19 +813,19 @@ fn normalize_team_summary(
         })
         .collect();
     if credits.len() != 1 {
-        return Err(TeamError::Skipped(
+        return Err(TeamError::skipped(
             "ambiguous or missing team credit equity",
         ));
     }
     let total = team_number(credits[0].get("TotalValue"))?;
     let surplus = team_number(credits[0].get("SurplusValue"))?;
     if total <= 0.0 || surplus > total {
-        return Err(TeamError::Skipped("invalid team credit count"));
+        return Err(TeamError::skipped("invalid team credit count"));
     }
     let resets_at = match group.get("NextCycleFlushTime").filter(|v| !v.is_null()) {
         Some(value) => Some(
             epoch_ms_to_iso8601(team_millis(Some(value))?)
-                .ok_or(TeamError::Skipped("invalid team cycle reset"))?,
+                .ok_or(TeamError::skipped("invalid team cycle reset"))?,
         ),
         None => None,
     };
@@ -872,19 +877,13 @@ async fn fetch_team(
     urls: [&str; 3],
     now_ms: i64,
 ) -> Result<Option<TeamPlan>, TeamError> {
-    let info = team_json(
-        client,
-        JsonRequest::get(urls[0]),
-        cookie,
-        "team user info request failed",
-    )
-    .await?;
+    let info = team_json(client, JsonRequest::get(urls[0]), cookie, "team user info").await?;
     let token = info
         .get("data")
         .and_then(|data| data.get("secToken"))
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or(TeamError::Skipped("team user info has no secToken"))?;
+        .ok_or(TeamError::skipped("team user info has no secToken"))?;
     let human = team_json(
         client,
         JsonRequest::post_form(
@@ -899,7 +898,7 @@ async fn fetch_team(
         )
         .header(Header::new("Origin", "https://home.qwencloud.com")),
         cookie,
-        "team billing selector request failed",
+        "team billing selector",
     )
     .await?;
     let nbid = team_rpc_data(&human)?
@@ -908,7 +907,7 @@ async fn fetch_team(
         .and_then(|seller| seller.get("Nbid"))
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or(TeamError::Skipped("team billing selector has no Nbid"))?;
+        .ok_or(TeamError::skipped("team billing selector has no Nbid"))?;
     // Nbid identifies the billing account returned for this session, not the
     // user's login UID. Without that selector, prefer personal usage rather than
     // query a plan whose billing-account attribution we cannot establish.
@@ -928,7 +927,7 @@ async fn fetch_team(
         )
         .header(Header::new("Origin", "https://home.qwencloud.com")),
         cookie,
-        "team summary request failed",
+        "team summary",
     )
     .await?;
     normalize_team_summary(team_rpc_data(&summary)?, now_ms)
@@ -939,7 +938,12 @@ pub struct QwenCloudProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
     team_http: Option<reqwest::Client>,
-    team_skips: Mutex<HashMap<String, &'static str>>,
+    team_skips: Mutex<HashMap<String, String>>,
+}
+
+struct FetchUrls<'a> {
+    team: [&'a str; 3],
+    personal: [&'a str; 4],
 }
 
 impl QwenCloudProvider {
@@ -966,12 +970,124 @@ impl QwenCloudProvider {
         }
     }
 
-    fn settle_team_skip(&self, handle_id: &str, reason: Option<&'static str>) {
+    /// Run both plan paths with the already-resolved session. Keeping this seam
+    /// below credential loading lets fixtures exercise the real fallback HTTP
+    /// sequence without a vault service or a live account.
+    async fn fetch_plans(
+        &self,
+        cookie_header: String,
+        source: &str,
+        handle_id: &str,
+        urls: FetchUrls<'_>,
+    ) -> Result<ProviderUsage, FetchError> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        let team = match (&self.team_http, now_ms) {
+            (Some(client), Some(now_ms)) => {
+                fetch_team(client, &cookie_header, urls.team, now_ms).await
+            }
+            _ => Err(TeamError::skipped("team client or clock unavailable")),
+        };
+        if let Some(team) = select_team(team, |reason| self.settle_team_skip(handle_id, reason))? {
+            let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, source, team.usage);
+            entry.account_info = Some(AccountInfo {
+                plan_type: Some(team.plan_type),
+                ..AccountInfo::default()
+            });
+            return Ok(entry);
+        }
+        let [plan_url, usage_url, config_url, subscription_url] = urls.personal;
+        let token_page = JsonRequest::get(plan_url)
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Cookie", &cookie_header))
+            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+            .header(Header::new(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ))
+            .send(&self.http)
+            .await?;
+        let html = String::from_utf8_lossy(&token_page);
+        let sec_token = extract_sec_token(&html).ok_or_else(|| missing_token_error(&html))?;
+
+        let body = JsonRequest::post_form(
+            usage_url,
+            &[
+                ("product", "sfm_bailian"),
+                ("action", "IntlBroadScopeAspnGateway"),
+                ("sec_token", sec_token),
+                ("region", "ap-southeast-1"),
+                ("params", GATEWAY_PARAMS),
+            ],
+        )
+        .timeout(REQUEST_TIMEOUT)
+        .header(Header::new("Cookie", &cookie_header))
+        .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+        .header(Header::new("Origin", "https://home.qwencloud.com"))
+        .header(Header::new("Referer", plan_url))
+        .send(&self.http)
+        .await?;
+
+        let usage = normalize_usage(&body)?;
+        let mut enriched = usage;
+
+        // Best-effort enrichment: fetch quota-config + subscription to derive
+        // absolute counts. If either call fails the windows stay without counts
+        // (the percentage is still honest).
+        let config_body = JsonRequest::post_form(
+            config_url,
+            &[
+                ("product", "sfm_bailian"),
+                ("action", "IntlBroadScopeAspnGateway"),
+                ("sec_token", sec_token),
+                ("region", "ap-southeast-1"),
+                ("params", QUOTA_CONFIG_PARAMS),
+            ],
+        )
+        .timeout(REQUEST_TIMEOUT)
+        .header(Header::new("Cookie", &cookie_header))
+        .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+        .header(Header::new("Origin", "https://home.qwencloud.com"))
+        .header(Header::new("Referer", plan_url))
+        .send(&self.http)
+        .await;
+        let sub_body = JsonRequest::post_form(
+            subscription_url,
+            &[
+                ("product", "sfm_bailian"),
+                ("action", "IntlBroadScopeAspnGateway"),
+                ("sec_token", sec_token),
+                ("region", "ap-southeast-1"),
+                ("params", SUBSCRIPTION_PARAMS),
+            ],
+        )
+        .timeout(REQUEST_TIMEOUT)
+        .header(Header::new("Cookie", &cookie_header))
+        .header(Header::new("User-Agent", BROWSER_USER_AGENT))
+        .header(Header::new("Origin", "https://home.qwencloud.com"))
+        .header(Header::new("Referer", plan_url))
+        .send(&self.http)
+        .await;
+        if let (Ok(config_bytes), Ok(sub_bytes)) = (config_body, sub_body) {
+            enrich_with_counts(&mut enriched, &config_bytes, &sub_bytes);
+        }
+
+        Ok(ProviderUsage::healthy(
+            PROVIDER_NAME,
+            None,
+            source,
+            enriched,
+        ))
+    }
+
+    fn settle_team_skip(&self, handle_id: &str, reason: Option<&str>) {
         let mut skips = self
             .team_skips
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if skips.get(handle_id).copied() != reason {
+        if skips.get(handle_id).map(String::as_str) != reason {
             match reason {
                 Some(reason) => eprintln!(
                     "{} qwen-cloud Team skipped ({handle_id}): {reason}; trying personal plan",
@@ -985,7 +1101,7 @@ impl QwenCloudProvider {
         }
         match reason {
             Some(reason) => {
-                skips.insert(handle_id.to_string(), reason);
+                skips.insert(handle_id.to_string(), reason.to_string());
             }
             None => {
                 skips.remove(handle_id);
@@ -1017,115 +1133,21 @@ impl UsageProvider for QwenCloudProvider {
                     crate::cookie_vault::DEPOSIT_PHRASE
                 )));
             }
-
-            let cookie_header = jar.header();
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|d| i64::try_from(d.as_millis()).ok());
-            let team = match (&self.team_http, now_ms) {
-                (Some(client), Some(now_ms)) => {
-                    fetch_team(
-                        client,
-                        &cookie_header,
-                        [TEAM_INFO_URL, TEAM_HUMAN_URL, TEAM_SUMMARY_URL],
-                        now_ms,
-                    )
-                    .await
-                }
-                _ => Err(TeamError::Skipped("team client or clock unavailable")),
-            };
-            if let Some(team) = select_team(team, |reason| {
-                self.settle_team_skip(handle.stable_id(), reason)
-            })? {
-                let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, source, team.usage);
-                entry.account_info = Some(AccountInfo {
-                    plan_type: Some(team.plan_type),
-                    ..AccountInfo::default()
-                });
-                return Ok(entry);
-            }
-            let token_page = JsonRequest::get(TOKEN_PLAN_URL)
-                .timeout(REQUEST_TIMEOUT)
-                .header(Header::new("Cookie", &cookie_header))
-                .header(Header::new("User-Agent", BROWSER_USER_AGENT))
-                .header(Header::new(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                ))
-                .send(&self.http)
-                .await?;
-            let html = String::from_utf8_lossy(&token_page);
-            let sec_token = extract_sec_token(&html).ok_or_else(|| missing_token_error(&html))?;
-
-            let body = JsonRequest::post_form(
-                USAGE_URL,
-                &[
-                    ("product", "sfm_bailian"),
-                    ("action", "IntlBroadScopeAspnGateway"),
-                    ("sec_token", sec_token),
-                    ("region", "ap-southeast-1"),
-                    ("params", GATEWAY_PARAMS),
-                ],
-            )
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", &cookie_header))
-            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
-            .header(Header::new("Origin", "https://home.qwencloud.com"))
-            .header(Header::new("Referer", TOKEN_PLAN_URL))
-            .send(&self.http)
-            .await?;
-
-            let usage = normalize_usage(&body)?;
-            let mut enriched = usage;
-
-            // Best-effort enrichment: fetch quota-config + subscription to derive
-            // absolute counts. If either call fails the windows stay without counts
-            // (the percentage is still honest).
-            let config_body = JsonRequest::post_form(
-                QUOTA_CONFIG_URL,
-                &[
-                    ("product", "sfm_bailian"),
-                    ("action", "IntlBroadScopeAspnGateway"),
-                    ("sec_token", sec_token),
-                    ("region", "ap-southeast-1"),
-                    ("params", QUOTA_CONFIG_PARAMS),
-                ],
-            )
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", &cookie_header))
-            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
-            .header(Header::new("Origin", "https://home.qwencloud.com"))
-            .header(Header::new("Referer", TOKEN_PLAN_URL))
-            .send(&self.http)
-            .await;
-            let sub_body = JsonRequest::post_form(
-                SUBSCRIPTION_URL,
-                &[
-                    ("product", "sfm_bailian"),
-                    ("action", "IntlBroadScopeAspnGateway"),
-                    ("sec_token", sec_token),
-                    ("region", "ap-southeast-1"),
-                    ("params", SUBSCRIPTION_PARAMS),
-                ],
-            )
-            .timeout(REQUEST_TIMEOUT)
-            .header(Header::new("Cookie", &cookie_header))
-            .header(Header::new("User-Agent", BROWSER_USER_AGENT))
-            .header(Header::new("Origin", "https://home.qwencloud.com"))
-            .header(Header::new("Referer", TOKEN_PLAN_URL))
-            .send(&self.http)
-            .await;
-            if let (Ok(config_bytes), Ok(sub_bytes)) = (config_body, sub_body) {
-                enrich_with_counts(&mut enriched, &config_bytes, &sub_bytes);
-            }
-
-            Ok(ProviderUsage::healthy(
-                PROVIDER_NAME,
-                None,
+            self.fetch_plans(
+                jar.header(),
                 source,
-                enriched,
-            ))
+                handle.stable_id(),
+                FetchUrls {
+                    team: [TEAM_INFO_URL, TEAM_HUMAN_URL, TEAM_SUMMARY_URL],
+                    personal: [
+                        TOKEN_PLAN_URL,
+                        USAGE_URL,
+                        QUOTA_CONFIG_URL,
+                        SUBSCRIPTION_URL,
+                    ],
+                },
+            )
+            .await
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -1143,9 +1165,9 @@ mod tests {
     const TEAM_HUMAN: &str = r#"{"successResponse":true,"data":{"Success":true,"Data":{"SellerInfoDto":{"Nbid":"seller-123"}}}}"#;
     const TEAM_SUMMARY: &str = r#"{"successResponse":true,"data":{"Success":true,"Data":{"ProductCode":"sfm_tokenplanteams_dp_intl","StartTime":1790000000000,"EndTime":1792000000000,"SubscriptionGroupList":[{"SpecType":"pro","SubscriptionAssignedNumber":3,"SubscriptionTotalNumber":5,"NextCycleFlushTime":1791043200000,"EquityList":[{"EquityCode":"credit_value","TotalValue":"1000.50","SurplusValue":"750.375"}]}]}}}"#;
 
-    async fn team_fixture(
+    async fn fixture_server(
         replies: Vec<(u16, String, Option<&'static str>)>,
-    ) -> (Result<Option<TeamPlan>, TeamError>, Vec<String>) {
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1163,6 +1185,13 @@ mod tests {
             }
             requests
         });
+        (base, server)
+    }
+
+    async fn team_fixture(
+        replies: Vec<(u16, String, Option<&'static str>)>,
+    ) -> (Result<Option<TeamPlan>, TeamError>, Vec<String>) {
+        let (base, server) = fixture_server(replies).await;
         let urls = [
             format!("{base}/tool/user/info.json"),
             format!("{base}/data/api.json?product=ea-service&action=LoadHumanInfo"),
@@ -1360,7 +1389,7 @@ mod tests {
         summary["Data"]["ProductCode"] = serde_json::json!("sfm_tokenplansolo_public_intl");
         assert!(matches!(
             normalize_team_summary(&summary, TEAM_NOW_MS),
-            Err(TeamError::Skipped("unexpected team subscription product"))
+            Err(TeamError::Skipped(reason)) if reason == "unexpected team subscription product"
         ));
     }
 
@@ -1424,31 +1453,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_sign_in_redirects_and_refusals_are_expired_sessions() {
+    async fn team_sign_in_redirects_and_refusals_fall_back_with_named_reasons() {
         for step in 0..3 {
-            for reply in [
+            for (reply, refusal) in [
                 (
-                    302,
-                    String::new(),
-                    Some("https://account.qwencloud.com/login"),
+                    (
+                        302,
+                        String::new(),
+                        Some("https://account.qwencloud.com/login"),
+                    ),
+                    "sign-in redirect",
                 ),
-                (401, "expired".into(), None),
-                (403, "expired".into(), None),
-                (200, r#"{"code":"NO_LOGIN"}"#.into(), None),
-                (200, r#"{"code":"ConsoleNeedLogin"}"#.into(), None),
+                ((401, "expired".into(), None), "401"),
+                ((403, "not entitled".into(), None), "403"),
+                ((200, r#"{"code":"NO_LOGIN"}"#.into(), None), "NO_LOGIN"),
                 (
-                    200,
-                    r#"{"code":"BailianGateway.Login.NotLogined"}"#.into(),
-                    None,
+                    (200, r#"{"code":"ConsoleNeedLogin"}"#.into(), None),
+                    "ConsoleNeedLogin",
+                ),
+                (
+                    (
+                        200,
+                        r#"{"code":"BailianGateway.Login.NotLogined"}"#.into(),
+                        None,
+                    ),
+                    "BailianGateway.Login.NotLogined",
                 ),
             ] {
                 let mut replies = team_replies(TEAM_SUMMARY);
                 replies.truncate(step);
                 replies.push(reply);
                 let (result, _) = team_fixture(replies).await;
-                let error = select_team(result, |_| {}).unwrap_err();
-                assert_eq!(error.error_class(), "credential_rejected");
+                let stage = ["team user info", "team billing selector", "team summary"][step];
+                let expected = format!("{stage} refused ({refusal})");
+                let selected =
+                    select_team(result, |reason| assert_eq!(reason, Some(expected.as_str())))
+                        .unwrap();
+                assert!(
+                    selected.is_none(),
+                    "every team refusal must allow personal fallback"
+                );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn team_billing_403_with_healthy_personal_publishes_personal_windows() {
+        for step in [1, 2] {
+            let mut replies = team_replies(TEAM_SUMMARY);
+            replies.truncate(step);
+            replies.push((403, "team billing API not permitted".into(), None));
+            replies.extend([
+                (
+                    200,
+                    r#"ONE_CONSOLE_TOOL SEC_TOKEN: "personal-sec-token""#.into(),
+                    None,
+                ),
+                (200, HAR_RESPONSE.into(), None),
+                (
+                    200,
+                    String::from_utf8(caps_body("pro", "40000", "200000")).unwrap(),
+                    None,
+                ),
+                (
+                    200,
+                    String::from_utf8(subscription_body("pro")).unwrap(),
+                    None,
+                ),
+            ]);
+            let (base, server) = fixture_server(replies).await;
+            let provider = QwenCloudProvider::new_with_handle_loader(
+                None,
+                std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            );
+            let team_urls = [
+                format!("{base}/info"),
+                format!("{base}/human"),
+                format!("{base}/summary"),
+            ];
+            let personal_urls = [
+                format!("{base}/personal-page"),
+                format!("{base}/usage"),
+                format!("{base}/quota-config"),
+                format!("{base}/subscription"),
+            ];
+            let entry = provider
+                .fetch_plans(
+                    "login_qwencloud_ticket=fixture-ticket".into(),
+                    "vault",
+                    "fixture-account",
+                    FetchUrls {
+                        team: [&team_urls[0], &team_urls[1], &team_urls[2]],
+                        personal: [
+                            &personal_urls[0],
+                            &personal_urls[1],
+                            &personal_urls[2],
+                            &personal_urls[3],
+                        ],
+                    },
+                )
+                .await
+                .expect("a Team billing 403 must not reject a working personal session");
+            assert!(entry.error.is_none());
+            assert!(entry.error_class.is_none());
+            assert!(entry.account_info.is_none());
+            let usage = entry
+                .usage
+                .expect("healthy personal windows must be published");
+            let primary = usage.primary.unwrap();
+            let secondary = usage.secondary.unwrap();
+            assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
+            assert_eq!(primary.window_minutes, Some(300));
+            assert!((primary.used_percent - 13.1177).abs() < 0.001);
+            assert_eq!(primary.total_count, Some(40000.0));
+            assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
+            assert_eq!(secondary.window_minutes, Some(10080));
+            assert!((secondary.used_percent - 5.3835).abs() < 0.001);
+            assert_eq!(secondary.total_count, Some(200000.0));
+            assert!(usage.extra_rate_windows.is_none());
+            let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(requests.len(), step + 5);
+            let personal = &requests[step + 1..];
+            assert!(personal[0].starts_with("GET /personal-page HTTP/1.1"));
+            for (request, path) in
+                personal[1..]
+                    .iter()
+                    .zip(["usage", "quota-config", "subscription"])
+            {
+                assert!(request.starts_with(&format!("POST /{path} HTTP/1.1")));
+                assert!(request.contains("sec_token=personal-sec-token"));
+            }
+            let expected = format!(
+                "{} refused (403)",
+                ["team user info", "team billing selector", "team summary"][step]
+            );
+            assert_eq!(
+                provider.team_skips.lock().unwrap().get("fixture-account"),
+                Some(&expected)
+            );
         }
     }
 
