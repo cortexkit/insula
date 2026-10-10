@@ -9797,6 +9797,7 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "apikey:deepseek",
         "apikey:openrouter",
         "apikey:opencode-go",
+        "apikey:ollama-cloud",
         "apikey:minimax-coding-plan",
     ] {
         assert!(

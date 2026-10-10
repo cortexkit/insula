@@ -1,11 +1,9 @@
-//! Ollama usage — session-cookie scrape of ollama.com/settings.
+//! Ollama usage — settings-page cookie scrape or API-key credit balance.
 //!
-//! Ollama has NO headless usage/quota API: its API key (OLLAMA_API_KEY) only
-//! VERIFIES Cloud access (GET /api/tags returns a model list, zero quota) — quota
-//! lives only on the authenticated settings page. CodexBar reads it by pulling the
-//! session cookie from the browser and scraping the HTML; here the session cookie
-//! is a `cookie:ollama.com` vault deposit, read through the shared
-//! [`crate::cookie_vault`] lane.
+//! A vault `apikey:ollama-cloud` reads `GET /api/balance` with a bearer key.
+//! When present it is the only lane: neither credential identifies an account,
+//! so emitting the key beside a cookie would create competing unlabelled rows.
+//! Without a key, `cookie:ollama.com` serves through [`crate::cookie_vault`].
 //!
 //! Flow: read the deposited ollama.com cookie header → GET
 //! `https://ollama.com/settings` with the `Cookie:` header → parse the "Monthly
@@ -19,7 +17,8 @@
 //! BRITTLE (accepted): needs a deposited login, and the session cookie rotates (no headless refresh), so it degrades to
 //! unavailable when the cookie is dead/expired or the login page is served. The one
 //! hard rule: degrade NEVER means a wrong/stale number — a dead cookie, a
-//! login-redirect, or missing usage markers yield [`FetchError`] (a degraded entry),
+//! login-redirect, or a page lacking both usage meters and wallet amounts yields
+//! [`FetchError`] (a degraded entry),
 //! never a fabricated window.
 //!
 //! VERIFICATION: LIVE-verified — the real cookie→GET→parse chain has returned
@@ -32,15 +31,17 @@
 //! fixture-verified, not live-verified (see `MONTHLY_LABELS`). The "Free usage"
 //! alias and text-node label matching are ported from CodexBar v0.73.0 and
 //! fixture-verified, not live-verified.
+//! The Usage credits section and `/api/balance` shape are ported from CodexBar
+//! v0.74.0 (`OllamaUsageParser.parseCreditDetails`, `ollama-api.ts`), fixture-only.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
 use crate::{
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{Amount, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -48,8 +49,11 @@ pub const PROVIDER_NAME: &str = "ollama";
 /// The bare vault credential id for this domain; a suffixed deposit under it
 /// names an account and outranks a bare deposit.
 const COOKIE_FAMILY: &str = "cookie:ollama.com";
+const API_KEY_FAMILY: &str = "apikey:ollama-cloud";
+const VAULT_SOURCE: &str = "vault";
 
 const SETTINGS_URL: &str = "https://ollama.com/settings";
+const BALANCE_URL: &str = "https://ollama.com/api/balance";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 const SESSION_WINDOW_MINUTES: i64 = 5 * 60;
@@ -567,6 +571,242 @@ const SESSION_LABELS: &[(&str, Option<i64>)] = &[
 /// label names no period.
 const MONTHLY_LABELS: &[(&str, Option<i64>)] = &[("Monthly usage", None), ("Free usage", None)];
 
+/// Wallet observations from complete elements in the Usage credits section.
+/// Spending alone has no denominator; refill prose has no absolute timestamp.
+/// Keep both available to the diagnostic without inventing a percent or reset.
+#[derive(Debug, Default, PartialEq)]
+pub struct CreditDetails {
+    pub balance: Option<Amount>,
+    pub monthly_used: Option<Amount>,
+    pub next_refill: Option<String>,
+}
+
+impl CreditDetails {
+    fn is_present(&self) -> bool {
+        self.balance.is_some() || self.monthly_used.is_some()
+    }
+}
+
+/// Read an entire element at the current position, never an adjacent value.
+fn element_at<'a>(html: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
+    let html = html.trim_start();
+    let lower = html.to_ascii_lowercase();
+    let prefix = format!("<{tag}");
+    let tail = lower.strip_prefix(&prefix)?;
+    if !tail.starts_with('>') && !tail.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let start = html.find('>')? + 1;
+    let close = lower[start..].find(&format!("</{tag}"))? + start;
+    let end = html[close..].find('>')? + close + 1;
+    Some((&html[start..close], &html[end..]))
+}
+
+fn wallet_amount(text: &str) -> Option<Amount> {
+    let raw = text.trim().strip_prefix('$')?;
+    // Page figures may group thousands, unlike API decimal values. Validate the
+    // grouping before removing commas, then let the shared money parser scale USD.
+    let (whole, _) = raw.split_once('.').unwrap_or((raw, ""));
+    if !valid_integer_amount(whole) {
+        return None;
+    }
+    crate::money::parse_amount(&raw.replace(',', ""), "USD")
+}
+
+/// Read wallet amounts only between the Usage credits heading and the next
+/// heading/section boundary. Ignore script/style content so embedded examples
+/// cannot masquerade as the account's balance (CodexBar v0.74.0).
+pub fn parse_credit_details(html: &str) -> CreditDetails {
+    let mut page = html.replace("&nbsp;", " ");
+    for tag in ["script", "style"] {
+        loop {
+            let lower = page.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else {
+                break;
+            };
+            let Some(close) = lower[start..].find(&format!("</{tag}")) else {
+                page.truncate(start);
+                break;
+            };
+            let Some(end) = lower[start + close..].find('>') else {
+                page.truncate(start);
+                break;
+            };
+            page.replace_range(start..start + close + end + 1, "");
+        }
+    }
+    let lower = page.to_ascii_lowercase();
+    let wallet = lower.match_indices("<h").find_map(|(start, _)| {
+        let level = *lower.as_bytes().get(start + 2)?;
+        if !(b'1'..=b'6').contains(&level) {
+            return None;
+        }
+        let tag = format!("h{}", char::from(level));
+        let (heading, rest) = element_at(&page[start..], &tag)?;
+        let heading = heading.trim();
+        let caption = heading.split('<').next()?.trim();
+        if !caption.eq_ignore_ascii_case("Usage credits") {
+            return None;
+        }
+        let lower_rest = rest.to_ascii_lowercase();
+        let end = lower_rest
+            .match_indices('<')
+            .find_map(|(at, _)| {
+                let tail = &lower_rest[at..];
+                (tail.starts_with("</section")
+                    || (tail.starts_with("<h")
+                        && tail
+                            .as_bytes()
+                            .get(2)
+                            .is_some_and(|c| (b'1'..=b'6').contains(c))))
+                .then_some(at)
+            })
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    });
+    let Some(wallet) = wallet else {
+        return CreditDetails::default();
+    };
+    let mut first = wallet.trim_start();
+    while first.to_ascii_lowercase().starts_with("<div") {
+        let Some(end) = first.find('>') else { break };
+        first = first[end + 1..].trim_start();
+    }
+    let balance = element_at(first, "span").and_then(|(text, _)| wallet_amount(text));
+    let monthly_used = wallet.match_indices('<').find_map(|(at, _)| {
+        let (label, rest) = element_at(&wallet[at..], "span")?;
+        if !label.trim().eq_ignore_ascii_case("Monthly credits used") {
+            return None;
+        }
+        let (value, _) = element_at(rest, "span")?;
+        wallet_amount(value)
+    });
+    let next_refill = wallet.match_indices('<').find_map(|(at, _)| {
+        let (text, _) = element_at(&wallet[at..], "p")?;
+        let refill = strip_prefix_ignore_case(text.trim(), "Refills")?.trim();
+        let amount_and_delay = strip_prefix_ignore_case(refill, "to ")?;
+        let (amount, delay) = amount_and_delay.split_once(" in ")?;
+        wallet_amount(amount)?;
+        (!delay.is_empty() && delay.len() <= 160 && !delay.contains('<'))
+            .then(|| refill.to_string())
+    });
+    CreditDetails {
+        balance,
+        monthly_used,
+        next_refill,
+    }
+}
+
+fn purchased_pool(balance: Option<Amount>) -> Pool {
+    Pool {
+        id: "purchased".to_string(),
+        label: "Credit balance".to_string(),
+        funding: PoolFunding::Purchased,
+        // Both lanes state dollars, not cents. No amount means unknown, not zero.
+        basis: if balance.is_some() {
+            PoolBasis::Reported
+        } else {
+            PoolBasis::Unstated
+        },
+        remaining: balance,
+        total: None,
+        spendable: None,
+        resets_at: None,
+    }
+}
+
+fn page_usage(html: &str, source: &str) -> Result<ProviderUsage, FetchError> {
+    let usage = normalize_usage(html)?;
+    let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, source, usage);
+    if let Some(balance) = parse_credit_details(html).balance {
+        entry.spend = Some(vec![purchased_pool(Some(balance))]);
+    }
+    Ok(entry)
+}
+
+fn api_amount(value: Option<&serde_json::Value>) -> Result<Option<Amount>, FetchError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => return Err(balance_decode_error()),
+    };
+    crate::money::parse_amount(&text, "USD")
+        .map(Some)
+        .ok_or_else(balance_decode_error)
+}
+
+fn balance_decode_error() -> FetchError {
+    FetchError::Decode("ollama: unrecognized credit balance response".to_string())
+}
+
+/// Included dollars describe the same primary allowance as the page meter.
+/// Slot `primary` is the allowance's identity on both lanes; copying it into a
+/// titled extra would count one limit twice. Derive used = max(0, allowance - balance), only with
+/// both amounts and a positive allowance. `period` is an object with `until`,
+/// not a monthly label, so unlike upstream's 30-day sentinel it names no kind
+/// or fixed duration (the same rule as the page's Free usage label).
+/// A key replaces the cookie, so lanes cannot alternate within one handle set;
+/// the kind can change only when a key is added or removed, and only because the
+/// page's Monthly usage label states a period that the API does not name.
+fn parse_api_balance(text: &str) -> Result<ProviderUsage, FetchError> {
+    let root: serde_json::Value = serde_json::from_str(text).map_err(|_| balance_decode_error())?;
+    let root = root.as_object().ok_or_else(balance_decode_error)?;
+    let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, VAULT_SOURCE, Usage::default());
+    if let Some(purchased) = root.get("purchased").filter(|value| !value.is_null()) {
+        let purchased = purchased.as_object().ok_or_else(balance_decode_error)?;
+        entry.spend = Some(vec![purchased_pool(api_amount(
+            purchased.get("balance_usd"),
+        )?)]);
+    }
+    if let Some(included) = root.get("included").filter(|value| !value.is_null()) {
+        let included = included.as_object().ok_or_else(balance_decode_error)?;
+        let allowance = api_amount(included.get("allowance_usd"))?;
+        let balance = api_amount(included.get("balance_usd"))?;
+        if allowance.as_ref().is_some_and(|amount| amount.minor < 0) {
+            return Err(balance_decode_error());
+        }
+        let mut reset = None;
+        if let Some(period) = included.get("period").filter(|value| !value.is_null()) {
+            let period = period.as_object().ok_or_else(balance_decode_error)?;
+            if let Some(until) = period.get("until").filter(|value| !value.is_null()) {
+                reset = until
+                    .as_str()
+                    .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                    .map(|date| {
+                        date.with_timezone(&chrono::Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    });
+            }
+        }
+        if let (Some(allowance), Some(balance)) = (allowance, balance) {
+            if allowance.minor > 0 {
+                let dollars =
+                    |amount: &Amount| amount.minor as f64 / 10_f64.powi(i32::from(amount.exponent));
+                let allowance = dollars(&allowance);
+                let used = (allowance - dollars(&balance)).max(0.0);
+                entry.usage.as_mut().unwrap().primary = Some(RateWindow {
+                    used_percent: (used / allowance * 100.0).min(100.0),
+                    resets_at: reset,
+                    window_kind: None,
+                    window_minutes: None,
+                    raw_used_percent: None,
+                    used_count: None,
+                    total_count: None,
+                    regeneration: None,
+                    breakdown: None,
+                });
+            }
+        }
+    }
+    if !root.get("included").is_some_and(|value| value.is_object()) && entry.spend.is_none() {
+        return Err(balance_decode_error());
+    }
+    Ok(entry)
+}
+
 /// Normalize the settings HTML to [`Usage`]. Pure — unit-testable against a fixture.
 pub fn normalize_usage(html: &str) -> Result<Usage, FetchError> {
     normalize_usage_at(html, chrono::Utc::now())
@@ -603,7 +843,11 @@ pub fn normalize_usage_at(
         }
     }
 
-    if monthly.is_none() && session.is_none() && weekly.is_none() {
+    if monthly.is_none()
+        && session.is_none()
+        && weekly.is_none()
+        && !parse_credit_details(html).is_present()
+    {
         if looks_signed_out(html) {
             return Err(FetchError::Unauthorized(
                 "ollama session expired (settings page served a login)".to_string(),
@@ -646,6 +890,9 @@ pub fn normalize_usage_at(
 pub struct OllamaProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
+    credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+    handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+    balance_url: String,
 }
 
 impl OllamaProvider {
@@ -656,12 +903,65 @@ impl OllamaProvider {
         Self {
             http: crate::http::provider_client(),
             vault: crate::cookie_vault::CookieVault::new(
-                credential_source,
-                handle_loader,
+                credential_source.clone(),
+                std::sync::Arc::clone(&handle_loader),
                 COOKIE_FAMILY,
             ),
+            credential_source,
+            handle_loader,
+            balance_url: BALANCE_URL.to_string(),
         }
     }
+
+    async fn fetch_vault_api(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let Some(source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match crate::credential_source::get_vault_credential(
+            source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let version = credential.record_version;
+        let key = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(key) => key,
+            Err(error) => return FetchAttempt::failure(None, None, error),
+        };
+        let result = async {
+            let response = JsonRequest::get(&self.balance_url)
+                .timeout(REQUEST_TIMEOUT)
+                .bearer(key.trim())
+                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .await?;
+            parse_api_balance(&String::from_utf8_lossy(&response.body))
+        }
+        .await;
+        if let Err(error) = &result {
+            // Preserve HTTP 401/403 before decoding the body so a refused key
+            // remains credential_rejected, not a JSON parse failure. The shared
+            // report helper invalidates a vault key only on HTTP 401.
+            crate::credential_source::report_vault_auth_failure(
+                self.credential_source.as_ref(),
+                handle,
+                version,
+                error,
+            );
+        }
+        FetchAttempt::from_provider_usage(result)
+    }
+}
+
+fn is_api_key_handle(handle: &CredentialHandle) -> bool {
+    handle
+        .vault_credential_id()
+        .is_some_and(|id| crate::vault_handles::handle_id_names_family(id, API_KEY_FAMILY))
 }
 
 #[async_trait]
@@ -674,11 +974,28 @@ impl UsageProvider for OllamaProvider {
         true
     }
 
-    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        // API keys and cookie deposits have no account identity. Enumerating both
+        // would create two unlabelled Ollama rows that the registry deduplicates
+        // by an invisible tie-break. A key must replace, not accompany, cookies.
+        if self.credential_source.is_some() {
+            let keys: Vec<_> = self
+                .handle_loader
+                .ollama_handles()?
+                .into_iter()
+                .filter(is_api_key_handle)
+                .collect();
+            if !keys.is_empty() {
+                return Ok(keys);
+            }
+        }
         self.vault.handles()
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if is_api_key_handle(handle) {
+            return self.fetch_vault_api(handle).await;
+        }
         let result: Result<ProviderUsage, FetchError> = async {
             let (jar, source) = self.vault.jar_for(handle).await?;
 
@@ -740,9 +1057,8 @@ impl UsageProvider for OllamaProvider {
             }
 
             let html = String::from_utf8_lossy(&html_bytes.body);
-            let usage = normalize_usage(&html)
-                .map_err(|error| describe_unparsed_page(error, &html_bytes.final_url, &html))?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
+            page_usage(&html, source)
+                .map_err(|error| describe_unparsed_page(error, &html_bytes.final_url, &html))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -752,6 +1068,332 @@ impl UsageProvider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shapes consumed by CodexBar v0.74.0's wallet parser and ollama-api.ts;
+    // synthetic amounts, not a capture of the operator's account.
+    const CREDITS_ONLY: &str = r#"<section>
+        <h2>Usage credits <span>Pro</span></h2>
+        <div><span>$25.50</span></div>
+        <div><span>Monthly credits used</span><span>$7.50</span></div>
+        <p>Refills to $60.00 in 22 days</p>
+        </section>"#;
+    const API_BALANCE: &str = r#"{"purchased":{"balance_usd":"25.50"},
+        "included":{"allowance_usd":"60.00","balance_usd":"52.50",
+        "period":{"until":"2026-06-30T00:00:00Z"}}}"#;
+
+    #[test]
+    fn credits_and_meters_preserve_all_existing_windows() {
+        let html = format!("{SETTINGS_FIXTURE}{CREDITS_ONLY}");
+        let entry = page_usage(&html, "vault").unwrap();
+        assert_eq!(
+            entry.usage,
+            Some(normalize_usage(SETTINGS_FIXTURE).unwrap())
+        );
+        let details = parse_credit_details(&html);
+        assert_eq!(
+            details.monthly_used,
+            Some(Amount {
+                minor: 750,
+                exponent: 2,
+                unit: "USD".into()
+            })
+        );
+        assert_eq!(details.next_refill.as_deref(), Some("to $60.00 in 22 days"));
+        let pool = &entry.spend.unwrap()[0];
+        assert_eq!(pool.id, "purchased");
+        assert_eq!(pool.funding, PoolFunding::Purchased);
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        assert_eq!(pool.remaining.as_ref().unwrap().minor, 2550);
+        assert!(pool.total.is_none() && pool.resets_at.is_none() && pool.spendable.is_none());
+    }
+
+    #[test]
+    fn credits_only_is_signed_in_without_inventing_a_window() {
+        let entry = page_usage(CREDITS_ONLY, "vault").unwrap();
+        assert_eq!(entry.usage, Some(Usage::default()));
+        assert!(entry.spend.is_some());
+        // A monthly spend observation alone has no stated allowance to divide by.
+        let spending_only = CREDITS_ONLY.replace("<span>$25.50</span>", "<span></span>");
+        assert!(normalize_usage(&spending_only).is_ok());
+        assert!(page_usage(&spending_only, "vault").unwrap().spend.is_none());
+    }
+
+    #[test]
+    fn wallet_fields_cannot_borrow_other_sections_or_script_values() {
+        for html in [
+            "<h2>Usage credits</h2><div><span></span></div><p>Refills to $60.00 in 22 days</p>",
+            "<script><h2>Usage credits</h2><span>$30.00</span></script>",
+            "<style><h2>Usage credits</h2><span>$30.00</span></style>",
+            "<h2>Usage credits</h2><span></span><h2>Other</h2><span>$30.00</span>",
+            "<h2>Usage credits</h2><span>Monthly credits used</span><span></span><span>$30.00</span>",
+        ] {
+            assert!(!parse_credit_details(html).is_present(), "{html}");
+            assert!(normalize_usage(html).is_err(), "{html}");
+        }
+        let grouped = CREDITS_ONLY.replace("$25.50", "$1,025.50");
+        assert_eq!(
+            parse_credit_details(&grouped).balance.unwrap().minor,
+            102550
+        );
+        assert!(
+            parse_credit_details(&CREDITS_ONLY.replace("$25.50", "$1,02.50"))
+                .balance
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn api_balance_is_exact_dollars_not_cents() {
+        let entry = parse_api_balance(API_BALANCE).unwrap();
+        assert_eq!(
+            entry.spend.unwrap()[0].remaining,
+            Some(Amount {
+                minor: 2550,
+                exponent: 2,
+                unit: "USD".into()
+            })
+        );
+        let primary = entry.usage.unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 12.5);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-30T00:00:00Z"));
+        assert!(primary.window_kind.is_none() && primary.window_minutes.is_none());
+        let numeric = API_BALANCE.replace("\"25.50\"", "25.5");
+        assert_eq!(
+            parse_api_balance(&numeric).unwrap().spend.unwrap()[0].remaining,
+            Some(Amount {
+                minor: 255,
+                exponent: 1,
+                unit: "USD".into()
+            })
+        );
+    }
+
+    #[test]
+    fn api_missing_amounts_stay_unknown_not_zero() {
+        for body in [
+            r#"{"purchased":{},"included":{"allowance_usd":"60.00","balance_usd":null,"period":null}}"#,
+            r#"{"purchased":{"balance_usd":null},"included":{"allowance_usd":null,"balance_usd":"52.50"}}"#,
+        ] {
+            let entry = parse_api_balance(body).unwrap();
+            let pool = &entry.spend.unwrap()[0];
+            assert!(
+                pool.remaining.is_none(),
+                "missing purchased balance must remain unknown"
+            );
+            assert_eq!(pool.basis, PoolBasis::Unstated);
+            assert!(
+                entry.usage.unwrap().primary.is_none(),
+                "missing included amount cannot derive utilization"
+            );
+        }
+        assert!(
+            parse_api_balance(r#"{"included":{"allowance_usd":"0","balance_usd":"0"}}"#)
+                .unwrap()
+                .usage
+                .unwrap()
+                .primary
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn both_lanes_keep_the_included_allowance_in_primary() {
+        let page =
+            normalize_usage("<span>Free usage</span><span>$7.50 of $60.00 used</span>").unwrap();
+        let api = parse_api_balance(API_BALANCE).unwrap().usage.unwrap();
+        assert_eq!(
+            page.primary.as_ref().unwrap().used_percent,
+            api.primary.as_ref().unwrap().used_percent
+        );
+        // The primary slot identifies the included allowance for both the page
+        // and API readers. A named extra copy would count that allowance twice.
+        for usage in [&page, &api] {
+            assert!(usage.primary.is_some());
+            assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+            assert!(usage.extra_rate_windows.is_none());
+        }
+        assert_eq!(
+            page.primary.unwrap().window_kind,
+            api.primary.unwrap().window_kind
+        );
+        let monthly =
+            normalize_usage("<span>Monthly usage</span><span>$7.50 of $60.00 used</span>").unwrap();
+        assert_eq!(
+            monthly.primary.unwrap().window_kind.as_deref(),
+            Some("monthly")
+        );
+    }
+
+    #[test]
+    fn malformed_balance_payloads_fail_without_a_fabricated_reading() {
+        for body in [
+            "null",
+            "[]",
+            "{}",
+            "not json",
+            r#"{"purchased":null,"included":null}"#,
+            r#"{"purchased":{"balance_usd":"bad"}}"#,
+            r#"{"included":{"allowance_usd":"-1","balance_usd":"0"}}"#,
+            r#"{"included":{"period":"monthly"}}"#,
+        ] {
+            assert_eq!(
+                parse_api_balance(body).unwrap_err().error_class(),
+                "decode_failed",
+                "{body}"
+            );
+        }
+        let invalid_reset = API_BALANCE.replace("2026-06-30T00:00:00Z", "2026-02-30T00:00:00Z");
+        assert!(parse_api_balance(&invalid_reset)
+            .unwrap()
+            .usage
+            .unwrap()
+            .primary
+            .unwrap()
+            .resets_at
+            .is_none());
+    }
+
+    type AuthReports = std::sync::Arc<std::sync::Mutex<Vec<(u16, u64)>>>;
+
+    fn provider_with_rows(rows: &[(&str, &str)]) -> (OllamaProvider, AuthReports) {
+        use crate::credential_source::*;
+        use std::sync::{Arc, Mutex};
+        struct Source(AuthReports);
+        #[async_trait]
+        impl CredentialSource for Source {
+            async fn get(
+                &self,
+                _: &VaultCapability,
+                _: u64,
+            ) -> Result<VaultCredential, VaultGetError> {
+                Err(VaultGetError::FailClosed)
+            }
+            async fn get_scoped(&self, _: &str, _: u64) -> Result<VaultCredential, VaultGetError> {
+                Ok(VaultCredential {
+                    payload: b"fixture_key".to_vec(),
+                    expires_at_ms: None,
+                    record_version: 7,
+                    account_id: None,
+                    email: None,
+                    org_name: None,
+                    project_id: None,
+                })
+            }
+            async fn report_auth_failure_scoped(&self, _: &str, status: u16, version: u64) {
+                self.0.lock().unwrap().push((status, version));
+            }
+            async fn report_auth_failure(&self, _: &VaultCapability, status: u16, version: u64) {
+                self.0.lock().unwrap().push((status, version));
+            }
+        }
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(rows);
+        (
+            OllamaProvider::new_with_handle_loader(
+                Some(Arc::new(Source(Arc::clone(&reports)))),
+                loader,
+            ),
+            reports,
+        )
+    }
+
+    #[test]
+    fn api_key_handle_hides_the_cookie_lane() {
+        for rows in [
+            vec![("cookie:ollama.com", "cookie"), (API_KEY_FAMILY, "apikey")],
+            vec![
+                (API_KEY_FAMILY, "apikey"),
+                ("cookie:ollama.com:account", "cookie"),
+            ],
+        ] {
+            let (provider, _) = provider_with_rows(&rows);
+            let handles = provider.handles().unwrap();
+            assert_eq!(handles.len(), 1, "the key must be Ollama's only lane");
+            assert_eq!(handles[0].stable_id(), API_KEY_FAMILY);
+        }
+    }
+
+    #[test]
+    fn no_api_key_leaves_the_cookie_lane_serving() {
+        for id in ["cookie:ollama.com", "cookie:ollama.com:account"] {
+            let (provider, _) = provider_with_rows(&[(id, "cookie")]);
+            let handles = provider.handles().unwrap();
+            assert_eq!(handles.len(), 1);
+            assert_eq!(handles[0].stable_id(), id);
+        }
+        assert!(provider_with_rows(&[]).0.handles().unwrap().is_empty());
+    }
+
+    async fn balance_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/api/balance", listener.local_addr().unwrap());
+        let request = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let recorded = std::sync::Arc::clone(&request);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            *recorded.lock().unwrap() = crate::loopback::read_request(&mut stream).await;
+            stream.write_all(format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        (url, request)
+    }
+
+    #[tokio::test]
+    async fn vault_key_fetches_balance_with_bearer_authorization() {
+        let (url, request) = balance_server(200, API_BALANCE).await;
+        let (mut provider, reports) = provider_with_rows(&[(API_KEY_FAMILY, "apikey")]);
+        provider.balance_url = url;
+        let handle = provider.handles().unwrap().remove(0);
+        let attempt = provider.fetch_handle(&handle).await;
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.5);
+        assert_eq!(
+            attempt.pools.unwrap()[0].remaining.as_ref().unwrap().minor,
+            2550
+        );
+        let request = request.lock().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /api/balance "));
+        assert!(request.contains("authorization: bearer fixture_key\r\n"));
+        assert!(!request.contains("cookie:"));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_401_and_403_match_opencodego_rejection_and_reporting() {
+        for status in [401, 403] {
+            let (url, _) = balance_server(status, r#"{"error":"unauthorized"}"#).await;
+            let (mut provider, reports) = provider_with_rows(&[(API_KEY_FAMILY, "apikey")]);
+            provider.balance_url = url;
+            let error = provider
+                .fetch_handle(&provider.handles().unwrap()[0])
+                .await
+                .usage
+                .unwrap_err();
+            assert!(matches!(&error, FetchError::ProviderStatus(code, _) if *code == status));
+            assert_eq!(error.error_class(), "credential_rejected");
+            if status == 401 {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while reports.lock().unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("401 auth report must arrive");
+                assert_eq!(*reports.lock().unwrap(), vec![(401, 7)]);
+            } else {
+                tokio::task::yield_now().await;
+                assert!(
+                    reports.lock().unwrap().is_empty(),
+                    "a 403 must not invalidate the key"
+                );
+            }
+        }
+    }
 
     /// A page with no usage windows names where it was fetched from and how it
     /// looked, without its query string or any of its text.

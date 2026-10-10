@@ -50,7 +50,7 @@ const OUR_LABELS: &[&str] = &[
 /// adds one, list it here so the probe reports whether this page carries it.
 const THEIR_ADDED_LABELS: &[&str] = &[];
 const MONTHLY_LABEL: &str = "Monthly usage";
-const PLAN_HEADINGS: &[&str] = &["Cloud Usage", "Included usage"];
+const PLAN_HEADINGS: &[&str] = &["Cloud Usage", "Included usage", "Usage credits"];
 
 #[tokio::main]
 async fn main() {
@@ -148,6 +148,25 @@ async fn main() {
     for heading in PLAN_HEADINGS {
         println!("      {:<16} {}", heading, mark(html.contains(heading)));
     }
+    let credits = quota_core::ollama::parse_credit_details(&html);
+    let credits_present = credits.balance.is_some() || credits.monthly_used.is_some();
+    println!("  credits section the parser produces:");
+    for (label, amount) in [
+        ("Credit balance", credits.balance.as_ref()),
+        ("Monthly credits used", credits.monthly_used.as_ref()),
+    ] {
+        match amount {
+            Some(amount) => println!(
+                "      {label}: {} minor units, exponent {}, {}",
+                amount.minor, amount.exponent, amount.unit
+            ),
+            None => println!("      {label}: NOT STATED"),
+        }
+    }
+    println!(
+        "      Next refill: {}",
+        credits.next_refill.as_deref().unwrap_or("NOT STATED")
+    );
 
     // WHAT THE REAL PARSER MAKES OF IT, not a second reading of the same page.
     //
@@ -181,7 +200,7 @@ async fn main() {
                     reset
                 );
             }
-            if seen == 0 {
+            if seen == 0 && !credits_present {
                 eprintln!("      FINDING: the parser produced NO windows from a page");
                 eprintln!("      that carries recognised labels.");
             }
@@ -204,7 +223,7 @@ async fn main() {
         .iter()
         .filter(|l| label_text_node_range(&html, l).is_some())
         .count();
-    if recognised == 0 {
+    if recognised == 0 && !credits_present {
         eprintln!("  FINDING: the page carries NONE of the labels this module parses.");
         eprintln!("  That is total drift, not a healthy page -- every window this");
         eprintln!("  provider publishes comes from one of them, so the fetch fails");

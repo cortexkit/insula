@@ -1265,6 +1265,26 @@ occupy the same slot but names the five-hour allowance (`windowKind: "five_hour"
 Use the kind to distinguish them and to match a refusal naming the monthly limit;
 slot position or missing minutes cannot distinguish these windows.
 
+Ollama's API-key lane (`apikey:ollama-cloud`, GET `/api/balance`) describes that
+same included allowance in `primary`, with no named extra copy. It derives
+`usedPercent = min(100, max(0, allowance_usd - balance_usd) / allowance_usd * 100)`
+only when both amounts are stated and allowance is positive. `included.period`
+is an object whose `until` supplies `resetsAt` when parseable; it does not name a
+monthly period, so the API sets neither `windowKind` nor `windowMinutes`. The
+page's `Free usage` label follows that same unnamed-period rule. A key replaces
+the cookie lane, so lanes do not alternate for one handle set; adding/removing a
+key may change kind metadata if the page explicitly says `Monthly usage`.
+
+Ollama's page `Credit balance` and API `purchased.balance_usd` publish a separate
+`spend` pool (`id: "purchased"`, `label: "Credit balance"`, funding `purchased`),
+as exact USD minor units with the decimal exponent preserved. A stated remainder
+has basis `reported`; a present API purchased section with a missing/null amount
+has no remainder and basis `unstated`, never a zero balance. No total, spendable
+flag or refill timestamp is inferred. The page parser/probe also reads `Monthly
+credits used` and relative `Next refill` prose: without a denominator or absolute
+timestamp these cannot become a window/reset. Credits-only pages are valid even
+with no rate window. The new wallet and API parsing is fixture-verified only.
+
 `usedCount` and `totalCount` are the absolute figures behind the percentage,
 carried only where the upstream supplies them, which is a small minority of
 providers. They exist because a percentage alone cannot distinguish a plan whose

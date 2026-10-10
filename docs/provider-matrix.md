@@ -1167,7 +1167,7 @@ headless.)
 | factory | factory | WorkOS/next-auth browser session (cookie + local-storage scrape), NO CLI file. Real window `windowEnd`/`secondsRemaining`. |
 | langdock | langdock | **Built, fixture-verified, not live-verified** (no Langdock account here). Source: CodexBar v0.73.0 (`1d313fe50a361fc0a12383da0cdc11a75f59daa5`), `Sources/CodexBarCore/Resources/Plugins/langdock.ts`, `Providers/Langdock/LangdockProviderDescriptor.swift`, and inline `Tests/CodexBarTests/LangdockPluginTests.swift` / `LangdockUsageTests.swift` fixtures. Vault `cookie:langdock.com[:<account>]` request header with `auth_token`, never browser extraction. GET `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` with tRPC `batch=1`/null input; personal session/weekly percentages with optional resets, no invented counts or identity. No included limits is `no_quota_reported`, not an idle window. Weekly keys name the period; session's 300-minute duration comes from the plugin, not a response-stated five-hour kind. Capture this fetch URL after login at `https://app.langdock.com/settings/account/usage`; replace the single deposit on account switching. No models.dev `langdock` counterpart was present, so `apiProvider` is unset. |
 | mimo | mimo | browser cookie (`api-platform_serviceToken`+`userId`), desktop-only. Real window `currentPeriodEnd`. |
-| ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. Included credits use `Monthly usage` or free-plan `Free usage` (CodexBar v0.73.0); labels match standalone text nodes, not explanatory prose. Both take `primary`, but only `Monthly usage` states a `windowKind`. No API-key route exists: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
+| ollama | ollama | **Built:** vault `apikey:ollama-cloud` → bearer GET `https://ollama.com/api/balance` (CodexBar v0.74.0), **fixture-verified only**, awaiting live verification after deploy. A key handle replaces the cookie lane; without a key, `cookie:ollama.com` → settings HTML as before. Included credits occupy `primary` on both lanes: page percentage/dollar pair, or API `max(0, allowance_usd - balance_usd) / allowance_usd` when both amounts exist and allowance is positive. Only the page's `Monthly usage` label names a monthly kind; `Free usage` and API `period: {until}` name none. No invented fixed cadence. Wallet `Credit balance` and `purchased.balance_usd` publish an exact USD `purchased` spend pool; missing amounts stay unknown. The page also reads `Monthly credits used` and `Next refill` for diagnostics and accepts credits-only accounts; spend/refill prose alone invents no window or reset. |
 | opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |
 | opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
 | amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |
@@ -1184,13 +1184,17 @@ reset. So manus maps secondary←refresh-allotment legitimately. Caveat: the
 RateWindow — emit only the refresh window; `totalCredits` is a prepaid balance →
 the future Balance seam, not forced into a window.
 
-CHARTER CORRECTION (important): the "prefer opencode-store bearer over cookie-scrape
-for ollama/opencode/opencodego" rule rested on a false premise. The opencode store
-does NOT carry an opencode-own or ollama-usage credential — it holds bearer tokens
-for the inference providers the user logged into (anthropic/openai/ollama-cloud-
-inference/etc.). ollama's usage endpoint rejects the inference key (proven live);
-opencode/opencodego usage is browser-cookie-only. So none of the three collapse to
-a headless bearer — all three DEFER.
+COOKIE VERSUS KEY (updated after CodexBar v0.74.0): the original opencode-store
+bearer proposal did not establish a usage endpoint. Ollama now has a separate
+vault-key lane for `/api/balance`; the old 404s on `/api/user`, `/api/usage` and
+`/api/account` did not test that endpoint. `apikey:ollama-cloud` is routed, not
+deliberately unclaimed. Like OpenCode Go, a key is the only enumerated lane when
+present: neither key nor cookie deposit carries identity, and publishing both
+would leave the emission gate to choose an invisible winner. No key leaves the
+cookie deposit serving unchanged. This is not a new opencode-store or environment
+reader. OpenCode's Zen balance remains cookie-backed; OpenCode Go's own key lane
+is described above. Ollama's API lane has fixtures and loopback HTTP proofs, not
+a live-key verification.
 
 ### Group 4 — cloud-vendor signed  (NO WINDOW)
 | provider | cb_id | session source | endpoint | window |
@@ -1425,10 +1429,13 @@ and a 30-day primary rate window (43200 mins).
 `OllamaUsageFetcher.swift` and `OllamaUsageSnapshot.swift` attach details sections
 to `UsageSnapshot`. `OllamaProviderDescriptor.swift` registers the API strategy
 and `menuBarBalanceDetailLabels: ["Credit balance"]` (`08f42ab06`).
-**Port candidate:** insula currently parses only percentage usage blocks ("Free usage",
-"Monthly usage", etc.) in `ollama.rs`. Adding wallet credit parsing will surface
-credit balances and monthly credit spend for paid accounts and prevent classifying
-credit-only accounts as parse failures.
+**Since ported, fixture-only:** `ollama.rs` reads the bounded wallet section,
+accepts credit-only pages and routes vault `apikey:ollama-cloud` to `/api/balance`.
+Purchased dollars become an exact spend pool; included utilization stays in the
+same primary slot as the page meter. Missing money is never zero. Unlike the
+upstream plugin's 30-day sentinel, `period.until` alone names no monthly kind or
+fixed cadence. Monthly spending and relative refill prose remain parser/probe
+observations, not invented windows or timestamps. Live API verification is pending.
 
 **Cursor (4 files): Linux cursor-agent store; no HTTP wire drift.**
 `CursorAppAuth.swift` adds `CursorAgentAuthStore` to read `cursor/auth.json` on Linux
@@ -1524,6 +1531,8 @@ wrong number on this host; retain the existing live-account and paid-tier fences
    usage percentage meters are omitted. Also support `OLLAMA_API_KEY` for
    `GET https://ollama.com/api/balance`. Risk: low; prevents parse errors on credit-only
    accounts and adds paid credit visibility without altering free usage parsing.
+   **Built since this survey; fixture-verified only.** See the Ollama row for the
+   vault-key precedence, exact-dollar pool and primary-slot mapping.
 2. **Qwen Cloud — Team Token Plan coverage.** Upstream
    `QwenCloud/QwenCloudTeamFetchStrategy.swift` and `Resources/Plugins/qwencloud-team.ts`
    (v0.74.0). Add team token plan support (`sfm_tokenplanteams_dp_intl`) via
