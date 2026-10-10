@@ -124,6 +124,82 @@ build_timeout_s = 1800
 
 
 [[control]]
+id = "codex-wall-is-reported-limit"
+guards = "A usage percent near 100 never puts a Codex account at its wall; only a reported limit_reached spends a banked reset"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "let at_wall = limit_reached == Some(true);"
+new = "let at_wall = limit_reached == Some(true) || raw_percents.iter().any(|percent| *percent >= RELAX_CEILING_PERCENT); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::a_window_at_its_limit_blocks_relaxation_even_when_the_upstream_reports_clear", "codex_resets::tests::only_a_reported_limit_is_the_wall", "codex_resets::tests::the_wall_lifts_when_the_latest_window_resets", "tests::a_sibling_near_its_limit_without_a_reported_limit_still_has_room", "tests::a_sibling_with_an_absent_limit_reached_counts_as_room", "tests::an_absent_limit_reached_is_not_the_wall", "tests::an_account_near_its_limit_without_a_reported_limit_keeps_its_reset", "tests::real_codex_account_spends_its_reset_only_once_its_limit_is_reported"]
+expect_message = "whose limit is not reported as reached must keep its banked reset"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "codex-sibling-room-is-reported-limit"
+guards = "A sibling has room unless its fresh reading reports limit_reached, whatever its percent"
+file = "crates/quota-core/src/codex_resets.rs"
+old = """
+                    at_wall: facts.at_wall,
+                    wall_lifts_at: facts.wall_lifts_at,"""
+new = """
+                    at_wall: facts.raw_percents.iter().any(|percent| *percent >= RELAX_CEILING_PERCENT), // NON-VACUITY BREAK
+                    wall_lifts_at: facts.wall_lifts_at,"""
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["tests::a_sibling_near_its_limit_without_a_reported_limit_still_has_room", "tests::a_sibling_with_an_absent_limit_reached_counts_as_room"]
+expect_message = "without a reported limit still has room, so the walled account keeps its reset"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "codex-absent-limit-is-not-the-wall"
+guards = "A usage response without limit_reached is not at its wall, and such a sibling counts as room"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "let at_wall = limit_reached == Some(true);"
+new = "let at_wall = limit_reached != Some(false); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::only_a_reported_limit_is_the_wall", "codex_resets::tests::the_wall_lifts_when_the_latest_window_resets", "tests::a_sibling_with_an_absent_limit_reached_counts_as_room", "tests::an_absent_limit_reached_is_not_the_wall", "tests::f6_missing_limit_reached_never_relaxes_even_at_low_usage", "tests::real_codex_account_spends_its_reset_only_once_its_limit_is_reported"]
+expect_message = "does not state limit_reached is not at its wall"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "codex-relax-ceiling-percent"
+guards = "A window at 99% or more is never relaxed to zero even when the upstream reports the limit not reached"
+file = "crates/quota-core/src/codex_resets.rs"
+old = ".all(|percent| *percent < RELAX_CEILING_PERCENT)"
+new = ".all(|percent| *percent < 1000.0) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::a_window_at_its_limit_blocks_relaxation_even_when_the_upstream_reports_clear"]
+expect_message = "a spent window must block relaxation even when the upstream reports clear"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
 id = "codex-pending-never-pruned"
 guards = "A pending journal record retains the original retry request id regardless of age"
 file = "crates/quota-core/src/codex_resets.rs"

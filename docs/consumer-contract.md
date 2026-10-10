@@ -1075,10 +1075,26 @@ provider is currently refusing requests**. Do not read one into `usedPercent`.
 ### `usedPercent` can be lower than what the provider reported
 
 One upstream grants banked quota-reset credits, and this module can spend one on
-your behalf when an account is about to hit its wall (see `savedResets` below).
-While an account holds an unspent credit that will be used before the window
-binds, its published `usedPercent` is **zero**, and the figure the provider
-actually reported moves to `rawUsedPercent` on the same window.
+your behalf (see `savedResets` below). It spends one in exactly two cases:
+
+- **The account is at its wall**, which means the upstream itself reports the
+  account's limit as reached. A `usedPercent` near 100 is not the wall: the
+  upstream reports whole percentages, so 99 can still hold most of a percent of
+  a weekly window, and a response that does not say whether the limit is
+  reached is treated as not at the wall. Even then the credit is kept while any
+  other account of that provider may have room: one whose fresh reading does
+  not report its limit reached (at any percent), or one that has not been read
+  recently. At most one account redeems at a time, and when several are walled
+  together it is the one whose own reset is furthest away.
+- **A credit is about to expire**, within the configured auto-use window. This
+  happens whether or not the account is at its wall, because an expired credit
+  is lost either way.
+
+While an account holds an unspent credit and is clear of its wall by a margin
+(the upstream affirms the limit is not reached, and every window is below 99%),
+its published `usedPercent` is **zero**, and the figure the provider actually
+reported moves to `rawUsedPercent` on the same window. A window at 99% or more
+is always published as reported.
 
 The split is deliberate and the two fields answer different questions:
 

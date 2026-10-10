@@ -401,6 +401,10 @@ struct CreditDetails {
 struct RateLimit {
     primary_window: Option<WindowSnapshot>,
     secondary_window: Option<WindowSnapshot>,
+    /// The upstream's own statement that this account's limit is reached, and
+    /// the ONLY thing that puts a Codex account at its wall for the banked-reset
+    /// policy (see `UsageFacts::from_usage`). Absent and `null` both decode to
+    /// `None`, which is read as not at the wall: no credit is spent on it.
     #[serde(default)]
     limit_reached: Option<bool>,
 }
