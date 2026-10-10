@@ -11,9 +11,9 @@ members = ["crates/quota-core", "crates/quota-module"]
 # wire; subc-daemon is dev-only for the in-process skeleton test. The TS
 # @cortexkit/subc-client consumer transport is owned by subc, NOT built here.
 [workspace.dependencies]
-subc-protocol = "0.29"
-subc-transport = "0.10"
-subc-daemon = "0.32"
+subc-protocol = "0.30"
+subc-transport = "0.11"
+subc-daemon = "0.33"
 subc-jsonc = "0.1"
 # `subc_os::launch_nonce()` is the one reader of the launch nonce the daemon hands
 # a supervised module on descriptor 3. It must be the only reader in the process:

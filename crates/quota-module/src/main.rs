@@ -2936,10 +2936,7 @@ mod tests {
             kind: ScopeKind::Worker,
             parent: None,
             parent_state: None,
-            attributes: ScopeAttributes {
-                flow_id: Some("flow:7".to_string()),
-                ..ScopeAttributes::default()
-            },
+            attributes: ScopeAttributes::new().with_flow_id(Some("flow:7".to_string())),
             owner_authorized: true,
         };
         let mut bind = serde_json::json!({
