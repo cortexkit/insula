@@ -80,13 +80,13 @@ def table(name):
 
 
 def families():
-    """The lane families: each id they claim becomes a provider's handle."""
+    """Provider routes; enrichment-only families do not become usage handles."""
     return table("CREDENTIAL_FAMILIES")
 
 
 def enrichment_families():
-    """Families a provider reads WITHOUT a lane (`cookie:kimi.com` for
-    kimi-for-coding's subscription extras). Their ids route to no handle and are
+    """Families a provider reads WITHOUT a lane (`cookie:kimi.com` and
+    `cookie:claude.ai` for subscription extras). Their ids route to no handle and are
     still consumed, so they are neither findings nor unrelated."""
     return table("ENRICHMENT_FAMILIES")
 

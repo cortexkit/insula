@@ -2063,6 +2063,8 @@ mod tests {
             email: Some("someone@example.test".into()),
             org_name: None,
             plan_type: None,
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         });
         let mut second = labelled("claude", "acct-2");
         second.account_info = first.account_info.clone();
@@ -2091,6 +2093,8 @@ mod tests {
             email: Some("someone@example.test".into()),
             org_name: None,
             plan_type: None,
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         });
         let mut codex = labelled("codex", "acct-1");
         codex.account_info = info.clone();

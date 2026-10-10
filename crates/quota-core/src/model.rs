@@ -364,6 +364,8 @@ mod tests {
             email: Some("a@example.test".into()),
             org_name: Some("Example Org".into()),
             plan_type: Some("pro".into()),
+            subscription_renews_at: Some("2026-11-01".into()),
+            subscription_ends_at: Some("2026-12-01T00:00:00Z".into()),
         };
         let value = serde_json::to_value(&info).expect("serialises");
         let mut keys: Vec<&str> = value
@@ -375,7 +377,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["email", "orgName", "planType"],
+            [
+                "email",
+                "orgName",
+                "planType",
+                "subscriptionEndsAt",
+                "subscriptionRenewsAt"
+            ],
             // NAMES THE CONSEQUENCE, not just the diff. A message saying "the key
             // set changed" makes the reader go and find out why that matters, and
             // the cheapest resolution is to widen the list and move on. SUBC's
@@ -543,6 +551,8 @@ mod tests {
             email: Some(huge.clone()),
             org_name: Some(huge.clone()),
             plan_type: Some(huge),
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         });
 
         bound_wire_strings(&mut entries);

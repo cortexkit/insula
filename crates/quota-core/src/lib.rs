@@ -14,6 +14,7 @@ pub mod alibaba;
 pub mod amp;
 pub mod anthropic;
 pub mod antigravity;
+mod claude_subscription;
 pub mod clinepass;
 pub mod codebuff;
 pub mod codex;

@@ -16,6 +16,7 @@ use crate::provider::{CredentialHandle, HandlesError};
 pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("chatgpt:openai", "codex"),
     ("oauth:anthropic", "claude"),
+    ("cookie:claude.ai", "claude"),
     ("oauth:xai", "grok"),
     ("antigravity:google", "antigravity"),
     ("oauth:google", "gemini"),
@@ -51,12 +52,16 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
 ///
-/// Kept apart from [`CREDENTIAL_FAMILIES`] because a family there becomes a
-/// handle and a slot. The Kimi web console session only enriches
+/// These families never become usage handles or slots, even when also listed
+/// in [`CREDENTIAL_FAMILIES`] for provider routing. The Kimi web console session
+/// only enriches
 /// kimi-for-coding's usage with optional extras; it fetches no usage of its own,
 /// so as a lane it would publish a second, failing row for the same account.
 /// Listed so the snapshot mapping does not report these ids as unsupported.
-pub const ENRICHMENT_FAMILIES: &[(&str, &str)] = &[("cookie:kimi.com", "kimi-for-coding")];
+pub const ENRICHMENT_FAMILIES: &[(&str, &str)] = &[
+    ("cookie:kimi.com", "kimi-for-coding"),
+    ("cookie:claude.ai", "claude"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ProviderKind {
@@ -585,6 +590,11 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
     let mut refused_families: Vec<(&str, Vec<&str>)> = CREDENTIAL_FAMILIES
         .iter()
         .filter(|(prefix, _)| prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
+        .filter(|(prefix, _)| {
+            !ENRICHMENT_FAMILIES
+                .iter()
+                .any(|(family, _)| family == prefix)
+        })
         .filter_map(|(prefix, _)| {
             let ids: Vec<_> = rows
                 .iter()
@@ -607,6 +617,16 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
     let mut ignored_cursor_cookie = Vec::new();
     let mut mapped = ProviderHandleSnapshot::default();
     for row in rows {
+        // Enrichment deposits are read from the snapshot by the matching usage
+        // lane. Enumerating one would collapse labelled Claude usage into an
+        // identity-less row; multiple suffixed deposits are safe only after
+        // each session owner has been verified by that lane.
+        if ENRICHMENT_FAMILIES
+            .iter()
+            .any(|(family, _)| handle_id_names_family(&row.credential_id, family))
+        {
+            continue;
+        }
         if refused_ids.contains(row.credential_id.as_str()) {
             continue;
         }
@@ -886,6 +906,48 @@ mod tests {
                 "{id} did not route to {provider}"
             );
         }
+    }
+
+    #[test]
+    fn claude_cookies_route_as_enrichment_never_as_usage_handles() {
+        let loader = VaultHandleLoader::default();
+        install(
+            &loader,
+            vec![
+                row("oauth:anthropic:first", "oauth"),
+                row("oauth:anthropic:second", "oauth"),
+                row("cookie:claude.ai:first", "cookie"),
+                row("cookie:claude.ai:second", "cookie"),
+            ],
+        );
+        assert!(CREDENTIAL_FAMILIES.contains(&("cookie:claude.ai", "claude")));
+        let handles = loader.anthropic_handles().unwrap();
+        assert_eq!(
+            handles.len(),
+            2,
+            "cookies must not collapse labelled OAuth rows"
+        );
+        assert!(handles.iter().all(|h| h
+            .vault_credential_id()
+            .unwrap()
+            .starts_with("oauth:anthropic:")));
+        assert!(
+            loader.warning().is_none(),
+            "multiple owner-checked enrichment deposits are not ambiguous lanes"
+        );
+        assert_eq!(
+            loader.snapshot().unwrap().rows.len(),
+            4,
+            "candidate cookies must remain readable from the snapshot"
+        );
+    }
+
+    #[test]
+    fn a_claude_cookie_without_oauth_is_not_a_usage_handle() {
+        let loader = VaultHandleLoader::default();
+        install(&loader, vec![row("cookie:claude.ai:first", "cookie")]);
+        assert!(loader.anthropic_handles().unwrap().is_empty());
+        assert!(loader.warning().is_none());
     }
 
     /// An enrichment id routes to no lane and is not reported as unsupported.

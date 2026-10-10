@@ -322,7 +322,8 @@ A cookie-backed provider reads its session from the vault and nowhere else:
 insula reads no browser store. Cerebellum captures the login in a throwaway
 browser and deposits it as `cookie:<domain>:<account>` (or a bare
 `cookie:<domain>`). With no deposit the provider is unconfigured on that host.
-One domain takes ONE deposit: cookies carry no identity, so a second deposit
+Domains whose cookies supply usage windows take ONE deposit: those lanes do not
+verify account identity, so a second deposit
 for the same domain is refused at load time. Re-capturing replaces the same id
 (`ck auth put --replace`) rather than adding a new suffix.
 
@@ -335,6 +336,7 @@ until this table follows.
 
 | Deposit id | Provider(s) | Fetch URL |
 |---|---|---|
+| `cookie:claude.ai:<account>` | claude | `https://claude.ai/api/account` |
 | `cookie:ollama.com:<account>` | ollama | `https://ollama.com/settings` |
 | `cookie:opencode.ai:<account>` | opencode, opencodego | `https://opencode.ai/console/api/go/status` |
 | `cookie:ampcode.com:<account>` | amp | `https://ampcode.com/settings` |
@@ -347,6 +349,15 @@ until this table follows.
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 
 The Langdock capture target is fixture-verified, not live-verified; no Langdock account was available.
+
+Claude's deposit is enrichment only, never a second usage lane. Use the same
+account suffix as `oauth:anthropic:<account>`; a bare deposit is not used. Multiple
+suffixed Claude deposits are allowed because each web owner is independently
+verified against the OAuth bearer via `/api/oauth/profile` and `/api/account`
+before reading `/api/organizations/{org_id}/subscription_details`. Capture a
+`sessionKey` cookie scoped to `/api` so it covers both account and billing URLs.
+This capture target and date enrichment are fixture-verified only: there is no
+claude.ai cookie on this host.
 
 The `kimi.com` deposit is not a lane: kimi-for-coding reads its usage with the
 coding API key and uses the web session's `kimi-auth` cookie only to fetch two
