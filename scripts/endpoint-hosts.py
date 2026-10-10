@@ -53,6 +53,11 @@ SRC = REPO / "crates/quota-core/src"
 EXPECTED: dict[str, dict[str, str]] = {
     "amp": {"SETTINGS_URL": "ampcode.com"},
     "anthropic": {"USAGE_URL": "api.anthropic.com"},
+    "claude_subscription": {
+        "PROFILE_URL": "api.anthropic.com",
+        "ACCOUNT_URL": "claude.ai",
+        "ORGANIZATIONS_URL": "claude.ai",
+    },
     "antigravity": {
         "REMOTE_QUOTA_URL": "cloudcode-pa.googleapis.com",
         "LOAD_CODE_ASSIST_URL": "cloudcode-pa.googleapis.com",

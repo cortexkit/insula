@@ -196,6 +196,8 @@ pub fn normalize_usage_envelope(body: &[u8]) -> Result<(Usage, Option<AccountInf
         email: None,
         org_name: None,
         plan_type: Some(pt),
+        subscription_renews_at: None,
+        subscription_ends_at: None,
     });
 
     Ok((usage, account_info))

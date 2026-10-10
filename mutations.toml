@@ -833,3 +833,77 @@ expect_message = "a preflight without an affirmative consumer-client refusal mus
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "claude-subscription-owner"
+guards = "A suffix-matched cookie with another authenticated owner must never attach billing dates to the OAuth row"
+file = "crates/quota-core/src/claude_subscription.rs"
+old = "Owner::new(uuid, Some(email), Some(id)).as_ref() == Some(owner)"
+new = "Owner::new(uuid, Some(email), Some(id)).as_ref() == Some(owner) || true /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/quota-core/src/claude_subscription.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["claude_subscription::tests::mismatched_owner_attaches_nothing"]
+expect_message = "a mismatched web owner must not attach billing dates"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-subscription-end-precedence"
+guards = "A scheduled subscription end suppresses leftover renewal data, including canceled subscriptions"
+file = "crates/quota-core/src/claude_subscription.rs"
+old = 'let renews = if ends.is_none() && ["active", "trialing"].contains(&status) {'
+new = 'let renews = if ["active", "trialing", "canceled"].contains(&status) { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/claude_subscription.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["claude_subscription::tests::canceled_scheduled_end_wins_over_leftover_renewal"]
+expect_message = "a scheduled end must suppress a leftover next charge"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-subscription-date-only"
+guards = "A full billing date is a day and must not be converted into a midnight timestamp"
+file = "crates/quota-core/src/claude_subscription.rs"
+old = "Ok(Some(raw.clone()))"
+new = 'Ok(Some(format!("{raw}T00:00:00Z"))) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/claude_subscription.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["claude_subscription::tests::date_only_renewal_stays_a_full_date"]
+expect_message = "a date-only value must remain a day, not an invented timestamp"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-subscription-failure-isolation"
+guards = "An optional billing failure never changes OAuth windows or the Claude row's errorClass"
+file = "crates/quota-core/src/claude_subscription.rs"
+old = """let Some(dates) = &cached.good else {
+            return;
+        };"""
+new = """let Some(dates) = &cached.good else {
+            attempt.usage = Err(crate::provider::FetchError::Unauthorized("billing failed".into())); // NON-VACUITY BREAK
+            return;
+        };"""
+edits = []
+test_file = "crates/quota-core/src/claude_subscription.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["claude_subscription::tests::dates_failure_leaves_windows_and_error_class_unchanged"]
+expect_message = "a dates failure must never set the Claude row's errorClass"
+only = true
+timeout_s = 600
+build_timeout_s = 1800

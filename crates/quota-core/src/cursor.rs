@@ -492,6 +492,8 @@ fn provider_usage_from_credential(
             email: Some(email.to_string()),
             org_name: None,
             plan_type: None,
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         });
     }
     provider_usage

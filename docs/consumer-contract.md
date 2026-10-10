@@ -1415,6 +1415,24 @@ display- and grouping-only: nothing in this module derives behaviour from them,
 and `planType` in particular is the upstream's own label rather than a
 normalised vocabulary, so it is not comparable across providers.
 
+For Claude it can also carry optional `subscriptionRenewsAt` and
+`subscriptionEndsAt`. Renewal is the next subscription charge for an active or
+trialing subscription with no scheduled end; end is the scheduled end of an
+active, trialing or canceled subscription. An end takes precedence: a leftover
+next-charge value is not published as renewal. These are billing metadata, not
+quota resets, API credit balances, or account identity. Each value is an RFC 3339
+date-time, or a full date `YYYY-MM-DD` when upstream supplies only a day. Preserve
+that date-only meaning; do not convert it to a midnight timestamp.
+
+Dates enrich the existing OAuth row only after the deposited claude.ai session's
+owner and organization match the owner obtained from that row's OAuth bearer.
+The suffix selects the candidate cookie but proves nothing. Billing fetches run
+in the background at most once an hour per account; a cold poll may have no
+dates until a subsequent poll. A failed/unreadable dates fetch leaves them absent
+or retains the last good answer for the same credential binding, never changing
+usage windows or `errorClass`. A changed or unverifiable authenticated principal
+or organization on either the OAuth or web-session side withholds dates.
+
 **`accountInfo` can be present while `account` is absent, and the pair must not
 be used as one another's proxy.** They are gated differently on purpose:
 `account` is the identity this module VERIFIED for the fetch unit. It is withheld
@@ -1424,8 +1442,9 @@ second credential, and publishing both would state one account's capacity twice.
 A handle that resolves no identity and serves no usage does not force that: it
 publishes as one unlabeled entry beside its labeled siblings, since an entry with
 no usage cannot be double-counted. `accountInfo` is
-descriptive text the upstream happened to return with the payload, and it rides
-along unverified.
+descriptive metadata, not an identity key. Email/org/plan labels ride along
+unverified; Claude's subscription dates have the additional owner check described
+above, but must not be used to reconstruct identity either.
 
 So an unlabeled entry can carry an email — that is reachable today, not
 theoretical. Do NOT key on it, join on it, or use it to reconstruct the identity
@@ -2071,7 +2090,7 @@ carry across. Only two are properties of the provider:
 | `provider` | provider | the module's own name for the upstream |
 | `apiProvider` | provider | derived from `provider` at read time, identical on every entry |
 | `account` | account | the credential's account id |
-| `accountInfo` | account | that account's email, org, plan |
+| `accountInfo` | account | that account's email, org, plan, optional subscription dates |
 | `source` | lane | set per credential lane, and the lane serving one account can change between polls |
 | `fetchedAt` | account | that slot's own last success |
 | `savedResets` | account | reset credits are granted to **one** account |

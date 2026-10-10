@@ -1741,9 +1741,12 @@ fn langdock_replacement_changes_the_single_deposit_and_two_deposits_are_refused(
 /// credential to show, so one assertion holds for all of them: a vault handle
 /// for that id is AMONG the handles. "Among" rather than "only", because codex
 /// and antigravity legitimately list a local lane beside their vault handles.
+/// Enrichment-only routes are the exception: Claude's billing cookie must NOT
+/// enumerate a usage handle. Claude still has to prove its OAuth family below;
+/// the subscription fixtures separately prove the cookie is read for metadata.
 #[test]
 fn every_provider_with_a_vault_family_enumerates_a_deposit_in_it() {
-    use crate::vault_handles::CREDENTIAL_FAMILIES;
+    use crate::vault_handles::{CREDENTIAL_FAMILIES, ENRICHMENT_FAMILIES};
     use std::collections::BTreeSet;
 
     let registry = Registry::with_defaults(
@@ -1826,6 +1829,14 @@ fn every_provider_with_a_vault_family_enumerates_a_deposit_in_it() {
             let enumerated = handles.iter().any(|handle| {
                 handle.is_vault() && handle.vault_credential_id() == Some(deposit.as_str())
             });
+            if ENRICHMENT_FAMILIES.contains(&(family, *provider_name)) {
+                if enumerated {
+                    unwired.push(format!(
+                        "{provider_name} ({deposit}): enrichment became a usage handle"
+                    ));
+                }
+                continue;
+            }
             if enumerated {
                 providers_proved.insert(provider_name);
                 continue;
@@ -2048,6 +2059,8 @@ impl UsageProvider for LabelProvider {
             email: Some(format!("{}@example.test", handle.stable_id())),
             org_name: None,
             plan_type: None,
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         }))
     }
 }
@@ -11067,6 +11080,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
     )
     .expect("docs/vault-consumer-design.md must be readable");
     let sources: std::collections::HashMap<&str, &str> = [
+        ("claude", include_str!("claude_subscription.rs")),
         ("amp", include_str!("amp.rs")),
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),

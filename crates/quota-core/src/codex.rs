@@ -286,6 +286,8 @@ impl ServedCodexContext {
             email: self.email.clone(),
             org_name: self.org_name.clone(),
             plan_type: plan_type.and_then(|value| canonical_label(Some(value))),
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         };
         (!info.is_empty()).then_some(info)
     }

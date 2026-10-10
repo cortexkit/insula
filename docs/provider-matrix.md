@@ -1287,8 +1287,9 @@ not parallel workers:
 
 ### Parity round: CodexBar v0.73.0 → v0.74.0
 
-Checked against v0.74.0, tagged 2026-10-09 (`c2f22ccf8`). **Documentation only;
-no provider behaviour changed.** The comparison uses
+Checked against v0.74.0, tagged 2026-10-09 (`c2f22ccf8`). The original round was
+documentation only; Claude subscription dates were subsequently ported as noted
+below. The comparison uses
 `git diff v0.73.0 v0.74.0 -- <path>` and `git show v0.74.0:<path>`, not the
 upstream working tree. For each implemented directory, changed lines were
 checked for URLs, cookies, headers, JSON keys, sign-in/redirect handling, parsing
@@ -1356,9 +1357,10 @@ Upstream changes in the 12 files instead concern:
   `GET https://claude.ai/api/organizations/{org_id}/subscription_details` using
   an existing web session cookie (`sessionKey`), decoding `renews` / `expires`
   dates (supporting YYYY-MM-DD date-only strings and ISO-8601 timestamps) for
-  active, trialing, and canceled subscriptions (`5349f629a`). **Declined / backlog
-  candidate:** insula reads OAuth `/api/oauth/usage` directly with bearer tokens
-  and has no web session cookie lane for Claude.
+  active, trialing, and canceled subscriptions (`5349f629a`). **Ported:** insula
+  reads OAuth usage as before and uses `cookie:claude.ai:<account>` only to enrich
+  that suffix's OAuth row after verifying the session owner and organization.
+  It is not a separate web usage lane.
 - `ClaudeCLIScreen.swift`: expands PTY replay screen to 200 rows (`static let rows = 200`,
   160 columns) to prevent truncating tall inline `/usage` panels (2.1.270–2.1.294)
   containing session stats above and usage insights below quota rows (`d82f195bd`).
@@ -1376,7 +1378,7 @@ Upstream changes in the 12 files instead concern:
 - `ClaudeStatusProbe.swift` and `ClaudeUsageFetcher.swift`: recognizes the tall CLI
   insights marker (`usageInsightsMarker`), preserves PTY errors over insights-only
   summaries, and enriches OAuth snapshots with web subscription dates when cookies
-  are available (`36bf01ace`). **Declined.**
+  are available (`36bf01ace`). **Subscription enrichment ported; CLI changes declined.**
 - `ClaudeUsageSnapshot+WebExtras.swift` and `ClaudeVerifiedAccountOwner.swift`:
   preserves subscription metadata across snapshot transformations. **No effect.**
 
@@ -1532,10 +1534,20 @@ wrong number on this host; retain the existing live-account and paid-tier fences
    and seat attribution. Coverage candidate, does not affect existing personal token
    plan scrape.
 3. **Claude — subscription renewal and expiration dates from web billing.** Upstream
-   `Claude/ClaudeWeb/ClaudeSubscriptionMetadata.swift` (v0.74.0). Optionally query
+   `Claude/ClaudeWeb/ClaudeSubscriptionMetadata.swift` (v0.74.0). **Implemented,
+   fixture-verified only:** there is no claude.ai cookie on this host, so no live
+   billing probe was run. Optionally query
    `GET https://claude.ai/api/organizations/{org_id}/subscription_details` with deposited
-   session cookie to obtain `renews_at` and `expires_at`. Risk: low; supplementary
-   billing metadata. Note: does NOT provide monthly Claude API credits on
+   session cookie to publish `accountInfo.subscriptionRenewsAt` and
+   `accountInfo.subscriptionEndsAt` via cortexkit-provider-usage 0.11.0. Scheduled
+   end wins over renewal; date-only values stay full dates. The owner is derived
+   from `/api/oauth/profile` using the accepted usage bearer (UUID preferred,
+   normalized email fallback, plus organization), matched to `/api/account`,
+   and both authenticated sides are rechecked after billing. Background requests
+   are limited to once an hour per account; same-binding failures keep the last
+   good answer, owner failures withhold it, and no billing failure changes usage
+   or `errorClass` or reports a cookie auth failure to the vault. Risk: low;
+   supplementary billing metadata. Note: does NOT provide monthly Claude API credits on
    `platform.claude.com` (which upstream does not read anywhere).
 
 ### Parity round: CodexBar v0.72.0 → v0.73.0

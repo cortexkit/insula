@@ -52,6 +52,8 @@ impl VaultCredential {
             email: canonical_label(self.email.clone()),
             org_name: canonical_label(self.org_name.clone()),
             plan_type: None,
+            subscription_renews_at: None,
+            subscription_ends_at: None,
         };
         (!info.is_empty()).then_some(info)
     }

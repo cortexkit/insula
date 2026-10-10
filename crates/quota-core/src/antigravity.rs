@@ -1639,6 +1639,8 @@ impl AntigravityProvider {
                 email: Some(email.to_string()),
                 org_name: None,
                 plan_type: None,
+                subscription_renews_at: None,
+                subscription_ends_at: None,
             });
 
         // 1. Probe the local agy / language-server lane first.

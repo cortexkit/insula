@@ -777,9 +777,23 @@ pub struct AnthropicProvider {
     /// Per handle stable id, the last logged reason a readable saved-reset
     /// block counted nothing. See [`inventory_shape`].
     inventory_shapes: Mutex<HashMap<String, String>>,
+    subscription: Arc<crate::claude_subscription::SubscriptionCache>,
 }
 
 impl AnthropicProvider {
+    #[cfg(test)]
+    pub(crate) fn subscription_fixture(
+        source: Arc<dyn CredentialSource>,
+        loader: Arc<VaultHandleLoader>,
+        usage_url: String,
+        subscription: Arc<crate::claude_subscription::SubscriptionCache>,
+    ) -> Self {
+        let mut provider = Self::new_with_handle_loader(Some(source), loader);
+        provider.usage_url = usage_url;
+        provider.subscription = subscription;
+        provider
+    }
+
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -793,6 +807,7 @@ impl AnthropicProvider {
             reset_refusals: Mutex::new(HashMap::new()),
             inventory_fallbacks: Mutex::new(HashMap::new()),
             inventory_shapes: Mutex::new(HashMap::new()),
+            subscription: crate::claude_subscription::SubscriptionCache::new(),
         }
     }
 
@@ -1020,6 +1035,16 @@ impl AnthropicProvider {
             Err(error) => return FetchAttempt::failure(observed, None, error),
         };
 
+        // Billing works independently: a slow or expired web session must not
+        // hold up this account's OAuth usage windows.
+        self.subscription.queue(
+            Arc::clone(credential_source),
+            &self.handle_loader,
+            handle,
+            &credential,
+            &bearer,
+        );
+
         let result = self
             .inventory_body(handle_id, &bearer, true)
             .await
@@ -1031,9 +1056,12 @@ impl AnthropicProvider {
             Ok((usage, overage, resets, shape)) => {
                 self.settle_shape(handle_id, shape);
                 let pool = self.settle_overage(handle_id, overage);
-                success_attempt(observed, "vault", usage, pool)
+                let mut attempt = success_attempt(observed, "vault", usage, pool)
                     .with_account_info(account_info)
-                    .with_saved_resets(self.settle_resets(handle_id, resets))
+                    .with_saved_resets(self.settle_resets(handle_id, resets));
+                self.subscription
+                    .apply(&self.handle_loader, handle, &credential, &mut attempt);
+                attempt
             }
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
