@@ -256,6 +256,10 @@ fn evaluate(
         .credential_ids
         .iter()
         .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:opencode-go"));
+    let ollama_api_key_present = installed
+        .credential_ids
+        .iter()
+        .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:ollama-cloud"));
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
         if prefix.starts_with("cookie:") || prefix.starts_with("apikey:") {
@@ -319,6 +323,12 @@ fn evaluate(
                     && quota_core::vault_handles::handle_id_names_family(
                         credential_id,
                         "cookie:opencode.ai",
+                    ))
+                || (ollama_api_key_present
+                    && provider == "ollama"
+                    && quota_core::vault_handles::handle_id_names_family(
+                        credential_id,
+                        "cookie:ollama.com",
                     ));
             if !dual_lane.iter().any(|(name, _)| *name == provider)
                 && !precedence_suppressed
@@ -905,6 +915,25 @@ mod tests {
         );
         assert_eq!(stale.exit_code, 1, "{stale:?}");
         assert!(stale.lines.join("\n").contains("stale DUAL_LANE exemption"));
+    }
+
+    #[test]
+    fn ollama_key_precedence_matches_the_provider_lanes() {
+        for ids in [
+            vec!["apikey:ollama-cloud", "cookie:ollama.com"],
+            vec!["cookie:ollama.com"],
+        ] {
+            let report = evaluate(
+                granted(&ids),
+                usage(vec![healthy("ollama", "vault")]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                &[],
+                ENUMERATED_UNSUPPORTED,
+            );
+            assert_eq!(report.exit_code, 0, "{report:?}");
+            assert_eq!(report.counts.as_ref().unwrap().expected, 1);
+            assert_eq!(report.counts.as_ref().unwrap().checked, 1);
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:langdock.com", "langdock"),
     ("cookie:xiaomimimo.com", "mimo"),
     ("cookie:ollama.com", "ollama"),
+    ("apikey:ollama-cloud", "ollama"),
     ("cookie:opencode.ai", "opencode"),
     ("cookie:opencode.ai", "opencodego"),
     // The OpenCode Go usage API's key. Routed to opencodego only: `opencode`

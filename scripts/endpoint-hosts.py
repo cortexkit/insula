@@ -86,7 +86,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     # and the manifest entry did not, which is exactly the drift this file exists
     # to name.
     "openrouter": {"CREDITS_URL": "openrouter.ai", "KEY_URL": "openrouter.ai"},
-    "ollama": {"SETTINGS_URL": "ollama.com"},
+    "ollama": {"SETTINGS_URL": "ollama.com", "BALANCE_URL": "ollama.com"},
     "opencode": {"SERVER_BASE": "opencode.ai"},
     "opencodego": {"API_USAGE_URL": "opencode.ai"},
     "qoder": {"USAGE_URL": "qoder.com"},
