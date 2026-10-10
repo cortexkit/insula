@@ -1170,6 +1170,7 @@ headless.)
 | ollama | ollama | browser session cookie → `ollama.com/settings` HTML scrape. Included credits use `Monthly usage` or free-plan `Free usage` (CodexBar v0.73.0); labels match standalone text nodes, not explanatory prose. Both take `primary`, but only `Monthly usage` states a `windowKind`. No API-key route exists: the opencode-store `ollama-cloud` key is an INFERENCE key — it 404s on /api/user, /api/usage, /api/account (no usage endpoint accepts it). No headless origin. |
 | opencode | opencode | browser cookie `auth`/`__Host-auth`. The `~/.local/share/opencode/auth.json` store holds creds for OTHER providers, NOT an opencode-own usage credential — charter assumption corrected. Real window (rolling 5h + weekly). |
 | opencodego | opencodego | same opencode browser cookie; HTML scrape of opencode.ai/workspace/{id}/go. Real window (rolling+weekly+monthly). |
+| qwen-cloud | qwencloud | **Built; Team fixture-verified only, no Qwen Cloud account on this host.** Vault `cookie:qwencloud.com[:<account>]` with `login_qwencloud_ticket`. Team Token Plan support follows CodexBar v0.74.0 (upstream implementation commit `9fae8c8e4`): `home.qwencloud.com/tool/user/info.json` → `secToken`, then `/data/api.json` `ea-service:LoadHumanInfo` (ap-southeast-1) → `SellerInfoDto.Nbid`, then `BssOpenAPI-V3:GetSeatSubscriptionSummary` (cn-hangzhou, zh-CN) for `sfm_tokenplanteams_dp_intl`. One named extra window `team` / `Team`, slots empty: percent derived only from valid positive total and stated surplus in the single `credit_value` equity. No derived counts, duplicate spend pool, invented period or seat count. Affirmed absent/inactive Team plan or failed discovery falls back to the existing personal five-hour/weekly/monthly path and logs the skip once per change; a failed request is not evidence of an absent Team plan. Missing `secToken` or `Nbid` also falls back; explicit login codes, 401/403 and sign-in redirects are `credential_rejected`. Personal request shapes and error classes remain unchanged. |
 | amp | amp | browser cookie (ampcode.com) → settings HTML scrape, desktop-only. |
 
 **3C — manus → BUILD (copilot test PASSED against source).** `MANUS_SESSION_TOKEN`
@@ -1287,8 +1288,8 @@ not parallel workers:
 
 ### Parity round: CodexBar v0.73.0 → v0.74.0
 
-Checked against v0.74.0, tagged 2026-10-09 (`c2f22ccf8`). **Documentation only;
-no provider behaviour changed.** The comparison uses
+Checked against v0.74.0, tagged 2026-10-09 (`c2f22ccf8`). **The comparison was
+documentation only; subsequent ports are marked below.** The comparison uses
 `git diff v0.73.0 v0.74.0 -- <path>` and `git show v0.74.0:<path>`, not the
 upstream working tree. For each implemented directory, changed lines were
 checked for URLs, cookies, headers, JSON keys, sign-in/redirect handling, parsing
@@ -1467,9 +1468,15 @@ session cookies (`9fae8c8e4`): `GET /tool/user/info.json` for `secToken`,
 and `POST /data/api.json?product=BssOpenAPI-V3&action=GetSeatSubscriptionSummary` for
 credit pools (`credit_value`, total/surplus, seats). Primary rate window label is "Team".
 Falls back to personal web strategy if no active team plan is found.
-**Port candidate:** insula currently implements personal token plan scraping via
-`cs-data.qwencloud.com` in `qwen_cloud.rs`. Adding Team plan support expands
-coverage for enterprise accounts.
+**Ported, fixture-only:** insula tries the Team path before its existing personal
+`cs-data.qwencloud.com` path in `qwen_cloud.rs`. No Qwen Cloud account is available
+on this host. The shared wire has no slot labels, so Team is published only as
+`extraRateWindows[id="team", title="Team"]`, not duplicated in `primary` or a
+spend pool. Its percent is derived from the single credit equity's positive total
+and stated surplus; counts stay absent. Explicit expired-session signals reject
+the credential; failed discovery (including missing token/selector) logs once on
+change and leaves personal usage serving. Unlike upstream's optional selector,
+an absent `Nbid` is not sent to the summary API without attribution.
 
 **OpenCodeGo (1 file): presentation only.**
 `OpenCodeGoProviderDescriptor.swift` adds `switcherUsesAutomaticMenuBarWindow: true`
@@ -1526,10 +1533,11 @@ wrong number on this host; retain the existing live-account and paid-tier fences
    accounts and adds paid credit visibility without altering free usage parsing.
 2. **Qwen Cloud — Team Token Plan coverage.** Upstream
    `QwenCloud/QwenCloudTeamFetchStrategy.swift` and `Resources/Plugins/qwencloud-team.ts`
-   (v0.74.0). Add team token plan support (`sfm_tokenplanteams_dp_intl`) via
+   (v0.74.0). **Ported, fixture-only; no account on this host.** Team token plan
+   support (`sfm_tokenplanteams_dp_intl`) via
    `ea-service:LoadHumanInfo` and `BssOpenAPI-V3:GetSeatSubscriptionSummary` from the web
    session cookie. Risk: medium; multi-step gateway RPC with region-specific endpoints
-   and seat attribution. Coverage candidate, does not affect existing personal token
+   and seat attribution. Named Team credit window; does not affect existing personal token
    plan scrape.
 3. **Claude — subscription renewal and expiration dates from web billing.** Upstream
    `Claude/ClaudeWeb/ClaudeSubscriptionMetadata.swift` (v0.74.0). Optionally query

@@ -1245,6 +1245,21 @@ its slot.
 
 ### The other window fields
 
+Qwen Cloud (`qwen-cloud`) tries the Team Token Plan before the personal plan.
+An active Team plan publishes exactly one named extra, `id: "team"`, `title:
+"Team"`, with all three slots empty. It represents the shared subscription's
+`credit_value` allowance, not the personal plan's rolling token windows. Its
+`usedPercent` is derived as `(total − surplus) / total × 100` only with both
+figures present and a positive total. It carries the stated cycle reset when
+available, but no invented duration/kind, derived counts, or duplicate spend pool.
+Seat allocation is not a second allowance and has no field in this wire schema.
+No active Team plan or a failed Team discovery falls back to personal windows
+(five-hour primary, weekly secondary, monthly primary when alone or the named
+`monthly` extra otherwise). Explicit sign-in refusals remain
+`credential_rejected`; request failures never assert that a Team plan is absent.
+Team coverage has been checked against test fixtures, not a live Qwen Cloud
+account; no account is available on this host.
+
 `windowMinutes` is the window's length, and it is optional. It is set when the
 upstream states a cadence or the field name implies one; it is absent when the
 upstream reports usage without a stated length (including a calendar month).

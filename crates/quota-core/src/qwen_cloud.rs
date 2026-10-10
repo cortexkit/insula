@@ -1,14 +1,13 @@
 //! Qwen Cloud token-plan usage — session-cookie + console-gateway scrape.
 //!
 //! The token-plan quota is available only to an authenticated Qwen Cloud web
-//! session, deposited in the vault as `cookie:qwencloud.com`. Each scrape loads
-//! the token-plan page to obtain a fresh `SEC_TOKEN`, then posts that token with
+//! session, deposited in the vault as `cookie:qwencloud.com`. Each personal
+//! scrape loads the token-plan page to obtain a fresh `SEC_TOKEN`, then posts it with
 //! the deposited cookies through the ONE_CONSOLE
 //! `IntlBroadScopeAspnGateway` gateway.
 //!
-//! VERIFICATION: fixture-verified from a live browser HAR capture of
-//! `home.qwencloud.com`, not a CodexBar port (Qwen Cloud has no CodexBar
-//! equivalent). The HAR verifies the
+//! VERIFICATION: the personal path is fixture-verified from a live browser HAR
+//! capture of `home.qwencloud.com`. The HAR verifies the
 //! `zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage` endpoint via the
 //! `IntlBroadScopeAspnGateway` console gateway, the session cookie + per-page
 //! `SEC_TOKEN` authentication, and the `per5HourPercentage`,
@@ -25,13 +24,21 @@
 //! `extra_rate_windows` with id `monthly`, so it is never dropped. The gateway
 //! call shape is HAR-verified.
 //!
-//! Two hosts: the token-plan PAGE (`home.qwencloud.com`) is loaded only to extract
-//! the per-session `SEC_TOKEN`; the quota call itself goes to the console data
+//! Team Token Plan discovery runs first, using the same deposited cookies. Its
+//! home-console RPCs and fixtures follow CodexBar v0.74.0
+//! `QwenCloudTeamFetchStrategy.swift` and `qwencloud-team.ts` (9fae8c8e4).
+//! Team coverage is checked against test fixtures, not a live account: no Qwen
+//! Cloud account is available on this host.
+//! Failed discovery falls back to the unchanged personal path; explicit login
+//! refusals instead report an expired session.
+//!
+//! The personal path uses two hosts: its token-plan PAGE (`home.qwencloud.com`)
+//! supplies the per-session `SEC_TOKEN`; the quota call itself goes to the console data
 //! gateway at `cs-data.qwencloud.com` (same-site, so the `qwencloud.com` cookies
 //! apply), with `Origin: https://home.qwencloud.com`. Posting the quota action to
 //! `home.qwencloud.com` instead returns an empty success — the gateway host matters.
 //!
-//! KNOWN LIMITATION (entitled view; no enforced signal in the console): the
+//! PERSONAL PLAN LIMITATION (entitled view; no enforced signal in the console): the
 //! `/usage` percentages are the *entitled* view — consumed usage divided by the
 //! current tier cap from `/quota-config`. The console exposes NO enforced-cap,
 //! absolute-used, or exhausted/limited field: the live `/usage`, `/quota-config`,
@@ -55,7 +62,11 @@
 //! apply their own cooldown. This module reports the console's entitled figure,
 //! the most accurate value the console provides.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -64,7 +75,7 @@ use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{AccountInfo, ExtraWindow, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -82,6 +93,13 @@ const TOKEN_PLAN_URL: &str =
 const USAGE_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
 const QUOTA_CONFIG_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config";
 const SUBSCRIPTION_URL: &str = "https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway&api=zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription";
+const TEAM_INFO_URL: &str = "https://home.qwencloud.com/tool/user/info.json";
+#[rustfmt::skip]
+const TEAM_HUMAN_URL: &str = "https://home.qwencloud.com/data/api.json?product=ea-service&action=LoadHumanInfo";
+const TEAM_SUMMARY_URL: &str = "https://home.qwencloud.com/data/api.json?product=BssOpenAPI-V3&action=GetSeatSubscriptionSummary";
+const TEAM_REFERER_URL: &str = "https://home.qwencloud.com/analytics/token-plan/team";
+const TEAM_PRODUCT: &str = "sfm_tokenplanteams_dp_intl";
+const TEAM_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
@@ -603,10 +621,325 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     })
 }
 
+#[derive(Debug)]
+struct TeamPlan {
+    usage: Usage,
+    plan_type: String,
+}
+
+#[derive(Debug)]
+enum TeamError {
+    Expired(FetchError),
+    Skipped(&'static str),
+}
+
+/// Discovery failures say nothing about entitlement. Only an affirmative empty
+/// summary or an inactive period means no active team plan; both allow personal
+/// usage to serve. Login refusals report `credential_rejected`, as the personal
+/// path does, so consumers know the session needs to be renewed.
+fn select_team(
+    result: Result<Option<TeamPlan>, TeamError>,
+    settle: impl FnOnce(Option<&'static str>),
+) -> Result<Option<TeamPlan>, FetchError> {
+    match result {
+        Ok(Some(plan)) => {
+            settle(None);
+            Ok(Some(plan))
+        }
+        Ok(None) => {
+            settle(Some("no active team plan"));
+            Ok(None)
+        }
+        Err(TeamError::Skipped(reason)) => {
+            settle(Some(reason));
+            Ok(None)
+        }
+        Err(TeamError::Expired(error)) => {
+            settle(None);
+            Err(error)
+        }
+    }
+}
+
+async fn team_json(
+    client: &reqwest::Client,
+    request: JsonRequest,
+    cookie: &str,
+    stage: &'static str,
+) -> Result<serde_json::Value, TeamError> {
+    let response = request
+        .timeout(TEAM_TIMEOUT)
+        .header(Header::new("Cookie", cookie))
+        .header(Header::new("Accept", "application/json"))
+        .header(Header::new("Referer", TEAM_REFERER_URL))
+        .send_raw(client)
+        .await
+        .map_err(|_| TeamError::Skipped(stage))?;
+    let sign_in_redirect = (300..400).contains(&response.status)
+        && response.header("location").is_some_and(|location| {
+            let lower = location.to_ascii_lowercase();
+            ["login", "signin", "sign-in"]
+                .iter()
+                .any(|s| lower.contains(s))
+        });
+    if response.status == 401 || response.status == 403 || sign_in_redirect {
+        return Err(TeamError::Expired(FetchError::Unauthorized(
+            "qwen-cloud Team session expired; sign in again".into(),
+        )));
+    }
+    if response.status != 200 {
+        return Err(TeamError::Skipped(stage));
+    }
+    let root: serde_json::Value = serde_json::from_slice(
+        response
+            .body_for_parsing()
+            .map_err(|_| TeamError::Skipped(stage))?,
+    )
+    .map_err(|_| TeamError::Skipped(stage))?;
+    if matches!(
+        root.get("code").and_then(serde_json::Value::as_str),
+        Some("ConsoleNeedLogin" | "BailianGateway.Login.NotLogined" | "NO_LOGIN")
+    ) {
+        return Err(TeamError::Expired(FetchError::Unauthorized(
+            "qwen-cloud Team login required".into(),
+        )));
+    }
+    root.is_object()
+        .then_some(root)
+        .ok_or(TeamError::Skipped(stage))
+}
+
+fn team_rpc_data(root: &serde_json::Value) -> Result<&serde_json::Value, TeamError> {
+    let data = root.get("data").filter(|data| data.is_object());
+    if root
+        .get("successResponse")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || data
+            .and_then(|data| data.get("Success"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        return Err(TeamError::Skipped("team RPC reported failure"));
+    }
+    if root
+        .get("successResponse")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        && root.get("code").and_then(serde_json::Value::as_str) != Some("200")
+    {
+        return Err(TeamError::Skipped("unreadable team gateway envelope"));
+    }
+    data.ok_or(TeamError::Skipped("unreadable team gateway envelope"))
+}
+
+/// Accept nonnegative finite JSON numbers or digit-only decimal strings, up to
+/// JavaScript's maximum safe integer, as CodexBar's team plugin does. Do not
+/// default a missing figure to zero: missing surplus is unknown, not exhausted.
+fn team_number(value: Option<&serde_json::Value>) -> Result<f64, TeamError> {
+    let number = match value {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => {
+            let (whole, fraction) = s
+                .split_once('.')
+                .map_or((s.as_str(), None), |(w, f)| (w, Some(f)));
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if !digits(whole) || fraction.is_some_and(|f| !digits(f)) {
+                return Err(TeamError::Skipped("invalid team credit count"));
+            }
+            s.parse().ok()
+        }
+        _ => None,
+    };
+    number
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0)
+        .ok_or(TeamError::Skipped("missing or invalid team credit count"))
+}
+
+fn team_millis(value: Option<&serde_json::Value>) -> Result<i64, TeamError> {
+    let millis = team_number(value)?;
+    if millis <= 0.0 || millis.fract() != 0.0 {
+        return Err(TeamError::Skipped("invalid team timestamp"));
+    }
+    Ok(millis as i64)
+}
+
+fn normalize_team_summary(
+    summary: &serde_json::Value,
+    now_ms: i64,
+) -> Result<Option<TeamPlan>, TeamError> {
+    if summary.get("Data").is_some_and(serde_json::Value::is_null) {
+        return Ok(None);
+    }
+    let data = summary
+        .get("Data")
+        .filter(|data| data.is_object())
+        .ok_or(TeamError::Skipped("unreadable team subscription"))?;
+    let groups = data
+        .get("SubscriptionGroupList")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TeamError::Skipped("unreadable team subscription groups"))?;
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    let start = team_millis(data.get("StartTime"))?;
+    let end = team_millis(data.get("EndTime"))?;
+    if end <= start {
+        return Err(TeamError::Skipped("invalid team subscription period"));
+    }
+    if now_ms < start || now_ms >= end {
+        return Ok(None);
+    }
+    if data.get("ProductCode").and_then(serde_json::Value::as_str) != Some(TEAM_PRODUCT) {
+        return Err(TeamError::Skipped("unexpected team subscription product"));
+    }
+    if groups.len() != 1 {
+        return Err(TeamError::Skipped("multiple team credit pools"));
+    }
+    let group = &groups[0];
+    let equities = group
+        .get("EquityList")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TeamError::Skipped("unreadable team credit equity"))?;
+    let credits: Vec<_> = equities
+        .iter()
+        .filter(|equity| {
+            equity.get("EquityCode").and_then(serde_json::Value::as_str) == Some("credit_value")
+        })
+        .collect();
+    if credits.len() != 1 {
+        return Err(TeamError::Skipped(
+            "ambiguous or missing team credit equity",
+        ));
+    }
+    let total = team_number(credits[0].get("TotalValue"))?;
+    let surplus = team_number(credits[0].get("SurplusValue"))?;
+    if total <= 0.0 || surplus > total {
+        return Err(TeamError::Skipped("invalid team credit count"));
+    }
+    let resets_at = match group.get("NextCycleFlushTime").filter(|v| !v.is_null()) {
+        Some(value) => Some(
+            epoch_ms_to_iso8601(team_millis(Some(value))?)
+                .ok_or(TeamError::Skipped("invalid team cycle reset"))?,
+        ),
+        None => None,
+    };
+    let spec = group
+        .get("SpecType")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| {
+            (1..=40).contains(&s.len())
+                && s.as_bytes()[0].is_ascii_lowercase()
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        });
+    let plan_type = spec.map_or_else(
+        || "Team Token Plan".into(),
+        |spec| format!("{}{} Team", spec[..1].to_ascii_uppercase(), &spec[1..]),
+    );
+    // Team is the shared subscription's credit allowance, not the personal plan's
+    // rolling five-hour/weekly/monthly token windows. Its percent is DERIVED from
+    // stated total and surplus; no count is reconstructed. The named extra gives
+    // it a distinct id/label. Publishing it again as primary/secondary/tertiary
+    // or as a spend balance would describe the same allowance twice.
+    let window = RateWindow {
+        window_kind: None,
+        used_percent: ((total - surplus) / total * 100.0).clamp(0.0, 100.0),
+        raw_used_percent: None,
+        resets_at,
+        window_minutes: None,
+        used_count: None,
+        total_count: None,
+        regeneration: None,
+        breakdown: None,
+    };
+    Ok(Some(TeamPlan {
+        usage: Usage {
+            extra_rate_windows: Some(vec![ExtraWindow {
+                id: Some("team".into()),
+                title: Some("Team".into()),
+                window: Some(window),
+            }]),
+            ..Usage::default()
+        },
+        plan_type,
+    }))
+}
+
+async fn fetch_team(
+    client: &reqwest::Client,
+    cookie: &str,
+    urls: [&str; 3],
+    now_ms: i64,
+) -> Result<Option<TeamPlan>, TeamError> {
+    let info = team_json(
+        client,
+        JsonRequest::get(urls[0]),
+        cookie,
+        "team user info request failed",
+    )
+    .await?;
+    let token = info
+        .get("data")
+        .and_then(|data| data.get("secToken"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(TeamError::Skipped("team user info has no secToken"))?;
+    let human = team_json(
+        client,
+        JsonRequest::post_form(
+            urls[1],
+            &[
+                ("product", "ea-service"),
+                ("action", "LoadHumanInfo"),
+                ("sec_token", token),
+                ("region", "ap-southeast-1"),
+                ("params", "{}"),
+            ],
+        )
+        .header(Header::new("Origin", "https://home.qwencloud.com")),
+        cookie,
+        "team billing selector request failed",
+    )
+    .await?;
+    let nbid = team_rpc_data(&human)?
+        .get("Data")
+        .and_then(|data| data.get("SellerInfoDto"))
+        .and_then(|seller| seller.get("Nbid"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(TeamError::Skipped("team billing selector has no Nbid"))?;
+    // Nbid identifies the billing account returned for this session, not the
+    // user's login UID. Without that selector, prefer personal usage rather than
+    // query a plan whose billing-account attribution we cannot establish.
+    let params = serde_json::json!({"productCode": TEAM_PRODUCT, "Nbid": nbid}).to_string();
+    let summary = team_json(
+        client,
+        JsonRequest::post_form(
+            urls[2],
+            &[
+                ("product", "BssOpenAPI-V3"),
+                ("action", "GetSeatSubscriptionSummary"),
+                ("sec_token", token),
+                ("region", "cn-hangzhou"),
+                ("params", &params),
+                ("language", "zh-CN"),
+            ],
+        )
+        .header(Header::new("Origin", "https://home.qwencloud.com")),
+        cookie,
+        "team summary request failed",
+    )
+    .await?;
+    normalize_team_summary(team_rpc_data(&summary)?, now_ms)
+}
+
 /// The Qwen Cloud token-plan usage provider.
 pub struct QwenCloudProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
+    team_http: Option<reqwest::Client>,
+    team_skips: Mutex<HashMap<String, &'static str>>,
 }
 
 impl QwenCloudProvider {
@@ -616,11 +949,47 @@ impl QwenCloudProvider {
     ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            // Inspect sign-in redirects before following them, without changing
+            // the personal path's existing HTTP client or redirect behavior.
+            team_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_idle_timeout(crate::http::POOL_IDLE_TIMEOUT)
+                .tcp_keepalive(crate::http::POOL_IDLE_TIMEOUT)
+                .build()
+                .ok(),
+            team_skips: Mutex::new(HashMap::new()),
             vault: crate::cookie_vault::CookieVault::new(
                 credential_source,
                 handle_loader,
                 COOKIE_FAMILY,
             ),
+        }
+    }
+
+    fn settle_team_skip(&self, handle_id: &str, reason: Option<&'static str>) {
+        let mut skips = self
+            .team_skips
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if skips.get(handle_id).copied() != reason {
+            match reason {
+                Some(reason) => eprintln!(
+                    "{} qwen-cloud Team skipped ({handle_id}): {reason}; trying personal plan",
+                    crate::LOG_TAG
+                ),
+                None => eprintln!(
+                    "{} qwen-cloud Team skip cleared ({handle_id})",
+                    crate::LOG_TAG
+                ),
+            }
+        }
+        match reason {
+            Some(reason) => {
+                skips.insert(handle_id.to_string(), reason);
+            }
+            None => {
+                skips.remove(handle_id);
+            }
         }
     }
 }
@@ -650,6 +1019,32 @@ impl UsageProvider for QwenCloudProvider {
             }
 
             let cookie_header = jar.header();
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_millis()).ok());
+            let team = match (&self.team_http, now_ms) {
+                (Some(client), Some(now_ms)) => {
+                    fetch_team(
+                        client,
+                        &cookie_header,
+                        [TEAM_INFO_URL, TEAM_HUMAN_URL, TEAM_SUMMARY_URL],
+                        now_ms,
+                    )
+                    .await
+                }
+                _ => Err(TeamError::Skipped("team client or clock unavailable")),
+            };
+            if let Some(team) = select_team(team, |reason| {
+                self.settle_team_skip(handle.stable_id(), reason)
+            })? {
+                let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, source, team.usage);
+                entry.account_info = Some(AccountInfo {
+                    plan_type: Some(team.plan_type),
+                    ..AccountInfo::default()
+                });
+                return Ok(entry);
+            }
             let token_page = JsonRequest::get(TOKEN_PLAN_URL)
                 .timeout(REQUEST_TIMEOUT)
                 .header(Header::new("Cookie", &cookie_header))
@@ -739,6 +1134,341 @@ impl UsageProvider for QwenCloudProvider {
 
 #[cfg(test)]
 mod tests {
+
+    // UPSTREAM-SHAPED fixtures: field names, envelopes and selection rules come
+    // from CodexBar v0.74.0 qwencloud-team.ts. Values are synthetic; these are not
+    // captured account balances or evidence of live Team access.
+    const TEAM_NOW_MS: i64 = 1_791_000_000_000;
+    const TEAM_INFO: &str = r#"{"data":{"secToken":"team-sec-token"}}"#;
+    const TEAM_HUMAN: &str = r#"{"successResponse":true,"data":{"Success":true,"Data":{"SellerInfoDto":{"Nbid":"seller-123"}}}}"#;
+    const TEAM_SUMMARY: &str = r#"{"successResponse":true,"data":{"Success":true,"Data":{"ProductCode":"sfm_tokenplanteams_dp_intl","StartTime":1790000000000,"EndTime":1792000000000,"SubscriptionGroupList":[{"SpecType":"pro","SubscriptionAssignedNumber":3,"SubscriptionTotalNumber":5,"NextCycleFlushTime":1791043200000,"EquityList":[{"EquityCode":"credit_value","TotalValue":"1000.50","SurplusValue":"750.375"}]}]}}}"#;
+
+    async fn team_fixture(
+        replies: Vec<(u16, String, Option<&'static str>)>,
+    ) -> (Result<Option<TeamPlan>, TeamError>, Vec<String>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body, location) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(crate::loopback::read_request(&mut socket).await);
+                let location = location
+                    .map(|l| format!("Location: {l}\r\n"))
+                    .unwrap_or_default();
+                socket.write_all(format!("HTTP/1.1 {status} fixture\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let urls = [
+            format!("{base}/tool/user/info.json"),
+            format!("{base}/data/api.json?product=ea-service&action=LoadHumanInfo"),
+            format!("{base}/data/api.json?product=BssOpenAPI-V3&action=GetSeatSubscriptionSummary"),
+        ];
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let result = fetch_team(
+            &client,
+            "login_qwencloud_ticket=fixture-ticket",
+            [&urls[0], &urls[1], &urls[2]],
+            TEAM_NOW_MS,
+        )
+        .await;
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        (result, requests)
+    }
+
+    fn team_replies(summary: &str) -> Vec<(u16, String, Option<&'static str>)> {
+        [TEAM_INFO, TEAM_HUMAN, summary]
+            .into_iter()
+            .map(|body| (200, body.into(), None))
+            .collect()
+    }
+
+    fn team_summary_value() -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(TEAM_SUMMARY).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn active_team_plan_publishes_one_distinct_credit_window() {
+        let (result, requests) = team_fixture(team_replies(TEAM_SUMMARY)).await;
+        let plan = select_team(result, |reason| assert_eq!(reason, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.plan_type, "Pro Team");
+        assert!(plan.usage.primary.is_none());
+        assert!(plan.usage.secondary.is_none());
+        assert!(plan.usage.tertiary.is_none());
+        let extras = plan.usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].id.as_deref(), Some("team"));
+        assert_eq!(extras[0].title.as_deref(), Some("Team"));
+        let window = extras[0].window.as_ref().unwrap();
+        assert_eq!(window.used_percent, 25.0);
+        assert_eq!(window.resets_at.as_deref(), Some("2026-10-03T16:00:00Z"));
+        assert!(window.used_count.is_none());
+        assert!(window.total_count.is_none());
+        assert!(window.window_kind.is_none());
+        assert!(window.window_minutes.is_none());
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /tool/user/info.json HTTP/1.1"));
+        for request in &requests {
+            let headers = request
+                .split("\r\n\r\n")
+                .next()
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("cookie: login_qwencloud_ticket=fixture-ticket"));
+            assert!(headers.contains("accept: application/json"));
+            assert!(
+                headers.contains("referer: https://home.qwencloud.com/analytics/token-plan/team")
+            );
+        }
+        assert!(requests[1]
+            .starts_with("POST /data/api.json?product=ea-service&action=LoadHumanInfo HTTP/1.1"));
+        assert!(requests[2].starts_with(
+            "POST /data/api.json?product=BssOpenAPI-V3&action=GetSeatSubscriptionSummary HTTP/1.1"
+        ));
+        let human: HashMap<_, _> =
+            url::form_urlencoded::parse(requests[1].split_once("\r\n\r\n").unwrap().1.as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(human.len(), 5);
+        assert_eq!(human["product"], "ea-service");
+        assert_eq!(human["action"], "LoadHumanInfo");
+        assert_eq!(human["region"], "ap-southeast-1");
+        assert_eq!(human["sec_token"], "team-sec-token");
+        assert_eq!(human["params"], "{}");
+        let summary: HashMap<_, _> =
+            url::form_urlencoded::parse(requests[2].split_once("\r\n\r\n").unwrap().1.as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(summary.len(), 6);
+        assert_eq!(summary["product"], "BssOpenAPI-V3");
+        assert_eq!(summary["action"], "GetSeatSubscriptionSummary");
+        assert_eq!(summary["region"], "cn-hangzhou");
+        assert_eq!(summary["language"], "zh-CN");
+        assert_eq!(summary["sec_token"], "team-sec-token");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary["params"]).unwrap(),
+            serde_json::json!({"productCode":"sfm_tokenplanteams_dp_intl","Nbid":"seller-123"})
+        );
+        for request in &requests[1..] {
+            let headers = request
+                .split("\r\n\r\n")
+                .next()
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("origin: https://home.qwencloud.com"));
+            assert!(headers.contains("content-type: application/x-www-form-urlencoded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_active_team_plan_falls_back_to_personal_windows() {
+        let mut inactive = team_summary_value();
+        inactive["Data"]["EndTime"] = serde_json::json!(TEAM_NOW_MS);
+        for data in [
+            serde_json::json!({"Data":null}),
+            serde_json::json!({"Data":{"SubscriptionGroupList":[]}}),
+            inactive,
+        ] {
+            let summary = serde_json::json!({"code":"200","data":data}).to_string();
+            let (team, _) = team_fixture(team_replies(&summary)).await;
+            let selected = select_team(team, |reason| {
+                assert_eq!(reason, Some("no active team plan"))
+            })
+            .unwrap();
+            assert!(selected.is_none());
+            let personal = normalize_usage(HAR_RESPONSE.as_bytes()).unwrap();
+            assert_eq!(personal.primary.unwrap().window_minutes, Some(300));
+            assert_eq!(personal.secondary.unwrap().window_minutes, Some(10080));
+            assert!(personal.extra_rate_windows.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn team_discovery_failures_keep_personal_usage_serving() {
+        let failures = [
+            vec![(200, r#"{"data":{}}"#.into(), None)],
+            vec![(500, "request failed".into(), None)],
+            vec![
+                (200, TEAM_INFO.into(), None),
+                (
+                    200,
+                    r#"{"successResponse":true,"data":{"Data":{"SellerInfoDto":{}}}}"#.into(),
+                    None,
+                ),
+            ],
+            vec![
+                (200, TEAM_INFO.into(), None),
+                (503, "request failed".into(), None),
+            ],
+            team_replies("not JSON"),
+            team_replies(r#"{"successResponse":false,"data":{"Data":null}}"#),
+            team_replies(r#"{"successResponse":true,"data":{"Success":false,"Data":null}}"#),
+            team_replies(r#"{"successResponse":true,"data":{}}"#),
+        ];
+        for replies in failures {
+            let (team, _) = team_fixture(replies).await;
+            let selected = select_team(team, |reason| {
+                let reason = reason.expect("a failed request must explain the skip");
+                assert_ne!(reason, "no active team plan");
+            })
+            .expect("a team discovery failure must not suppress personal usage");
+            let usage = match selected {
+                Some(plan) => plan.usage,
+                None => normalize_usage(HAR_RESPONSE.as_bytes()).unwrap(),
+            };
+            assert!((usage.primary.unwrap().used_percent - 13.1177).abs() < 0.001);
+            assert!(usage.secondary.is_some());
+        }
+    }
+
+    #[test]
+    fn team_missing_surplus_is_unknown_not_exhaustion() {
+        for surplus in [None, Some(serde_json::Value::Null)] {
+            let mut summary = team_summary_value();
+            let equity = summary["Data"]["SubscriptionGroupList"][0]["EquityList"][0]
+                .as_object_mut()
+                .unwrap();
+            equity.remove("SurplusValue");
+            if let Some(surplus) = surplus {
+                equity.insert("SurplusValue".into(), surplus);
+            }
+            assert!(
+                matches!(
+                    normalize_team_summary(&summary, TEAM_NOW_MS),
+                    Err(TeamError::Skipped(_))
+                ),
+                "missing surplus cannot publish a 100% used window"
+            );
+        }
+    }
+
+    #[test]
+    fn team_summary_rejects_another_products_credit_pool() {
+        let mut summary = team_summary_value();
+        summary["Data"]["ProductCode"] = serde_json::json!("sfm_tokenplansolo_public_intl");
+        assert!(matches!(
+            normalize_team_summary(&summary, TEAM_NOW_MS),
+            Err(TeamError::Skipped("unexpected team subscription product"))
+        ));
+    }
+
+    #[test]
+    fn team_summary_refuses_unreadable_or_ambiguous_allowances() {
+        for (pointer, value) in [
+            ("/Data/StartTime", serde_json::json!(0)),
+            ("/Data/EndTime", serde_json::json!(1790000000000i64)),
+            ("/Data/SubscriptionGroupList", serde_json::json!([{}, {}])),
+            (
+                "/Data/SubscriptionGroupList/0/EquityList",
+                serde_json::json!([]),
+            ),
+            (
+                "/Data/SubscriptionGroupList/0/EquityList",
+                serde_json::json!([{"EquityCode":"credit_value"},{"EquityCode":"credit_value"}]),
+            ),
+            (
+                "/Data/SubscriptionGroupList/0/EquityList/0/TotalValue",
+                serde_json::json!(0),
+            ),
+            (
+                "/Data/SubscriptionGroupList/0/EquityList/0/SurplusValue",
+                serde_json::json!(1001),
+            ),
+            (
+                "/Data/SubscriptionGroupList/0/NextCycleFlushTime",
+                serde_json::json!(1.5),
+            ),
+        ] {
+            let mut summary = team_summary_value();
+            *summary.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                matches!(
+                    normalize_team_summary(&summary, TEAM_NOW_MS),
+                    Err(TeamError::Skipped(_))
+                ),
+                "{pointer}"
+            );
+        }
+        assert!(matches!(
+            normalize_team_summary(&serde_json::json!({}), TEAM_NOW_MS),
+            Err(TeamError::Skipped(_))
+        ));
+        let mut summary = team_summary_value();
+        summary["Data"]["SubscriptionGroupList"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("NextCycleFlushTime");
+        summary["Data"]["SubscriptionGroupList"][0]["SpecType"] = serde_json::json!("<unsafe>");
+        let plan = normalize_team_summary(&summary, TEAM_NOW_MS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.plan_type, "Team Token Plan");
+        assert!(plan.usage.extra_rate_windows.unwrap()[0]
+            .window
+            .as_ref()
+            .unwrap()
+            .resets_at
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn team_sign_in_redirects_and_refusals_are_expired_sessions() {
+        for step in 0..3 {
+            for reply in [
+                (
+                    302,
+                    String::new(),
+                    Some("https://account.qwencloud.com/login"),
+                ),
+                (401, "expired".into(), None),
+                (403, "expired".into(), None),
+                (200, r#"{"code":"NO_LOGIN"}"#.into(), None),
+                (200, r#"{"code":"ConsoleNeedLogin"}"#.into(), None),
+                (
+                    200,
+                    r#"{"code":"BailianGateway.Login.NotLogined"}"#.into(),
+                    None,
+                ),
+            ] {
+                let mut replies = team_replies(TEAM_SUMMARY);
+                replies.truncate(step);
+                replies.push(reply);
+                let (result, _) = team_fixture(replies).await;
+                let error = select_team(result, |_| {}).unwrap_err();
+                assert_eq!(error.error_class(), "credential_rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn team_credit_numbers_follow_the_plugins_safe_decimal_grammar() {
+        for value in [
+            serde_json::json!("-1"),
+            serde_json::json!(" 1"),
+            serde_json::json!("1."),
+            serde_json::json!("1e3"),
+            serde_json::json!("1,000"),
+            serde_json::json!(true),
+            serde_json::json!(9007199254740992u64),
+        ] {
+            assert!(team_number(Some(&value)).is_err(), "{value}");
+        }
+        for value in [serde_json::json!("1.25"), serde_json::json!(1.25)] {
+            assert_eq!(team_number(Some(&value)).unwrap(), 1.25);
+        }
+    }
 
     /// A gateway success with an explicitly null plan block is NOT a decode error.
     ///
