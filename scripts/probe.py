@@ -13,6 +13,7 @@ everything before touching the file, and restores from that index afterwards,
 which makes the destructive version unreachable rather than discouraged.
 
     probe.py <file> <old-text> <new-text> [-- cargo test args...]
+    probe.py --self-test  # checks restoration when signal.SIGHUP is unavailable
 
 Exit codes: 0 nothing reddened, 1 A NAMED TEST reddened (the usual proof), 2 no
 proof could be established -- the mutation would not build, the tree could not be
@@ -24,16 +25,9 @@ cannot miss it whatever that verdict turns out to be. A grep is an ALLOW-LIST OV
 OUTCOMES: it shows only what matches, so an outcome you did not anticipate prints
 NOTHING, and nothing reads as quiet success rather than as a failure to classify.
 
-SUBC lost a real refusal to exactly this on their placement gate tonight -- their
-habitual grep returned empty against a refusal from a code path they had not met,
-because the tool carried TWO refusal vocabularies and their pattern knew one. No
-pattern could have been right there; the tool disagreed with itself.
-
 This tool avoids that at the source by classifying its own outcome and carrying it
 in the EXIT CODE, which is a closed set a caller cannot mis-spell. The positional
-filter is the second line, for the human reading along. Stated here rather than
-left to habit because the safe shape was originally chosen for being short, and
-nobody remembers that a property was luck.
+filter lets a reader see the final verdict without suppressing unfamiliar outcomes.
 
 HUNG EXITS 2, NOT 1, and the reason is worth stating because the text and the exit
 code used to disagree. A hang IS evidence that the mutated thing is load-bearing,
@@ -46,6 +40,7 @@ nobody wrote. The exit code names the mechanism; only the text carries the inten
 import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -54,6 +49,49 @@ TIMEOUT_SECS = 600
 
 def run(args, **kwargs):
     return subprocess.run(args, cwd=REPO, capture_output=True, text=True, **kwargs)
+
+
+@contextmanager
+def restoring_source(rel, path, source):
+    """Arm restoration before signal registration or a source write can fail."""
+    previous_handlers = {}
+    received_signal = None
+    restoring = False
+
+    def _restore_on_signal(signum, _frame):
+        nonlocal received_signal
+        if restoring:
+            return
+        received_signal = signum
+        sys.exit(128 + signum)
+
+    try:
+        for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is not None:
+                previous_handlers[sig] = signal.signal(sig, _restore_on_signal)
+        yield
+    finally:
+        # Repeated interrupts must not interrupt the restore itself.
+        restoring = True
+        # Restore the file before resetting handlers: either operation can fail,
+        # but a handler-registration error must never strand mutated source.
+        try:
+            restored = run(["git", "checkout", "--", rel])
+            # Invalidate compiled mutants even when checkout restores identical bytes.
+            if path.exists():
+                path.touch()
+            if restored.returncode != 0 or path.read_text() != source:
+                raise RuntimeError(f"RESTORE FAILED for {rel} -- fix the tree before continuing")
+            if received_signal is not None:
+                print(f"  restored {rel} on signal {received_signal}", file=sys.stderr)
+            else:
+                print("  restored")
+            diff = run(["git", "diff", "--stat"])
+            print(f"  git diff --stat after restore: {diff.stdout.strip() or '(empty)'}")
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
 
 def main(argv):
@@ -79,6 +117,11 @@ def main(argv):
     if staged.returncode != 0:
         print(f"  could not stage: {staged.stderr.strip()}", file=sys.stderr)
         return 2
+    diff = run(["git", "diff", "--stat"])
+    if diff.returncode != 0 or diff.stdout.strip():
+        print("  staging did not leave an empty working diff; nothing mutated", file=sys.stderr)
+        return 2
+    print("  git diff --stat before mutation: (empty)")
 
     source = path.read_text()
     if old == new:
@@ -109,30 +152,6 @@ def main(argv):
         print(f"  pattern occurs {occurrences} times in {rel}; make it unique", file=sys.stderr)
         return 2
 
-    path.write_text(source.replace(old, new, 1))
-    print(f"  mutated {rel}")
-
-    # The restore runs in `finally` so that an interrupt cannot leave the tree
-    # mutated. Without it, Ctrl-C during a slow suite exits with the mutation
-    # still applied and nothing saying so -- and the next thing anyone runs
-    # reports on code they did not write.
-    #
-    # `finally` covers Ctrl-C, which arrives as an exception and unwinds. It does
-    # NOT cover SIGTERM, which terminates the process without unwinding -- so a
-    # `timeout` around this script, or any supervisor killing it, leaves the
-    # mutation in place. That is not hypothetical: it happened to the sibling
-    # audit script today, and a neutralised checker rule reached master under a
-    # `git add -A`. Both paths now reach the same restore.
-    def _restore_on_signal(signum, _frame):
-        run(["git", "checkout", "--", rel])
-        print(f"  restored {rel} on signal {signum}", file=sys.stderr)
-        sys.exit(128 + signum)
-
-    previous_handlers = {
-        sig: signal.signal(sig, _restore_on_signal)
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-    }
-
     # BUILD FIRST, WITH NO DEADLINE, THEN RUN THE TESTS UNDER ONE. The deadline
     # exists to catch a mutant that makes a test loop forever. Applied to build
     # and run together, it also fires on a slow COMPILE, and a loaded host makes
@@ -141,45 +160,30 @@ def main(argv):
     # "load-bearing" about code whose tests had never started.
     cargo_args = test_args[: test_args.index("--")] if "--" in test_args else test_args
     try:
-        built = run(["cargo", "test", *cargo_args, "--no-run"])
-        if built.returncode != 0:
-            ran, failed, outcome = False, [], "did-not-build"
-        else:
-            result = run(["cargo", "test", *test_args], timeout=TIMEOUT_SECS)
-            ran = "\ntest result:" in result.stdout or result.stdout.startswith("test result:")
-            failed = [
-                line.split()[1]
-                for line in result.stdout.splitlines()
-                if line.startswith("test ") and line.endswith("FAILED")
-            ]
-            outcome = "ran" if ran else "did-not-build"
+        with restoring_source(rel, path, source):
+            path.write_text(source.replace(old, new, 1))
+            print(f"  mutated {rel}")
+            diff = run(["git", "diff", "--stat"])
+            if diff.returncode != 0 or not diff.stdout.strip():
+                raise RuntimeError("mutation did not produce a non-empty working diff")
+            print(f"  git diff --stat during mutation:\n{diff.stdout.rstrip()}")
+            built = run(["cargo", "test", *cargo_args, "--no-run"])
+            if built.returncode != 0:
+                ran, failed, outcome = False, [], "did-not-build"
+            else:
+                result = run(["cargo", "test", *test_args], timeout=TIMEOUT_SECS)
+                ran = "\ntest result:" in result.stdout or result.stdout.startswith("test result:")
+                failed = [
+                    line.split()[1]
+                    for line in result.stdout.splitlines()
+                    if line.startswith("test ") and line.endswith("FAILED")
+                ]
+                outcome = "ran" if ran else "did-not-build"
     except subprocess.TimeoutExpired:
         ran, failed, outcome = False, [], "hung"
-    finally:
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
-        restored = run(["git", "checkout", "--", rel])
-        # BUMP THE MTIME AFTER RESTORING. `git checkout --` writes the original
-        # bytes back, and a build system keying on mtime can then leave the
-        # MUTANT's compiled artefacts in place: the source is correct, the binary
-        # is not, and every later run in this session describes code that is no
-        # longer on disk. Hit for real on 2026-09-02, where a restored build.rs
-        # did not re-run its build script.
-        #
-        # Unconditional rather than gated on a comparison: a spurious rebuild
-        # costs seconds, and a skipped one costs a wrong verdict that looks
-        # exactly like a right one.
-        if path.exists():
-            path.touch()
-        if restored.returncode != 0 or path.read_text() != source:
-            # Louder than a failed proof: the tree is now wrong, and every later
-            # result in this session would describe mutated code.
-            print(
-                f"  !! RESTORE FAILED for {rel} -- fix the tree before continuing",
-                file=sys.stderr,
-            )
-            return 2
-        print("  restored")
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"  !! {error}", file=sys.stderr)
+        return 2
 
     if outcome == "hung":
         # A third outcome, distinct from red and green: the build finished and
@@ -203,5 +207,78 @@ def main(argv):
     return 0
 
 
+def self_test():
+    """Exercise restoration with Windows-like signals and interrupted setup."""
+    import tempfile
+    import types
+    import unittest
+    from unittest.mock import patch
+
+    class RestorationTests(unittest.TestCase):
+        def setUp(self):
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.root = Path(self.temp.name)
+            self.path = self.root / "source.txt"
+            self.path.write_text("original")
+            for args in (["git", "init", "-q"], ["git", "add", "source.txt"]):
+                subprocess.run(args, cwd=self.root, check=True, capture_output=True)
+            self.repo_patch = patch.dict(globals(), REPO=self.root)
+            self.repo_patch.start()
+            self.addCleanup(self.repo_patch.stop)
+
+        def test_missing_sighup_restores_mutated_file(self):
+            registered = []
+            windows_signals = types.SimpleNamespace(
+                SIGTERM=15, SIGINT=2,
+                signal=lambda sig, handler: registered.append(sig),
+            )
+            real_run = run
+            cargo_calls = []
+
+            def fake_cargo(args, **kwargs):
+                if args[0] != "cargo":
+                    return real_run(args, **kwargs)
+                self.assertEqual(self.path.read_text(), "mutated")
+                cargo_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, stdout="test result: ok. 1 passed\n", stderr="")
+
+            with patch.dict(globals(), signal=windows_signals, run=fake_cargo):
+                self.assertEqual(main(["source.txt", "original", "mutated"]), 0)
+            self.assertEqual(self.path.read_text(), "original")
+            self.assertEqual(len(cargo_calls), 2, "both build and test must observe the mutant")
+            self.assertEqual(registered, [15, 2, 15, 2])
+
+        def test_registration_failure_restores_file(self):
+            def fail_registration(_sig, _handler):
+                # Simulate a setup failure after a write to check the finally guard.
+                self.path.write_text("mutated")
+                raise ValueError("registration failed")
+
+            windows_signals = types.SimpleNamespace(SIGTERM=15, signal=fail_registration)
+            with patch.dict(globals(), signal=windows_signals):
+                with self.assertRaisesRegex(ValueError, "registration failed"):
+                    with restoring_source("source.txt", self.path, "original"):
+                        self.fail("setup should fail before yielding")
+            self.assertEqual(self.path.read_text(), "original")
+
+        def test_signal_during_mutation_restores_file(self):
+            handlers = []
+            supported = types.SimpleNamespace(
+                SIGTERM=15,
+                signal=lambda _sig, handler: handlers.append(handler),
+            )
+            with patch.dict(globals(), signal=supported):
+                with self.assertRaises(SystemExit) as exit:
+                    with restoring_source("source.txt", self.path, "original"):
+                        self.path.write_text("mutated")
+                        handlers[0](15, None)
+            self.assertEqual(exit.exception.code, 143)
+            self.assertEqual(self.path.read_text(), "original")
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(RestorationTests)
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(self_test() if sys.argv[1:] == ["--self-test"] else main(sys.argv[1:]))

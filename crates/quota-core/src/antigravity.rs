@@ -57,9 +57,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use crate::credential_source::{CredentialSource, VaultGetError};
 use crate::provider::AccountObservation;
-#[cfg(any(target_os = "macos", test))]
-use crate::subprocess::SubprocessError;
-use crate::subprocess::{BoundedCommand, Gate};
+use crate::subprocess::{BoundedCommand, Gate, SubprocessError};
 use crate::vault_handles::VaultHandleLoader;
 
 use async_trait::async_trait;
@@ -586,7 +584,7 @@ fn emails_match(expected: Option<&str>, local: Option<&str>) -> bool {
 const SESSION_WINDOW_MINUTES: i64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
 
-// ---- process + port discovery (macOS) ---------------------------------------
+// ---- process + port discovery ----------------------------------------------
 
 /// A discovered Antigravity language-server process and how to talk to it.
 #[derive(Clone, Debug)]
@@ -606,29 +604,39 @@ struct LocalSnapshot {
 /// Whether a command line is an Antigravity language server or `agy` CLI, and the
 /// CSRF token to use (empty string = CLI, needs none; None = app/IDE with no token,
 /// which we cannot auth so skip).
-#[cfg(any(target_os = "macos", test))]
 fn classify_command(command: &str) -> Option<String> {
-    let lower = command.to_ascii_lowercase();
+    if command_requires_csrf(command)? {
+        // app/IDE language server: requires a --csrf_token; skip if absent.
+        extract_csrf_token(command)
+    } else {
+        // CLI language server: no token required.
+        Some(String::new())
+    }
+}
+
+/// The same identification is used for argv and Windows' image-path prefilter.
+fn command_requires_csrf(command: &str) -> Option<bool> {
+    let lower = command.to_ascii_lowercase().replace('\\', "/");
     let is_language_server = lower.contains("language_server") || lower.contains("language-server");
     let is_antigravity = lower.contains("antigravity");
     let is_cli = lower.contains("antigravity-cli")
         || lower.contains("antigravity_cli")
         || lower.contains("/agy ")
-        || lower.ends_with("/agy");
+        || lower.ends_with("/agy")
+        || lower.contains("/agy.exe ")
+        || lower.contains("/agy.exe\"")
+        || lower.ends_with("/agy.exe");
 
     if is_language_server && is_antigravity {
-        // app/IDE language server: requires a --csrf_token; skip if absent.
-        return extract_csrf_token(command);
+        return Some(true);
     }
     if is_cli {
-        // CLI language server: no token required.
-        return Some(String::new());
+        return Some(false);
     }
     None
 }
 
 /// Extract the value of `--csrf_token` (`--csrf_token=VALUE` or `--csrf_token VALUE`).
-#[cfg(any(target_os = "macos", test))]
 fn extract_csrf_token(command: &str) -> Option<String> {
     let flag = "--csrf_token";
     let at = command.find(flag)? + flag.len();
@@ -686,6 +694,17 @@ fn parse_listening_ports(output: &str) -> Vec<u16> {
             }
         }
     }
+    select_ports(0, ports.into_iter().map(|port| (0, port)))
+}
+
+/// Select one owner's ports consistently across lsof, procfs and TCP owner tables.
+fn select_ports(pid: i32, rows: impl IntoIterator<Item = (i32, u16)>) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for (owner, port) in rows {
+        if owner == pid && !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
     ports
 }
 
@@ -704,27 +723,28 @@ const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Measured on the same host at 0.02-0.05 s for one process. Five seconds for
 /// the same reason as [`PROCESS_SCAN_TIMEOUT`]: generous for a working scan and
 /// bounded for a stuck one.
-#[cfg(target_os = "macos")]
 const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Lets only one process-table scan run at a time, so at most one `ps` child is
-/// alive even while one is stuck.
-static PROCESS_SCAN_GATE: Gate = Gate::new("/bin/ps -ax -o pid=,command=");
+/// Lets only one process-table scan run at a time, including a native worker or
+/// `ps` child whose caller has already timed out.
+static PROCESS_SCAN_GATE: Gate = Gate::new("Antigravity process scan");
 
-/// Lets only one port scan run at a time, so at most one `lsof` child is alive
-/// even while one is stuck.
-#[cfg(target_os = "macos")]
-static PORT_SCAN_GATE: Gate = Gate::new("lsof -nP -iTCP -sTCP:LISTEN");
+/// Lets only one port scan run at a time, including a native worker or `lsof`
+/// child whose caller has already timed out.
+static PORT_SCAN_GATE: Gate = Gate::new("Antigravity listening-port scan");
 
 /// The process-table scan discovery runs: the real `/bin/ps`, bounded by
 /// [`PROCESS_SCAN_TIMEOUT`]. Tests substitute their own command.
-fn process_scan() -> BoundedCommand {
-    BoundedCommand::new(
+fn process_scan() -> Option<BoundedCommand> {
+    #[cfg(target_os = "macos")]
+    return Some(BoundedCommand::new(
         &PROCESS_SCAN_GATE,
         "/bin/ps",
         ["-ax", "-o", "pid=,command="],
         PROCESS_SCAN_TIMEOUT,
-    )
+    ));
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Report a scan that could not run as "could not look".
@@ -733,7 +753,6 @@ fn process_scan() -> BoundedCommand {
 /// serving, and worded so a reader can tell it apart from "no Antigravity
 /// running": a stalled process table says nothing about whether the editor is
 /// open.
-#[cfg(any(target_os = "macos", test))]
 fn could_not_look(what: &str, error: &SubprocessError) -> FetchError {
     FetchError::LocalSourceUnavailable(format!("could not {what}: {error}"))
 }
@@ -745,7 +764,9 @@ fn could_not_look(what: &str, error: &SubprocessError) -> FetchError {
 /// `Err`, never an empty list: an empty list is published as "no Antigravity
 /// running", which is a different fact.
 #[cfg(any(target_os = "macos", test))]
-async fn discover_servers(scan: &BoundedCommand) -> Result<Vec<LocalServer>, FetchError> {
+async fn discover_servers_with_command(
+    scan: &BoundedCommand,
+) -> Result<Vec<LocalServer>, FetchError> {
     let output = match scan.output().await {
         Ok(output) => output,
         Err(error) => return Err(could_not_look("list processes", &error)),
@@ -759,9 +780,30 @@ async fn discover_servers(scan: &BoundedCommand) -> Result<Vec<LocalServer>, Fet
     Ok(parse_process_list(&String::from_utf8_lossy(&output.stdout)))
 }
 
-#[cfg(not(any(target_os = "macos", test)))]
-async fn discover_servers(_scan: &BoundedCommand) -> Result<Vec<LocalServer>, FetchError> {
-    Ok(Vec::new())
+async fn discover_servers(scan: &Option<BoundedCommand>) -> Result<Vec<LocalServer>, FetchError> {
+    #[cfg(any(target_os = "macos", test))]
+    if let Some(scan) = scan {
+        return discover_servers_with_command(scan).await;
+    }
+    #[cfg(not(any(target_os = "macos", test)))]
+    let _ = scan;
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let processes = PROCESS_SCAN_GATE
+            .run_blocking(PROCESS_SCAN_TIMEOUT, native_processes)
+            .await
+            .map_err(|error| could_not_look("list processes", &error))?;
+        Ok(processes
+            .into_iter()
+            .filter_map(|(pid, command)| {
+                classify_command(&command).map(|csrf_token| LocalServer { pid, csrf_token })
+            })
+            .collect())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    Err(FetchError::LocalSourceUnavailable(
+        "could not list processes: no native enumerator".into(),
+    ))
 }
 
 /// The loopback ports a server process listens on.
@@ -800,9 +842,590 @@ async fn discover_ports(pid: i32) -> Result<Vec<u16>, FetchError> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", windows))]
+async fn discover_ports(pid: i32) -> Result<Vec<u16>, FetchError> {
+    PORT_SCAN_GATE
+        .run_blocking(PORT_SCAN_TIMEOUT, move |deadline| {
+            native_ports(pid, deadline)
+        })
+        .await
+        .map_err(|error| could_not_look("list listening ports", &error))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 async fn discover_ports(_pid: i32) -> Result<Vec<u16>, FetchError> {
-    Ok(Vec::new())
+    Err(FetchError::LocalSourceUnavailable(
+        "could not list listening ports: no native enumerator".into(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn scan_deadline(deadline: std::time::Instant) -> std::io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native scan deadline expired",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Decode procfs argv without retaining NUL separators in the shared matcher.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_cmdline(bytes: &[u8]) -> String {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// LISTEN rows have a hexadecimal local port and a decimal inode in field ten.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_tcp(output: &str) -> Vec<(u64, u16)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" {
+                return None;
+            }
+            let (address, port) = fields[1].split_once(':')?;
+            if !matches!(address.len(), 8 | 32)
+                || !address.bytes().all(|b| b.is_ascii_hexdigit())
+                || port.len() != 4
+            {
+                return None;
+            }
+            Some((fields[9].parse().ok()?, u16::from_str_radix(port, 16).ok()?))
+        })
+        .collect()
+}
+
+/// Decode collected procfs entries independently of filesystem access, so the
+/// Linux discovery logic can be fixture-tested on every supported platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn enumerate_proc_cmdlines(
+    entries: impl IntoIterator<Item = (i32, Vec<u8>)>,
+) -> Vec<(i32, String)> {
+    entries
+        .into_iter()
+        .map(|(pid, bytes)| (pid, parse_proc_cmdline(&bytes)))
+        .collect()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_socket_inode(target: &str) -> Option<u64> {
+    target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// A socket table is shared by processes; only inodes from this pid's fd table
+/// may supply candidate ports.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn select_proc_ports(
+    pid: i32,
+    inodes: &HashSet<u64>,
+    rows: impl IntoIterator<Item = (u64, u16)>,
+) -> Vec<u16> {
+    select_ports(
+        pid,
+        rows.into_iter()
+            .filter_map(|(inode, port)| inodes.contains(&inode).then_some((pid, port))),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_file(
+    path: &std::path::Path,
+    cap: u64,
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    scan_deadline(deadline)?;
+    // procfs files have no useful metadata length. Cap reads and refuse symlinks
+    // or blocking opens, including when this reader is used with fixture roots.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    scan_deadline(deadline)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "procfs entry exceeds scan cap",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_processes(
+    root: &std::path::Path,
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<(i32, String)>> {
+    scan_deadline(deadline)?;
+    let entries = std::fs::read_dir(root)?;
+    let mut processes = Vec::new();
+    let mut readable = false;
+    for entry in entries {
+        scan_deadline(deadline)?;
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        // A disappearing or inaccessible process is normal during enumeration.
+        let Ok(bytes) = read_proc_file(&entry.path().join("cmdline"), 64 * 1024, deadline) else {
+            continue;
+        };
+        readable = true;
+        processes.push((pid, bytes));
+    }
+    scan_deadline(deadline)?;
+    if !readable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no readable procfs command lines",
+        ));
+    }
+    Ok(enumerate_proc_cmdlines(processes))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ports(
+    root: &std::path::Path,
+    pid: i32,
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u16>> {
+    scan_deadline(deadline)?;
+    let mut inodes = HashSet::new();
+    for entry in std::fs::read_dir(root.join(pid.to_string()).join("fd"))? {
+        scan_deadline(deadline)?;
+        let Ok(entry) = entry else { continue };
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(inode) = target.to_str().and_then(proc_socket_inode) else {
+            continue;
+        };
+        inodes.insert(inode);
+    }
+    let mut rows = Vec::new();
+    for table in ["net/tcp", "net/tcp6"] {
+        let bytes = match read_proc_file(&root.join(table), 16 * 1024 * 1024, deadline) {
+            Ok(bytes) => bytes,
+            // IPv6 can be disabled at kernel build time.
+            Err(error)
+                if table.ends_with("tcp6") && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        rows.extend(parse_proc_tcp(&String::from_utf8_lossy(&bytes)));
+    }
+    scan_deadline(deadline)?;
+    Ok(select_proc_ports(pid, &inodes, rows))
+}
+
+#[cfg(target_os = "linux")]
+fn native_processes(deadline: std::time::Instant) -> std::io::Result<Vec<(i32, String)>> {
+    linux_processes(std::path::Path::new("/proc"), deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn native_ports(pid: i32, deadline: std::time::Instant) -> std::io::Result<Vec<u16>> {
+    linux_ports(std::path::Path::new("/proc"), pid, deadline)
+}
+
+/// Decode documented MIB_TCP{,6}ROW_OWNER_PID layouts without casting an
+/// untrusted row count into a slice. DWORD ports carry two network-order bytes.
+#[cfg(any(windows, test))]
+fn parse_tcp_owner_table(bytes: &[u8], ipv6: bool) -> std::io::Result<Vec<(i32, u16)>> {
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed TCP owner table");
+    let count =
+        u32::from_le_bytes(bytes.get(..4).ok_or_else(invalid)?.try_into().unwrap()) as usize;
+    let (row_size, port_at, state_at, pid_at) = if ipv6 {
+        (56, 20, 48, 52)
+    } else {
+        (24, 8, 0, 20)
+    };
+    let rows = bytes.get(4..).ok_or_else(invalid)?;
+    if count > rows.len() / row_size {
+        return Err(invalid());
+    }
+    let mut out = Vec::new();
+    for row in rows.chunks_exact(row_size).take(count) {
+        let state = u32::from_le_bytes(row[state_at..state_at + 4].try_into().unwrap());
+        let pid = u32::from_le_bytes(row[pid_at..pid_at + 4].try_into().unwrap());
+        if state == 2 {
+            if let Ok(pid) = i32::try_from(pid) {
+                out.push((pid, u16::from_be_bytes([row[port_at], row[port_at + 1]])));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn native_processes(deadline: std::time::Instant) -> std::io::Result<Vec<(i32, String)>> {
+    windows_discovery::processes(deadline, None)
+}
+
+#[cfg(windows)]
+fn native_ports(pid: i32, deadline: std::time::Instant) -> std::io::Result<Vec<u16>> {
+    windows_discovery::ports(pid, deadline)
+}
+
+#[cfg(windows)]
+mod windows_discovery {
+    use super::{command_requires_csrf, parse_tcp_owner_table, scan_deadline, select_ports};
+    use std::{ffi::c_void, io, mem, ptr, time::Instant};
+    use windows_sys::{
+        Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
+        Win32::{
+            Foundation::{
+                CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_SUPPORTED,
+                ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+            },
+            NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER},
+            Networking::WinSock::{AF_INET, AF_INET6},
+            System::{
+                Diagnostics::{
+                    Debug::ReadProcessMemory,
+                    ToolHelp::{
+                        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                        TH32CS_SNAPPROCESS,
+                    },
+                },
+                Threading::{
+                    GetCurrentProcess, IsWow64Process2, OpenProcess, QueryFullProcessImageNameW,
+                    PEB, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION,
+                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+                    RTL_USER_PROCESS_PARAMETERS,
+                },
+            },
+        },
+    };
+
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // Only successful OpenProcess/snapshot handles are owned here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn open(pid: u32, rights: u32) -> io::Result<OwnedHandle> {
+        // Request explicit rights only; never enable SeDebugPrivilege.
+        let handle = unsafe { OpenProcess(rights, 0, pid) };
+        if handle.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(OwnedHandle(handle))
+        }
+    }
+
+    fn image_path(handle: HANDLE) -> io::Result<String> {
+        let mut path = vec![0u16; 32768];
+        let mut size = path.len() as u32;
+        // The allocated buffer is writable for the supplied character count.
+        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut size) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::from_utf16_lossy(&path[..size as usize]))
+    }
+
+    fn machine(handle: HANDLE) -> io::Result<u16> {
+        let (mut process, mut native) = (0, 0);
+        // Both output pointers are live; UNKNOWN (zero) means a native process.
+        if unsafe { IsWow64Process2(handle, &mut process, &mut native) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(if process == 0 { native } else { process })
+    }
+
+    fn read_memory(
+        handle: HANDLE,
+        address: usize,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        scan_deadline(deadline)?;
+        if address == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "null remote address",
+            ));
+        }
+        let mut read = 0;
+        // The remote pointer is never dereferenced locally. Win32 validates it;
+        // the local byte buffer is writable, and partial reads are refused.
+        if unsafe {
+            ReadProcessMemory(
+                handle,
+                address as *const c_void,
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut read,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if read != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial remote read",
+            ));
+        }
+        scan_deadline(deadline)
+    }
+
+    fn command_line(handle: HANDLE, deadline: Instant) -> io::Result<String> {
+        scan_deadline(deadline)?;
+        // PEB layouts are native-width only. Refuse even same-width foreign
+        // architectures rather than assuming a foreign/emulated layout.
+        if machine(handle)? != machine(unsafe { GetCurrentProcess() })? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "different process architecture",
+            ));
+        }
+        let mut basic = PROCESS_BASIC_INFORMATION::default();
+        let mut returned = 0;
+        // ProcessBasicInformation and these field layouts are documented at
+        // Microsoft Learn's winternl/PEB/RTL_USER_PROCESS_PARAMETERS pages.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessBasicInformation,
+                (&mut basic as *mut PROCESS_BASIC_INFORMATION).cast(),
+                mem::size_of_val(&basic) as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 || returned as usize != mem::size_of_val(&basic) {
+            return Err(io::Error::other(format!(
+                "process basic information failed ({status:#x})"
+            )));
+        }
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidData, "malformed process command line");
+        let parameters_at = (basic.PebBaseAddress as usize)
+            .checked_add(mem::offset_of!(PEB, ProcessParameters))
+            .ok_or_else(invalid)?;
+        let mut pointer = [0u8; mem::size_of::<usize>()];
+        read_memory(handle, parameters_at, &mut pointer, deadline)?;
+        let parameters = usize::from_ne_bytes(pointer);
+        if parameters == 0 {
+            return Err(invalid());
+        }
+        let command_at = parameters
+            .checked_add(mem::offset_of!(RTL_USER_PROCESS_PARAMETERS, CommandLine))
+            .ok_or_else(invalid)?;
+        let mut descriptor = [0u8; mem::size_of::<UNICODE_STRING>()];
+        read_memory(handle, command_at, &mut descriptor, deadline)?;
+        // UNICODE_STRING contains integer lengths and a raw pointer only; every
+        // bit pattern is valid, and read_unaligned avoids buffer alignment assumptions.
+        let command = unsafe { ptr::read_unaligned(descriptor.as_ptr().cast::<UNICODE_STRING>()) };
+        if command.Length == 0
+            || command.Length > 32 * 1024
+            || command.Length % 2 != 0
+            || command.Length > command.MaximumLength
+            || command.MaximumLength % 2 != 0
+            || command.Buffer.is_null()
+        {
+            return Err(invalid());
+        }
+        let mut bytes = vec![0u8; command.Length as usize];
+        read_memory(handle, command.Buffer as usize, &mut bytes, deadline)?;
+        let units: Vec<_> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        String::from_utf16(&units).map_err(|_| invalid())
+    }
+
+    /// The optional own pid lets CI exercise exactly the same PEB reader without
+    /// pretending that the quota-core test executable is an Antigravity server.
+    pub(super) fn processes(
+        deadline: Instant,
+        own_pid: Option<u32>,
+    ) -> io::Result<Vec<(i32, String)>> {
+        scan_deadline(deadline)?;
+        // Process-only snapshots need no module walk or target memory access.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = OwnedHandle(snapshot);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut processes = Vec::new();
+        let mut candidates = 0;
+        // dwSize is initialized and the snapshot remains owned for the walk.
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+        let mut error = if more == 0 {
+            unsafe { GetLastError() }
+        } else {
+            ERROR_NO_MORE_FILES
+        };
+        while more != 0 {
+            scan_deadline(deadline)?;
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let image = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            let lower = image.to_ascii_lowercase();
+            let pid = entry.th32ProcessID;
+            let own = own_pid == Some(pid) && pid == std::process::id();
+            let possible = own
+                || lower.contains("language_server")
+                || lower.contains("language-server")
+                || command_requires_csrf(&format!("/{image}")).is_some();
+            if possible {
+                let read = (|| {
+                    let limited = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+                    let path = image_path(limited.0)?;
+                    if !own && command_requires_csrf(&path).is_none() {
+                        return Ok(None);
+                    }
+                    // Check the path again on the memory-read handle so pid reuse
+                    // between opens cannot expose an unrelated process's argv.
+                    let process = open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+                    if image_path(process.0)? != path {
+                        return Err(io::Error::other("process image changed"));
+                    }
+                    command_line(process.0, deadline).map(Some)
+                })();
+                match read {
+                    Ok(None) => {}
+                    Ok(Some(command)) => {
+                        candidates += 1;
+                        if let Ok(pid) = i32::try_from(pid) {
+                            processes.push((pid, command));
+                        }
+                    }
+                    Err(error) => {
+                        candidates += 1;
+                        // Command lines contain CSRF tokens: only image, pid and
+                        // the read failure may appear in diagnostics.
+                        eprintln!(
+                            "{} skipped local process pid={pid} image={image:?}: {error}",
+                            crate::LOG_TAG
+                        );
+                    }
+                }
+            }
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) };
+            if more == 0 {
+                error = unsafe { GetLastError() };
+            }
+        }
+        if error != ERROR_NO_MORE_FILES {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        scan_deadline(deadline)?;
+        if candidates > 0 && processes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no readable candidate process command lines",
+            ));
+        }
+        Ok(processes)
+    }
+
+    fn tcp_table(ipv6: bool, deadline: Instant) -> io::Result<Vec<(i32, u16)>> {
+        let family = if ipv6 { AF_INET6 } else { AF_INET } as u32;
+        let mut size = 0;
+        // The first call asks only for the required size; no buffer is supplied.
+        let status = unsafe {
+            GetExtendedTcpTable(
+                ptr::null_mut(),
+                &mut size,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if ipv6 && status == ERROR_NOT_SUPPORTED {
+            return Ok(Vec::new());
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER && status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // A busy TCP table can grow between calls. Bound both retries and allocation.
+        for _ in 0..3 {
+            scan_deadline(deadline)?;
+            if !(4..=16 * 1024 * 1024).contains(&size) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TCP owner table exceeds scan cap",
+                ));
+            }
+            let mut buffer = vec![0u32; (size as usize).div_ceil(4)];
+            let capacity = buffer.len() * 4;
+            let status = unsafe {
+                GetExtendedTcpTable(
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                    0,
+                    family,
+                    TCP_TABLE_OWNER_PID_LISTENER,
+                    0,
+                )
+            };
+            if status == ERROR_INSUFFICIENT_BUFFER {
+                continue;
+            }
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            if size as usize > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TCP owner table overrun",
+                ));
+            }
+            // The DWORD allocation is aligned and initialized; only returned bytes
+            // are exposed, and the parser validates the row count before access.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size as usize) };
+            return parse_tcp_owner_table(bytes, ipv6);
+        }
+        Err(io::Error::other("TCP owner table kept growing during scan"))
+    }
+
+    pub(super) fn ports(pid: i32, deadline: Instant) -> io::Result<Vec<u16>> {
+        let mut rows = tcp_table(false, deadline)?;
+        rows.extend(tcp_table(true, deadline)?);
+        scan_deadline(deadline)?;
+        Ok(select_ports(pid, rows))
+    }
 }
 
 /// What one local probe found, cached briefly so concurrent handle fetches share
@@ -1476,9 +2099,9 @@ pub struct AntigravityProvider {
     /// first would otherwise be refused as "still running" and report a
     /// could-not-look error during an ordinary, healthy tick.
     local_cache: tokio::sync::Mutex<Option<(std::time::Instant, Result<LocalProbe, String>)>>,
-    /// The process-table scan discovery runs. Always the real `ps` outside
-    /// tests; a test substitutes a command it controls to simulate a stall.
-    process_scan: BoundedCommand,
+    /// macOS uses bounded `ps`; other platforms enumerate natively. Tests can
+    /// substitute a command to simulate a stalled process table.
+    process_scan: Option<BoundedCommand>,
     /// Which lane last answered for each handle, so a SWITCH can be logged.
     ///
     /// Three lanes stamp the same `source` on the wire (the local editor probe,
@@ -2325,6 +2948,248 @@ impl UsageProvider for AntigravityProvider {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn native_discovery_uses_one_matcher_and_owner_port_selection() {
+        for command in [
+            "/opt/Antigravity/language_server --csrf_token=editor-token",
+            "C:\\Program Files\\Antigravity\\language_server.exe --csrf_token=editor-token",
+        ] {
+            assert_eq!(classify_command(command).as_deref(), Some("editor-token"));
+        }
+        for command in [
+            "/usr/bin/agy serve",
+            "C:\\bin\\agy.exe serve",
+            "\"C:\\Program Files\\agy.exe\" serve",
+        ] {
+            assert_eq!(classify_command(command).as_deref(), Some(""));
+        }
+        assert_eq!(classify_command("/opt/Antigravity/language_server"), None);
+        assert_eq!(
+            classify_command("/opt/other/language_server --csrf_token=other"),
+            None
+        );
+        assert_eq!(
+            command_requires_csrf("C:\\OtherEditor\\language_server.exe"),
+            None
+        );
+        assert_eq!(
+            command_requires_csrf("C:\\Antigravity\\language_server.exe"),
+            Some(true)
+        );
+        assert_eq!(
+            select_ports(42, [(7, 8000), (42, 9000), (42, 9000), (42, 9001)]),
+            vec![9000, 9001]
+        );
+    }
+
+    #[test]
+    fn windows_tcp_owner_fixtures_select_pid_and_network_order_ports() {
+        // Literal DWORD rows from the documented layouts, independent of the decoder.
+        let ipv4 = [
+            2, 0, 0, 0, // Count.
+            2, 0, 0, 0, 127, 0, 0, 1, 0x23, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 2, 0,
+            0, 0, 127, 0, 0, 1, 0x23, 0x29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
+        ];
+        assert_eq!(
+            select_ports(42, parse_tcp_owner_table(&ipv4, false).unwrap()),
+            vec![9000]
+        );
+        let ipv6 = [
+            1, 0, 0, 0, // Count.
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // Local address.
+            0, 0, 0, 0, 0x23, 0x29, 0, 0, // Scope and port.
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Remote address.
+            0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 42, 0, 0, 0, // Scope, port, state, pid.
+        ];
+        assert_eq!(
+            select_ports(42, parse_tcp_owner_table(&ipv6, true).unwrap()),
+            vec![9001]
+        );
+        assert!(parse_tcp_owner_table(&ipv4[..ipv4.len() - 1], false).is_err());
+        assert!(parse_tcp_owner_table(&[255, 255, 255, 255], true).is_err());
+        let mut connected = ipv4;
+        connected[4] = 5;
+        assert_eq!(
+            select_ports(42, parse_tcp_owner_table(&connected, false).unwrap()),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_real_enumerator_reads_own_command_line_and_listener() {
+        static PROCESSES: Gate = Gate::new("Windows own process control");
+        static PORTS: Gate = Gate::new("Windows own listener control");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pid = std::process::id();
+        let processes = PROCESSES
+            .run_blocking(PROCESS_SCAN_TIMEOUT, move |deadline| {
+                windows_discovery::processes(deadline, Some(pid))
+            })
+            .await
+            .unwrap();
+        let command = &processes
+            .iter()
+            .find(|(owner, _)| *owner == pid as i32)
+            .expect("Toolhelp must see the test process")
+            .1;
+        let executable = std::env::current_exe().unwrap();
+        let name = executable.file_name().unwrap().to_string_lossy();
+        assert!(
+            command.contains(name.as_ref()),
+            "PEB read must include the test executable name"
+        );
+        let ports = PORTS
+            .run_blocking(PORT_SCAN_TIMEOUT, move |deadline| {
+                native_ports(pid as i32, deadline)
+            })
+            .await
+            .unwrap();
+        assert!(
+            ports.contains(&listener.local_addr().unwrap().port()),
+            "TCP owner table must include the listener opened by this process"
+        );
+    }
+
+    #[test]
+    fn proc_cmdline_and_tcp_fixtures_preserve_arguments_and_listen_inodes() {
+        let command =
+            parse_proc_cmdline(b"/opt/Antigravity/language_server\0--csrf_token\0fixture-token\0");
+        assert_eq!(classify_command(&command).as_deref(), Some("fixture-token"));
+        assert_eq!(parse_proc_cmdline(b""), "");
+        assert_eq!(
+            parse_proc_cmdline(b"/usr/bin/agy\0serve\0"),
+            "/usr/bin/agy serve"
+        );
+        let rows = " sl local_address rem_address st tx_queue rx tr tm retr uid timeout inode\n\
+            0: 0100007F:2328 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 123\n\
+            1: 00000000000000000000000001000000:2329 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 124\n\
+            2: 0100007F:232A 0100007F:232B 01 0:0 00:0 0 1000 0 125\n\
+            3: 0100007F:ZZZZ 00000000:0000 0A 0:0 00:0 0 1000 0 126\n\
+            malformed\n";
+        assert_eq!(parse_proc_tcp(rows), vec![(123, 9000), (124, 9001)]);
+    }
+
+    #[test]
+    fn proc_fixtures_enumerate_server_and_owned_listener() {
+        let processes = enumerate_proc_cmdlines([(
+            42,
+            b"/opt/Antigravity/language_server\0--csrf_token=fixture-token\0".to_vec(),
+        )]);
+        assert_eq!(
+            processes.len(),
+            1,
+            "procfs command-line enumeration must not silently return empty"
+        );
+        assert_eq!(processes[0].0, 42);
+        assert_eq!(
+            classify_command(&processes[0].1).as_deref(),
+            Some("fixture-token")
+        );
+        let inodes: HashSet<_> = ["socket:[123]", "socket:[124]", "pipe:[999]", "not a socket"]
+            .into_iter()
+            .filter_map(proc_socket_inode)
+            .collect();
+        assert_eq!(inodes, HashSet::from([123, 124]));
+        let tcp = "0: 0100007F:2328 00000000:0000 0A 0:0 00:0 0 1000 0 123\n1: 0100007F:232A 00000000:0000 0A 0:0 00:0 0 1000 0 999\n";
+        let tcp6 = "0: 00000000000000000000000001000000:2329 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 124\n";
+        let rows = parse_proc_tcp(tcp).into_iter().chain(parse_proc_tcp(tcp6));
+        assert_eq!(select_proc_ports(42, &inodes, rows), vec![9000, 9001]);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ProcFixture(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl ProcFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("insula-proc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("42/fd")).unwrap();
+            std::fs::create_dir_all(root.join("net")).unwrap();
+            Self(root)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ProcFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_enumerator_discovers_fixture_server_and_its_listener() {
+        use std::os::unix::fs::symlink;
+        let proc = ProcFixture::new();
+        std::fs::write(
+            proc.0.join("42/cmdline"),
+            b"/opt/Antigravity/language_server\0--csrf_token=fixture-token\0",
+        )
+        .unwrap();
+        std::fs::create_dir(proc.0.join("43")).unwrap(); // Unreadable/disappeared cmdline is skipped.
+        symlink("socket:[123]", proc.0.join("42/fd/3")).unwrap();
+        symlink("socket:[124]", proc.0.join("42/fd/4")).unwrap();
+        std::fs::write(proc.0.join("net/tcp"), "0: 0100007F:2328 00000000:0000 0A 0:0 00:0 0 1000 0 123\n1: 0100007F:232A 00000000:0000 0A 0:0 00:0 0 1000 0 999\n").unwrap();
+        std::fs::write(proc.0.join("net/tcp6"), "0: 00000000000000000000000001000000:2329 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 124\n").unwrap();
+        let deadline = std::time::Instant::now() + PROCESS_SCAN_TIMEOUT;
+        let processes = linux_processes(&proc.0, deadline).unwrap();
+        assert_eq!(
+            processes.len(),
+            1,
+            "Linux enumeration must not silently return empty"
+        );
+        assert_eq!(processes[0].0, 42);
+        assert_eq!(
+            classify_command(&processes[0].1).as_deref(),
+            Some("fixture-token")
+        );
+        assert_eq!(
+            linux_ports(&proc.0, 42, deadline).unwrap(),
+            vec![9000, 9001]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_unreadable_procfs_is_could_not_look_and_deadlines_are_enforced() {
+        static GATE: Gate = Gate::new("unreadable procfs fixture");
+        let proc = ProcFixture::new();
+        let root = proc.0.clone();
+        let error = GATE
+            .run_blocking(PROCESS_SCAN_TIMEOUT, move |deadline| {
+                linux_processes(&root, deadline)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(could_not_look("list processes", &error), FetchError::LocalSourceUnavailable(reason) if reason.contains("could not list processes"))
+        );
+        assert!(linux_processes(&proc.0, std::time::Instant::now()).is_err());
+        assert!(linux_ports(&proc.0, 42, std::time::Instant::now()).is_err());
+        let deadline = std::time::Instant::now() + PROCESS_SCAN_TIMEOUT;
+        assert!(linux_processes(&proc.0.join("missing"), deadline).is_err());
+        assert!(linux_ports(&proc.0, 42, deadline).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_real_enumerator_sees_own_pid_and_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pid = std::process::id() as i32;
+        let deadline = std::time::Instant::now() + PROCESS_SCAN_TIMEOUT;
+        assert!(
+            native_processes(deadline)
+                .unwrap()
+                .iter()
+                .any(|(owner, _)| *owner == pid),
+            "real procfs scan must see current test pid"
+        );
+        assert!(native_ports(pid, deadline)
+            .unwrap()
+            .contains(&listener.local_addr().unwrap().port()));
+    }
 
     // From CodexBar Tests/CodexBarTests/AntigravityRemoteUsageFetcherTests.swift,
     // "remote fetch asks for sign in again when the oauth client cannot read consumer quota",
@@ -4439,7 +5304,7 @@ mod plugin_lane_tests {
     #[cfg(unix)]
     fn provider_scanning_with(command: BoundedCommand) -> AntigravityProvider {
         let mut provider = AntigravityProvider::new();
-        provider.process_scan = command;
+        provider.process_scan = Some(command);
         provider.set_override_accounts(Vec::new());
         provider
     }

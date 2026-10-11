@@ -1,5 +1,5 @@
-//! Bounded subprocesses for the children this crate spawns to look at the
-//! machine: `ps` and `lsof` for the Antigravity local probe.
+//! Bounded machine discovery: macOS `ps`/`lsof` children and Linux/Windows
+//! in-process scans for the Antigravity local probe.
 //!
 //! Two guarantees, and each one exists because its absence was observed:
 //!
@@ -29,10 +29,13 @@
 //! another process's arguments, and doing that read in-process would park an
 //! insula thread uninterruptibly on the same stall. A child is something we can
 //! walk away from; a thread of our own is not.
+//!
+//! Linux procfs and Windows API scans use `Gate::run_blocking` instead: the
+//! async caller still has a deadline, and the gate remains held until the native
+//! worker returns. Native calls cannot be forcibly cancelled, but at most one
+//! worker per scan kind can remain blocked, rather than one per refresh tick.
 
-// The only production caller is a macOS path (the Antigravity probe). On other
-// platforms this module is exercised by its tests alone,
-// and the build denies warnings.
+// Subprocess commands are also test seams on the native-enumeration platforms.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::process::{Output, Stdio};
@@ -64,6 +67,42 @@ impl Gate {
             label,
             running_since: Mutex::new(None),
             spawns: AtomicUsize::new(0),
+        }
+    }
+
+    /// Bound a native scan without blocking the async runtime. A timed-out or
+    /// cancelled caller leaves the gate held until the worker actually returns,
+    /// so a stalled OS read cannot accumulate one blocking thread per refresh.
+    #[cfg(any(target_os = "linux", windows, test))]
+    pub(crate) async fn run_blocking<T, F>(
+        &'static self,
+        timeout: Duration,
+        scan: F,
+    ) -> Result<T, SubprocessError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Instant) -> std::io::Result<T> + Send + 'static,
+    {
+        let held = self.try_enter()?;
+        let deadline = Instant::now() + timeout;
+        let worker = tokio::task::spawn_blocking(move || {
+            let _held_until_return = held;
+            scan(deadline)
+        });
+        match tokio::time::timeout(timeout, worker).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(result) => Err(SubprocessError::Spawn {
+                command: self.label,
+                detail: match result {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                },
+            }),
+            Err(_) => Err(SubprocessError::Timeout {
+                command: self.label,
+                after: timeout,
+            }),
         }
     }
 
@@ -275,6 +314,28 @@ impl BoundedCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_scan_timeout_keeps_single_flight_until_worker_returns() {
+        static GATE: Gate = Gate::new("native scan timeout control");
+        let first = GATE
+            .run_blocking(Duration::from_millis(20), |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await;
+        assert!(matches!(first, Err(SubprocessError::Timeout { .. })));
+        let second = GATE.run_blocking(Duration::from_secs(1), |_| Ok(())).await;
+        assert!(matches!(second, Err(SubprocessError::Busy { .. })));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while GATE.is_occupied() {
+            assert!(Instant::now() < deadline, "native scan gate never reopened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        GATE.run_blocking(Duration::from_secs(1), |_| Ok(()))
+            .await
+            .unwrap();
+    }
 
     /// The helper's whole contract against a child that outlives its timeout:
     /// the caller is answered at the timeout, a second call while the child
