@@ -372,10 +372,17 @@ sudo /usr/bin/python3 scripts/syspolicyd-capture.py
 
 ## Install as a supervised subc module
 
-The subc daemon binary (`ck-subc`, built from the `subc-core` crate) spawns and
-supervises modules listed in its config at
-`$XDG_CONFIG_HOME/cortexkit/subc.jsonc` (`~/.config/cortexkit/subc.jsonc`). Add an
-entry pointing `program` at the built binary — see `examples/subc.jsonc`:
+On every platform, install and upgrade insula with `ck setup` and `ck upgrade`.
+They place the release binary (`ck-insula`, or `ck-insula.exe` on Windows),
+register it with the daemon and replace a running build safely. Use them rather
+than copying a binary by hand: on Windows a running executable can't be
+replaced in place, and the daemon's config lives in a platform-specific folder.
+
+The rest of this section is the manual route for development on macOS and
+Linux. The subc daemon binary (`ck-subc`) spawns and supervises the modules
+listed in its config, `$XDG_CONFIG_HOME/cortexkit/subc.jsonc` (by default
+`~/.config/cortexkit/subc.jsonc`). Add an entry whose `program` points at the
+built binary; see `examples/subc.jsonc`:
 
 ```jsonc
 {
@@ -388,9 +395,11 @@ entry pointing `program` at the built binary — see `examples/subc.jsonc`:
 }
 ```
 
-Once it is installed, **`docs/deploying.md` is how you replace a running build** —
-including why a bare `kill` is the wrong way to restart it, and how to verify from
-the running process that the deployed binary is the one you think it is.
+For that development install, **`docs/deploying.md` is how you replace a running
+build**. It explains why a bare `kill` is the wrong way to restart it, and how to
+confirm from the running process that the deployed binary is the one you expect.
+It's the macOS developer procedure (signing, scratch-file placement), not a way
+to install on Linux or Windows.
 
 `args`/`env`/`enabled` are optional. The daemon appends `--subc <connection-file>`
 and injects `SUBC_MODULE_ID` itself — do **not** put those in `args`/`env`. On its
