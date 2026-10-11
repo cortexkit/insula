@@ -17,7 +17,7 @@
 //! Exits non-zero when something disagrees, or when it could not examine
 //! anything, so it can gate a deploy.
 
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 // Reached through `quota_core` rather than added as direct dependencies: this
 // example must decode with the exact same type definition the module serves, and
@@ -28,25 +28,15 @@ use quota_core::{model::ProviderUsage, wire_sanity};
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-/// Where the daemon writes its connection file. Overridable so this can be
-/// pointed at a non-default daemon.
-fn connection_file() -> PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").expect("HOME must be set");
-    PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
+#[path = "support/connection.rs"]
+mod connection;
 
 #[tokio::main]
 async fn main() {
-    let filter = std::env::args().nth(1);
-    let path = connection_file();
-    if !path.exists() {
-        eprintln!("no daemon connection file at {}", path.display());
-        eprintln!("the daemon must be running: this checks the deployed module, not a local build");
-        std::process::exit(2);
-    }
+    let (path, positional) = connection::connection_and_args();
+    let filter = positional
+        .first()
+        .map(|value| value.to_string_lossy().into_owned());
 
     let mut stream = common::connect_consumer(&path).await;
     common::wait_for_catalog(&mut stream, common::MODULE_ID, Duration::from_secs(10)).await;

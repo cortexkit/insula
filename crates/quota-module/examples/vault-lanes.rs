@@ -20,7 +20,7 @@
 //! `cargo run -p quota-module --example vault-lanes`
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use quota_core::model::ProviderUsage;
@@ -75,13 +75,8 @@ const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[
     ),
 ];
 
-fn connection_file_path() -> PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
+#[path = "support/connection.rs"]
+mod connection;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InstalledSnapshot {
@@ -611,11 +606,7 @@ async fn read_usage(stream: &mut TcpStream, route: common::Route) -> Result<Usag
 
 #[tokio::main]
 async fn main() {
-    let path = connection_file_path();
-    if !path.exists() {
-        eprintln!("error: no daemon connection file at {}", path.display());
-        std::process::exit(2);
-    }
+    let (path, _) = connection::connection_and_args();
     let mut stream = match connect_to_daemon(&path).await {
         Ok(stream) => stream,
         Err(error) => {

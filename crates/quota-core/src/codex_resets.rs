@@ -536,9 +536,23 @@ impl RedemptionJournal {
     /// Only a journal that ASKED THE ENVIRONMENT where to live has any business
     /// reading the environment's previous answer.
     pub fn from_env() -> Result<Self, JournalError> {
-        let journal = Self::new(redemption_journal_path()?);
-        if let Ok(legacy) = legacy_redemption_journal_path() {
-            journal.adopt_from(&legacy)?;
+        Self::from_env_source(&cortexkit_paths::SystemEnv, cfg!(windows))
+    }
+
+    fn from_env_source(
+        env: &impl cortexkit_paths::EnvSource,
+        windows: bool,
+    ) -> Result<Self, JournalError> {
+        let journal = Self::new(journal_path_from(env, windows)?);
+        for legacy in legacy_journal_paths(env, windows)? {
+            journal.adopt_from(&legacy).map_err(|error| {
+                eprintln!(
+                    "{LOG_TAG} codex reset journal: adoption from {} into {} refused: {error}",
+                    legacy.display(),
+                    journal.path.display()
+                );
+                error
+            })?;
         }
         Ok(journal)
     }
@@ -631,21 +645,7 @@ impl RedemptionJournal {
         }
 
         self.save(&carried)?;
-        // Defensive readback. Its failure path is not reachable from a test
-        // without a deliberately broken `save`, so nothing exercises it -- but
-        // it is the difference between "the records are at the new path" and
-        // "a file exists at the new path", and only the first justifies
-        // deleting the old one.
-        let readback = self.load()?;
-        if readback.len() != carried.len() {
-            return Err(JournalError::new(format!(
-                "adopting {} into {} wrote {} of {} record(s); the legacy journal is left in place",
-                legacy.display(),
-                self.path.display(),
-                readback.len(),
-                carried.len()
-            )));
-        }
+        self.verify_adoption(legacy, &carried)?;
         std::fs::remove_file(legacy).map_err(|error| {
             JournalError::new(format!(
                 "adopted {} record(s) into {} but could not remove the legacy journal: {error}",
@@ -659,6 +659,32 @@ impl RedemptionJournal {
             legacy.display()
         );
         Ok(())
+    }
+
+    /// Removing the source is safe only after every record survived readback.
+    fn verify_adoption(
+        &self,
+        legacy: &Path,
+        carried: &[RedemptionRecord],
+    ) -> Result<(), JournalError> {
+        let verified = self.load().and_then(|readback| {
+            if readback == carried {
+                Ok(())
+            } else {
+                Err(JournalError::new(
+                    "journal readback differs from the source records",
+                ))
+            }
+        });
+        verified.map_err(|error| {
+            let message = format!(
+                "adopting {} into {} refused: {error}; both journals are left in place",
+                legacy.display(),
+                self.path.display()
+            );
+            eprintln!("{LOG_TAG} codex reset journal: {message}");
+            JournalError::new(message)
+        })
     }
 
     fn probe_atomic_write(&self) -> Result<(), JournalError> {
@@ -905,17 +931,14 @@ impl RedemptionJournal {
             file.write_all(&body).map_err(|error| {
                 JournalError::new(format!("writing {}: {error}", temp_path.display()))
             })?;
-            file.sync_all().map_err(|error| {
-                JournalError::new(format!("syncing {}: {error}", temp_path.display()))
-            })?;
-            fs::rename(&temp_path, &self.path).map_err(|error| {
+            drop(file);
+            replace_journal(&temp_path, &self.path).map_err(|error| {
                 JournalError::new(format!(
-                    "renaming {} to {}: {error}",
-                    temp_path.display(),
-                    self.path.display()
+                    "durably replacing {} with {}: {error}",
+                    self.path.display(),
+                    temp_path.display()
                 ))
             })?;
-            sync_parent_directory(parent)?;
             Ok(())
         })();
         if write_result.is_err() {
@@ -925,41 +948,30 @@ impl RedemptionJournal {
     }
 }
 
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> Result<(), JournalError> {
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| JournalError::new(format!("syncing {}: {error}", parent.display())))
-}
-
-#[cfg(windows)]
-fn sync_parent_directory(_parent: &Path) -> Result<(), JournalError> {
-    // Nothing to do here, but NOT because the guarantee is unnecessary -- this
-    // is a gap, and it is recorded rather than papered over.
-    //
-    // Windows has no documented equivalent of fsync on a directory. A directory
-    // handle can be opened with FILE_FLAG_BACKUP_SEMANTICS, but FlushFileBuffers
-    // is specified in terms of a file's data and does not promise directory-entry
-    // durability, so calling it here would look like a fix while guaranteeing
-    // nothing.
-    //
-    // The durable sequence on Windows puts the guarantee in the RENAME instead:
-    // MoveFileExW with MOVEFILE_WRITE_THROUGH does not return until the move is
-    // on disk. Rust's fs::rename does not pass that flag, so the rename above is
-    // not crash-durable on Windows as written -- a crash in the window after it
-    // returns can lose the rename while both the old and new contents survive.
-    //
-    // What that costs: this journal fences a banked reset credit against being
-    // spent twice. Losing a rename can lose the record of a redemption that
-    // already happened. The upstream consume endpoint is idempotent on the
-    // request id, which is the outer fence, so the failure is bounded -- but the
-    // local half of a two-part fence is weaker here than on Unix, and that is
-    // worth knowing before anyone relies on it.
-    //
-    // Not yet fixed because the feature is off unless `auto_use_resets` is
-    // configured, and no Windows host has configured it. Fixing it means calling
-    // MoveFileExW directly rather than fs::rename.
-    Ok(())
+fn replace_journal(temp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // MoveFileExW in cortexkit-lease has no retry. Only sharing/access-denied
+        // failures get four 250ms delays; never delete the existing money journal.
+        for attempt in 0..5 {
+            match cortexkit_lease::durable_replace(temp, dest) {
+                Err(error) if attempt < 4 && matches!(error.raw_os_error(), Some(32) | Some(5)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final attempt returns")
+    }
+    #[cfg(not(windows))]
+    {
+        cortexkit_lease::durable_replace(temp, dest)?;
+        // The shared Unix barrier tolerates EINVAL on unsupported filesystems.
+        // This journal additionally syncs the parent and propagates every sync error.
+        #[cfg(unix)]
+        File::open(dest.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        Ok(())
+    }
 }
 
 fn parse_record_timestamp(
@@ -1014,7 +1026,7 @@ fn prune_records(
 /// redemption it used to fence is unfenced and free to be spent a second time.
 /// The cost is money and there is no symptom.
 ///
-/// So the move is a migration rather than an edit, and `adopt_legacy_journal`
+/// So the move is a migration rather than an edit, and `adopt_from`
 /// is that migration: it verifies by CONTENTS, not by existence.
 const STATE_SEGMENT: &str = "cortexkit/insula";
 const LEGACY_STATE_SEGMENT: &str = "cortexkit/ck-quota";
@@ -1027,38 +1039,169 @@ const LEGACY_STATE_SEGMENT: &str = "cortexkit/ck-quota";
 /// silently relocate the journal for anyone who set it — the exact failure this
 /// whole migration exists to avoid, arriving through the escape hatch.
 pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
-    journal_path_under(STATE_SEGMENT)
+    journal_path_from(&cortexkit_paths::SystemEnv, cfg!(windows))
 }
 
-/// Where it lived before the `ck-quota` to `insula` rename.
-///
-/// Read once at startup, adopted if the current path holds nothing, then
-/// removed. Not a fallback: a permanent two-location read would mean neither
-/// location is authoritative, and the next reader could not tell which one a
-/// given record came from.
-fn legacy_redemption_journal_path() -> Result<PathBuf, JournalError> {
-    journal_path_under(LEGACY_STATE_SEGMENT)
-}
-
-fn journal_path_under(segment: &str) -> Result<PathBuf, JournalError> {
-    if let Some(path) = std::env::var_os("CK_QUOTA_STATE_DIR").filter(|value| !value.is_empty()) {
-        // An explicit directory is used verbatim for both the current and the
-        // legacy path, so a host that sets it has nothing to migrate and the
-        // adoption below is a no-op rather than a second location.
+fn journal_path_from(
+    env: &impl cortexkit_paths::EnvSource,
+    windows: bool,
+) -> Result<PathBuf, JournalError> {
+    if let Some(path) = env
+        .var_os("CK_QUOTA_STATE_DIR")
+        .filter(|value| !value.is_empty())
+    {
         return Ok(PathBuf::from(path).join("redemptions.json"));
     }
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join(segment).join("redemptions.json"));
+    state_dir_from(env, windows).map(|state| state.join("insula").join("redemptions.json"))
+}
+
+/// The native path always comes from the shared resolver. The alternate-platform
+/// branch lets fixtures exercise both ladders without touching the process environment.
+fn state_dir_from(
+    env: &impl cortexkit_paths::EnvSource,
+    windows: bool,
+) -> Result<PathBuf, JournalError> {
+    if windows == cfg!(windows) {
+        return cortexkit_paths::with_env(env)
+            .cortexkit_state_dir()
+            .map_err(|error| JournalError::new(error.to_string()));
     }
-    crate::env::home_dir()
-        .map(|home| {
+    let absolute = |key| cortexkit_paths::env_absolute_path(env, key).ok().flatten();
+    let base = absolute("XDG_STATE_HOME").or_else(|| {
+        if windows {
+            absolute("LOCALAPPDATA")
+                .or_else(|| absolute("USERPROFILE").map(|home| home.join("AppData").join("Local")))
+        } else {
+            absolute("HOME").map(|home| home.join(".local").join("state"))
+        }
+    });
+    base.map(|base| base.join("cortexkit"))
+        .ok_or_else(|| JournalError::new("cannot resolve an absolute state directory"))
+}
+
+fn legacy_journal_paths(
+    env: &impl cortexkit_paths::EnvSource,
+    windows: bool,
+) -> Result<Vec<PathBuf>, JournalError> {
+    if env
+        .var_os("CK_QUOTA_STATE_DIR")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    let xdg = env
+        .var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if let Some(relative) = xdg.as_ref().filter(|path| path.is_relative()) {
+        // Ignoring a relative XDG_STATE_HOME moves its journal, so carry the
+        // old records before writing at the default location. When Insula's
+        // macOS workstation deployment adopted cortexkit-paths, its supervised
+        // daemon environment was measured with XDG_STATE_HOME unset; the shared
+        // default therefore kept that live HOME/.local/state/cortexkit/insula journal.
+        eprintln!(
+            "{LOG_TAG} codex reset journal: ignoring relative XDG_STATE_HOME={}",
+            relative.display()
+        );
+        let cwd = env.current_dir().map_err(|error| {
+            JournalError::new(format!("resolving old relative journal: {error}"))
+        })?;
+        let old_base = cwd.join(relative);
+        paths.push(old_base.join(STATE_SEGMENT).join("redemptions.json"));
+        paths.push(old_base.join(LEGACY_STATE_SEGMENT).join("redemptions.json"));
+    }
+    if windows {
+        let old_home = old_windows_home_from(env);
+        let mut old_path = old_home.as_ref().map(|home| {
             home.join(".local/state")
-                .join(segment)
+                .join(STATE_SEGMENT)
                 .join("redemptions.json")
-        })
-        .ok_or_else(|| {
-            JournalError::new("cannot resolve CK_QUOTA_STATE_DIR, XDG_STATE_HOME, or HOME")
-        })
+        });
+        if let Some(path) = old_path.as_mut().filter(|path| path.is_relative()) {
+            *path = env
+                .current_dir()
+                .map_err(|error| {
+                    JournalError::new(format!("resolving old Windows journal: {error}"))
+                })?
+                .join(&*path);
+        }
+        let profile = cortexkit_paths::env_absolute_path(env, "USERPROFILE")
+            .ok()
+            .flatten();
+        let profile_path = profile.as_ref().map(|home| {
+            home.join(".local/state")
+                .join(STATE_SEGMENT)
+                .join("redemptions.json")
+        });
+        if let (Some(old), Some(profile)) = (&old_path, &profile_path) {
+            refuse_competing_legacy_journals(old, profile)?;
+        }
+        if let Some(old) = old_path {
+            paths.push(old.clone());
+            paths.push(
+                old.parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("ck-quota/redemptions.json"),
+            );
+        }
+        if let Some(profile) = profile {
+            let old_base = profile.join(".local").join("state");
+            paths.push(old_base.join(STATE_SEGMENT).join("redemptions.json"));
+            paths.push(old_base.join(LEGACY_STATE_SEGMENT).join("redemptions.json"));
+        }
+    }
+    paths.push(
+        state_dir_from(env, windows)?
+            .join("ck-quota")
+            .join("redemptions.json"),
+    );
+    Ok(paths)
+}
+
+/// The pre-shared home ladder, retained verbatim only to locate Windows journals
+/// written before native USERPROFILE took precedence over shell-specific HOME.
+fn old_windows_home_from(env: &impl cortexkit_paths::EnvSource) -> Option<PathBuf> {
+    let lookup = |key| env.var_os(key).filter(|value| !value.is_empty());
+    if let Some(home) = lookup("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let Some(profile) = lookup("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    match (lookup("HOMEDRIVE"), lookup("HOMEPATH")) {
+        (Some(mut drive), Some(path)) => {
+            drive.push(path);
+            Some(PathBuf::from(drive))
+        }
+        _ => None,
+    }
+}
+
+fn refuse_competing_legacy_journals(old: &Path, profile: &Path) -> Result<(), JournalError> {
+    let checked = (|| -> std::io::Result<bool> {
+        if old == profile || !old.try_exists()? || !profile.try_exists()? {
+            return Ok(false);
+        }
+        Ok(fs::canonicalize(old)? != fs::canonicalize(profile)?)
+    })();
+    let reason = match checked {
+        Ok(false) => return Ok(()),
+        Ok(true) => {
+            "both old Windows locations hold journals; neither can be chosen as authoritative"
+                .to_string()
+        }
+        Err(error) => format!("old Windows journal locations could not be checked: {error}"),
+    };
+    let message = format!(
+        "{reason}: {} and {}; adoption refused and both files left in place",
+        old.display(),
+        profile.display()
+    );
+    eprintln!("{LOG_TAG} codex reset journal: {message}");
+    Err(JournalError::new(message))
 }
 
 /// CAS identity used to report a provider rejection of a vault-served token.
@@ -2168,6 +2311,257 @@ mod tests {
         }
     }
 
+    struct JournalEnv {
+        values: Vec<(&'static str, std::ffi::OsString)>,
+        cwd: PathBuf,
+    }
+
+    impl cortexkit_paths::EnvSource for JournalEnv {
+        fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+            self.values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+        fn current_dir(&self) -> std::io::Result<PathBuf> {
+            Ok(self.cwd.clone())
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_journal_path_bytes_match_the_old_ladder_for_valid_xdg() {
+        let scratch = scratch_dir("unix-paths");
+        let home = scratch.path().join("home with spaces");
+        let absolute = scratch.path().join("xdg-state");
+        for xdg in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(absolute.into_os_string()),
+        ] {
+            let mut env = JournalEnv {
+                values: vec![("HOME", home.clone().into_os_string())],
+                cwd: scratch.path().to_path_buf(),
+            };
+            if let Some(xdg) = xdg {
+                env.values.push(("XDG_STATE_HOME", xdg));
+            }
+            let old_base = cortexkit_paths::EnvSource::var_os(&env, "XDG_STATE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/state"));
+            let old = old_base.join(STATE_SEGMENT).join("redemptions.json");
+            assert_eq!(
+                journal_path_from(&env, false).unwrap().as_os_str(),
+                old.as_os_str()
+            );
+        }
+    }
+
+    #[test]
+    fn journal_override_is_verbatim_and_never_adopts_default_records() {
+        let scratch = scratch_dir("override");
+        let home = scratch.path().join("home");
+        let old = home.join(".local/state/cortexkit/insula/redemptions.json");
+        RedemptionJournal::new(old.clone())
+            .save(&[pending_record("real-account", "old-request")])
+            .unwrap();
+        let override_dir = scratch.path().join("override");
+        let env = JournalEnv {
+            values: vec![
+                ("HOME", home.clone().into_os_string()),
+                ("USERPROFILE", home.into_os_string()),
+                ("CK_QUOTA_STATE_DIR", override_dir.clone().into_os_string()),
+                ("XDG_STATE_HOME", "relative".into()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        for windows in [false, true] {
+            let journal = RedemptionJournal::from_env_source(&env, windows).unwrap();
+            assert_eq!(
+                journal.path(),
+                override_dir.join("redemptions.json"),
+                "CK_QUOTA_STATE_DIR must remain authoritative"
+            );
+            assert!(
+                journal.load().unwrap().is_empty(),
+                "an override must never adopt default records"
+            );
+            assert!(legacy_journal_paths(&env, windows).unwrap().is_empty());
+        }
+        assert_eq!(
+            RedemptionJournal::new(old).load().unwrap()[0].redeem_request_id,
+            "old-request"
+        );
+        let relative_override = JournalEnv {
+            values: vec![("CK_QUOTA_STATE_DIR", "scratch-relative".into())],
+            cwd: scratch.path().to_path_buf(),
+        };
+        assert_eq!(
+            journal_path_from(&relative_override, false).unwrap(),
+            PathBuf::from("scratch-relative/redemptions.json")
+        );
+    }
+
+    #[test]
+    fn relative_xdg_adopts_pending_records_before_using_the_shared_default() {
+        let scratch = scratch_dir("relative-xdg");
+        let home = scratch.path().join("home");
+        let env = JournalEnv {
+            values: vec![
+                ("HOME", home.clone().into_os_string()),
+                ("XDG_STATE_HOME", "relative-state".into()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        let old = scratch
+            .path()
+            .join("relative-state/cortexkit/insula/redemptions.json");
+        let carried = vec![pending_record("account", "same-pending-id")];
+        RedemptionJournal::new(old.clone()).save(&carried).unwrap();
+        let journal = RedemptionJournal::from_env_source(&env, false).unwrap();
+        assert_eq!(
+            journal.path(),
+            home.join(".local/state/cortexkit/insula/redemptions.json")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            journal.path(),
+            cortexkit_paths::with_env(&env)
+                .cortexkit_state_dir()
+                .unwrap()
+                .join("insula/redemptions.json")
+        );
+        assert_eq!(journal.load().unwrap(), carried);
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn windows_journal_ladder_migrates_the_old_profile_journal_by_content() {
+        let scratch = scratch_dir("windows-paths");
+        let profile = scratch.path().join("profile");
+        let local = scratch.path().join("local-app-data");
+        let mut env = JournalEnv {
+            values: vec![
+                ("USERPROFILE", profile.clone().into_os_string()),
+                ("LOCALAPPDATA", local.clone().into_os_string()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        let old = profile.join(".local/state/cortexkit/insula/redemptions.json");
+        let carried = vec![pending_record("account", "windows-pending-id")];
+        RedemptionJournal::new(old.clone()).save(&carried).unwrap();
+        let journal = RedemptionJournal::from_env_source(&env, true).unwrap();
+        assert_eq!(
+            journal.path(),
+            local.join("cortexkit/insula/redemptions.json")
+        );
+        assert_eq!(journal.load().unwrap(), carried);
+        assert!(!old.exists());
+        env.values.retain(|(key, _)| *key != "LOCALAPPDATA");
+        assert_eq!(
+            journal_path_from(&env, true).unwrap(),
+            profile.join("AppData/Local/cortexkit/insula/redemptions.json")
+        );
+        let xdg = scratch.path().join("xdg");
+        env.values
+            .push(("XDG_STATE_HOME", xdg.clone().into_os_string()));
+        assert_eq!(
+            journal_path_from(&env, true).unwrap(),
+            xdg.join("cortexkit/insula/redemptions.json")
+        );
+    }
+
+    #[test]
+    fn windows_journal_migration_preserves_a_divergent_shell_home() {
+        let scratch = scratch_dir("windows-shell-home");
+        let home = scratch.path().join("shell-home");
+        let profile = scratch.path().join("native-profile");
+        let local = scratch.path().join("local-data");
+        let env = JournalEnv {
+            values: vec![
+                ("HOME", home.clone().into_os_string()),
+                ("USERPROFILE", profile.into_os_string()),
+                ("LOCALAPPDATA", local.clone().into_os_string()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        assert_eq!(old_windows_home_from(&env), Some(home.clone()));
+        let old = home.join(".local/state/cortexkit/insula/redemptions.json");
+        let carried = vec![pending_record("account", "shell-home-pending-id")];
+        RedemptionJournal::new(old.clone()).save(&carried).unwrap();
+        let journal = RedemptionJournal::from_env_source(&env, true).unwrap();
+        assert_eq!(
+            journal.path(),
+            local.join("cortexkit/insula/redemptions.json")
+        );
+        assert_eq!(journal.load().unwrap(), carried);
+        assert!(!old.exists());
+        let drive_env = JournalEnv {
+            values: vec![
+                ("HOMEDRIVE", "C:".into()),
+                ("HOMEPATH", r"\Users\someone".into()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        assert_eq!(
+            old_windows_home_from(&drive_env),
+            Some(PathBuf::from(r"C:\Users\someone"))
+        );
+    }
+
+    #[test]
+    fn windows_two_distinct_old_journals_refuse_adoption_and_keep_every_file() {
+        let scratch = scratch_dir("windows-competing-journals");
+        let home = scratch.path().join("shell-home");
+        let profile = scratch.path().join("native-profile");
+        let local = scratch.path().join("local-data");
+        let mut env = JournalEnv {
+            values: vec![
+                ("HOME", home.clone().into_os_string()),
+                ("USERPROFILE", profile.clone().into_os_string()),
+                ("LOCALAPPDATA", local.clone().into_os_string()),
+            ],
+            cwd: scratch.path().to_path_buf(),
+        };
+        let home_old = home.join(".local/state/cortexkit/insula/redemptions.json");
+        let profile_old = profile.join(".local/state/cortexkit/insula/redemptions.json");
+        let shell_records = vec![pending_record("shell", "shell-pending-id")];
+        let profile_records = vec![pending_record("native", "native-pending-id")];
+        RedemptionJournal::new(home_old.clone())
+            .save(&shell_records)
+            .unwrap();
+        RedemptionJournal::new(profile_old.clone())
+            .save(&profile_records)
+            .unwrap();
+        let error = match RedemptionJournal::from_env_source(&env, true) {
+            Ok(_) => panic!("two old journals must not choose an authoritative source"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&home_old.display().to_string()));
+        assert!(error
+            .to_string()
+            .contains(&profile_old.display().to_string()));
+        assert!(!local.join("cortexkit/insula/redemptions.json").exists());
+        assert_eq!(
+            RedemptionJournal::new(home_old).load().unwrap(),
+            shell_records
+        );
+        assert_eq!(
+            RedemptionJournal::new(profile_old).load().unwrap(),
+            profile_records
+        );
+        env.values.push((
+            "CK_QUOTA_STATE_DIR",
+            scratch.path().join("override").into_os_string(),
+        ));
+        assert!(RedemptionJournal::from_env_source(&env, true)
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn identical_reset_ticks_emit_only_once() {
         let logger = ResetTickLogger::default();
@@ -2571,7 +2965,7 @@ mod tests {
         // somewhere must be the constructor that asked the environment in the
         // first place.
         let from_env = source
-            .split_once("pub fn from_env() -> Result<Self, JournalError> {")
+            .split_once("fn from_env_source(")
             .expect("from_env must exist")
             .1;
         let from_env_body = from_env
@@ -2642,6 +3036,91 @@ mod tests {
             "the legacy journal must survive a refused adoption, or its records are \
              lost with nothing holding them"
         );
+    }
+
+    #[test]
+    fn adoption_readback_rejects_same_count_different_records() {
+        let scratch = scratch_dir("adopt-substitution");
+        let legacy = scratch.path().join("old.json");
+        let journal = RedemptionJournal::new(scratch.path().join("current.json"));
+        let carried = vec![pending_record("source-account", "source-id")];
+        RedemptionJournal::new(legacy.clone())
+            .save(&carried)
+            .unwrap();
+        let mut substituted = carried.clone();
+        substituted[0].redeem_request_id = "different-pending-id".to_string();
+        journal.save(&substituted).unwrap();
+        let error = journal
+            .verify_adoption(&legacy, &carried)
+            .expect_err("same-count substituted records must refuse adoption");
+        assert!(error.to_string().contains("readback differs"));
+        assert_eq!(journal.load().unwrap(), substituted);
+        assert_eq!(
+            RedemptionJournal::new(legacy.clone()).load().unwrap(),
+            carried
+        );
+        journal.save(&carried).unwrap();
+        journal.verify_adoption(&legacy, &carried).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_save_atomically_replaces_the_open_destination() {
+        use std::io::Read;
+        let scratch = scratch_dir("atomic-save");
+        let journal = RedemptionJournal::new(scratch.path().join("redemptions.json"));
+        journal
+            .save(&[pending_record("account", "old-id")])
+            .unwrap();
+        let old_bytes = fs::read(journal.path()).unwrap();
+        let mut reader = File::open(journal.path()).unwrap();
+        let new_records = vec![pending_record("account", "new-id")];
+        journal.save(&new_records).unwrap();
+        let mut held_bytes = Vec::new();
+        reader.read_to_end(&mut held_bytes).unwrap();
+        assert_eq!(
+            held_bytes, old_bytes,
+            "atomic replacement must not overwrite the open destination inode"
+        );
+        assert_eq!(journal.load().unwrap(), new_records);
+        assert_eq!(
+            fs::read_dir(scratch.path()).unwrap().count(),
+            1,
+            "successful replacement must consume its same-folder temp"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_save_refuses_a_non_delete_sharing_reader_then_recovers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let scratch = scratch_dir("sharing-save");
+        let journal = RedemptionJournal::new(scratch.path().join("redemptions.json"));
+        let old = vec![pending_record("account", "old-id")];
+        journal.save(&old).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(journal.path())
+            .unwrap();
+        let replacement = vec![pending_record("account", "new-id")];
+        journal
+            .save(&replacement)
+            .expect_err("persistent sharing denial must fail the save");
+        assert_eq!(
+            journal.load().unwrap(),
+            old,
+            "a refused save must preserve pending records"
+        );
+        assert_eq!(
+            fs::read_dir(scratch.path()).unwrap().count(),
+            1,
+            "failed replacement must clean up its temp"
+        );
+        drop(held);
+        journal.save(&replacement).unwrap();
+        assert_eq!(journal.load().unwrap(), replacement);
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -907,3 +907,98 @@ expect_message = "a dates failure must never set the Claude row's errorClass"
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "codex-journal-atomic-replace"
+guards = "Journal saves atomically replace a destination rather than overwriting a live reader's inode"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "replace_journal(&temp_path, &self.path).map_err"
+new = "fs::write(&self.path, &body) /* NON-VACUITY BREAK */.map_err"
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::journal_save_atomically_replaces_the_open_destination"]
+expect_message = "atomic replacement must not overwrite the open destination inode"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "codex-journal-sharing-safe-replace"
+guards = "A Windows reader denying delete sharing blocks replacement without altering pending records"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "replace_journal(&temp_path, &self.path).map_err"
+new = "fs::write(&self.path, &body) /* NON-VACUITY BREAK */.map_err"
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::journal_save_refuses_a_non_delete_sharing_reader_then_recovers"]
+expect_message = "persistent sharing denial must fail the save"
+only = false
+platforms = ["windows"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "codex-journal-state-override"
+guards = "An explicit state directory remains authoritative and never migrates default journal records"
+file = "crates/quota-core/src/codex_resets.rs"
+old = '''if let Some(path) = env
+        .var_os("CK_QUOTA_STATE_DIR")
+        .filter(|value| !value.is_empty())
+    {'''
+new = '''if let Some(path) = env
+        .var_os("CK_QUOTA_STATE_DIR")
+        .filter(|_| false) // NON-VACUITY BREAK
+    {'''
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::journal_override_is_verbatim_and_never_adopts_default_records"]
+expect_message = "CK_QUOTA_STATE_DIR must remain authoritative"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "codex-journal-adoption-full-readback"
+guards = "Migration cannot remove its source after a same-count substitution of pending records"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "if readback == carried {"
+new = "if readback.len() == carried.len() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::adoption_readback_rejects_same_count_different_records"]
+expect_message = "same-count substituted records must refuse adoption"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "codex-journal-competing-windows-sources"
+guards = "Two distinct old Windows journals cannot silently choose an authoritative source"
+file = "crates/quota-core/src/codex_resets.rs"
+old = "refuse_competing_legacy_journals(old, profile)?;"
+new = "let _ = (old, profile); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/codex_resets.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::tests::windows_two_distinct_old_journals_refuse_adoption_and_keep_every_file"]
+expect_message = "two old journals must not choose an authoritative source"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

@@ -67,13 +67,8 @@ fn is_identity_key(key: &str) -> bool {
         || key.contains("name")
 }
 
-fn connection_file() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return std::path::PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
+#[path = "support/connection.rs"]
+mod connection;
 
 fn refuse(message: &str) -> ! {
     eprintln!("{message}");
@@ -83,7 +78,11 @@ fn refuse(message: &str) -> ! {
 
 #[tokio::main]
 async fn main() {
-    let provider = std::env::args().nth(1).unwrap_or_default();
+    let (path, positional) = connection::connection_and_args();
+    let provider = positional
+        .first()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let keys = match provider.as_str() {
         "claude" => CLAUDE_KEYS,
         "codex" => CODEX_KEYS,
@@ -99,11 +98,6 @@ async fn main() {
     if handle.is_empty() {
         refuse("the handle file is empty");
     }
-    let path = connection_file();
-    if !path.exists() {
-        refuse(&format!("no daemon connection file at {}", path.display()));
-    }
-
     let client = VaultClient::new(path);
     let mut credential = match client
         .get(&VaultCapability::new(handle), VAULT_READ_MIN_TTL_MS)
