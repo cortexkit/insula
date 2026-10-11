@@ -93,10 +93,14 @@ fn app_auth_db_path_from(
             .map(PathBuf::from)
             .or(home.map(|home| home.join(".config"))),
         AppPlatform::Windows => {
+            // A relative APPDATA means the store can't be located, not that
+            // nobody signed in: report "couldn't look" so the last reading is
+            // kept rather than an absent or broken credential.
             cortexkit_paths::env_absolute_path(&crate::env::LookupEnv(lookup), "APPDATA")
                 .map_err(|_| {
-                    FetchError::CredentialUnusable(
-                        "cursor app auth store APPDATA must be absolute".to_string(),
+                    FetchError::LocalSourceUnavailable(
+                        "cursor app auth store: APPDATA is set but not an absolute path"
+                            .to_string(),
                     )
                 })?
                 .or(home.map(|home| home.join("AppData").join("Roaming")))
