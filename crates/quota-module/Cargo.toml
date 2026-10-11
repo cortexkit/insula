@@ -39,6 +39,7 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+cortexkit-paths = "=0.1.2"
 # For the diagnostic examples only: the module itself makes no HTTP calls.
 reqwest = { workspace = true }
 # Content-addresses the ckdev copies the integration tests spawn

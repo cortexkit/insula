@@ -58,38 +58,56 @@ fn is_session_cookie(name: &str) -> bool {
 }
 
 /// Resolve Cursor's application-state database for the host platform.
-fn app_auth_db_path() -> Option<PathBuf> {
-    app_auth_db_path_from(crate::env::home_dir(), |key| std::env::var_os(key))
+fn app_auth_db_path() -> Result<Option<PathBuf>, FetchError> {
+    let platform = if cfg!(target_os = "macos") {
+        AppPlatform::Macos
+    } else if cfg!(windows) {
+        AppPlatform::Windows
+    } else {
+        AppPlatform::Linux
+    };
+    app_auth_db_path_from(
+        crate::env::home_dir(),
+        |key| std::env::var_os(key),
+        platform,
+    )
 }
 
-/// Resolve the app-state path from an injected environment, keeping the platform
-/// layouts independently testable without reading the caller's home directory.
+#[derive(Clone, Copy)]
+enum AppPlatform {
+    Macos,
+    Linux,
+    Windows,
+}
+
+/// Resolve Cursor's own app folder, not CortexKit's configuration directory.
 fn app_auth_db_path_from(
     home: Option<PathBuf>,
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = lookup;
-        home.map(|home| {
-            home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        lookup("XDG_CONFIG_HOME")
+    platform: AppPlatform,
+) -> Result<Option<PathBuf>, FetchError> {
+    let base = match platform {
+        AppPlatform::Macos => home.map(|home| home.join("Library").join("Application Support")),
+        AppPlatform::Linux => lookup("XDG_CONFIG_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .or(home.map(|home| home.join(".config")))
-            .map(|config| config.join("Cursor/User/globalStorage/state.vscdb"))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (home, lookup);
-        None
-    }
+            .or(home.map(|home| home.join(".config"))),
+        AppPlatform::Windows => {
+            cortexkit_paths::env_absolute_path(&crate::env::LookupEnv(lookup), "APPDATA")
+                .map_err(|_| {
+                    FetchError::CredentialUnusable(
+                        "cursor app auth store APPDATA must be absolute".to_string(),
+                    )
+                })?
+                .or(home.map(|home| home.join("AppData").join("Roaming")))
+        }
+    };
+    Ok(base.map(|base| {
+        base.join("Cursor")
+            .join("User")
+            .join("globalStorage")
+            .join("state.vscdb")
+    }))
 }
 
 struct CursorAppAuth {
@@ -252,6 +270,12 @@ fn immutable_app_auth_uri(path: &Path) -> Result<String, FetchError> {
         FetchError::CredentialUnusable("cursor app auth store URI construction failed".to_string())
     })?;
     uri.set_query(Some("immutable=1"));
+    #[cfg(windows)]
+    if let Some(host) = uri.host_str() {
+        // SQLite rejects non-local URI authorities in its default build. An
+        // empty authority with a //server/share path expresses the same UNC file.
+        return Ok(format!("file:////{host}{}?immutable=1", uri.path()));
+    }
     Ok(uri.into())
 }
 
@@ -630,7 +654,22 @@ impl UsageProvider for CursorProvider {
             } else {
                 (None, APP_STORE_SOURCE)
             };
-            let credential = resolve_cursor_credential_async(jar, app_auth_db_path()).await?;
+            let app_path = match app_auth_db_path() {
+                Ok(path) => path,
+                // A session cookie remains usable even if the optional app database
+                // path needed to enrich it with account identity cannot be resolved.
+                Err(_)
+                    if jar.as_ref().is_some_and(|jar| {
+                        jar.cookies
+                            .iter()
+                            .any(|cookie| is_session_cookie(&cookie.name))
+                    }) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let credential = resolve_cursor_credential_async(jar, app_path).await?;
             let cookie = credential.cookie_header();
 
             let body_bytes = JsonRequest::get(USAGE_URL)
@@ -722,10 +761,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn macos_app_auth_store_path_uses_the_injected_home() {
-        let path = app_auth_db_path_from(Some(PathBuf::from("/Users/synthetic")), |_| None);
+        let path = app_auth_db_path_from(
+            Some(PathBuf::from("/Users/synthetic")),
+            |_| None,
+            AppPlatform::Macos,
+        )
+        .unwrap();
 
         assert_eq!(
             path.as_deref(),
@@ -735,13 +778,20 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn linux_app_auth_store_path_prefers_xdg_then_home_config() {
-        let xdg = app_auth_db_path_from(Some(PathBuf::from("/home/synthetic")), |key| {
-            (key == "XDG_CONFIG_HOME").then(|| std::ffi::OsString::from("/xdg"))
-        });
-        let fallback = app_auth_db_path_from(Some(PathBuf::from("/home/synthetic")), |_| None);
+        let xdg = app_auth_db_path_from(
+            Some(PathBuf::from("/home/synthetic")),
+            |key| (key == "XDG_CONFIG_HOME").then(|| std::ffi::OsString::from("/xdg")),
+            AppPlatform::Linux,
+        )
+        .unwrap();
+        let fallback = app_auth_db_path_from(
+            Some(PathBuf::from("/home/synthetic")),
+            |_| None,
+            AppPlatform::Linux,
+        )
+        .unwrap();
 
         assert_eq!(
             xdg.as_deref(),
@@ -752,6 +802,80 @@ mod tests {
             Some(Path::new(
                 "/home/synthetic/.config/Cursor/User/globalStorage/state.vscdb"
             ))
+        );
+    }
+
+    #[test]
+    fn windows_app_auth_store_prefers_appdata_then_profile_roaming() {
+        let home = test_path("profile");
+        let appdata = test_path("appdata");
+        let tail = Path::new("Cursor/User/globalStorage/state.vscdb");
+        let path = app_auth_db_path_from(
+            Some(home.clone()),
+            |key| (key == "APPDATA").then(|| appdata.clone().into_os_string()),
+            AppPlatform::Windows,
+        )
+        .unwrap();
+        assert_eq!(path, Some(appdata.join(tail)));
+        for appdata in [None, Some(std::ffi::OsString::new())] {
+            let fallback = app_auth_db_path_from(
+                Some(home.clone()),
+                |key| {
+                    if key == "APPDATA" {
+                        appdata.clone()
+                    } else {
+                        None
+                    }
+                },
+                AppPlatform::Windows,
+            )
+            .unwrap();
+            assert_eq!(fallback, Some(home.join("AppData/Roaming").join(tail)));
+        }
+        assert!(app_auth_db_path_from(
+            Some(home),
+            |key| (key == "APPDATA").then(|| "relative-appdata".into()),
+            AppPlatform::Windows
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn immutable_uri_escapes_filename_and_opens_the_database_read_only() {
+        let dir = test_path("uri");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("state # % unicode-é.vscdb");
+        create_state_db(&path, &synthetic_jwt("user"), None);
+        let uri = immutable_app_auth_uri(&path).unwrap();
+        assert!(
+            uri.contains("%23") && uri.contains("%25") && uri.ends_with("?immutable=1"),
+            "URI must escape filename syntax and retain immutable mode: {uri}"
+        );
+        let auth = load_app_auth_from_path(Some(&path)).unwrap().unwrap();
+        assert_eq!(auth.user_id, "user");
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        assert!(
+            connection.execute("DELETE FROM ItemTable", []).is_err(),
+            "app auth reads must not enable SQLite writes"
+        );
+        drop(connection);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_immutable_uri_handles_drive_and_unc_paths() {
+        assert_eq!(
+            immutable_app_auth_uri(Path::new(r"C:\Users\someone\state #.vscdb")).unwrap(),
+            "file:///C:/Users/someone/state%20%23.vscdb?immutable=1"
+        );
+        assert_eq!(
+            immutable_app_auth_uri(Path::new(r"\\server\share\state #.vscdb")).unwrap(),
+            "file:////server/share/state%20%23.vscdb?immutable=1"
         );
     }
 

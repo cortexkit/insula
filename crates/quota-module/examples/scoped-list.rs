@@ -42,22 +42,12 @@ fn control_handle() -> Option<VaultCapability> {
         .map(VaultCapability::new)
 }
 
-fn connection_file() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return std::path::PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
+#[path = "support/connection.rs"]
+mod connection;
 
 #[tokio::main]
 async fn main() {
-    let path = connection_file();
-    if !path.exists() {
-        eprintln!("no daemon connection file at {}", path.display());
-        eprintln!("this dials the live vault through the daemon: it must be running");
-        std::process::exit(2);
-    }
+    let (path, _) = connection::connection_and_args();
 
     let client = VaultClient::new(path);
     let listing = match client.list_scoped_report().await {

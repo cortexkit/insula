@@ -28,23 +28,12 @@ use quota_core::vault_handles::VaultHandleLoader;
 use quota_module::ids;
 use quota_module::vault_client::VaultClient;
 
-/// Where the daemon writes its connection file.
-fn connection_file() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("SUBC_CONNECTION_FILE") {
-        return std::path::PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json")
-}
+#[path = "support/connection.rs"]
+mod connection;
 
 #[tokio::main]
 async fn main() {
-    let path = connection_file();
-    if !path.exists() {
-        eprintln!("no daemon connection file at {}", path.display());
-        eprintln!("this dials the daemon for a vault credential: it must be running");
-        std::process::exit(2);
-    }
+    let (path, _) = connection::connection_and_args();
 
     // The same loader the module uses, so an id spelled differently here could
     // not silently probe a credential the module would never reach.

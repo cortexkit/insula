@@ -18,11 +18,9 @@ use std::path::PathBuf;
 /// machine where the user has genuinely logged into nothing, so it is worth
 /// resolving centrally rather than at nine call sites.
 ///
-/// `HOME` is still consulted first on every platform: a Unix-shaped environment
-/// is authoritative where it exists, and Windows shells that set it (MSYS, Git
-/// Bash, WSL interop) mean what they say. `USERPROFILE` is the native Windows
-/// answer, and `HOMEDRIVE` + `HOMEPATH` is the fallback for the domain-joined
-/// case where a profile lives on a mapped drive.
+/// Unix uses `HOME`; Windows prefers `USERPROFILE` to shell-specific `HOME`,
+/// matching the Node CLIs whose credential stores we read. The shared resolver
+/// refuses relative homes rather than reading credentials under the working directory.
 ///
 /// Note this resolves OUR home directory, not where another tool keeps its
 /// files. Several third-party CLIs this module reads from are Node programs
@@ -36,29 +34,19 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// The resolution order, over an arbitrary environment.
 ///
-/// Split from [`home_dir`] so the Windows branches can be exercised anywhere.
-/// Reading the process environment directly would leave them testable only on
-/// the platform they exist for -- and a rule that cannot be tested where it is
-/// written is one nobody checks until a user reports that nothing resolves.
+/// Split from [`home_dir`] so tests supply their own environment. Mutating the
+/// process environment races other provider tests and can redirect real-file reads.
 pub(crate) fn home_dir_from(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if let Some(home) = lookup("HOME") {
-        return Some(PathBuf::from(home));
-    }
-    if let Some(profile) = lookup("USERPROFILE") {
-        return Some(PathBuf::from(profile));
-    }
-    // Both halves are required: a drive with no path, or a path with no drive,
-    // does not name a directory, and joining one to a relative credential path
-    // would produce a location that happens to resolve against the process's
-    // current directory.
-    match (lookup("HOMEDRIVE"), lookup("HOMEPATH")) {
-        (Some(mut drive), Some(path)) => {
-            drive.push(path);
-            Some(PathBuf::from(drive))
-        }
-        _ => None,
+    cortexkit_paths::with_env(&LookupEnv(lookup)).home().ok()
+}
+
+pub(crate) struct LookupEnv<F>(pub(crate) F);
+
+impl<F: Fn(&str) -> Option<std::ffi::OsString>> cortexkit_paths::EnvSource for LookupEnv<F> {
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        (self.0)(key)
     }
 }
 
@@ -215,14 +203,7 @@ mod tests {
         }
     }
 
-    /// `HOME` wins wherever it is set, including on Windows.
-    ///
-    /// Windows shells that publish it (MSYS, Git Bash, WSL interop) mean what
-    /// they say, and several third-party CLIs this module reads from are Node
-    /// programs that build POSIX-shaped paths under it on every platform. A
-    /// resolver preferring the native variable would send those reads to a
-    /// directory the tool never writes -- which resolves, finds nothing, and
-    /// reports as an account that was never configured.
+    #[cfg(not(windows))]
     #[test]
     fn home_wins_over_the_windows_variables() {
         let resolved = home_dir_from(env_of(&[
@@ -234,11 +215,38 @@ mod tests {
         assert_eq!(resolved, Some(PathBuf::from("/Users/someone")));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_home_bytes_match_the_old_injected_lookup() {
+        let home = std::env::temp_dir().join("home with spaces");
+        let env = |key: &str| match key {
+            "HOME" => Some(home.clone().into_os_string()),
+            "USERPROFILE" => Some(std::ffi::OsString::from("ignored-profile")),
+            _ => None,
+        };
+        let old = env("HOME").map(PathBuf::from);
+        assert_eq!(
+            home_dir_from(env).map(PathBuf::into_os_string),
+            old.map(PathBuf::into_os_string)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_profile_wins_over_shell_home() {
+        let env = env_of(&[
+            ("HOME", r"C:\shell-home"),
+            ("USERPROFILE", r"C:\Users\someone"),
+        ]);
+        assert_eq!(home_dir_from(env), Some(PathBuf::from(r"C:\Users\someone")));
+    }
+
     /// The ordinary Windows case: no `HOME`, so `USERPROFILE` answers.
     ///
     /// Without this branch every credential path on Windows resolves to `None`
     /// at once, and the module reports a host where nothing is configured --
     /// indistinguishable from the truth on a machine nobody has logged in on.
+    #[cfg(windows)]
     #[test]
     fn userprofile_answers_when_home_is_absent() {
         let resolved = home_dir_from(env_of(&[
@@ -254,6 +262,7 @@ mod tests {
     /// A drive with no path, or a path with no drive, does not name a directory:
     /// joining a relative credential path to either produces a location that
     /// resolves against the process's current directory instead of failing.
+    #[cfg(windows)]
     #[test]
     fn homedrive_and_homepath_answer_only_together() {
         assert_eq!(
@@ -282,7 +291,14 @@ mod tests {
             ("HOME", ""),
             ("USERPROFILE", r"C:\Users\someone"),
         ]));
-        assert_eq!(resolved, Some(PathBuf::from(r"C:\Users\someone")));
+        assert_eq!(
+            resolved,
+            if cfg!(windows) {
+                Some(PathBuf::from(r"C:\Users\someone"))
+            } else {
+                None
+            }
+        );
 
         assert_eq!(home_dir_from(env_of(&[("HOME", "")])), None);
     }

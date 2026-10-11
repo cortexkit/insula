@@ -8,6 +8,8 @@ license = "MIT"
 repository = "https://github.com/cortexkit/insula"
 
 [dependencies]
+cortexkit-paths = "=0.1.2"
+cortexkit-lease = "=0.1.3"
 cortexkit-provider-usage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

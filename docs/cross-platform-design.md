@@ -34,6 +34,65 @@ describes what full Windows and Linux parity requires, what parity is
 *achievable* (it is not total, and the gap is not ours to close), and how each
 part fails when it cannot work.
 
+## Shared paths and reset-journal persistence
+
+The current home helper uses `cortexkit-paths =0.1.2` over an injectable
+`EnvSource`. Unix uses absolute `HOME`; Windows prefers `USERPROFILE`, then
+`HOMEDRIVE` plus `HOMEPATH`, then `HOME`, matching the Node-based CLI stores.
+Tests inject inputs rather than changing the process environment.
+
+The paid Codex reset journal keeps `CK_QUOTA_STATE_DIR` authoritative and verbatim.
+With no override it lives at `cortexkit_state_dir()/insula/redemptions.json`:
+absolute `XDG_STATE_HOME/cortexkit/insula`, otherwise Unix
+`HOME/.local/state/cortexkit/insula` or Windows local application data
+(`LOCALAPPDATA`, otherwise `USERPROFILE/AppData/Local`). These Unix location
+spellings are byte-identical to the old ladder for unset, empty and absolute
+XDG inputs. Relative XDG state overrides
+are invalid and now ignored, with a startup diagnostic naming the value. Their
+old cwd-relative journals and old Windows home-relative `.local/state` journals
+are adopted only by the default location's constructor. Windows computes the
+exact old home ladder (`HOME`, then `USERPROFILE`, then the concatenated
+`HOMEDRIVE` plus `HOMEPATH`) and appends
+`.local/state/cortexkit/insula/redemptions.json`, before also trying
+`USERPROFILE/.local/state/cortexkit/insula/redemptions.json`. If that old
+location and the profile location hold distinct files, startup refuses, logs
+both paths, and keeps every file rather than guessing which history is authoritative.
+It also consults
+`ck-quota/redemptions.json` beside each of these `insula/redemptions.json` paths
+(the new shared state directory, old relative-XDG base, and old Windows
+profile-relative base). Adoption fails closed on unreadable current state;
+every source record must match readback before the source is removed. Explicit
+scratch journals and state-directory overrides never consult legacy locations.
+
+Saving uses a same-directory temporary file and `cortexkit-lease =0.1.3`
+`durable_replace`: file flush, atomic replacement, then Unix directory sync or
+Windows write-through replacement. Unix additionally retains its strict
+all-sync-errors-fail rule, including unsupported directory barriers. Windows
+retries only raw sharing/access-denied errors, at most five attempts with four
+250ms delays. Persistent errors fail the save and block redemption; the old
+journal is never deleted first. These barriers depend on the local filesystem
+honoring flushes, not on remote-filesystem or physical-device guarantees.
+
+Cursor's read-only immutable app database is at
+`APPDATA/Cursor/User/globalStorage/state.vscdb` on Windows, falling back to the
+shared home plus `AppData/Roaming`. A relative APPDATA is refused, not treated as
+an absent login. macOS and Linux app paths are unchanged. SQLite URI filenames
+are escaped; Windows UNC paths use an empty URI authority so SQLite's default
+build does not reject the server name. Native Windows tests cover drive/UNC URI
+construction and journal replacement while a reader denies delete sharing.
+
+The five diagnostic module examples share connection discovery: `--subc <path>`
+wins, then `SUBC_CONNECTION_FILE`, then the shared ordered candidates:
+`XDG_RUNTIME_DIR/subc-connection.json`,
+`HOME/.local/share/cortexkit/run/subc-connection.json`, and
+`temp_dir()/subc-<user_connection_token>.connection.json`. The token comes from
+`subc-transport`, matching the daemon writer. They use
+the first existing candidate and refuse with the full attempted list if none
+exists. `scoped-list` still reads
+`HOME/.config/cortexkit/ck-quota/vault-handles.json` for its control capability.
+Production no longer writes that file, so on a fresh host this diagnostic control
+is skipped; that limitation is unchanged.
+
 ## The measured starting point
 
 | | |
