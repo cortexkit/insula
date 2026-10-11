@@ -212,8 +212,13 @@ mod tests {
 
         // THE CONTROL: a resolvable home still yields a path, or the refusal
         // above would fire on every healthy host and take five providers dark.
-        let home_set =
-            |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/someone"));
+        // An absolute path on the host platform, offered under both names: Windows
+        // resolves USERPROFILE first and refuses a drive-less "/home/..." as relative.
+        let home = std::env::temp_dir().join("someone");
+        let home = &home;
+        let home_set = |name: &str| {
+            matches!(name, "HOME" | "USERPROFILE").then(|| home.clone().into_os_string())
+        };
         let path = auth_path_from(home_set).expect("a resolvable home yields a path");
         assert!(
             path.ends_with(".local/share/opencode/auth.json"),

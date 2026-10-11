@@ -2524,8 +2524,17 @@ mod tests {
             ],
             cwd: scratch.path().to_path_buf(),
         };
-        let home_old = home.join(".local/state/cortexkit/insula/redemptions.json");
-        let profile_old = profile.join(".local/state/cortexkit/insula/redemptions.json");
+        // Built exactly as the resolver builds them: the refusal names both paths,
+        // and on Windows a single ".local/state/..." literal keeps its forward
+        // slashes while separate joins insert backslashes, so the two spellings
+        // of one file would compare unequal as strings.
+        let old_path = |base: &Path| {
+            base.join(".local/state")
+                .join(STATE_SEGMENT)
+                .join("redemptions.json")
+        };
+        let home_old = old_path(&home);
+        let profile_old = old_path(&profile);
         let shell_records = vec![pending_record("shell", "shell-pending-id")];
         let profile_records = vec![pending_record("native", "native-pending-id")];
         RedemptionJournal::new(home_old.clone())
