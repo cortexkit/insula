@@ -907,3 +907,22 @@ expect_message = "a dates failure must never set the Claude row's errorClass"
 only = true
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-linux-real-proc-empty"
+guards = "Linux local discovery must enumerate the real procfs process table, not silently report no editor"
+file = "crates/quota-core/src/antigravity.rs"
+old = 'linux_processes(std::path::Path::new("/proc"), deadline)'
+new = 'Ok(Vec::new()) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::tests::linux_real_enumerator_sees_own_pid_and_listener"]
+expect_message = "real procfs scan must see current test pid"
+only = false
+platforms = ["linux"]
+timeout_s = 600
+build_timeout_s = 1800

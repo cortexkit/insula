@@ -866,6 +866,7 @@ dependencies = [
  "cortexkit-provider-usage",
  "futures-util",
  "hmac",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",
@@ -876,6 +877,7 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

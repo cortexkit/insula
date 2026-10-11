@@ -977,7 +977,7 @@ Read an OAuth bearer from a local file (or opencode store) → one GET → decod
 |---|---|---|---|---|
 | **codex** ✅ | codex | `~/.codex/auth.json` (oauth access_token) | GET chatgpt.com/backend-api/wham/usage | 5h + weekly |
 | **claude** ✅ | claude | opencode `anthropic` / Keychain | GET api.anthropic.com/api/oauth/usage | 5h + weekly + sonnet/opus |
-| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server via `ps` + `lsof` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary`; wrong-client placeholder fence ported via projectless `loadCodeAssist` preflight → `credential_rejected`, with stored-project/local/cache lanes unchanged | per-pool (resetTime) |
+| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server: macOS `ps` + `lsof`; Linux `/proc` command lines + socket inodes/TCP tables; Windows Toolhelp + same-architecture PEB reads + TCP owner tables (discovery bounds and verification below) | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary`; a projectless `loadCodeAssist` preflight that refuses the OAuth client for consumer accounts reports `credential_rejected` instead of serving placeholder quota; stored projects bypass this preflight, and the local/editor-cache paths remain alternatives | per-pool (resetTime) |
 | gemini | gemini | `~/.gemini/oauth_creds.json` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model 24h |
 Notes — the Google-OAuth sub-archetype (gemini/antigravity, cloudcode-pa quota):
 the fetch is a clean POST (loadCodeAssist→retrieveUserQuota, per-model windows),
@@ -992,8 +992,20 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   NEVER write back to oauth_creds.json (read-only consumer).
 - **antigravity = TWO LANES, cloud and local probe.** The cloud lane uses the
   vault's `antigravity:google` credential and needs no local process. The local
-  lane finds a running `agy` CLI or app language server with `ps`, discovers its
-  loopback port with `lsof`, and asks that process.
+  lane finds a running `agy` CLI or app language server and asks its loopback
+  port. macOS uses `ps`/`lsof`, Linux reads `/proc`, and Windows uses Toolhelp,
+  image-filtered PEB command-line reads and TCP owner tables. Process scans and
+  each port scan have a five-second deadline and a single-flight gate that stays
+  held until the underlying operation finishes. An unreadable scan reports
+  transient `LocalSourceUnavailable`, not an absent editor.
+
+  Windows requests query and VM-read access only for candidate image paths,
+  without elevation or debug privileges. Different-architecture processes are
+  skipped, command-line reads are capped at 32 KiB, and command lines/CSRF tokens
+  are never logged. Windows discovery has portable fixture tests and a Windows
+  cross-target type check; native execution is covered by
+  `windows_real_enumerator_reads_own_command_line_and_listener` on CI's Windows
+  leg. It has not been live-checked from the macOS development host.
 
   Both are offered, and the local one is **not** replaced when the vault handle
   exists — unlike the vault-served providers, where a vault handle replaces the
