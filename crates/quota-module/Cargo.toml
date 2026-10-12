@@ -42,7 +42,8 @@ sha2 = { workspace = true }
 cortexkit-paths = "=0.1.2"
 # For the diagnostic examples only: the module itself makes no HTTP calls.
 reqwest = { workspace = true }
-# Content-addresses the ckdev copies the integration tests spawn
-# (tests/common/mod.rs). Already in the graph, so no new third-party surface.
-sha2 = { workspace = true }
+# The fleet's shared test helper: copies a built binary to a content-addressed
+# `ckdev-*` file on the internal disk, which the integration tests then spawn
+# (tests/common/mod.rs).
+cortexkit-test-support = "=0.1.4"
 subc-daemon = { workspace = true }

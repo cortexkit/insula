@@ -499,7 +499,15 @@ struct AccountsFile {
 /// would drop every plugin account from the wire, and a consumer reads a
 /// vanished account as one that no longer exists.
 fn stored_accounts() -> Result<Vec<StoredAccount>, String> {
-    let home = crate::env::home_dir().ok_or_else(|| {
+    // Unit tests never read the developer's real plugin store. Several build
+    // the default registry, and its contents decided their outcome: after the
+    // plugin migrated this Mac's store, four of them failed on this host alone.
+    // Tests that need a store build one and call `read_plugin_store` directly.
+    #[cfg(test)]
+    let home = Some(std::env::temp_dir().join("insula-no-plugin-home"));
+    #[cfg(not(test))]
+    let home = crate::env::home_dir();
+    let home = home.ok_or_else(|| {
         "home directory unresolved, so the plugin store can't be located".to_string()
     })?;
     read_plugin_store(&home)
