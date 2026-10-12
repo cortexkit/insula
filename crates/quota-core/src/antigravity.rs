@@ -153,7 +153,8 @@ const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 /// never installed" (no accounts, nothing to look at) apart from "the accounts
 /// moved somewhere this reader cannot follow". Both leave the legacy file
 /// missing, and only the second has accounts that are still logged in.
-const MIGRATED_STORE_POINTER: &str = ".config/opencode/antigravity-accounts.json.store.pointer.json";
+const MIGRATED_STORE_POINTER: &str =
+    ".config/opencode/antigravity-accounts.json.store.pointer.json";
 
 /// A cached pool older than this is more than 20% of the five-hour window's
 /// period old, so it has stopped describing the window it claims to describe.
@@ -496,8 +497,9 @@ struct AccountsFile {
 /// would drop every plugin account from the wire, and a consumer reads a
 /// vanished account as one that no longer exists.
 fn stored_accounts() -> Result<Vec<StoredAccount>, String> {
-    let home = crate::env::home_dir()
-        .ok_or_else(|| "home directory unresolved, so the plugin store can't be located".to_string())?;
+    let home = crate::env::home_dir().ok_or_else(|| {
+        "home directory unresolved, so the plugin store can't be located".to_string()
+    })?;
     read_plugin_store(&home)
 }
 
