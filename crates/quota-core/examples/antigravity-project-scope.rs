@@ -34,7 +34,13 @@ type Attempt = (&'static str, serde_json::Value, Vec<(&'static str, String)>);
 async fn main() {
     let provider = AntigravityProvider::new();
 
-    let accounts = provider.probe_plugin_accounts();
+    let accounts = match provider.probe_plugin_accounts() {
+        Ok(accounts) => accounts,
+        Err(reason) => {
+            println!("plugin account store not readable: {reason}");
+            std::process::exit(2);
+        }
+    };
     if accounts.is_empty() {
         println!("no plugin accounts on this host: nothing to probe");
         std::process::exit(2);

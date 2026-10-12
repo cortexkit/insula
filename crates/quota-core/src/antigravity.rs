@@ -146,6 +146,15 @@ fn remote_user_agent_header() -> Header {
 /// them with `local_source_unavailable` — correct and useless.
 const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 
+/// What the plugin leaves beside [`ACCOUNTS_FILE`] once its 3.0 migration has
+/// moved the accounts into a generation store.
+///
+/// insula does not read that store. Its presence is what tells "the plugin was
+/// never installed" (no accounts, nothing to look at) apart from "the accounts
+/// moved somewhere this reader cannot follow". Both leave the legacy file
+/// missing, and only the second has accounts that are still logged in.
+const MIGRATED_STORE_POINTER: &str = ".config/opencode/antigravity-accounts.json.store.pointer.json";
+
 /// A cached pool older than this is more than 20% of the five-hour window's
 /// period old, so it has stopped describing the window it claims to describe.
 /// The weekly window would tolerate longer, but one cache entry carries both
@@ -254,11 +263,13 @@ fn unmask(masked: &[u8]) -> String {
 impl AntigravityProvider {
     /// The plugin account store as the lane reads it, reduced to the three
     /// fields the probe needs: email, project, refresh token.
-    pub fn probe_plugin_accounts(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
-        stored_accounts()
+    pub fn probe_plugin_accounts(
+        &self,
+    ) -> Result<Vec<(Option<String>, Option<String>, Option<String>)>, String> {
+        Ok(stored_accounts()?
             .into_iter()
             .map(|a| (a.email, a.managed_project_id, a.refresh_token))
-            .collect()
+            .collect())
     }
 
     /// Exchange a refresh token, exactly as the lane does.
@@ -476,21 +487,37 @@ struct AccountsFile {
 
 /// Read the plugin's accounts, keeping only those that can actually be fetched.
 ///
-/// Returns an empty vector when the file is absent, which is the ordinary case
-/// on a host that never installed the plugin -- not an error, and deliberately
-/// indistinguishable from having no accounts, because both mean this lane has
-/// nothing to offer.
-fn stored_accounts() -> Vec<StoredAccount> {
-    let Some(home) = crate::env::home_dir() else {
-        return Vec::new();
+/// An empty list means the plugin has no accounts here: the file is absent and
+/// nothing says the accounts moved, which is the ordinary case on a host that
+/// never installed the plugin.
+///
+/// An error means this reader could not look, and it must never come back as
+/// an empty list. The caller turns it into "keep what you had": an empty list
+/// would drop every plugin account from the wire, and a consumer reads a
+/// vanished account as one that no longer exists.
+fn stored_accounts() -> Result<Vec<StoredAccount>, String> {
+    let home = crate::env::home_dir()
+        .ok_or_else(|| "home directory unresolved, so the plugin store can't be located".to_string())?;
+    read_plugin_store(&home)
+}
+
+fn read_plugin_store(home: &std::path::Path) -> Result<Vec<StoredAccount>, String> {
+    let text = match std::fs::read_to_string(home.join(ACCOUNTS_FILE)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if home.join(MIGRATED_STORE_POINTER).exists() {
+                return Err("the opencode antigravity plugin moved its accounts to a \
+                            generation store this version does not read"
+                    .to_string());
+            }
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(format!("plugin account store unreadable: {error}")),
     };
-    let Ok(text) = std::fs::read_to_string(home.join(ACCOUNTS_FILE)) else {
-        return Vec::new();
-    };
-    let Ok(file) = serde_json::from_str::<AccountsFile>(&text) else {
-        return Vec::new();
-    };
-    file.accounts
+    let file = serde_json::from_str::<AccountsFile>(&text)
+        .map_err(|error| format!("plugin account store did not parse: {error}"))?;
+    Ok(file
+        .accounts
         .into_iter()
         .filter(|account| account.enabled != Some(false))
         .filter(|account| {
@@ -499,7 +526,7 @@ fn stored_accounts() -> Vec<StoredAccount> {
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty())
         })
-        .collect()
+        .collect())
 }
 
 /// The handle name for a stored account.
@@ -2117,7 +2144,7 @@ pub struct AntigravityProvider {
     /// PRODUCER.
     served_lane: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
     local_endpoints: Option<Vec<(LocalServer, u16)>>,
-    override_accounts: Option<Vec<StoredAccount>>,
+    override_store: Option<Result<Vec<StoredAccount>, String>>,
 }
 
 impl AntigravityProvider {
@@ -2146,7 +2173,7 @@ impl AntigravityProvider {
             process_scan: process_scan(),
             served_lane: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_endpoints: None,
-            override_accounts: None,
+            override_store: None,
         }
     }
 
@@ -2158,11 +2185,16 @@ impl AntigravityProvider {
 
     #[doc(hidden)]
     pub fn set_override_accounts(&mut self, accounts: Vec<StoredAccount>) {
-        self.override_accounts = Some(accounts);
+        self.override_store = Some(Ok(accounts));
     }
 
-    fn stored_accounts(&self) -> Vec<StoredAccount> {
-        if let Some(accounts) = &self.override_accounts {
+    #[doc(hidden)]
+    pub fn set_override_store_unreadable(&mut self, reason: &str) {
+        self.override_store = Some(Err(reason.to_string()));
+    }
+
+    fn stored_accounts(&self) -> Result<Vec<StoredAccount>, String> {
+        if let Some(accounts) = &self.override_store {
             return accounts.clone();
         }
         stored_accounts()
@@ -2209,7 +2241,19 @@ impl AntigravityProvider {
     }
 
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
-        let accounts = self.stored_accounts();
+        let accounts = match self.stored_accounts() {
+            Ok(accounts) => accounts,
+            // Transient, so the slot keeps serving its last reading and says it
+            // is stale. Treating this as "no longer listed" would publish the
+            // account as signed out.
+            Err(reason) => {
+                return FetchAttempt::failure(
+                    None,
+                    Some(PLUGIN_SOURCE.to_string()),
+                    FetchError::LocalSourceUnavailable(reason),
+                );
+            }
+        };
         let found = accounts
             .iter()
             .enumerate()
@@ -2598,7 +2642,20 @@ impl AntigravityProvider {
             }
         }
 
-        let accounts = self.stored_accounts();
+        // Without the store, this lane can't tell whether the account is paid,
+        // and for a paid account the cloud reading below is a different pool.
+        // So it keeps the last reading instead of guessing.
+        let accounts = match self.stored_accounts() {
+            Ok(accounts) => accounts,
+            Err(reason) => {
+                return FetchAttempt::failure(
+                    observed,
+                    Some("vault".to_string()),
+                    FetchError::LocalSourceUnavailable(reason),
+                )
+                .with_account_info(account_info);
+            }
+        };
         let plugin_account = stored_account_for_email(&accounts, observed_email.as_deref());
 
         // The account-local plugin cache outranks this live network call because
@@ -2899,7 +2956,13 @@ impl UsageProvider for AntigravityProvider {
         // ordinary install has, and the only one that can see more than one
         // account: the local probe reports whichever account the running editor
         // happens to be using, and a vault credential is minted per fleet host.
-        for (index, account) in self.stored_accounts().iter().enumerate() {
+        // An unreadable store fails the whole enumeration rather than returning
+        // the vault handles alone. Either way the plugin accounts would be
+        // missing from the set, and the refresher would take that as their removal.
+        let accounts = self
+            .stored_accounts()
+            .map_err(crate::provider::HandlesError::new)?;
+        for (index, account) in accounts.iter().enumerate() {
             credentialed.push(CredentialHandle::new(account_handle_name(account, index)));
         }
 
@@ -3473,6 +3536,27 @@ mod tests {
         assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
         assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 0);
         assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    /// The vault lane can't tell a paid account without the store, so it keeps
+    /// the last reading instead of publishing the cloud pool.
+    #[tokio::test]
+    async fn the_vault_lane_withholds_the_cloud_pool_when_the_store_is_unreadable() {
+        let mut mock =
+            cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
+        let handle = attach_vault(&mut mock.provider, Some("p"), Arc::new(AtomicUsize::new(0)));
+        mock.provider.set_override_store_unreadable("moved");
+        let error = mock
+            .provider
+            .fetch_handle(&handle)
+            .await
+            .usage
+            .expect_err("the tier is unknown, so the cloud pool may be the wrong one");
+        assert!(
+            matches!(error, FetchError::LocalSourceUnavailable(_)),
+            "{error:?}"
+        );
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -5046,6 +5130,76 @@ mod plugin_lane_tests {
             classify(&error),
             FetchClass::Transient,
             "a closed editor is not a broken credential"
+        );
+    }
+
+    fn plugin_home(label: &str) -> crate::tests::ResetTempDir {
+        let home = crate::tests::ResetTempDir::with_prefix("antigravity-store", label);
+        std::fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
+        home
+    }
+
+    /// A missing store is "no accounts" only when nothing says they moved.
+    ///
+    /// The 3.0 plugin migration removes the legacy file and leaves a pointer to
+    /// its generation store. Reading that as an empty list would drop every
+    /// plugin account from the wire, and consumers prune a vanished account.
+    #[test]
+    fn a_migrated_plugin_store_is_unreadable_not_empty() {
+        let never_installed = plugin_home("never-installed");
+        assert_eq!(
+            read_plugin_store(never_installed.path()).map(|a| a.len()),
+            Ok(0),
+            "no store and no pointer is the ordinary empty case"
+        );
+
+        let migrated = plugin_home("migrated");
+        std::fs::write(migrated.path().join(MIGRATED_STORE_POINTER), "{}").unwrap();
+        let error = read_plugin_store(migrated.path())
+            .expect_err("a migrated store must not read as an empty account list");
+        assert!(error.contains("generation store"), "{error}");
+
+        let corrupt = plugin_home("corrupt");
+        std::fs::write(corrupt.path().join(ACCOUNTS_FILE), "{not json").unwrap();
+        assert!(
+            read_plugin_store(corrupt.path()).is_err(),
+            "a store that fails to parse is unreadable, not empty"
+        );
+
+        let present = plugin_home("present");
+        std::fs::write(
+            present.path().join(ACCOUNTS_FILE),
+            r#"{"version":4,"accounts":[{"email":"a@example.test","refreshToken":"tok"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(read_plugin_store(present.path()).map(|a| a.len()), Ok(1));
+    }
+
+    /// An unreadable store fails enumeration instead of dropping its accounts.
+    #[test]
+    fn an_unreadable_plugin_store_fails_enumeration() {
+        let mut provider = AntigravityProvider::new();
+        provider.set_override_store_unreadable("moved");
+        assert!(
+            provider.handles().is_err(),
+            "an error keeps the existing slots; an empty set would reap them"
+        );
+    }
+
+    /// A plugin account whose store can't be read keeps its last reading.
+    #[tokio::test]
+    async fn a_plugin_account_with_an_unreadable_store_stays_transient() {
+        let mut provider = AntigravityProvider::new();
+        provider.set_local_endpoints(Vec::new());
+        provider.set_override_store_unreadable("moved");
+        let error = provider
+            .fetch_handle(&CredentialHandle::Named("plugin:a@example.test".into()))
+            .await
+            .usage
+            .expect_err("no reading without the store");
+        assert!(
+            matches!(error, FetchError::LocalSourceUnavailable(_)),
+            "must not read as signed out (credential_absent), got {error:?}"
         );
     }
 
