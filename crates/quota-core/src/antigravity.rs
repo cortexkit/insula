@@ -248,6 +248,10 @@ fn unmask(masked: &[u8]) -> String {
         .collect()
 }
 
+/// Email, project and refresh token of one plugin account, for the probe.
+#[doc(hidden)]
+pub type ProbeAccount = (Option<String>, Option<String>, Option<String>);
+
 /// Diagnostic access to the cloud quota call, for the live probe example.
 ///
 /// EXISTS BECAUSE THE QUESTION IS ABOUT THE REQUEST, NOT THE NORMALISER. Our
@@ -260,10 +264,6 @@ fn unmask(masked: &[u8]) -> String {
 /// alternative is copying the token exchange and the request shape into the
 /// example, where they would drift from the lane they are supposed to be
 /// measuring, and a probe that measures a copy of the request answers nothing.
-/// Email, project and refresh token of one plugin account, for the probe.
-#[doc(hidden)]
-pub type ProbeAccount = (Option<String>, Option<String>, Option<String>);
-
 #[doc(hidden)]
 impl AntigravityProvider {
     /// The plugin account store as the lane reads it, reduced to the three
@@ -2247,9 +2247,10 @@ impl AntigravityProvider {
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
         let accounts = match self.stored_accounts() {
             Ok(accounts) => accounts,
-            // Transient, so the slot keeps serving its last reading and says it
-            // is stale. Treating this as "no longer listed" would publish the
-            // account as signed out.
+            // An unreadable store is reported as LocalSourceUnavailable, which is
+            // transient: the refresher keeps serving this account's last reading
+            // and marks it stale. Treating it as "no longer listed" would publish
+            // the account as signed out.
             Err(reason) => {
                 return FetchAttempt::failure(
                     None,
