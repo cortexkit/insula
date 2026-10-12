@@ -260,13 +260,15 @@ fn unmask(masked: &[u8]) -> String {
 /// alternative is copying the token exchange and the request shape into the
 /// example, where they would drift from the lane they are supposed to be
 /// measuring, and a probe that measures a copy of the request answers nothing.
+/// Email, project and refresh token of one plugin account, for the probe.
+#[doc(hidden)]
+pub type ProbeAccount = (Option<String>, Option<String>, Option<String>);
+
 #[doc(hidden)]
 impl AntigravityProvider {
     /// The plugin account store as the lane reads it, reduced to the three
     /// fields the probe needs: email, project, refresh token.
-    pub fn probe_plugin_accounts(
-        &self,
-    ) -> Result<Vec<(Option<String>, Option<String>, Option<String>)>, String> {
+    pub fn probe_plugin_accounts(&self) -> Result<Vec<ProbeAccount>, String> {
         Ok(stored_accounts()?
             .into_iter()
             .map(|a| (a.email, a.managed_project_id, a.refresh_token))
