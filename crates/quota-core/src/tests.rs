@@ -8181,36 +8181,14 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
     );
 }
 
-/// Spent and about-to-expire credit lists yield no usable expiry.
+/// Every opaque upstream constant appears in the pinned parity table, and nothing
+/// else does. The table lives in this test so a public checkout needs no internal
+/// research to check the port. Values were checked against CodexBar v0.74.0.
 ///
-/// RENAMED from `zero_or_expiring_now_credits_cannot_arm`, which stated a
-/// conclusion this test does not reach. It checks `earliest_usable_expiry`
-/// twice, then checks that `reporting_eligible` refuses an `armed: false` it is
-/// HANDED as a literal -- so nothing here connects a spent account to unrelaxed
-/// output. The old name asserted that join, a reader believed it, and the join
-/// went untested until a live account ran out of credits.
-///
-/// The join now lives in `an_account_with_no_credits_left_publishes_its_real_usage`.
-/// Every opaque upstream constant appears in the parity table, and nothing else does.
-///
-/// WHY THIS EXISTS. `docs/provider-matrix.md` carries a table of values copied
-/// from the upstream that we cannot compute or validate. It is the first step of
-/// every parity round, because a rotated constant is a one-line change a diff
-/// draws no attention to, and a stale one surfaces as a rejected request that
-/// reads exactly like an outage.
-///
-/// The table claimed to enumerate them and MISSED ONE: `BILLING_SERVER_ID`, the
-/// server function opencode falls back to when a workspace has no subscription.
-/// Same class, same rotation risk, absent from the list that gets re-checked. It
-/// also cited a line number that had drifted by ten.
-///
-/// So the population is declared AT EACH DEFINITION with a marker, and this test
-/// compares that set against the table. A new constant now announces itself from
-/// the file where it is written, rather than depending on its author remembering
-/// a document in another directory.
-///
-/// Line numbers are deliberately NOT asserted. They drift on every edit above the
-/// constant, and a test that fails on unrelated edits gets weakened or deleted.
+/// A rotated constant can look like an upstream outage. Definitions declare their
+/// membership with a marker, so adding a constant requires adding its independent
+/// expected value here. Source line numbers are not pinned because unrelated edits
+/// move them without changing the request.
 #[test]
 fn every_opaque_upstream_constant_is_in_the_parity_table() {
     // Split so this file does not itself contain the contiguous marker: a scanner
@@ -8219,6 +8197,26 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
     const MARKER: &str = concat!("OPAQUE-UPSTREAM", "-CONSTANT");
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
+    const PINNED: &[(&str, &str)] = &[
+        (
+            "WORKSPACES_SERVER_ID",
+            "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f",
+        ),
+        (
+            "SUBSCRIPTION_SERVER_ID",
+            "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4",
+        ),
+        (
+            "BILLING_SERVER_ID",
+            "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d",
+        ),
+        ("BETA_HEADER", "oauth-2025-04-20"),
+        ("OASIS_WEB_ID", "c8a1002d2c457e758785a9979832217c7c0b884c"),
+        ("CONSOLE_WORKSPACES_PATH", "/console/api/orgs"),
+        ("CONSOLE_GO_STATUS_PATH", "/console/api/go/status"),
+        ("CONSOLE_WORKSPACE_HEADER", "x-org-id"),
+    ];
+    let table: Vec<String> = PINNED.iter().map(|(name, _)| (*name).to_string()).collect();
     let mut marked: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&src).expect("the source directory must be readable") {
         let path = entry.expect("a readable directory entry").path();
@@ -8232,14 +8230,11 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
                 continue;
             }
             // The marked item is the next `const` declaration below the comment.
-            let name = lines[i..]
+            let declaration = lines[i..]
                 .iter()
-                .find_map(|l| {
+                .position(|l| {
                     let l = l.trim_start();
-                    let rest = l
-                        .strip_prefix("pub const ")
-                        .or_else(|| l.strip_prefix("const "))?;
-                    rest.split(':').next().map(str::to_string)
+                    l.starts_with("pub const ") || l.starts_with("const ")
                 })
                 .unwrap_or_else(|| {
                     panic!(
@@ -8248,28 +8243,43 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
                         i + 1
                     )
                 });
-            marked.push(name);
+            let definition = lines[i + declaration..].join("\n");
+            let rest = definition
+                .trim_start()
+                .strip_prefix("pub ")
+                .unwrap_or(definition.trim_start());
+            let name = rest
+                .strip_prefix("const ")
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap();
+            if let Some((_, expected)) = PINNED.iter().find(|(pinned, _)| *pinned == name) {
+                let value = definition
+                    .split_once('=')
+                    .unwrap()
+                    .1
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .trim();
+                assert_eq!(
+                    value,
+                    format!("{expected:?}"),
+                    "{name} differs from the pinned upstream value"
+                );
+            }
+            marked.push(name.to_string());
         }
     }
     marked.sort();
     marked.dedup();
 
-    let matrix = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/provider-matrix.md"),
-    )
-    .expect("provider-matrix.md must be readable from the crate directory");
-    let table: Vec<String> = matrix
-        .lines()
-        .filter(|line| line.starts_with("| `"))
-        .filter_map(|line| line.split('`').nth(1).map(str::to_string))
-        .filter(|token| token.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
-        .collect();
-
     for name in &marked {
         assert!(
             table.contains(name),
             "{name} is marked {MARKER} in the source but is not a row in the \
-             provider-matrix parity table, so no round re-checks it"
+             pinned parity table, so no round re-checks it"
         );
     }
     for row in &table {
@@ -8280,7 +8290,7 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
         );
     }
 
-    // Not vacuous: a lost marker convention or a renamed table heading would
+    // Not vacuous: a lost marker convention or an emptied table would
     // satisfy both loops above by comparing two empty sets.
     assert_eq!(
         marked.len(),
@@ -9434,16 +9444,9 @@ async fn the_idle_sleep_is_capped_so_discovery_keeps_running() {
 
 /// Every document this repository points at from another document exists.
 ///
-/// The charter's superseding banner, the README index and the cross-references
-/// between the contract and invariants notes are all paths in prose. A rename
+/// The README index and the public contract's cross-references are paths in prose. A rename
 /// breaks them and nothing reports it: markdown has no build step here, so a
 /// dangling doc link is invisible until a reader follows it and finds nothing.
-///
-/// That matters most for the pointers that exist BECAUSE a document went stale.
-/// The charter is retained as a record and sends readers elsewhere for current
-/// behaviour; if those targets move, the stale document stays and its escape
-/// hatch is what breaks -- leaving a reader inside the overtaken description
-/// with no way out.
 ///
 /// Checked rather than verified once by hand, so the pointers are stable for a
 /// structural reason instead of being right on the day someone looked.
@@ -9490,7 +9493,8 @@ fn every_doc_reference_between_documents_resolves() {
         .filter(|line| line.ends_with(".md"))
         .collect();
 
-    let mut checked = 0usize;
+    const PUBLIC_DOCS: [&str; 3] = ["consumer-contract.md", "provider-matrix.md", "verifying.md"];
+    let mut referenced_public_docs = std::collections::BTreeSet::new();
     let mut missing: Vec<String> = Vec::new();
     for source in &sources {
         let text = std::fs::read_to_string(source).expect("a readable markdown file");
@@ -9502,7 +9506,10 @@ fn every_doc_reference_between_documents_resolves() {
             if !token.ends_with(".md") || token.starts_with("http") || token.contains(':') {
                 continue;
             }
-            checked += 1;
+            let bare = token.strip_prefix("docs/").unwrap_or(token);
+            if PUBLIC_DOCS.contains(&bare) {
+                referenced_public_docs.insert(bare.to_string());
+            }
             // Three spellings are all legitimate here: a sibling reference from
             // inside docs/, a repo-relative path, and a bare filename in the
             // README's documentation table, which means the file in docs/.
@@ -9552,11 +9559,12 @@ fn every_doc_reference_between_documents_resolves() {
         missing.is_empty(),
         "documents point at files that do not exist: {missing:?}"
     );
-    // Not vacuous: a tokenizer that matched nothing would pass silently, which
-    // is the failure this test exists to catch one level down.
-    assert!(
-        checked >= 20,
-        "expected the doc set to cross-reference itself; only found {checked}"
+    // The public doc set has three files. Witness each one explicitly rather
+    // than pinning a link count that grows with private design/review notes.
+    assert_eq!(
+        referenced_public_docs,
+        PUBLIC_DOCS.into_iter().map(str::to_string).collect(),
+        "the public documentation index must reference every public document"
     );
 }
 
@@ -11042,7 +11050,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
     );
 }
 
-/// The cookie-capture table in docs/vault-consumer-design.md names the URL each
+/// The cookie-capture table in docs/consumer-contract.md names the URL each
 /// provider actually fetches.
 ///
 /// A capture tool scopes the cookie it saves to that URL, so a row naming the
@@ -11054,10 +11062,9 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
 #[test]
 fn cookie_capture_urls_match_the_providers_fetch_urls() {
     let doc = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/vault-consumer-design.md"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/consumer-contract.md"),
     )
-    .expect("docs/vault-consumer-design.md must be readable");
+    .expect("docs/consumer-contract.md must be readable");
     let sources: std::collections::HashMap<&str, &str> = [
         ("claude", include_str!("claude_subscription.rs")),
         ("amp", include_str!("amp.rs")),

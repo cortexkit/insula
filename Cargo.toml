@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/quota-core", "crates/quota-module"]
 
 # ai-provider-quota — a subc-supervised module serving per-provider usage/quota
-# windows, replacing the external CodexBar dependency. See docs/charter.md.
+# windows, replacing the external CodexBar dependency.
 #
 # The subc crates come from crates.io: a sibling release cannot rewrite our lock.
 # We take upgrades deliberately with `cargo update -p <crate>` (and bump the

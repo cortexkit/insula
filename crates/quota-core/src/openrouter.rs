@@ -10,8 +10,8 @@
 //! - Account: `GET https://openrouter.ai/api/v1/key` with the same key returns
 //!   `data.organization_id` and `data.creator_user_id`. The account is the
 //!   organization when one is set, because an org key's credits bill to the org,
-//!   and otherwise the user who created the key. See the "openrouter" section of
-//!   `docs/audits/account-identity-survey.md`, which verified the fields live.
+//!   and otherwise the user who created the key. Both fields were verified live;
+//!   using the billing owner keeps keys for one organization on one account label.
 //!
 //!   A key's owner does not change, so the lookup is made once per credential and
 //!   cached in memory: per `record_version` for a vault record, per key value for

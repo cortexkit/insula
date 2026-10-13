@@ -17,8 +17,9 @@ scripts/gates.sh --e2e    # also the integration suites, ~80s more
 That runs the checks together and stops at the first failure. Use it rather
 than a partial list of individual commands: it also checks Python and shell
 instruments, repository path dependencies (using Python 3.11+ for TOML),
-endpoint hosts, CI push triggers for `master` and `train/**` branches (which
-must both produce checks before a tested train can land), the newest stable clippy,
+endpoint hosts, CI push triggers for `master` and release-candidate `train/**`
+branches (both must produce checks before publishing a tested commit to master), the public `.cortexkit/`
+layout and its ignore controls, the newest stable clippy,
 unit tests, doctests, and orphan modules.
 
 ### Updating subc dependencies

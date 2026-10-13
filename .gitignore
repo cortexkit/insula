@@ -18,13 +18,17 @@ bun.lockb
 
 # Agent tooling.
 #
-# Machine-local and untracked: notes, ledgers and plans written here reach this
-# machine only. A long-running audit ledger lived under .cortexkit once and was
-# invisible to every other checkout for its whole life. Durable findings belong
-# in docs/ -- see docs/provider-invariants.md for where a rule goes and why.
+# Public material belongs in docs/. Internal designs, investigations, audits,
+# research and ledgers belong in .cortexkit/internal-docs/ and stay untracked.
+# Only the release notes, skills, rules and worker guide below may be tracked
+# under .cortexkit/.
 .alfonso
 .opencode
-.cortexkit
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
 _bmad-output
 .bmad
 
@@ -40,8 +44,8 @@ _bmad-output
 # (untracked) and is then erased by the next generation with no event marking
 # either, so the author cannot learn it happened.
 #
-# Durable equivalents: docs/provider-invariants.md for porting rules and
-# procedures, docs/consumer-contract.md for wire semantics, README.md for the
-# index. Both are tracked and authored.
+# Authored public equivalents: docs/consumer-contract.md for wire semantics,
+# docs/provider-matrix.md for the provider inventory, README.md for the index.
+# Internal engineering notes stay in .cortexkit/internal-docs/.
 /ARCHITECTURE.md
 /STRUCTURE.md

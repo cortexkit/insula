@@ -136,6 +136,11 @@ jobs:
         working-directory: insula
         run: ./scripts/check-train-preconditions.sh
 
+      - name: Public .cortexkit layout
+        if: matrix.os == 'ubuntu'
+        working-directory: insula
+        run: ./scripts/check-cortexkit-layout.sh
+
       # Only real_daemon_e2e needs this public sibling checkout: it builds the
       # ck-subc binary from ../subconscious to test against subconscious master.
       # Compiling insula itself uses crates.io and does not need the sibling.

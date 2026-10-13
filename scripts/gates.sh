@@ -128,6 +128,9 @@ step "train preconditions"
 # carries it, not on the run it breaks.
 ./scripts/check-train-preconditions.sh || fail "train preconditions drifted"
 
+step "public .cortexkit layout"
+./scripts/check-cortexkit-layout.sh || fail "disallowed .cortexkit tracking or missing ignore controls"
+
 step "cargo fmt --check"
 cargo fmt --check || fail "formatting"
 
