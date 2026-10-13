@@ -4859,9 +4859,15 @@ mod plugin_lane_tests {
             sidebar_path(&lookup(&[("XDG_STATE_HOME", "/state"), ("HOME", "/home")])).unwrap(),
             std::path::Path::new("/state").join(SIDEBAR_STATE_RELATIVE)
         );
+        // A drive-less "/home" is relative on Windows, where the home resolver
+        // rightly refuses it, so the home case uses an absolute path on any host.
+        let home = std::env::temp_dir().join("sidebar-home");
+        let home = home.to_str().expect("temp dir is UTF-8");
         assert_eq!(
-            sidebar_path(&lookup(&[("HOME", "/home"), ("USERPROFILE", "/home")])).unwrap(),
-            std::path::Path::new("/home/.local/state").join(SIDEBAR_STATE_RELATIVE)
+            sidebar_path(&lookup(&[("HOME", home), ("USERPROFILE", home)])).unwrap(),
+            std::path::Path::new(home)
+                .join(".local/state")
+                .join(SIDEBAR_STATE_RELATIVE)
         );
     }
 
