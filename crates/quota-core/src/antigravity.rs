@@ -2,9 +2,10 @@
 //!
 //! Unlike the OAuth providers, Antigravity's authoritative paid-tier usage is not a
 //! cloud call: the Antigravity editor (its `language_server`, or the `agy` CLI) runs a
-//! local server on a loopback port, and the opencode plugin preserves that same pool
-//! in its account-local cache. We prefer the live server, then a recent plugin cache;
-//! only free-tier accounts fall through to the cloud client's standard-tier pool.
+//! local server on a loopback port. The opencode antigravity-auth plugin publishes
+//! remaining fractions, reset times and observation times for that paid quota in
+//! its non-secret sidebar v2 JSON file. We prefer the live server, then a recent
+//! sidebar reading; vault credentials without a known paid tier may use the cloud.
 //!
 //! Flow:
 //!  1. `ps -ax -o pid=,command=` → find the Antigravity `language_server` (app/IDE) or
@@ -137,24 +138,16 @@ fn remote_user_agent_header() -> Header {
     Header::new("User-Agent", remote_user_agent())
 }
 
-/// Where the opencode `antigravity-auth` plugin keeps its logged-in accounts.
-///
-/// This is the third credential lane, and the one an ordinary install actually
-/// has: the local probe needs the editor running, and the cloud lane as first
-/// shipped needed a vault credential that only this fleet mints. A user who
-/// signed in through the plugin has neither, and the provider went dark for
-/// them with `local_source_unavailable` — correct and useless.
+/// Installation evidence only: never open the plugin's credential store.
 const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 
 /// What the plugin leaves beside [`ACCOUNTS_FILE`] once its 3.0 migration has
-/// moved the accounts into a generation store.
-///
-/// insula does not read that store. Its presence is what tells "the plugin was
-/// never installed" (no accounts, nothing to look at) apart from "the accounts
-/// moved somewhere this reader cannot follow". Both leave the legacy file
-/// missing, and only the second has accounts that are still logged in.
+/// moved the accounts into a generation store. Its presence is installation
+/// evidence even when no sidebar snapshot has been published yet.
 const MIGRATED_STORE_POINTER: &str =
     ".config/opencode/antigravity-accounts.json.store.pointer.json";
+const SIDEBAR_STATE_ENV: &str = "ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE";
+const SIDEBAR_STATE_RELATIVE: &str = "cortexkit/antigravity-auth/sidebar-state.json";
 
 /// A cached pool older than this is more than 20% of the five-hour window's
 /// period old, so it has stopped describing the window it claims to describe.
@@ -175,204 +168,58 @@ const MIGRATED_STORE_POINTER: &str =
 /// from window-period reasoning alone. Not a distribution.
 const CACHED_QUOTA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
-/// Why reading another tool's refresh token is safe HERE and not in general.
-///
-/// Google does not rotate: a refresh exchange returns an access token and no
-/// new refresh token, so the value in the plugin's file stays valid and two
-/// readers can each refresh independently without disturbing the other.
-///
-/// HOW TO RE-DERIVE THIS, because the claim is what carries the safety and a
-/// bare "verified" cannot be re-run: POST to `https://oauth2.googleapis.com/token`
-/// with `grant_type=refresh_token` and this lane's client id, then read the
-/// response body for a `refresh_token` field. Google's response contains
-/// `access_token`, `expires_in`, `scope`, `token_type` and NO `refresh_token`,
-/// which is what makes the stored value survive the exchange. If that field ever
-/// appears, this lane is spending a credential it does not own and must stop.
-/// (Contrast Anthropic, whose token response does carry a replacement.)
-///
-/// The check costs one request and answers definitively, so re-run it rather
-/// than trusting this paragraph -- a citation that cannot be re-run is a claim
-/// wearing the costume of evidence, and this one guards a user's sign-in.
-///
-/// THAT IS A PROPERTY OF GOOGLE, NOT A PATTERN TO COPY. Anthropic's OAuth
-/// rotates -- its token response carries a replacement refresh token and the
-/// old one stops working -- so a lane reading the anthropic plugin's store the
-/// way this one reads antigravity's would invalidate the credential that plugin
-/// depends on, breaking the user's actual sign-in to collect a usage figure. A
-/// reader that is not the owner of a rotating credential must not spend it.
-///
-/// Before adding a file-backed lane for any provider, establish which kind its
-/// refresh is. The failure is silent on this side and expensive on the other.
-const _ROTATION_NOTE: () = ();
-
-/// The plugin's own Google OAuth client, which is what makes this lane work.
-///
-/// A refresh token is bound to the client that minted it, so the client here
-/// must be the PLUGIN's — not Antigravity's desktop app, and not Gemini CLI's.
-/// Both of those were tried against a healthy token and returned 401, which
-/// reads exactly like a dead credential and is not one.
-///
-/// Public by construction (it ships in the plugin's own JavaScript) and stored
-/// XOR-masked for the same reason as the Gemini pair: to keep secret-scanner
-/// regexes off the source text, never for secrecy. Overridable by env when the
-/// plugin rotates it.
-const ANTIGRAVITY_CLIENT_ID_MASKED: &[u8] = &[
-    64, 69, 88, 69, 81, 29, 70, 69, 84, 92, 92, 90, 28, 78, 6, 8, 12, 0, 94, 31, 95, 67, 29, 93,
-    69, 13, 78, 2, 16, 80, 95, 92, 21, 89, 12, 30, 10, 14, 27, 25, 17, 5, 65, 70, 10, 4, 79, 76, 0,
-    5, 17, 66, 14, 12, 66, 4, 30, 0, 17, 0, 72, 4, 82, 30, 27, 27, 17, 15, 89, 94, 22, 13, 1,
-];
-const ANTIGRAVITY_CLIENT_SECRET_MASKED: &[u8] = &[
-    54, 58, 44, 39, 49, 117, 93, 62, 87, 84, 47, 52, 127, 87, 74, 83, 40, 23, 97, 60, 0, 28, 57,
-    45, 76, 18, 117, 51, 65, 24, 90, 24, 39, 108, 5,
-];
-const CRED_MASK: &[u8] = b"quota-public-creds-v1";
-const CLIENT_ID_ENV: &[&str] = &["ANTIGRAVITY_OAUTH_CLIENT_ID"];
-const CLIENT_SECRET_ENV: &[&str] = &["ANTIGRAVITY_OAUTH_CLIENT_SECRET"];
-const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-
-/// The wire `source` for this lane.
-///
-/// Deliberately the EXISTING `oauth` value rather than a new one. The published
-/// meaning of `oauth` is "an OAuth token or session found on this machine",
-/// whose remedy is "log in with the tool that owns it" -- which describes this
-/// lane exactly, the owning tool being the opencode plugin. A new value would
-/// have to earn its place by implying a different remedy, and this one does not.
+/// The plugin handle retains `source: oauth`: it identifies an opencode
+/// Antigravity login, even though the plugin owns all token access and polling.
 const PLUGIN_SOURCE: &str = "oauth";
 
-/// XOR-unmask an embedded public credential to its plaintext.
-fn unmask(masked: &[u8]) -> String {
-    masked
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b ^ CRED_MASK[i % CRED_MASK.len()]) as char)
-        .collect()
+type EnvLookup = Arc<dyn Fn(&str) -> Option<std::ffi::OsString> + Send + Sync>;
+
+#[cfg(not(test))]
+fn default_sidebar_env() -> EnvLookup {
+    Arc::new(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
 }
 
-/// Email, project and refresh token of one plugin account, for the probe.
-#[doc(hidden)]
-pub type ProbeAccount = (Option<String>, Option<String>, Option<String>);
-
-/// Diagnostic access to the cloud quota call, for the live probe example.
-///
-/// EXISTS BECAUSE THE QUESTION IS ABOUT THE REQUEST, NOT THE NORMALISER. Our
-/// cloud lane and the editor's own language server disagree about one of the two
-/// pools on the same account in the same second, and the only difference between
-/// the two requests is the `project` field. Answering that needs the raw upstream
-/// body for both spellings of the request, which no public path exposes.
-///
-/// `doc(hidden)` rather than private because an example is a separate crate: the
-/// alternative is copying the token exchange and the request shape into the
-/// example, where they would drift from the lane they are supposed to be
-/// measuring, and a probe that measures a copy of the request answers nothing.
-#[doc(hidden)]
-impl AntigravityProvider {
-    /// The plugin account store as the lane reads it, reduced to the three
-    /// fields the probe needs: email, project, refresh token.
-    pub fn probe_plugin_accounts(&self) -> Result<Vec<ProbeAccount>, String> {
-        Ok(stored_accounts()?
-            .into_iter()
-            .map(|a| (a.email, a.managed_project_id, a.refresh_token))
-            .collect())
-    }
-
-    /// Exchange a refresh token, exactly as the lane does.
-    ///
-    /// Safe to call repeatedly: Google's refresh tokens do not rotate on
-    /// exchange, which is the invariant the whole plugin lane rests on and is
-    /// re-verified at its call sites.
-    pub async fn probe_access_token(&self, refresh_token: &str) -> Result<String, FetchError> {
-        self.exchange_refresh_token(refresh_token).await
-    }
-
-    /// The raw summary body for an arbitrary request body.
-    ///
-    /// Takes the whole body rather than a project string because the question
-    /// outgrew the project: the endpoint answers with a DIFFERENT pool depending
-    /// on request context we may not be sending, and finding which field carries
-    /// that means trying several spellings against the live endpoint.
-    ///
-    /// Returns the body UNPARSED so the comparison is against what the endpoint
-    /// said rather than against our reading of it.
-    pub async fn probe_quota_summary(
-        &self,
-        access_token: &str,
-        request_body: serde_json::Value,
-        extra_headers: &[(&'static str, String)],
-    ) -> Result<String, FetchError> {
-        let body =
-            serde_json::to_vec(&request_body).map_err(|e| FetchError::Decode(e.to_string()))?;
-        let response = if extra_headers.is_empty() {
-            self.post_quota(&self.quota_summary_url, body, access_token)
-                .await?
-        } else {
-            // Vary headers against the shipped request. The body was ruled out --
-            // the project changes nothing and every tier spelling is refused --
-            // so what remains different from the editor is CALLER IDENTITY, which
-            // this endpoint is known to resolve entitlement from.
-            let mut request = JsonRequest::post_json(&self.quota_summary_url, body)
-                .bearer(access_token)
-                .header(remote_user_agent_header());
-            for (name, value) in extra_headers {
-                request = request.header(Header::new(name, value.clone()));
-            }
-            request
-                .timeout(REQUEST_TIMEOUT)
-                .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
-                .await?
-        };
-        Ok(String::from_utf8_lossy(&response.body).into_owned())
-    }
+#[cfg(test)]
+fn default_sidebar_env() -> EnvLookup {
+    // Registry tests construct production providers too. Give each one an absent
+    // home and no process environment so neither quota nor evidence is read from
+    // the developer's plugin installation.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "insula-absent-sidebar-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    Arc::new(move |key| match key {
+        "HOME" | "USERPROFILE" => Some(home.clone().into_os_string()),
+        _ => None,
+    })
 }
-
-fn oauth_client_id() -> String {
-    crate::env::first_env(CLIENT_ID_ENV).unwrap_or_else(|| unmask(ANTIGRAVITY_CLIENT_ID_MASKED))
-}
-
-fn oauth_client_secret() -> String {
-    crate::env::first_env(CLIENT_SECRET_ENV)
-        .unwrap_or_else(|| unmask(ANTIGRAVITY_CLIENT_SECRET_MASKED))
-}
-
-/// One logged-in account as the plugin stores it.
+/// Email, enabled status, captured tier and quota projected by opencode's
+/// antigravity-auth plugin. Its `docs/sidebar-contract.md` defines the v2 file;
+/// credentials and project identifiers are deliberately excluded.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoredAccount {
     #[serde(default)]
     pub email: Option<String>,
-    #[serde(default, rename = "refreshToken")]
-    pub refresh_token: Option<String>,
-    #[serde(default, rename = "managedProjectId")]
-    pub managed_project_id: Option<String>,
-    /// The plugin's own switch. A disabled account is one the user turned off,
-    /// so reporting its quota would describe capacity they have chosen not to
-    /// use -- and absent is treated as enabled, matching the plugin's default.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// The paid tier this account holds, as the plugin captured it at login.
-    ///
-    /// LOAD-BEARING FOR WHICH POOL WE MAY PUBLISH, not display. Google resolves
-    /// Code Assist entitlement from the OAuth client a token was issued to, and
-    /// the cloud lane's token -- ours or the vault's -- is only ever entitled to
-    /// the standard tier. Measured 2026-09-11 with `loadCodeAssist`: our
-    /// credential answers `allowedTiers: ["standard-tier"]` for an account the
-    /// editor reports as Google AI Ultra.
-    ///
-    /// So for an account that HOLDS a paid tier, the cloud lane answers about a
-    /// pool the user does not consume. This field is the free, local, no-network
-    /// way to know that before publishing it. `free-tier` here means the account
-    /// has no paid tier and the cloud lane is reporting its real pool.
-    #[serde(default, rename = "capturedPaidTierId")]
-    pub captured_paid_tier_id: Option<String>,
-    /// When the plugin last read `cachedQuota`, as Unix epoch milliseconds.
-    #[serde(default, rename = "cachedQuotaUpdatedAt")]
-    pub cached_quota_updated_at: Option<i64>,
-    /// The paid-pool snapshot maintained by the plugin for this account.
-    #[serde(default, rename = "cachedQuota")]
-    pub cached_quota: Option<CachedQuota>,
+    /// Paid accounts spend a different pool from the cloud credential's standard
+    /// quota; only positive paid-tier metadata justifies withholding cloud usage.
+    #[serde(default)]
+    pub tier: Option<SidebarTier>,
+    #[serde(default)]
+    pub quota: CachedQuota,
 }
 
-/// One plugin-cached Antigravity quota snapshot.
-#[doc(hidden)]
 #[derive(Debug, Clone, Deserialize)]
+pub struct SidebarTier {
+    #[serde(default, rename = "paidId")]
+    pub paid_id: Option<String>,
+}
+
+/// The partial map of model groups, not a credential or account store.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CachedQuota {
     #[serde(default)]
     pub gemini: Option<CachedQuotaPool>,
@@ -380,27 +227,30 @@ pub struct CachedQuota {
     pub non_gemini: Option<CachedQuotaPool>,
 }
 
-/// One model pool inside the plugin cache.
-#[doc(hidden)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CachedQuotaPool {
+    /// Quota observation time, not the top-level file publication `checkedAt`.
+    /// Rewriting the file must not make an old quota reading appear fresh.
+    #[serde(default, rename = "checkedAt")]
+    pub checked_at: Option<i64>,
     #[serde(default)]
     pub windows: Vec<CachedQuotaWindow>,
 }
 
-/// One cadence reading inside a plugin-cached model pool.
-#[doc(hidden)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CachedQuotaWindow {
     #[serde(default)]
     pub window: String,
     #[serde(default, rename = "remainingFraction")]
     pub remaining_fraction: Option<f64>,
-    #[serde(default, rename = "resetTime")]
-    pub reset_time: Option<Value>,
+    /// Rounded presentation metadata; never substitutes for the source fraction.
+    #[serde(default, rename = "remainingPercent")]
+    pub remaining_percent: Option<f64>,
+    #[serde(default, rename = "resetAt")]
+    pub reset_at: Option<i64>,
 }
 
-/// Find this identity's plugin-store row without introducing a second account key.
+/// Find the sidebar's email identity without using a positional account key.
 fn stored_account_for_email<'a>(
     accounts: &'a [StoredAccount],
     email: Option<&str>,
@@ -410,47 +260,19 @@ fn stored_account_for_email<'a>(
         .find(|account| emails_match(email, account.email.as_deref()))
 }
 
-/// Does this account hold a paid tier the cloud lane cannot see?
-///
-/// Answered from the plugin store by email, so BOTH lanes can ask it: the vault
-/// lane resolves an email too, and the hazard is identical whichever credential
-/// dialled the cloud.
-///
-/// FALSE WHEN WE SIMPLY DO NOT KNOW -- no store, no matching account, no captured
-/// tier. A fleet host with a vault credential and no plugin install has no way to
-/// learn the tier, and withholding usage there would take a working lane dark on
-/// a suspicion. Positive evidence of a paid tier is required to withhold.
+/// Only positive paid-tier metadata withholds the cloud's standard-tier pool.
+/// An absent tier is unknown, so a host with no plugin can still use its vault.
 fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
-    account.is_some_and(|account| {
-        account
-            .captured_paid_tier_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|tier| !tier.is_empty() && !tier.eq_ignore_ascii_case("free-tier"))
-    })
+    account
+        .and_then(|account| account.tier.as_ref())
+        .and_then(|tier| tier.paid_id.as_deref())
+        .is_some_and(|tier| tier != "free-tier")
 }
 
-/// Must the cloud lane withhold rather than publish what it can reach?
-///
-/// The cloud answers about the STANDARD-TIER pool whatever credential dialled it,
-/// so for an account holding a paid tier it describes capacity that account never
-/// spends. This decides whether we know enough to publish.
-///
-/// Extracted because it is a DECISION, and the plumbing around it needs a stub
-/// vault and a mock server to drive -- which is exactly why the missing half
-/// below shipped unguarded and was found on live data rather than in a test.
-///
-/// TWO IGNORANCES THAT USED TO READ AS ONE:
-///   - NO PAID ACCOUNT IS KNOWN ANYWHERE (no store, or no row carries a paid
-///     tier). There is no evidence of a paid tier to withhold against, so serve.
-///     This is the fleet host with a vault credential and no plugin install, and
-///     taking it dark on a suspicion would be the worse error.
-///   - A PAID ACCOUNT EXISTS AND THIS CREDENTIAL CANNOT BE MATCHED TO A ROW.
-///     Withhold. The lookup is by email and `emails_match(None, _)` is false, so a
-///     fetch where the vault supplied no identity found no row and read as "not
-///     paid" -- publishing the standard pool for an account that does not spend
-///     it. Nothing rules out that this credential IS the paid account, and the
-///     failure direction is a confident wrong number rather than a missing one.
+/// Withhold a paid account's cloud quota because it is a different, standard-tier
+/// pool the user does not spend. An unmatched credential is also withheld when
+/// any paid account is known: it could belong to that account. With no positive
+/// paid-tier evidence, cloud usage remains available for free or unknown tiers.
 fn cloud_lane_must_withhold(
     accounts: &[StoredAccount],
     plugin_account: Option<&StoredAccount>,
@@ -483,81 +305,77 @@ fn paid_tier_usage_unavailable() -> FetchError {
 }
 
 #[derive(Debug, Deserialize)]
-struct AccountsFile {
+struct SidebarFile {
+    version: Value,
     #[serde(default)]
-    accounts: Vec<StoredAccount>,
+    accounts: Value,
 }
 
-/// Read the plugin's accounts, keeping only those that can actually be fetched.
-///
-/// An empty list means the plugin has no accounts here: the file is absent and
-/// nothing says the accounts moved, which is the ordinary case on a host that
-/// never installed the plugin.
-///
-/// An error means this reader could not look, and it must never come back as
-/// an empty list. The caller turns it into "keep what you had": an empty list
-/// would drop every plugin account from the wire, and a consumer reads a
-/// vanished account as one that no longer exists.
-fn stored_accounts() -> Result<Vec<StoredAccount>, String> {
-    // Unit tests never read the developer's real plugin store. Several build
-    // the default registry, and its contents decided their outcome: after the
-    // plugin migrated this Mac's store, four of them failed on this host alone.
-    // Tests that need a store build one and call `read_plugin_store` directly.
-    #[cfg(test)]
-    let home = Some(std::env::temp_dir().join("insula-no-plugin-home"));
-    #[cfg(not(test))]
-    let home = crate::env::home_dir();
-    let home = home.ok_or_else(|| {
-        "home directory unresolved, so the plugin store can't be located".to_string()
-    })?;
-    read_plugin_store(&home)
+fn sidebar_path(lookup: &EnvLookup) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = lookup(SIDEBAR_STATE_ENV) {
+        return Ok(path.into());
+    }
+    if let Some(state_home) = lookup("XDG_STATE_HOME") {
+        return Ok(std::path::PathBuf::from(state_home).join(SIDEBAR_STATE_RELATIVE));
+    }
+    let home = env::home_dir_from(|key| lookup(key))
+        .ok_or_else(|| "home directory unresolved, so the sidebar can't be located".to_string())?;
+    Ok(home.join(".local/state").join(SIDEBAR_STATE_RELATIVE))
 }
 
-fn read_plugin_store(home: &std::path::Path) -> Result<Vec<StoredAccount>, String> {
-    let text = match std::fs::read_to_string(home.join(ACCOUNTS_FILE)) {
+/// Failure means keep the last roster, not remove its accounts. Only absence
+/// without installation evidence proves there is no plugin roster to enumerate.
+fn read_sidebar(lookup: &EnvLookup) -> Result<Vec<StoredAccount>, String> {
+    let path = sidebar_path(lookup)?;
+    let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if home.join(MIGRATED_STORE_POINTER).exists() {
-                return Err("the opencode antigravity plugin moved its accounts to a \
-                            generation store this version does not read"
-                    .to_string());
+            let home = env::home_dir_from(|key| lookup(key)).ok_or_else(|| {
+                "home directory unresolved, so plugin evidence can't be checked".to_string()
+            })?;
+            for evidence in [ACCOUNTS_FILE, MIGRATED_STORE_POINTER] {
+                match home.join(evidence).try_exists() {
+                    Ok(true) => {
+                        return Err("Antigravity plugin is installed but its sidebar state is absent; update the plugin and let it publish quota".to_string());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(format!("plugin installation evidence unreadable: {error}"))
+                    }
+                }
             }
             return Ok(Vec::new());
         }
-        Err(error) => return Err(format!("plugin account store unreadable: {error}")),
+        Err(error) => return Err(format!("plugin sidebar state unreadable: {error}")),
     };
-    let file = serde_json::from_str::<AccountsFile>(&text)
-        .map_err(|error| format!("plugin account store did not parse: {error}"))?;
-    Ok(file
-        .accounts
+    let file = serde_json::from_str::<SidebarFile>(&text)
+        .map_err(|error| format!("plugin sidebar state did not parse: {error}"))?;
+    if file.version.as_u64() != Some(2) {
+        return Err(format!(
+            "unsupported Antigravity sidebar version {}; update the plugin to sidebar v2",
+            file.version
+        ));
+    }
+    // An unknown major may change the account shape. Check its version before
+    // interpreting account fields so schema errors cannot mask the update remedy.
+    let accounts: Vec<StoredAccount> = serde_json::from_value(file.accounts)
+        .map_err(|error| format!("plugin sidebar accounts did not parse: {error}"))?;
+    Ok(accounts
         .into_iter()
         .filter(|account| account.enabled != Some(false))
-        .filter(|account| {
-            account
-                .refresh_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-        })
+        .filter(|account| account_handle_name(account).is_some())
         .collect())
 }
 
-/// The handle name for a stored account.
-///
-/// The email when the plugin recorded one, since it is stable across restarts
-/// and survives the list being reordered -- which the index does not. A slot
-/// number is the fallback, and it is a worse key: adding an account above this
-/// one silently repoints the handle at a different account, and the refresher
-/// keys its backoff and identity fencing on exactly this string.
-fn account_handle_name(account: &StoredAccount, index: usize) -> String {
-    match account
+/// Positional ids and labels can move when the roster is reordered, so only a
+/// genuine non-empty email may key identity fencing and failure history.
+fn account_handle_name(account: &StoredAccount) -> Option<String> {
+    account
         .email
         .as_deref()
         .map(str::trim)
-        .filter(|e| !e.is_empty())
-    {
-        Some(email) => format!("plugin:{email}"),
-        None => format!("plugin:#{index}"),
-    }
+        .filter(|email| !email.is_empty())
+        .map(|email| format!("plugin:{email}"))
 }
 
 const QUOTA_SUMMARY_PATH: &str =
@@ -1806,56 +1624,93 @@ fn normalize_quota_summary(summary: QuotaSummary) -> Result<Usage, FetchError> {
     })
 }
 
-/// Normalize the plugin's account-local cache into the same named pools as the
-/// live editor. The cache's `gemini` and `non-gemini` keys are pool labels, while
-/// each child `window` is the cadence that completes the public bucket id.
-fn parse_cached_quota(cache: &CachedQuota) -> Result<Usage, FetchError> {
-    let groups = [
+/// Serve only dated, recent quota groups whose `5h`/`weekly` windows have a
+/// remaining fraction. Use the oldest served observation so a newer group
+/// cannot make the combined reading appear fresher than all of its values.
+fn parse_cached_quota(cache: &CachedQuota, now: DateTime<Utc>) -> Option<(Usage, DateTime<Utc>)> {
+    let mut extra = Vec::new();
+    let mut oldest: Option<DateTime<Utc>> = None;
+    for (pool, display_name, id_prefix) in [
         (cache.gemini.as_ref(), "Gemini Models", "gemini"),
         (cache.non_gemini.as_ref(), "Claude and GPT models", "3p"),
-    ]
-    .into_iter()
-    .filter_map(|(pool, display_name, id_prefix)| {
-        let pool = pool?;
-        let buckets = pool
+    ] {
+        let Some(pool) = pool else { continue };
+        let Some(checked_at) = pool
+            .checked_at
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+        else {
+            continue;
+        };
+        let Ok(age) = now.signed_duration_since(checked_at).to_std() else {
+            continue;
+        };
+        if age > CACHED_QUOTA_MAX_AGE {
+            continue;
+        }
+        let windows: Vec<_> = pool
             .windows
             .iter()
-            .map(|window| {
-                let cadence = window.window.trim().to_ascii_lowercase().replace('_', "-");
-                QuotaBucket {
-                    bucket_id: format!("{id_prefix}-{cadence}"),
+            .filter_map(|window| {
+                if !matches!(window.window.as_str(), "5h" | "weekly") {
+                    return None;
+                }
+                let remaining = window.remaining_fraction?;
+                if !remaining.is_finite() || !(0.0..=1.0).contains(&remaining) {
+                    return None;
+                }
+                let group = QuotaGroup {
+                    display_name: display_name.to_string(),
+                    buckets: Vec::new(),
+                };
+                let bucket = QuotaBucket {
+                    bucket_id: format!("{id_prefix}-{}", window.window),
                     display_name: window.window.clone(),
                     window: Some(window.window.clone()),
                     disabled: false,
-                    remaining_fraction: window.remaining_fraction,
+                    remaining_fraction: Some(remaining),
                     remaining: None,
-                    reset_time: window.reset_time.clone(),
-                }
+                    reset_time: None,
+                };
+                let mut resolved = resolve_window(&group, &bucket)?;
+                // Do not round the precise remainingFraction like remainingPercent:
+                // rounding would discard real headroom changes between plugin polls.
+                resolved.window.used_percent = (1.0 - remaining) * 100.0;
+                resolved.window.resets_at = window
+                    .reset_at
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .map(|reset| reset.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                Some(ExtraWindow {
+                    title: Some(resolved.title),
+                    id: Some(resolved.id),
+                    window: Some(resolved.window),
+                })
             })
             .collect();
-        Some(QuotaGroup {
-            display_name: display_name.to_string(),
-            buckets,
-        })
-    })
-    .collect();
-    normalize_quota_summary(QuotaSummary { groups })
+        if windows.is_empty() {
+            continue;
+        }
+        oldest = Some(oldest.map_or(checked_at, |previous| previous.min(checked_at)));
+        extra.extend(windows);
+    }
+    Some((
+        Usage {
+            primary: None,
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: Some(extra),
+        },
+        oldest?,
+    ))
 }
 
-/// Return a paid account's usable cache and the wall time its value was read.
-/// Free-tier accounts deliberately keep using their live cloud lane.
+/// Serve a recent sidebar only for positively identified paid accounts. Free
+/// and unknown tiers keep the vault credential's standard cloud quota path.
 fn fresh_paid_cached_quota(
     account: Option<&StoredAccount>,
     now: DateTime<Utc>,
 ) -> Option<(Usage, DateTime<Utc>)> {
     let account = account.filter(|account| account_holds_paid_tier(Some(account)))?;
-    let updated_at = DateTime::<Utc>::from_timestamp_millis(account.cached_quota_updated_at?)?;
-    let age = now.signed_duration_since(updated_at).to_std().ok()?;
-    if age > CACHED_QUOTA_MAX_AGE {
-        return None;
-    }
-    let usage = parse_cached_quota(account.cached_quota.as_ref()?).ok()?;
-    Some((usage, updated_at))
+    parse_cached_quota(&account.quota, now)
 }
 
 // ---- remote lane (cloud, no local process) -----------------------------------
@@ -2127,7 +1982,6 @@ pub struct AntigravityProvider {
     quota_url: String,
     quota_summary_url: String,
     load_code_assist_url: String,
-    token_url: String,
     /// The last local probe and when it was taken. A failed probe is cached as
     /// its reason, for the same two seconds, so every handle in one tick gets the
     /// same answer.
@@ -2157,6 +2011,7 @@ pub struct AntigravityProvider {
     served_lane: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
     local_endpoints: Option<Vec<(LocalServer, u16)>>,
     override_store: Option<Result<Vec<StoredAccount>, String>>,
+    env_lookup: EnvLookup,
 }
 
 impl AntigravityProvider {
@@ -2180,12 +2035,12 @@ impl AntigravityProvider {
             quota_url: REMOTE_QUOTA_URL.to_string(),
             quota_summary_url: REMOTE_QUOTA_SUMMARY_URL.to_string(),
             load_code_assist_url: LOAD_CODE_ASSIST_URL.to_string(),
-            token_url: TOKEN_URL.to_string(),
             local_cache: tokio::sync::Mutex::new(None),
             process_scan: process_scan(),
             served_lane: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_endpoints: None,
             override_store: None,
+            env_lookup: default_sidebar_env(),
         }
     }
 
@@ -2209,32 +2064,12 @@ impl AntigravityProvider {
         if let Some(accounts) = &self.override_store {
             return accounts.clone();
         }
-        stored_accounts()
+        read_sidebar(&self.env_lookup)
     }
 
-    /// Fetch one plugin-stored account's quota.
-    ///
-    /// The account row supports both offline paths: a recent paid-pool cache, or
-    /// the cloud endpoint for free-tier accounts. The latter exchanges the
-    /// plugin's refresh token on every fetch rather than caching an access token
-    /// whose lifetime is shorter than the refresher's own interval.
-    /// Log which lane answered, and ONLY when it changes.
-    ///
-    /// Per-poll it would be one line a minute per account forever, which is the
-    /// cadence at which log lines stop being read -- the same reason the reset
-    /// tick prints on change rather than on every tick. A switch is rare and is
-    /// exactly the event that explains an apparent anomaly downstream: a reading
-    /// that steps backwards, or a quota drop flagged non-continuous, is a lane
-    /// switch seen from the other side.
-    ///
-    /// NOT A WIRE CHANGE, deliberately. `source` is documented as per-lane-kind
-    /// with consumers told not to key on flips, so widening its value set to
-    /// distinguish three lanes that share a credential kind would be a contract
-    /// change to buy a diagnostic. A log line costs nobody a decode.
-    ///
-    /// First answer for a handle is NOT logged: there is no switch, and printing
-    /// one would mean a line per account on every restart, which is noise that
-    /// looks like an event.
+    /// Log source switches, not every poll. Different sources use the same
+    /// output `source` name, so this diagnostic explains sudden changes in usage
+    /// or observation time without logging every unchanged account.
     fn note_lane(&self, key: &str, lane: &'static str) {
         let Ok(mut seen) = self.served_lane.lock() else {
             return;
@@ -2255,7 +2090,7 @@ impl AntigravityProvider {
     async fn fetch_plugin_account(&self, handle_name: &str) -> FetchAttempt {
         let accounts = match self.stored_accounts() {
             Ok(accounts) => accounts,
-            // An unreadable store is reported as LocalSourceUnavailable, which is
+            // An unreadable sidebar is reported as LocalSourceUnavailable, which is
             // transient: the refresher keeps serving this account's last reading
             // and marks it stale. Treating it as "no longer listed" would publish
             // the account as signed out.
@@ -2269,9 +2104,8 @@ impl AntigravityProvider {
         };
         let found = accounts
             .iter()
-            .enumerate()
-            .find(|(index, account)| account_handle_name(account, *index) == handle_name);
-        let Some((_, account)) = found else {
+            .find(|account| account_handle_name(account).as_deref() == Some(handle_name));
+        let Some(account) = found else {
             // The account was removed or disabled between enumeration and fetch.
             // Absent rather than broken: nothing here is wrong, the user simply
             // signed it out.
@@ -2291,25 +2125,7 @@ impl AntigravityProvider {
             .filter(|email| !email.is_empty())
             .map(|email| AccountObservation::new(Some(email.to_string()), None));
 
-        // THE SAME EMAIL, PUBLISHED AS DISPLAY METADATA AS WELL AS IDENTITY.
-        //
-        // This lane selects the account BY EMAIL -- it is the value `observed`
-        // above is built from, and the value the local probe is matched against --
-        // and it used to publish it only as the identity, leaving `accountInfo`
-        // absent. The vault lane for the same account DOES attach it, so a row
-        // whose two slots alternate showed the address, then nothing, then the
-        // address again.
-        //
-        // Measured on this host 2026-09-19, one account, consecutive reads:
-        //
-        //     src=oauth  email=None
-        //     src=vault  email=beatricelau0414@gmail.com
-        //     src=oauth  email=None
-        //
-        // Nothing joined wrongly -- `account` is stable across all of them and is
-        // what consumers key on -- but a surface rendering the address blinks, and
-        // the fix is not a dedup change: the lane simply was not publishing a value
-        // it already held.
+        // Email is both the stable identity and the account's display metadata.
         let account_info = account
             .email
             .as_deref()
@@ -2323,24 +2139,9 @@ impl AntigravityProvider {
                 subscription_ends_at: None,
             });
 
-        // 1. Probe the local agy / language-server lane first.
-        //
-        // WHY THE LOCAL LANE OUTRANKS A CREDENTIALED ONE:
-        // Normally, a stored cloud credential would take precedence over an ambient
-        // local desktop probe. Here the ordering is reversed because Google resolves
-        // Code Assist tier entitlement from the OAuth CLIENT the token was issued to:
-        // our cloud token comes from the opencode plugin client, which is only entitled
-        // to standard tier (~7% pool that never moves on a paid plan), whereas the local
-        // editor's own server sees the user's actual paid subscription tier (e.g. Google
-        // AI Ultra / ~58% pool).
-        //
-        // THE ACCOUNT GUARD:
-        // The local probe reports whichever account is signed into the running editor.
-        // If the user has multiple accounts, an unverified local probe would silently
-        // publish another account's quota under this handle's row. We therefore query
-        // GetUserStatus on the loopback server and require the email to match this
-        // handle's email case-insensitively. A mismatch, missing email, or absent local
-        // server falls through to the cloud lane.
+        // Prefer the live editor after its GetUserStatus response proves the
+        // session email matches this sidebar account. Otherwise an editor signed
+        // into another account could publish its quota under the wrong handle.
         if let Some(expected_email) = account.email.as_deref() {
             // A probe that could not look falls through exactly like one that
             // found no matching session: either way the local lane has nothing to
@@ -2360,64 +2161,28 @@ impl AntigravityProvider {
             }
         }
 
-        // 2. The plugin cache outranks a live cloud request because the cloud
-        // token is entitled to a different tier and therefore answers a different
-        // question. The row is selected by email; `cachedQuotaAccountId` is not an
-        // account identity and must never create or repoint a published row.
-        let cache_account = stored_account_for_email(&accounts, account.email.as_deref());
-        if let Some((usage, updated_at)) = fresh_paid_cached_quota(cache_account, Utc::now()) {
+        // The plugin owns quota polling. This lane reads only the sidebar's cached
+        // quota data and never tries a token exchange or cloud fallback.
+        if let Some((usage, checked_at)) = parse_cached_quota(&account.quota, Utc::now()) {
             self.note_lane(handle_name, "plugin-cache");
             return FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
-                .with_value_observed_at(updated_at)
+                .with_value_observed_at(checked_at)
                 .with_account_info(account_info);
         }
-
-        // No live session or fresh cache for this account. Falling back to the
-        // cloud is right ONLY when the cloud answers about the pool this account
-        // actually uses. For a paid tier it does not, so publish nothing and let
-        // the last correct reading stand.
-        if account_holds_paid_tier(Some(account)) {
-            return FetchAttempt::failure(
-                observed,
-                Some(PLUGIN_SOURCE.to_string()),
-                paid_tier_usage_unavailable(),
-            );
-        }
-
-        let refresh_token = account.refresh_token.clone().unwrap_or_default();
-        let access_token = match self.exchange_refresh_token(&refresh_token).await {
-            Ok(token) => token,
-            Err(error) => {
-                return FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error)
-            }
-        };
-
-        let project = account
-            .managed_project_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string);
-
-        let usage = self
-            .fetch_remote_quota(&access_token, project.as_deref())
-            .await;
-        match usage {
-            Ok(usage) => {
-                self.note_lane(handle_name, "cloud-api");
-                FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
-                    .with_account_info(account_info)
-            }
-            Err(error) => FetchAttempt::failure(observed, Some(PLUGIN_SOURCE.to_string()), error),
-        }
+        FetchAttempt::failure(
+            observed,
+            Some(PLUGIN_SOURCE.to_string()),
+            FetchError::LocalSourceUnavailable(
+                "no dated, recent Antigravity sidebar quota is available for this account"
+                    .to_string(),
+            ),
+        )
+        .with_account_info(account_info)
     }
 
     /// Call the cloud quota endpoint with an already-resolved access token.
     ///
-    /// Shared by both cloud credential lanes -- the vault one and the plugin
-    /// file one -- because they differ only in where the token came from. Two
-    /// copies of this call would be two places for the request shape to drift,
-    /// and the endpoint is the half that is hard to verify.
+    /// Only the vault supplies cloud credentials; the sidebar lane is cache-only.
     async fn fetch_remote_quota(
         &self,
         access_token: &str,
@@ -2507,87 +2272,6 @@ impl AntigravityProvider {
             .await
     }
 
-    /// Exchange a stored refresh token for a short-lived access token.
-    ///
-    /// Only an OAuth body that explicitly states `invalid_grant` proves the
-    /// credential needs re-authorization. Other refusal bodies can describe a
-    /// transient endpoint failure, so they retain their existing status class.
-    /// THIS LANE REFRESHES, WHICH IS AN EXCEPTION -- READ BEFORE COPYING IT.
-    ///
-    /// The fleet rule is that a quota reader never touches a refresh endpoint,
-    /// because exactly one process may refresh a credential and that process is its
-    /// custodian. A second refresher on a family whose refresh tokens ROTATE
-    /// silently revokes the first holder's session -- for anthropic and openai that
-    /// means signing the user out of their editor, which is why those plugin lanes
-    /// were declined outright.
-    ///
-    /// Google's refresh tokens do NOT rotate on exchange. That was established by
-    /// probe, not by documentation, and it is the entire basis on which this lane
-    /// exists. It is a property of the credential family, not of this code.
-    ///
-    /// So the operative rule here has never been "never refresh". It is: NEVER
-    /// REFRESH A FAMILY WHOSE TOKENS ROTATE. If you are reading this as precedent
-    /// for a new lane, the question to answer first is which of those two your
-    /// family is -- and the answer is a probe, because getting it wrong produces no
-    /// error here and a logged-out user somewhere else.
-    async fn exchange_refresh_token(&self, refresh_token: &str) -> Result<String, FetchError> {
-        if refresh_token.trim().is_empty() {
-            return Err(FetchError::NoSession(
-                "the stored account carries no refresh token".to_string(),
-            ));
-        }
-        let client_id = oauth_client_id();
-        let client_secret = oauth_client_secret();
-        let response = JsonRequest::post_form(
-            &self.token_url,
-            &[
-                ("client_id", &client_id),
-                ("client_secret", &client_secret),
-                ("refresh_token", refresh_token),
-                ("grant_type", "refresh_token"),
-            ],
-        )
-        .timeout(REQUEST_TIMEOUT)
-        .send_raw(&self.remote_http)
-        .await?;
-
-        if !(200..300).contains(&response.status) {
-            #[derive(Deserialize)]
-            struct OAuthErrorResponse {
-                error: Option<String>,
-            }
-            let invalid_grant = serde_json::from_slice::<OAuthErrorResponse>(&response.body)
-                .ok()
-                .and_then(|response| response.error)
-                .as_deref()
-                == Some("invalid_grant");
-            return if invalid_grant {
-                Err(FetchError::CredentialUnusable(
-                    "antigravity refresh token was rejected: invalid_grant".to_string(),
-                ))
-            } else {
-                Err(FetchError::ProviderStatus(response.status, String::new()))
-            };
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: Option<String>,
-        }
-        let parsed: TokenResponse =
-            serde_json::from_slice(response.body_for_parsing()?).map_err(|e| {
-                FetchError::Decode(format!("antigravity token response not decodable: {e}"))
-            })?;
-        parsed
-            .access_token
-            .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| {
-                FetchError::CredentialUnusable(
-                    "the token exchange returned no access token".to_string(),
-                )
-            })
-    }
-
     /// Fetch quota from the cloud, needing no local process.
     ///
     /// The credential is Antigravity's own Google login, served by the vault.
@@ -2655,7 +2339,7 @@ impl AntigravityProvider {
             }
         }
 
-        // Without the store, this lane can't tell whether the account is paid,
+        // Without the sidebar, this lane can't tell whether the account is paid,
         // and for a paid account the cloud reading below is a different pool.
         // So it keeps the last reading instead of guessing.
         let accounts = match self.stored_accounts() {
@@ -2681,30 +2365,10 @@ impl AntigravityProvider {
                 .with_account_info(account_info);
         }
 
-        // Same rule as the plugin lane, and for the same reason: the vault's
-        // token is issued to the same OAuth client, so it reaches the same
-        // standard-tier pool. The tier is read from the plugin store by email
-        // because that is the only place on this host that records it.
-        //
-        // AN UNRESOLVED IDENTITY MUST NOT ANSWER "NOT PAID". The lookup is by
-        // email, and `emails_match(None, _)` is false, so a fetch where the vault
-        // supplied no identity found no row and fell through to the cloud --
-        // publishing the standard-tier pool for an account that does not spend
-        // it. That is the exact wrong-pool reading this guard exists to prevent,
-        // arriving through the one door the guard did not cover, and it is
-        // intermittent: it happens only on the fetches where identity is missing,
-        // so the published percent alternates between two pools and each step
-        // down is recorded as a quota drop. Measured on this host: 28 false drops
-        // for one account in seventy minutes.
-        //
-        // So separate two ignorances that both used to read as false:
-        //   - NO PAID ACCOUNT IS KNOWN ANYWHERE (no store, or none paid) -- there
-        //     is no evidence of a paid tier to withhold against, so serve. This
-        //     keeps a fleet host with a vault credential and no plugin install
-        //     working, which is the case the original rule protected.
-        //   - A PAID ACCOUNT EXISTS AND WE CANNOT TELL WHETHER THIS IS IT --
-        //     refuse. Not a suspicion: the store states a paid tier, and nothing
-        //     rules out that this credential is that account.
+        // A paid account's cloud credential reaches a different, standard-tier
+        // pool. The sidebar identifies paid accounts by email; if this credential
+        // has no matching identity while a paid account is known, it could be
+        // that account and must also be withheld. No paid evidence means serve.
         if cloud_lane_must_withhold(&accounts, plugin_account) {
             return FetchAttempt::failure(
                 observed,
@@ -2965,18 +2629,16 @@ impl UsageProvider for AntigravityProvider {
         if self.credential_source.is_some() {
             credentialed.extend(self.handle_loader.antigravity_handles()?);
         }
-        // One handle per account the plugin has logged in. This is the lane an
-        // ordinary install has, and the only one that can see more than one
-        // account: the local probe reports whichever account the running editor
-        // happens to be using, and a vault credential is minted per fleet host.
-        // An unreadable store fails the whole enumeration rather than returning
-        // the vault handles alone. Either way the plugin accounts would be
-        // missing from the set, and the refresher would take that as their removal.
+        // Enumerate plugin accounts by genuine email. A sidebar read failure
+        // fails the whole enumeration: returning only vault handles would omit
+        // plugin accounts and make the refresher interpret them as signed out.
         let accounts = self
             .stored_accounts()
             .map_err(crate::provider::HandlesError::new)?;
-        for (index, account) in accounts.iter().enumerate() {
-            credentialed.push(CredentialHandle::new(account_handle_name(account, index)));
+        for account in &accounts {
+            if let Some(name) = account_handle_name(account) {
+                credentialed.push(CredentialHandle::new(name));
+            }
         }
 
         if credentialed.is_empty() {
@@ -3490,6 +3152,7 @@ mod tests {
 
     struct PreflightVaultSource {
         project: Option<String>,
+        email: Option<String>,
         reports: Arc<AtomicUsize>,
     }
 
@@ -3504,8 +3167,8 @@ mod tests {
                 payload: b"mock-token".to_vec(),
                 expires_at_ms: None,
                 record_version: 1,
-                account_id: None,
-                email: None,
+                account_id: self.email.clone(),
+                email: self.email.clone(),
                 org_name: None,
                 project_id: self.project.clone(),
             })
@@ -3528,6 +3191,7 @@ mod tests {
     ) -> CredentialHandle {
         provider.credential_source = Some(Arc::new(PreflightVaultSource {
             project: project.map(str::to_string),
+            email: None,
             reports,
         }));
         CredentialHandle::vault(
@@ -3551,10 +3215,92 @@ mod tests {
         assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
     }
 
-    /// The vault lane can't tell a paid account without the store, so it keeps
+    #[tokio::test]
+    async fn a_paid_sidebar_tier_withholds_the_vault_cloud_pool_and_serves_the_sidebar() {
+        let now = Utc::now() - chrono::Duration::minutes(5);
+        let account = super::plugin_lane_tests::sidebar_account_json(
+            "paid@example.test",
+            now.timestamp_millis(),
+        );
+        let (sidebar, _home) =
+            super::plugin_lane_tests::sidebar_fixture("vault-paid", serde_json::json!([account]));
+        let mut mock = cloud_preflight_mock(200, b"{}".to_vec()).await;
+        mock.provider.override_store = None;
+        mock.provider.env_lookup = sidebar.env_lookup;
+        let handle = attach_vault(&mut mock.provider, None, Arc::new(AtomicUsize::new(0)));
+        mock.provider.credential_source = Some(Arc::new(PreflightVaultSource {
+            project: None,
+            email: Some("paid@example.test".to_string()),
+            reports: Arc::new(AtomicUsize::new(0)),
+        }));
+        let attempt = mock.provider.fetch_handle(&handle).await;
+        let usage = attempt.usage.unwrap();
+        assert!((pool_window(&usage, "gemini-weekly").used_percent - 6.1696).abs() < 1e-10);
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt.account_info.and_then(|info| info.email).as_deref(),
+            Some("paid@example.test")
+        );
+        assert_eq!(
+            attempt.value_observed_at.unwrap().timestamp_millis(),
+            now.timestamp_millis()
+        );
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
+    }
+
+    async fn assert_sidebar_tier_reaches_vault_cloud(label: &str, tier: Option<Value>) {
+        let mut account = super::plugin_lane_tests::sidebar_account_json(
+            "cloud@example.test",
+            Utc::now().timestamp_millis(),
+        );
+        match tier {
+            Some(tier) => account["tier"] = tier,
+            None => {
+                account.as_object_mut().unwrap().remove("tier");
+            }
+        }
+        let (sidebar, _home) =
+            super::plugin_lane_tests::sidebar_fixture(label, serde_json::json!([account]));
+        let mut mock = cloud_preflight_mock(200, b"{}".to_vec()).await;
+        mock.provider.override_store = None;
+        mock.provider.env_lookup = sidebar.env_lookup;
+        let handle = attach_vault(&mut mock.provider, None, Arc::new(AtomicUsize::new(0)));
+        mock.provider.credential_source = Some(Arc::new(PreflightVaultSource {
+            project: None,
+            email: Some("cloud@example.test".to_string()),
+            reports: Arc::new(AtomicUsize::new(0)),
+        }));
+        let attempt = mock.provider.fetch_handle(&handle).await;
+        assert_eq!(
+            pool_window(&attempt.usage.unwrap(), "gemini-weekly").used_percent,
+            7.15
+        );
+        assert_eq!(attempt.value_observed_at, None);
+        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_sidebar_tier_still_reaches_the_vault_cloud() {
+        assert_sidebar_tier_reaches_vault_cloud("vault-unknown", None).await;
+    }
+
+    #[tokio::test]
+    async fn a_free_sidebar_tier_still_reaches_the_vault_cloud() {
+        assert_sidebar_tier_reaches_vault_cloud(
+            "vault-free",
+            Some(serde_json::json!({
+                "id": "standard-tier", "paidId": "free-tier", "capturedAt": 1
+            })),
+        )
+        .await;
+    }
+
+    /// The vault lane can't tell a paid account without the sidebar, so it keeps
     /// the last reading instead of publishing the cloud pool.
     #[tokio::test]
-    async fn the_vault_lane_withholds_the_cloud_pool_when_the_store_is_unreadable() {
+    async fn the_vault_lane_withholds_the_cloud_pool_when_the_sidebar_is_unreadable() {
         let mut mock =
             cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
         let handle = attach_vault(&mut mock.provider, Some("p"), Arc::new(AtomicUsize::new(0)));
@@ -3649,13 +3395,15 @@ mod tests {
         .expect("the cloud body parses");
 
         let cached: CachedQuota = serde_json::from_str(
-            r#"{"gemini":{"windows":[
+            r#"{"gemini":{"checkedAt":1000,"windows":[
                 {"window":"weekly","remainingFraction":0.5,
-                 "resetTime":"2026-09-17T18:41:37Z"}
+                 "resetAt":1789670497000}
             ]}}"#,
         )
         .expect("the cache payload parses");
-        let cache = parse_cached_quota(&cached).expect("the cache normalises");
+        let (cache, _) =
+            parse_cached_quota(&cached, DateTime::from_timestamp_millis(2000).unwrap())
+                .expect("the sidebar normalises");
         for usage in [&cloud, &cache] {
             assert_eq!(
                 pool_window(usage, "gemini-weekly").window_kind.as_deref(),
@@ -3695,21 +3443,6 @@ mod tests {
         );
     }
 
-    /// The token endpoint is pinned to Google's own host.
-    ///
-    /// This is the URL a live REFRESH TOKEN is posted to, in the request body,
-    /// so a wrong host does not merely fail -- it receives a working
-    /// credential. The symptom afterwards is indistinguishable from an expired
-    /// login: the exchange returns an error, the account reads as dead, and an
-    /// operator re-authenticating does not fix it because the credential was
-    /// never the problem.
-    ///
-    /// Asserted against a literal read off the constant rather than compared to
-    /// the constant itself, which would hold at any value.
-    #[test]
-    fn the_token_endpoint_is_googles_own_host() {
-        assert_eq!(TOKEN_URL, "https://oauth2.googleapis.com/token");
-    }
     use super::*;
 
     /// The containment guard on the probe must read the URL's real host.
@@ -4451,8 +4184,8 @@ mod plugin_lane_tests {
     /// keep serving rather than go dark on a suspicion.
     #[test]
     fn an_unidentifiable_credential_withholds_only_when_a_paid_account_is_known() {
-        let paid = paid_account(Some("paid@example.test"), Some("tok"));
-        let free = account(Some("free@example.test"), Some("tok"), Some(true));
+        let paid = paid_account(Some("paid@example.test"));
+        let free = account(Some("free@example.test"), Some(true));
 
         // The matched paid account: withheld, as before.
         assert!(
@@ -4460,8 +4193,8 @@ mod plugin_lane_tests {
             "a matched paid account must not be served the standard pool"
         );
 
-        // THE DEFECT: no row matched, but the store states a paid account exists.
-        // Nothing rules out that this credential is that account.
+        // No row matched, but a paid account is known. This credential could
+        // belong to that account, so publishing its standard pool is unsafe.
         assert!(
             cloud_lane_must_withhold(&[paid.clone(), free.clone()], None),
             "an unidentifiable credential beside a known paid account must withhold"
@@ -4486,200 +4219,95 @@ mod plugin_lane_tests {
         );
     }
 
-    fn account(email: Option<&str>, token: Option<&str>, enabled: Option<bool>) -> StoredAccount {
-        StoredAccount {
-            email: email.map(str::to_string),
-            refresh_token: token.map(str::to_string),
-            managed_project_id: Some("proj-1".to_string()),
-            enabled,
-            // Free tier by default so the existing cases keep exercising the
-            // cloud fallback. The paid-tier arm has its own fixtures below.
-            captured_paid_tier_id: Some("free-tier".to_string()),
-            cached_quota_updated_at: None,
-            cached_quota: None,
-        }
-    }
-
-    /// The same account, holding a paid tier the cloud lane cannot see.
-    fn paid_account(email: Option<&str>, token: Option<&str>) -> StoredAccount {
-        StoredAccount {
-            captured_paid_tier_id: Some("g1-ultra-lite-tier".to_string()),
-            ..account(email, token, Some(true))
-        }
-    }
-
-    fn cached_paid_account(email: &str, updated_at: DateTime<Utc>) -> StoredAccount {
+    fn account(email: Option<&str>, enabled: Option<bool>) -> StoredAccount {
         serde_json::from_value(serde_json::json!({
-            "email": email,
-            "refreshToken": "refresh-tok",
-            "managedProjectId": "proj-1",
-            "enabled": true,
-            "capturedPaidTierId": "g1-ultra-lite-tier",
-            // Deliberately present and ignored: the cache belongs to the email
-            // row and this plugin-private hex id is not an account identity.
-            "cachedQuotaAccountId": "290d564a294e12a3",
-            "cachedQuotaUpdatedAt": updated_at.timestamp_millis(),
-            "cachedQuota": {
+            "id": "vault-acct-0", "label": "Account 1", "email": email,
+            "enabled": enabled, "health": 100, "current": false,
+            "tier": { "id": "standard-tier", "paidId": "free-tier", "capturedAt": 1 },
+            "quota": {}
+        }))
+        .expect("sidebar account fixture")
+    }
+
+    fn paid_account(email: Option<&str>) -> StoredAccount {
+        let mut account = account(email, Some(true));
+        account.tier.as_mut().unwrap().paid_id = Some("g1-ultra-lite-tier".to_string());
+        account
+    }
+
+    pub(super) fn sidebar_account_json(email: &str, checked_at: i64) -> Value {
+        serde_json::json!({
+            "id": "vault-acct-0", "label": "Account 1", "email": email,
+            "enabled": true, "health": 100, "current": false,
+            "tier": { "id": "standard-tier", "paidId": "g1-ultra-lite-tier", "capturedAt": 1 },
+            "quota": {
                 "gemini": {
-                    "remainingFraction": 0.938304,
-                    "resetTime": "2026-09-17T18:41:37Z",
-                    "modelCount": 2,
+                    "remainingPercent": 94, "remainingFraction": 0.938304,
+                    "checkedAt": checked_at, "resetAt": 1789670497000i64,
                     "windows": [
-                        { "window": "5h", "remainingFraction": 1.0,
-                          "resetTime": "2026-09-11T17:08:40Z" },
-                        { "window": "weekly", "remainingFraction": 0.938304,
-                          "resetTime": "2026-09-17T18:41:37Z" }
+                        { "window": "5h", "remainingPercent": 100, "remainingFraction": 1.0,
+                          "checkedAt": checked_at, "resetAt": 1789146520000i64 },
+                        { "window": "weekly", "remainingPercent": 94, "remainingFraction": 0.938304,
+                          "checkedAt": checked_at, "resetAt": 1789670497000i64 }
                     ]
                 },
                 "non-gemini": {
-                    "remainingFraction": 1.0,
-                    "resetTime": "2026-09-11T17:08:40Z",
-                    "modelCount": 3,
+                    "remainingPercent": 100, "remainingFraction": 1.0, "checkedAt": checked_at,
+                    "resetAt": 1789146520000i64,
                     "windows": [
-                        { "window": "5h", "remainingFraction": 1.0,
-                          "resetTime": "2026-09-11T17:08:40Z" },
-                        { "window": "weekly", "remainingFraction": 1.0,
-                          "resetTime": "2026-09-17T18:41:37Z" }
+                        { "window": "5h", "remainingPercent": 100, "remainingFraction": 1.0,
+                          "checkedAt": checked_at, "resetAt": 1789146520000i64 },
+                        { "window": "weekly", "remainingPercent": 100, "remainingFraction": 1.0,
+                          "checkedAt": checked_at, "resetAt": 1789670497000i64 }
                     ]
                 }
             }
-        }))
-        .expect("cached account fixture")
+        })
+    }
+
+    fn cached_paid_account(email: &str, updated_at: DateTime<Utc>) -> StoredAccount {
+        serde_json::from_value(sidebar_account_json(email, updated_at.timestamp_millis()))
+            .expect("sidebar quota fixture")
     }
 
     fn cached_free_account(email: &str, updated_at: DateTime<Utc>) -> StoredAccount {
-        StoredAccount {
-            captured_paid_tier_id: Some("free-tier".to_string()),
-            ..cached_paid_account(email, updated_at)
-        }
+        let mut account = cached_paid_account(email, updated_at);
+        account.tier.as_mut().unwrap().paid_id = Some("free-tier".to_string());
+        account
     }
 
-    #[tokio::test]
-    async fn plugin_refresh_invalid_grant_is_credential_unusable_and_non_transient() {
-        let (base_url, request) =
-            crate::loopback::serve_once(400, br#"{"error":"invalid_grant"}"#.to_vec()).await;
-        let mut provider = AntigravityProvider::new();
-        provider.token_url = format!("{base_url}/token");
-
-        let error = provider
-            .exchange_refresh_token("refresh-token")
-            .await
-            .expect_err("invalid_grant must reject the credential");
-        assert!(matches!(error, FetchError::CredentialUnusable(_)));
-        assert_eq!(classify(&error), FetchClass::NonTransient);
-
-        let request = request.await.unwrap().to_ascii_lowercase();
-        assert!(request.starts_with("post /token "));
-        assert!(request.contains("refresh_token=refresh-token"));
-    }
-
-    /// The handle name keys on the email, not the slot.
-    ///
-    /// The refresher keys backoff and identity fencing on this string, so a name
-    /// that moves when the list is reordered silently repoints a slot at a
-    /// different account -- carrying the previous account's failure history and
-    /// its cached window with it.
     #[test]
     fn the_handle_name_keys_on_the_email_when_there_is_one() {
-        let named = account(Some("a@example.test"), Some("tok"), None);
-        assert_eq!(account_handle_name(&named, 0), "plugin:a@example.test");
+        let named = account(Some(" a@example.test "), None);
         assert_eq!(
-            account_handle_name(&named, 7),
-            "plugin:a@example.test",
-            "the position must not appear in the name"
+            account_handle_name(&named).as_deref(),
+            Some("plugin:a@example.test")
         );
-
-        // Without an email there is nothing stable to use, and the slot number
-        // is the honest fallback rather than a fabricated identity.
-        let anonymous = account(None, Some("tok"), None);
-        assert_eq!(account_handle_name(&anonymous, 3), "plugin:#3");
+        let mut provider = AntigravityProvider::new();
+        provider.set_override_accounts(vec![account(Some("b@example.test"), None), named.clone()]);
+        let before = provider.handles().unwrap();
+        provider.set_override_accounts(vec![named, account(Some("b@example.test"), None)]);
+        let after = provider.handles().unwrap();
+        assert_eq!(before[1], after[0]);
     }
 
-    /// A blank email does not produce a handle named `plugin:`.
-    #[test]
-    fn a_blank_email_falls_back_to_the_slot() {
-        let blank = account(Some("   "), Some("tok"), None);
-        assert_eq!(account_handle_name(&blank, 2), "plugin:#2");
-    }
-
-    /// Accounts the user disabled, or that carry no token, are not offered.
-    ///
-    /// Both would produce a handle that can only fail: a disabled account is
-    /// capacity the user chose not to use, and a tokenless one cannot be
-    /// exchanged. Offering either would publish a degraded entry describing
-    /// nothing wrong.
-    #[test]
-    fn disabled_and_tokenless_accounts_are_filtered() {
-        let file = AccountsFile {
-            accounts: vec![
-                account(Some("live@example.test"), Some("tok"), Some(true)),
-                account(Some("off@example.test"), Some("tok"), Some(false)),
-                account(Some("empty@example.test"), Some("   "), None),
-                account(Some("none@example.test"), None, None),
-                // Absent `enabled` matches the plugin's own default of on.
-                account(Some("default@example.test"), Some("tok"), None),
-            ],
-        };
-        let kept: Vec<String> = file
-            .accounts
-            .into_iter()
-            .filter(|a| a.enabled != Some(false))
-            .filter(|a| {
-                a.refresh_token
-                    .as_deref()
-                    .is_some_and(|t| !t.trim().is_empty())
-            })
-            .filter_map(|a| a.email)
-            .collect();
-        assert_eq!(kept, ["live@example.test", "default@example.test"]);
-    }
-
-    /// With no credential anywhere, the local probe is the whole provider.
-    ///
-    /// The case the probe was built for: no plugin, no vault, an editor running.
-    /// Dropping it here would take the provider dark for the only users who
-    /// have nothing else.
     #[test]
     fn the_local_probe_stands_alone_when_nothing_else_is_configured() {
         let provider = AntigravityProvider::new();
-        let handles = provider.handles().expect("handles");
-        // This host has plugin accounts, so assert the RULE rather than the
-        // count: whenever no credentialed lane exists, the probe is offered.
-        let credentialed = handles
-            .iter()
-            .filter(|handle| !matches!(handle, CredentialHandle::ImplicitLocal))
-            .count();
-        if credentialed == 0 {
-            assert_eq!(handles, vec![CredentialHandle::implicit()]);
-        } else {
-            assert!(
-                !handles.contains(&CredentialHandle::implicit()),
-                "a credentialed lane must replace the probe, not join it: {handles:?}"
-            );
-        }
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
     }
 
-    /// A credentialed lane replaces the probe rather than joining it.
-    ///
-    /// The probe resolves no account identity, and the read path emits labeled
-    /// entries only when EVERY handle resolves one -- so keeping it beside a
-    /// lane that DOES resolve identity discards that identity for the whole
-    /// provider. This shipped wrong once: the wire showed `account: null` for an
-    /// account whose email the plugin lane had read correctly.
     #[test]
     fn a_credentialed_lane_replaces_the_local_probe() {
-        let provider = AntigravityProvider::new();
-        let handles = provider.handles().expect("handles");
-        let named = handles
-            .iter()
-            .filter(|handle| matches!(handle, CredentialHandle::Named(_)))
-            .count();
-        if named > 0 {
-            assert!(
-                !handles.contains(&CredentialHandle::implicit()),
-                "the probe must not survive beside identity-bearing lanes: {handles:?}"
-            );
-        }
+        let mut provider = AntigravityProvider::new();
+        provider.set_override_accounts(vec![account(Some("a@example.test"), None)]);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::new("plugin:a@example.test")]
+        );
     }
 
     /// The Hub user agent's platform and architecture spellings, including the
@@ -4717,30 +4345,8 @@ mod plugin_lane_tests {
         );
     }
 
-    /// The masked OAuth constants unmask to the plugin's real client.
-    ///
-    /// A refresh token is bound to the client that minted it, so an unmasking
-    /// error does not degrade gracefully -- it returns 401 from a healthy
-    /// credential, which reads as a dead login. Pinned against literals rather
-    /// than against the masking function, or the test would pass for any pair
-    /// that round-trips.
-    #[test]
-    fn the_masked_oauth_client_unmasks_to_the_plugin_pair() {
-        assert_eq!(
-            unmask(ANTIGRAVITY_CLIENT_ID_MASKED),
-            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-        );
-        assert_eq!(
-            unmask(ANTIGRAVITY_CLIENT_SECRET_MASKED),
-            "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"
-        );
-    }
-
-    /// The plugin lane reports the existing `oauth` source, not a new value.
-    ///
-    /// Its published meaning -- an OAuth token found on this machine, fixed by
-    /// logging in with the tool that owns it -- describes this lane exactly, and
-    /// a new value would have to imply a different remedy to earn its place.
+    /// The plugin keeps `source: oauth` to identify the opencode-owned login;
+    /// changing to sidebar storage does not change how consumers remedy sign-out.
     #[test]
     fn the_plugin_lane_uses_the_existing_oauth_source() {
         assert_eq!(PLUGIN_SOURCE, "oauth");
@@ -4881,8 +4487,6 @@ mod plugin_lane_tests {
                     200,
                     br#"{"userStatus":{"email":"beatricelau0414@gmail.com"}}"#.to_vec(),
                 )
-            } else if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
             } else if path == "/cloud-quota" {
                 (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
             } else {
@@ -4903,7 +4507,6 @@ mod plugin_lane_tests {
             "beatricelau0414@gmail.com",
             Utc::now() - chrono::Duration::minutes(5),
         )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
         provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
@@ -4934,10 +4537,9 @@ mod plugin_lane_tests {
         );
     }
 
-    /// 2. Identity MISMATCH falls through to the cloud lane.
-    /// Asserts WHICH lane served: the cloud lane, not merely that some usage returned.
+    /// A different editor email must use the handle email's sidebar quota.
     #[tokio::test]
-    async fn identity_mismatch_falls_through_to_the_cloud_lane() {
+    async fn identity_mismatch_falls_through_to_the_sidebar_lane() {
         let (port, _server) = spawn_mock_server(move |path| {
             if path == QUOTA_SUMMARY_PATH {
                 (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
@@ -4947,8 +4549,6 @@ mod plugin_lane_tests {
                     200,
                     br#"{"userStatus":{"email":"different_user@gmail.com"}}"#.to_vec(),
                 )
-            } else if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
             } else if path == "/cloud-quota" {
                 (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
             } else {
@@ -4965,12 +4565,10 @@ mod plugin_lane_tests {
             },
             port,
         )]);
-        provider.set_override_accounts(vec![account(
-            Some("beatricelau0414@gmail.com"),
-            Some("refresh-tok"),
-            Some(true),
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            Utc::now() - chrono::Duration::minutes(5),
         )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
         provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
@@ -4982,20 +4580,12 @@ mod plugin_lane_tests {
         let usage = attempt.usage.expect("usage must be present");
         let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
-        // Asserts CLOUD lane served (7.15%, 2026-09-08 reset) because identity mismatched.
-        assert_eq!(
-            primary.resets_at.as_deref(),
-            Some("2026-09-08T18:02:09Z"),
-            "mismatch must fall through to the cloud lane"
-        );
-        assert_eq!(
-            primary.used_percent, 7.15,
-            "mismatch must fall through to the cloud lane"
-        );
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
+        assert!((primary.used_percent - 6.1696).abs() < 1e-10);
+        assert!(attempt.value_observed_at.is_some());
     }
 
-    /// 3. Local snapshot with NO email does not serve a named handle.
-    /// Asserts WHICH lane served: the cloud lane, not the unattributable local lane.
+    /// A local status response without email cannot attribute quota to this account.
     #[tokio::test]
     async fn local_snapshot_with_no_email_does_not_serve_a_named_handle() {
         let (port, _server) = spawn_mock_server(move |path| {
@@ -5004,8 +4594,6 @@ mod plugin_lane_tests {
             } else if path == USER_STATUS_PATH {
                 // GetUserStatus call fails or omits email.
                 (200, br#"{"userStatus":{}}"#.to_vec())
-            } else if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
             } else if path == "/cloud-quota" {
                 (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
             } else {
@@ -5022,12 +4610,10 @@ mod plugin_lane_tests {
             },
             port,
         )]);
-        provider.set_override_accounts(vec![account(
-            Some("beatricelau0414@gmail.com"),
-            Some("refresh-tok"),
-            Some(true),
+        provider.set_override_accounts(vec![cached_paid_account(
+            "beatricelau0414@gmail.com",
+            Utc::now() - chrono::Duration::minutes(5),
         )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
         provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
         provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
@@ -5039,111 +4625,42 @@ mod plugin_lane_tests {
         let usage = attempt.usage.expect("usage must be present");
         let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
-        // Asserts CLOUD lane served because the local snapshot carried no email to attribute.
-        assert_eq!(
-            primary.resets_at.as_deref(),
-            Some("2026-09-08T18:02:09Z"),
-            "snapshot with no email must not serve a named handle"
-        );
-        assert_eq!(
-            primary.used_percent, 7.15,
-            "snapshot with no email must not serve a named handle"
-        );
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
+        assert!((primary.used_percent - 6.1696).abs() < 1e-10);
+        assert!(attempt.value_observed_at.is_some());
     }
 
-    /// 4. Local lane absent on a credentialed handle still reaches the cloud lane.
     #[tokio::test]
-    async fn local_lane_absent_on_a_credentialed_handle_still_reaches_the_cloud_lane() {
-        let (port, _server) = spawn_mock_server(move |path| {
-            if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
-            } else if path == "/cloud-quota" {
-                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
-            } else {
-                (404, b"not found".to_vec())
-            }
-        })
-        .await;
-
+    async fn local_lane_absent_on_a_plugin_handle_serves_the_sidebar() {
         let mut provider = AntigravityProvider::new();
-        // No local servers running at all.
         provider.set_local_endpoints(Vec::new());
-        provider.set_override_accounts(vec![account(
-            Some("beatricelau0414@gmail.com"),
-            Some("refresh-tok"),
-            Some(true),
+        provider.set_override_accounts(vec![cached_paid_account(
+            "a@example.test",
+            Utc::now() - chrono::Duration::minutes(5),
         )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
-        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
-        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
-
         let attempt = provider
-            .fetch_handle(&CredentialHandle::Named(
-                "plugin:beatricelau0414@gmail.com".into(),
-            ))
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
             .await;
-        let usage = attempt.usage.expect("usage must be present");
-        let primary = super::tests::pool_window(&usage, "gemini-weekly");
-
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
-        assert_eq!(primary.used_percent, 7.15);
+        let usage = attempt.usage.expect("sidebar reading");
+        assert!(
+            (super::tests::pool_window(&usage, "gemini-weekly").used_percent - 6.1696).abs()
+                < 1e-10
+        );
+        assert!(attempt.value_observed_at.is_some());
     }
 
-    /// A PAID-TIER account with no live editor session publishes NOTHING.
-    ///
-    /// The cloud lane is entitled to the standard tier, so for an account holding
-    /// a paid one it answers about a pool the user does not consume. Measured on
-    /// this host: the same account read 7.15% through the cloud and 58.41% in the
-    /// editor, and the 7.15% figure never moved because nothing spends it.
-    ///
-    /// Publishing that would replace a true reading with a confident wrong one --
-    /// a DIFFERENT POOL rather than a stale number, which a consumer cannot tell
-    /// from a real one. `LocalSourceUnavailable` is transient, so the last correct
-    /// reading keeps serving until the editor is open again.
-    ///
-    /// The paired free-tier case below is the control: it must still reach the
-    /// cloud, or this guard has taken a working lane dark.
     #[tokio::test]
     async fn a_paid_tier_account_without_a_local_session_publishes_nothing() {
-        let (port, _server) = spawn_mock_server(move |path| {
-            if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
-            } else if path == "/cloud-quota" {
-                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
-            } else {
-                (404, b"not found".to_vec())
-            }
-        })
-        .await;
-
         let mut provider = AntigravityProvider::new();
         provider.set_local_endpoints(Vec::new());
-        provider.set_override_accounts(vec![paid_account(
-            Some("beatricelau0414@gmail.com"),
-            Some("refresh-tok"),
-        )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
-        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
-        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
-
-        let attempt = provider
-            .fetch_handle(&CredentialHandle::Named(
-                "plugin:beatricelau0414@gmail.com".into(),
-            ))
-            .await;
-
-        let error = attempt
+        provider.set_override_accounts(vec![paid_account(Some("a@example.test"))]);
+        let error = provider
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+            .await
             .usage
-            .expect_err("a paid-tier account must not publish the standard-tier pool");
-        assert!(
-            matches!(error, FetchError::LocalSourceUnavailable(_)),
-            "must be the transient local class so the last good reading survives, got {error:?}"
-        );
-        assert_eq!(
-            classify(&error),
-            FetchClass::Transient,
-            "a closed editor is not a broken credential"
-        );
+            .expect_err("without a reading the plugin lane is unavailable");
+        assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
+        assert_eq!(classify(&error), FetchClass::Transient);
     }
 
     fn plugin_home(label: &str) -> crate::tests::ResetTempDir {
@@ -5152,45 +4669,203 @@ mod plugin_lane_tests {
         home
     }
 
-    /// A missing store is "no accounts" only when nothing says they moved.
-    ///
-    /// The 3.0 plugin migration removes the legacy file and leaves a pointer to
-    /// its generation store. Reading that as an empty list would drop every
-    /// plugin account from the wire, and consumers prune a vanished account.
-    #[test]
-    fn a_migrated_plugin_store_is_unreadable_not_empty() {
-        let never_installed = plugin_home("never-installed");
-        assert_eq!(
-            read_plugin_store(never_installed.path()).map(|a| a.len()),
-            Ok(0),
-            "no store and no pointer is the ordinary empty case"
-        );
-
-        let migrated = plugin_home("migrated");
-        std::fs::write(migrated.path().join(MIGRATED_STORE_POINTER), "{}").unwrap();
-        let error = read_plugin_store(migrated.path())
-            .expect_err("a migrated store must not read as an empty account list");
-        assert!(error.contains("generation store"), "{error}");
-
-        let corrupt = plugin_home("corrupt");
-        std::fs::write(corrupt.path().join(ACCOUNTS_FILE), "{not json").unwrap();
-        assert!(
-            read_plugin_store(corrupt.path()).is_err(),
-            "a store that fails to parse is unreadable, not empty"
-        );
-
-        let present = plugin_home("present");
+    pub(super) fn sidebar_fixture(
+        label: &str,
+        accounts: Value,
+    ) -> (AntigravityProvider, crate::tests::ResetTempDir) {
+        let home = plugin_home(label);
+        let mut provider = AntigravityProvider::new();
+        let path = home.path().to_path_buf();
+        provider.env_lookup = Arc::new(move |key| match key {
+            "HOME" | "USERPROFILE" => Some(path.clone().into_os_string()),
+            _ => None,
+        });
+        let sidebar = sidebar_path(&provider.env_lookup).unwrap();
+        std::fs::create_dir_all(sidebar.parent().unwrap()).unwrap();
         std::fs::write(
-            present.path().join(ACCOUNTS_FILE),
-            r#"{"version":4,"accounts":[{"email":"a@example.test","refreshToken":"tok"}]}"#,
+            sidebar,
+            serde_json::json!({
+                "version": 2, "checkedAt": Utc::now().timestamp_millis(),
+                "accounts": accounts, "activeRouting": {}, "routingAuthoritative": false
+            })
+            .to_string(),
         )
         .unwrap();
-        assert_eq!(read_plugin_store(present.path()).map(|a| a.len()), Ok(1));
+        provider.set_local_endpoints(Vec::new());
+        (provider, home)
     }
 
-    /// An unreadable store fails enumeration instead of dropping its accounts.
     #[test]
-    fn an_unreadable_plugin_store_fails_enumeration() {
+    fn an_absent_sidebar_without_plugin_evidence_is_empty() {
+        let (provider, _home) = sidebar_fixture("absent", serde_json::json!([]));
+        std::fs::remove_file(sidebar_path(&provider.env_lookup).unwrap()).unwrap();
+        assert!(provider.stored_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_absent_sidebar_with_plugin_evidence_is_unavailable_not_empty() {
+        for (label, evidence) in [
+            ("legacy", ACCOUNTS_FILE),
+            ("migrated", MIGRATED_STORE_POINTER),
+        ] {
+            let (provider, home) = sidebar_fixture(label, serde_json::json!([]));
+            std::fs::remove_file(sidebar_path(&provider.env_lookup).unwrap()).unwrap();
+            // Legacy account and migration-pointer files are installation evidence
+            // only; their contents must never be opened or parsed by this reader.
+            std::fs::write(
+                home.path().join(evidence),
+                "credential store must not be read",
+            )
+            .unwrap();
+            let error = provider
+                .stored_accounts()
+                .expect_err("installed plugin is not an empty roster");
+            assert!(error.contains("sidebar state is absent"), "{error}");
+            assert!(provider.handles().is_err());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_sidebar_is_unavailable_not_empty() {
+        let (provider, _home) = sidebar_fixture("unreadable", serde_json::json!([]));
+        let path = sidebar_path(&provider.env_lookup).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        assert!(provider
+            .stored_accounts()
+            .unwrap_err()
+            .contains("unreadable"));
+    }
+
+    #[test]
+    fn malformed_sidebar_json_is_unavailable_not_empty() {
+        let (provider, _home) = sidebar_fixture("malformed", serde_json::json!([]));
+        std::fs::write(sidebar_path(&provider.env_lookup).unwrap(), "{not json").unwrap();
+        assert!(provider
+            .stored_accounts()
+            .unwrap_err()
+            .contains("did not parse"));
+    }
+
+    #[test]
+    fn unsupported_sidebar_versions_require_a_plugin_update() {
+        let (provider, _home) = sidebar_fixture("version", serde_json::json!([]));
+        for version in [
+            serde_json::json!(1),
+            serde_json::json!(3),
+            serde_json::json!(2.5),
+            serde_json::json!("2"),
+        ] {
+            std::fs::write(
+                sidebar_path(&provider.env_lookup).unwrap(),
+                serde_json::json!({
+                    "version": version, "accounts": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let error = provider
+                .stored_accounts()
+                .expect_err("only integer major 2 is supported");
+            assert!(error.contains(&format!("version {version}")), "{error}");
+            assert!(error.contains("update the plugin"), "{error}");
+            std::fs::write(
+                sidebar_path(&provider.env_lookup).unwrap(),
+                serde_json::json!({ "version": version, "accounts": "different schema" })
+                    .to_string(),
+            )
+            .unwrap();
+            let error = provider.stored_accounts().unwrap_err();
+            assert!(error.contains(&format!("version {version}")), "{error}");
+            assert!(error.contains("update the plugin"), "{error}");
+        }
+    }
+
+    #[test]
+    fn sidebar_v2_enumerates_email_handles_without_reading_credentials() {
+        let (provider, home) = sidebar_fixture(
+            "v2",
+            serde_json::json!([
+                { "id": "vault-acct-0", "label": "Account 1", "email": "a@example.test", "enabled": true, "quota": {} },
+                { "id": "vault-acct-1", "label": "Account 2", "email": " b@example.test ", "quota": {} }
+            ]),
+        );
+        std::fs::write(
+            home.path().join(ACCOUNTS_FILE),
+            "unparseable credential store",
+        )
+        .unwrap();
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![
+                CredentialHandle::new("plugin:a@example.test"),
+                CredentialHandle::new("plugin:b@example.test")
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_accounts_without_nonempty_email_are_skipped() {
+        let (provider, _home) = sidebar_fixture(
+            "no-email",
+            serde_json::json!([
+                { "id": "acct-0", "label": "not-an-identity", "enabled": true, "quota": {} },
+                { "id": "acct-1", "email": "   ", "enabled": true, "quota": {} }
+            ]),
+        );
+        assert!(provider.stored_accounts().unwrap().is_empty());
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
+    }
+
+    #[test]
+    fn disabled_sidebar_accounts_are_skipped() {
+        let (provider, _home) = sidebar_fixture(
+            "disabled",
+            serde_json::json!([
+                { "id": "acct-0", "email": "off@example.test", "enabled": false, "quota": {} },
+                { "id": "acct-1", "email": "on@example.test", "enabled": true, "quota": {} }
+            ]),
+        );
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::new("plugin:on@example.test")]
+        );
+    }
+
+    #[test]
+    fn sidebar_path_resolution_uses_override_then_xdg_then_home() {
+        let lookup = |vars: &[(&str, &str)]| -> EnvLookup {
+            let vars: Vec<_> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), std::ffi::OsString::from(v)))
+                .collect();
+            Arc::new(move |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+        };
+        assert_eq!(
+            sidebar_path(&lookup(&[
+                (SIDEBAR_STATE_ENV, "/override/full.json"),
+                ("XDG_STATE_HOME", "/state"),
+                ("HOME", "/home")
+            ]))
+            .unwrap(),
+            std::path::Path::new("/override/full.json")
+        );
+        assert_eq!(
+            sidebar_path(&lookup(&[("XDG_STATE_HOME", "/state"), ("HOME", "/home")])).unwrap(),
+            std::path::Path::new("/state").join(SIDEBAR_STATE_RELATIVE)
+        );
+        assert_eq!(
+            sidebar_path(&lookup(&[("HOME", "/home"), ("USERPROFILE", "/home")])).unwrap(),
+            std::path::Path::new("/home/.local/state").join(SIDEBAR_STATE_RELATIVE)
+        );
+    }
+
+    /// A sidebar read error must not enumerate an empty roster and prune accounts.
+    #[test]
+    fn an_unreadable_plugin_sidebar_fails_enumeration() {
         let mut provider = AntigravityProvider::new();
         provider.set_override_store_unreadable("moved");
         assert!(
@@ -5199,9 +4874,9 @@ mod plugin_lane_tests {
         );
     }
 
-    /// A plugin account whose store can't be read keeps its last reading.
+    /// A plugin account whose sidebar can't be read keeps its last reading.
     #[tokio::test]
-    async fn a_plugin_account_with_an_unreadable_store_stays_transient() {
+    async fn a_plugin_account_with_an_unreadable_sidebar_stays_transient() {
         let mut provider = AntigravityProvider::new();
         provider.set_local_endpoints(Vec::new());
         provider.set_override_store_unreadable("moved");
@@ -5209,7 +4884,7 @@ mod plugin_lane_tests {
             .fetch_handle(&CredentialHandle::Named("plugin:a@example.test".into()))
             .await
             .usage
-            .expect_err("no reading without the store");
+            .expect_err("no reading without the sidebar");
         assert!(
             matches!(error, FetchError::LocalSourceUnavailable(_)),
             "must not read as signed out (credential_absent), got {error:?}"
@@ -5321,7 +4996,7 @@ mod plugin_lane_tests {
                 "account-a@example.com",
                 Utc::now() - chrono::Duration::minutes(5),
             ),
-            paid_account(Some("account-b@example.com"), Some("refresh-tok")),
+            paid_account(Some("account-b@example.com")),
         ]);
 
         let attempt = provider
@@ -5337,52 +5012,131 @@ mod plugin_lane_tests {
         assert_eq!(attempt.value_observed_at, None);
     }
 
-    /// A FREE-TIER account with no live session still reaches the cloud.
-    ///
-    /// The control for the guard above, and the load-bearing half: for an account
-    /// with no paid tier the cloud lane reports the pool it really uses, so
-    /// withholding would take a correct lane dark. Measured on this host, the
-    /// second account reads 100% through the cloud and that figure is true.
     #[tokio::test]
-    async fn a_free_tier_account_without_a_local_session_still_reaches_the_cloud() {
-        let (port, _server) = spawn_mock_server(move |path| {
-            if path == "/token" {
-                (200, br#"{"access_token":"mock-token"}"#.to_vec())
-            } else if path == "/cloud-quota" {
-                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
-            } else {
-                (404, b"not found".to_vec())
-            }
-        })
-        .await;
-
+    async fn a_free_tier_plugin_account_serves_the_sidebar_without_cloud_credentials() {
         let mut provider = AntigravityProvider::new();
         provider.set_local_endpoints(Vec::new());
         provider.set_override_accounts(vec![cached_free_account(
-            "ufukaltinok@gmail.com",
+            "free@example.test",
             Utc::now() - chrono::Duration::minutes(5),
         )]);
-        provider.token_url = format!("http://127.0.0.1:{port}/token");
-        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
-        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
-
         let attempt = provider
-            .fetch_handle(&CredentialHandle::Named(
-                "plugin:ufukaltinok@gmail.com".into(),
-            ))
+            .fetch_handle(&CredentialHandle::new("plugin:free@example.test"))
             .await;
-        let usage = attempt
-            .usage
-            .expect("a free-tier account must still reach the cloud lane");
-        let primary = super::tests::pool_window(&usage, "gemini-weekly");
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-08T18:02:09Z"));
+        let usage = attempt.usage.expect("the plugin polls free accounts too");
+        assert!(
+            (super::tests::pool_window(&usage, "gemini-weekly").used_percent - 6.1696).abs()
+                < 1e-10
+        );
+        assert!(attempt.value_observed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn sidebar_fraction_precision_is_preserved_not_the_rounded_percent() {
+        let mut account = sidebar_account_json("a@example.test", Utc::now().timestamp_millis());
+        account["quota"]["gemini"]["windows"][1]["remainingFraction"] =
+            serde_json::json!(0.44850576);
+        account["quota"]["gemini"]["windows"][1]["remainingPercent"] = serde_json::json!(45);
+        let (provider, _home) = sidebar_fixture("precision", serde_json::json!([account]));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+            .await;
+        let usage = attempt.usage.unwrap();
+        assert!(
+            (super::tests::pool_window(&usage, "gemini-weekly").used_percent - 55.149424).abs()
+                < 1e-10
+        );
         assert_eq!(
-            attempt.value_observed_at, None,
-            "the paid-cache lane must not fire for a free-tier account"
+            attempt.account_info.and_then(|info| info.email).as_deref(),
+            Some("a@example.test")
         );
     }
 
-    /// 5. Implicit handle still serves the local lane with no identity to match.
+    #[tokio::test]
+    async fn undated_sidebar_groups_are_not_served_even_with_fresh_publication() {
+        let mut account = sidebar_account_json("a@example.test", Utc::now().timestamp_millis());
+        for group in ["gemini", "non-gemini"] {
+            account["quota"][group]
+                .as_object_mut()
+                .unwrap()
+                .remove("checkedAt");
+        }
+        let (provider, _home) = sidebar_fixture("undated", serde_json::json!([account]));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+            .await;
+        let error = attempt
+            .usage
+            .expect_err("publication and window clocks cannot date a group");
+        assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
+        assert_eq!(classify(&error), FetchClass::Transient);
+        assert_eq!(attempt.value_observed_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_sidebar_group_is_omitted_while_its_fresh_sibling_is_served() {
+        let now = Utc::now();
+        let mut account = sidebar_account_json("a@example.test", now.timestamp_millis());
+        account["quota"]["gemini"]["checkedAt"] =
+            serde_json::json!((now - chrono::Duration::seconds(3601)).timestamp_millis());
+        let (provider, _home) = sidebar_fixture("fresh-sibling", serde_json::json!([account]));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+            .await;
+        let usage = attempt.usage.unwrap();
+        let ids: Vec<_> = usage
+            .extra_rate_windows
+            .unwrap()
+            .into_iter()
+            .map(|window| window.id.unwrap())
+            .collect();
+        assert_eq!(ids, ["3p-5h", "3p-weekly"]);
+        assert_eq!(
+            attempt.value_observed_at.unwrap().timestamp_millis(),
+            now.timestamp_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_value_time_is_the_oldest_served_group_observation() {
+        let newest = Utc::now() - chrono::Duration::minutes(1);
+        let oldest = newest - chrono::Duration::minutes(4);
+        let mut account = sidebar_account_json("a@example.test", newest.timestamp_millis());
+        account["quota"]["gemini"]["checkedAt"] = serde_json::json!(oldest.timestamp_millis());
+        let (provider, _home) = sidebar_fixture("oldest", serde_json::json!([account]));
+        let attempt = provider
+            .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+            .await;
+        assert_eq!(attempt.usage.unwrap().extra_rate_windows.unwrap().len(), 4);
+        assert_eq!(
+            attempt.value_observed_at.unwrap().timestamp_millis(),
+            oldest.timestamp_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_windows_without_fractions_or_stable_keys_are_not_invented() {
+        let mut account = sidebar_account_json("a@example.test", Utc::now().timestamp_millis());
+        account["quota"]
+            .as_object_mut()
+            .unwrap()
+            .remove("non-gemini");
+        account["quota"]["gemini"]["windows"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("remainingFraction");
+        account["quota"]["gemini"]["windows"][1]["window"] = serde_json::json!("7d");
+        let (provider, _home) = sidebar_fixture("missing-fraction", serde_json::json!([account]));
+        assert!(matches!(
+            provider
+                .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
+                .await
+                .usage,
+            Err(FetchError::LocalSourceUnavailable(_))
+        ));
+    }
+
+    /// Implicit handle still serves the local lane with no identity to match.
     #[tokio::test]
     async fn implicit_handle_still_serves_the_local_lane_with_no_identity_to_match() {
         let (port, _server) = spawn_mock_server(move |path| {

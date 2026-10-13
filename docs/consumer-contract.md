@@ -172,11 +172,15 @@ per-entry freshness on it.
 
 Usually that is the moment this module fetched. It is not always: where a
 provider's real figure lives in a source this module does not poll, `fetchedAt`
-is when **that** source produced the value. `antigravity` served from the editor
-plugin's cache is the live instance, and
-[sizing a staleness threshold](#sizing-a-staleness-threshold) has the bound and
-the reasoning. The field's meaning is unchanged either way, which is the point of
-spelling it this way round: it dates the READING, not the request.
+is when **that** source produced the value. For `antigravity`, the cache-only
+plugin lane reads the non-secret sidebar v2 state file; a matching live local
+editor still wins. The full-file override `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE`
+takes precedence over `$XDG_STATE_HOME/cortexkit/antigravity-auth/sidebar-state.json`,
+then `~/.local/state/cortexkit/antigravity-auth/sidebar-state.json`. Only genuine
+non-empty emails identify accounts, never positional ids or display labels.
+The lane does not read the plugin account store or exchange its refresh tokens.
+See [sizing a staleness threshold](#sizing-a-staleness-threshold) has the bound and
+the reasoning. The field dates the READING, not the request.
 
 Do not stamp poll time. On a transient failure this module keeps serving the
 last healthy window, so an entry can legitimately be much older than the
@@ -273,8 +277,9 @@ preserved one.
 one process, a successful fetch whose reading is older than the one already
 served is discarded and the entry disclosed `stale` (no class). That memory is
 the process's own: after a restart a slot has nothing to compare against, so if
-the source it reads has rewound in the meantime (antigravity's plugin cache has
-been measured doing this), the first reading published can be older than the
+the source it reads has rewound in the meantime (Antigravity's former plugin
+cache was measured doing this; sidebar snapshots also carry source observation
+times), the first reading published can be older than the
 one the previous process was serving, with no `stale`. It is not marked because
 it is not stale by this contract's meaning: it WAS obtained by the latest fetch.
 `fetchedAt` stays honest and shows the step. Measured on a consumer's host at a
@@ -1358,12 +1363,13 @@ throughout.
 account through more than one lane, the lanes can publish different ids for the
 same limit, and which lane answers is decided per fetch.
 
-`antigravity` reads one account through three, and they are no longer all
-different. Its live editor probe, and the cloud summary endpoint, and the editor
-plugin's cache all normalise through one path and publish the upstream bucket
-identifiers — `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` — with titles
-derived from the cadence rather than from whatever wording each lane carried.
-Those three agree by construction.
+`antigravity` can read one account through three sources: the matching live
+editor, the vault cloud summary, and the plugin's non-secret sidebar v2 snapshot.
+The plugin lane itself is cache-only, with no cloud fallback. All three publish
+the same bucket identifiers — `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` —
+with titles derived from cadence. Sidebar ids come from the stable `5h` and
+`weekly` window keys, never display text, and used percentages preserve the
+unrounded `remainingFraction`, not the rounded `remainingPercent`.
 
 The exception is a **fallback that runs only when the summary endpoint refuses**.
 It reads a per-model endpoint that reports one figure per pool with no window
@@ -1606,18 +1612,25 @@ sees a live signal on **45%** of reads; at 60 seconds, 97%; at 90 seconds and
 beyond, 100%. Under 120 seconds — the same figure this module uses internally,
 for this reason — a healthy provider never reads stale.
 
-**One lane publishes an age this arithmetic does not bound, deliberately.** A
-provider whose real figure lives in a source *it* does not poll stamps the time
-that source was read, not the time we read the source. `antigravity` does this:
-for an account holding a paid tier, the correct pool is visible only to the local
-editor, so with the editor closed the entry is served from the editor plugin's
-own cache and carries **the cache's** timestamp. Such an entry can legitimately
-reach one hour, which is the bound past which it is withheld instead.
+**Sidebar-backed readings can legitimately age past the poll-based threshold.**
+Antigravity's plugin polls quota and publishes a non-secret sidebar v2 snapshot.
+A quota group is served only with an observation `checkedAt` no more than
+3600 seconds old; an undated group means no reading yet. Groups age independently,
+so a fresh sibling still serves when another is stale. `fetchedAt` carries the
+**oldest served group's `checkedAt`**, never the top-level publication clock or
+our file-read time. Windows without a source fraction are not invented.
 
-The alternative was stamping the read time, which would have asserted a freshness
-we cannot support — the same objection that keeps `windsurf` deferred. So the
-older timestamp is the honest one, and a consumer applying its own threshold gets
-an accurate answer rather than a confident one.
+For the vault lane, `tier.paidId` present and not `free-tier` is positive paid-tier
+evidence: a matching fresh sidebar outranks the cloud's different standard pool.
+An absent tier is unknown, not paid; free and unknown tiers may still use the
+cloud. A sidebar read error is transient, never an empty roster that prunes
+accounts. Unsupported versions (including v1) require a plugin update.
+
+The 3600-second bound is also recorded by astrocyte at its `window_sample` insert
+site: over-age sidebar readings are withheld, not published as older values.
+Changing `CACHED_QUOTA_MAX_AGE` requires coordinating that cross-repository fact.
+Stamping a poll or publication time would assert freshness we cannot support;
+the observation time lets consumers apply their own thresholds honestly.
 
 What this means for a threshold: **an entry aging past your bound is a reason to
 DISCOUNT a reading, never to conclude the producer is failing.** Health is the
@@ -2086,7 +2099,7 @@ magnitude as a lower bound and the record as weaker evidence.
 
 The lane switch is the one to plan for, because the other three are rare and it
 is not. Where a provider reads one account through several sources —
-`antigravity` uses a live editor probe, the editor plugin's cache, and a cloud
+`antigravity` uses a live editor probe, the editor plugin's sidebar v2 snapshot, and a cloud
 endpoint — consecutive readings can come from sources whose values were observed
 at very different moments. The gap is then in the thing DESCRIBED rather than in
 the polling: two readings taken 60 seconds apart can describe moments an hour

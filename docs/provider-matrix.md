@@ -977,12 +977,14 @@ Read an OAuth bearer from a local file (or opencode store) → one GET → decod
 |---|---|---|---|---|
 | **codex** ✅ | codex | `~/.codex/auth.json` (oauth access_token) | GET chatgpt.com/backend-api/wham/usage | 5h + weekly |
 | **claude** ✅ | claude | opencode `anthropic` / Keychain | GET api.anthropic.com/api/oauth/usage | 5h + weekly + sonnet/opus |
-| **antigravity** ✅ two lanes | antigravity | vault `antigravity:google`, or the RUNNING `agy` CLI / app language server: macOS `ps` + `lsof`; Linux `/proc` command lines + socket inodes/TCP tables; Windows Toolhelp + same-architecture PEB reads + TCP owner tables (discovery bounds and verification below) | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota, or loopback `…/RetrieveUserQuotaSummary`; a projectless `loadCodeAssist` preflight that refuses the OAuth client for consumer accounts reports `credential_rejected` instead of serving placeholder quota; stored projects bypass this preflight, and the local/editor-cache paths remain alternatives | per-pool (resetTime) |
+| **antigravity** ✅ | antigravity | vault `antigravity:google`; non-secret plugin sidebar v2; running `agy` / app language server (bounded discovery below) | Matching live editor first; cache-only sidebar plugin lane; vault `retrieveUserQuotaSummary` with refusal-only `retrieveUserQuota` fallback and projectless `loadCodeAssist` refusal check | Gemini + 3p, 5h + weekly; fallback cadence unknown |
 | gemini | gemini | `~/.gemini/oauth_creds.json` | POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota | per-model 24h |
-Notes — the Google-OAuth sub-archetype (gemini/antigravity, cloudcode-pa quota):
-the fetch is a clean POST (loadCodeAssist→retrieveUserQuota, per-model windows),
-but the access token in oauth_creds.json expires (~1h), so a real fetch needs an
-oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
+Notes — the Google-OAuth cloud quota API is shared by Gemini and Antigravity.
+Gemini's native-file fetch uses loadCodeAssist→retrieveUserQuota with per-model
+windows, but its access token in oauth_creds.json expires (~1h), so that lane
+needs an oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
+Antigravity does not use that file or refresh path: its cloud bearer comes from
+the vault, and its plugin lane reads only non-secret sidebar state.
 - **gemini = IN v1, Option 2 (refresh-only).** `~/.gemini/oauth_creds.json` is
   created by gemini-cli ITSELF (a real native, headless path) and carries the Code
   Assist scope (cloud-platform). We do NOT replicate CodexBar's macOS-only package
@@ -990,9 +992,31 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   its public installed-app client (RFC 8252 native-app client — secret not
   confidential), cited to gemini-cli source. Refresh in-memory, cache in cache.rs,
   NEVER write back to oauth_creds.json (read-only consumer).
-- **antigravity = TWO LANES, cloud and local probe.** The cloud lane uses the
-  vault's `antigravity:google` credential and needs no local process. The local
-  lane finds a running `agy` CLI or app language server and asks its loopback
+- **antigravity = live editor, sidebar v2, and vault cloud.** The plugin lane
+  reads only the non-secret sidebar, never the plugin's account/credential store
+  or refresh tokens. Path order: full-file `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE`,
+  `$XDG_STATE_HOME/cortexkit/antigravity-auth/sidebar-state.json`, then
+  `~/.local/state/cortexkit/antigravity-auth/sidebar-state.json`. Version 2 is
+  required; unsupported versions (including v1) require a plugin update. Only
+  enabled accounts with genuine non-empty emails become `plugin:<email>` handles;
+  positional ids/labels never identify accounts. Read errors keep the last roster
+  and reading rather than pruning accounts.
+
+  The plugin polls quota itself. Groups need an observation `checkedAt` at most
+  3600 seconds old; undated/stale groups are withheld independently. Value time
+  is the oldest served group observation, never the publication `checkedAt`.
+  Stable `5h`/`weekly` keys generate ids, and `remainingFraction` preserves source
+  precision rather than using rounded `remainingPercent`. The bound is also
+  recorded by astrocyte at `window_sample`; coordinate any change to
+  `CACHED_QUOTA_MAX_AGE` across repositories.
+
+  The vault cloud lane uses the `antigravity:google` credential family and needs no local process.
+  Sidebar `tier.paidId` present and not `free-tier` withholds the cloud's wrong
+  standard-tier pool; a matching fresh sidebar serves instead. Absent tier is
+  unknown, not paid. A credential without an identifiable email is withheld when
+  any paid account is known; a sidebar read error also withholds the cloud.
+  Both named lanes prefer a live editor only when GetUserStatus email matches.
+  The local lane finds a running `agy` CLI or app language server and asks its loopback
   port. macOS uses `ps`/`lsof`, Linux reads `/proc`, and Windows uses Toolhelp,
   image-filtered PEB command-line reads and TCP owner tables. Process scans and
   each port scan have a five-second deadline and a single-flight gate that stays
@@ -1007,11 +1031,9 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   `windows_real_enumerator_reads_own_command_line_and_listener` on CI's Windows
   leg. It has not been live-checked from the macOS development host.
 
-  Both are offered, and the local one is **not** replaced when the vault handle
-  exists — unlike the vault-served providers, where a vault handle replaces the
-  implicit local lane to avoid two identity-less entries. Here both lanes
-  describe the same account, so there is no ambiguity to avoid, and keeping both
-  means a cloud outage or a dead credential still leaves the local answer.
+  Named plugin/vault handles replace the implicit local handle so identity-less
+  usage cannot collapse the account roster. With neither configured, the implicit
+  local probe remains the whole provider.
 
   **Why the cloud lane was needed:** the local probe reports usage only while
   that process happens to be running, and nothing in this repository starts it.
@@ -1029,18 +1051,14 @@ oauth2.googleapis.com/token refresh with the CLI's OAuth client_id/secret.
   Gemini CLI login has no access to. `vault_handles.rs` routes
   `antigravity:google` to its own provider for exactly this reason.
 
-  **The cloud response states no window length**, unlike the local server which
-  labels each bucket `5h` or `weekly`. Its buckets carry only a model id, a
-  fraction, a reset and a token type. The reset cannot supply the cadence either:
-  the local server meters each pool on both a five-hour and a weekly window while
-  the cloud returns a single reset per pool, so which meter a given reset belongs
-  to is not knowable from the response. The cloud lane therefore publishes no
-  `windowMinutes` rather than guessing one.
+  The cloud summary publishes named 5h/weekly windows like the local editor and
+  sidebar. Only the refusal-only per-model fallback states no window length; a
+  reset cannot supply its cadence, so that fallback publishes no `windowMinutes`
+  rather than guessing one.
 
-  Granularity differs between the lanes — named pool groups locally, one bucket
-  per model from the cloud — so the cloud lane folds models back into their pools
-  (by model-id prefix, the only pool evidence it carries) and publishes the same
-  shape either way. Buckets with no reset are the always-available internal
+  The per-model cloud fallback lacks cadence keys, so it groups models into pools
+  (by model-id prefix, the only pool evidence it carries), publishing one window
+  per pool rather than inventing four cadence buckets. Buckets with no reset are the always-available internal
   models and are excluded: folding a permanently-idle bucket into a metered pool
   would drag its worst-case reading toward zero.
 
@@ -1657,14 +1675,18 @@ that inventory. The three changed files instead concern other mechanisms:
   word “token” can trigger auth classification (`b719ddaef`, `b37a61213`); it
   does not change an OAuth HTTP error or our usage parser.
 
-**Antigravity (5 files): a new false-quota fence, not a Hub version bump.**
+**Historical Antigravity review (5 files): a new false-quota fence, not a Hub version bump.**
+The plugin-refresh discussion below describes the former account-store lane,
+which has been removed. Current plugin usage is cache-only sidebar v2; cloud
+credentials come only from the vault. The consumer-client refusal check is now
+implemented. Current lane details and freshness are in the inventory above.
 `AntigravityOAuthCredentialsStore.swift` prefers the consumer sign-in client
 `1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`
 when a binary contains several adjacent client-id/secret pairs; the secret still
 comes from that same record (`837d30dff`). None of the eight tracked constants
 rotated: this is a new client-selection rule. **Decline a blind client swap** in
-insula, whose existing refresh credential is bound to the opencode plugin's
-different client. A refresh token cannot simply be reassigned to a new client.
+the former insula plugin lane, whose refresh credential was bound to the opencode
+plugin's different client. A refresh token cannot simply be reassigned to a new client.
 
 `AntigravityRemoteUsageFetcher.swift` now reads `loadCodeAssist.ineligibleTiers`
 and rejects an account before onboarding/quota fetching when the stored project
@@ -1672,7 +1694,8 @@ is absent, `currentTier` and the response project are absent, and a reason code
 is `GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT` (`837d30dff`, hardened in `1c70e8966`).
 It returns `reauthenticationRequired` rather than publishing the placeholder
 100% quota summary returned to the wrong OAuth client. **Port candidate:**
-insula's cloud lane goes straight to quota and has no equivalent refusal check.
+At the time, insula's cloud lane went straight to quota and had no equivalent
+refusal check (now implemented).
 Its paid-account fence is already present, but it cannot detect this distinct
 client rejection for free/unknown accounts with no authoritative local/cache
 reading. A successful quota HTTP status alone does not establish real capacity.
@@ -1683,7 +1706,7 @@ duration-label precedence and quota math are unchanged. The v0.71.0 Hub UA is
 **already ported**. Tier/onboarding precedence is only refactored; selected-account
 email trimming/case-insensitive comparison is preserved. Keep insula's stricter
 refusal-only fallback and its paid-tier/account-attribution guard: the new
-consumer fence does not prove our plugin-bound token sees a paid account's pool.
+consumer fence did not prove a plugin-bound token saw a paid account's pool.
 
 `AntigravityProviderDescriptor.swift` shares one `agy --version` result between
 spawn and print fallbacks, preserves cancellation and the existing agy 1.2.2
@@ -1822,8 +1845,9 @@ wrong number on this host; retain the existing live-account and paid-tier fences
    Upstream `Antigravity/AntigravityRemoteUsageFetcher.swift` (`CodeAssistResponse`
    and fetch guard) and `AntigravityOAuthCredentialsStore.swift` (v0.73.0).
    Check the explicit `GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT` refusal on the cloud
-   lane and surface reauthentication; do not rotate plugin-bound refresh clients,
-   auto-onboard or relax paid/account guards. Risk: high if entitlement or client
+   lane and surface reauthentication; do not auto-onboard or relax paid/account
+   guards. Plugin-bound refresh clients are no longer read or exchanged: the
+   plugin lane is cache-only sidebar v2. Risk: high if entitlement or client
    identity is guessed; a nominally successful placeholder can claim false
    headroom on a live account. Capture matching local/cache/cloud evidence first.
 2. **Kimi for Coding — ratio pools plus same-period conservative reconciliation.**
@@ -1953,17 +1977,20 @@ against `anthropic.rs`, not against its unrelated web/CLI lanes:
   (`ac0d9b4c4`). Insula neither spawns Claude nor reads its Keychain/browser;
   it sends an opencode-store or vault access token and never refreshes it.
 
-**Antigravity (13 files): investigate client identity, retain the paid-account
-fence.** `AntigravityRemoteUsageFetcher.swift` changes the request UA from
+**Historical Antigravity review (13 files): investigate client identity, retain the paid-account
+fence.** The plugin-bound refresh-client discussion below predates the cache-only
+sidebar v2 lane. Insula no longer reads or exchanges plugin refresh tokens; the
+paid-tier guard now reads sidebar `tier.paidId`. Current cloud credentials come
+only from the vault. `AntigravityRemoteUsageFetcher.swift` changes the request UA from
 `antigravity` to `antigravity/hub/2.9.1 <darwin|linux>/<arm64|amd64>` (v0.71.0,
 `2cfa63250` / `51eb3b0e8`) to restore Cloud Code quota access. Shared metadata
 remains `ideType: ANTIGRAVITY`, `platform: PLATFORM_UNSPECIFIED`,
-`pluginType: GEMINI`. Insula still uses `REMOTE_USER_AGENT = "antigravity"`.
-This is a portable request-header difference, but **not evidence that a plugin
-OAuth client now sees a paid account's real pool**. Our token is bound to the
-plugin's OAuth client, and the recorded standard-tier/paid-tier mismatch is why
-`cloud_lane_blocked` refuses that fallback. Do not remove that guard just because
-an updated UA returns 200.
+`pluginType: GEMINI`. At the time, insula used `REMOTE_USER_AGENT = "antigravity"`
+(now Hub 2.9.1). This was a portable request-header difference, but not evidence
+of paid-pool access. Former plugin tokens were bound to the plugin's OAuth client;
+the recorded standard-tier/paid-tier mismatch motivated the paid-account fence.
+The current vault cloud lane still withholds paid accounts. Do not remove that
+guard just because an updated UA returns 200.
 
 Endpoints (`retrieveUserQuotaSummary` first, then the per-model fallback),
 bucket ids, explicit duration-label precedence, quota parsing and tier selection
@@ -1983,8 +2010,9 @@ selected account and reaps descendants. Insula already guards local-probe and
 cache attribution by account; it never spawns `/usage`. Decline the subprocess
 lane absent a need and captured output. `AntigravityOAuthCredentialsStore.swift`
 now pairs app client id and secret from the same binary record rather than
-string-pool ordering (v0.72.0, `6dca28df4`); do not port onto our different
-plugin-bound refresh client. Additional Gemini profile homes (v0.72.0,
+string-pool ordering (v0.72.0, `6dca28df4`). Insula no longer reads or exchanges
+plugin refresh tokens; the current plugin lane is cache-only sidebar v2.
+Additional Gemini profile homes (v0.72.0,
 `c8e53a318`), local usage-field/schema fixes (v0.71.0, `ca32251b4`,
 `bfbc6a6de`) and empty-model-history fixes (v0.72.0, `316ea2095`) concern local
 consumption/offline history, not quota buckets. No effect on our capacity lane.

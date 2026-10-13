@@ -1020,3 +1020,98 @@ only = false
 platforms = ["linux"]
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-sidebar-version"
+guards = "Unknown sidebar major versions including v1 require a plugin update"
+file = "crates/quota-core/src/antigravity.rs"
+old = "if file.version.as_u64() != Some(2) {"
+new = "if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::plugin_lane_tests::unsupported_sidebar_versions_require_a_plugin_update"]
+expect_message = "only integer major 2 is supported"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-sidebar-installed-missing"
+guards = "An absent sidebar with plugin installation evidence is unavailable, never an empty roster"
+file = "crates/quota-core/src/antigravity.rs"
+old = '''return Err("Antigravity plugin is installed but its sidebar state is absent; update the plugin and let it publish quota".to_string());'''
+new = "return Ok(Vec::new()); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::plugin_lane_tests::an_absent_sidebar_with_plugin_evidence_is_unavailable_not_empty"]
+expect_message = "installed plugin is not an empty roster"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-sidebar-undated"
+guards = "Undated quota groups cannot borrow publication or window clocks to appear current"
+file = "crates/quota-core/src/antigravity.rs"
+old = """let Some(checked_at) = pool
+            .checked_at
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+        else {
+            continue;
+        };"""
+new = "let checked_at = pool.checked_at.and_then(DateTime::<Utc>::from_timestamp_millis).unwrap_or(now); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::plugin_lane_tests::undated_sidebar_groups_are_not_served_even_with_fresh_publication"]
+expect_message = "publication and window clocks cannot date a group"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-sidebar-oldest-observation"
+guards = "Sidebar value time is the oldest observation among groups actually served"
+file = "crates/quota-core/src/antigravity.rs"
+old = "oldest = Some(oldest.map_or(checked_at, |previous| previous.min(checked_at)));"
+new = "oldest = Some(oldest.map_or(checked_at, |previous| previous.max(checked_at))); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::plugin_lane_tests::sidebar_value_time_is_the_oldest_served_group_observation"]
+expect_message = "assertion `left == right` failed"
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "antigravity-sidebar-fraction-precision"
+guards = "Used percent preserves source fraction precision, never the rounded display percent"
+file = "crates/quota-core/src/antigravity.rs"
+old = "let remaining = window.remaining_fraction?;"
+new = "let remaining = window.remaining_percent? / 100.0; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::plugin_lane_tests::sidebar_fraction_precision_is_preserved_not_the_rounded_percent"]
+expect_message = "55.149424"
+only = true
+timeout_s = 600
+build_timeout_s = 1800

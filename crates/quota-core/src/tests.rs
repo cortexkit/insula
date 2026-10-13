@@ -500,32 +500,10 @@ fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
     );
 }
 
-/// Every antigravity plugin-lane success publishes the email the lane selected on.
-///
-/// THE DEFECT WAS AN OMISSION AT ONE OF THREE SITES, which is the shape a source
-/// walk catches and an example-based test does not. `PLUGIN_SOURCE` is returned
-/// from three places -- the local editor probe, the on-disk cache, and the cloud
-/// -- each its own `FetchAttempt::success`. Two attached the account info and one
-/// did not, so a row whose two slots alternate showed the address, then nothing,
-/// then the address again.
-///
-/// Measured on this host 2026-09-19, one account, consecutive reads:
-///
-///     src=oauth  email=None
-///     src=vault  email=beatricelau0414@gmail.com
-///     src=oauth  email=None
-///
-/// The lane SELECTS the account by email, so the value is always in hand; the only
-/// way to get this wrong is to forget one return. Nothing joined wrongly --
-/// `account` is stable across all of them -- but a surface rendering the address
-/// blinks.
-///
-/// Uses `production_body` rather than a second stripper. The first draft of this
-/// test carried its own brace-matching copy, which counted SEVEN sites where three
-/// exist: it had eaten a production item's `#[cfg(test)]` and left the test module
-/// standing, so the walk matched its own source text. That is the first of the
-/// three test-stripping traps in docs/provider-invariants.md, reproduced while
-/// writing a test about a duplicated omission.
+/// Both success paths for an opencode plugin account must put its selected
+/// email in `accountInfo.email`. The local editor and sidebar snapshot attach
+/// this metadata independently; omitting it on either makes the address blink
+/// when sources switch. Walk production returns to catch a new path omitting it.
 #[test]
 fn every_antigravity_plugin_lane_publishes_the_account_email() {
     let production = production_body(include_str!("antigravity.rs"));
@@ -540,8 +518,8 @@ fn every_antigravity_plugin_lane_publishes_the_account_email() {
 
     assert_eq!(
         sites.len(),
-        3,
-        "expected exactly the three plugin lanes (local probe, cache, cloud); a \
+        2,
+        "expected exactly the two plugin lanes (local probe, sidebar); a \
          lane added without account info is what this guards, and a lane removed \
          should update this count deliberately"
     );
