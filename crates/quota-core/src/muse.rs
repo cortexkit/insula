@@ -10,9 +10,16 @@
 //! - Reference: CodexBar's `Sources/CodexBarCore/Resources/Plugins/muse.ts` and
 //!   `docs/muse.md` (main branch, read 2026-10-13).
 //!
-//! The same response also carries a freshly usable inference key and the
-//! account's `payment_method`. Neither is declared in [`KeyResponse`], so serde
-//! drops them unread; nothing here may log or publish the raw body.
+//! The same response also carries the account's inference key (`api_key`) and
+//! its `payment_method`. Neither is declared in [`KeyResponse`], so serde drops
+//! them unread; nothing here may log or publish the raw body.
+//!
+//! CodexBar's docs call this a "mint" endpoint, which raised the question of
+//! whether polling it creates a new key each time. It doesn't: two calls two
+//! seconds apart on a live account (2026-10-13) returned the same `api_key` and
+//! identical usage fields; only the signed `user_avatar_url` changed. So the
+//! ordinary poll interval applies. If that ever changes, every poll would add a
+//! key to the account, and the interval for this provider would need raising.
 //!
 //! Credential: a vault deposit (`apikey:muse`) when one exists, otherwise
 //! `MUSE_DEVICE_TOKEN`, otherwise an inline `providers.meta.access_token` in the
