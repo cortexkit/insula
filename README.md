@@ -217,13 +217,6 @@ cargo run -p quota-module --example scoped-list
 # work while its author narrated "built from HEAD". Override with
 # CK_DEPLOY_ALLOW_DIRTY=1, loudly:
 ./scripts/deploy.sh
-
-# vary request context against the cloud Code Assist endpoint to establish why
-# it reports a different Gemini pool than the local editor. It prints the raw
-# response across variations (project field, tier id, caller headers) and
-# confirmed that Code Assist resolves tier entitlement from the OAuth client id
-# rather than from any request parameter:
-cargo run -p quota-core --example antigravity-project-scope
 ```
 
 ### Repository sweeps
