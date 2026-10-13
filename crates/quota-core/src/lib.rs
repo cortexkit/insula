@@ -427,6 +427,10 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         "kimi-for-coding" => Some("kimi-code-plan-global"),
         "kilo" => Some("kilo"),
         "minimax" => Some("minimax"),
+        // The Muse Code plan's inference key is served at api.meta.ai/v1, which
+        // is exactly models.dev's `meta` provider, so routing that spends this
+        // quota reaches it under that slug.
+        "muse" => Some("meta"),
         "stepfun" => Some("stepfun"),
         "zai" => Some("zai"),
         "synthetic" => Some("synthetic"),
