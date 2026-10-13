@@ -7,8 +7,8 @@
 //! SUCCEEDED and the quota call was refused, which is the sunset, while
 //! `unauthorized: token refresh: HTTP 403` is a credential problem. Confirmed by
 //! probing `v1internal:loadCodeAssist` with a freshly refreshed token:
-//! `currentTier: null`, `ineligibleTiers: [UNSUPPORTED_CLIENT]`. Details and the
-//! probe are in docs/provider-matrix.md under "the CLI-OAuth sunset".
+//! `currentTier: null`, `ineligibleTiers: [UNSUPPORTED_CLIENT]`. The freshly
+//! refreshed token distinguishes a tier refusal from an expired credential.
 //!
 //! RE-AUTHENTICATING DOES NOT HELP, so the error class is doing something subtle:
 //! `credential_rejected` is correct because a credential WAS presented and

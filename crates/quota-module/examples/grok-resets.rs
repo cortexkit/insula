@@ -1,9 +1,9 @@
 //! Does grok's `GetRemainingResets` answer a bearer, and what shape is it?
 //!
 //! CodexBar v0.61.0 added this endpoint: grok's equivalent of the banked reset
-//! credits we publish as `savedResets` for codex. Recorded UNVERIFIED in
-//! `docs/provider-matrix.md` rather than declined, because the first probe could
-//! not establish either answer.
+//! credits we publish as `savedResets` for codex. The response has not been
+//! verified with a working credential: the first probe used an expired token,
+//! so it established neither bearer support nor response shape.
 //!
 //! WHY THE FIRST PROBE FAILED, and why this is an example rather than a shell
 //! command. It used the local `xai` token from the opencode auth store and got

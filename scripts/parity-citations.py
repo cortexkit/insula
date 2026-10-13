@@ -13,7 +13,9 @@ Eight were already in this state when this script was written, all from the same
 cause: the upstream QuickJS/TypeScript plugin-engine migration replaced several
 Swift fetchers with plugin JS. Nothing said so, because nothing was looking.
 
-THIS IS A PARITY-ROUND INSTRUMENT, not a gate. A dead citation is not a defect in
+THIS IS A LOCAL-ONLY PARITY-ROUND INSTRUMENT, not a CI gate. The anchor is the
+newest CodexBar version recorded in the internal CodexBar parity research history,
+which a public checkout does not contain. A dead citation is not a defect in
 our code -- the port it documents is still correct and still verified -- so
 failing a build on it would be wrong. What it does is tell the parity round which
 citations to re-anchor or annotate, at the one moment someone has the upstream
@@ -46,19 +48,20 @@ import sys
 # and costs someone a hunt through a repository they do not own. The digits
 # omission was caught within the hour; the `+` omission shipped.
 CITATION = re.compile(r"([A-Za-z_][A-Za-z0-9_+]*\.swift)")
+RESEARCH_PATH = pathlib.Path(".cortexkit/internal-docs/research/codexbar-parity.md")
 
 
 def anchored_tag(repo_root: pathlib.Path) -> str | None:
-    """The parity tag docs/provider-matrix.md currently claims.
+    """The newest CodexBar release tag in the local parity research record.
 
     Read from the doc rather than passed in, so the script and the recorded
     anchor cannot disagree -- checking against a tag nobody anchored to would
     produce findings that mean nothing.
     """
-    matrix = repo_root / "docs" / "provider-matrix.md"
-    if not matrix.is_file():
+    research = repo_root / RESEARCH_PATH
+    if not research.is_file():
         return None
-    tags = re.findall(r"\bv\d+\.\d+\.\d+\b", matrix.read_text())
+    tags = re.findall(r"\bv\d+\.\d+\.\d+\b", research.read_text())
     if not tags:
         return None
     # The newest by version order, not by position: the file records a history of
@@ -70,14 +73,19 @@ def main() -> int:
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     upstream = pathlib.Path.home() / "Work" / "OSS" / "CodexBar"
 
-    if not (upstream / ".git").exists():
-        print(f"refusing: no CodexBar checkout at {upstream}", file=sys.stderr)
-        print("this check needs the upstream tree; it says nothing without it", file=sys.stderr)
+    if not (repo_root / RESEARCH_PATH).is_file():
+        print(f"refusing: internal parity research is absent: {RESEARCH_PATH}", file=sys.stderr)
+        print("this local-only tool cannot check parity from a public checkout", file=sys.stderr)
         return 2
 
     tag = anchored_tag(repo_root)
     if tag is None:
-        print("refusing: no parity tag found in docs/provider-matrix.md", file=sys.stderr)
+        print(f"refusing: no parity tag found in internal research: {RESEARCH_PATH}", file=sys.stderr)
+        return 2
+
+    if not (upstream / ".git").exists():
+        print(f"refusing: no CodexBar checkout at {upstream}", file=sys.stderr)
+        print("this check needs the upstream tree; it says nothing without it", file=sys.stderr)
         return 2
 
     listing = subprocess.run(

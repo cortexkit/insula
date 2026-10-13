@@ -13,7 +13,8 @@
 //! rather than inside it. A window is a share of a period; a pool is an amount
 //! with no period, and over-spending them fails in opposite directions -- one
 //! throttles and recovers by waiting, the other bills and recovers by paying.
-//! See `docs/balance-axis-design.md` for why the shape is what it is.
+//! Keeping pools separate prevents money from entering quota pacing arithmetic;
+//! `docs/consumer-contract.md` defines the public pool fields and safe defaults.
 
 pub use cortexkit_provider_usage::{
     AccountInfo, Amount, BreakdownRow, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding,

@@ -33,8 +33,7 @@
 //! ACCOUNT: the OAuth access token is a JWT issued by `auth.x.ai`, and its
 //! payload `sub` is the xAI user id (a UUID). Both lanes read it from the token
 //! they already send; no request is made for it and the signature is not checked,
-//! because the value only labels the entry. See the "grok" section of
-//! `docs/audits/account-identity-survey.md`, which verified `sub` live against
+//! because the value only labels the entry. The claim was verified live against
 //! `user_id` in `~/.grok/auth.json`. A vault record's own account label, when it
 //! has one, still wins. A token that is not a JWT, or has no `sub`, publishes with
 //! no account, as before. The token's `team_id` is not published: `orgName` on

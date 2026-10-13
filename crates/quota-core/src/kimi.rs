@@ -16,9 +16,8 @@
 //!
 //! ACCOUNT: the `sub` claim of the `kimi-auth` JWT payload, the same payload
 //! already decoded here for the `x-msh-*` headers (it is also sent as
-//! `x-traffic-id`). `sub` is the stable Kimi user id; see the "kimi (web lane)"
-//! section of `docs/audits/account-identity-survey.md`, which verified it on the
-//! browser copy of this token. A token that is not a JWT, or carries no `sub`,
+//! `x-traffic-id`). `sub` is the stable Kimi user id, verified on the browser
+//! copy of this token. A token that is not a JWT, or carries no `sub`,
 //! publishes with no account, as it did before this was read.
 
 use async_trait::async_trait;

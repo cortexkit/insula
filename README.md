@@ -28,36 +28,23 @@ reference this module's normalizers are checked against on every upstream
 release. The difference is that this one is headless, cross-platform, and
 answers over a wire rather than drawing a menu bar.
 
-**Adding or changing a provider: read `docs/provider-invariants.md` first.** It lists
-the properties a normalizer must uphold, each recovered from a defect that shipped.
 **Consuming `usage.get`: read `docs/consumer-contract.md`.** It states what you can
 rely on and what you must not infer, and every rule in it was settled against a real
 consumer.
 
-### The rest of `docs/`
+### Public documentation
 
 Current, and kept true against the code:
 
 | Doc | What it answers |
 |---|---|
-| `provider-invariants.md` | what a provider normalizer must and must not do |
 | `consumer-contract.md` | what `usage.get` promises a consumer, and what it does not |
 | `verifying.md` | the gate procedure, in one place so a task prompt points at it rather than restating it |
-| `deploying.md` | how to replace a running build, and how to verify which one is live |
-| `provider-matrix.md` | per-provider auth archetype, endpoint, and verification status |
-| `codex-banked-resets-design.md` | how the one mutating feature is fenced against double-spend |
-| `cross-platform-design.md` | what Windows and Linux parity requires, and where it is not achievable (its browser-cookie sections are historical: that reader was removed) |
-| `balance-axis-design.md` | why prepaid balances are published apart from rate windows, and how the shape was chosen |
+| `provider-matrix.md` | current per-provider sources, endpoints, windows and credential families |
 
-Written before the code and kept for the reasoning, **not** as descriptions of
-what is there — each carries a list of the details that shipped differently:
-
-| Doc | What it argues |
-|---|---|
-| `charter.md` | the original mission and the contracts it was reverse-engineered from |
-| `refresher-spike-design.md` | why reads are cache-only and a single background task owns fetching |
-| `multi-account-fetch-design.md` | why slots key on credential handle rather than account |
-| `vault-consumer-design.md` | how credentials are fetched from the vault, and what fails closed |
+Design notes, producer investigations, host-specific runbooks, audits, CodexBar
+parity research and review ledgers are internal and are not published in this
+repository. The public contract and the source describe supported behaviour.
 
 **Reporting a bug that involves a provider payload:** read `SECURITY.md`
 first. A captured response often carries a live token, and this project's whole
@@ -92,9 +79,9 @@ Verification (see each module's `VERIFICATION:` doc block):
 - **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
   upgraded to live when a key is supplied): the rest.
 
-Providers that produce no real reset window (prepaid balances, fabricated
-resets) are deferred with rationale in
-`docs/provider-matrix.md`.
+The full inventory, including balance-only providers, is in
+`docs/provider-matrix.md`. Historical provider-porting decisions and upstream
+parity reviews are internal.
 
 ## Build
 
@@ -388,11 +375,11 @@ built binary; see `examples/subc.jsonc`:
 }
 ```
 
-For that development install, **`docs/deploying.md` is how you replace a running
-build**. It explains why a bare `kill` is the wrong way to restart it, and how to
-confirm from the running process that the deployed binary is the one you expect.
-It's the macOS developer procedure (signing, scratch-file placement), not a way
-to install on Linux or Windows.
+For a development install, replace the binary by rename rather than overwriting
+an executable inode, then use `ck module restart insula`, not a bare `kill`.
+Confirm the new process's `health.metrics.buildCommit` with `ck module status
+insula --json`. Host-specific deployment runbooks and incident histories are
+internal, not public installation instructions.
 
 `args`/`env`/`enabled` are optional. The daemon appends `--subc <connection-file>`
 and injects `SUBC_MODULE_ID` itself — do **not** put those in `args`/`env`. On its

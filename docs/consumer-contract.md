@@ -13,9 +13,9 @@ have no oracle between them — code settles a document, but nothing settles a
 document against another document unless precedence is declared. This repo has hit
 that three times, and every one was resolved by hand after the fact.
 
-What it does NOT own: how a normalizer must behave to produce those fields (see
-`provider-invariants.md`) and how to deploy or verify a build (see
-`deploying.md`). Where this document describes those, it is quoting them.
+Producer design notes and host-specific deployment runbooks are internal, not
+part of this public contract. For the public verification procedure, see
+`verifying.md`.
 
 ## The core rule
 
@@ -2227,6 +2227,64 @@ machine when it has no deposit, and publishes `oauth` then.
 
 Earlier releases read these cookies from the local Chrome store and published
 `cookie`. A consumer that matched on that value should treat it as retired.
+
+### Depositing a session cookie: which URL to capture against
+
+A cookie-backed provider reads its web session from the vault and nowhere else:
+insula reads no browser store. Cerebellum captures the login in a throwaway
+browser and deposits it as `cookie:<domain>:<account>` (or a bare
+`cookie:<domain>`). With no deposit the cookie lane is unconfigured on that host.
+Domains whose cookies supply usage windows take ONE deposit: those lanes do not
+verify account identity, so a second deposit for the same domain is refused at
+load time. Re-capturing replaces the same id (`ck auth put --replace`) rather
+than adding a new suffix.
+
+The captured value must be a REQUEST `Cookie:` header (`name=value; ...`) for
+the exact URL insula fetches, so host and path scoping match what that request
+sends. Capture tools take the URL from this table, not from memory.
+`cookie_capture_urls_match_the_providers_fetch_urls` checks each row against
+the provider's own source, so a provider changing its endpoint fails the build
+until this table follows.
+
+| Deposit id | Provider(s) | Fetch URL |
+|---|---|---|
+| `cookie:claude.ai:<account>` | claude | `https://claude.ai/api/account` |
+| `cookie:ollama.com:<account>` | ollama | `https://ollama.com/settings` |
+| `cookie:opencode.ai:<account>` | opencode, opencodego | `https://opencode.ai/console/api/go/status` |
+| `cookie:ampcode.com:<account>` | amp | `https://ampcode.com/settings` |
+| `cookie:qoder.com:<account>` | qoder | `https://qoder.com/api/v2/me/usages/big_model_credits` |
+| `cookie:qwencloud.com:<account>` | qwen-cloud | `https://cs-data.qwencloud.com/data/api.json` |
+| `cookie:xiaomimimo.com:<account>` | mimo | `https://platform.xiaomimimo.com/api/v1/tokenPlan/usage` |
+| `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
+| `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
+| `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
+| `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
+
+Langdock's usage URL and response mapping have fixture coverage, but have not
+been checked with an authenticated live Langdock session.
+
+Claude's deposit is enrichment only, never a second usage lane. Use the same
+account suffix as `oauth:anthropic:<account>`; a bare deposit is not used. Multiple
+suffixed Claude deposits are allowed because each web owner is independently
+verified against the OAuth bearer via `/api/oauth/profile` and `/api/account`
+before reading `/api/organizations/{org_id}/subscription_details`. Capture a
+`sessionKey` cookie scoped to `/api` so it covers both account and billing URLs.
+Claude's `/api/account` capture URL and subscription-date enrichment have fixture
+coverage, but have not been checked with a live claude.ai session.
+
+The `kimi.com` deposit is not a lane: kimi-for-coding reads its usage with the
+coding API key and uses the web session's `kimi-auth` cookie only to fetch two
+optional subscription extras. Without the deposit those extras are skipped.
+
+The login page can be any page on the site where the user signs in; it does not
+have to be the fetch URL, and for factory it is not (sign-in is on
+`app.factory.ai`, the fetch is on `api.factory.ai`).
+
+insula logs each deposit's first rejection after it has served, with its age
+(`deposited cookie ... first rejected after working <h>h<mm>m`). That is the
+site's session lifetime for that capture, and the only measurement of it.
+
+### Consumption metrics
 
 **Four health metrics describe CONSUMPTION rather than production.**
 `usageRequestsServed` and `usageRequestsRefused` count route requests this process

@@ -276,8 +276,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     // needs evidence of what an account with no windows actually receives, and no
     // credential on any machine here can produce that. If this provider is ever
     // configured, split it: absent and unreadable stay Decode, stated-empty
-    // becomes NoQuotaReported. See "An absent field is not the same as a stated
-    // absence" in docs/provider-invariants.md.
+    // becomes NoQuotaReported: an explicit empty list is an account fact, while
+    // an absent or unreadable field may be a payload/schema mismatch.
     if extra_rate_windows.is_empty() {
         return Err(FetchError::Decode(
             "sub2api response has no usable rate limit windows".to_string(),
