@@ -8299,6 +8299,12 @@ fn every_opaque_upstream_constant_is_in_the_parity_table() {
     );
 }
 
+/// Spent and about-to-expire credit lists yield no usable expiry.
+///
+/// It checks `earliest_usable_expiry` twice, then checks that
+/// `reporting_eligible` refuses an `armed: false` it is handed as a literal. So
+/// nothing here connects a spent account to unrelaxed output; that join is
+/// tested in `an_account_with_no_credits_left_publishes_its_real_usage`.
 #[test]
 fn spent_and_expiring_credit_lists_yield_no_usable_expiry() {
     let now = reset_now();
