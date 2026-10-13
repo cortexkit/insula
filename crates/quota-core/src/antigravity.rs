@@ -286,8 +286,8 @@ fn cloud_lane_must_withhold(
             .any(|account| account_holds_paid_tier(Some(account)))
 }
 
-/// Why a paid-tier account with neither an authoritative source nor a fresh cache
-/// publishes nothing.
+/// Why a paid-tier account with neither a matching live editor nor a recent
+/// sidebar reading publishes nothing.
 ///
 /// Deliberately `LocalSourceUnavailable` rather than a degraded entry: it is
 /// classified transient, so the last correct reading keeps serving while the
@@ -297,7 +297,7 @@ fn cloud_lane_must_withhold(
 fn paid_tier_usage_unavailable() -> FetchError {
     FetchError::LocalSourceUnavailable(
         "this account holds a paid Antigravity tier, but neither a matching local \
-         editor session nor a fresh plugin cache is available: the cloud credential \
+         editor session nor a recent plugin sidebar reading is available: the cloud credential \
          is entitled to the standard tier and would describe a pool this account \
          does not use"
             .to_string(),
@@ -4345,8 +4345,10 @@ mod plugin_lane_tests {
         );
     }
 
-    /// The plugin keeps `source: oauth` to identify the opencode-owned login;
-    /// changing to sidebar storage does not change how consumers remedy sign-out.
+    /// The plugin lane publishes `source: "oauth"`, the value consumers already
+    /// associate with the opencode plugin's login. Reading the sidebar file instead
+    /// of the account store doesn't change which login a consumer asks the user to
+    /// renew, so the published value stays the same.
     #[test]
     fn the_plugin_lane_uses_the_existing_oauth_source() {
         assert_eq!(PLUGIN_SOURCE, "oauth");
