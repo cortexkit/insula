@@ -48,6 +48,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // each through as two identity-less minimax slots, which the emission gate
     // collapses into one unlabelled row.
     ("apikey:minimax-coding-plan", "minimax"),
+    // The Muse CLI's device-code login token (`dca:…`), deposited by hand: the
+    // CLI keeps it in the macOS Keychain, which insula doesn't read.
+    ("apikey:muse", "muse"),
 ];
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
@@ -85,6 +88,7 @@ enum ProviderKind {
     Synthetic,
     OpenRouter,
     MiniMax,
+    Muse,
 }
 
 #[derive(Clone, Default)]
@@ -470,6 +474,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::MiniMax)
     }
 
+    pub fn muse_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Muse)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -567,6 +575,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "synthetic" => Some(ProviderKind::Synthetic),
         "openrouter" => Some(ProviderKind::OpenRouter),
         "minimax" => Some(ProviderKind::MiniMax),
+        "muse" => Some(ProviderKind::Muse),
         _ => None,
     }
 }

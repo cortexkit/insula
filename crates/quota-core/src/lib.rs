@@ -49,6 +49,7 @@ pub mod mimo;
 pub mod minimax;
 pub mod model;
 pub mod money;
+pub mod muse;
 pub mod neuralwatt;
 pub mod ollama;
 pub mod opencode;
@@ -678,6 +679,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(minimax::MinimaxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(muse::MuseProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

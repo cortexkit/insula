@@ -36,7 +36,7 @@ At the time of writing, two providers were built and proven live end-to-end:
 
 ## Parity status
 
-38 providers registered.
+39 providers registered.
 
 **Current parity: the newest "Parity round" section below names the tag.** This
 line used to state a tag, and it went stale for six rounds because each round
@@ -1163,6 +1163,7 @@ api-key providers mis-filed as cookie):**
 | minimax | minimax | vault `apikey:minimax-coding-plan`, else `MINIMAX_CODING_API_KEY`/`MINIMAX_API_KEY` bearer | GET {host}/v1/api/openplatform/coding_plan/remains | remains_time/end_time (epoch) |
 | doubao | doubao | `ARK_API_KEY`/`VOLCENGINE_API_KEY`/`DOUBAO_API_KEY` bearer | POST ark...volces.com (probe) | `x-ratelimit-reset-requests` header (ISO/duration/sec) |
 | kimi | kimi | `KIMI_AUTH_TOKEN` env (else cookie) | POST kimi.com/apiv2/.../GetUsages | weekly + 5h (`resetTime`) |
+| muse | muse | vault `apikey:muse` (the CLI's `dca:` token, bare or JSON with `access_token`), else `MUSE_DEVICE_TOKEN`, else an inline token in `~/.config/muse/auth.json` (`MUSE_AUTH_PATH`) | POST api.meta.ai/muse-code/key | 5h + weekly (`resets_at` epoch); usage omitted while the 5h window is idle, served stale |
 | stepfun | stepfun | `STEPFUN_TOKEN` env (else user/pass login flow) | POST platform.stepfun.com/.../QueryStepPlanRateLimit | 5h + weekly (Unix-sec) |
 | ~~windsurf~~ DEFERRED | windsurf | native SQLite `state.vscdb` (editor cache) | local read of `windsurf.settings.cachedPlanInfo` | daily + weekly (`*ResetAtUnix`) — see defer below |
 Notes: minimax/doubao/kimi belong with Group 2 (api-key-env bearer) — minimax has
