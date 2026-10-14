@@ -114,38 +114,17 @@ impl ClientFailure {
             // next one: Rust has no reflection over the daemon's constants, so a
             // new code falls through here silently.
             //
-            // The vault's own TypeScript client reached this default independently
-            // from the other side of the wire: unrecognised or absent class is
-            // transient, and the discarded value is logged.
+            // The vault's own TypeScript client (`asCredentialError` in claustrum's
+            // packages/client/src/errors.ts) takes the same default from the other
+            // side of the wire, and is stricter: it treats an error as transient
+            // unless it carries both `class` and `code`, so a broken or hostile
+            // peer can't force a permanent verdict with a bare `class`. That is
+            // corroboration, not the reason: the paragraph above stands on its own.
             //
-            // BORROWED, AND RE-DERIVED RATHER THAN RE-CITED. Reported by the vault
-            // seat 2026-09-02 (packages/client/src/errors.ts) and read back at
-            // their published tip 2026-09-19: `asCredentialError` still treats an
-            // unknown-or-absent class as transient. It is corroboration for a
-            // decision the paragraph above already justifies on its own, so if it
-            // drifts the argument does not move.
-            //
-            // THE RE-DERIVATION FOUND THE CLAIM HAD WIDENED, which is what a date
-            // alone would have hidden: they now require BOTH `class` and `code`,
-            // so a half-formed envelope carrying a valid `class` and no `code` is
-            // also transient -- a malicious or broken peer must not be able to
-            // drive a permanent verdict with `{ error: { class: 'permanent' } }`.
-            // My paraphrase stayed true and stopped being complete.
-            //
-            // A DATED PIN IS ONLY A MITIGATION WHERE THE SOURCE IS REACHABLE.
-            // Theirs is: the repository is on disk, so this is one command. A
-            // pin on an UNREACHABLE source is a fig leaf -- it carries a
-            // declaration's authority with no way to repeat the read, which is how
-            // a self-signal name in `docs/consumer-contract.md` came to be
-            // attributed to the wrong module for a day.
-            //
-            // Note their premise does NOT transfer automatically: a
-            // request/response client surfaces a repeated failure to its caller,
-            // while this background refresher does not. It holds here only
-            // because a stale-served entry publishes `stale: { since, class }`.
-            //
-            // Retrying costs one tick; failing closed costs an outage with a
-            // misattributed cause.
+            // The default is safe here only because this background refresher
+            // makes repeated failure visible: a stale-served entry publishes
+            // `stale: { since, class }`. Retrying costs one tick; failing closed
+            // costs an outage with a misattributed cause.
             //
             // The accepted risk is the same one the `unknown_channel` arm takes: a
             // permanently unrecognised code stale-serves a healthy-looking window

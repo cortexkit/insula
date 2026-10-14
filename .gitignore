@@ -44,8 +44,8 @@ _bmad-output
 # (untracked) and is then erased by the next generation with no event marking
 # either, so the author cannot learn it happened.
 #
-# Authored public equivalents: docs/consumer-contract.md for wire semantics,
-# docs/provider-matrix.md for the provider inventory, README.md for the index.
+# Authored public equivalents live in docs/ (docs/architecture.md for the
+# design, docs/consumer-contract.md for wire semantics), indexed by README.md.
 # Internal engineering notes stay in .cortexkit/internal-docs/.
 /ARCHITECTURE.md
 /STRUCTURE.md
