@@ -1,241 +1,153 @@
 # Verifying a change
 
-The gate procedure for this workspace, in one place so a task prompt can point
-at it instead of restating it. **Restating it is how it drifts**: three prompts
-written on 2026-08-16 instructed a mutation-restore method this repo had already
-documented as unsafe, twice, and a worker followed them correctly and lost its
-own implementation. A procedure copied into a prompt ages separately from the
-repo that knows better.
-
 ## The gates
 
-```bash
-scripts/gates.sh          # fmt, clippy, unit tests
-scripts/gates.sh --e2e    # also the integration suites, ~80s more
+```sh
+scripts/gates.sh          # repository checks, fmt, clippy, unit tests, doctests
+scripts/gates.sh --e2e    # also the in-process wire tests, about 80 s more
 ```
 
-That runs the checks together and stops at the first failure. Use it rather
-than a partial list of individual commands: it also checks Python and shell
-instruments, repository path dependencies (using Python 3.11+ for TOML),
-endpoint hosts, CI push triggers for `master` and release-candidate `train/**`
-branches (both must produce checks before publishing a tested commit to master), the public `.cortexkit/`
-layout and its ignore controls, the newest stable clippy,
-unit tests, doctests, and orphan modules.
+Run the gate script rather than a hand-picked list of commands; it stops at the
+first failure. [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gate) lists every step.
+A change that guards a costly property also gets a mutation row; see
+[`mutations.md`](mutations.md).
+
+### What the gate does not run
+
+`--all-targets` does not include doctests, so they are a separate step in both
+the gate and CI.
+
+| Target | Local gate | CI | How to run it |
+|---|---|---|---|
+| lib and bin unit tests | yes | yes | `cargo test --workspace --lib --bins` |
+| doctests | yes | yes | `cargo test --workspace --doc` |
+| `skeleton_e2e::` | with `--e2e` | yes | see below |
+| `real_daemon_e2e::` | no | yes | `#[ignore]`d; needs a `ck-subc` build |
+| `*_live::` provider tests | no | no | `#[ignore]`d; needs a real provider session |
+| examples compile | yes | yes | via `clippy --all-targets` |
+| examples run | no | `completeness-envelopes` only | `cargo run -p <crate> --example <name>` |
+
+The live provider tests are left out of both on purpose: they reach real
+upstreams, so a gate that ran them would depend on someone else's uptime. Run
+them by hand when changing a provider's request shape.
+
+### Integration tests need their binary built first
+
+`cargo test -p quota-module --test it skeleton_e2e::` spawns the `ck-insula`
+binary but does not rebuild it. A stale binary fails registration with no
+error output, which looks like a hang:
+
+```sh
+cargo build -p quota-module --bins
+cargo test -p quota-module --test it skeleton_e2e::
+```
+
+The suite takes about 80 seconds; one test waits out a full 60-second refresh
+interval because it checks that a slot fails closed on its next refresh. Its
+10-second registration wait can fail on a heavily loaded machine. Re-run that
+test alone before treating a failure as real, and do not widen the wait to make
+it pass.
+
+### Tests that need a session or a daemon
+
+```sh
+# real provider windows through the wire (needs that provider's session on this host)
+cargo test -p quota-core --test it -- --ignored --nocapture grok_live::
+cargo test -p quota-core --test it -- --ignored --nocapture antigravity_live::
+cargo test -p quota-core --test it -- --ignored --nocapture jetbrains_live::
+
+# a standalone ck-subc daemon spawns the module from subc.jsonc and routes usage.get;
+# builds ck-subc from a sibling ../subconscious checkout
+cargo test -p quota-module --test it -- --ignored --nocapture real_daemon_e2e::
+```
 
 ### Updating subc dependencies
 
-`subc-protocol`, `subc-transport`, `subc-daemon`, `subc-jsonc`, and `subc-os`
-come from crates.io, pinned by `Cargo.lock`.
-A sibling release does not change this workspace's dependency graph. To take
-an upgrade, run `cargo update -p <crate>`; for a new minor, bump its requirement
-in the root `Cargo.toml` first. Review the lock diff and the runtime versions in
-`cargo tree -e normal -p quota-module`, then run:
+`subc-protocol`, `subc-transport`, `subc-daemon`, `subc-jsonc` and `subc-os`
+come from crates.io, pinned by `Cargo.lock`. To take an upgrade, run
+`cargo update -p <crate>`; for a new minor version, raise its requirement in
+the root `Cargo.toml` first. Review the lock diff and
+`cargo tree -e normal -p quota-module`, then:
 
-```bash
+```sh
 scripts/gates.sh
 cargo check --locked --workspace --all-targets
 cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
 ```
 
-Land the manifest/lock change only after these pass. The real-daemon test still
-needs `../subconscious`: it builds that checkout's `ck-subc` daemon binary to
-verify process supervision and routing against the current daemon, not just the registry's dev-only in-process
-`subc-daemon`. Ordinary builds and non-ignored tests need no sibling checkout.
+Land the manifest and lock change only after all three pass.
 
-### Integration tests need their binaries built first
+## Exit codes
 
-`cargo test -p quota-module --test it skeleton_e2e::` does **not** rebuild the
-`ck-insula` binary the harness spawns. A stale binary fails registration with no
-error output at all, which reads as a hang rather than a build problem:
+Every checker and script in this repository uses three exit codes:
 
-```bash
-cargo build -p quota-module --bins
-cargo test -p quota-module --test it skeleton_e2e::
-```
-
-That suite is slow by nature — around 80 seconds, one test alone taking 60 — and
-the 10-second registration gate inside it is tight on a machine that has been
-compiling for a while. A failure there is worth re-running alone before treating
-it as real, and worth NOT "fixing" by widening the gate: CI passes it as-is, and
-widening a gate to accommodate a busy dev machine is masking.
-
-## Why CI takes about three minutes, measured
-
-Audited 2026-08-16 across three green runs, because a fleet relay ranked seven
-pipeline mechanisms and the first was *measure before mechanism* — another
-repo's two intuitive wins had been falsified by its own logs. Mine falsifies the
-whole ranked list, which is worth more than adopting it would have been.
-
-The ubuntu job, 177.6s end to end:
-
-| phase | time |
+| Code | Meaning |
 |---|---|
-| checkout, toolchain, clippy (33s), compile | 89.3s |
-| test execution | 88.3s |
-| — of which `i8_vault_stub_two_accounts_fail_closed_without_handle_reap` | **60.4s** |
+| 0 | checked, found nothing |
+| 1 | checked, found something; the findings are the output |
+| 2 | could not check; the run makes no claim either way |
 
-**One test is a third of the job**, and it is not slow by accident. It kills the
-vault stub and waits for the affected slot to fail closed, which happens on that
-slot's next refresh — so it is waiting out `BASE_INTERVAL`, a 60-second
-production cadence.
-
-Every mechanism on that ranked list (shard the build, share binaries across
-lanes, tune cache keys) attacks the 89s compile half. None touches the 60s,
-because the 60s is not work — it is elapsed time.
-
-**The obvious lever is a test-only override of `BASE_INTERVAL`, and it is
-refused.** `FRESH_HORIZON` must exceed `BASE_INTERVAL + FETCH_DEADLINE`, and a
-test running a one-second interval inverts that: the test would then pass under
-a timing configuration production never runs, while claiming to verify
-fail-closed behaviour that is entirely timing-dependent. A faster suite that
-proves something else is not a faster suite.
-
-Also worth the size check before optimising anything here: the relay's source
-repo went from 19–26 minutes to 8. This pipeline is already 3–4 minutes, so the
-mechanisms are sized for a problem this repo does not have.
-
-## Mutation proofs
-
-Use the fleet runner **ckdev-mutate 0.9.8** to prove and replay costly guards.
-The checked-in [`mutations.toml`](../mutations.toml) records source edits and
-the exact tests that must catch them. Catalogue crash safety, exactly-once,
-authorization/trust, wire contracts and data loss, not every ordinary logic test.
-An exactly-once claim needs a row through the production provider/scheduler path,
-not just its helper. Use `expect_message` to distinguish the intended assertion
-from a timeout, fixture failure or unrelated panic.
-
-```bash
-cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
-mkdir -p target/mutations
-ckdev-mutate check
-ckdev-mutate run --all --report target/mutations/all.json
-ckdev-mutate run --diff origin/master --report target/mutations/diff.json
-ckdev-mutate run --all --broad --report target/mutations/broad.json
-python3 scripts/mutation-report.py target/mutations/broad.json
-```
-
-Create rows from code with `ckdev-mutate prove`, never by transcribing old evidence:
-
-```bash
-ckdev-mutate prove --id my-guard --guards 'the costly property protected' \
-  --file crates/quota-core/src/example.rs --old 'live unique anchor' \
-  --new 'independent break /* NON-VACUITY BREAK */' \
-  --test-file crates/quota-core/src/example.rs --package quota-core \
-  --target=--lib --expect-red example::tests::the_guard \
-  --expect-message 'the intended assertion message' \
-  --report target/mutations/proof.json
-```
-
-`prove` appends only on a named catch; `explore --append` discovers the guarding
-tests when they are unknown. Replay a new row with `--broad` before committing.
-Narrow cross-target catches, or record a reviewed HUB with the shared property
-and the **other** stable target names. HUB is not a waiver for an unrelated red.
-UNREACHABLE needs a reason showing no production caller; EQUIVALENT needs both
-an explanation and the code fact that preserves behavior. Neither counts as a
-catch. Use `platforms` for OS-specific tests instead of quietly skipping them.
-Here, scanners are the source-walk tests and scripts that check code for forbidden
-patterns, such as outside path dependencies, cookie providers reporting auth
-failures, or direct launch-nonce environment reads. Each scanner must also run on
-a deliberately planted violation on every run, so one that stops matching anything
-fails instead of passing over apparently clean code.
-
-Deadlines stop hangs; assertions prove order and outcome, never elapsed time. The
-pinned runner's default deadlines are not measured performance budgets. Set budgets
-only from clean CI measurements, not a loaded development Mac.
-
-Read the [pinned runner README](https://github.com/cortexkit/commons/blob/0c99c7e16d8ae22b6e114136b6b7b68be6f1394e/crates/cortexkit-mutate/README.md)
-for multi-file edits, dispositions and prerequisites. Our root `prebuild`
-refreshes `ck-insula` before baselines, after mutant builds and on restoration;
-the broad module audit spawns that binary. These rows need no real-daemon test
-or sibling checkout (the daemon tests remain ignored).
-
-Run on a clean tree. ckdev-mutate refuses even staged edit targets differing from
-HEAD unless explicitly passed `--allow-dirty`; with that opt-in it restores saved
-local bytes, **not** HEAD or the index. It locks the tree, checks exact-once
-anchors and `Cargo.lock`, separates build and test deadlines, kills child process
-groups on timeout/interruption, restores bytes and refreshes mtimes. Never edit
-or check out a target mid-run. A SIGKILL/power loss cannot be recovered in-process;
-use disposable CI checkouts and inspect the tree before resuming.
-
-`scripts/probe.py` remains a legacy one-off Cargo diagnostic, not a catalogue or
-replay mechanism. ckdev-mutate now covers its safe restoration, mtime refresh and
-named-outcome classification, and adds test identity/message checking, baselines,
-platform gates and replay. The legacy tool still **stages all changes** before
-editing, accepts arbitrary Cargo test arguments (including filters/ignored tests),
-builds without a deadline and uses the old exit convention (1 means a named red,
-0 means undefended, 2 means no proof/hung). ckdev-mutate never stages anything, uses
-locked builds with a build deadline, and exits 0 when a proof succeeds. These are
-different interfaces, not missing safety features; prefer ckdev-mutate for durable
-proofs. If using the legacy tool, inspect its staging side effect and do not
-hand-roll a restore that could discard unstaged implementation.
-
-Read WHICH test reddened, not merely that something did. A mutation that reddens
-an unrelated test says the mutation was wrong, not that the guard is defended;
-one that reddens nothing may mean the mutation missed rather than that the guard
-is unguarded. Both cases are findings about the proof, not about the code.
-
-### Mutation CI
-
-`.github/workflows/mutations.yml` adds four advisory jobs named
-`Mutation replay (1/4)` through `Mutation replay (4/4)`. It does not rename or
-add required checks: branch protection remains `Test (ubuntu)` and
-`Test (windows)`. Each job has its own checkout and pinned, cached runner.
-Pull requests and `train/**` pushes replay touched rows; `master` pushes replay
-the full catalogue. Nightly and manual runs audit `--broad`. Diff selection sees
-committed edit targets, test files and changed catalogue rows, not unlisted
-helper/fixture dependencies; the nightly full audit covers that limitation.
-With `--broad`, tests outside a row's named test target can also catch its mutant.
-ckdev-mutate 0.9.8 reports `CAUGHT_BROADLY` and only warns.
-`scripts/mutation-report.py` fails the job unless the mutant was narrowed to its
-own test target or the row is marked `HUB`: a deliberately shared catch listing
-the other allowed test targets and the property all those tests assert.
-
-CI artifacts carry disposition counts and each shard's measured wall duration
-in `ci-timing.txt` and the step summary. No full-run CI duration is claimed yet:
-the first run after landing establishes it. For a sharded run report both the
-job-span wall time and the sum of shard durations; do not call a single shard
-the full catalogue's time.
+`2` is not a severity between the other two. A missing daemon, an unreadable
+handle file or an empty population is neither a finding nor a pass, and a
+checker that examined nothing exits `2` rather than reporting clean.
 
 ## Checkers, after deploying
 
-Both read the deployed module through the daemon, so they must run **after** the
-deploy rather than before:
+These read the deployed module through the daemon, so they run after a deploy:
 
-```bash
+```sh
+# every live window on the deployed module checked for internal inconsistency:
+# a reset further out than the window is long, counts that disagree with the
+# percent, a percent out of range; plus cross-entry and health-identity checks
 cargo run -p quota-module --example deployed-sanity --release
+
+# every vault credential granted to insula against what is actually served
 cargo run -p quota-module --example vault-lanes --release
+
+# every health metric with its raw value; a metric named but not published
+# reports ABSENT and exits 1
+python3 scripts/health.py [metricName ...]
 ```
 
-Exit codes across every checker and script here: `0` checked and found nothing,
-`1` checked and found something, `2` could not check — the run makes no claim
-either way. The third is the one that matters, because a `2` read as a `0` is a
-clean bill of health from an instrument that never looked.
+## Diagnostic examples
 
-## What the gate does NOT cover
+These run the real fetchers against this machine's credentials. Reads are
+cache-only, so each example warms its own registry first.
 
-Written down because `scripts/gates.sh` passing reads as "everything passed", and
-on 2026-08-26 it did not: master was red on a doctest while the gate was green,
-and the gap was found by a consumer running plain `cargo test --workspace`.
+| Command | What it answers |
+|---|---|
+| `cargo run -p quota-core --example wire-sanity` | the window rules against an in-process registry; needs no daemon, but without the vault it sees only local credentials |
+| `cargo run -p quota-core --example accuracy-dump` | the `usage.get` array as JSON |
+| `cargo run -p quota-core --example warmup-identity` | whether the health conservation identity holds through a real warm-up; exits non-zero when the warm-up was never observed |
+| `cargo run -p quota-core --example sweep-probe` | how long a full refresh sweep takes against the per-turn admission cap |
+| `cargo run -p quota-core --example completeness-envelopes` | reference `usage.get` envelopes for each account-completeness case |
+| `cargo run -p quota-core --example ollama-labels -- --cookie-file <file>` | which usage labels the live ollama settings page renders; exits non-zero on a label the parser does not read |
+| `cargo run -p quota-core --example opencode-stage -- --cookie-file <file>` | which of opencode's three server calls fails |
+| `cargo run -p quota-module --example grok-resets` | whether grok's reset endpoint answers the vault credential, with a control call first |
+| `cargo run -p quota-module --example antigravity-pool` | which Antigravity pool the vault's cloud credential reaches |
+| `cargo run -p quota-module --example unread-fields -- <claude\|codex>` | what the response fields insula does not read hold, with identity values redacted |
+| `cargo run -p quota-module --example scoped-list` | what `credential.list_scoped` returns to a standalone caller |
 
-The trap generalises past that one target. **`--all-targets` excludes doctests.**
-It reads as the widest possible flag and silently omits one target, which is why
-both the local gate and CI missed the same break.
+Cookie files are read from disk (create them with mode `600`), never from argv
+or the environment, which leak into `ps` and shell history. The examples that
+need a vault credential take a capability handle in a file, minted with
+`ck auth mint-handle --id <credential-id>`. Revoke it afterwards using only the
+`revoke with:` line `mint-handle` printed for that handle.
 
-| target | covered by | note |
-| --- | --- | --- |
-| lib + bin unit tests | gate and CI | |
-| doctests | gate and CI | added 2026-08-26; neither had it before |
-| `skeleton_e2e::` (quota-module `--test it`) | gate and CI | |
-| `real_daemon_e2e::` (quota-module `--test it`) | CI only | `#[ignore]`d, needs a live daemon |
-| `*_live::` provider tests (quota-core `--test it`) | NEITHER | `#[ignore]`d by design, hit real providers |
-| examples: compile | gate and CI | via `clippy --all-targets` |
-| examples: run | CI only | `completeness-envelopes` alone |
+## Repository checkers
 
-The two NEITHER rows are deliberate, not gaps to close: the live provider tests
-reach real upstreams and would make the gate depend on someone else's uptime.
-Run them by hand with `--ignored` when touching a provider's request shape.
-
-The rows that ARE worth watching are the CI-only ones, because a green local gate
-says nothing about them. If a change touches the daemon handshake or an example's
-behaviour, the local gate cannot tell you.
+| Command | What it checks |
+|---|---|
+| `python3 scripts/endpoint-hosts.py` | every provider endpoint constant against its recorded host; run by the gate |
+| `python3 scripts/path-dependencies.py` | no Cargo dependency points outside the repository; run by the gate |
+| `scripts/check-train-preconditions.sh` | the CI workflow still triggers on `train/**` and is not path- or ref-gated; run by the gate |
+| `scripts/check-cortexkit-layout.sh` | nothing under `.cortexkit/` is tracked except the allowed folders; run by the gate |
+| `python3 scripts/models-dev-slugs.py` | every published `apiProvider` slug still exists on models.dev; needs the network |
+| `python3 scripts/unread-credentials.py` | providers reporting no credential while a key they could read sits in OpenCode's auth store |
+| `python3 scripts/vault-id-families.py` | every vault credential id against the family table that routes it to a provider |
+| `python3 scripts/audit-checker-rules.py` | every rule in the wire checkers has a test that fails without it |
+| `python3 scripts/module_id_callers.py` | callers of this module's id across sibling repositories, before a rename |
+| `python3 scripts/witness-transient.py 1` | makes one provider fail transiently against a loopback endpoint, so stale-serving can be observed |
+| `python3 scripts/witness-gap-drop.py` | makes a quota drop happen across a gap, so `observedContinuously: false` can be observed |
+| `python3 scripts/prod_body.py <files>` | prints a Rust file with its test module removed, for source sweeps |
+| `python3 scripts/public-flip-verifier.py` | scans every blob and commit message in history for credential and identity patterns |

@@ -1,396 +1,56 @@
 # insula
 
-Reads how much quota is left on every AI provider you have an account with, and
-when each window resets.
+insula reads how much quota is left on each AI provider account a machine is
+signed in to, and when each window resets. It runs as a module under
+[subc](https://github.com/cortexkit/subconscious), the CortexKit supervisor:
+a background refresher fetches every provider's own usage report with the
+credential that already exists on the host (a vault login, a provider CLI's
+token file, an API key in the environment), normalizes each answer into rate
+windows and prepaid pools, and serves the result from memory over the subc
+`usage.get` operation, so a caller never waits on a provider's network. A
+provider that has no usable credential on the host reports that in its own
+entry; it never fails the request for the others.
 
-If you route work across several providers, the thing you need before dispatching
-is not a price list — it is whether the account you are about to use has capacity
-left, and if not, when it comes back. That answer exists behind ~37 different
-endpoints, in ~37 different shapes, behind ~37 different kinds of credential.
-This module fetches all of them, normalizes the result to one shape, and answers
-from cache so a caller never blocks on the network.
+| Crate | Role |
+|---|---|
+| `crates/quota-core` | Provider adapters, normalization, the slot store and the background refresher, behind a wire-agnostic `Registry`. |
+| `crates/quota-module` | The `ck-insula` binary: registers with the subc daemon, dials the credential vault, and answers `usage.get`, `usage.drops` and `health.check` from the registry's cache. |
 
-**It reuses the session you already have.** No new credential is issued and no
-password is asked for: it reads the OAuth token your provider CLI already wrote,
-the API key already in your environment, and credentials in the local vault --
-including web session cookies that Cerebellum captures and deposits there for
-providers that publish quota only to a logged-in page. It never reads a
-browser's cookie store itself. A provider you are not signed in to simply
-reports that, or is absent, rather than failing the request for the others.
+## Build and test
 
-It runs as a module under [subc](https://github.com/cortexkit/subconscious), a
-local supervisor that spawns it, health-checks it, and routes requests to it — so
-a consumer talks to one daemon rather than to a binary per concern.
+Needs only a Rust toolchain:
 
-Prior art worth naming: [CodexBar](https://github.com/steipete/CodexBar) solves
-the display half of this problem on macOS, and its provider fetchers are the
-reference this module's normalizers are checked against on every upstream
-release. The difference is that this one is headless, cross-platform, and
-answers over a wire rather than drawing a menu bar.
+```sh
+cargo build --release                   # quota-core and the ck-insula binary
+cargo test --workspace --lib --bins     # unit tests
+cargo test --workspace --doc            # doctests
+```
 
-**Consuming `usage.get`: read `docs/consumer-contract.md`.** It states what you can
-rely on and what you must not infer, and every rule in it was settled against a real
-consumer.
+The full local gate (formatting, clippy, unit and doc tests, and the
+repository's own checks) also needs Python 3.11 or newer with PyYAML:
 
-### Public documentation
+```sh
+scripts/gates.sh            # what a change must pass before it lands
+scripts/gates.sh --e2e      # also the in-process wire tests (skeleton_e2e)
+```
 
-Current, and kept true against the code:
+Tests that need a real provider session or a running subc daemon are
+`#[ignore]`d; [`docs/verifying.md`](docs/verifying.md) lists them with their
+commands.
+
+## Documentation
 
 | Doc | What it answers |
 |---|---|
-| `consumer-contract.md` | what `usage.get` promises a consumer, and what it does not |
-| `verifying.md` | the gate procedure, in one place so a task prompt points at it rather than restating it |
-| `provider-matrix.md` | current per-provider sources, endpoints, windows and credential families |
+| [`docs/architecture.md`](docs/architecture.md) | how the two crates fit together, from enumeration to serving |
+| [`docs/consumer-contract.md`](docs/consumer-contract.md) | what `usage.get`, `usage.drops` and the health metrics promise a consumer, and what they don't |
+| [`docs/provider-matrix.md`](docs/provider-matrix.md) | every registered provider: credential sources, endpoints, published windows |
+| [`docs/credentials.md`](docs/credentials.md) | how to make an account show up |
+| [`docs/installing.md`](docs/installing.md) | installing, upgrading and removing the module |
+| [`docs/verifying.md`](docs/verifying.md) | the gates, the ignored tests, and the checkers to run after a deploy |
+| [`docs/mutations.md`](docs/mutations.md) | the mutation catalogue in `mutations.toml` and how to prove a guard |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to make and land a change, and where code goes |
+| [`SECURITY.md`](SECURITY.md) | reporting a vulnerability, and what the module does with credentials |
+| [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) | licenses of code adapted from other projects |
 
-Design notes, producer investigations, host-specific runbooks, audits, CodexBar
-parity research and review ledgers are internal and are not published in this
-repository. The public contract and the source describe supported behaviour.
-
-**Reporting a bug that involves a provider payload:** read `SECURITY.md`
-first. A captured response often carries a live token, and this project's whole
-subject matter makes that the easy mistake to make.
-
-## What it serves
-
-A subc `ManagementSurface` exposing one query operation, `usage.get`, which returns
-`{ "result": ProviderUsage[] }`. Each entry is one provider/account's windows
-(`primary`/`secondary`/`tertiary` `RateWindow`s with `usedPercent` + `resetsAt`), or
-a silent-degraded entry carrying `error` when that provider has no usable session —
-a single provider's failure never fails the whole array.
-
-## Providers (window-bearing)
-
-38 providers are registered, each reading a rate window or credit balance from its upstream:
-
-`codex`, `claude`, `antigravity`, `codebuff`, `copilot`, `cursor`, `deepseek`,
-`doubao`, `elevenlabs`, `factory`, `grok`, `jetbrains`, `kimi`, `kimi-for-coding`,
-`clinepass`, `langdock`, `llmproxy`, `manus`, `mimo`, `minimax`, `muse`,
-`neuralwatt`, `ollama`, `opencode`, `opencodego`, `openrouter`, `qoder`,
-`qwen-cloud`, `sakana`, `stepfun`, `sub2api`, `warp`, `synthetic`, `zai`,
-`zenmux`, `kilo`, `alibaba`, `amp`.
-
-Google is covered by `antigravity` only. Google ended Gemini Code Assist for
-individual accounts, so the Gemini CLI login no longer has a quota to read.
-
-A provider may serve more than one account, so the served entry count exceeds the
-provider count.
-
-Verification (see each module's `VERIFICATION:` doc block):
-- **Live-verified** (real window proven through the wire): codex, claude, grok,
-  ollama, antigravity, muse.
-- **Hybrid**: jetbrains (file-read/parse/degrade proven on real disk; active-window
-  mapping fixture-verified).
-- **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
-  upgraded to live when a key is supplied): the rest.
-
-The full inventory, including balance-only providers, is in
-`docs/provider-matrix.md`. Historical provider-porting decisions and upstream
-parity reviews are internal.
-
-## Build
-
-```sh
-cargo build --release            # builds quota-core + the ck-insula binary
-cargo test -p quota-core         # provider normalizers (unit)
-cargo test -p quota-module       # in-process wire e2e (skeleton_e2e)
-```
-
-Live and real-daemon proofs are `#[ignore]` (need real sessions / a built
-`ck-subc`):
-
-```sh
-# real provider windows through the wire (needs the provider's real session):
-cargo test -p quota-core --test it   -- --ignored --nocapture grok_live::
-cargo test -p quota-module --test it -- --ignored --nocapture skeleton_e2e::
-
-# real-daemon supervision: a standalone ck-subc daemon spawns the module from
-# subc.jsonc and routes usage.get (builds ck-subc in ../subconscious):
-cargo test -p quota-module --test it -- --ignored --nocapture real_daemon_e2e::
-```
-
-Two examples run the real fetchers against this machine's credentials — they
-warm the cache themselves, since reads are cache-only and a cold registry serves
-nothing:
-
-```sh
-# ask whether every credential this host is configured for is actually being
-# served. Every other check here measures internal agreement -- and a set that
-# shrinks stays consistent, so a credential lane can go dark with all of them
-# green, which has happened. Reports how many lanes it checked, since providers
-# with a second non-vault lane cannot be covered this way:
-cargo run -p quota-module --example vault-lanes
-
-# check every live window on the DEPLOYED module for internal inconsistency (a
-# reset further out than the window is long, counts that disagree with the
-# percent, a percent out of range), plus cross-entry and health-identity checks.
-# It reads the running module through the daemon, so it sees vault-served
-# accounts. Exits non-zero on a finding, and when it examined nothing:
-cargo run -p quota-module --example deployed-sanity
-
-# the same window rules against a registry built in-process. Needs no running
-# daemon, so it is what to use while changing a normalizer -- but it has no
-# vault client, so vault-served providers fall back to local credentials or do
-# not report at all. It examined 12 windows here where the deployed checker saw
-# 29, and the difference is entirely accounts it cannot reach:
-cargo run -p quota-core --example wire-sanity
-
-# dump the live usage.get array as JSON, for eyeballing or diffing:
-cargo run -p quota-core --example accuracy-dump
-
-# check the health conservation identity across a real warm-up, when every
-# provider is changing bucket at once. Exits non-zero on an imbalance, and also
-# when the warm-up state never occurred and so was not observed:
-cargo run -p quota-core --example warmup-identity
-
-# measure how long a full refresh sweep takes, and how much headroom the
-# per-turn admission cap leaves before the refresh interval degrades. Run it
-# when the provider set grows:
-cargo run -p quota-core --example sweep-probe
-
-# print reference usage.get envelopes for the completeness cases, for a consumer
-# pinning its account reconciliation against real producer output:
-cargo run -p quota-core --example completeness-envelopes
-
-# ask the live ollama settings page WHICH usage labels it renders. This provider
-# is an HTML scrape, so its parser names the page's own strings, and a label that
-# changes is silent in the dangerous direction: the block is skipped, no window
-# is published, and absent capacity pressure reads downstream as headroom. Run it
-# on any upstream parity round that touches ollama, rather than re-deriving
-# whether the page moved. Exits non-zero when the page carries a label this
-# module does not parse, and refuses when there is no cookie or the page is too
-# small to be the settings page. The signed-in ollama.com `Cookie:` header is
-# read from a file (mode 600), never from argv or the environment, which leak
-# into `ps` and shell history:
-cargo run -p quota-core --example ollama-labels -- --cookie-file /tmp/ollama.cookie
-
-# run opencode's server-function calls one at a time, when its published error
-# says only that something returned 500. The provider makes three calls and any
-# of them can fail that way, so the entry alone cannot say which -- this reports
-# each stage separately and asks the billing function whether it answers on the
-# same cookie. The opencode.ai `Cookie:` header comes from a file, as above:
-cargo run -p quota-core --example opencode-stage -- --cookie-file /tmp/opencode.cookie
-
-# ask grok's GetRemainingResets endpoint whether it answers our bearer, using the
-# VAULT credential the provider actually serves from rather than whatever token a
-# shell can reach. Runs a control against the endpoint we already serve first, so
-# an empty answer from the subject cannot be confused with a dead credential --
-# the earlier hand probe measured an expired local token and concluded nothing.
-# Reports the grpc-web framing separately from the message, because a successful
-# empty reply is still 25 bytes and a byte count is not a data count. Needs the
-# daemon running, since it dials it for the credential:
-cargo run -p quota-module --example grok-resets
-
-# which Antigravity pool the vault's cloud credential reaches: sends insula's
-# request and the opencode plugin's request with the same vault token and prints
-# each bucket's remaining fraction and reset, to compare against the editor's own
-# figures. Takes a temporary capability handle from a file; mint it with
-# `ck auth mint-handle --id antigravity:google` and revoke it afterwards:
-INSULA_PROBE_CAPABILITY_FILE=/path/to/handle cargo run -p quota-module --example antigravity-pool
-# see what the usage-response fields insula does not read actually hold, for
-# claude or codex. The unread-key log names such fields but never prints values;
-# this prints the fields under study, plus anything shaped like a usage window,
-# with identity values redacted, and every other key as a shape only. It needs a
-# capability handle for one credential in a file, because a standalone binary is
-# a direct vault principal. Revoke the handle afterwards, using ONLY the
-# `revoke with:` line mint-handle prints for it: the lines under it name OTHER
-# consumers' live handles.
-umask 077; ck auth mint-handle --id oauth:anthropic > /tmp/h 2> /tmp/h.err
-QUOTA_PROBE_HANDLE_FILE=/tmp/h cargo run -p quota-module --example unread-fields -- claude
-
-# exercise `credential.list_scoped`, the read half of retiring the hand-edited
-# vault handle map. RUN AS-IS IT REFUSES, AND THAT IS INFORMATIVE: scoped ops are
-# authorised by the caller's bus principal, and a standalone example is a Direct
-# caller rather than the supervised module. A control op over the same connection
-# separates that from "the vault has nothing for us", so the refusal cannot be
-# misfiled as a defect. Needs the daemon running:
-cargo run -p quota-module --example scoped-list
-
-# build, place and verify the supervised module, REFUSING when what is on disk is
-# not what is on master. Two guards, because they catch different divergences: a
-# dirty tree (uncommitted work the build would include) and a non-master branch
-# (committed work a clean tree cannot reveal). Both refuse rather than warn --
-# this exists because a hand-typed deploy once staged a binary containing stashed
-# work while its author narrated "built from HEAD". Override with
-# CK_DEPLOY_ALLOW_DIRTY=1, loudly:
-./scripts/deploy.sh
-```
-
-### Repository sweeps
-
-Every checker here — the two Rust ones and the Python tools — uses three exit
-codes, and the third is the one that matters:
-
-| code | meaning |
-| --- | --- |
-| 0 | checked, found nothing |
-| 1 | checked, found something — the findings are the output |
-| 2 | **could not check** — the run makes no claim either way |
-
-The 2 is not a severity level between the other two. It is the difference
-between "I looked and it was fine" and "I could not look", and collapsing it
-into either neighbour is how a checker starts lying: reported as 0 it claims a
-clean bill it never earned, and reported as 1 it becomes a failure someone
-retries until it passes. A missing daemon, an unreadable handle file, an empty
-population — none of those are findings, and none of them are passes.
-
-Python tools under `scripts/`, for questions the Rust checkers cannot answer
-because they are about the source, the host, or the fleet rather than the wire.
-Each exits non-zero on a finding and refuses to report a clean result when it
-examined nothing — a sweep that finds nothing because it looked at nothing is
-indistinguishable from a real pass, and that failure is silent.
-
-```sh
-# every provider endpoint against the host it is supposed to reach. Each one
-# receives a credential, and the OAuth token endpoints receive a live refresh
-# token in the request body -- so a host that drifts does not fail, it receives
-# a working credential:
-python3 scripts/endpoint-hosts.py
-`scripts/parity-citations.py` — reports provider source citations whose upstream CodexBar file no longer exists at the anchored parity tag. A parity-round instrument, not a gate: the ports stay correct, but their provenance stops being followable.
-
-# every `apiProvider` slug we publish, checked against models.dev. Consumers
-# join usage to pricing and routing on it, and models.dev renames providers; a
-# retired slug joins to nothing and fails silently. Needs the network:
-python3 scripts/models-dev-slugs.py
-
-# providers reporting an absent credential while a key they could read sits in
-# the shared opencode auth store. That combination reads to an operator as
-# "never configured", so nobody investigates it:
-python3 scripts/unread-credentials.py
-
-# every credential the vault holds against the prefix table that routes it to a
-# provider. Both lists are internally coherent, so only the JOIN can be wrong --
-# and a broken join is silent: the credential is present, granted, and unrouted:
-python3 scripts/vault-id-families.py
-
-# read the production half of a Rust file, with the test module cut off. Any
-# sweep asking "does every provider do X" needs this, or assertions inside
-# run every gate in the order that makes them mean something:
-scripts/gates.sh
-
-# tests count as production code:
-python3 scripts/prod_body.py crates/quota-core/src/*.rs
-
-# Prove and replay costly guards with the fleet mutation catalogue. Create new
-# rows with ckdev-mutate prove or explore --append, not from old evidence. See
-# docs/verifying.md for exact test names, messages, HUB review and safe restore.
-cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
-mkdir -p target/mutations
-ckdev-mutate check
-ckdev-mutate run --all --report target/mutations/all.json
-ckdev-mutate run --diff origin/master --report target/mutations/diff.json
-ckdev-mutate run --all --broad --report target/mutations/broad.json
-python3 scripts/mutation-report.py target/mutations/broad.json
-
-# Legacy one-off diagnostic with arbitrary Cargo filters/ignored-test arguments.
-# It stages ALL changes first and uses 1 for a named red (ckdev-mutate uses 0 for a
-# successful proof). It does not record replayable rows; prefer ckdev-mutate above:
-python3 scripts/probe.py <file> <before> <after>
-
-# print every published health metric with its raw value. A metric asked for by
-# name that is not published reports ABSENT and exits 1, rather than defaulting
-# to zero -- which is how a hand-written probe once reported a restart that had
-# not happened:
-python3 scripts/health.py [metricName ...]
-
-# drive daemon control-plane requests at a fixed cadence, one fresh CLI process
-# each, and time every one. Built for the subc-core control-plane starvation hunt:
-# a distribution with one 30s outlier and a uniformly slow one have the same mean
-# and different causes, so it reports every sample rather than an aggregate:
-python3 scripts/channel0-cadence.py <baseline|drain|drain-with-in-flight> [samples]
-
-# make a provider fail transiently against a loopback endpoint, so
-# preserve-the-window behaviour can be witnessed on the wire rather than
-# waited for. A field that only appears during a failure cannot be verified
-# on a healthy host: absent is what correct and never-populated both look like:
-python3 scripts/witness-transient.py 1
-
-# make a quota drop happen ACROSS A GAP, so `observedContinuously: false` can be
-# witnessed rather than waited for. Thirteen recorded drops across two hosts have
-# all read true, and a field that has only ever taken one value is
-# indistinguishable from one that is stuck. Reads the continuity horizon from
-# source, and refuses if either constant was renamed:
-python3 scripts/witness-gap-drop.py
-
-# check that every rule in the wire checkers has a test that fails when the
-# rule is deleted, and a control that does not fire when it should not:
-python3 scripts/audit-checker-rules.py
-
-# find every caller of this module's id across the fleet, so a rename can be
-# sequenced rather than discovered:
-python3 scripts/module_id_callers.py
-
-# measure this process's real disk reads and writes, with a control write to
-# prove the counter moves before reporting anything:
-python3 scripts/measure-disk-io.py
-
-# report when macOS Gatekeeper's scan list has filled with dead Rust build
-# artifacts. syspolicyd re-walks target/debug/deps looking for binaries cargo
-# already deleted -- measured here at 13k directory syscalls a second. The
-# database survives OS upgrades, which is why reinstalling does not clear it.
-# Exit 1 means maintenance is indicated; clearing needs Recovery, because SIP
-# protects the file while booted.
-#
-# A CONTRIBUTOR, NOT THE CAUSE: clearing this dropped syspolicyd to idle and the
-# whole-machine lockups recurred within the hour. The dominant cost is the FIRST
-# exec of any freshly written binary (~300ms + 5ms/MB, against ~4ms to re-exec
-# the same bytes), serialised through one validator -- so a gate that rebuilds
-# and warm-executes ~100 test binaries queues the whole host for ~90 seconds. See
-# the capture script below:
-python3 scripts/gatekeeper-scanlist.py
-
-# whole-history exposure audit: scans every blob on disk (reachable or not) and
-# every commit message against narrow credential/identity classes. Proved in both
-# directions before its verdict is trusted -- synthetic positives must fire,
-# example/test/loopback specimens must stay silent. Exit 1 means hits to read:
-python3 scripts/public-flip-verifier.py
-
-# restart syspolicyd when it wedges, so recovery does not require a terminal --
-# which is exactly what a wedge prevents you from opening. Errs toward NOT
-# killing: high threshold, 120s sustain, startup grace, hard rate limit. See the
-# plist header for install and removal:
-sudo /usr/bin/python3 scripts/syspolicyd-watchdog.py   # foreground, to watch it
-
-# capture what syspolicyd is doing WHEN it wedges, instead of diagnosing the
-# wreckage afterwards. Arms at negligible cost and only records once the CPU
-# signature appears; writes the trigger record BEFORE spawning anything, because
-# during a wedge the follow-up commands may block too:
-sudo /usr/bin/python3 scripts/syspolicyd-capture.py
-
-```
-
-## Install as a supervised subc module
-
-On every platform, install and upgrade insula with `ck setup` and `ck upgrade`.
-They place the release binary (`ck-insula`, or `ck-insula.exe` on Windows),
-register it with the daemon and replace a running build safely. Use them rather
-than copying a binary by hand: on Windows a running executable can't be
-replaced in place, and the daemon's config lives in a platform-specific folder.
-
-The rest of this section is the manual route for development on macOS and
-Linux. The subc daemon binary (`ck-subc`) spawns and supervises the modules
-listed in its config, `$XDG_CONFIG_HOME/cortexkit/subc.jsonc` (by default
-`~/.config/cortexkit/subc.jsonc`). Add an entry whose `program` points at the
-built binary; see `examples/subc.jsonc`:
-
-```jsonc
-{
-  "version": 1,
-  "modules": {
-    "insula": {
-      "program": "/abs/path/to/target/release/ck-insula"
-    }
-  }
-}
-```
-
-For a development install, replace the binary by rename rather than overwriting
-an executable inode, then use `ck module restart insula`, not a bare `kill`.
-Confirm the new process's `health.metrics.buildCommit` with `ck module status
-insula --json`. Host-specific deployment runbooks and incident histories are
-internal, not public installation instructions.
-
-`args`/`env`/`enabled` are optional. The daemon appends `--subc <connection-file>`
-and injects `SUBC_MODULE_ID` itself — do **not** put those in `args`/`env`. On its
-next start the daemon spawns the module, which HELLO-registers its ManagementSurface;
-a consumer then reaches it via `catalog.list` → `route.open` → `usage.get`.
+insula is MIT licensed; see [`LICENSE`](LICENSE).

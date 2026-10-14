@@ -9504,15 +9504,20 @@ async fn the_idle_sleep_is_capped_so_discovery_keeps_running() {
 ///
 /// **Scope: markdown targets only, and widening it needs care.** These documents
 /// deliberately name paths that are not in this repository and never will be —
-/// a user's `~/.codex/auth.json`, a reference implementation under `~/Work/OSS`,
-/// the deployed binary's install location. Those are subjects under discussion,
+/// a user's `~/.codex/auth.json`, a provider tool's state file, the deployed
+/// binary's install location. Those are subjects under discussion,
 /// not links a reader follows, and a checker extended to all path-shaped tokens
 /// would report every one as broken. The failures would look like findings and
 /// the natural repair would be to delete the most useful sentences in the docs.
 #[test]
 fn every_doc_reference_between_documents_resolves() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut sources: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    let index = root.join("README.md");
+    let mut sources: Vec<std::path::PathBuf> = vec![
+        index.clone(),
+        root.join("CONTRIBUTING.md"),
+        root.join("SECURITY.md"),
+    ];
     for entry in std::fs::read_dir(root.join("docs")).expect("docs/ must be readable") {
         let path = entry.expect("a readable dir entry").path();
         if path.extension().is_some_and(|ext| ext == "md") {
@@ -9544,7 +9549,19 @@ fn every_doc_reference_between_documents_resolves() {
         .filter(|line| line.ends_with(".md"))
         .collect();
 
-    const PUBLIC_DOCS: [&str; 3] = ["consumer-contract.md", "provider-matrix.md", "verifying.md"];
+    // The public documents are the tracked files directly under docs/, read
+    // from git rather than listed here, so a new document is held to the index
+    // rule below without anyone remembering to add it to this test.
+    let public_docs: std::collections::BTreeSet<String> = tracked_docs
+        .iter()
+        .filter_map(|path| path.strip_prefix("docs/"))
+        .filter(|name| !name.contains('/'))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        public_docs.contains("consumer-contract.md") && public_docs.contains("provider-matrix.md"),
+        "the tracked docs/ set lost a document other modules read by path: {public_docs:?}"
+    );
     let mut referenced_public_docs = std::collections::BTreeSet::new();
     let mut missing: Vec<String> = Vec::new();
     for source in &sources {
@@ -9558,7 +9575,7 @@ fn every_doc_reference_between_documents_resolves() {
                 continue;
             }
             let bare = token.strip_prefix("docs/").unwrap_or(token);
-            if PUBLIC_DOCS.contains(&bare) {
+            if *source == index && public_docs.contains(bare) {
                 referenced_public_docs.insert(bare.to_string());
             }
             // Three spellings are all legitimate here: a sibling reference from
@@ -9610,12 +9627,10 @@ fn every_doc_reference_between_documents_resolves() {
         missing.is_empty(),
         "documents point at files that do not exist: {missing:?}"
     );
-    // The public doc set has three files. Witness each one explicitly rather
-    // than pinning a link count that grows with private design/review notes.
+    // The README is the index: every public document must be reachable from it.
     assert_eq!(
-        referenced_public_docs,
-        PUBLIC_DOCS.into_iter().map(str::to_string).collect(),
-        "the public documentation index must reference every public document"
+        referenced_public_docs, public_docs,
+        "the README documentation index must reference every document in docs/"
     );
 }
 
