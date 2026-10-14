@@ -1,4 +1,4 @@
-# Provider matrix — current inventory
+# Provider matrix
 
 38 providers registered.
 
@@ -6,7 +6,8 @@ This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
 Endpoints and signals below describe the current implementation; they do not
 promise that every account has a quota product or that every lane is available
-on every operating system. The public wire semantics are in `consumer-contract.md`.
+on every operating system. The public wire semantics are in
+[`consumer-contract.md`](consumer-contract.md).
 
 ## Reading the inventory
 
@@ -14,7 +15,8 @@ on every operating system. The public wire semantics are in `consumer-contract.m
   `crates/quota-core/src/vault_handles.rs`; an account suffix may follow the prefix.
   Families marked enrichment do not enumerate an independent usage lane.
 - A deposited cookie is a request `Cookie:` header captured by Cerebellum, not a
-  browser store read by insula. The capture URL table is in `consumer-contract.md`.
+  browser store read by insula. The capture URL table is in
+  [`consumer-contract.md`](consumer-contract.md#depositing-a-session-cookie-which-url-to-capture-against).
 - Periods name supported windows, not guaranteed response fields. Provider-reported
   durations and resets can vary; absent metadata stays absent. Balances are separate
   `spend` pools, never invented rate windows.
@@ -22,8 +24,9 @@ on every operating system. The public wire semantics are in `consumer-contract.m
   hyphens with underscores. `claude` uses `anthropic.rs`; its cookie enrichment
   is in `claude_subscription.rs`. Code and public contract take precedence over
   this inventory if an endpoint changes.
-- Design decisions, incident investigations, CodexBar parity rounds and historical
-  reviews are internal and are not linked from this public inventory.
+- How to make an account appear through each lane is in
+  [`credentials.md`](credentials.md); how the module reaches these endpoints is
+  in [`architecture.md`](architecture.md).
 
 ## OAuth, local-session and vault-token providers
 

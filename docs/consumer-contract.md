@@ -1,352 +1,368 @@
 # The `usage.get` consumer contract
 
-What a consumer of this module can rely on, what it must not infer, and where
-each answer comes from in the source. Every rule here was settled by checking a
-real consumer against the code from both ends, and four of them exist because
-doing that found a defect.
+What a consumer of this module can rely on, what it must not infer, and the test
+that holds each rule in place. It covers the `usage.get` envelope, the
+`usage.drops` operation and the `health.check` metrics.
 
-**This document OWNS the wire.** Field meanings, error classes, freshness and
-staleness semantics, and what a consumer may infer are settled here; where any
-other document in this repository states one of those facts differently, THIS ONE
-WINS and the other is the defect. Written down because two documents disagreeing
-have no oracle between them — code settles a document, but nothing settles a
-document against another document unless precedence is declared. This repo has hit
-that three times, and every one was resolved by hand after the fact.
-
-Producer design notes and host-specific deployment runbooks are internal, not
-part of this public contract. For the public verification procedure, see
+**This document owns the wire.** Field meanings, error classes, freshness and
+staleness semantics, and what a consumer may infer are settled here. Where any
+other document in this repository states one of those facts differently, this
+one wins and the other is wrong. How the module produces these answers is in
+[`architecture.md`](architecture.md); the provider inventory is in
+[`provider-matrix.md`](provider-matrix.md); the gate procedure is in
 `verifying.md`.
 
-## The core rule
+Each section ends with **Proven by**: the tests that fail if the rule stops
+holding, named by function. Registry-wide tests are in
+`crates/quota-core/src/tests.rs`, a provider's parsing tests are in that
+provider's module, scheduling and drop tests are in `refresh.rs`, `store.rs`
+and `quota_drop.rs`, and tests marked `main.rs` are in
+`crates/quota-module/src/main.rs`. `cargo test -p <crate> <name>` runs one.
 
-**A well-formed response is always a successful poll.** Per-provider failure is
-in-band by design: a single provider's failure never fails the array. So *did
+## Contents
+
+1. [Scope and the kinds of silence](#1-scope-and-the-kinds-of-silence)
+2. [The core rule](#the-core-rule)
+3. [Response shapes](#the-six-response-shapes)
+4. [Freshness](#freshness-comes-from-the-producer-never-from-the-poll)
+5. [Error classes](#degraded-means-we-cannot-read-it-not-the-provider-is-down)
+6. [Windows](#the-window-slots-are-positions-not-a-ranking)
+7. [Spend pools](#spend-is-money-and-it-fails-in-the-opposite-direction-from-a-window)
+8. [Account fields and keys](#fields-on-the-account-not-the-window)
+9. [Accounts and completeness](#an-absent-account-is-never-a-statement-that-the-account-is-gone)
+10. [`usage.drops`](#usagedrops--recently-observed-decreases)
+11. [Health](#health-is-a-separate-axis)
+12. [Observed provider behaviour](#measured-behaviour-is-recorded-here-not-stamped-on-the-wire)
+
+## 1. Scope and the kinds of silence
+
+<a id="three-kinds-of-quiet"></a>
+<a id="why-this-file-exists"></a>
+
+A producer and a consumer can each be locally correct and still disagree about
+what a response means, because the meaning lives at the boundary. The rules
+live here so a change on either side is reviewed against the same text.
+
+Where this document is silent, the silence has a category:
+
+| Category | Meaning |
+|---|---|
+| specified | guaranteed behaviour, stated in a section below |
+| deliberately unspecified | a non-guarantee you should rely on: for example, `fetchedAt` values in one response do not share an instant, so build nothing on cross-entry alignment |
+| undocumented | unstable ground, such as the prose of an `error` string; nothing marks it, so relying on it is unsafe |
+
+A field changes category only by an explicit change to this document, never by
+being observed on the wire. A consumer's reasonable inference from an
+underspecified field is not a guarantee.
+
+**Decode permissively.** This producer adds envelope fields, entry fields,
+error classes, `source` values, `funding` and `basis` values and window kinds
+without notice. A decoder that rejects unknown fields
+(`serde(deny_unknown_fields)` and equivalents) or unknown enum values turns
+each addition into an outage on the consumer side.
+
+<a id="the-core-rule"></a>
+
+## 2. The core rule
+
+**A well-formed response is always a successful poll.** One provider's failure
+never fails the array: each failure is in-band, in that provider's entry. *Did
 the poll succeed* and *is this data fresh* are different questions with
-different sources, and conflating them is the mistake every consumer audited so
-far had made in some form.
+different sources.
 
-Response assembly is `crates/quota-module/src/main.rs`, array construction is
-`Registry::get_usage` in `crates/quota-core/src/lib.rs`, and the entry type
+Response assembly is in `crates/quota-module/src/main.rs`, the array is built by
+`Registry::usage_snapshot` in `crates/quota-core/src/lib.rs`, and the entry type
 comes from the published `cortexkit-provider-usage` crate.
 
-## The six response shapes
+**Proven by:** `panicking_provider_is_contained_and_other_provider_resolves`,
+`cancellation_contains_a_provider_future_drop_panic`.
 
-| shape | meaning | consumer action |
+<a id="the-six-response-shapes"></a>
+
+## 3. Response shapes
+
+| Shape | Meaning | Consumer action |
 |---|---|---|
-| entries, some usable | normal, including mid-sweep | use them; never infer from the count |
-| entries, all degraded | reached every credential path, none usable | price as known-bad, not as no-signal |
-| empty array | no capacity information at all | see below — this is *not* "nothing configured" |
+| entries, some usable | normal, including mid-sweep | use them; never infer anything from the count |
+| entries, all degraded | every credential path was reached and none is usable | price as known-bad, not as no signal |
+| empty array | no capacity information at all | see [3.3](#an-empty-array-is-not-nothing-configured); this is not "nothing configured" |
 | malformed body | not producible on the success path | transport corruption; report it |
 | error frame | this module answered and refused | retry per your own policy |
-| no answer at all | the daemon refused before reaching this module | see below — carries **no** information about capacity |
+| no answer at all | the daemon refused before reaching this module | see [3.2](#a-refused-call-is-not-a-poll-at-all); carries no information about capacity |
 
-Results publish incrementally as each provider completes, so a partial array is
-normal rather than a symptom. A provider missing from one poll and present in
-the next has not necessarily changed state — it may simply have finished.
-**Nothing in the array is a delta.**
+Results publish as each provider completes, so a partial array is normal. A
+provider missing from one poll and present in the next has not necessarily
+changed state; it may simply have finished. **Nothing in the array is a
+delta.**
 
-### A partial array can look settled for seconds
+<a id="a-partial-array-can-look-settled-for-seconds"></a>
 
-The array does not fill smoothly. Providers whose credential is simply absent
-fail in microseconds, so they arrive almost immediately; the ones that reach a
-network settle much later. Sampling a real start every 5ms, the array reached 31
-of 35 entries and **stayed there, unchanged, for about six seconds** before the
-last four arrived.
+### 3.1 A partial array can look settled for seconds
 
-Two polls seconds apart therefore return identical results while the sweep is
-still running, and a consumer treating stability as completeness would take that
-for a finished answer. The four stragglers were the providers holding live
-credentials — the slowest to arrive are the ones doing real network work, which
-is exactly the data worth waiting for.
+The array does not fill smoothly. Providers with no credential fail in
+microseconds and arrive at once; providers doing network work arrive seconds
+later, and the array can stay unchanged between the two. Two identical polls
+seconds apart do not mean the sweep has finished.
 
-`pending` is the signal that resolves it: it held at 4 for the whole plateau and
-dropped to 0 as the last entries landed. Read it before concluding an array is
-complete, and never infer completeness from the count being stable across polls.
+The `pending` health metric answers it: it counts providers whose first fetch
+has not completed, and reaches 0 when the last one lands. Never infer
+completeness from a count that is stable across polls.
 
-## A refused call is not a poll at all
+<a id="a-refused-call-is-not-a-poll-at-all"></a>
 
-A call can fail before this module sees it. If the daemon has no module
-registered under the id being dialled, `route.open` fails with `unknown_module`
-and nothing is ever delivered here.
+### 3.2 A refused call is not a poll at all
 
-This is a third thing, distinct from both entries and error frames, and the
-distinction is load-bearing:
+If the daemon has no module registered under the id being dialled,
+`route.open` fails with `unknown_module` and nothing reaches this module. That
+is distinct from both entries and error frames:
 
-- a **degraded entry** is a verdict — this module reached a credential path and
-  concluded it was unusable,
-- an **absent entry** is unfinished — the sweep has not got there yet,
-- a **refused call** is neither. No verdict was reached and no work is pending,
-  because the request did not arrive. Nothing appears in this module's wire
-  output, its health metrics, or its logs, and `health.check` reads perfectly
-  normal throughout: the module is running and serving, just under a name the
-  caller is not using.
+- a **degraded entry** is a verdict: this module reached a credential path and
+  concluded it was unusable;
+- an **absent entry** is unfinished: the sweep has not got there yet;
+- a **refused call** is neither. No verdict was reached and no work is pending.
+  Nothing appears in this module's output, metrics or logs, and its
+  `health.check` reads normal.
 
-**It carries no information about capacity.** Retain what you last knew and
-retry; do not age, degrade, or prune anything on the strength of it. In
-particular it authorises nothing about account sets — `completeProviders` cannot
-arrive on a call that was refused, so a consumer that prunes accounts absent from
-a response must not run that path here. Handle it at transport level, before any
-body-shaped interpretation.
+**A refused call carries no information about capacity.** Retain what you last
+knew and retry; do not age, degrade or prune anything because of it. It
+authorises nothing about account sets: `completeProviders` cannot arrive on a
+refused call. Handle it at transport level, before any body is interpreted.
 
-The realistic cause is a name that changed on one side only — a module rename
-lands in the daemon while a consumer's target constant still says the old id.
-That window is short and self-inflicted, but during it the producer looks healthy
-from every angle and the consumer sees a feed that has silently stopped
-answering.
+The usual cause is a module id changed on one side only.
 
-### Render it differently from an empty result
+<a id="render-it-differently-from-an-empty-result"></a>
 
-On a typical host most providers are unconfigured, so a UI that hides providers
-without credentials is doing the right thing — and that is exactly what makes
-this dangerous. **Hiding an empty result and hiding a dead route produce the same
-observable**, so a display with no rows is indistinguishable from a display that
-cannot reach this module at all. Nothing else reports it: the module is healthy,
-its logs are quiet, and the failure lives entirely in the caller's constant.
+#### Render it differently from an empty result
 
-So a refused call needs its own rendering — "limits unavailable" rather than
-nothing. This is the one failure of the six where **silence is the default
-presentation and also the wrong one.**
+A UI that hides providers without credentials is right to, and that is what
+makes a refused call dangerous: a display with no rows looks the same whether
+there is nothing to show or the route is dead. Render a refused call as its own
+state ("limits unavailable"), never as an empty list.
 
-### The module id is the contract, and `insula` is the durable one
+<a id="the-module-id-is-the-contract-and-insula-is-the-durable-one"></a>
 
-The subc module id is `insula`. It was `ai-provider-quota` until 2026-08-08; the
-repository, the binary and the module id are now all the same word, which is the
-end state rather than a step toward another.
+#### The module id is the contract
 
-There is no capability-based resolution to prefer instead. The daemon's
-`catalog.list` does return each module's declared roles, so a consumer *could*
-select the module providing a `ManagementSurface` with a `usage.get` operation
-— but that describes a shape, not an identity, and it silently picks the wrong
-module the day a second one declares the same operation. Pin the id, and treat a
-failure to open the route as the visible, distinct condition described above.
+The subc module id is `insula`. Pin it. Do not resolve the module by
+capability (the `ManagementSurface` with a `usage.get` operation in
+`catalog.list`): that describes a shape, not an identity, and selects the wrong
+module as soon as a second one declares the same operation. Treat a failure to
+open the route as the distinct condition above.
 
-## An empty array is not "nothing configured"
+<a id="an-empty-array-is-not-nothing-configured"></a>
 
-Degraded entries *are* entries, so a host with zero usable credentials returns a
-**full array of degraded entries**. An empty array therefore means one of three
-much narrower things:
+### 3.3 An empty array is not "nothing configured"
 
-- **cold** — the refresher has not published a first result yet, so slots exist
-  but hold no entry. On an unfiltered query this is briefer than it sounds:
-  measured on a real start, the array was empty for **8 milliseconds** before the
-  first credential-absent providers landed. Treat it as a real state to handle,
-  not one to design around,
-- **structural** — providers resolved no credential handles at all, so there are
-  no slots, or
-- **withheld** — entries exist but every one is suppressed because its account
-  identity is unconfirmed. This is deliberate: serving usage under an identity
-  that may have changed is the one error this module refuses to risk, so it
-  emits nothing until the next fetch settles it.
+Degraded entries are entries, so a host with no usable credential returns a
+full array of degraded entries. An empty array means one of three narrower
+states:
 
-The third resolves on its own within a refresh cycle and is not a fault.
+| State | Meaning | Resolves |
+|---|---|---|
+| cold | the refresher has not published a first result; slots exist but hold no entry | within the first turns after a start |
+| structural | providers resolved no credential handles, so there are no slots | when a credential appears |
+| withheld | entries exist but each is suppressed because its account identity is unverified | within a refresh cycle |
 
-Which causes are plausible depends on the request. An **unfiltered** query goes
-empty only if *every* provider is simultaneously cold, handle-less, or withheld
-— so in practice that means cold or structural. A query **filtered to one
-provider** goes empty whenever that single provider is in any of the three
-states, and withheld is entirely ordinary there. Do not carry an inference from
-one shape of request to the other.
+Withheld is deliberate: serving usage under an identity that may have changed
+is the one error this module refuses to risk.
 
-Distinguish cold from structural using the health check's metrics —
-`withoutHandles` names providers that resolved no handle, `pending` counts those
-whose first fetch has not completed, and `lastTickAgeSecs` says whether the
-refresher has ticked at all. Never infer the difference from the array itself,
-and do not flip a staleness flag on elapsed time: a duration-based guess is the
-weakest available signal for a question that has a precise answer one call away.
+Which states are plausible depends on the request. An **unfiltered** query is
+empty only if every provider is cold, handle-less or withheld at once, which in
+practice means cold or structural. A query **filtered to one provider** is
+empty whenever that provider is in any of the three, and withheld is ordinary
+there.
 
-Note that cold is not the same as "before the first tick". The refresher admits
-a bounded number of fetch units per turn, so a provider can still be cold after
-several ticks have happened — `lastTickAgeSecs` being non-null says the refresher
-is alive, not that every provider has been tried. `pending` is the count that
-answers the per-provider question.
+Tell cold from structural with the health metrics, never from the array:
+`withoutHandles` names providers that resolved no handle, `pending` counts
+those whose first fetch has not completed, and `lastTickAgeSecs` says whether
+the refresher has ticked at all. Cold is not "before the first tick": the
+refresher admits a bounded number of fetches per turn, so a provider can stay
+cold for several turns. Do not decide this on elapsed time.
 
-The failure this prevents is specific. A renderer that treats zero rows as
-all-quiet shows its calmest possible screen in the one case where something is
-genuinely broken.
+**Proven by:** `no_provider_is_complete_before_the_first_turn`,
+`a_usage_bearing_entry_is_withheld_while_identity_is_unverified`,
+`a_labeled_entry_is_withheld_while_its_identity_is_in_flux`,
+`cancelled_tick_leaves_slots_pending_without_hanging`.
 
-## Freshness comes from the producer, never from the poll
+<a id="freshness-comes-from-the-producer-never-from-the-poll"></a>
 
-Each entry carries its own `fetchedAt`: the wall-clock time at which the served
-reading was **obtained from its source**, unchanged by failed attempts. Anchor
-per-entry freshness on it.
+## 4. Freshness
 
-Usually that is the moment this module fetched. It is not always: where a
-provider's real figure lives in a source this module does not poll, `fetchedAt`
-is when **that** source produced the value. For `antigravity`, the cache-only
-plugin lane reads the non-secret sidebar v2 state file; a matching live local
-editor still wins. The full-file override `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE`
-takes precedence over `$XDG_STATE_HOME/cortexkit/antigravity-auth/sidebar-state.json`,
-then `~/.local/state/cortexkit/antigravity-auth/sidebar-state.json`. Only genuine
-non-empty emails identify accounts, never positional ids or display labels.
-The lane does not read the plugin account store or exchange its refresh tokens.
-See [sizing a staleness threshold](#sizing-a-staleness-threshold) has the bound and
-the reasoning. The field dates the READING, not the request.
+### 4.1 `fetchedAt` dates the reading
 
-Do not stamp poll time. On a transient failure this module keeps serving the
-last healthy window, so an entry can legitimately be much older than the
-response containing it. Stamping poll time does not merely under-report that
-staleness, it **actively resets** it, and the reset is driven by the consumer's
-poll cadence rather than the producer's failure duration. Polling more often
-makes it strictly worse.
+Each entry carries `fetchedAt`: the wall-clock time at which the served reading
+was **obtained from its source**. Failed attempts do not change it. Anchor
+per-entry freshness on it, never on your poll time.
 
-**There is no upper bound on how stale a served entry can be.** The retry
-interval is capped — a nominal 60s doubling to 15 minutes — but that caps how
-often this module *retries*, not how long it will keep serving. Nothing expires
-an entry on age: while failures stay transient, a provider down for six hours
-serves a six-hour-old window, retried every fifteen minutes throughout. Do not
-size a staleness threshold against the retry cap, and do not treat any duration
-as "too old to still be served" — `fetchedAt` is the only thing that says how
-old an entry is, and it is authoritative without limit.
+Usually that is when this module fetched. Where a provider's figure comes from
+a source this module reads rather than polls, `fetchedAt` is when that source
+produced the value. For `antigravity`, the plugin lane reads the non-secret
+sidebar v2 state file (`ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE`, else
+`$XDG_STATE_HOME/cortexkit/antigravity-auth/sidebar-state.json`, else
+`~/.local/state/cortexkit/antigravity-auth/sidebar-state.json`) and publishes
+the observation time recorded there; a matching live local editor still wins.
+That lane identifies accounts only by genuine non-empty emails, never by
+positional ids or display labels, and never reads the plugin's account store or
+exchanges its refresh tokens.
 
-The mirror of that mistake is easy to make while fixing it. If you preserve
-windows across a response that did not mention them — an empty array, or a
-provider absent mid-sweep — **keep aging them on `fetchedAt` anyway**. Freezing
-their age because nothing arrived produces data that never grows stale, since
-the only thing that could have aged it is the thing that stopped coming.
+Guarantees:
 
-Both halves of one rule: never reset age on your own activity, and never pause
-it on the producer's silence. The decay clock belongs to whoever knew when the
-data was true, and it keeps running through the quiet.
+- **No upper bound on age.** On a transient failure this module keeps serving
+  the last healthy window. Retries back off from 60 s to at most 15 minutes,
+  but that caps how often it retries, not how long it serves: a provider down
+  for six hours serves a six-hour-old window. `fetchedAt` is the only age, and
+  it is authoritative without limit.
+- **Per entry, never a common instant.** Two accounts of one provider are
+  separate slots on separate schedules.
+- **Deterministic within a process.** The value is recorded once with the
+  reading, so the same reading renders the same string on every read.
+- **Nanosecond precision**, so two distinct successes cannot collide.
+- **On a degraded entry it dates the last success**, not the failure and not
+  anything now in the entry. It is absent only where the slot has never
+  succeeded, or where a credential verdict means nothing may be attributed to
+  the current credential ([5.4](#verdict-versus-unfinished)). Test `usage` for
+  usability, never the presence of `fetchedAt`.
 
-`fetchedAt` is per-entry and **never a common instant**. Two accounts of the
-same provider routinely differ, because they are separate slots on separate
-backoff schedules. Build no snapshot-moment invariant on one response.
+Two mistakes to avoid, which are the same rule: never reset an entry's age on
+your own activity (stamping poll time makes data look younger the more often
+you poll), and never pause it on the producer's silence (a window you preserve
+across a response that did not mention it keeps aging on its `fetchedAt`).
 
-**A degraded entry can carry a `fetchedAt` too, and it means something
-different.** The timestamp survives the failure that degraded the entry, so it
-reports when that provider last succeeded — not when the error was observed, and
-not when anything now in the entry was true. On a usable entry `fetchedAt` dates
-the content you are holding; on a degraded one it dates content that is no
-longer there. Its presence therefore says nothing about whether an entry is
-usable: test `usage` for that. It is absent only where a slot has never
-succeeded, which is the common case on a host lacking that credential.
-
-**Properties you may rely on if you key on it.** At least one consumer uses
-`fetchedAt` as part of a primary key, which is a stronger contract than a
-freshness hint, so the guarantees are stated rather than left to be discovered:
-
-- **Deterministic within a producer process.** The value is recorded once, when
-  the reading is taken, and stored with it — so the same success renders the same
-  string on every read. Polling twice never produces two timestamps for one
-  reading.
-- **Nanosecond precision**, so two genuinely distinct successes cannot collide.
-  **This breaks some standard parsers** — see below.
-- **It dates the READING, not the poll.** For a cache-backed lane the two differ;
-  the field is the instant the value became true at its source.
-
-> **Corrected 2026-09-18.** This section previously said the value was computed
-> as a startup wall-clock anchor plus monotonic elapsed time. That mechanism was
-> DELETED in `9e4b3bf` because it was wrong in a way consumers could see: on
-> macOS `Instant` pauses during system suspend, so every sleep left published
-> timestamps permanently behind real time for the rest of the process lifetime.
-> The contract kept describing the deleted mechanism. Recorded rather than
-> silently replaced, because a consumer who reasoned about drift from the old
-> description was reasoning correctly about a real defect that no longer exists.
-
-**Nanosecond precision breaks common parsers, and the failure is loud rather
-than silent.** A timestamp here carries nine fractional digits:
+**Parsing.** A timestamp carries nine fractional digits:
 
 ```
 2026-09-18T22:43:31.664189000+00:00
 ```
 
-Python's `datetime.fromisoformat` accepts at most six and raises `ValueError:
-Invalid isoformat string` on this. JavaScript's `Date` truncates without
-complaint. Go's `time.Parse` with RFC3339 handles it. If you are writing an
-ad-hoc reader, truncate the fraction to six digits before parsing:
+Python's `datetime.fromisoformat` rejects more than six; JavaScript's `Date`
+truncates; Go's RFC 3339 parser accepts it. An ad-hoc reader can truncate the
+fraction first:
 
 ```python
 re.sub(r"\.(\d{6})\d*", r".\1", stamp)   # keep the dot: r"\1" alone drops it
 ```
 
-Stated because the producer hit it against its own wire while writing a
-throwaway diagnostic. A loud parse failure is the good case; the hazard is a
-reader that catches the exception and treats an unparseable timestamp as an
-absent one, which reads as *this entry never succeeded*.
+Never treat an unparseable timestamp as an absent one: an absent `fetchedAt`
+means the entry never succeeded.
 
-**What a producer restart does, because it is not a defect and will look like
-one.** A restart discards every slot and each provider re-fetches, so the same
-underlying window produces a NEW `fetchedAt`. That is a genuine new observation
-rather than a duplicate — but a consumer appending a sample per distinct
-timestamp will gain a point whose utilization is unchanged. If a flat sample
-distorts what you are computing, the cause is the producer's lifecycle rather
-than your key, and `stale` does not mark it: this is a fresh read, not a
-preserved one.
+**Restarts.** A restart discards every slot, so the same underlying window is
+fetched again and gets a new `fetchedAt`: a genuine new observation, with
+`stale` unset. On a cache-backed lane a restart can also step `fetchedAt`
+**backwards**: within one process, a fetched reading older than the one already
+served is discarded and the entry is disclosed `stale`, but a new process has
+nothing to compare against. A consumer differencing a value series must treat a
+pair whose later `fetchedAt` is earlier than the former as not comparable,
+which is what this module's own drop detector does. The `usage.drops` `epoch`
+changing is the signal that a restart happened.
 
-**A restart can also step `fetchedAt` BACKWARDS on a cache-backed lane.** Within
-one process, a successful fetch whose reading is older than the one already
-served is discarded and the entry disclosed `stale` (no class). That memory is
-the process's own: after a restart a slot has nothing to compare against, so if
-the source it reads has rewound in the meantime (Antigravity's former plugin
-cache was measured doing this; sidebar snapshots also carry source observation
-times), the first reading published can be older than the
-one the previous process was serving, with no `stale`. It is not marked because
-it is not stale by this contract's meaning: it WAS obtained by the latest fetch.
-`fetchedAt` stays honest and shows the step. Measured on a consumer's host at a
-routine module swap (insula#22): `fetchedAt` 06:31:08 before, 06:19:59 after,
-value 24.09 -> 20.16, for 40 seconds until a newer reading arrived.
+**Proven by:** `fetched_at_is_stable_for_fresh_and_stale_slot_entries`,
+`a_degraded_entry_keeps_the_timestamp_of_its_last_success`,
+`entries_for_a_never_successful_slot_have_no_fetched_at`,
+`transient_failure_keeps_serving_last_good_window`,
+`a_blip_on_the_fresher_lane_does_not_republish_an_older_reading`,
+`a_backward_wall_step_does_not_manufacture_continuity`.
 
-So a consumer that differences a value series, for cost or drop analysis, must
-treat a pair whose later `fetchedAt` is EARLIER than the former as non-comparable
-rather than as a decrease. This module's own drop detector does exactly that
-(`quota_drop::detect` refuses continuity when the newer reading describes an
-earlier moment). The ring `epoch` changing is the separate signal that a restart
-happened at all. Persisting the high-water across restarts was considered and
-not done: it would be the first persisted quota state in a module that keeps
-none, to spare a check a correct differencer needs anyway.
+<a id="sizing-a-staleness-threshold"></a>
 
-## Degraded means "we cannot read it", not "the provider is down"
+### 4.2 Sizing a staleness threshold
 
-The set that produces a degraded entry is the non-transient failures, defined by
-`classify` in `crates/quota-core/src/refresh.rs` — read it there rather than
-trusting this list to stay current:
+A slot is refetched 60 s after its last success, and a fetch may run up to 35 s
+before it is abandoned, so a healthy entry's age reaches up to about 95 s. A
+threshold must clear that sum, not the interval alone; below it, every healthy
+provider reads stale for part of every cycle, all at once, which looks like a
+producer-wide outage. This module itself counts an entry as fresh for 120 s
+(`FRESH_HORIZON`), and a healthy provider never exceeds it.
 
-- HTTP 401 and 403
-- no session, credential unusable, unauthorized
-- no quota reported
-- decode failure
-- a caught panic in a provider fetch
+The threshold is a floor on time since the last *success*, so a provider
+retrying through failures legitimately ages past it. An entry aging past your
+bound is a reason to discount the reading, never evidence that the producer is
+failing; whether the producer is failing is answered by health
+([11](#health-is-a-separate-axis)).
 
-**429 and every 5xx are transient** and never arrive degraded; they arrive as an
-unchanged, aging healthy window. The honest phrasing is *the credential or the
-payload is unusable in a way retrying soon will not fix*, which is exactly why
-rate limits and server errors are excluded.
+**Sidebar-backed readings age by design.** The Antigravity plugin polls quota
+and publishes a sidebar snapshot. A quota group is served only while its
+observation `checkedAt` is at most 3600 s old (`CACHED_QUOTA_MAX_AGE`); an
+undated group means no reading yet. Groups age independently, and `fetchedAt`
+carries the oldest served group's `checkedAt`, never the file's publication
+time or the time this module read it. A sidebar read error is transient, never
+an empty roster. Sidebar versions other than v2 (including v1) need a plugin
+update. Changing `CACHED_QUOTA_MAX_AGE` is a contract change: consumers
+(astrocyte's `window_sample` insert) rely on over-age readings being withheld.
 
-A consequence worth stating: only decode failures self-recover. The auth family
-needs a human, and a panic recurs on every fetch until the code is fixed. So
-"degraded implies a dead credential" is wrong, and so is "most degraded entries
-recover on their own".
+For the vault lane, `tier.paidId` present and not `free-tier` is positive
+paid-tier evidence, so a matching fresh sidebar outranks the cloud's standard
+pool. An absent tier is unknown, not paid.
 
-## Not every degraded entry is a problem
+**Proven by:** `a_healthy_slot_stays_fresh_across_its_whole_refresh_cycle`,
+`freshness_is_computed_from_last_success`.
 
-The list above answers *how* a fetch failed. It does not answer the question a
-reader of your output actually has, which is **whether anything is wrong**, and
-those come apart sharply:
+### 4.3 `stale`: a reading preserved through failure
 
-- A provider nobody configured on this host fails every fetch, forever, and that
-  is the correct steady state. Nothing is broken and nothing is fixable.
-- A provider whose credential worked yesterday and was rejected this morning
-  fails identically on the wire, and is worth someone's attention.
-- A provider whose credential is fine but whose account genuinely has no quota
-  to report is a third thing again: not absent, not broken.
+Prefer the `stale` field to any age threshold, because it says directly that a
+reading is being preserved through failure:
 
-On the host these docs are written from, the great majority of degraded entries
-are the first case — providers nobody configured — and the genuinely broken ones
-number one or two. So an undifferentiated count of degraded entries is dominated
-by the case that can never mean anything, and a real breakage moves it by one.
-The exact figures drift as credentials come and go; the ratio is the point.
+```json
+"fetchedAt": "2026-08-13T10:00:00Z",
+"stale": { "since": "2026-08-13T10:02:00Z", "class": "upstream_failed" }
+```
 
-The health check applies this split for you at the provider level: `degraded`
-there counts only the second and third cases, and providers whose every account
-is an expected absence are reported separately as `unconfigured`. The `usage.get`
-array is not split — it carries one entry per account with its own `errorClass`,
-so a surface rendering accounts should group on the class itself using the table
-below.
+`fetchedAt` is when the served reading was obtained; `since` is when the
+producer first failed to refresh it. The gap between them is how long the
+producer has been unable to look, which is the quantity a staleness policy
+wants. `since` is always later than `fetchedAt`. `class` uses the `errorClass`
+vocabulary and is optional: render "stale, cause unstated" rather than
+suppressing it.
 
-`errorClass` is the machine-readable answer, and it is **on the wire** on every
-degraded entry. It is absent on healthy entries by design: the field says why an
-entry is degraded, and a healthy one has nothing to say — so branch on `error`
-for health, never on this field's presence.
+`stale` absent means the entry is a fresh success or a cache-served entry that
+is healthy and older than a poll. It is not a fault signal: preserving a
+reading through a brief upstream failure is correct behaviour.
+
+**Proven by:** `a_verdict_discloses_no_staleness_while_a_stale_served_window_does`,
+`an_unchanged_unlabeled_record_still_stale_serves_through_a_flap`.
+
+<a id="degraded-means-we-cannot-read-it-not-the-provider-is-down"></a>
+
+## 5. Error classes
+
+### 5.1 Degraded means "we cannot read it", not "the provider is down"
+
+A degraded entry carries `error` (prose) and `errorClass` (machine-readable),
+and no `usage`. Which failures degrade is decided by `classify` in
+`crates/quota-core/src/refresh.rs`; read it there rather than trusting a copy:
+
+| Failure | Classified | On a slot that has served before |
+|---|---|---|
+| HTTP 401 or 403 | non-transient | degrades |
+| no session, credential unusable, unauthorized | non-transient | degrades |
+| no quota reported | non-transient | degrades |
+| decode failure | non-transient | degrades |
+| a contained panic in a provider fetch | non-transient | degrades |
+| HTTP 429, any 5xx, network error, fetch deadline | transient | keeps serving the last window, marked `stale` |
+| a local source (editor, app) not reachable | transient | keeps serving the last window, marked `stale` |
+
+A transient failure on a slot that has **never** succeeded has nothing to
+serve, so it degrades like any other: a provider whose first fetch times out
+publishes a degraded entry carrying a timeout error.
+
+A non-transient failure is retried after a fixed 300 s
+(`NON_TRANSIENT_BACKOFF`); a transient one after an exponential backoff from
+60 s capped at 900 s (`MAX_TRANSIENT_BACKOFF`).
+
+**Proven by:** `classify_splits_transient_from_non_transient`,
+`a_transient_failure_with_no_prior_success_degrades`,
+`non_transient_failure_replaces_a_prior_healthy_entry`,
+`transient_failure_keeps_a_prior_healthy_entry`,
+`non_transient_backoff_is_fixed`, `transient_backoff_is_exponential_and_capped`,
+`a_deadline_overrun_is_attributed_to_the_upstream_and_stays_transient`.
+
+<a id="not-every-degraded-entry-is-a-problem"></a>
+
+### 5.2 The `errorClass` vocabulary
+
+`errorClass` is on the wire on every degraded entry and absent on every healthy
+one: branch on `error` for health, never on this field's presence. The
+self-recovery column decides between two messages to a person, *wait* or
+*act*; `no_quota_reported` is the one row where "no" means nothing is wrong.
 
 | class | meaning | self-recovers? |
 | --- | --- | --- |
@@ -359,1053 +375,269 @@ for health, never on this field's presence.
 | `decode_failed` | a response arrived in an unexpected shape | yes |
 | `internal_error` | a fault in this module, contained rather than crashing | sometimes |
 
-A revoked OAuth credential reaches you as `credential_unusable`, not as a
-transient failure. When a token endpoint refuses a refresh by *stating*
-`invalid_grant`, that is permanent under RFC 6749 §5.2 — the grant is gone and
-retrying cannot recover it — so the entry degrades rather than continuing to
-serve its last healthy window. Any other refusal from that endpoint stays
-transient and keeps stale-serving, because a rate-limited or malformed refresh
-must not condemn a working account.
+Notes on single rows:
 
-This is worth knowing precisely because the previous behaviour was invisible: a
-dead account kept publishing its last capacity reading with no upper age bound,
-never degraded, and went on counting as serving in the health snapshot.
+- `credential_unusable` is also what a vault credential reports once the vault
+  has marked it as needing re-authentication; this module does not refresh
+  OAuth tokens itself.
+- `local_source_unavailable` exists so that `credential_absent` keeps one
+  meaning. A provider that reads a running application would otherwise appear
+  and disappear as someone opens and closes it, while `credential_absent` is a
+  stable fact about the host that a consumer may act on.
+- `upstream_failed` and `local_source_unavailable` are rare on a degraded entry,
+  because both are transient: seeing either means the slot never had a healthy
+  window to fall back on.
+- `internal_error` means the provider may be healthy and this module failed
+  reading it. It is *sometimes* because a panic on one response clears on the
+  next fetch, while a deterministic bug repeats until fixed here; nothing on the
+  wire separates them.
 
-`scopedCredentialIds` is an array of strings naming every credential id in the
-scoped snapshot currently installed by this module. It is empty both before the
-first install and after an authoritative empty install. It is a readback of the
-inventory the refresher actually used, not a fresh vault query. External
-checkers must use this field because a standalone process has a direct principal
-and cannot call `credential.list_scoped` on the supervised module's reserved
-grant. Credential ids identify records; the field carries no credential bytes.
-
-Read it with `vaultEnumerationFailure` and `retainedVaultSnapshotAgeSecs`.
-`vaultEnumerationFailure` is `null` when no list failure is recorded and otherwise
-contains the latest failure, including `principal is not granted`. On failure,
-`scopedCredentialIds` remains the last installed snapshot and
-`retainedVaultSnapshotAgeSecs` is its age in whole seconds (or `null` when no
-snapshot has ever been installed). A consumer must not mistake retained rows for
-a current enumeration. `vaultMappingWarning` is `null` when every installed row
-mapped cleanly and otherwise carries the warning produced while mapping the
-snapshot. Family refusals can prevent usage rows; exact deliberately unsupported
-ids remain notes for a checker to classify rather than dark lanes.
-
-`vaultHandleState` says whether that inventory is a verdict yet. It is one of:
-
-- `"no_vault"` — no credential vault serves this module on this host: the daemon
-  has no credential module (a fresh install), or the vault answered and granted
-  this module nothing before ever granting it anything. Providers use their
-  local lanes.
-- `"awaiting"` — a vault is wired and has not answered an enumeration yet, for
-  example because it answered `module_warming` on the first turn after a restart.
-  Every vault-aware provider is held back as unfinished: it publishes **no**
-  entries, not even from a local lane, and is listed in `withoutHandles`. This
-  normally lasts one turn.
-- `"answered"` — at least one authoritative inventory has been installed. Later
-  list failures retain it (see `vaultEnumerationFailure`); a vault that
-  disappears afterwards does not blank the lanes it was serving.
-- `null` — this build has no vault loader at all.
-
-Why `awaiting` holds providers back rather than letting the local lane serve:
-a local credential usually resolves no account label, so falling back would
-replace every labelled account with one unlabelled row — and a single usable
-unlabelled row with no labelled siblings is exactly what this contract tells you
-to read as "this provider now resolves no identity". "Could not look" must not
-reach you as "absent". The cost is that a provider with both a vault lane and a
-local lane (`codex`, `antigravity`) serves neither while `awaiting`. A host that
-**stays** `awaiting` has a vault that keeps failing to list; read
-`vaultEnumerationFailure` for the reason. Its bucket counts look exactly like a
-host holding no credentials, so this field is the only place that state is named.
-
-`vaultConnectionsEstablished` counts the vault connections this process has
-opened. `1` means the first one is still in use; every increment is a reconnect
-after a transport failure. There is no idle timeout and no maximum lifetime, and
-the client answers pings, so a healthy connection is held for the life of the
-process and this number can legitimately sit at `1` for weeks.
-
-**Do not alert on it.** Reconnects are ordinary around a daemon restart. It
-answers a question about a moment — *did the connection change between these two
-observations?* — which is otherwise unanswerable from outside the process. It was
-added after a re-sealed vault credential kept being served with its pre-re-seal
-verdict until a module restart, where a restart is the one event in such a
-timeline that guarantees a new connection.
-
-`vaultAuthFailuresReported` counts the auth failures this process has reported to
-the vault. Each one **latches** the credential record: the vault marks it
-`needs_reauth`, and nothing clears that state but a human logging in.
-
-**The zero is the load-bearing reading.** This is the only outbound effect the
-module has that is not a read, and it is fire-and-forget, so nothing else in the
-process records it. When an account is found dark, the first question is whether
-this module latched it or the credential died on its own — and a `0` answers that
-by ruling the module out. A non-zero count does not say which credential; the
-capability is a bearer secret and the credential id is not in scope at the gate.
-
-The gate is narrow on purpose: only an upstream `401` **with a bearer this module
-served** reports. A `403` is deliberately excluded, because a refused call is not
-a dead credential — an entitlement withdrawal, a suspension and a network
-challenge all arrive as `403` and none of them is fixed by logging in again.
-
-`vaultRouteWarmingRetries` counts route opens the credential module refused
-because it was still coming up, each of which this client retried on the next
-tick rather than treating as a dead credential.
-
-**Do not alert on it either.** Rising during a daemon restart is the mechanism
-working: the lanes race the vault's own registration and whichever fires first
-can lose by a millisecond. Rising while nothing is restarting is the reading
-worth asking about.
-
-It exists because the retry is **silent on success**. The lane recovers and
-leaves no trace, so "the retry worked" and "that path has never executed" were
-the same observable from outside — and they send a reader in opposite
-directions. A flat zero across a restart now says the race did not happen,
-rather than saying nothing at all.
-
-`lastFetchSuccessAgeSecs` and `fetchBlackout` answer a question
-`refresherStalled` cannot: whether the refresher is accomplishing anything.
-
-`refresherStalled` watches the refresher LOOP — it goes true when the heartbeat
-stops. A process whose transport has died keeps ticking, keeps stale-serving
-(transient failures have no upper age bound by design), and reads `ok`
-indefinitely. That happened on 2026-08-19: this module served 10-hour-old
-windows to every consumer with `lastTickAgeSecs` at 1, `refresherStalled` false,
-and every other number reading normal. A fresh process on the same host fetched
-all 37 providers in twenty seconds.
-
-`lastFetchSuccessAgeSecs` is how long ago **any** slot last fetched successfully,
-and is `null` when nothing ever has — the ordinary state of a host holding
-credentials for none of these services. `fetchBlackout` is true once that age
-passes the blackout horizon, which sits above the longest gap a single flapping
-provider can legitimately produce, so one upstream having a bad afternoon does
-not trip it. When it is true the module reports `degraded`.
-
-It does not report `failing`, deliberately. `failing` asks the supervisor to
-restart the module — which would have cured that incident, and is still an action
-taken on a theory rather than a measurement. The signal says what is true; it
-does not act on a guess about why.
-
-`staleEpisodes` sits beside `stale` in the health metrics and answers a
-different question. `stale` is a gauge: how many providers are serving a
-preserved reading *right now*. `staleEpisodes` is a monotonic count of how many
-times any slot has ENTERED that state since the module started, so a slot stale
-across many refresh turns counts once.
-
-It counts episodes, not providers. Once an episode resolves the entry looks
-ordinary again and `stale` has returned to zero, so the count alone answers *did
-a transient failure happen* and not *to whom* or *why*.
-
-`lastStaleEpisode` answers those for the MOST RECENT one, and exists because the
-alternative was catching it live:
-
-```
-"lastStaleEpisode": "claude 57ce2cb7-… upstream_failed at 2026-09-19T00:14:22.…Z"
-```
-
-Provider, account, `errorClass`, and when. The account is `<unattributed>` where
-the credential resolves no identity — most cookie lanes — which means
-unattributable rather than *all accounts*. The class is the same vocabulary a
-degraded entry publishes; the difference is that a stale entry keeps serving its
-last healthy window and a degraded one does not.
-
-**Only the last one is kept**, and the field name says so. It is not a summary of
-a run: on a lane flapping repeatedly it tells you what the most recent failure
-was, which is the question an operator has when a count climbs, and it says
-nothing about whether the earlier ones matched.
-
-*Why it was added.* This host recorded eighteen episodes, all on one provider,
-and the only way to learn the class was to poll `usage.get` for three minutes
-hoping to catch a window — `stale: { since, class }` is published only WHILE an
-entry is stale-serving, and nothing is logged on that path. A metric that answers
-*whether* and can never answer *why* sends its reader to guess.
-
-`staleEpisodesByProvider` gives the distribution: a count per provider, summing
-to the total. The total says how many episodes; this says how they were SPREAD,
-and only the pair separates a marginal upstream from an environmental wobble —
-seventeen episodes concentrated on one lane is that provider's problem, and
-seventeen spread evenly over ten lanes is the network, and those want opposite
-responses.
-
-BUT A CONCENTRATION IS NOT AUTOMATICALLY A PROBLEM, and the standing example is
-`antigravity`. It has run 3-5x every other lane on this host for a full day, and
-none of it is an incident: it is the only provider carrying a lane that is
-STRUCTURALLY EXPECTED TO BE ABSENT. Its local probe needs the editor process
-running, `local_source_unavailable` is classified transient ON PURPOSE so a
-closed editor does not discard last-healthy windows, and the cloud lane serves
-throughout. Every poll while the editor is shut counts one episode.
-
-So the counter is honest about what it counts and misleading about what it
-implies: **a provider with a graceful fallback accrues episodes faster than one
-with a single brittle lane**, and the metric ranks the better-designed provider
-worse. Before treating a concentration as a provider problem, check whether that
-provider has a lane whose absence is ordinary — a local process probe, an
-editor. Read this one against `errorClass` on the entry: episodes
-paired with a healthy served entry are a fallback working, and only episodes
-paired with a degraded entry are a lane in trouble.
-
-Recorded because the author of the metric misread it three times in one night
-before checking the mechanism.
-
-**This replaced a set of names, which saturated.** Every serving lane flaps
-eventually, so after enough uptime the set listed all of them and stopped
-discriminating — measured here after fourteen hours, with a lane known to flap
-hourly hidden inside a list that looked like uniform noise. Counts keep working
-at any uptime; a structure that only grows answers its question only while it is
-young.
-
-Counts are since boot, so a provider appearing here is usually healthy right now,
-and they only grow until a restart. Bounded by the registry, and **not** part of
-the conservation identity: these are lanes that flapped at some point, not a
-partition of the current population.
-
-### `quotaDropsByProvider` and `quotaDropsObservedContinuously`
-
-How many times an account's used percent went **down** between two readings, per
-provider, and how many of those were seen across a continuous poll interval.
-
-**Named for the observation, not the inference.** A window rollover, a redeemed
-reset credit, a goodwill grant, a plan change and an upstream correction are
-identical from here — the cause of a drop is not observable, only the drop is.
-The one cause this module could attribute is its own banked-reset redemptions,
-which are recorded in a local journal; that attribution belongs with a consumable
-record, not with a counter.
-
-The pair matters more than either half. A drop inferred across a gap — host
-sleep, a fetch blackout, a long backoff — **understates what happened**: a drop
-followed by consumption reads as a smaller drop, and a drop followed by a re-fill
-reads as no drop at all. If most drops are inferred rather than observed, any
-future per-event record has to carry that on every row.
-
-Three things deliberately do not count: a decrease across an **account change**
-(two accounts are not one series), a decrease on a window stating a `drip`
-regeneration mechanic (a continuously refilling pool reads lower as a matter of
-course), and a decrease under one percentage point (upstream arithmetic rather
-than capacity returning).
-
-**One reset is one event, even when several credentials watch it happen.** An
-account can be served by more than one slot — a vault handle beside a local or
-plugin one, both resolving the same identity — and each slot observes the same
-window reset within one poll cycle. A second decrease for the same
-`(provider, account)` inside 60 seconds is folded: one record in `usage.drops`,
-one increment here. Without that fold the counter doubled on every reset of such
-an account, which a reader could not distinguish from a busier account.
-
-The fold needs an identity to key on, so it **never applies to lanes that resolve
-none** (the cookie providers). Two unidentified slots cannot be shown to
-be the same account, and collapsing two genuinely different ones would hide a
-real reset — the expensive direction. Those records stay separate, as does any
-second decrease more than 60 seconds after the first.
-
-These exist to answer a design question before the reset events asked for in
-issue #5 are built: whether a 60-second poll observes these at all. Not part of
-the conservation identity.
-
-### `quotaComparisonsNoDrop` and `quotaNotComparable`
-
-The two counts that make the drop counts readable.
-
-`quotaComparisonsNoDrop` is how many paired readings **ran** and found the
-account had not gone down. It is the denominator the drop counts were missing:
-without it, a low drop count reads identically whether the host was quiet or
-whether nothing was comparable.
-
-`quotaNotComparable` is how many readings **could not be compared**, by reason:
-
-| reason | what it means |
-| --- | --- |
-| `account_changed` | the credential now serves a different account, so the two readings are not one series |
-| `no_prior_reading` | a cold slot, or an entry carrying no usage |
-| `prior_reading_was_an_error` | the previous reading was degraded |
-
-**The third is the one worth alerting on.** A latched credential produces a long
-run of them, and in every other measure that looks exactly like a quiet account:
-an 84-minute latch measured by a consumer produced no drop records at all and was
-invisible in the numbers. A sustained `prior_reading_was_an_error` is a
-credential problem wearing the shape of a quiet host.
-
-Each is incremented in the same statement that returns the reason, so the count
-and the decision cannot disagree. Not part of the conservation identity.
-
-It exists because the gauge alone cannot distinguish "nothing is failing" from
-"nothing was failing at the instant you polled" — and a transient failure that
-resolves between two polls leaves no other trace. Read it for "has this host
-seen transient failure at all", never as a population count: it is an event
-tally and is deliberately excluded from the conservation identity.
-
-A provider's `account` does not depend on which credential lane fetched the
-usage. `cursor` has two — a deposited session cookie and Cursor.app's local token
-store — and only the second carries an identity. A cookie session used to win
-and the account silently lose its name, which read downstream as an account
-disappearing and an unlabelled row appearing, and dropped the provider out of
-`completeProviders`.
-
-Identity is now resolved independently of the fetching lane, **and only on
-proof**: the deposited session cookie and the local store both name a user id, and
-the email is attached only when those ids are equal. Different ids mean two
-different accounts signed in, and an unlabelled entry is the honest answer — a
-wrong name is worse than no name, because a consumer cannot tell them apart.
-
-The general rule, for any provider that grows a second lane: `source` may change
-between polls, `account` should not.
-
-The self-recovery column is the one a user-facing surface should group on,
-because it decides between two sentences: **wait**, or **act**. Read it off the
-column rather than from any summary here — a `no` means someone must do
-something, and `no_quota_reported` is the one row where `no` means nothing is
-wrong and nothing is needed.
-
-**This list grows, so decode it as an open vocabulary.** Two of the eight rows
-above were added after consumers were already reading the field, because a
-failure that had been folded into a neighbouring class turned out to need its
-own remedy. A decoder that treats the set as closed — an enum that fails, a
-match that panics, a filter that drops what it does not recognise — breaks on an
-addition that is additive by construction and breaks in the direction that hides
-it, since an unrecognised class becomes silence rather than an error.
-
-Keep an unknown class as a readable string and let it reach whatever surface
-displays the known ones. The strings are chosen to be legible for exactly this
-reason: a consumer that cannot classify a new one can still show it, and a
-person reading `credential_rejected` needs no table. Branch on the classes you
-know and pass the rest through.
-
-`internal_error` is marked *sometimes* because both of its causes carry that
-class and nothing on the wire separates them: a panic while handling one
-particular response clears on the next fetch, while a deterministic bug in this
-module repeats until it is fixed here. Promising recovery would be worse than
-saying nothing, since someone waiting on the second kind waits forever.
-
-`internal_error` also deserves its own sentence rather than sharing one with the
-other two. Those mean the provider is unwell; this one means the provider may be
-perfectly healthy and this module fell over reading it. Telling someone to check
-a service that is fine sends them somewhere with nothing to find.
-
-`upstream_failed` and `local_source_unavailable` are both rare on a degraded
-entry, because a transient failure with a prior healthy window serves that
-window stale instead of degrading. Seeing either means the slot never had a
-healthy window to fall back on.
-
-**`local_source_unavailable` exists to keep `credential_absent` meaning one
-thing.** A few providers read usage from a program running on this machine
-rather than from a stored credential, and that program's absence tracks whether
-someone has an application open. Reported as `credential_absent`, such a
-provider would appear and disappear on a cadence driven by desktop activity no
-consumer can see — while `credential_absent` is otherwise a stable fact about
-the host, which a consumer may reasonably act on by discarding what it knows
-about that provider. Keeping the two apart is what makes that reading safe.
-
-**The list will grow, and it is a string rather than an enum for that reason.**
-Render an unrecognised class as a degraded entry with an unknown reason: never
-drop the entry, never fold it into an existing bucket. Meeting an unknown value
-must not become a parse failure — the moment the list grows is the moment some
-provider's state changed, which is the worst possible time for an entry to
-vanish from a consumer's view.
+**The vocabulary grows.** Decode `errorClass` as an open string. Render an
+unrecognised class as a degraded entry with an unknown reason; never drop the
+entry and never fold it into a known class.
 
 **No class authorises removing an account.** A degraded entry names an account
-that exists and is currently unusable, `credential_absent` included — that one
-means this host has no credential for the provider, never that an account is
-gone. Account removal is authorised only by `completeProviders`.
+that exists and is currently unusable, `credential_absent` included. Account
+removal is authorised only by `completeProviders`
+([9.3](#completeproviders-is-how-an-account-may-be-removed)).
 
-The error string is prose, not a stable taxonomy. Use it for observability, and
-if you need to branch on the class, ask for a machine-readable field rather than
-parsing it — a retention policy keyed on prose is how the next seam defect gets
-built. **The prose is not stable across releases and has already changed**:
-failures that once read `no session: …` now read `credential unusable: …` or
-`no quota reported: …` where that is what actually happened. Anything storing
-these strings will see a discontinuity at that release, and anything matching on
-them was relying on a promise this contract never made.
+**The `error` string is prose with no stability promise**, and its wording has
+changed between releases. Use it for display and logs; branch on `errorClass`.
 
-## Measured behaviour is recorded here, not stamped on the wire
+**Proven by:** `every_wire_error_class_has_a_documented_row` (this table against
+`FetchError::error_class`, both directions), `a_degraded_entry_publishes_its_error_class`,
+`a_healthy_entry_publishes_no_error_class`,
+`a_contained_panic_is_attributed_to_this_module_not_the_upstream`.
 
-Some questions a consumer needs answered are not things any upstream states.
-Whether a rate window resets at a boundary or slides is one: it changes how a
-router paces, and no provider on this wire says which it is.
+### 5.3 Which degraded entries need attention
 
-**Anthropic 5-hour windows reset at a boundary — they do not slide.** Measured
-2026-08-17 by polling one account every 100 seconds for five minutes: the reset
-instant held at `21:20:00`/`21:19:59`, sub-second jitter only, where a rolling
-last-5h window would have carried it forward by five minutes. Corroborating, two
-accounts on the same plan sat 30 minutes apart, which is a per-account session
-anchor — a sliding window has no anchor to differ on. Reproduce it the same way:
-poll ONE account repeatedly and watch its own `resetsAt`.
+`errorClass` says how a fetch failed, not whether anything is wrong:
 
-This is deliberately NOT published as a `regeneration` mechanic. That object
-means *the upstream stated how quota returns*, and Anthropic states a reset
-instant and nothing else; `resetsAt` already carries that. Stamping a mechanic
-derived from our own observation would mint an upstream claim out of a
-measurement, and a wire field asserts itself indefinitely while a documented
-measurement carries its date and its method.
+- a provider nobody configured on this host fails every fetch forever, and that
+  is the correct steady state;
+- a credential that worked and was then refused fails identically on the wire,
+  and needs attention;
+- a working credential whose account has no quota is neither absent nor broken.
 
-**What that measurement does NOT establish, and cannot from this host.** It was
-taken from accounts this machine's own agent traffic drives, and a window that is
-never idle cannot show what happens when it expires unused. So the claim is
-bounded: *within an active window the reset instant is stable*, which rules out a
-rolling window. Whether the next window anchors at the next first use or lands on
-a fixed grid is a different question, and the very activity that makes these
-accounts worth measuring is what keeps it unanswerable here.
+On a typical host most degraded entries are the first kind, so an
+undifferentiated count of degraded entries mostly measures how many providers
+are unconfigured. The health check applies the split at the provider level
+(`degraded` versus `unconfigured`, [11.2](#health-is-a-separate-axis)); a
+surface rendering accounts should group on `errorClass`.
 
-> **Self-signals considered: none registered.** No module's manifest declares a
-> `Mutate` signal against these lanes.
->
-> **The host's own traffic is a separate thing and it is what bounds this
-> measurement.** A keepalive firing at window-expiry + ε was reported on insula#9
-> (iceteaSA, 2026-08-18) as the box operator's infrastructure — not a module
-> self-signal, and not declared in any manifest. It is why the unanswerable half
-> above is unanswerable: not *some* activity, but precisely the activity that
-> denies the measurement its idle window. A host without it could answer.
->
-> **How to decide whether a signal belongs on a measurement**, keyed on what the
-> producer declares rather than on a reader's judgement. `SelfSignalEffect` is a
-> two-variant enum in `subc-protocol` — `Observe` or `Mutate` — and `domain` names
-> the lane:
->
-> ```
-> effect = Mutate,  domain matches the surface  ->  can move that series. ANNOTATE.
-> effect = Observe                              ->  cannot move anything. No annotation.
-> ```
->
-> No case-by-case call: the producer has already declared whether their signal
-> spends or merely watches. It is deliberately not subtraction — nothing here
-> compensates for a signal, and a reader wanting unshaped mechanics needs a host
-> that does not run one.
->
-> **This line is transcribed, not derived, and that is a defect.** `ck module
-> status` does not expose manifests, so there is no programmatic path to another
-> module's declared signals from here. An unreadable-but-present declaration is
-> worse than an absent one: an absent value sends you to ask, while an unreadable
-> one invites a transcription that looks sourced. The first version of this very
-> annotation named a signal against the wrong module, on the wrong date, as a
-> manifest declaration it had never made — corrected 2026-09-19 after astrocyte
-> read their own manifest back. When the registry becomes readable this becomes a
-> set test over `(name, effect, domain)` and the misattribution closes by
-> construction.
+<a id="verdict-versus-unfinished"></a>
 
-One live corroboration of the anchoring half, observable on any host with an
-unused account: on 2026-08-21 three accounts on this box read 16.0% with a reset
-instant, 0.0% with a reset instant, and **0.0% with no `resetsAt` at all**. The
-third is an account nothing has used — so no window exists to state a reset for,
-which is what a per-session anchor looks like from outside. A fixed grid would
-publish the next boundary whether or not anyone had used the account.
+### 5.4 Verdict versus unfinished
 
-The general rule this is an instance of: a measurement of provider behaviour
-taken from a host that is itself driving that provider is shaped by that driving,
-and the shaping is invisible in the numbers. State what was feeding the lane
-beside the method and the date. Where nothing was, say so — an unstated
-influence and an absent one look identical to the next reader.
+A degraded entry is a **verdict**: this module concluded the credential or
+payload is unusable. An absent entry is **unfinished**. Retaining a
+last-known-good value through an absent entry is correct; retaining it through
+a degraded entry overrides a conclusion already reached. If you keep anything,
+age it hard rather than dropping it, since some classes self-recover.
 
-And state it as what was CONSULTED, never as what is true. "Nothing was feeding
-this lane" is a claim about the sources someone checked, not a guarantee that no
-influence existed; an unregistered process shaping a lane produces exactly the
-same sentence as an unshaped one. This is the same arm as every other absence on
-this wire — **an absence licenses nothing** — and it is the arm that decays
-quietest, because the reassuring reading requires no action from anybody.
+Read `errorClass` and `fetchedAt` together:
 
-**The failure that produced this section.** The same measurement was recorded
-the day before with the opposite conclusion, from two accounts in one output
-block read as one account over time. Different anchors look exactly like
-movement. A per-account field compared ACROSS accounts fabricates a time series,
-and the fabrication is invisible whenever the false reading is plausible for the
-thing being studied. Before concluding a value changed, confirm the rows share
-an identity and not merely a provider name.
-
-**And confirm they share a HOST.** The rule above was committed a second time,
-one level up, by a reader who had read this section that morning: two arrays
-from two different machines, compared as one module over ninety minutes. Nothing
-in a `usage.get` payload identifies which deployment produced it, so two hosts'
-output is indistinguishable once pasted side by side — and the cross-host version
-is EASIER to commit than the cross-account one, because the account labels differ
-legitimately and that difference is what a genuine change would also look like.
-
-The tell is available and is not in the changed rows. A host's credential surface
-is structural: which environment variables are set, which vault handles are
-configured. Four providers serving in one array and absent from the other —
-including an entire nine-provider cookie cohort with no deposits on one host —
-is not something that can change in ninety minutes. Before
-reading two arrays as one series, check the rows that DID NOT change; they carry
-the machine's fingerprint, and the rows under study do not.
-
-## `spend` is money, and it fails in the opposite direction from a window
-
-Some providers sell credit alongside a plan, or instead of one. That credit is
-an **amount with no period** — no percentage, no reset, no window length — so it
-cannot be a `RateWindow`, and it is published separately as `spend`:
-
-```json
-"spend": [
-  { "id": "granted_balance",   "label": "Granted credit",
-    "funding": "granted",   "basis": "reported",
-    "remaining": { "minor": 0,    "exponent": 2, "unit": "CNY" } },
-  { "id": "topped_up_balance", "label": "Purchased credit",
-    "funding": "purchased", "basis": "reported",
-    "remaining": { "minor": 2402, "exponent": 2, "unit": "CNY" } }
-]
-```
-
-**Why it is a separate key rather than another window.** Over-consuming a window
-gets you throttled and recovers by waiting. Over-consuming a balance gets you
-**billed**, and no routing decision can undo that. A consumer that found a
-balance where it expected headroom would pace into a bill, so nothing here is a
-percentage and nothing carries a reset.
-
-### Amounts are integer minor units
-
-`{ minor: 2402, exponent: 2, unit: "CNY" }` is 24.02 CNY. Reconstruct with
-`minor / 10^exponent`, and prefer comparing in minor units directly: a balance is
-compared against zero on every routing decision that reads it, and binary floats
-cannot hold decimal amounts exactly.
-
-`unit` is a free string. It is a currency code where the provider states one,
-and otherwise a provider's own word for its credits — some pools are points that
-convert to no currency. **Never assume two pools are comparable because both
-carry an amount.**
-
-### `funding` says what a pool costs to spend
-
-| value | meaning |
-| --- | --- |
-| `granted` | given by the provider; spending it costs nothing |
-| `purchased` | bought; spending it costs money |
-| `subscription` | included in a plan already paid for |
-| `unknown` | the provider separates this pool but does not say what funds it |
-
-`unknown` is a **correct answer, not a failure**. Several providers name their
-pools and define none of them, and this producer will not invent the label a
-spend policy keys on. It is also what an unrecognised value from a newer producer
-decodes to, and the two meanings agree: a funding you cannot name is one you must
-not spend from.
-
-Consequently, **"spend only free credit" must mean *only pools stated as
-`granted`*, never *everything not stated as `purchased`***.
-
-### `basis` says whether `remaining` is exact
-
-| value | meaning |
-| --- | --- |
-| `reported` | the provider states this pool's remainder directly — exact |
-| `derived` | computed against a consumption figure covering several pools — a **ceiling** |
-| `unstated` | not stated, or a value this consumer does not recognise — treat as a **ceiling** |
-
-The difference is not cosmetic. Providers commonly report grants per pool but
-consumption against their **sum**, which makes a per-pool remainder
-underivable — so a policy naming one pool is exact against a `reported` pool and
-only an upper bound against the other two.
-
-### `spendable`, and what absence means
-
-`spendable` is read from the provider, never inferred from `remaining > 0`: a
-pool can be non-empty and closed. When it is **absent**, the provider did not
-say, and the safe reading depends on what you are about to do:
-
-| reader | treat absent as | why |
+| `errorClass` | `fetchedAt` | What happened |
 | --- | --- | --- |
-| about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
-| rendering to a person | **unknown** | hiding a live pool misleads someone who could act on it |
-
-### Finding out what your build cannot decode
-
-The wire types live in the `cortexkit-provider-usage` crate, and every release
-is tagged in `cortexkit/commons`. To see what this producer added since the
-version you decode against:
-
-```
-git diff cortexkit-provider-usage-v<yours>..cortexkit-provider-usage-v<latest> \
-  -- crates/cortexkit-provider-usage/src/lib.rs
-```
-
-Deliberately a command rather than a list of fields kept here. A hand-written
-"added since" table is a curated artifact: nothing breaks when it falls behind,
-so it decays into a confident wrong answer. The diff is derived from the
-released artifact, so it cannot disagree with what shipped.
-
-Consumers that decode this wire with their own structs rather than the crate
-have no version to check — the fields they parse are the fields they wrote. Both
-kinds of consumer exist today.
-
-### Decode `funding` and `basis` permissively
-
-Both are closed sets today and **both will gain values**. Decode them as
-strings, or as an enum with a catch-all — never as a closed enum that fails on
-an unrecognised value.
-
-The failure this prevents is not local. A strict decode of one pool's `funding`
-fails the whole entry, taking the account's **rate windows** down with it — data
-that has nothing to do with pools and was perfectly readable. That is a pool
-field deleting a capacity signal.
-
-The safe landing is already the correct one: an unrecognised `funding` means the
-same as `unknown` (a funding you cannot name is one you must not spend from),
-and an unrecognised `basis` means the same as `unstated` (treat `remaining` as a
-ceiling). Both fall to the conservative side without special handling.
-
-The same applies to the envelope as a whole: this producer adds fields
-additively and without warning, so a decoder that rejects unknown fields
-(`serde(deny_unknown_fields)` and equivalents) turns every future addition into
-an outage on the consumer's side.
-
-### Absent, empty, and present
-
-`spend` absent means this producer has nothing to report about pools — most
-providers, and any provider whose pool fetch failed. `spend: []` means it asked
-and the provider reports none. They are not interchangeable: an absent list is
-silence, an empty one is a statement.
-
-**A pool may carry no `remaining` at all.** That states "this pool exists, and
-the provider did not say how much is in it". Its `basis` is then `unstated`,
-since no remainder was stated. `codex` publishes this shape for an account whose
-plan has credits (`has_credits: true`) but whose balance comes back `null`,
-which is every sample seen from a team account so far. Read it as "credits
-exist, amount unknown", never as zero.
-
-**An entry may carry pools and no windows at all.** A provider that sells only
-credit publishes `usage: {}` beside a non-empty `spend`, and that entry is
-healthy — its whole answer is the balance. Consumers that reduce an account to
-its most constrained window must not treat such an entry as capacity-less or
-malformed.
-
-### `claude`: paid overage as the `extra_usage` pool
-
-A Claude account with extra usage enabled keeps serving past 100% of its
-windows and bills the overage. Without the pool, "every window at 100%" cannot
-be told apart from "still serving, and billing". The overage is published beside
-the windows as one pool:
-
-```json
-"spend": [
-  { "id": "extra_usage", "label": "Extra usage",
-    "funding": "unknown", "basis": "derived", "spendable": true,
-    "total":     { "minor": 10000, "exponent": 2, "unit": "USD" },
-    "remaining": { "minor": 8723,  "exponent": 2, "unit": "USD" } }
-]
-```
-
-- `total` is the overage limit the provider states, and `remaining` is that
-  limit minus the overage used so far. It never goes below zero, even when usage
-  has run past the limit. `basis: derived` because the provider states a limit
-  and a usage figure, not a remainder.
-- `spendable: true` means paid overage is switched on **and** has not reached
-  its spend limit. `false` means one of the two stopped it. The value comes
-  from the provider's own switches, so it can be `false` while `remaining` is
-  above zero. It is absent when the provider did not state both.
-- `funding: unknown` here means **post-paid**: overage is billed after it is
-  used. None of the named kinds describes that, and `purchased` would claim the
-  money was paid in advance. Spending this pool costs money, which is what the
-  conservative reading of `unknown` already assumes.
-- The pool has no reset. The provider states no period for it, so none is
-  published.
-- No pool, and `spend` absent, when the provider sends no overage figures, sends
-  a shape this producer cannot read, or states the limit and usage in different
-  currencies or scales. An account without extra usage is in that group. The
-  windows are published as usual in every one of these cases.
-
-### `codex`: the workspace credit limit as the `individual_limit` pool
-
-Codex team and enterprise workspaces can cap each member's monthly credit
-spend. When the account reports that cap, it is published beside the windows,
-and beside the `credits` pool if there is one, never in place of it:
-
-```json
-"spend": [
-  { "id": "individual_limit", "label": "Workspace credit limit",
-    "funding": "unknown", "basis": "reported",
-    "total":     { "minor": 10000, "exponent": 1, "unit": "credit" },
-    "remaining": { "minor": 7495,  "exponent": 1, "unit": "credit" },
-    "resetsAt": "2026-10-01T00:00:00Z" }
-]
-```
-
-- `total` is the limit the workspace set and `remaining` is what the provider
-  says is left of it, so `basis: reported`. Both are stated at one exponent so
-  they can be compared. `unit` is the provider's own; no pool is published if
-  it names none.
-- `funding: unknown`: an admin-set cap is not a grant, a purchase or a
-  subscription allowance.
-- `spendable: false` when the provider says the limit has been reached.
-  Otherwise it is absent, which is not a promise that the pool can be drawn on.
-- `resetsAt` is the provider's own period end for this limit, rendered like a
-  window's `resetsAt`. It is the only pool here that states one. **A pool
-  without `resetsAt` means the period was not stated, never that the pool does
-  not renew.** Claude's `extra_usage` and Codex's `credits` both carry no reset
-  for that reason. The limit pool is still published when its reset is missing
-  or unreadable, just without `resetsAt`.
-- No pool when the account has no limit (`individual_limit: null`, the usual
-  case outside a team workspace), or when the limit or remainder is missing or
-  unreadable. The windows are published as usual in every one of these cases.
-
-### `jetbrains`: the purchased top-up as the `topUpQuota` pool
-
-JetBrains splits the AI quota into a tariff that refills at `nextRefill` and a
-purchased top-up that does not renew and is drawn only after the tariff is
-spent. The primary window is the **tariff alone**: its `usedPercent`,
-`usedCount` and `totalCount` come from the tariff, and `windowMinutes` is the
-tariff period when the payload states one (`PT720H` is 43200). The top-up is
-published beside it:
-
-```json
-"spend": [
-  { "id": "topUpQuota", "label": "Top-up quota",
-    "funding": "purchased", "basis": "reported",
-    "total":     { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" },
-    "remaining": { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" } }
-]
-```
-
-- A window at 100% with this pool non-empty means the refilling allowance is
-  spent and the account is drawing purchased quota. Before the split the window
-  measured the sum of both parts, so it could not reach 100% while any top-up
-  remained.
-- `unit` is a label, not a currency. JetBrains states no unit for its quota.
-- `funding: purchased`: the top-up is bought. It has no `resetsAt` because it
-  does not renew.
-- No pool, and `spend` absent, when the payload has no `topUpQuota` or states
-  its figures in a form that does not parse exactly. When the payload has no
-  readable `tariffQuota` the window is the summed balance, as before, with no
-  `windowMinutes` and no pool: the sum already contains the top-up.
-
-## 100% used does not mean requests are being refused
-
-`usedPercent` is a **capacity reading**, not an enforcement state. A window at
-100 says the accounting reached the limit; it does not say the next request is
-rejected, and the two genuinely diverge:
-
-- A provider can serve past a reported 100% — soft limits, grace, or an
-  allowance the reported figure does not cover.
-- A provider can refuse *below* 100%, when the enforced cap differs from the one
-  the usage figures are computed against. This is not hypothetical: a plan
-  change can leave the console reporting against the new cap while the edge
-  still enforces the previous one until the window resets.
-
-Only one upstream in this module reports enforcement directly, and it is
-consumed internally rather than published. Everywhere else, a 100% window is
-inferred from counts or percentages, so **no field on this wire states that a
-provider is currently refusing requests**. Do not read one into `usedPercent`.
-
-### `usedPercent` can be lower than what the provider reported
-
-One upstream grants banked quota-reset credits, and this module can spend one on
-your behalf (see `savedResets` below). It spends one in exactly two cases:
-
-- **The account is at its wall**, which means the upstream itself reports the
-  account's limit as reached. A `usedPercent` near 100 is not the wall: the
-  upstream reports whole percentages, so 99 can still hold most of a percent of
-  a weekly window, and a response that does not say whether the limit is
-  reached is treated as not at the wall. Even then the credit is kept while any
-  other account of that provider may have room: one whose fresh reading does
-  not report its limit reached (at any percent), or one that has not been read
-  recently. At most one account redeems at a time, and when several are walled
-  together it is the one whose own reset is furthest away.
-- **A credit is about to expire**, within the configured auto-use window. This
-  happens whether or not the account is at its wall, because an expired credit
-  is lost either way.
-
-While an account holds an unspent credit and is clear of its wall by a margin
-(the upstream affirms the limit is not reached, and every window is below 99%),
-its published `usedPercent` is **zero**, and the figure the provider actually
-reported moves to `rawUsedPercent` on the same window. A window at 99% or more
-is always published as reported.
-
-The split is deliberate and the two fields answer different questions:
-
-- **`usedPercent` is the effective number** — how much headroom this account has
-  in practice, given a reset that is going to happen. Pace, route, and price on
-  this one.
-- **`rawUsedPercent` is what the upstream said** — present only when the two
-  diverge, so its absence means they agree. Show it in a human-facing view where
-  a zero beside real consumption would otherwise look like a bug.
-
-**Do not treat `rawUsedPercent` as the truer number and pace on it.** An account
-with a credit about to be spent genuinely has the headroom the zero claims, and
-routing away from it wastes the credit — which expires whether or not it is
-used.
-
-A consequence worth expecting: **an account can jump from 0% to a high number in
-one poll**, when the credits run out or the conditions for spending one stop
-holding. That is the module reporting honestly again, not a fault. A consumer
-that treats a large single-poll jump as implausible will reject the one reading
-that matters.
-
-### An exhausted window may carry no reset at all
-
-`resetsAt` is optional and is never fabricated. The percent is the load-bearing
-field: a window is emitted from the percent alone, and a reset is carried
-through only when the upstream reports one. **A window at 100% with no
-`resetsAt` is a legal, intended shape**, not a parse failure.
-
-It is also reachable rather than theoretical, and it clusters exactly where it
-hurts most. At least one upstream *moves* its reset timestamp out of the
-exhausted window's block once that window is spent, so the depleted window
-honestly reports no recovery time. Others simply omit it, and dropping such a
-window once made a fully-exhausted account read as no signal at all — which is
-why they are emitted.
-
-The consequence for any logic that sorts or selects on reset time: decide
-explicitly what an absent reset means there, because the answer that falls out
-of a comparator by default is rarely the one you want. Treating absent as
-"soonest" makes a provider with no evidence of recovery win every retry;
-treating it as "never" excludes it from recovery paths permanently rather than
-until it resets. Neither is wrong by construction, but it should be a decision.
-
-A live sample will not reveal this. At any given moment most exhausted windows
-do carry a reset, so a check against today's wire agrees with the assumption
-that one is always present. That agreement is not evidence — the case is
-structurally absent from the sample rather than impossible.
-
-What follows for a consumer: treat 100% as *expect no headroom* rather than
-*calls will fail*, and let the actual API error be what proves refusal. If you
-need enforcement as a fact rather than an inference, ask — it would be an
-explicit optional field with three states (refusing / not refusing / not
-reported), and absence would have to mean unknown rather than false, since for
-most providers here it is genuinely unknown.
-
-## The window slots are positions, not a ranking
-
-A `usage` object carries up to three named slots — `primary`, `secondary`,
-`tertiary` — plus `extraRateWindows`, a list of named windows for anything that
-does not fit three. It is tempting to read `primary` as *the* number for a
-provider. It is not.
-
-**No field on this wire identifies the binding limit. There is no slot, flag, or
-ordering that marks it, and the producer does not compute it.** If you need the
-constraint that actually applies to an account, you must rank the windows
-yourself — every slot and every `extraRateWindows` entry — by whatever policy
-suits you. Taking the maximum `usedPercent` is the usual one.
-
-That is stated positively because the alternative is every consumer inferring it
-from a field name, and a name is a promise people believe without checking. The
-failure is not weighing `primary` and choosing wrong; it is never noticing there
-was a choice.
-
-**`primary` is the provider's shortest window, not its most constrained one.**
-For most upstreams here the slots are filled in cadence order: the session or
-five-hour window lands in `primary`, the weekly in `secondary`. Nothing checks
-that `primary` is the one closest to its limit, and usually it is not — a short
-window refills quickly and reads low most of the time, while the long window
-accumulates.
-
-On this host as this was written, three of the four entries carrying a `primary`
-had a **more used** secondary: one showed `primary 0%` over five hours beside a
-weekly at 36.5%. A consumer reading only `primary` would have seen an idle
-provider that was in fact a third of the way through its week. This is not a
-rare alignment; it is the normal state of a short window.
-
-**An absent slot means that window was not reported, and the slots can have
-holes.** Each is filled from its own optional field on the upstream response, so
-`secondary` can be absent while `tertiary` is present — the account has a
-model-scoped weekly limit and no all-models one, say. Absent never means the
-window exists at zero, and it never means the slots below it are empty either.
-Walk all three and the extras rather than stopping at the first gap.
-
-So for "how much headroom does this account have", take the **maximum**
-`usedPercent` across every slot and every entry in `extraRateWindows`, or apply
-whatever policy you want deliberately. Do not let slot position stand in for a
-judgement about which limit binds.
-
-**Slots and named extras are disjoint.** They were not always: `antigravity` used
-to publish its native Gemini pool as `primary` *and* as a named extra,
-byte-identical, because the slot was a headline pointing at one of the named
-pools rather than an additional limit. A maximum was unaffected, which is why it
-survived; a sum, a mean or a count weighted that pool twice.
-
-The copy is gone. `antigravity` now publishes **only named windows** — one per
-pool per cadence — and no slot at all, so there is nothing to deduplicate.
-
-**That makes it the first provider whose `usage` carries extras and no `primary`,
-and a consumer reading `primary` alone gets nothing for it.** That reading was
-already wrong here: two independent pools cannot be summarised by one window,
-which is why this section asks for the maximum across slots *and* extras. If you
-need a single headline for a provider, take it from that reduction rather than
-from slot position.
-
-### A maximum over an incomplete set is biased downward
-
-That reduction has a property worth stating, because it is the direction that
-costs you: **a window missing from the set can only lower the answer.** Taking a
-maximum over what arrived reports more headroom than the account has, and the
-result looks exactly like a genuine reading — there is no ragged edge, no null,
-nothing to notice.
-
-So the question that matters is what an absent window *means*, and there are two
-kinds:
-
-- **Not reported by the upstream.** Ordinary, described above: the account has no
-  such limit, or the provider does not expose it. Nothing is lost.
-- **Reported but unusable.** A window whose percent cannot be represented is
-  dropped by this module rather than published, because a non-finite number
-  serializes as `null` and would fail a typed decode of the whole array.
-
-Those are indistinguishable on the wire, and the second is the one that biases
-your reading. It is unreachable today — it requires an unguarded division
-upstream of the drop — which is why no field marks it rather than the case being
-impossible.
-
-The same reasoning applies to your own decoder, and is the more likely source:
-if it discards a window it cannot parse, it has converted *unreadable* into
-*absent* and will report a smaller number with full confidence. Prefer marking a
-reading as assembled from an incomplete set over silently narrowing it — the
-figures shown stay true, and the marker is what keeps a partial answer honest
-rather than merely lower.
-
-The slots are also not stable across providers. One provider's `primary` may be
-a five-hour window and another's a monthly one, so `primary` is not comparable
-between providers. Read `windowKind` when present, falling back to
-`windowMinutes` — the window's length — rather than inferring the period from
-its slot.
-
-### The other window fields
-
-Qwen Cloud (`qwen-cloud`) tries the Team Token Plan before the personal plan.
-An active Team plan publishes exactly one named extra, `id: "team"`, `title:
-"Team"`, with all three slots empty. It represents the shared subscription's
-`credit_value` allowance, not the personal plan's rolling token windows. Its
-`usedPercent` is derived as `(total − surplus) / total × 100` only with both
-figures present and a positive total. It carries the stated cycle reset when
-available, but no invented duration/kind, derived counts, or duplicate spend pool.
-Seat allocation is not a second allowance and has no field in this wire schema.
-No active Team plan or a failed Team discovery falls back to personal windows
-(five-hour primary, weekly secondary, monthly primary when alone or the named
-`monthly` extra otherwise). Team refusals (401/403, sign-in redirects and login
-codes) also fall back: permission to call a Team billing API is not proof that a
-personal session has expired. Only the personal path classifies an expired
-session as `credential_rejected`. Request failures never assert that a Team plan
-is absent.
-Team coverage has been checked against test fixtures, not a live Qwen Cloud
-account; no account is available on this host.
-
-`windowMinutes` is the window's length, and it is optional. It is set when the
-upstream states a cadence or the field name implies one; it is absent when the
-upstream reports usage without a stated length (including a calendar month).
-Absent means no stated length — not "unlimited", and not a default worth inventing.
-
-`windowKind` is the period **named by the upstream's own label, key or field**,
-mapped by period onto `hourly`, `five_hour`, `daily`, `weekly`, or `monthly`.
-For example Anthropic's `seven_day` maps to `weekly`. It is optional: absence
-means **not named**, never "some other kind". A numeric duration alone does not
-name a period: Codex's `limit_window_seconds` leaves `windowKind` absent even
-when `windowMinutes` is 300. Consumers needing an unnamed window's period fall
-back to `windowMinutes`. The wire type is an open string so a future unknown kind
-survives decoding; producers here emit only the five vocabulary values.
-
-Ollama's `Monthly usage` publishes `windowKind: "monthly"` with `windowMinutes`
-absent because calendar months vary in length. Its legacy `Session usage` can
-occupy the same slot but names the five-hour allowance (`windowKind: "five_hour"`).
-Use the kind to distinguish them and to match a refusal naming the monthly limit;
-slot position or missing minutes cannot distinguish these windows.
-
-Ollama's API-key lane (`apikey:ollama-cloud`, GET `/api/balance`) describes that
-same included allowance in `primary`, with no named extra copy. It derives
-`usedPercent = min(100, max(0, allowance_usd - balance_usd) / allowance_usd * 100)`
-only when both amounts are stated and allowance is positive. `included.period`
-is an object whose `until` supplies `resetsAt` when parseable; it does not name a
-monthly period, so the API sets neither `windowKind` nor `windowMinutes`. The
-page's `Free usage` label follows that same unnamed-period rule. A key replaces
-the cookie lane, so lanes do not alternate for one handle set; adding/removing a
-key may change kind metadata if the page explicitly says `Monthly usage`.
-
-Ollama's page `Credit balance` and API `purchased.balance_usd` publish a separate
-`spend` pool (`id: "purchased"`, `label: "Credit balance"`, funding `purchased`),
-as exact USD minor units with the decimal exponent preserved. A stated remainder
-has basis `reported`; a present API purchased section with a missing/null amount
-has no remainder and basis `unstated`, never a zero balance. No total, spendable
-flag or refill timestamp is inferred. The page parser/probe also reads `Monthly
-credits used` and relative `Next refill` prose: without a denominator or absolute
-timestamp these cannot become a window/reset. Credits-only pages are valid even
-with no rate window. The new wallet and API parsing is fixture-verified only.
-
-`usedCount` and `totalCount` are the absolute figures behind the percentage,
-carried only where the upstream supplies them, which is a small minority of
-providers. They exist because a percentage alone cannot distinguish a plan whose
-cap changed from one whose usage did. Do not compute one from the other and the
-percent: the percent can be reported directly by the upstream against a cap that
-differs from the one you would divide by.
-
-**Both are whole numbers, always.** They count things — requests, messages,
-tokens — so a fractional value is not a rounding blemish but evidence the number
-was computed rather than measured. The wire type is `f64` for range, not to
-permit fractions. Storing them as integers is correct, and rejecting a
-non-integral one is a reasonable thing for a consumer to do.
-
-**`usedCount` is emitted only where the upstream REPORTS a count.** It is never
-reconstructed from the percentage and the cap. This rule was learned the
-expensive way: this document previously said a recovered count was "a faithful
-recovery of the number the upstream divided", and that was false. Measured on
-the live wire, one upstream returned `45.052361473854994%` against a cap of
-`40000`, and no integer count over that cap produces that percentage — the
-nearest, `18021`, gives `45.0525%`, off by `1.4e-6` where `f64` noise is `1e-17`.
-The console divides by something other than the cap its own endpoint reports. A
-recovered count would therefore have carried a disagreement between two upstream
-endpoints while presenting it as a measurement.
-
-So where you see `totalCount` with no `usedCount`, the cap is known and the
-consumed figure is not; the percentage is the whole signal for consumption. The
-independent signal is `totalCount` alone: watching it change is how a cap change
-becomes visible, which is what these fields were added for.
-
-Each entry in `extraRateWindows` carries an `id` (a stable identifier), a `title`
-(human-facing text), and a `window` — all three optional. Match on `id`; render
-`title`; and handle an entry whose `window` is absent, which is how a provider
-names a limit it could not read a figure for. A window whose meaning has no slot
-— a per-model pool, a scoped weekly — lives here rather than being forced into
-one, so a consumer ignoring `extraRateWindows` silently ignores real limits.
-
-`id` is not unique across providers and is not drawn from any shared vocabulary:
-one provider's ids are model names, another's are its own scope labels. Key on
-`(provider, id)`, never on `id` alone.
-
-That is not a precaution against a coincidence. Two providers here were separate
-products reached through the same Google API and sharing its model catalogue, so
-their identifiers were drawn from one namespace: every model id the former
-`gemini` provider published (`gemini-2.5-flash`, `gemini-2.5-pro`, …) also
-appears in `antigravity`'s upstream response. They didn't collide on the wire
-only because `antigravity` folds its models into pools before publishing, which
-is a property of this module's normalizer rather than of the data. The two
-described different quota pools under different credentials, so a consumer
-keying on `id` alone would have merged them and seen plausible numbers
-throughout. The rule stands for any two providers that share an upstream.
-
-**Nor is it guaranteed stable within a provider.** Where a provider reads one
-account through more than one lane, the lanes can publish different ids for the
-same limit, and which lane answers is decided per fetch.
-
-`antigravity` can read one account through three sources: the matching live
-editor, the vault cloud summary, and the plugin's non-secret sidebar v2 snapshot.
-The plugin lane itself is cache-only, with no cloud fallback. All three publish
-the same bucket identifiers — `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly` —
-with titles derived from cadence. Sidebar ids come from the stable `5h` and
-`weekly` window keys, never display text, and used percentages preserve the
-unrounded `remainingFraction`, not the rounded `remainingPercent`.
-
-The exception is a **fallback that runs only when the summary endpoint refuses**.
-It reads a per-model endpoint that reports one figure per pool with no window
-length, so it cannot produce the same ids: it publishes one window per pool named
-for the pool (`Gemini Models`), with `windowMinutes` absent because the upstream
-states no cadence. That is a genuinely different shape rather than a different
-spelling of the same one, which is why it is not normalised onto the others —
-forcing a match would assert a cadence nobody reported.
-
-So a consumer matching ids for a provider with more than one lane must enumerate
-every lane's form — for `antigravity`, the four bucket ids plus the two pool
-names the fallback uses.
-
-**And match on `id`, not on `title`, even when the titles look stable.** Titles
-here are derived rather than passed through, so two lanes cannot spell one meter
-two ways — but that is a property this module maintains, not a guarantee the
-field carries. A consumer aggregating across accounts by title was silently
-unable to aggregate at all while two lanes disagreed, and the symptom was a
-missing roll-up rather than an error. Enumerate the ids you positively want rather than the ones you
-mean to skip: a skip-list fails **open** on every form nobody thought of, and
-those are exactly the forms that share no vocabulary with the ones that were.
-
-Provenance differs by lane and decides what a producer can promise. Ids this
-module constructs are stable because it controls them, and a change is
-announced. Ids passed through from an upstream are not: a change there is
-observed, not planned, so it arrives on the wire before anyone can warn you.
-`title` is weaker than both — render it, never match on it, and note that a title
-can legitimately carry mutable detail such as a count of the models in a pool.
-
-### `breakdown`: who consumed a window
-
-`breakdown` is optional on every window, and today exactly one window carries
-it: `claude`'s weekly all-models window (the `secondary` slot,
-`windowMinutes: 10080`). No other `claude` window and no other provider
-publishes one. It is read from `seven_day_breakdown` on Anthropic's
-`/api/oauth/usage`.
+| absent | present | served |
+| present | present | a provider call failed; the timestamp is the last success |
+| present | **absent** | the slot never succeeded, or a credential verdict was reached and nothing about earlier readings may be attributed to the credential now in place |
+
+The last row covers a slot whose identity is unverified: a credential that was
+replaced, or one the vault has latched. One failure can pass through both
+degraded rows: a vault credential going bad is first refused by the provider
+(`credential_rejected` beside a frozen `fetchedAt`), and once the vault
+reaches its own verdict this module stops calling the provider
+(`credential_unusable`, no `fetchedAt`). So a class change on one account is not
+necessarily a state change, and a disappearing `fetchedAt` does not mean the
+account never worked; it means nothing here may be attributed to the current
+credential.
+
+**Proven by:** `a_vault_latch_on_an_identity_less_credential_publishes_a_verdict`,
+`entries_for_a_never_successful_slot_have_no_fetched_at`,
+`transient_failure_after_degradation_stays_degraded`.
+
+<a id="recovery-after-a-latch-is-backoff-gated-not-immediate"></a>
+
+### 5.5 Recovery after a credential is repaired
+
+A slot in non-transient backoff is retried after 300 s at the latest. A vault
+credential recovers sooner:
+
+| Repair | When the slot is fetched again |
+|---|---|
+| the vault record is re-sealed (its `record_version` increases) | on the first refresher turn whose vault listing shows the new version |
+| the vault record is reactivated (`needs_reauth` cleared) | on the first turn whose listing shows it reactivated |
+| a vault-backed slot is in non-transient backoff | it also asks the vault for the credential's status once per 60 s, and a replaced record ends the backoff |
+| a cookie or API-key lane, which records no version | after the 300 s backoff |
+
+A record in `needs_reauth` is not fetched at all until it is repaired, so
+continued `credential_unusable` until the vault shows the repair is expected,
+not evidence that the repair failed.
+
+**Proven by:** `replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_backoff`,
+`enumeration_version_and_reactivation_accelerate_while_needs_reauth_suppresses_fetch`,
+`refresh_loop_reactivated_handle_is_admitted_within_one_discovery_interval`,
+`scoped_non_transient_backoff_polls_status_once_per_base_interval`,
+`an_advanced_record_version_clears_non_transient_backoff`.
+
+<a id="the-window-slots-are-positions-not-a-ranking"></a>
+
+## 6. Windows
+
+### 6.1 The window slots are positions, not a ranking
+
+A `usage` object carries up to three slots, `primary`, `secondary` and
+`tertiary`, plus `extraRateWindows`, a list of named windows for anything that
+does not fit three.
+
+**No field identifies the binding limit**, and the producer does not compute
+one. To know how much headroom an account has, take the maximum `usedPercent`
+across every slot and every `extraRateWindows` entry, or apply your own policy
+deliberately.
+
+- **`primary` is usually the shortest window, not the most constrained one.**
+  Most adapters fill slots in cadence order (session or five-hour in `primary`,
+  weekly in `secondary`). A short window refills quickly and often reads low
+  while the weekly window is well used.
+- **Slots can have holes.** Each comes from its own optional upstream field, so
+  `secondary` can be absent while `tertiary` is present. An absent slot means
+  that window was not reported; never that it exists at zero, and never that
+  the slots after it are empty.
+- **Slots and named extras are disjoint.** A limit is published once, either in
+  a slot or as an extra, never both.
+- **A provider may publish only extras.** `antigravity` publishes one named
+  window per pool and cadence and no slot, so a consumer reading `primary`
+  alone gets nothing for it.
+- **Slots are not comparable across providers.** One provider's `primary` may be
+  five hours and another's a month. Read `windowKind`, falling back to
+  `windowMinutes`.
+
+<a id="a-maximum-over-an-incomplete-set-is-biased-downward"></a>
+
+### 6.2 A maximum over an incomplete set is biased downward
+
+A window missing from the set can only lower a maximum, and the result looks
+exactly like a genuine reading. Two kinds of absence exist:
+
+- **not reported by the upstream**: the account has no such limit, or the
+  provider does not expose it. Nothing is lost;
+- **reported but unusable**: a window whose percent cannot be represented is
+  dropped rather than published, because a non-finite number serializes as
+  `null` and would fail a typed decode of the whole array. This requires an
+  unguarded division upstream of the check and is not reachable today.
+
+The same applies to a consumer's own decoder: one that discards a window it
+cannot parse turns *unreadable* into *absent* and reports a smaller number.
+Prefer marking a reading as built from an incomplete set.
+
+<a id="a-window-set-carries-no-completeness-claim"></a>
+
+### 6.3 A clean entry carries every window
+
+There is no per-entry flag saying a window set is complete, because the
+producer guarantees it instead:
+
+- a window set is complete unless the entry carries an error; publishing a
+  subset silently is a defect in this module;
+- a lane that cannot enumerate an account's windows reports that through the
+  error classes (`no_quota_reported` if the upstream states there is nothing,
+  `decode_failed` if its answer could not be read) rather than publishing what
+  it managed to read;
+- so a consumer may treat the windows on an entry without `error` as all of
+  them.
+
+<a id="the-other-window-fields"></a>
+
+### 6.4 Window fields
+
+| Field | Meaning | Absent means |
+|---|---|---|
+| `usedPercent` | share of the window used, 0 to 100; the effective figure after banked-reset relaxation ([6.6](#usedpercent-can-be-lower-than-what-the-provider-reported)) | (always present) |
+| `rawUsedPercent` | what the upstream reported, present only when it differs from `usedPercent` | the two agree |
+| `resetsAt` | when the window resets, as the upstream stated it | no reset was stated ([6.7](#an-exhausted-window-may-carry-no-reset-at-all)) |
+| `windowMinutes` | the window's length, when the upstream states a cadence or its field name implies one | no stated length; never "unlimited" |
+| `windowKind` | the period named by the upstream's own label, key or field: `hourly`, `five_hour`, `daily`, `weekly` or `monthly` | not named; never "some other kind" |
+| `usedCount`, `totalCount` | the absolute figures behind the percentage, where the upstream reports them | not reported |
+| `breakdown` | who consumed the window ([6.5](#breakdown-who-consumed-a-window)) | no split published |
+
+`windowKind` is set only from the upstream's own naming. A numeric duration
+alone does not name a period: Codex's `limit_window_seconds` leaves
+`windowKind` absent even when `windowMinutes` is 300. The wire type is an open
+string; this producer emits only the five values above. A calendar month has no
+fixed length, so a monthly window carries `windowKind: "monthly"` and no
+`windowMinutes`.
+
+`usedCount` and `totalCount` are whole numbers; the wire type is `f64` for
+range only. `usedCount` is published only where the upstream reports a count,
+never reconstructed from the percentage and the cap, because an upstream can
+compute its percentage against a different cap from the one it reports. Do not
+compute one from the other. `totalCount` alone is still useful: a change in it
+is a cap change.
+
+#### Named extra windows
+
+Each `extraRateWindows` entry has an optional `id`, `title` and `window`. Match
+on `id`, render `title`, and handle an entry whose `window` is absent: that is a
+limit the provider named without a readable figure. A consumer that ignores
+`extraRateWindows` ignores real limits.
+
+- **Key on `(provider, id)`, never `id` alone.** Ids are not drawn from a
+  shared vocabulary, and providers sharing an upstream can share ids for
+  different quota pools.
+- **Ids can differ between lanes of one provider.** `antigravity` reads one
+  account through the live editor, the vault cloud summary and the plugin's
+  sidebar snapshot; all three publish `gemini-5h`, `gemini-weekly`, `3p-5h`
+  and `3p-weekly`, with titles derived from cadence. When the summary endpoint
+  refuses, a per-model fallback that states no cadence publishes one window per
+  pool named for the pool (`Gemini Models`) with no `windowMinutes`. A consumer
+  matching ids must accept every lane's form.
+- **Never match on `title`.** It is display text and may carry mutable detail
+  such as a model count. List the ids you want rather than the ones to skip; a
+  skip list passes every form nobody anticipated.
+- Ids this module constructs are stable and change only with notice; ids passed
+  through from an upstream change when the upstream does.
+
+#### Provider-specific window shapes
+
+- **`qwen-cloud`** tries the Team Token Plan before the personal plan. An active
+  Team plan publishes exactly one named extra, `id: "team"`, `title: "Team"`,
+  with all three slots empty. It is the shared subscription's `credit_value`
+  allowance, with `usedPercent` derived as `(total − surplus) / total × 100`
+  only when both figures are present and the total is positive. It carries the
+  stated cycle reset when available, and no invented duration, kind, counts or
+  duplicate spend pool; seat allocation has no field. With no active Team plan,
+  a failed Team discovery, or a Team refusal (401/403, sign-in redirects, login
+  codes), it publishes personal windows: five-hour `primary`, weekly
+  `secondary`, and monthly as `primary` when alone or as the named `monthly`
+  extra otherwise. Only the personal path reports an expired session as
+  `credential_rejected`. Team coverage is fixture-verified only.
+- **`ollama`** page lane: `Monthly usage` publishes `windowKind: "monthly"` with
+  no `windowMinutes`; a legacy `Session usage` block in the same slot names the
+  five-hour allowance (`windowKind: "five_hour"`). Use the kind, not the slot,
+  to tell them apart. The page's `Free usage` label and the API-key lane
+  (`apikey:ollama-cloud`, `GET /api/balance`) name no period, so they set
+  neither `windowKind` nor `windowMinutes`. The API lane publishes the included
+  allowance in `primary` with
+  `usedPercent = min(100, max(0, allowance_usd - balance_usd) / allowance_usd * 100)`
+  only when both amounts are stated and the allowance is positive, and takes
+  `resetsAt` from `included.period.until` when parseable. A key replaces the
+  cookie lane for that account. `Monthly credits used` and relative
+  `Next refill` prose have no denominator or absolute time and are not
+  published as a window or reset.
+
+**Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
+`a_page_with_monthly_and_session_blocks_publishes_both`,
+`active_team_plan_publishes_one_distinct_credit_window`,
+`a_monthly_window_beside_the_rolling_windows_is_an_extra`.
+
+<a id="breakdown-who-consumed-a-window"></a>
+
+### 6.5 `breakdown`: who consumed a window
+
+`breakdown` is optional on every window. Today only `claude`'s weekly
+all-models window (`secondary`, `windowMinutes: 10080`) carries it, read from
+`seven_day_breakdown` on Anthropic's `/api/oauth/usage`.
 
 ```json
 "breakdown": {
@@ -1420,395 +652,556 @@ publishes one. It is read from `seven_day_breakdown` on Anthropic's
 }
 ```
 
-**`sharePercent` is a share of consumption, not a used-percent.** Across rows it
-sums to about 100 whatever the window's `usedPercent`: a window 85% used whose
-consumption was all Claude Code reads 100 on `claude_code`, not 85. The part of
-`usedPercent` a surface accounts for is `usedPercent * sharePercent / 100`.
-Every published share is in 0..=100; the wire-sanity checker reports any that
-is not.
+- **`sharePercent` is a share of consumption, not a used percent.** Rows sum to
+  about 100 whatever the window's `usedPercent`; the part of `usedPercent` a
+  surface accounts for is `usedPercent * sharePercent / 100`. Every published
+  share is within 0..=100.
+- **`key` is the upstream's category key, verbatim** and open-ended. Handle
+  keys you do not know. The upstream's `display_name` is not carried; a row
+  without a key is dropped.
+- **Absence means unpublished, never zero.** No `breakdown` means the upstream
+  sent none, sent one this module could not read, or sent no usable rows. A row
+  without `sharePercent` had no usable figure. A malformed split never fails
+  the fetch. `asOf` (when the split was computed) and `windowStartedAt` (when
+  its window began, which places a split relative to a reset) are each omitted
+  when unstated.
+- Which key traffic from third-party OAuth clients is attributed to is not
+  documented by Anthropic; do not build on a mapping without confirming it for
+  your own traffic.
 
-**`key` is the upstream's own category key, verbatim.** It is never mapped or
-renamed, and it is not an enum: a category Anthropic adds arrives as itself, so
-handle keys you do not know rather than rejecting the window. The upstream's
-human-facing `display_name` is not carried; render from `key`. A row the
-upstream sent without a key is dropped.
+**Proven by:** `a_breakdown_row_without_a_percent_publishes_no_share_not_zero`,
+`a_malformed_breakdown_publishes_no_split_and_leaves_the_windows_alone`.
 
-**Absence means unpublished, never zero.** No `breakdown` on the weekly window
-means the upstream sent no split, sent one this module could not read, or sent
-one with no usable rows; it never means nothing was consumed. Likewise a row
-without `sharePercent` means the upstream gave that surface no usable figure
-(missing, non-numeric, or outside 0..=100), not a share of 0. A malformed split
-never fails the fetch: the windows publish without it. `asOf` (when the split
-was computed) and `windowStartedAt` (when the window it describes began, which
-tells you which window a split belongs to across a reset) are each omitted when
-unstated.
+<a id="100-used-does-not-mean-requests-are-being-refused"></a>
 
-**Which surface third-party OAuth clients land in is not confirmed.** Traffic
-from clients such as OpenCode, authenticating through anthropic-auth with a
-Claude subscription, is attributed by Anthropic to one of these keys, and
-which one is not documented. This host's accounts, used through such a client,
-read `claude_code` 100, which fits attribution to `claude_code` but does not
-prove it. Do not build on that mapping without confirming it for your own
-traffic.
+### 6.6 100% used does not mean requests are being refused
 
-### Fields on the account, not the window
+`usedPercent` is a capacity reading, not an enforcement state. A provider can
+serve past a reported 100% (soft limits, grace, an allowance the figure does
+not cover), and can refuse below it (an enforced cap that differs from the one
+the figure is computed against, for example after a plan change). **No field on
+this wire states that a provider is refusing requests.** Treat 100% as *expect
+no headroom* and let the provider's own error prove refusal.
 
-`accountInfo` carries `email`, `orgName` and `planType`, each optional and each
-present only when the upstream identifies the account that way. They are
-display- and grouping-only: nothing in this module derives behaviour from them,
-and `planType` in particular is the upstream's own label rather than a
-normalised vocabulary, so it is not comparable across providers.
+<a id="usedpercent-can-be-lower-than-what-the-provider-reported"></a>
 
-For Claude it can also carry optional `subscriptionRenewsAt` and
-`subscriptionEndsAt`. Renewal is the next subscription charge for an active or
-trialing subscription with no scheduled end; end is the scheduled end of an
-active, trialing or canceled subscription. An end takes precedence: a leftover
-next-charge value is not published as renewal. These are billing metadata, not
-quota resets, API credit balances, or account identity. Each value is an RFC 3339
-date-time, or a full date `YYYY-MM-DD` when upstream supplies only a day. Preserve
-that date-only meaning; do not convert it to a midnight timestamp.
+#### `usedPercent` can be lower than what the provider reported
 
-Dates enrich the existing OAuth row only after the deposited claude.ai session's
-owner and organization match the owner obtained from that row's OAuth bearer.
-The suffix selects the candidate cookie but proves nothing. Billing fetches run
-in the background at most once an hour per account; a cold poll may have no
-dates until a subsequent poll. A failed/unreadable dates fetch leaves them absent
-or retains the last good answer for the same credential binding, never changing
-usage windows or `errorClass`. A changed or unverifiable authenticated principal
-or organization on either the OAuth or web-session side withholds dates.
+Codex grants banked quota-reset credits (`savedResets`), and when
+`codex.auto_use_resets` is configured this module may spend one. It spends one
+in exactly two cases:
 
-**`accountInfo` can be present while `account` is absent, and the pair must not
-be used as one another's proxy.** They are gated differently on purpose:
-`account` is the identity this module VERIFIED for the fetch unit. It is withheld
-from every account of a provider when a handle that is SERVING USAGE resolves no
-identity, because that handle may be one of the labeled accounts reached by a
-second credential, and publishing both would state one account's capacity twice.
-A handle that resolves no identity and serves no usage does not force that: it
-publishes as one unlabeled entry beside its labeled siblings, since an entry with
-no usage cannot be double-counted. `accountInfo` is
-descriptive metadata, not an identity key. Email/org/plan labels ride along
-unverified; Claude's subscription dates have the additional owner check described
-above, but must not be used to reconstruct identity either.
+- **the account is at its wall**: the upstream itself reports the limit as
+  reached. A `usedPercent` near 100 is not the wall, and a response that does
+  not say whether the limit is reached is treated as not at the wall. Even then
+  the credit is kept while any other account of the provider may have room: one
+  whose fresh reading does not report its limit reached, or one not read
+  recently. At most one account redeems at a time; among several walled
+  accounts it is the one whose own reset is furthest away;
+- **a credit is about to expire**, within the configured window, whether or not
+  the account is at its wall, because an expired credit is lost either way.
 
-So an unlabeled entry can carry an email — that is reachable today, not
-theoretical. Do NOT key on it, join on it, or use it to reconstruct the identity
-the `account` field is withholding: the entry is one representative of several
-handles selected by freshness, so its email names the account whose numbers are
-published while the other handles' accounts are not represented at all. Reading
-it as the identity would attribute one account's windows to a set of accounts
-this response is deliberately declining to enumerate. Render it; never resolve
-with it.
+While an account holds an unspent credit and is clear of its wall by a margin
+(the upstream affirms the limit is not reached and every window is below 99%),
+its published `usedPercent` is **zero**, and the upstream's figure moves to
+`rawUsedPercent`. A window at 99% or more is always published as reported. The
+relaxation is applied at read time and only to a fresh, healthy entry.
 
-`savedResets` describes banked quota-reset credits published by Codex and Claude.
-`availableCount` is how many are held, `soonestExpiresAt` when the next
-one lapses, and `credits` lists each with its own `expiresAt`. They are granted
-to **one account**, never to a provider — see the field-scope table below.
+- `usedPercent` is the effective number: pace, route and price on it.
+- `rawUsedPercent` is what the upstream said: show it where a zero beside real
+  consumption would look like a bug. Do not pace on it; routing away from an
+  account with a credit to spend wastes the credit.
+- An account can jump from 0% to a high number in one poll when its credits run
+  out or the conditions stop holding. That is a correct reading.
 
-Claude's inventory is **display-only**: there is no known redemption path. It
-never relaxes Claude's rate windows; `rawUsedPercent` and reset relaxation remain
-Codex-only. Paused, future, expired, or ineligible Claude grants are not counted;
-`usable_now` does not change the saved inventory. Credits without a stated expiry
-contribute to `availableCount` but have no expiry row to publish.
+Claude also publishes a `savedResets` inventory, but it is display-only: no
+redemption path is known, and Claude windows are never relaxed.
 
-Its absence means this account has no credit inventory to report — either the
-upstream does not grant them, or the lookup did not succeed on that fetch. It
-does **not** mean zero credits are held, and an entry can carry usage normally
-while omitting it, because the inventory lookup is separate from the usage fetch
-and is allowed to fail without degrading the entry. `soonestExpiresAt` is absent
-when no credit has a stated expiry, which is not the same as none expiring soon.
+**Proven by:** `relaxation_is_read_time_only_and_expires_at_the_freshness_horizon`,
+`degraded_slots_and_other_providers_never_relax`,
+`real_codex_account_spends_its_reset_only_once_its_limit_is_reported`,
+`an_absent_limit_reached_is_not_the_wall`,
+`a_walled_account_withholds_when_sibling_is_stale_or_unaffirmed`,
+`the_expiry_trigger_still_spends_on_an_account_not_at_its_wall`,
+`redemption_journal_reuses_pending_id_after_restart`.
 
-## Sibling keys on the envelope may be invisible to you
+<a id="an-exhausted-window-may-carry-no-reset-at-all"></a>
 
-`completeProviders` sits beside `result` on the `usage.get` envelope, and this
-module adds envelope-level keys rather than new operations so existing callers
-keep working. That reasoning holds for a consumer that reads the envelope. **Not
-every consumer does.**
+### 6.7 An exhausted window may carry no reset at all
 
-Somewhere between the socket and the code that would use it, a consumer narrows
-the response to the array. **Wherever that happens, everything beside `result` is
-gone from that point on** — not ignored, but absent from the value being passed
-along. That is a different situation from ignoring a key: adopting one later
-means changing the layer that narrows, which is rarely the layer that wants the
-data.
+`resetsAt` is never fabricated. A window is published from its percent alone,
+and a reset only when the upstream reports one, so **a window at 100% with no
+`resetsAt` is a legal shape**. At least one upstream moves the reset out of an
+exhausted window's block, and others omit it. A live sample rarely shows this
+case, which is not evidence that it cannot occur.
 
-The narrowing is not always in the transport, and looking only there gives a
-false all-clear. Two real shapes among current consumers:
+Any logic that sorts or selects on reset time must decide what an absent reset
+means. Treating it as "soonest" makes a provider with no evidence of recovery
+win every retry; treating it as "never" excludes it from recovery permanently.
 
-- A shared request helper unwraps `{"result": ...}` and hands the bare array
-  onward, so nothing downstream ever sees the envelope.
-- The transport decodes the whole body faithfully, and a **classify or mapping**
-  step then takes `envelope["result"]` and passes only the deserialized entries
-  inward. The envelope was reachable and stopped being so one layer in.
+<a id="spend-is-money-and-it-fails-in-the-opposite-direction-from-a-window"></a>
 
-Both are harmless for a display-only consumer. Neither is harmless for anyone
-reconciling stored account sets, because `completeProviders` is the only thing
-that authorises deleting a stored account — a provider missing from the array is
-otherwise indistinguishable from one whose accounts are temporarily withheld.
+## 7. Spend pools
 
-So the check is **not** "do I use `completeProviders`", and not "does my
-transport read the envelope" either. It is: **trace one response from the socket
-to the code that would act on it, and find the first place the object becomes an
-array.** Everything past that point is working from a value that cannot answer
-the question, however faithfully the bytes were decoded upstream.
+Some providers sell credit beside a plan, or instead of one. Credit is an
+amount with no period (no percentage, no reset, no window length), so it is
+published separately as `spend`, never as a window:
 
-The answer then sorts into three cases, and only the last is expensive:
+```json
+"spend": [
+  { "id": "granted_balance",   "label": "Granted credit",
+    "funding": "granted",   "basis": "reported",
+    "remaining": { "minor": 0,    "exponent": 2, "unit": "CNY" } },
+  { "id": "topped_up_balance", "label": "Purchased credit",
+    "funding": "purchased", "basis": "reported",
+    "remaining": { "minor": 2402, "exponent": 2, "unit": "CNY" } }
+]
+```
 
-1. **Nothing narrows** — the envelope reaches the code that acts. Nothing to do.
-2. **Something you own narrows** — a private helper with callers you control.
-   Adopting a key is a local change in a file you already edit.
-3. **Something you do not own narrows** — a shared client or library. Adoption
-   means changing code other consumers depend on, and the moment you need it is
-   the moment you are about to prune stored accounts.
+Over-consuming a window gets an account throttled until it resets.
+Over-consuming a balance gets it **billed**, so nothing in a pool is a
+percentage and nothing carries a window's semantics.
 
-Worth locating yourself precisely, because the second and third look identical
-from the inside — both answer "no, I cannot see it today" — and they differ by
-an order of magnitude in what adoption costs. A consumer in the second case
-reporting that they "cannot see envelope keys" can leave a genuinely third-case
-consumer believing their situation is equally cheap.
+<a id="amounts-are-integer-minor-units"></a>
 
-## Which field to key on
+### 7.1 Amounts are integer minor units
 
-Two fields name the provider and they are **different namespaces**:
+`{ minor: 2402, exponent: 2, unit: "CNY" }` is 24.02 CNY: `minor / 10^exponent`.
+Compare in minor units; binary floats cannot hold decimal amounts exactly.
+`unit` is a free string: a currency code where the provider states one,
+otherwise the provider's own word for its credits. **Two pools are not
+comparable because both carry an amount.**
 
-- `provider` is this module's own name for the upstream, inherited from the
-  reference implementation the adapters were ported from.
-- `apiProvider` is the canonical slug, and is present only where a canonical
-  counterpart exists — it is `null` for roughly a third of entries.
+<a id="funding-says-what-a-pool-costs-to-spend"></a>
 
-Decide which namespace your lookup key is in and key on that field. A key from
-one namespace matched against the other does not fail loudly; it simply matches
-nothing, and an entry that never matches is indistinguishable from a provider
-that published no signal.
+### 7.2 `funding` says what a pool costs to spend
 
-**A wrong guess can land on a real entry rather than on nothing**, which is the
-case worth guarding against, because it produces a confident wrong answer. Two
-entries here carry names close enough to be mapped into each other by hand:
+| value | meaning |
+| --- | --- |
+| `granted` | given by the provider; spending it costs nothing |
+| `purchased` | bought; spending it costs money |
+| `subscription` | included in a plan already paid for |
+| `unknown` | the provider separates this pool but does not say what funds it |
+
+`unknown` is a correct answer, not a failure, and it is also how an
+unrecognised value from a newer producer should decode. "Spend only free
+credit" must mean *only pools stated as `granted`*, never *everything not
+stated as `purchased`*.
+
+<a id="basis-says-whether-remaining-is-exact"></a>
+
+### 7.3 `basis` says whether `remaining` is exact
+
+| value | meaning |
+| --- | --- |
+| `reported` | the provider states this pool's remainder directly — exact |
+| `derived` | computed against a consumption figure covering several pools — a **ceiling** |
+| `unstated` | not stated, or a value this consumer does not recognise — treat as a **ceiling** |
+
+Providers often report grants per pool and consumption against their sum,
+which makes a per-pool remainder underivable.
+
+<a id="spendable-and-what-absence-means"></a>
+
+### 7.4 `spendable`, and what absence means
+
+`spendable` is read from the provider, never inferred from `remaining > 0`: a
+pool can be non-empty and closed. When it is absent the provider did not say:
+
+| Reader | Treat absent as | Why |
+| --- | --- | --- |
+| about to spend | **not spendable** | spending from a closed pool costs money and cannot be undone |
+| rendering to a person | **unknown** | hiding a live pool misleads someone who could act on it |
+
+<a id="decode-funding-and-basis-permissively"></a>
+
+### 7.5 Decode `funding` and `basis` permissively
+
+Both sets will gain values. Decode them as strings or as an enum with a
+catch-all. A strict decode of one pool's `funding` fails the whole entry and
+takes the account's rate windows with it. An unrecognised `funding` means the
+same as `unknown`, and an unrecognised `basis` the same as `unstated`; both
+land on the conservative side without special handling.
+
+<a id="finding-out-what-your-build-cannot-decode"></a>
+
+### 7.6 Finding out what your build cannot decode
+
+The wire types live in the `cortexkit-provider-usage` crate, tagged per release
+in `cortexkit/commons`. To see what changed since the version you decode
+against:
+
+```
+git diff cortexkit-provider-usage-v<yours>..cortexkit-provider-usage-v<latest> \
+  -- crates/cortexkit-provider-usage/src/lib.rs
+```
+
+<a id="absent-empty-and-present"></a>
+
+### 7.7 Absent, empty, and present
+
+- `spend` **absent**: nothing to report about pools, either because the
+  provider has none or because the pool fetch failed. Silence.
+- `spend: []`: the provider was asked and reports none. A statement.
+- **A pool with no `remaining`**: the pool exists and the provider did not say
+  how much is in it; its `basis` is `unstated`. Read it as "credits exist,
+  amount unknown", never as zero. `codex` publishes this shape for an account
+  whose plan has credits but whose balance is `null`.
+- **Pools and no windows**: a provider that sells only credit publishes
+  `usage: {}` beside a non-empty `spend`, and the entry is healthy.
+- **A pool without `resetsAt`** means the period was not stated, never that the
+  pool does not renew.
+
+**Proven by:** `a_null_balance_publishes_a_pool_with_no_amount_and_no_basis`,
+`an_absent_has_credits_publishes_no_pool`, `deepseek_pools_are_reported_not_derived`.
+
+<a id="claude-paid-overage-as-the-extra_usage-pool"></a>
+
+### 7.8 `claude`: paid overage as the `extra_usage` pool
+
+A Claude account with extra usage enabled keeps serving past 100% of its
+windows and bills the overage, published as one pool beside the windows:
+
+```json
+"spend": [
+  { "id": "extra_usage", "label": "Extra usage",
+    "funding": "unknown", "basis": "derived", "spendable": true,
+    "total":     { "minor": 10000, "exponent": 2, "unit": "USD" },
+    "remaining": { "minor": 8723,  "exponent": 2, "unit": "USD" } }
+]
+```
+
+- `total` is the stated overage limit; `remaining` is that limit minus the
+  overage used, never below zero. `basis: derived`, because the provider states
+  a limit and a usage figure, not a remainder.
+- `spendable: true` means overage is switched on **and** has not reached its
+  limit; `false` means one of the two stopped it, which can happen while
+  `remaining` is above zero. Absent when the provider did not state both.
+- `funding: unknown` here means post-paid: billed after use. Spending it costs
+  money, which is what the conservative reading of `unknown` already assumes.
+- No reset: the provider states no period.
+- No pool, and `spend` absent, when the provider sends no overage figures, a
+  shape this producer cannot read, or a limit and usage in different currencies
+  or scales. The windows are published as usual.
+
+**Proven by:** `captured_overage_account_publishes_one_extra_usage_pool`,
+`disabled_overage_is_not_spendable`.
+
+<a id="codex-the-workspace-credit-limit-as-the-individual_limit-pool"></a>
+
+### 7.9 `codex`: the workspace credit limit as the `individual_limit` pool
+
+Codex team and enterprise workspaces can cap each member's monthly credit
+spend. When the account reports that cap, it is published beside the windows
+and beside any `credits` pool:
+
+```json
+"spend": [
+  { "id": "individual_limit", "label": "Workspace credit limit",
+    "funding": "unknown", "basis": "reported",
+    "total":     { "minor": 10000, "exponent": 1, "unit": "credit" },
+    "remaining": { "minor": 7495,  "exponent": 1, "unit": "credit" },
+    "resetsAt": "2026-10-01T00:00:00Z" }
+]
+```
+
+- `total` is the workspace's limit and `remaining` what the provider says is
+  left, at one exponent. `unit` is the provider's own; no pool is published if
+  it names none.
+- `funding: unknown`: an admin-set cap is not a grant, a purchase or a
+  subscription allowance.
+- `spendable: false` when the provider says the limit is reached; otherwise
+  absent, which is not a promise that the pool can be drawn on.
+- `resetsAt` is the provider's period end for the limit. The pool is still
+  published, without `resetsAt`, when the reset is missing or unreadable.
+- No pool when the account has no limit (`individual_limit: null`) or the limit
+  or remainder is missing or unreadable.
+
+**Proven by:** `a_populated_individual_limit_publishes_a_pool_with_its_reset`,
+`a_null_individual_limit_publishes_no_pool_and_keeps_the_windows`,
+`a_reached_limit_marks_the_pool_unspendable`,
+`an_unreadable_reset_publishes_the_pool_without_one`.
+
+<a id="jetbrains-the-purchased-top-up-as-the-topupquota-pool"></a>
+
+### 7.10 `jetbrains`: the purchased top-up as the `topUpQuota` pool
+
+JetBrains splits AI quota into a tariff that refills at `nextRefill` and a
+purchased top-up that does not renew and is drawn only after the tariff is
+spent. The primary window is the **tariff alone** (its `usedPercent`,
+`usedCount`, `totalCount`, and `windowMinutes` when the payload states a
+period: `PT720H` is 43200). The top-up is a pool:
+
+```json
+"spend": [
+  { "id": "topUpQuota", "label": "Top-up quota",
+    "funding": "purchased", "basis": "reported",
+    "total":     { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" },
+    "remaining": { "minor": 207000000, "exponent": 3, "unit": "jetbrains-ai-quota" } }
+]
+```
+
+- A window at 100% beside a non-empty pool means the refilling allowance is
+  spent and the account is drawing purchased quota.
+- `unit` is a label, not a currency.
+- No pool, and `spend` absent, when the payload has no `topUpQuota` or states
+  it in a form that does not parse exactly. Without a readable `tariffQuota`
+  the window is the summed balance, with no `windowMinutes` and no pool.
+
+**Proven by:** `a_spent_tariff_reads_full_while_the_top_up_stays_untouched`,
+`an_unreadable_top_up_publishes_no_pool_and_leaves_the_window`.
+
+### 7.11 `ollama`: the credit balance as the `purchased` pool
+
+The page's `Credit balance` and the API's `purchased.balance_usd` publish a
+pool `id: "purchased"`, `label: "Credit balance"`, funding `purchased`, in exact
+USD minor units. A stated remainder has basis `reported`; an API `purchased`
+section with a missing or null amount has no remainder and basis `unstated`,
+never a zero balance. No total, `spendable` flag or refill time is inferred.
+A page with credits and no rate window is valid.
+
+<a id="fields-on-the-account-not-the-window"></a>
+
+## 8. Account fields and keys
+
+### 8.1 Fields on the account, not the window
+
+| Field | Meaning |
+|---|---|
+| `account` | the account id this module **verified** for the fetch; absent when unverified or when the provider exposes no identity |
+| `accountInfo` | optional `email`, `orgName`, `planType`, and for Claude `subscriptionRenewsAt` / `subscriptionEndsAt`; descriptive only |
+| `source` | the lane that produced the reading ([8.2](#82-source-says-how-a-reading-was-obtained)) |
+| `savedResets` | banked quota-reset credits held by this account |
+
+**`accountInfo` is not an identity.** Nothing in this module derives behaviour
+from it, and `planType` is the upstream's own label, not comparable across
+providers. It can be present while `account` is absent: `account` is withheld
+from every account of a provider when a handle that is serving usage resolves
+no identity, because that handle may be one of the labelled accounts reached
+through a second credential. The single unlabelled entry then published may
+carry an email, which names whichever account's numbers were selected, not the
+set the entry stands for. Render it; never key, join or resolve identity on it.
+
+**Claude subscription dates.** `subscriptionRenewsAt` is the next charge of an
+active or trialing subscription with no scheduled end; `subscriptionEndsAt` is
+the scheduled end of an active, trialing or cancelled one, and takes precedence.
+Each is an RFC 3339 date-time, or a date `YYYY-MM-DD` when the upstream gives
+only a day; preserve that meaning rather than converting it to midnight. They
+are billing metadata, not quota resets. They are added to the OAuth entry only
+after the deposited claude.ai session's owner and organization match the owner
+of that entry's OAuth bearer; the deposit's id suffix selects a candidate but
+proves nothing. They are fetched in the background at most hourly per account,
+so a cold poll may lack them; a failed fetch leaves them absent or keeps the
+last good answer for the same credential, and never changes windows or
+`errorClass`. A changed or unverifiable owner withholds them. This path is
+fixture-verified only.
+
+**`savedResets`** carries `availableCount` (credits held), `soonestExpiresAt`
+(the next expiry) and `credits` (each with its own `expiresAt`). Credits are
+granted to one account, never to a provider. Codex credits can be redeemed by
+this module ([6.6](#usedpercent-can-be-lower-than-what-the-provider-reported));
+Claude's inventory is display-only and counts only grants usable now (paused,
+future, expired and ineligible grants are excluded). A credit without a stated
+expiry counts toward `availableCount` with no expiry row. **Absent
+`savedResets` does not mean zero credits**: the inventory lookup is separate
+from the usage fetch and may fail without degrading the entry.
+`soonestExpiresAt` absent means no credit has a stated expiry.
+
+### 8.2 `source` says how a reading was obtained
+
+| value | how the credential was obtained | what fixes it when it stops working |
+| --- | --- | --- |
+| `vault` | served by the credential vault | re-authenticate that vault record |
+| `oauth` | an OAuth token or session found on this machine | log in with the tool that owns it |
+| `api` | an API key from the environment or a config file | supply or replace the key |
+
+The set is open. `source` is observability only: one account read through two
+lanes (a local file and a vault credential) can publish `vault` on one poll and
+`oauth` on the next with nothing changed. Never key on it or alert on a change.
+`account` must not change with the lane; `source` may.
+
+**Cookie providers publish `vault`.** Providers that read quota from a
+logged-in web page take their session cookie only from a vault deposit
+([11.5](#depositing-a-session-cookie-which-url-to-capture-against)). A host with
+no deposit has no lane for such a provider: it is unconfigured, not a
+`credential_absent` entry. `cursor` can also serve from Cursor's own sign-in on
+the machine and publishes `oauth` then. The value `cookie`, published by
+earlier releases that read browser stores, is retired.
+
+Identity for a provider with two lanes is resolved independently of the lane
+that fetched, and only on proof: `cursor`'s deposited session and its local
+store each name a user id, and the email is attached only when the two ids are
+equal.
+
+**Proven by:** `every_cookie_provider_publishes_the_vault_source_label`,
+`identical_readings_publish_a_stable_source_label`,
+`adapter_distinguishes_absent_label_from_unavailable_observation`.
+
+<a id="which-field-to-key-on"></a>
+
+### 8.3 Which field to key on
+
+Two fields name the provider, in different namespaces:
+
+- `provider` is this module's own name for the upstream;
+- `apiProvider` is the canonical models.dev slug, present only where one
+  exists.
+
+Key on the field whose namespace your lookup uses. A key from one namespace
+matched against the other matches nothing silently, or worse, lands on a
+different real entry:
 
 | `provider` | `apiProvider` | what it is |
 |---|---|---|
 | `alibaba` | `alibaba-coding-plan` | the coding-plan subscription |
 | `qwen-cloud` | `alibaba-token-plan` | the token-plan console |
 
-They are separate upstreams with separate credentials, and on a host holding one
-and not the other, a lookup landing on the wrong one reads as a permanently
-degraded provider — a steady "no signal" for a provider that is in fact serving
-full windows under the other name. Prefer the published `apiProvider` over any
-local table: a hand-rolled map is a copy of this one that nothing keeps in step.
+`alibaba` and `qwen-cloud` are separate upstreams with separate credentials.
+Prefer the published
+`apiProvider` over a local mapping table.
 
-## Sizing a staleness threshold
+**Proven by:** `every_api_provider_key_names_a_registered_provider`.
 
-A threshold below the refresh cadence reports a healthy provider as stale for
-most of every cycle, and does it to **every** provider at once, so it looks like
-a producer-wide outage rather than a threshold that is too tight.
+<a id="sibling-keys-on-the-envelope-may-be-invisible-to-you"></a>
 
-A slot is refetched every 60 seconds after its last success, and a fetch may run
-up to 35 seconds before it is abandoned. So the oldest a `fetchedAt` gets while
-everything is working is those two added together, and a threshold has to clear
-the sum, not the interval alone.
+### 8.4 Sibling keys on the envelope may be invisible to you
 
-Measured on a healthy host, sampling the deployed module: entry ages span 1–62
-seconds and average 32. A consumer calling anything older than 30 seconds stale
-sees a live signal on **45%** of reads; at 60 seconds, 97%; at 90 seconds and
-beyond, 100%. Under 120 seconds — the same figure this module uses internally,
-for this reason — a healthy provider never reads stale.
+`completeProviders` sits beside `result` on the envelope, and this module adds
+envelope keys rather than new operations. A consumer that narrows the response
+to the array (a request helper that unwraps `result`, or a mapping step that
+passes only `envelope["result"]` inward) loses every sibling key from that
+point on.
 
-**Sidebar-backed readings can legitimately age past the poll-based threshold.**
-Antigravity's plugin polls quota and publishes a non-secret sidebar v2 snapshot.
-A quota group is served only with an observation `checkedAt` no more than
-3600 seconds old; an undated group means no reading yet. Groups age independently,
-so a fresh sibling still serves when another is stale. `fetchedAt` carries the
-**oldest served group's `checkedAt`**, never the top-level publication clock or
-our file-read time. Windows without a source fraction are not invented.
+That is harmless for a display-only consumer and not for one that reconciles
+stored accounts, because `completeProviders` is the only thing that authorises
+deleting one. Trace one response from the socket to the code that would act on
+it and find where the object first becomes an array. If nothing narrows it,
+nothing to do; if code you own narrows it, adopting a key is local; if a shared
+library narrows it, adoption means changing code other consumers depend on.
 
-For the vault lane, `tier.paidId` present and not `free-tier` is positive paid-tier
-evidence: a matching fresh sidebar outranks the cloud's different standard pool.
-An absent tier is unknown, not paid; free and unknown tiers may still use the
-cloud. A sidebar read error is transient, never an empty roster that prunes
-accounts. Unsupported versions (including v1) require a plugin update.
+<a id="an-absent-account-is-never-a-statement-that-the-account-is-gone"></a>
 
-The 3600-second bound is also recorded by astrocyte at its `window_sample` insert
-site: over-age sidebar readings are withheld, not published as older values.
-Changing `CACHED_QUOTA_MAX_AGE` requires coordinating that cross-repository fact.
-Stamping a poll or publication time would assert freshness we cannot support;
-the observation time lets consumers apply their own thresholds honestly.
+## 9. Accounts and completeness
 
-What this means for a threshold: **an entry aging past your bound is a reason to
-DISCOUNT a reading, never to conclude the producer is failing.** Health is the
-surface that answers the second question, and it reads `ok` throughout. If you
-need the distinction per-entry, `stale` is present exactly when a reading is
-being preserved through failures and absent on a cache-served entry, which is
-healthy and simply older than a poll.
+### 9.1 An absent account is never a statement that the account is gone
 
-This is a floor rather than a period: it is time since the last *success*, so a
-provider retrying through failures legitimately ages past it. That is the
-signal working, not the threshold being wrong, and
-[the freshness section](#freshness-comes-from-the-producer-never-from-the-poll)
-covers what to do with it.
+An entry is per account, so a provider can publish some accounts and omit
+others in one response, with nothing marking the response as partial:
 
-**Prefer the disclosure to the threshold where you have it.** An entry preserved
-through an ongoing failure now says so directly, which answers the question a
-wall-clock threshold can only approximate:
+- **a labelled sibling is withheld**: its identity became unverified, so its
+  entry is cleared while the others stay labelled;
+- **a new account briefly collapses the provider**: a credential added for a
+  second account has no identity until its first fetch completes; if that fetch
+  succeeds before the identity resolves, the provider publishes one unlabelled
+  entry until it settles;
+- **labelled entries beside one unlabelled entry**: one credential of a
+  multi-account provider fails while the others serve. The failing one is a
+  single unlabelled entry carrying its error and no usage, and its siblings
+  keep their names. A handle whose credential was deleted while the handle
+  remains configured reaches the same shape and does not clear on its own.
 
-```json
-"fetchedAt": "2026-08-13T10:00:00Z",
-"stale": { "since": "2026-08-13T10:02:00Z", "class": "upstream_failed" }
-```
+There is never more than one unlabelled entry per provider. Summing capacity is
+unaffected (the unlabelled failing entry carries no usage); counting accounts
+from entries overcounts, so count entries that carry an `account`. The health
+metric `handlesWithoutAccount` names providers in the third shape.
 
-`fetchedAt` is when the served reading was obtained. `since` is when the producer
-first failed to refresh it. **The gap between them is how long the producer has
-been unable to look**, which is the quantity a staleness policy actually wants —
-an entry can be minutes old with the producer perfectly healthy, or seconds old
-with the producer failing since just after the read. A threshold on age alone
-cannot separate those, so it has to deny fresh-enough data in order to catch
-stale data.
+**Do not reconcile by provider.** Key retention on `(provider, account)`,
+update the accounts a response names, and leave the rest to age on their own
+`fetchedAt`.
 
-`since` is always later than `fetchedAt`; a negative difference means something
-is wrong upstream of you. `class` uses the `errorClass` vocabulary and is
-optional, since a producer that cannot classify a failure should still disclose
-the state — render "stale, cause unstated" rather than suppressing it.
+**Proven by:** `a_withheld_account_leaves_its_labeled_siblings_published`,
+`unresolved_multi_handle_provider_emits_one_unlabeled_entry_then_deduplicates`,
+`a_failing_identity_less_handle_does_not_unlabel_its_siblings`,
+`one_identity_less_handle_suppresses_the_labels_of_every_other_handle`.
 
-Absent means this entry is a fresh success. It is **not a fault signal**:
-preserving a reading through a brief upstream failure is correct behaviour, and
-this field reports that it is happening rather than that something is broken.
+<a id="a-provider-can-leave-the-array-entirely-and-that-is-not-a-fault"></a>
 
-## An absent account is never a statement that the account is gone
+### 9.2 A provider can leave the array entirely
 
-The rule above applies per **entry**, and an entry is per account — so a
-provider with several accounts can publish some and omit others in the same
-response, with nothing marking that response as partial.
+Entries are emitted per credential handle, so a provider that resolves zero
+handles emits nothing. The ordinary case is a vault that is wired but has not
+answered a listing yet (`vaultHandleState: "awaiting"`, normally one turn
+after a restart): every vault-aware provider is held back as unfinished and
+publishes no entries, not even from a local lane, because a local credential
+usually resolves no identity and would replace every labelled account with one
+unlabelled row. Such providers are listed in `withoutHandles`. **Retain, do not
+prune**: the accounts are not gone, and a provider that emitted nothing cannot
+be named in `completeProviders`.
 
-Both shapes are reachable and ordinary:
+**Proven by:** `an_error_before_any_install_preserves_an_existing_vault_slot`,
+`known_handles_from_a_failed_enumeration_serve_without_claiming_completeness`.
 
-- **A labeled sibling vanishes.** Every account resolves, so entries carry their
-  own account, and one of them is then withheld because its identity became
-  unconfirmed. Its entry is cleared while its identity is kept, so the provider
-  still counts as fully resolved and the remaining accounts stay labeled. The
-  array names account A and does not mention account B at all.
-- **A new account can briefly collapse the whole provider.** A credential added
-  for a second account has no identity until its first fetch completes. If that
-  first fetch SUCCEEDS before an identity is resolved, every account of the
-  provider publishes as a single unlabeled entry, so accounts you already had
-  stop being named until it settles.
+<a id="completeproviders-is-how-an-account-may-be-removed"></a>
 
-**A provider can publish labeled entries and an unlabeled one in the same
-response.** This is the shape when one credential of a multi-account provider
-fails while the others serve: the failing one appears as a single unlabeled
-entry carrying its error and NO usage, and its siblings keep their names. It is
-also the shape a handle reaches when the credential behind it is deleted while
-the handle stays configured, which does not clear on its own.
-
-Two consequences, opposite in direction:
-
-- Summing CAPACITY across a provider's entries is unaffected, because the
-  unlabeled entry carries no usage to add.
-- COUNTING accounts from entries overstates them. Three working accounts beside
-  one dead credential is four entries. Count the entries that carry an identity,
-  and read the unlabeled one as what it is: a credential that reached no
-  account, whose `errorClass` says whether it is absent, rejected, or unusable.
-
-There is never more than one unlabeled entry per provider, so a consumer can
-rely on the count of unlabeled entries being zero or one — but not on it
-naming how many credentials are behind it.
-
-**Health names this on its own line rather than in a bucket.** A provider with
-three working accounts and one broken credential counts as `fresh`, because it
-is serving and alarming on it would be wrong — so the buckets cannot express it.
-`handlesWithoutAccount` lists such providers beside the buckets, and does not
-participate in the conservation identity: a provider named there is still
-counted in exactly one bucket.
-
-It is deliberately silent in two neighbouring states. A provider whose accounts
-ALL fail is already named by `degraded` or `unconfigured`. A provider that serves
-usage while resolving no account id is healthy and permanently unlabeled, which
-is ordinary for upstreams that return no account identity. The line means a
-credential that FAILED to reach an account while its siblings serve.
-
-The same fact reaches the usage array as the provider's absence from
-`completeProviders` plus one unlabeled entry carrying an `errorClass`. Health
-answers "is this provider serving"; the array answers "did every credential
-resolve".
-
-Neither is a fault, both clear on their own within a refresh cycle, and neither
-is distinguishable from the account having been removed by looking at the array.
-
-**So do not reconcile by provider.** Deleting stored accounts that a response
-did not name — even a response containing perfectly usable entries for that
-provider — discards capacity that still exists and is merely unmentioned. Key
-retention on `(provider, account)`, update the accounts a response names, and
-leave the rest alone to age on their own `fetchedAt`.
-
-### A provider can leave the array entirely, and that is not a fault
-
-An entry is emitted per credential handle. A provider that resolves **zero**
-handles emits nothing at all — not a degraded entry, not an empty one. So a
-provider disappearing from the array is a statement that no credential for it
-could be enumerated, which is a different condition from every credential having
-failed.
-
-The reachable case is a provider whose credentials come only from the credential
-store. One provider here works that way: when any stored handle exists for it,
-those handles **replace** the local-file lane entirely, because the local token
-carries no account identity and keeping it alongside labelled accounts would
-collapse them all into one unlabelled entry. If the store becomes unreachable,
-that provider resolves zero handles and vanishes — while providers that keep a
-local lane stay in the array showing their local lane's own failure.
-
-**Retain, do not prune.** This is the absent-means-unfinished rule with a
-concrete cause: the accounts are not gone and nothing about them has changed.
-Account removal is authorised only by `completeProviders`, and a provider that
-emitted nothing cannot appear there.
-
-### `completeProviders` is how an account may be removed
-
-The reply carries a sibling key beside `result`:
+### 9.3 `completeProviders` is how an account may be removed
 
 ```json
 { "result": [ ... ], "completeProviders": ["codex", "claude"] }
 ```
 
-A provider named there has had its **whole account set** published in that same
+A provider named there has had its **whole account set** published in the same
 response, so a consumer holding stored accounts for it may replace that set,
-including removing accounts the entries do not name.
+including removing accounts the entries do not name. A provider is named only
+when all of these hold:
 
-#### What "whole" is measured against, and where it can fall short
+- its latest handle enumeration succeeded;
+- every handle resolved an account identity;
+- no account was withheld or still pending;
+- the accounts emitted equal that inventory as a set (two credentials resolving
+  one account are collapsed deliberately, so it is a set, not a count).
 
-The claim is over **the credentials this module could enumerate**, which is not
-always the same as the accounts you hold. Today a vault-backed provider's account
-set comes from a local handle mapping, and a credential with no mapped handle is
-not partially visible — it is *structurally invisible*. This module cannot report
-an account it has never been told exists, so the completeness claim is computed
-over a set that can silently be short, and it will still name the provider.
+A successful enumeration that finds no credentials names the provider with no
+entries; that is the only way a provider is cleared outright.
 
-**Measured on a live host, not hypothetical.** Four active Claude credentials in
-the credential store, three with mapped handles, three published — and `claude`
-named in `completeProviders` throughout. A consumer following this contract
-exactly would have pruned a live account sitting at 81% of its five-hour window.
+A provider **not** named is **unknown, never empty**. Its entries are as usable
+as any other. A cold start names nobody.
 
-So the honest reading of the field is *"the enumeration I could reach is fully
-published here"*, which is what it has always computed. The name promises more
-than that, and the gap is invisible from the wire: a short enumeration and a
-complete one produce identical responses.
+- **The survivor set is every labelled entry, including degraded ones.**
+  Usability decides which windows you store, never which accounts you keep.
+- **Only a consumer performing a destructive action should read it.** A
+  display-only consumer that gated on it would hide live data. A consumer that
+  cannot see the key has no deletion authority, which is safe.
+- **Providers that expose no account identity are never named.** They publish
+  one unlabelled entry and never enter an account-keyed store. Expect them to
+  be most providers.
+- Health cannot substitute: its counts are per provider and a provider with one
+  healthy and one withheld account reads as serving.
 
-**What this does not change:** completeness is still the only thing that
-authorises removal, and absence still means unfinished. A consumer that ignores
-it deletes on far weaker evidence. The correction is to the confidence, not to
-the rule — and where a consumer can cheaply keep a tombstone rather than a hard
-delete, the asymmetry is worth it, because a wrongly pruned account returns only
-when someone notices it is missing.
+Reference envelopes for each case come from
+`cargo run -p quota-core --example completeness-envelopes`. Pin the pair
+genuine-removal and withheld-account: their `result` arrays are identical and
+only the claim differs.
 
-The gap closes upstream rather than here. The credential store is adding an
-enumeration call a consumer makes at runtime, so the set this module can reach
-and the set the operator holds become one object; at that point the strong
-reading becomes true without this paragraph changing. The rule that arrives with
-it, and which is worth stating now because it is already true: if that
-enumeration fails, completeness must be **withheld** rather than fall back to a
-locally cached set — a stale local set is exactly the incomplete-but-confident
-case described above.
+**Proven by:** `no_provider_is_complete_before_the_first_turn`,
+`a_withheld_account_forfeits_the_claim`, `a_pending_account_forfeits_the_claim`,
+`an_identity_less_provider_is_never_complete`,
+`a_provider_with_no_credentials_left_is_complete_with_no_entries`,
+`a_removed_account_leaves_a_complete_claim_naming_only_the_survivor`,
+`an_enumeration_failure_withdraws_completeness_but_keeps_the_entries`,
+`duplicate_handles_resolving_one_account_stay_complete`,
+`a_degraded_account_is_named_and_keeps_the_provider_complete`; CI also runs the
+`completeness-envelopes` example.
 
-### Telling an identity transition from a broken handle
+<a id="what-whole-is-measured-against-and-where-it-can-fall-short"></a>
 
-A consumer holding account-keyed rows needs one distinction this wire does not
-name in a single field, and it is derivable from the array:
+#### What "whole" is measured against
+
+The claim is over **the credentials this module could enumerate**: the vault
+records granted to it plus its local lanes. A credential the vault holds but
+has not granted to this module is invisible here, so the claim can name a
+provider while an account you know about is missing. Where a consumer can keep
+a tombstone rather than delete outright, the asymmetry favours it: a wrongly
+pruned account comes back only when someone notices it is gone.
+
+When a vault listing fails after one has succeeded, the last installed listing
+is kept and completeness is computed against it. `vaultEnumerationFailure` is
+then non-null and `retainedVaultSnapshotAgeSecs` gives the retained listing's
+age. A consumer that prunes accounts can read both to judge how current the
+claim is.
+
+<a id="telling-an-identity-transition-from-a-broken-handle"></a>
+
+### 9.4 Telling an identity transition from a broken handle
 
 ```
 you hold labelled rows for P
@@ -1818,208 +1211,20 @@ AND this response has no labelled entries for P
 => P currently resolves no identity
 ```
 
-Your labelled rows are then from a prior regime. They are not wrong, they are
-**undated** — nothing has replaced them because nothing can: an unlabelled entry
-never mints an observation for an account, and a provider serving one is never in
-`completeProviders`. So the only thing that ages those rows out is a judgement you
-make from this signal.
+Your labelled rows are then from an earlier state: not wrong, but undated.
+Nothing replaces them, because an unlabelled entry never stands for an account
+and a provider serving one is never in `completeProviders`. The third clause
+matters: an unlabelled entry carrying an error can sit beside labelled serving
+siblings ([9.1](#an-absent-account-is-never-a-statement-that-the-account-is-gone)).
+**Mark, do not delete.** If the provider resolves identities again it becomes
+labelled and completable, and ordinary reconciliation applies.
 
-**The third clause is load-bearing.** An unlabelled entry *carrying an error* can
-sit beside labelled serving siblings — that is deliberate, and the shape that
-forced it was one Anthropic handle needing re-authentication while three healthy
-accounts served. Keying on "an unlabelled entry exists" would mark all three as
-transitioned on a provider whose identity resolution is fine. The condition is
-that the unlabelled entry is **serving usage**.
+<a id="usagedrops--recently-observed-decreases"></a>
 
-**Mark, do not delete.** This signal says the labelled rows are stale, not that
-those accounts are gone. Deletion is still authorised only by `completeProviders`,
-and trading an old row for a wrong one is the failure that rule exists to prevent.
+## 10. `usage.drops`
 
-The state has an exit and no timer: if the provider's credentials resolve identity
-again it becomes labelled and completable, and the ordinary path reaps.
-
-A provider **not** named is **unknown, never empty**. Its entries are as usable
-as any other; the module is declining to say that they are all of them. Reading
-absence as an empty account set is the destructive misreading the field exists
-to prevent, and it is the tempting one — a cold start names nobody.
-
-**The survivor set is every labelled entry, including degraded ones.** A
-degraded entry names an account that exists and is currently unusable.
-Usability governs which windows you store; it never governs which accounts you
-keep. Building the survivor set from usable entries alone deletes an account
-whose token merely expired, under a claim that makes the deletion look correct.
-
-A provider is named only when its latest handle enumeration **succeeded**, every
-handle resolved an account identity, no account was withheld or still pending,
-and the accounts emitted equal that inventory as a **set** — two credentials can
-resolve one account and are collapsed deliberately, so a count would read that
-dedup as a missing account forever. A successful enumeration finding no
-credentials at all is named with no entries, and that is the only way a provider
-is cleared outright.
-
-Two consequences worth stating plainly:
-
-- **Only a consumer performing a destructive action should read it.** A
-  display-only consumer must not: gating what it shows on completeness hides
-  live data for exactly the providers whose identity is momentarily unsettled.
-  A consumer whose transport unwraps `result` for it cannot see the key at all,
-  which is safe here — no visibility means no deletion authority, never false
-  authority.
-- **Providers whose upstream exposes no account identity are never named.**
-  They publish a single unlabelled entry by contract and never enter an
-  account-keyed store, so completeness is meaningless for them. Their permanent
-  absence is correct, not a fault.
-
-  **Expect this to be most of them.** On the hosts measured so far the account
-  dimension exists for a small minority of providers — the rest carry credentials
-  with no account field at all — so a consumer gating on `completeProviders`
-  should expect abstention to be the ordinary case and authorisation the
-  exception. That is not a wire limitation to work around: for a provider with no
-  account dimension there is no account-keyed state to reconcile, so the
-  abstention costs nothing. It matters only for setting expectations, because a
-  consumer that builds a reconciliation path and sees it fire for one provider in
-  dozens will reasonably suspect its own code first.
-
-Health cannot substitute for this. Its counts are per provider, so they cannot
-say how many accounts a provider ought to have — and a provider with one healthy
-and one withheld account reports as *serving*, because the bucket is decided by
-its best slot.
-
-Reference envelopes for every case, generated by the producer rather than
-hand-written, come from `cargo run -p quota-core --example
-completeness-envelopes`. The pair to pin is genuine-removal against
-withheld-account: their `result` arrays are identical and only the claim
-differs.
-
-## Verdict versus unfinished
-
-A degraded entry is a **verdict**: this module concluded the credential or
-payload is unusable. An absent entry is **unfinished**: a sweep is still
-running.
-
-Retaining a last-known-good value through an absent entry is correct. Retaining
-it through a degraded entry overrides a conclusion already reached. Hard-age
-rather than drop if you keep anything, since only some of the class
-self-recovers.
-
-One exception, and it matters because it is the *first* thing a consumer sees
-from a provider: a transient failure serves the last healthy window stale only
-when there **is** one. A slot that has never yet succeeded has nothing to serve,
-so a transient failure there degrades like any other — a provider whose very
-first fetch times out reports a degraded entry carrying a timeout error, not an
-absent one. Such an entry is a *verdict about this attempt*, not about the
-credential, and it flips to a window on the first success without any state
-change on your side. Concretely: a degraded entry with **no** `fetchedAt` has
-never produced data, so there is nothing to retain and nothing to hard-age, and
-its error text may name a transient cause. The retention question only arises
-for a degraded entry that *does* carry a `fetchedAt`.
-
-**That split is no longer exhaustive, and the third case is common.** It used to
-be: the only thing that cleared the timestamp was an account change, and an
-account change also suppressed the entry entirely, so a published degraded entry
-without `fetchedAt` could only be a slot that had never succeeded.
-
-Suppressing those entries was a defect — a credential this module had reached and
-concluded was unusable presented as *not yet fetched*, which is the calmest
-reading a consumer can take — and it was fixed. The verdict is now published. So
-a **third** shape exists on the wire:
-
-> a degraded entry, no `fetchedAt`, on a slot that **has** succeeded before —
-> because identity is unverified, so nothing about the prior reading may be
-> attributed to the credential now in place.
-
-Measured on real traffic across a 105-minute credential rotation: 199 consecutive
-samples of `credential_unusable` with a null `fetchedAt`, on a credential that had
-been serving for hours (insula#8).
-
-**Read the pair, not either field alone.** Two fields give three states, and this
-is the discriminator, confirmed across two independent episodes:
-
-| `errorClass` | `fetchedAt` | what happened |
-| --- | --- | --- |
-| absent | present | served |
-| present | present | a provider call failed; the timestamp is the last success |
-| present | **absent** | a credential verdict was reached and the provider was never called |
-
-**These are stages, not stable states, and one failure passes through both.** A
-vault credential going bad is observed as row 2 first — the provider itself
-refuses, so `credential_rejected` rides beside a frozen `fetchedAt` — and then as
-row 3 once the vault reaches its own verdict and this module stops calling the
-provider at all. Measured identically across eight consecutive episodes by a
-consumer polling at 30s: about ten samples of the first shape, then the second for
-the rest of the latch, with the switch landing one non-transient backoff after the
-first refusal.
-
-Two consequences worth designing for. **An `errorClass` change is not necessarily a
-state change** — `credential_rejected` becoming `credential_unusable` on one
-account is the same failure being described by a better-informed party, so
-alerting on class transitions will fire mid-latch on something that did not
-happen. And **`fetchedAt` disappearing is not evidence the account never worked**:
-within one episode it is present for the early samples and absent thereafter. The
-third row means the verdict was reached without calling the provider on THIS
-attempt, not that no attempt ever succeeded.
-
-The third row is the one that changed. Do **not** read a missing `fetchedAt` as
-"never worked" — read it as "nothing here may be attributed to this credential".
-The remedy differs: the first invites waiting, the second needs someone to
-re-authenticate.
-
-### Recovery after a latch is backoff-gated, not immediate
-
-A re-sealed credential does not serve on the next poll. The slot is on its
-scheduled retry, so recovery takes **up to one non-transient backoff interval**.
-That is the scheduler working as specified, not a stall, and a consumer should
-not treat continued `credential_unusable` in the minutes after a repair as
-evidence the repair failed.
-
-**A bound, not a measurement**, and the mechanism is now known rather than
-inferred from a scatter. The lag is fully determined by *where in the backoff
-cycle the repair happened to land*:
-
-```text
-lag = NON_TRANSIENT_BACKOFF − (repair offset into the current cycle)
-```
-
-That holds because `backoff()` returns `NON_TRANSIENT_BACKOFF` unconditionally
-for this class — no exponential term, no retry count — so the next attempt is at a
-fixed distance from the last one and a repair anywhere inside that span waits out
-the remainder. Verified predictively by the insula#8 filer on 2026-08-27: repair
-at 34.9 s into the cycle, predicted 265.1 s, **observed 265.07 s**.
-
-So the lag is a uniform draw on `[0, backoff)` — expected value ≈ 150 s, not
-300 s. Nine warm-slot observations: 146.8 · 280.3 · 209.3 · 149.5 · 209.0 ·
-202.2 · 147.9 · 64.0 · 265.1. Sizing an alert at the 300 s bound is correct but
-pessimistic by a factor of two on the average case; sizing it at an observed
-figure is wrong in the other direction.
-
-Quoting one as a latency invites reading three of them as a trend, and this is a
-model rather than a fit: it predicts the next one. The same applies to how quickly a revoked credential is
-detected: that gap can never exceed the fetch interval, so it records when the
-next fetch landed rather than anything about the revocation.
-
-**That whole model assumes the slot survives the repair, and a re-minted vault
-handle does not.** The capability is a field of `CredentialHandle`, which derives
-`PartialEq`/`Hash`, and the handle *is* the slot key — so a repair that mints a
-new capability produces a DIFFERENT slot. The scheduler re-reads the handle file
-every turn and treats it as authoritative: keys it no longer names are reaped,
-keys it names for the first time are created due-now. A new slot has no backoff
-to inherit, so recovery is the next turn rather than a draw on `[0, 300)`.
-
-| repair | recovery |
-|---|---|
-| re-seal the record, capability unchanged | the model above: `[0, 300)`, expected ~150 s |
-| re-seal **and** re-mint the handle | next scheduler turn |
-
-Worth stating because it is invisible from either side alone: the operator action
-that looks like *more* work is also the one that recovers an order of magnitude
-faster, and the reason lives in a `derive` two modules away from anything about
-backoff. Answered on insula#8.
-
-## `usage.drops` — recently observed decreases
-
-A second operation on the same route. `usage.get` is a statement of **current
-state**; a drop is an **event**, and folding events into a state response would
-make one poll answer two questions with different retention rules.
+A second query operation on the same route. `usage.get` states current state;
+a drop is an event, with its own retention rules.
 
 ```jsonc
 {
@@ -2034,107 +1239,136 @@ make one poll answer two questions with different retention rules.
 }
 ```
 
-Poll with `{"method": "usage.drops", "params": {"since": 56}}`. Omit `since` to
+Poll with `{"method": "usage.drops", "params": {"since": 56}}`; omit `since` to
 get everything retained.
 
-**Collapse by `(provider, account)` before counting events.** Detection runs per
-CREDENTIAL, and a provider can reach one account through several — a vault handle
-beside a local one — so a single reset emits one record per credential,
-milliseconds apart and otherwise identical. Counting records rather than events
-doubles those. Measured here: eight `antigravity` records arriving in pairs where
-four events occurred.
+| Field | Guarantee |
+|---|---|
+| `epoch` | identifies the ring, which lives in memory and dies with the process. A changed `epoch` means resynchronize; a held cursor is meaningless across it. It is formatted from the wall clock when the ring was created, so it is an identifier, not a start time: compare it for change only |
+| `oldestRetained` | the oldest `seq` still held. A cursor older than it means records were evicted between your polls; without it an empty page and a lost cursor would look the same |
+| `next` | the `seq` the next record will get |
+| `seq`, `at` | every record carries both, so a consumer that lost its cursor can re-derive its position from its own log |
+| `account` | the same key `usage.get` entries carry; absent when the credential resolves no identity |
+| `observedContinuously` | whether the two readings either side were taken across a continuous poll interval |
 
-`account` is the same key `usage.get` entries carry, so drops join to entries
-without a second mapping. It is **absent** where the credential resolves no
-identity — cookie lanes, a token with no account claim — and that absence
-is load-bearing rather than incidental: two identity-less credentials for one
-provider genuinely cannot be told apart here, so records that lack it cannot be
-collapsed, and treating them as one event would under-count in the same way
-counting records over-counts.
+**It is a gap-closer, not an archive.** The ring holds the newest 100 records;
+its job is that a drop between two consecutive polls is not missed. Keep the
+durable record yourself. The supervisor, not this module, reports when the
+module started (`ck module status insula`).
 
-**It is a gap-closer, not an archive.** The ring lives in memory, bounded, and
-its job is to ensure a drop occurring between two consecutive polls is not
-missed. The durable record is yours.
+<a id="what-a-drop-is-and-is-not"></a>
 
-Three properties, each present because its absence has cost somebody a real
-observation:
+### 10.1 What a drop is, and is not
 
-**`oldestRetained` tells you whether you lost records.** If your cursor is older
-than it, entries were evicted between your polls. Without this field an empty
-page and a lost cursor are the same bytes — and a gap that reads as a quiet
-interval is how a monitoring series records silence where an outage was.
+A drop is an account's used percent going **down** between two readings. It
+names an observation, not a cause: a window rollover, a redeemed reset credit,
+a goodwill grant, a plan change and an upstream correction look the same.
 
-**`epoch` identifies the ring.** The ring dies with the process, so sequences
-mean nothing across a restart. A changed `epoch` means resync; a held cursor is
-meaningless. Do not assume a restart is visible any other way — a
-process-lifetime counter that resets to the value it already had reads as
-perfectly continuous.
+These do not count as drops:
 
-**`epoch` is an identifier, not a timestamp, though it looks like one.** It is
-formatted from the wall clock at the moment the ring was created, so it inherits
-whatever that clock said. A host that boots with a wrong clock and corrects it
-seconds later keeps a mis-dated `epoch` for the life of the process: measured on
-a consumer's host, two hours ahead, after an RTC read as UTC was corrected by
-time sync about 40 seconds into boot. Compared for change, as above, that is
-harmless, because a wrong value still changes on restart. Read as "when the
-module started", it is wrong with nothing on the wire to say so, and after the
-first hours it is not even implausible. This module publishes no start time of
-its own; the supervisor reports one (`ck module status insula`, "started ... ago"),
-and that is the place to ask. Per-record `at` stamps do not share the hazard in that
-boot window: a drop needs two successful readings at least one poll apart, so no
-record can be written in the seconds before the clock is corrected.
+- a decrease across an account change (two accounts are not one series);
+- a decrease on a window that states a continuous `drip` regeneration;
+- a decrease under one percentage point;
+- a reading whose `fetchedAt` is earlier than the previous one.
 
-**Every record carries both `seq` and `at`**, so a consumer that lost its cursor
-re-derives its position from the last line of its own log rather than keeping
-separate durable state. The state you keep in memory is exactly the state that
-does not survive the events worth recording.
+**`observedContinuously: false`** means the readings either side were taken
+across a gap: host suspend, a fetch blackout, a long backoff, or a switch
+between lanes whose readings describe different moments (`antigravity` reads
+one account through a live editor, the plugin's sidebar snapshot and a cloud
+endpoint). A gap hides magnitude: a drop followed by consumption reads smaller,
+and a drop followed by a refill reads as nothing. **Filter on
+`observedContinuously` before counting.**
 
-### What a drop is, and is not
+**Collapse by `(provider, account)` before counting events.** Detection runs
+per credential, and one account reached through two credentials can emit two
+records for one reset. A second decrease for the same `(provider, account)`
+within 60 seconds is folded into the first, in both the ring and the
+`quotaDropsByProvider` count. Records without an `account` are never folded,
+because two identity-less credentials cannot be shown to be one account.
 
-`observedContinuously: false` means the two readings either side were taken
-across a **gap** — suspend, a fetch blackout, a long backoff, or a **lane
-switch**. A gap hides magnitude: a drop followed by consumption reads smaller
-than it was, and a drop followed by a re-fill reads as nothing at all. Treat the
-magnitude as a lower bound and the record as weaker evidence.
+**Proven by:** `a_cursor_that_fell_off_the_ring_is_distinguishable_from_a_quiet_interval`,
+`a_new_store_gets_a_new_epoch`, `a_decrease_across_one_interval_is_an_observed_drop`,
+`the_same_decrease_across_a_gap_is_not_observed_continuously`,
+`a_suspend_shaped_clock_disagreement_is_not_observed_continuously`,
+`a_switch_to_an_older_source_is_a_drop_without_confidence`,
+`a_changed_account_is_never_a_drop`, `ordinary_consumption_is_not_a_drop`,
+`relaxation_engaging_is_not_a_drop`,
+`the_fold_window_folds_siblings_and_spares_a_later_reset`,
+`the_refresher_attributes_a_drop_to_the_account_it_observed`.
 
-The lane switch is the one to plan for, because the other three are rare and it
-is not. Where a provider reads one account through several sources —
-`antigravity` uses a live editor probe, the editor plugin's sidebar v2 snapshot, and a cloud
-endpoint — consecutive readings can come from sources whose values were observed
-at very different moments. The gap is then in the thing DESCRIBED rather than in
-the polling: two readings taken 60 seconds apart can describe moments an hour
-apart, and the later-fetched one can describe the earlier moment. A decrease
-between two such readings is not a decrease in the account.
+<a id="health-is-a-separate-axis"></a>
 
-**So filter on `observedContinuously` before counting anything.** Measured here
-on a healthy, un-suspended host: 28 non-continuous records for a single account
-in seventy minutes, while the continuous records over the same window numbered in
-the low single digits. A consumer counting records rather than events would have
-read twenty-eight resets that never happened. The producer marked every one of
-them correctly — the flag did its job — and a consumer that ignores the flag
-still gets a wrong answer.
+## 11. Health
 
-**The record names an observation, not a cause.** A window rollover, a redeemed
-reset credit, a goodwill grant, a plan change and an upstream correction are
-identical from here. The honest reading is *this went down, and across a
-continuous interval it was not something we caused* — nothing on this wire
-identifies why.
+### 11.1 Status
 
-## Health is a separate axis
+Module health comes from `health.check`, not from the array:
 
-Module health comes from the health check, not from the array: `failing` only
-when the serving store is poisoned, `degraded` only when the refresher heartbeat
-is stale, otherwise `ok`. Per-provider degradation deliberately does not flip
-module status — most providers lack credentials on any given host, so it would
-sit permanently degraded and mean nothing.
+| Status | When |
+|---|---|
+| `failing` | the slot store is poisoned (a serving or refresher task panicked while holding it) |
+| `degraded` | `refresherStalled` or `fetchBlackout` is true |
+| `ok` | otherwise |
 
-Aggregating across a provider's accounts is a consumer decision, and it is not
-the same decision for every question. "Can I use this provider at all" takes the
-best account. "Is this account exhausted" must stay per-account, or one dead
-account walls a provider that has a live sibling.
+Per-provider failures never change the module status: most providers lack
+credentials on any given host, so the module would be permanently degraded.
+`fetchBlackout` reports `degraded`, not `failing`: `failing` asks the
+supervisor to restart the module, and the signal states what is true without
+acting on a guess about why.
 
-If you collapse entries at all, the scope of each field decides what is safe to
-carry across. Only two are properties of the provider:
+**Proven by:** `stalled_refresher_reports_degraded`,
+`a_lane_that_stops_succeeding_for_hours_reports_degraded`,
+`a_host_that_never_fetched_anything_is_not_a_blackout`,
+`health_check_control_request_returns_domain_report` (`main.rs`).
+
+### 11.2 Provider buckets and the conservation identity
+
+**Health counts providers; the array carries accounts.** A provider with
+several accounts contributes several entries to `usage.get` and one to the
+buckets. When its accounts disagree, the best one decides: any fresh account
+makes it `fresh`, otherwise any stale one makes it `stale`, and it is
+`degraded` or `unconfigured` only when every account failed.
+
+```
+fresh + stale + pending + len(degraded) + len(unconfigured) + len(withoutHandles)
+  == providersTotal
+```
+
+`fresh`, `stale` and `pending` are numbers; `degraded`, `unconfigured` and
+`withoutHandles` are arrays of provider names, so take their lengths. A
+language that coerces (`7 + 0 + [..names..]` in JavaScript is a string) makes
+the identity false forever.
+
+- **Alert on `degraded`, not on `unconfigured`.** `unconfigured` names
+  providers whose every account is an expected absence, the normal state for
+  most providers on most hosts. `degraded` names providers where a credential
+  exists and something is wrong with it, the upstream refused it, or the
+  response could not be read. A provider with one broken credential and one
+  never set up is `degraded`.
+- **The identity holds only after the first tick.** Before it no provider is in
+  any bucket, so gate the assertion on `lastTickAgeSecs` being non-null.
+- **`pending` is ordinary after a start.** The refresher admits a bounded
+  number of fetches per turn, so providers wait several turns for their first
+  fetch. For "is this provider usable now", read `fresh + stale`, not the
+  absence of `pending`.
+- The identity holds when every provider is degraded, so it is not a liveness
+  signal.
+- `handlesWithoutAccount` names providers holding a credential that reaches no
+  account while their other accounts serve. It sits outside the identity: such
+  a provider is still in exactly one bucket.
+
+**Proven by:** `every_provider_lands_in_exactly_one_health_bucket`,
+`conservation_identity_holds_with_stale_episodes_nonzero`,
+`a_broken_account_beside_an_unconfigured_one_stays_actionable`,
+`a_provider_in_the_fresh_bucket_can_still_publish_a_failed_account`,
+`the_health_detail_does_not_conflate_its_three_counts`.
+
+<a id="folding-several-accounts-into-one-answer"></a>
+
+### 11.3 Folding several accounts into one answer
+
+Aggregating across a provider's accounts is a consumer decision, and only two
+fields are provider-scoped:
 
 | Field | Scope | Why |
 |---|---|---|
@@ -2146,105 +1380,179 @@ carry across. Only two are properties of the provider:
 | `fetchedAt` | account | that slot's own last success |
 | `savedResets` | account | reset credits are granted to **one** account |
 | `usage` (incl. `rawUsedPercent`) | account | measured against that account's own limits |
+| `spend` | account | credit is bought per account |
 | `error` | account | that lane's failure, not the provider's |
 
-So a merged per-provider view is safe only if it **selects a whole entry** and
-uses its fields together. Taking fields from more than one entry produces a
-coherent-looking record describing no actual account — one account's effective
-percent beside another's `rawUsedPercent`, or a `savedResets` count belonging to
-a third. Nothing on the wire marks the difference, which is why it is stated
-here.
+So a merged view must **select a whole entry** and use its fields together.
+"Can I use this provider now?" takes the account with the most headroom. "How
+pressured is this account?" takes that account's entry and nothing else.
 
-### Folding several accounts into one answer
+1. **Never average.** Two accounts at 50% are two accounts either of which can
+   serve.
+2. **Degraded is not zero and not full.** An entry with `error` and no `usage`
+   folds as *unknown*.
+3. **Never combine account-scoped fields** from different entries. Summing
+   `spend` across siblings states a total no single credential can draw on.
 
-Selecting a whole entry is the rule; *which* entry depends on the question, and
-the two common questions have different answers.
+This producer publishes no provider-level rollup entry: every field but two is
+account-scoped, so a rollup would omit most of the record or state one
+account's figures under a provider's name.
 
-**"Can I use this provider right now?"** takes the account with the most
-headroom — the minimum `usedPercent` across entries whose `usage` is present.
-A provider is unusable only when every account is exhausted, and treating it as
-unusable because the *first* account is exhausted abandons capacity that exists.
+<a id="consumption-metrics"></a>
 
-**"How pressured is this account?"** takes that account's own entry and nothing
-else. This is the one that must not be folded: pacing decisions belong to the
-account that will actually serve the request.
+### 11.4 Health metrics
 
-Three rules make either safe:
+`health.check` publishes these metrics. Ages and counts are since the module
+process started unless stated. A metric with value `null` is unknown or has
+not happened, never zero.
 
-1. **Never average.** Two accounts at 50% are not one account at 50%; they are
-   two accounts either of which can serve. Averaging invents a figure that
-   describes nothing, and it moves in the wrong direction when an account is
-   added.
-2. **Degraded is not zero and not full.** An entry with an `error` and no
-   `usage` carries no capacity reading at all. Fold it as *unknown*, not as
-   exhausted (which hides a working account) and not as idle (which routes work
-   at an account that cannot serve it).
-3. **Fold only entries you would act on.** `savedResets`, `accountInfo`,
-   `rawUsedPercent` and `spend` describe one account each; carry them from the
-   entry you selected or drop them, never combine them. Credit is bought per
-   account: summing `spend` across sibling entries states a total no single
-   credential can draw on.
+| Metric | Type | Meaning |
+|---|---|---|
+| `buildCommit` | string | the commit the running binary was built from |
+| `providersTotal` | number | providers registered |
+| `fresh` | number | providers serving a reading inside the freshness horizon |
+| `stale` | number | providers serving a reading preserved through transient failure |
+| `pending` | number | providers whose first fetch has not completed |
+| `degraded` | array | providers with a credential that is failing ([11.2](#health-is-a-separate-axis)) |
+| `unconfigured` | array | providers with no credential on this host |
+| `withoutHandles` | array | providers that resolved no credential handle |
+| `handlesWithoutAccount` | array | providers with a credential that reaches no account while siblings serve |
+| `lastTickAgeSecs` | number or null | seconds since the refresher's last turn; null before the first |
+| `refresherStalled` | bool | the refresher's heartbeat is older than its stall horizon (300 s) |
+| `lastFetchSuccessAgeSecs` | number or null | seconds since any slot last fetched successfully; null when nothing ever has |
+| `fetchBlackout` | bool | `lastFetchSuccessAgeSecs` has passed the blackout horizon (1800 s) |
+| `staleEpisodes` | number | times any slot entered stale-serving |
+| `staleEpisodesByProvider` | object | `staleEpisodes` per provider |
+| `lastStaleEpisode` | string or null | the most recent episode |
+| `quotaDropsByProvider` | object | drops recorded per provider |
+| `quotaDropsObservedContinuously` | object | of those, the ones observed across a continuous interval |
+| `quotaComparisonsNoDrop` | number | paired readings that were compared and showed no drop |
+| `quotaNotComparable` | object | readings that could not be compared, by reason |
+| `cookieCohortTotal` | number | providers whose credential is a web session cookie |
+| `cookieLoginsStale` | array | cookie providers whose deposited login stopped working |
+| `usageRequestsServed` | number | requests on this route answered |
+| `usageRequestsRefused` | number | requests refused (undecodable body, unknown method) |
+| `lastServedAgeSecs` | number or null | seconds since the last answered request |
+| `lastRefusedAgeSecs` | number or null | seconds since the last refused request |
+| `vaultHandleState` | string or null | `no_vault`, `awaiting`, `answered`, or null without a vault loader |
+| `scopedCredentialIds` | array | vault credential ids in the installed listing |
+| `vaultEnumerationFailure` | string or null | the latest vault listing failure |
+| `retainedVaultSnapshotAgeSecs` | number or null | age of the retained listing; null when none was ever installed |
+| `vaultMappingWarning` | string or null | a warning from mapping the listing to providers |
+| `vaultConnectionsEstablished` | number | vault connections opened |
+| `vaultAuthFailuresReported` | number | upstream `401`s on vault credentials reported back to the vault |
+| `vaultRouteWarmingRetries` | number | vault route opens refused while the vault was starting, then retried |
+| `vaultUnmatchedDrops` | number | vault replies discarded because their caller had gone |
+| `vaultStaleGenerationDrops` | number | vault replies discarded because they belonged to a previous connection |
 
-**What this producer will not do for you.** A provider-level rollup entry is not
-published, and the reason is structural rather than a missing feature: every
-field except `provider` and `apiProvider` is account-scoped, so a synthesised
-provider entry would either omit most of the record or state one account's
-figures under a provider's name. Both are worse than the fold above, because the
-consumer can see which account it selected and a rollup cannot say.
+**Event counters** (`staleEpisodes`, `staleEpisodesByProvider`, the
+`quotaDrops*` and `quotaComparisonsNoDrop` / `quotaNotComparable` counts) are
+not part of the conservation identity: they count events over time, not
+members of the current population. They reset on restart.
 
-**`source` is narrower than account scope, and it moves.** A provider can read
-one account through more than one lane — a local file or process, and a
-credential from the vault. Both describe the same account, and which one answers
-is decided per fetch by whichever is healthy and fresh. So the same account can
-publish `source: "vault"` on one poll and something else on the next, with no
-change to the account, the credential, or anything a consumer did.
+**Stale episodes.** `stale` is a gauge; `staleEpisodes` counts transitions into
+stale-serving, so a slot stale across many turns counts once, and a transient
+failure that resolved between two polls still leaves a trace. A non-transient
+failure is not an episode. `lastStaleEpisode` reads
+`<provider> <account> <class> [<message>] at <time>`, where the account is
+`<unattributed>` when the credential resolves no identity, the class is
+`<no class>` when unclassified, and the message is the first 160 characters of
+the failure. Only the most recent episode is kept.
+`staleEpisodesByProvider` separates one marginal upstream (episodes
+concentrated on one provider) from an environmental problem (spread across
+many). A provider with a graceful fallback accrues episodes faster than one
+with a single lane: `antigravity`'s local editor probe is
+`local_source_unavailable` (transient) whenever the editor is closed, while
+its cloud lane keeps serving. Episodes beside a healthy served entry are a
+fallback working; episodes beside a degraded entry are a lane in trouble.
 
-It is observability only: read it to know how a figure was obtained, never as an
-identity or a state. Keying on it treats one account as two, and alerting on a
-change reports a lane fallback — which is the system working — as an incident.
+<a id="quotadropsbyprovider-and-quotadropsobservedcontinuously"></a>
+<a id="quotacomparisonsnodrop-and-quotanotcomparable"></a>
 
-The values in use are:
+**Drop counters.** `quotaDropsByProvider` and `quotaDropsObservedContinuously`
+follow the rules in [10.1](#what-a-drop-is-and-is-not), including the 60-second
+fold. `quotaComparisonsNoDrop` is the denominator: comparisons that ran and
+found no drop. `quotaNotComparable` counts readings that could not be compared:
 
-| value | how the credential was obtained | what fixes it when it stops working |
-| --- | --- | --- |
-| `vault` | served by the credential vault | re-authenticate that vault record |
-| `oauth` | an OAuth token or session found on this machine | log in with the tool that owns it |
-| `api` | an API key from the environment or a config file | supply or replace the key |
+| reason | what it means |
+| --- | --- |
+| `account_changed` | the credential now serves a different account, so the two readings are not one series |
+| `no_prior_reading` | a cold slot, or an entry carrying no usage |
+| `prior_reading_was_an_error` | the previous reading was degraded |
 
-Treat the set as open: a new lane adds a value without warning.
+A sustained run of `prior_reading_was_an_error` is a credential problem that
+otherwise looks like a quiet account.
 
-**Cookie providers publish `vault`.** The ten providers that read quota from a
-logged-in web page (amp, cursor, factory, langdock, mimo, ollama, opencode, opencodego,
-qoder, qwen-cloud) take their session cookie only from a vault deposit,
-`cookie:<domain>` or `cookie:<domain>:<account>`, captured by Cerebellum. This
-module reads no browser store, so it needs no Full Disk Access or Keychain
-access. A host with no deposit for such a provider has no lane for it: the
-provider is absent and counted as unconfigured, not published as a
-`credential_absent` entry. When a deposited session expires the entry degrades
-with `credential_rejected`, and the fix is to capture the login again and
-re-deposit it. Cursor alone can also serve from Cursor.app's own sign-in on this
-machine when it has no deposit, and publishes `oauth` then.
+**Consumption metrics.** `usageRequestsServed`, `usageRequestsRefused`,
+`lastServedAgeSecs` and `lastRefusedAgeSecs` answer whether anyone is reading
+this module, which no production metric can. They are not alarmed, and
+consumers should not alarm on them: a host with nobody polling is a legitimate
+configuration. Read as a pair they separate quiet (neither advancing),
+consuming (served advancing) and failing to consume (refused advancing while
+served does not).
 
-Earlier releases read these cookies from the local Chrome store and published
-`cookie`. A consumer that matched on that value should treat it as retired.
+**Cookie logins.** Read `cookieLoginsStale` against `cookieCohortTotal` as "N of
+C logins stale". It names providers whose deposited cookie was sent and
+rejected, or whose page no longer parses; a cookie provider with no deposit is
+unconfigured and is not counted. It is not the set of degraded cookie
+providers.
 
-### Depositing a session cookie: which URL to capture against
+**Vault client metrics.**
 
-A cookie-backed provider reads its web session from the vault and nowhere else:
-insula reads no browser store. Cerebellum captures the login in a throwaway
-browser and deposits it as `cookie:<domain>:<account>` (or a bare
-`cookie:<domain>`). With no deposit the cookie lane is unconfigured on that host.
-Domains whose cookies supply usage windows take ONE deposit: those lanes do not
-verify account identity, so a second deposit for the same domain is refused at
-load time. Re-capturing replaces the same id (`ck auth put --replace`) rather
-than adding a new suffix.
+- `vaultHandleState`: `no_vault` means no credential vault serves this module
+  (no vault module, or a vault that granted it nothing before ever granting
+  anything) and providers use their local lanes; `awaiting` means a vault is
+  wired and has not answered a listing yet, so vault-aware providers are held
+  back ([9.2](#a-provider-can-leave-the-array-entirely-and-that-is-not-a-fault));
+  `answered` means at least one listing was installed, and later failures keep
+  it. A host that stays `awaiting` has a vault that keeps failing to list, and
+  its bucket counts look like a host with no credentials.
+- `scopedCredentialIds` is a readback of the listing the refresher used, not a
+  fresh vault query, and carries no credential bytes. A standalone checker
+  reads it here because its own daemon connection cannot list this module's
+  grant. On a listing failure it keeps the last installed set, and
+  `retainedVaultSnapshotAgeSecs` gives its age in whole seconds.
+- `vaultMappingWarning` is null when every installed row mapped cleanly.
+- `vaultConnectionsEstablished` is `1` while the first connection is in use;
+  each increment is a reconnect. There is no idle timeout, so `1` for weeks is
+  normal. Do not alert on it.
+- `vaultAuthFailuresReported` counts reports that latch a credential as
+  needing re-authentication, which only a human login clears. Only an upstream
+  `401` on a bearer this module got from the vault is reported; a `403` is not,
+  because suspensions, entitlement changes and network challenges all arrive as
+  `403`. A zero rules this module out when an account is found latched.
+- `vaultRouteWarmingRetries` rising during a daemon restart is expected; rising
+  while nothing restarts is worth asking about.
+- `vaultUnmatchedDrops` and `vaultStaleGenerationDrops` in small numbers around
+  a daemon restart are ordinary; a rising unmatched count while nothing is
+  restarting is not.
 
-The captured value must be a REQUEST `Cookie:` header (`name=value; ...`) for
-the exact URL insula fetches, so host and path scoping match what that request
-sends. Capture tools take the URL from this table, not from memory.
-`cookie_capture_urls_match_the_providers_fetch_urls` checks each row against
-the provider's own source, so a provider changing its endpoint fails the build
-until this table follows.
+**Proven by:** `every_published_health_metric_is_documented` (`main.rs`; every
+published key against this document),
+`a_slot_stale_across_three_turns_counts_one_episode`,
+`a_transient_failure_entering_stale_serving_counts_one_episode`,
+`a_non_transient_failure_does_not_count_an_episode`,
+`a_stale_episode_records_the_account_and_the_class`,
+`a_degraded_previous_reading_is_named_as_its_own_reason`,
+`only_a_failed_cookie_counts_as_a_stale_login`,
+`a_cookie_login_leaves_the_stale_list_once_it_works_again`,
+`scoped_inventory_health_keeps_rows_failure_and_retained_age_distinct`.
+
+<a id="depositing-a-session-cookie-which-url-to-capture-against"></a>
+
+### 11.5 Depositing a session cookie: which URL to capture against
+
+A cookie-backed provider reads its web session only from the vault. Cerebellum
+captures a login in a throwaway browser and deposits it as
+`cookie:<domain>:<account>` (or a bare `cookie:<domain>`). Without a deposit the
+cookie lane is unconfigured. A domain whose cookies supply usage windows takes
+**one** deposit, because those lanes do not verify account identity; a second
+deposit for the same domain is refused when the listing is installed.
+Re-capturing replaces the same id (`ck auth put --replace`).
+
+The captured value must be the **request** `Cookie:` header
+(`name=value; ...`) for the exact URL insula fetches, so host and path scoping
+match. Capture tools take the URL from this table:
 
 | Deposit id | Provider(s) | Fetch URL |
 |---|---|---|
@@ -2260,242 +1568,50 @@ until this table follows.
 | `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 
-Langdock's usage URL and response mapping have fixture coverage, but have not
-been checked with an authenticated live Langdock session.
+- **claude**: enrichment only, never a usage lane. Use the same account suffix
+  as `oauth:anthropic:<account>`; a bare deposit is not used. Several suffixed
+  deposits are allowed because each owner is verified against the OAuth bearer
+  through `/api/oauth/profile` and `/api/account` before
+  `/api/organizations/{org_id}/subscription_details` is read. Capture a
+  `sessionKey` cookie scoped to `/api` so it covers both URLs.
+- **kimi.com**: not a lane. `kimi-for-coding` reads usage with its API key and
+  uses the session's `kimi-auth` cookie only for two optional subscription
+  extras.
+- The login page can be any page where the user signs in; for factory it is
+  `app.factory.ai` while the fetch is on `api.factory.ai`.
+- Langdock and the claude.ai capture URL are fixture-verified only.
 
-Claude's deposit is enrichment only, never a second usage lane. Use the same
-account suffix as `oauth:anthropic:<account>`; a bare deposit is not used. Multiple
-suffixed Claude deposits are allowed because each web owner is independently
-verified against the OAuth bearer via `/api/oauth/profile` and `/api/account`
-before reading `/api/organizations/{org_id}/subscription_details`. Capture a
-`sessionKey` cookie scoped to `/api` so it covers both account and billing URLs.
-Claude's `/api/account` capture URL and subscription-date enrichment have fixture
-coverage, but have not been checked with a live claude.ai session.
+insula logs a deposit's first rejection after it has served, with its age
+(`deposited cookie ... first rejected after working <h>h<mm>m`): the site's
+session lifetime for that capture.
 
-The `kimi.com` deposit is not a lane: kimi-for-coding reads its usage with the
-coding API key and uses the web session's `kimi-auth` cookie only to fetch two
-optional subscription extras. Without the deposit those extras are skipped.
+**Proven by:** `cookie_capture_urls_match_the_providers_fetch_urls` (every row
+against the provider's source, and every cookie family against the table),
+`langdock_replacement_changes_the_single_deposit_and_two_deposits_are_refused`.
 
-The login page can be any page on the site where the user signs in; it does not
-have to be the fetch URL, and for factory it is not (sign-in is on
-`app.factory.ai`, the fetch is on `api.factory.ai`).
+<a id="measured-behaviour-is-recorded-here-not-stamped-on-the-wire"></a>
 
-insula logs each deposit's first rejection after it has served, with its age
-(`deposited cookie ... first rejected after working <h>h<mm>m`). That is the
-site's session lifetime for that capture, and the only measurement of it.
+## 12. Observed provider behaviour
 
-### Consumption metrics
+Some facts a consumer needs are not stated by any upstream, so they are recorded
+here as observations rather than published as wire fields. A wire field would
+assert an upstream claim indefinitely; an observation here carries its method.
 
-**Four health metrics describe CONSUMPTION rather than production.**
-`usageRequestsServed` and `usageRequestsRefused` count route requests this process
-answered and refused since it started; `lastServedAgeSecs` and `lastRefusedAgeSecs`
-give the seconds since each, or null if it has not happened.
+**Anthropic five-hour windows reset at a boundary; they do not slide.** Polling
+one account repeatedly within an active window shows its `resetsAt` constant
+(sub-second jitter only), where a rolling window would move it forward. Two
+accounts on one plan carry different reset instants, which is a per-account
+anchor. An account nothing has used carries no `resetsAt`, consistent with a
+window that starts at first use. Whether the next window anchors at the next
+first use or on a fixed grid has not been observed. Reproduce by polling one
+account and watching its own `resetsAt`; never compare `resetsAt` across
+accounts, or across arrays from different hosts, as if it were one series.
 
-Every other metric on this surface answers *am I producing correctly* — fresh,
-stale, degraded, blackout, refresher ticking. None of them answers *is anyone
-reading*. A host whose consumers all stopped dialling an hour ago publishes
-health identical to a perfectly healthy one, because nothing in the producing
-path notices. These four close that gap.
+The boundary reset is deliberately not published as a `regeneration`
+mechanic: that object
+means the upstream stated how quota returns, and Anthropic states only a reset
+instant, which `resetsAt` already carries.
 
-**They are deliberately not alarmed, and consumers should not alarm on them
-either.** A host with nobody polling is a legitimate configuration; a rule that
-degrades on it fires everywhere and trains the surface into noise. They exist so
-that *is anything reading insula* is answerable by looking rather than inferring.
-
-**Served and refused are separate because an age alone cannot tell
-nobody-asked from asked-and-failed.** A consumer whose every request is refused —
-undecodable body, unknown method — never advances the served watermark and looks
-exactly like silence. Read as a pair they separate the three states worth
-triaging: quiet (neither advancing), consuming (served advancing), and
-failing-to-consume (refused advancing while served does not).
-
-Counts are process-lifetime and reset on restart, so the AGES carry more meaning
-than the totals: a freshly restarted module legitimately reports zero served.
-
-**Two health metrics describe this module's own client, not any provider.**
-`vaultUnmatchedDrops` and `vaultStaleGenerationDrops` count frames this module
-read from the credential vault and discarded: one whose caller had already gone,
-and one arriving for a caller from a previous connection. Both drops are
-correct — the point of publishing them is that a silently discarded reply and a
-peer that never answered look identical from outside, and those two states send
-an investigation to opposite components.
-
-Small numbers around a daemon restart are ordinary. A rising unmatched count
-while nothing is restarting is the one worth asking about. Neither says anything
-about a provider's capacity, so they belong to operators rather than to routing.
-
-**Health counts providers; the array carries accounts.** A provider with several
-credentialed accounts contributes several entries to `usage.get` and exactly one
-to these buckets, so the array is normally longer than `providersTotal` and the
-two are not reconcilable by counting. On this host today: 39 entries against 35
-providers. When a provider's accounts disagree, the buckets take the best one —
-any fresh account makes it fresh, any stale one makes it stale, and it counts as
-degraded only when *every* account is. So a provider showing `fresh` here can
-still have a dead account visible in the array, which is the intended reading:
-this axis answers whether the module is serving a provider at all, not whether
-every account under it is healthy.
-
-The metrics carry a conservation identity that must balance:
-
-```
-fresh + stale + pending + len(degraded) + len(unconfigured) + len(withoutHandles)
-  == providersTotal
-```
-
-**The terms are not the same type on the wire.** `fresh`, `stale` and `pending`
-are numbers; `degraded`, `unconfigured` and `withoutHandles` are arrays of
-provider names, because knowing *which* providers are in a bucket is worth more
-than knowing how many. Take their lengths. A language that coerces rather than
-complaining will happily evaluate the wrong expression here — in JavaScript,
-`7 + 0 + [..28 names..] + []` is a string, and the comparison is simply false
-forever, which reads as a standing imbalance rather than as a bug in the
-assertion.
-
-**`degraded` is the operator signal; `unconfigured` is not.** A provider whose
-accounts all failed because no credential exists on the host is reported as
-`unconfigured` — the expected state for most adapters on most machines, since
-this module ships 35 and nobody uses all of them. `degraded` is narrower: a
-credential exists and something is wrong with it, or the upstream refused it, or
-the response could not be read. Alert on `degraded` being non-empty; do not
-alert on `unconfigured`.
-
-The split matters because the combined count is a permanent alarm. On the host
-these docs are written from, 27 providers failed and 23 of those had no
-credential at all — so a genuine new failure moved the old number from 27 to 28,
-which no operator would notice. A provider needs *every* account to be an
-expected absence to count as unconfigured; one broken credential beside one that
-was never set up is a provider somebody should look at, and it is reported as
-degraded.
-
-Assert it and alert on imbalance. It cannot be tuned into silence and cannot
-pass by sampling healthy members. It is **not** a liveness signal, though: it
-holds perfectly when every provider is degraded.
-
-**It holds only once the refresher has ticked.** Before the first tick no
-provider is in any bucket — slots do not exist yet and nothing is reported as
-handle-less, because naming every provider during the seconds after a start
-would make the field meaningless. So the sum is zero while `providersTotal` is
-not. Gate the assertion on `lastTickAgeSecs` being non-null, or it fires on
-every module start and restart, and an alert that cries wolf at boot gets
-trained into noise within a week — which costs more than the identity was worth.
-
-**`pending` is why one tick is not enough on its own.** The refresher admits a
-bounded number of fetch units per turn, so a provider registered here can wait
-several turns for its first fetch — with 35 providers that is the ordinary state
-for the first turns after a start, not an exceptional one. Those providers are
-serving nothing and have failed at nothing, so they belong to no other bucket;
-`pending` exists to hold them and keep the sum whole. It is not a fault, and
-alerting on a non-zero `pending` would alert on a module that is simply starting
-up. If you want "is this provider usable right now", read `fresh + stale`
-(published in the health detail as *serving*), not the absence of `pending`.
-
-**The remaining metrics are diagnostics, not a second capacity axis.**
-
-`cookieCohortTotal` counts the providers whose credential is a web session
-cookie — the ones that need a captured login deposited in the vault rather than
-a stored token. `cookieLoginsStale` names the subset whose login **stopped
-working**: a deposited cookie was sent and the upstream rejected it, or the page
-it scrapes no longer parses.
-
-Read them together as "N of C logins stale". Do **not** read
-`cookieLoginsStale` as the cookie providers that are degraded — it is a
-deliberately narrower set. A cookie provider with no deposit publishes no entry
-at all (it is unconfigured on that host), because not being logged into
-something you do not use is the correct state and counting it would pin the
-number at the cohort size on every machine.
-
-`refresherStalled` is the boolean behind a `degraded` module status: the
-refresher's heartbeat is older than its stall horizon. Windows already fetched
-keep serving while it is set — only their freshness decays — which is why it
-degrades rather than fails.
-
-`buildCommit` reports the commit the running module was built from. It is
-generated by the module and merely relayed by whatever asks, so a stale client
-can fail to ask but cannot report a stale answer as current.
-
-## Three kinds of quiet
-
-Where this document is silent, the silence has a category, and they are
-different promises:
-
-- **specified** — guaranteed behaviour, above.
-- **deliberately unspecified** — a non-guarantee you should rely on. `fetchedAt`
-  entries not sharing an instant is the example: build nothing on cross-entry
-  alignment.
-- **undocumented** — unstable ground, such as error-string prose. Reliance is
-  unsafe precisely because nothing marks it.
-
-A field's category changes only by an explicit decision recorded here, never by
-observation and never by appearing in a document. **Silence is not permission**:
-a consumer's reasonable inference from an underspecified field is
-indistinguishable from a guarantee until it breaks, which is exactly how the
-retention defect above was built.
-
-## Why this file exists
-
-A producer and a consumer can each be locally correct and still disagree about
-what a response means, because the meaning lives at the boundary and neither
-codebase contains it.
-
-A worked case: `fetchedAt` records the producer's last **successful** fetch, and
-a transient failure keeps serving the previous entry with that older timestamp
-unchanged. A consumer that stamps its own poll time instead is locally
-reasonable — nothing in its own code looks wrong — and the substitution resets
-the apparent age of data that is in fact getting older, on the consumer's poll
-cadence rather than the producer's failure duration. Polling more often makes it
-worse. That defect is not visible from either side alone: the consumer cannot
-falsify it without knowing the retention rule, and the producer never sees the
-consumer's clock.
-
-So the rules live here, where a change on either side can be reviewed against the
-same text. **Silence from a consumer is not confirmation.** A misreading produces
-no error on the producing side — no failed request, no exception, no support
-ticket — so the absence of complaints measures visibility rather than
-correctness.
-
-
-## A window set carries no completeness claim
-
-`completeProviders` tells you the ACCOUNT axis was fully enumerated. Nothing on
-the wire says the same about the WINDOW axis, and the difference bit a consumer.
-
-Before 2026-08-29, `antigravity` published one window with `windowMinutes: null`.
-A renderer showed a single figure and labelled the cadence `?`, which was a
-faithful rendering of what arrived. What it could not know, in the words of the
-consumer who hit it:
-
-> Nothing distinguished "this provider has one limit" from "we asked the endpoint
-> that only reports one."
-
-It was the second. The lane dialled an endpoint returning one bucket per model
-with a single implicit window, so both cadences collapsed and the weekly one —
-the constrained one, at 17.6% against the 5h reading of 1.2% — was never
-published. The consumer had no signal, because a dropped window and an absent
-window look identical: `windowMinutes: null` reads as "cadence unknown", never as
-"a second window existed and was discarded".
-
-THERE IS NO FLAG FOR THIS AND THERE SHOULD NOT BE. A per-entry `windows_complete`
-would be `true` on every row this module emits, since a lane that cannot
-enumerate its cadences is a lane with a defect rather than a lane with a
-different shape. A field with one value reads as a check being performed while
-being a constant — the failure it would be introduced to prevent, wearing the
-costume of a fix.
-
-So the rule is a producer obligation rather than a wire field:
-
-- A window set is COMPLETE unless the entry carries an error. Publishing a subset
-  silently is a defect on this side, not a state consumers must detect.
-- Where a lane genuinely cannot enumerate cadences, it must say so through the
-  error taxonomy — `no_quota_reported` if the upstream states there is nothing,
-  `decode_failed` if we could not read what it sent — rather than by publishing
-  the subset it managed to read.
-- A consumer therefore may treat the windows on a clean entry as all of them.
-  That guarantee is only worth what this side's discipline is worth, which is why
-  it is written here where a future partial lane will be reviewed against it.
-
-The general form, which is why this sits beside the discard rules rather than
-under antigravity: DROPPING A WINDOW BIASES EVERY READING TAKEN FROM THE SET, and
-biases it toward more headroom, because the window most likely to be dropped is
-the one whose shape the parser did not expect. Silence about the drop is what
-makes it dangerous — a reduction over an incomplete set returns a smaller number
-with no indication it is smaller.
+A measurement taken on a host that is itself using a provider is shaped by that
+use. State what was driving the lane beside the method, and where nothing was
+known to be, say what was checked.
