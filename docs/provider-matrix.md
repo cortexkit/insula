@@ -1,6 +1,6 @@
 # Provider matrix — current inventory
 
-39 providers registered.
+38 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -31,8 +31,7 @@ on every operating system. The public wire semantics are in `consumer-contract.m
 |---|---|---|---|
 | `codex` | Codex CLI `~/.codex/auth.json`; vault `chatgpt:openai` | `GET https://chatgpt.com/backend-api/wham/usage` (base configurable); `/wham/rate-limit-reset-credits` and optional consume | Provider-reported windows (including 5h / weekly), banked resets, credit balance |
 | `claude` | OpenCode `anthropic` OAuth; vault `oauth:anthropic`; `cookie:claude.ai` enrichment | `GET https://api.anthropic.com/api/oauth/usage`; profile and optional web subscription enrichment | 5h / weekly, named model windows, optional extra usage and subscription dates |
-| `antigravity` | Running editor/CLI, plugin sidebar cache; vault `antigravity:google` | Loopback `LanguageServerService/RetrieveUserQuotaSummary`; `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, refusal fallback `retrieveUserQuota` | Native Gemini primary plus named native/external pool windows (5h / weekly when stated); paid-tier quota requires the running editor or a recent plugin observation |
-| `gemini` | Gemini CLI `~/.gemini/oauth_creds.json`; vault `oauth:google` | `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` and `retrieveUserQuota`; local-token refresh at `https://oauth2.googleapis.com/token` | Per-model quota windows (24h / reset-derived duration); individual-tier refusal is not repaired by refreshing a token |
+| `antigravity` | Running editor/CLI, plugin sidebar cache; vault `antigravity:google` | Loopback `LanguageServerService/RetrieveUserQuotaSummary`; `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, refusal fallback `retrieveUserQuota` | Named Gemini and Claude/GPT pool windows (5h / weekly when stated); the vault login reads a paid account's own pool, so neither the editor nor the plugin needs to run |
 | `grok` | OpenCode `xai` OAuth; vault `oauth:xai` | gRPC-web `POST https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` | Billing-period utilization and reset |
 | `cursor` | Cursor app `state.vscdb`; vault `oauth:cursor` or `cookie:cursor.com` | `https://cursor.com/api/usage-summary` | Plan and on-demand billing-cycle utilization; period/reset metadata from response |
 | `jetbrains` | IDE quota XML and `idea.log` | Local `options/AIAssistantQuotaManager2.xml` or newer quota log record; no network call | Tariff quota window, stated refill duration; purchased top-up pool |

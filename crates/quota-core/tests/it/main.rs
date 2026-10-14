@@ -7,9 +7,8 @@
 //! All of these are live provider proofs and stay `#[ignore]`: they read real
 //! sessions on the machine running them. None mutates the process environment
 //! or cwd, so they share a process safely. Run one with a name filter, e.g.
-//! `cargo test -p quota-core --test it gemini_live:: -- --ignored --nocapture`.
+//! `cargo test -p quota-core --test it grok_live:: -- --ignored --nocapture`.
 
 mod antigravity_live;
-mod gemini_live;
 mod grok_live;
 mod jetbrains_live;

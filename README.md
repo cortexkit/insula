@@ -60,20 +60,24 @@ a single provider's failure never fails the whole array.
 
 ## Providers (window-bearing)
 
-35 providers are registered, each fetching a real rate/usage window:
+38 providers are registered, each reading a rate window or credit balance from its upstream:
 
-`codex`, `claude`, `antigravity`, `codebuff`, `copilot`, `cursor`, `doubao`,
-`elevenlabs`, `factory`, `gemini`, `grok`, `jetbrains`, `kimi`, `kimi-for-coding`,
-`clinepass`, `llmproxy`, `manus`, `mimo`, `minimax`, `neuralwatt`, `ollama`,
-`opencode`, `opencodego`, `qoder`, `qwen-cloud`, `sakana`, `stepfun`, `sub2api`,
-`warp`, `synthetic`, `zai`, `zenmux`, `kilo`, `alibaba`, `amp`.
+`codex`, `claude`, `antigravity`, `codebuff`, `copilot`, `cursor`, `deepseek`,
+`doubao`, `elevenlabs`, `factory`, `grok`, `jetbrains`, `kimi`, `kimi-for-coding`,
+`clinepass`, `langdock`, `llmproxy`, `manus`, `mimo`, `minimax`, `muse`,
+`neuralwatt`, `ollama`, `opencode`, `opencodego`, `openrouter`, `qoder`,
+`qwen-cloud`, `sakana`, `stepfun`, `sub2api`, `warp`, `synthetic`, `zai`,
+`zenmux`, `kilo`, `alibaba`, `amp`.
+
+Google is covered by `antigravity` only. Google ended Gemini Code Assist for
+individual accounts, so the Gemini CLI login no longer has a quota to read.
 
 A provider may serve more than one account, so the served entry count exceeds the
 provider count.
 
 Verification (see each module's `VERIFICATION:` doc block):
-- **Live-verified** (real window proven through the wire): codex, claude, gemini,
-  grok, ollama, antigravity.
+- **Live-verified** (real window proven through the wire): codex, claude, grok,
+  ollama, antigravity, muse.
 - **Hybrid**: jetbrains (file-read/parse/degrade proven on real disk; active-window
   mapping fixture-verified).
 - **Fixture-verified** (CodexBar-sourced port, no credential on the build machine;
@@ -96,7 +100,6 @@ Live and real-daemon proofs are `#[ignore]` (need real sessions / a built
 
 ```sh
 # real provider windows through the wire (needs the provider's real session):
-cargo test -p quota-core --test it   -- --ignored --nocapture gemini_live::
 cargo test -p quota-core --test it   -- --ignored --nocapture grok_live::
 cargo test -p quota-module --test it -- --ignored --nocapture skeleton_e2e::
 

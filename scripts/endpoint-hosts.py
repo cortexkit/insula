@@ -71,12 +71,6 @@ EXPECTED: dict[str, dict[str, str]] = {
     "doubao": {"API_URL": "ark.cn-beijing.volces.com"},
     "elevenlabs": {"DEFAULT_BASE": "api.elevenlabs.io"},
     "factory": {"BILLING_LIMITS_URL": "api.factory.ai"},
-    "gemini": {
-        "LOAD_CODE_ASSIST_URL": "cloudcode-pa.googleapis.com",
-        "PROJECTS_URL": "cloudresourcemanager.googleapis.com",
-        "QUOTA_URL": "cloudcode-pa.googleapis.com",
-        "TOKEN_URL": "oauth2.googleapis.com",
-    },
     "grok": {"USAGE_URL": "grok.com"},
     "kilo": {"DEFAULT_TRPC_BASE": "app.kilo.ai"},
     "kimi_for_coding": {"USAGE_URL": "api.kimi.com"},

@@ -85,17 +85,6 @@ fn main() {
         ),
         Err(e) => println!("  grok             ERROR {e:?}"),
     }
-    match loader.gemini_handles() {
-        Ok(h) if h.is_empty() => println!("  gemini           NONE"),
-        Ok(h) => println!(
-            "  gemini           {}",
-            h.iter()
-                .map(|x| x.stable_id().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Err(e) => println!("  gemini           ERROR {e:?}"),
-    }
     match loader.antigravity_handles() {
         Ok(h) if h.is_empty() => println!("  antigravity      NONE"),
         Ok(h) => println!(

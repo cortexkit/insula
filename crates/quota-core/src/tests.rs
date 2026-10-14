@@ -494,7 +494,7 @@ fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
         mixers.is_empty(),
         "these providers offer an implicit local lane beside vault handles: \
          {mixers:?}. Either return the vault set alone when it is non-empty (see \
-         anthropic, deepseek, gemini, grok, openrouter, synthetic), or add an \
+         anthropic, deepseek, grok, openrouter, synthetic), or add an \
          exemption stating why this provider's LOCAL lane resolves an account \
          identity of its own."
     );
@@ -1577,11 +1577,11 @@ fn every_api_provider_key_names_a_registered_provider() {
     // entries are individually well-formed and the collision is visible only by
     // comparing them.
     //
-    // The near miss this guards against is concrete. `antigravity` and `gemini`
-    // are separate products reached through the same Google API, with separate
-    // credentials and separate quota pools, and `gemini` already publishes
-    // `google`. Giving antigravity the obvious-looking slug would make one
-    // product's exhaustion read as the other's.
+    // The near miss this guards against is concrete. `antigravity` and the
+    // former `gemini` provider were separate products reached through the same
+    // Google API, with separate credentials and quota pools, and `gemini`
+    // published `google`. Giving two such products one slug makes one product's
+    // exhaustion read as the other's.
     let mut by_slug: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for (key, value) in &keys {
         by_slug

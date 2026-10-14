@@ -493,9 +493,9 @@ impl JsonRequest {
             // characters of the upstream's own words; the one class whose remedy is
             // an OPERATOR ACTION carried `HTTP 403` and nothing else.
             //
-            // A 403 is not reliably an auth verdict. Two live rows on this host say
-            // so: `gemini` answers `unauthorized: quota: HTTP 403` because Google
-            // sunset Code Assist for individual accounts, where re-authenticating
+            // A 403 is not reliably an auth verdict. Two live rows said so: the
+            // former `gemini` provider answered `unauthorized: quota: HTTP 403`
+            // because Google sunset Code Assist for individual accounts, where re-authenticating
             // cannot help, and upstream CodexBar hit the same shape from a different
             // direction at v0.56.4 -- claude.ai returning 403 for a Cloudflare
             // challenge, which they had to add a distinct class for because the
@@ -580,7 +580,7 @@ impl JsonRequest {
             //
             // The unredacted-excerpt obligation stated above applies to this path
             // in full, and more sharply: every caller is a bearer-token lane
-            // (anthropic, antigravity, codex, gemini, grok, kimi-for-coding), so a
+            // (anthropic, antigravity, codex, grok, kimi-for-coding, muse), so a
             // provider echoing the rejected credential back would echo it here.
             let body = match read_error_body_prefix(response).await {
                 Ok(body) => refusal_excerpt(&body),
@@ -846,7 +846,7 @@ mod tests {
     /// ACTION carried `HTTP 403`.
     ///
     /// A 403 is not reliably an auth verdict, and both known counterexamples cost
-    /// someone real time. `gemini` answers 403 on this host because Google sunset
+    /// someone real time. The former `gemini` provider got 403 because Google sunset
     /// Code Assist for individual accounts -- re-authenticating cannot fix it --
     /// and upstream CodexBar found claude.ai answering 403 for a Cloudflare
     /// challenge, where the remedy is a network change. Neither is distinguishable

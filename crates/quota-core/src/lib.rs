@@ -31,7 +31,6 @@ pub mod doubao;
 pub mod elevenlabs;
 pub mod env;
 pub mod factory;
-pub mod gemini;
 pub mod grok;
 pub mod health;
 pub mod http;
@@ -405,7 +404,6 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some("openai"),
         "claude" => Some("anthropic"),
-        "gemini" => Some("google"),
         "grok" => Some("xai"),
         "copilot" => Some("github-copilot"),
         "deepseek" => Some("deepseek"),
@@ -652,10 +650,6 @@ impl Registry {
             Box::new(doubao::DoubaoProvider::new()),
             Box::new(elevenlabs::ElevenLabsProvider::new()),
             Box::new(factory::FactoryProvider::new_with_handle_loader(
-                credential_source.clone(),
-                Arc::clone(&vault_handle_loader),
-            )),
-            Box::new(gemini::GeminiProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

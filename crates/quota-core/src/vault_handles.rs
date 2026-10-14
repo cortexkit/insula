@@ -19,7 +19,6 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:claude.ai", "claude"),
     ("oauth:xai", "grok"),
     ("antigravity:google", "antigravity"),
-    ("oauth:google", "gemini"),
     ("kimi-for-coding", "kimi-for-coding"),
     ("apikey:kimi-for-coding", "kimi-for-coding"),
     ("cookie:ampcode.com", "amp"),
@@ -71,7 +70,6 @@ enum ProviderKind {
     Codex,
     Anthropic,
     Grok,
-    Gemini,
     Antigravity,
     KimiForCoding,
     Amp,
@@ -410,10 +408,6 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Grok)
     }
 
-    pub fn gemini_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
-        self.provider_handles(ProviderKind::Gemini)
-    }
-
     pub fn antigravity_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Antigravity)
     }
@@ -558,7 +552,6 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "codex" => Some(ProviderKind::Codex),
         "claude" => Some(ProviderKind::Anthropic),
         "grok" => Some(ProviderKind::Grok),
-        "gemini" => Some(ProviderKind::Gemini),
         "antigravity" => Some(ProviderKind::Antigravity),
         "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
         "amp" => Some(ProviderKind::Amp),
