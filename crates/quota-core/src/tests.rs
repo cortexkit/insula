@@ -2883,6 +2883,51 @@ async fn no_provider_is_complete_before_the_first_turn() {
     );
 }
 
+/// A provider whose enumeration always fails but names the handles it knows.
+struct PartlyKnownProvider {
+    known: Vec<CredentialHandle>,
+}
+
+#[async_trait]
+impl UsageProvider for PartlyKnownProvider {
+    fn name(&self) -> &str {
+        "partly"
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Err(HandlesError::with_known(
+            "second source unreadable",
+            self.known.clone(),
+        ))
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(observed(Some("A")), "vault", Usage::default())
+    }
+}
+
+/// A failed enumeration that still names a known handle is fetched and served
+/// even on the registry's first turn, when no earlier handle set exists to fall
+/// back on (as right after a restart). It still claims no complete account set.
+#[tokio::test]
+async fn known_handles_from_a_failed_enumeration_serve_without_claiming_completeness() {
+    let registry = Registry::new(vec![Box::new(PartlyKnownProvider {
+        known: vec![handle("H1")],
+    })]);
+    tick(&registry).await;
+    let snapshot = registry.usage_snapshot(None).await;
+    assert_eq!(
+        accounts_of(&snapshot),
+        [Some("A")],
+        "the known handle serves"
+    );
+    assert!(
+        complete_set(&snapshot).is_empty(),
+        "a partial enumeration authorises no deletion: {:?}",
+        snapshot.complete_providers
+    );
+}
+
 /// A failed enumeration withdraws the completeness claim while entries remain.
 ///
 /// The previous handle set is deliberately retained on a failed enumeration, so

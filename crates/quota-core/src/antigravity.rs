@@ -2348,20 +2348,12 @@ impl AntigravityProvider {
             }
         }
 
-        // Without the sidebar, this lane can't tell whether the account is paid,
-        // and for a paid account the cloud reading below is a different pool.
-        // So it keeps the last reading instead of guessing.
-        let accounts = match self.stored_accounts() {
-            Ok(accounts) => accounts,
-            Err(reason) => {
-                return FetchAttempt::failure(
-                    observed,
-                    Some("vault".to_string()),
-                    FetchError::LocalSourceUnavailable(reason),
-                )
-                .with_account_info(account_info);
-            }
-        };
+        // The sidebar can only add a fresher plugin reading or paid-tier
+        // evidence. Without it, this lane still reads the account's own pool:
+        // the vault credential reaches the same pool the editor reports (see
+        // `cloud_lane_must_withhold`), so an unreadable sidebar is treated as
+        // carrying no evidence rather than taking the account dark.
+        let accounts = self.stored_accounts().unwrap_or_default();
         let plugin_account = stored_account_for_email(&accounts, observed_email.as_deref());
 
         // The account-local plugin cache outranks this live network call because
@@ -2639,11 +2631,21 @@ impl UsageProvider for AntigravityProvider {
             credentialed.extend(self.handle_loader.antigravity_handles()?);
         }
         // Enumerate plugin accounts by genuine email. A sidebar read failure
-        // fails the whole enumeration: returning only vault handles would omit
-        // plugin accounts and make the refresher interpret them as signed out.
-        let accounts = self
-            .stored_accounts()
-            .map_err(crate::provider::HandlesError::new)?;
+        // fails the enumeration, because returning only vault handles would omit
+        // plugin accounts and let the refresher treat them as signed out. The
+        // vault handles still go with the error as known handles: the vault lane
+        // reads the account's own pool without the sidebar, so it must not go
+        // dark (after a restart there would be no slot to keep) just because the
+        // plugin's file can't be read.
+        let accounts = match self.stored_accounts() {
+            Ok(accounts) => accounts,
+            Err(reason) => {
+                return Err(crate::provider::HandlesError::with_known(
+                    reason,
+                    credentialed,
+                ));
+            }
+        };
         for account in &accounts {
             if let Some(name) = account_handle_name(account) {
                 credentialed.push(CredentialHandle::new(name));
@@ -3306,25 +3308,47 @@ mod tests {
         .await;
     }
 
-    /// The vault lane can't tell a paid account without the sidebar, so it keeps
-    /// the last reading instead of publishing the cloud pool.
+    /// An unreadable sidebar doesn't take the vault lane dark. The vault
+    /// credential reads the account's own pool, so without paid-tier evidence
+    /// the lane serves the cloud reading, as it does on a host with no plugin.
     #[tokio::test]
-    async fn the_vault_lane_withholds_the_cloud_pool_when_the_sidebar_is_unreadable() {
+    async fn the_vault_lane_serves_the_cloud_pool_when_the_sidebar_is_unreadable() {
         let mut mock =
             cloud_preflight_mock(200, consumer_client_refusal().to_string().into_bytes()).await;
         let handle = attach_vault(&mut mock.provider, Some("p"), Arc::new(AtomicUsize::new(0)));
         mock.provider.set_override_store_unreadable("moved");
-        let error = mock
+        let usage = mock
             .provider
             .fetch_handle(&handle)
             .await
             .usage
-            .expect_err("the tier is unknown, so the cloud pool may be the wrong one");
-        assert!(
-            matches!(error, FetchError::LocalSourceUnavailable(_)),
-            "{error:?}"
-        );
-        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
+            .expect("an unreadable sidebar must not withhold the vault reading");
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
+    }
+
+    /// After a restart there are no slots to keep, so a failed enumeration must
+    /// still name the vault handle, or an unreadable sidebar takes the account
+    /// dark. The enumeration still fails, so the provider never claims a
+    /// complete account set.
+    #[test]
+    fn an_unreadable_sidebar_still_names_the_vault_handle() {
+        let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("antigravity:google", "oauth")]);
+        let source: Arc<dyn CredentialSource> = Arc::new(PreflightVaultSource {
+            project: Some("p".to_string()),
+            email: None,
+            reports: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut provider = AntigravityProvider::new_with_handle_loader(Some(source), loader);
+        provider.set_override_store_unreadable("moved");
+        let error = provider.handles().expect_err("enumeration must fail");
+        let known: Vec<&str> = error
+            .known()
+            .iter()
+            .map(CredentialHandle::stable_id)
+            .collect();
+        assert_eq!(known, vec!["antigravity:google"]);
     }
 
     #[tokio::test]

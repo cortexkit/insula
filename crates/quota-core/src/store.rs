@@ -342,6 +342,21 @@ impl SlotStore {
         }
     }
 
+    /// Give handles a failed enumeration still knows about a slot, without
+    /// reaping anything or counting the enumeration as a success.
+    ///
+    /// Called after [`Self::reconcile_batch`] for providers whose enumeration
+    /// failed partway (see `HandlesError::with_known`). Existing slots are left
+    /// as they are, exactly as for any failed enumeration.
+    pub(crate) fn insert_known(
+        &mut self,
+        provider: &str,
+        handles: &[CredentialHandle],
+        now: Instant,
+    ) {
+        self.insert_missing(provider, handles, now);
+    }
+
     fn insert_missing(&mut self, provider: &str, handles: &[CredentialHandle], now: Instant) {
         for handle in handles {
             let key = SlotKey::new(provider, handle.clone());

@@ -149,17 +149,42 @@ impl std::fmt::Display for CredentialHandle {
 /// This is distinct from an authoritative empty set so a transient config error
 /// cannot accidentally reap every account for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandlesError(String);
+pub struct HandlesError {
+    message: String,
+    known: Vec<CredentialHandle>,
+}
 
 impl HandlesError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            known: Vec::new(),
+        }
+    }
+
+    /// An enumeration that failed for part of the account set but still knows
+    /// some handles exist, for example a provider with a working vault
+    /// credential whose second source (a local file) couldn't be read.
+    ///
+    /// The refresher creates slots for `known` handles that don't have one yet,
+    /// so a source that is readable keeps serving after a restart. It reaps
+    /// nothing and the enumeration still counts as failed, so the provider never
+    /// claims a complete account set on the strength of half a reading.
+    pub fn with_known(message: impl Into<String>, known: Vec<CredentialHandle>) -> Self {
+        Self {
+            message: message.into(),
+            known,
+        }
+    }
+
+    pub fn known(&self) -> &[CredentialHandle] {
+        &self.known
     }
 }
 
 impl std::fmt::Display for HandlesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 

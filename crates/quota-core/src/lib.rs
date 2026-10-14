@@ -1392,6 +1392,9 @@ impl Registry {
             }
         }
 
+        // Each provider either enumerated its full set (`Ok`) or failed, possibly
+        // still naming handles it knows exist (`Err` with `known`).
+        let mut partial: Vec<(&str, Vec<CredentialHandle>)> = Vec::new();
         let enumerated: Vec<Option<Vec<CredentialHandle>>> = self
             .providers
             .iter()
@@ -1407,7 +1410,13 @@ impl Registry {
                         handles.dedup();
                         Some(handles)
                     }
-                    Ok(Err(_)) | Err(_) => None,
+                    Ok(Err(error)) => {
+                        if !error.known().is_empty() {
+                            partial.push((provider.name.as_str(), error.known().to_vec()));
+                        }
+                        None
+                    }
+                    Err(_) => None,
                 }
             })
             .collect();
@@ -1426,6 +1435,9 @@ impl Registry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             store.reconcile_batch(&authoritative, turn_start);
+            for (provider, handles) in &partial {
+                store.insert_known(provider, handles, turn_start);
+            }
             if authoritative_vault_install {
                 let rows: HashMap<_, _> = self
                     .vault_handle_loader
