@@ -178,7 +178,19 @@ else
 fi
 
 step "cargo test --workspace --lib --bins"
-cargo test --workspace --lib --bins || fail "unit tests"
+# The unit tests run with TMPDIR pointed at a fresh empty folder, which must be
+# empty again afterwards. A test helper that creates a scratch folder and never
+# removes it leaves entries in the shared temp root on every run, without
+# bound, and nothing else notices: it fails no test.
+test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/insula-gate-tmp.XXXXXX") || fail "could not create a scratch TMPDIR"
+TMPDIR="$test_tmp" cargo test --workspace --lib --bins || fail "unit tests"
+leftover=$(ls -A "$test_tmp")
+if [ -n "$leftover" ]; then
+    echo "$leftover" | sed 's/^/    left behind: /'
+    fail "unit tests left $(echo "$leftover" | wc -l | tr -d ' ') entries in TMPDIR; use crate::tests::ResetTempDir"
+fi
+rmdir "$test_tmp"
+echo "  TMPDIR after the unit tests: 0 entries"
 
 # DOCTESTS ARE A SEPARATE TARGET AND --lib --bins DOES NOT INCLUDE THEM. Neither
 # does --all-targets, which is the trap: it reads as "everything" and silently

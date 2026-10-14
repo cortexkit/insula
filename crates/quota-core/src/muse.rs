@@ -598,15 +598,9 @@ mod tests {
         provider
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "insula-muse-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A per-test scratch directory, removed when the returned guard drops.
+    fn scratch(name: &str) -> crate::tests::ResetTempDir {
+        crate::tests::ResetTempDir::with_prefix("insula-muse", name)
     }
 
     #[test]
@@ -823,7 +817,7 @@ mod tests {
     #[test]
     fn an_inline_cli_token_is_read() {
         let dir = scratch("inline");
-        let path = dir.join("auth.json");
+        let path = dir.path().join("auth.json");
         std::fs::write(
             &path,
             r#"{"providers": {"meta": {"mechanism": "oauth", "access_token": "dca:inline"}}}"#,
@@ -838,7 +832,7 @@ mod tests {
     #[test]
     fn a_keychain_only_login_is_unusable_not_absent() {
         let dir = scratch("keychain");
-        let path = dir.join("auth.json");
+        let path = dir.path().join("auth.json");
         std::fs::write(
             &path,
             r#"{"providers": {"meta": {"mechanism": "oauth", "storage": "keychain"}}}"#,
@@ -855,7 +849,7 @@ mod tests {
         let dir = scratch("absent");
         let provider = provider(env_with(&[(
             AUTH_PATH_ENV,
-            dir.join("missing.json").to_str().unwrap(),
+            dir.path().join("missing.json").to_str().unwrap(),
         )]));
         assert_eq!(
             provider.local_token().unwrap_err().error_class(),
@@ -869,7 +863,7 @@ mod tests {
     fn an_unreadable_login_file_is_unavailable_not_absent() {
         // A directory where the file should be: present, but not readable as a file.
         let dir = scratch("unreadable");
-        let provider = provider(env_with(&[(AUTH_PATH_ENV, dir.to_str().unwrap())]));
+        let provider = provider(env_with(&[(AUTH_PATH_ENV, dir.path().to_str().unwrap())]));
         assert_eq!(
             provider.local_token().unwrap_err().error_class(),
             "local_source_unavailable"
