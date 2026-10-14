@@ -102,7 +102,8 @@ struct UsageWindow {
 /// What one `muse-code/key` answer says about the account.
 #[derive(Debug, PartialEq)]
 struct Reading {
-    usage: Usage,
+    /// `None` when Meta left `subs_usage` out: the 5-hour window is idle.
+    usage: Option<Usage>,
     email: Option<String>,
     plan: Option<String>,
 }
@@ -157,17 +158,17 @@ fn parse(body: &[u8]) -> Result<Reading, FetchError> {
             "no Muse Code subscription is active on this login".to_string(),
         ));
     }
+    let email = trimmed(response.user_email);
+    let plan = trimmed(response.subs_tier_name);
     let Some(subs) = response.subs_usage else {
         // Meta leaves `subs_usage` out (or null) while the 5-hour window is idle,
-        // even when the weekly window has usage. That's not "no quota": the
-        // weekly figure exists and simply wasn't sent. A transient class keeps
-        // the last reading serving, marked stale. A clean entry here would claim
-        // a complete window set with the weekly limit missing, and a 0% weekly
-        // would be invented. `Upstream` is the transient class for "the upstream
-        // didn't give us the reading this time".
-        return Err(FetchError::Upstream(
-            "Muse Code omitted usage, which Meta does while the 5-hour window is idle".to_string(),
-        ));
+        // even when the weekly window has usage. The caller decides what that
+        // means, because only it remembers the account's last weekly figure.
+        return Ok(Reading {
+            usage: None,
+            email,
+            plan,
+        });
     };
     for (field, value) in [
         ("window.used_percent", subs.window.used_percent),
@@ -204,9 +205,47 @@ fn parse(body: &[u8]) -> Result<Reading, FetchError> {
         extra_rate_windows: None,
     };
     Ok(Reading {
-        usage,
-        email: trimmed(response.user_email),
-        plan: trimmed(response.subs_tier_name),
+        usage: Some(usage),
+        email,
+        plan,
+    })
+}
+
+/// The reading to publish when Meta omitted usage because the 5-hour window is
+/// idle, built from the account's last full reading.
+///
+/// Both windows are known without being sent. The 5-hour window is idle, so it
+/// is 0% with no reset pending. The weekly figure can't have moved since the
+/// last full reading: any request would have opened a new 5-hour window, and an
+/// open window makes Meta send `subs_usage` again. So the last weekly figure is
+/// still the current one, until its own reset passes, after which it's 0% with
+/// the next reset unknown. With no earlier full reading (just after a restart)
+/// there's nothing to build from, and the caller reports a transient failure.
+fn idle_usage(last: &Usage, now: chrono::DateTime<chrono::Utc>) -> Option<Usage> {
+    let short = last.primary.as_ref()?;
+    let weekly = last.secondary.as_ref()?;
+    let weekly_reset_passed = weekly
+        .resets_at
+        .as_deref()
+        .and_then(|reset| chrono::DateTime::parse_from_rfc3339(reset).ok())
+        .is_some_and(|reset| reset <= now);
+    Some(Usage {
+        primary: Some(RateWindow {
+            used_percent: 0.0,
+            resets_at: None,
+            ..short.clone()
+        }),
+        secondary: Some(if weekly_reset_passed {
+            RateWindow {
+                used_percent: 0.0,
+                resets_at: None,
+                ..weekly.clone()
+            }
+        } else {
+            weekly.clone()
+        }),
+        tertiary: None,
+        extra_rate_windows: None,
     })
 }
 
@@ -261,6 +300,9 @@ pub struct MuseProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     env: EnvLookup,
+    /// Each account's last full reading, keyed by Meta's `user_email`, so an
+    /// idle answer can be filled in (see [`idle_usage`]). Process memory only.
+    last_full: std::sync::Mutex<std::collections::HashMap<String, Usage>>,
 }
 
 impl MuseProvider {
@@ -274,6 +316,13 @@ impl MuseProvider {
             credential_source,
             handle_loader,
             env: default_env(),
+            last_full: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn remember(&self, email: &str, usage: &Usage) {
+        if let Ok(mut last) = self.last_full.lock() {
+            last.insert(email.to_string(), usage.clone());
         }
     }
 
@@ -386,8 +435,38 @@ impl MuseProvider {
                     subscription_renews_at: None,
                     subscription_ends_at: None,
                 });
+                let usage = match (reading.usage, reading.email.as_deref()) {
+                    (Some(usage), email) => {
+                        if let Some(email) = email {
+                            self.remember(email, &usage);
+                        }
+                        usage
+                    }
+                    (None, email) => {
+                        let idle = email.and_then(|email| {
+                            let last = self.last_full.lock().ok()?.get(email).cloned()?;
+                            idle_usage(&last, chrono::Utc::now())
+                        });
+                        let Some(idle) = idle else {
+                            // Nothing to build from, so keep the last served
+                            // reading (if any) with a transient class, rather
+                            // than publish a weekly figure nobody sent.
+                            let error = FetchError::Upstream(
+                                "Muse Code omitted usage, which Meta does while the 5-hour \
+                                 window is idle, and no earlier reading is held to fill it"
+                                    .to_string(),
+                            );
+                            return (
+                                FetchAttempt::failure(observed, Some(source.to_string()), error)
+                                    .with_account_info(info),
+                                None,
+                            );
+                        };
+                        idle
+                    }
+                };
                 (
-                    FetchAttempt::success(observed, source, reading.usage).with_account_info(info),
+                    FetchAttempt::success(observed, source, usage).with_account_info(info),
                     None,
                 )
             }
@@ -533,12 +612,13 @@ mod tests {
     #[test]
     fn a_full_answer_publishes_both_windows_the_plan_and_the_email() {
         let reading = parse(FULL.as_bytes()).unwrap();
-        let primary = reading.usage.primary.as_ref().unwrap();
+        let usage = reading.usage.as_ref().unwrap();
+        let primary = usage.primary.as_ref().unwrap();
         assert_eq!(primary.used_percent, 37.5);
         assert_eq!(primary.window_minutes, Some(300));
         assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.resets_at.as_deref(), Some("2026-10-03T04:00:00Z"));
-        let weekly = reading.usage.secondary.as_ref().unwrap();
+        let weekly = usage.secondary.as_ref().unwrap();
         assert_eq!(weekly.used_percent, 12.25);
         assert_eq!(weekly.window_minutes, Some(WEEKLY_MINUTES));
         assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
@@ -563,25 +643,123 @@ mod tests {
             "\"window_duration_mins\": 240",
         );
         let reading = parse(body.as_bytes()).unwrap();
-        let primary = reading.usage.primary.unwrap();
+        let primary = reading.usage.unwrap().primary.unwrap();
         assert_eq!(primary.window_minutes, Some(240));
         assert_eq!(primary.window_kind, None);
     }
 
-    /// Meta omits `subs_usage` while the 5-hour window is idle. That must keep
-    /// the last reading serving, never become a clean entry with no windows.
+    /// Meta omits `subs_usage` (absent or null) while the 5-hour window is idle.
+    /// `parse` reports that as "no usage" with the account still identified, so
+    /// the provider can fill it from the last full reading.
     #[test]
-    fn omitted_usage_is_transient_whether_absent_or_null() {
+    fn omitted_usage_parses_as_idle_whether_absent_or_null() {
         let absent = r#"{"is_subs_active": true, "subs_tier_name": "Pro", "user_email": "a@b.c"}"#;
         let null = r#"{"is_subs_active": true, "user_email": "a@b.c", "subs_usage": null}"#;
         for body in [absent, null] {
-            let error = parse(body.as_bytes()).unwrap_err();
-            assert!(
-                matches!(error, FetchError::Upstream(_)),
-                "{body}: {error:?}"
-            );
-            assert_eq!(error.error_class(), "upstream_failed");
+            let reading = parse(body.as_bytes()).unwrap();
+            assert_eq!(reading.usage, None, "{body}");
+            assert_eq!(reading.email.as_deref(), Some("a@b.c"), "{body}");
         }
+    }
+
+    const IDLE: &str = r#"{"is_subs_active": true, "subs_tier_name": "Muse Code Power Usage", "user_email": "person@example.com"}"#;
+
+    /// With no earlier full reading (just after a restart) an idle answer can't
+    /// be filled in, so it's a transient failure and no weekly figure is invented.
+    #[tokio::test]
+    async fn an_idle_answer_with_nothing_remembered_is_transient() {
+        let (base, _) = crate::loopback::serve_once(200, IDLE.as_bytes().to_vec()).await;
+        let mut provider = provider(env_with(&[(TOKEN_ENV, "dca:local")]));
+        provider.url = format!("{base}/muse-code/key");
+        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        assert_eq!(attempt.usage.unwrap_err().error_class(), "upstream_failed");
+    }
+
+    fn weekly_in(full: &str, resets_at: i64) -> String {
+        full.replace("1791500000", &resets_at.to_string())
+    }
+
+    /// After a full reading, an idle answer is a fresh reading: the 5-hour
+    /// window at 0% with no reset, and the weekly figure unchanged, because no
+    /// request can have been made without reopening the 5-hour window.
+    #[tokio::test]
+    async fn an_idle_answer_after_a_full_reading_serves_both_windows() {
+        let future = chrono::Utc::now().timestamp() + 3 * 86_400;
+        let mut provider = provider(env_with(&[(TOKEN_ENV, "dca:local")]));
+        let (base, _) =
+            crate::loopback::serve_once(200, weekly_in(FULL, future).into_bytes()).await;
+        provider.url = format!("{base}/muse-code/key");
+        assert!(provider
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .is_ok());
+
+        let (base, _) = crate::loopback::serve_once(200, IDLE.as_bytes().to_vec()).await;
+        provider.url = format!("{base}/muse-code/key");
+        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        let usage = attempt
+            .usage
+            .as_ref()
+            .expect("an idle answer after a full one serves");
+        let short = usage.primary.as_ref().unwrap();
+        assert_eq!(short.used_percent, 0.0);
+        assert_eq!(short.resets_at, None);
+        assert_eq!(short.window_minutes, Some(300));
+        let weekly = usage.secondary.as_ref().unwrap();
+        assert_eq!(weekly.used_percent, 12.25);
+        assert!(weekly.resets_at.is_some());
+        assert_eq!(
+            attempt.observed.as_ref().unwrap().account_id.as_deref(),
+            Some("person@example.com")
+        );
+    }
+
+    /// Once the remembered weekly reset has passed, that window restarted at 0%.
+    #[tokio::test]
+    async fn an_idle_answer_after_the_weekly_reset_reads_zero() {
+        let past = chrono::Utc::now().timestamp() - 60;
+        let mut provider = provider(env_with(&[(TOKEN_ENV, "dca:local")]));
+        let (base, _) = crate::loopback::serve_once(200, weekly_in(FULL, past).into_bytes()).await;
+        provider.url = format!("{base}/muse-code/key");
+        assert!(provider
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .is_ok());
+
+        let (base, _) = crate::loopback::serve_once(200, IDLE.as_bytes().to_vec()).await;
+        provider.url = format!("{base}/muse-code/key");
+        let usage = provider
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .unwrap();
+        let weekly = usage.secondary.unwrap();
+        assert_eq!(weekly.used_percent, 0.0);
+        assert_eq!(weekly.resets_at, None);
+    }
+
+    /// A remembered reading belongs to one account: an idle answer for another
+    /// email gets nothing filled in.
+    #[tokio::test]
+    async fn an_idle_answer_for_another_account_is_not_filled_from_this_one() {
+        let future = chrono::Utc::now().timestamp() + 3 * 86_400;
+        let mut provider = provider(env_with(&[(TOKEN_ENV, "dca:local")]));
+        let (base, _) =
+            crate::loopback::serve_once(200, weekly_in(FULL, future).into_bytes()).await;
+        provider.url = format!("{base}/muse-code/key");
+        assert!(provider
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .is_ok());
+
+        let other = IDLE.replace("person@example.com", "other@example.com");
+        let (base, _) = crate::loopback::serve_once(200, other.into_bytes()).await;
+        provider.url = format!("{base}/muse-code/key");
+        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        assert_eq!(attempt.usage.unwrap_err().error_class(), "upstream_failed");
     }
 
     #[test]
@@ -612,7 +790,12 @@ mod tests {
     #[test]
     fn an_out_of_range_reset_drops_the_reset_but_keeps_the_window() {
         let body = FULL.replace("1791000000", "99999999999999");
-        let primary = parse(body.as_bytes()).unwrap().usage.primary.unwrap();
+        let primary = parse(body.as_bytes())
+            .unwrap()
+            .usage
+            .unwrap()
+            .primary
+            .unwrap();
         assert_eq!(primary.resets_at, None);
         assert_eq!(primary.used_percent, 37.5);
     }
