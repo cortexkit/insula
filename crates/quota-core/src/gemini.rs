@@ -685,11 +685,8 @@ impl GeminiProvider {
             };
             let quota_body = serde_json::to_vec(&quota_body)
                 .map_err(|error| FetchError::Decode(error.to_string()))?;
-            let response = JsonRequest::post_json(&self.quota_url, quota_body)
-                .bearer(&access_token)
-                .send_provider_status_first(&self.http, PROVIDER_NAME)
-                .await?;
-            normalize_quota(&response.body)
+            let body = self.post_quota(&access_token, quota_body, true).await?;
+            normalize_quota(&body)
         }
         .await;
         if let Err(error) = &result {
@@ -702,6 +699,70 @@ impl GeminiProvider {
             Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
         }
     }
+}
+
+impl GeminiProvider {
+    /// POST the quota query, classifying Google's "no subscription" refusal.
+    ///
+    /// Google answers a Gemini Code Assist login for an individual account with
+    /// HTTP 403 and `ErrorInfo.reason: SUBSCRIPTION_REQUIRED` (domain
+    /// `cloudaicompanion.googleapis.com`), since it moved individuals to
+    /// Antigravity. That credential works and the account simply has no quota
+    /// product here, so it is `no_quota_reported`. Reported as a rejected
+    /// credential, it told the user to sign in again, which can't help.
+    ///
+    /// The decision reads Google's structured reason, never the message text.
+    /// Every other refusal keeps the classification it had: the vault lane keeps
+    /// the numeric status, which the shared gate needs to report a 401, and the
+    /// local lane maps 401/403 to a rejected credential.
+    async fn post_quota(
+        &self,
+        access_token: &str,
+        body: Vec<u8>,
+        vault: bool,
+    ) -> Result<Vec<u8>, FetchError> {
+        let response = JsonRequest::post_json(&self.quota_url, body)
+            .bearer(access_token)
+            .send_raw(&self.http)
+            .await?;
+        if (200..300).contains(&response.status) {
+            return Ok(response.body_for_parsing()?.to_vec());
+        }
+        if response.status == 403 && subscription_required(&response.body) {
+            return Err(FetchError::NoQuotaReported(
+                "this Google account has no Gemini Code Assist subscription \
+                 (Google: SUBSCRIPTION_REQUIRED); individual accounts moved to Antigravity"
+                    .to_string(),
+            ));
+        }
+        Err(if vault {
+            FetchError::ProviderStatus(
+                response.status,
+                crate::http::refusal_excerpt(&response.body),
+            )
+        } else {
+            crate::http::status_error(response.status, &response.body)
+        })
+    }
+}
+
+/// Whether a Google refusal carries `ErrorInfo.reason: SUBSCRIPTION_REQUIRED`
+/// from the Code Assist service.
+fn subscription_required(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .pointer("/error/details")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail.get("reason").and_then(serde_json::Value::as_str)
+                    == Some("SUBSCRIPTION_REQUIRED")
+                    && detail.get("domain").and_then(serde_json::Value::as_str)
+                        == Some("cloudaicompanion.googleapis.com")
+            })
+        })
 }
 
 impl Default for GeminiProvider {
@@ -766,9 +827,8 @@ impl UsageProvider for GeminiProvider {
             };
             let quota_body =
                 serde_json::to_vec(&quota_body).map_err(|e| FetchError::Decode(e.to_string()))?;
-            let response = JsonRequest::post_json(&self.quota_url, quota_body)
-                .bearer(&access_token)
-                .send(&self.http)
+            let response = self
+                .post_quota(&access_token, quota_body, false)
                 .await
                 .map_err(|error| error.stage("quota"))?;
 
@@ -1305,6 +1365,61 @@ mod tests {
         ));
         tokio::task::yield_now().await;
         assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// Google's refusal for an individual account's Code Assist login, as it
+    /// answered on 2026-10-14 (message shortened; the structured part verbatim).
+    const SUBSCRIPTION_REQUIRED: &str = r#"{"error":{"code":403,"message":"You do not have a valid license of this product.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SUBSCRIPTION_REQUIRED","domain":"cloudaicompanion.googleapis.com","metadata":{"uiMessage":"true","error_number":"1001"}}]}}"#;
+
+    /// A login for an account with no Code Assist subscription works, and has no
+    /// quota: no_quota_reported, on both lanes, and never reported to the vault.
+    #[tokio::test]
+    async fn a_subscription_required_refusal_reports_no_quota() {
+        let (vault_base, _) =
+            serve_sequence(vec![(403, SUBSCRIPTION_REQUIRED.as_bytes().to_vec())]).await;
+        let (source, reports) = source(Ok(credential(
+            b"ya29.individual-token",
+            130,
+            Some("served-project"),
+        )));
+        let mut provider = test_provider(Arc::clone(&source), &vault_base);
+        let vault = provider
+            .fetch_handle(&CredentialHandle::vault(
+                "oauth:google",
+                VaultCapability::new("ckh_google"),
+            ))
+            .await;
+        assert_eq!(vault.usage.unwrap_err().error_class(), "no_quota_reported");
+        tokio::task::yield_now().await;
+        assert!(reports.lock().unwrap().is_empty());
+
+        let load_body = br#"{"cloudaicompanionProject":"local-project"}"#.to_vec();
+        let (local_base, _) = serve_sequence(vec![
+            (200, load_body),
+            (403, SUBSCRIPTION_REQUIRED.as_bytes().to_vec()),
+        ])
+        .await;
+        provider.load_code_assist_url = format!("{local_base}/load");
+        provider.quota_url = format!("{local_base}/quota");
+        provider.projects_url = format!("{local_base}/projects");
+        *provider.token.lock().unwrap() = Some(CachedToken {
+            token: "local-cached-token".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(300),
+        });
+        let local = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        assert_eq!(local.usage.unwrap_err().error_class(), "no_quota_reported");
+    }
+
+    /// Any other 403 keeps its old class: only Google's structured reason makes
+    /// a refusal "no quota". The same message without the ErrorInfo stays a
+    /// rejected credential.
+    #[test]
+    fn only_the_structured_reason_marks_subscription_required() {
+        assert!(subscription_required(SUBSCRIPTION_REQUIRED.as_bytes()));
+        let message_only = r#"{"error":{"code":403,"message":"You do not have a valid license of this product."}}"#;
+        assert!(!subscription_required(message_only.as_bytes()));
+        let other_domain = SUBSCRIPTION_REQUIRED.replace("cloudaicompanion", "other");
+        assert!(!subscription_required(other_domain.as_bytes()));
     }
 
     #[tokio::test]

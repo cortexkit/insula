@@ -171,7 +171,7 @@ pub(crate) fn status_error(status: u16, body: &[u8]) -> FetchError {
     }
 }
 
-fn refusal_excerpt(body: &[u8]) -> String {
+pub(crate) fn refusal_excerpt(body: &[u8]) -> String {
     String::from_utf8_lossy(body)
         .trim()
         .chars()
