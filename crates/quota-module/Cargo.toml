@@ -45,5 +45,5 @@ reqwest = { workspace = true }
 # The fleet's shared test helper: copies a built binary to a content-addressed
 # `ckdev-*` file on the internal disk, which the integration tests then spawn
 # (tests/common/mod.rs).
-cortexkit-test-support = "=0.1.4"
+cortexkit-test-support = "=0.1.7"
 subc-daemon = { workspace = true }
