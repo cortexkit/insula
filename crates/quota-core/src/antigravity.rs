@@ -273,6 +273,15 @@ fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
 /// pool the user does not spend. An unmatched credential is also withheld when
 /// any paid account is known: it could belong to that account. With no positive
 /// paid-tier evidence, cloud usage remains available for free or unknown tiers.
+///
+/// The wrong pool came from the opencode plugin's own OAuth token (measured
+/// 2026-09-08: 7.15% from the cloud against the editor's 58.41%). The vault's
+/// `antigravity:google` token does not have that problem: on 2026-10-14 it read
+/// the editor's pool exactly, every weekly reset anchor equal to the second, on
+/// both the production and the daily endpoint
+/// (`crates/quota-module/examples/antigravity-pool.rs`). So for a vault
+/// credential this guard is a safety net, not the only source of a correct
+/// number; with sidebar v2 carrying no tier, it currently doesn't fire.
 fn cloud_lane_must_withhold(
     accounts: &[StoredAccount],
     plugin_account: Option<&StoredAccount>,

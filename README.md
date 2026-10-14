@@ -177,6 +177,12 @@ cargo run -p quota-core --example opencode-stage -- --cookie-file /tmp/opencode.
 # daemon running, since it dials it for the credential:
 cargo run -p quota-module --example grok-resets
 
+# which Antigravity pool the vault's cloud credential reaches: sends insula's
+# request and the opencode plugin's request with the same vault token and prints
+# each bucket's remaining fraction and reset, to compare against the editor's own
+# figures. Takes a temporary capability handle from a file; mint it with
+# `ck auth mint-handle --id antigravity:google` and revoke it afterwards:
+INSULA_PROBE_CAPABILITY_FILE=/path/to/handle cargo run -p quota-module --example antigravity-pool
 # see what the usage-response fields insula does not read actually hold, for
 # claude or codex. The unread-key log names such fields but never prints values;
 # this prints the fields under study, plus anything shaped like a usage window,
