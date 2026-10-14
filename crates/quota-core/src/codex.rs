@@ -566,6 +566,28 @@ fn individual_limit_pool(spend_control: Option<&serde_json::Value>) -> Option<Po
     })
 }
 
+/// Whether `spend_control` states a budget this module couldn't read.
+///
+/// A null or missing `individual_limit` means the account has no budget, and an
+/// absent pool says exactly that to a consumer, which clears any budget it
+/// remembered. A limit that IS present but unreadable must not look the same:
+/// it would clear a real budget. The provider keeps the account's last readable
+/// pool in that case instead.
+fn spend_control_unreadable(spend_control: Option<&serde_json::Value>) -> bool {
+    let Some(control) = spend_control.filter(|value| !value.is_null()) else {
+        return false;
+    };
+    let limit = control
+        .as_object()
+        .and_then(|control| control.get("individual_limit"));
+    match limit {
+        Some(limit) if !limit.is_null() => individual_limit_pool(Some(control)).is_none(),
+        // A `spend_control` that isn't an object at all is unreadable too.
+        None => control.as_object().is_none(),
+        Some(_) => false,
+    }
+}
+
 /// Restate two amounts at the larger of their two exponents.
 ///
 /// The limit and remainder arrive as independent decimal strings ("1000" beside
@@ -617,6 +639,9 @@ pub struct CodexUsageSnapshot {
     /// Prepaid credit and the workspace credit limit on this account. Empty
     /// when the account has neither, which is not the same as a spent pool.
     pub pools: Vec<Pool>,
+    /// `spend_control` stated a budget that couldn't be read, so `pools` holds
+    /// no `individual_limit` pool even though the account has a budget.
+    pub spend_control_unreadable: bool,
 }
 
 /// Normalize a full `/wham/usage` JSON body without relaxing any percentages.
@@ -641,6 +666,7 @@ pub fn normalize_usage_snapshot(body: &[u8]) -> Result<CodexUsageSnapshot, Fetch
             extra_rate_windows: None,
         },
         limit_reached: rate_limit.limit_reached,
+        spend_control_unreadable: spend_control_unreadable(response.spend_control.as_ref()),
         pools: credit_pools(response.credits.as_ref())
             .into_iter()
             .chain(individual_limit_pool(response.spend_control.as_ref()))
@@ -796,6 +822,10 @@ pub struct CodexProvider {
     handle_loader: Arc<VaultHandleLoader>,
     codex_home_override: Option<PathBuf>,
     reset_tick_logger: ResetTickLogger,
+    /// Each account's last readable workspace credit-limit pool, so a reading
+    /// whose limit couldn't be parsed keeps it rather than dropping it (see
+    /// [`spend_control_unreadable`]). Process memory only.
+    last_budget: std::sync::Mutex<std::collections::HashMap<String, Pool>>,
 }
 
 impl CodexProvider {
@@ -832,7 +862,43 @@ impl CodexProvider {
             handle_loader,
             codex_home_override: None,
             reset_tick_logger: ResetTickLogger::default(),
+            last_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Keep an account's workspace credit-limit pool consistent across readings.
+    ///
+    /// A readable pool is remembered. A reading that states a budget but can't
+    /// be read gets the remembered pool back, so a consumer doesn't take its
+    /// absence for "no budget". A reading with no budget (wham sends `null`)
+    /// forgets it.
+    fn settle_budget(
+        &self,
+        account_id: &str,
+        mut snapshot: CodexUsageSnapshot,
+    ) -> CodexUsageSnapshot {
+        let Ok(mut last) = self.last_budget.lock() else {
+            return snapshot;
+        };
+        let current = snapshot
+            .pools
+            .iter()
+            .find(|pool| pool.id == "individual_limit")
+            .cloned();
+        match (current, snapshot.spend_control_unreadable) {
+            (Some(pool), _) => {
+                last.insert(account_id.to_string(), pool);
+            }
+            (None, true) => {
+                if let Some(pool) = last.get(account_id) {
+                    snapshot.pools.push(pool.clone());
+                }
+            }
+            (None, false) => {
+                last.remove(account_id);
+            }
+        }
+        snapshot
     }
 
     #[cfg(test)]
@@ -853,6 +919,7 @@ impl CodexProvider {
             handle_loader: Arc::new(handle_loader),
             codex_home_override: Some(codex_home_override),
             reset_tick_logger: ResetTickLogger::default(),
+            last_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -996,7 +1063,9 @@ impl CodexProvider {
             reset_request.report_auth_failure(error);
         }
 
-        let usage_snapshot = usage_http.and_then(|body| normalize_usage_snapshot(&body));
+        let usage_snapshot = usage_http
+            .and_then(|body| normalize_usage_snapshot(&body))
+            .map(|snapshot| self.settle_budget(account_id, snapshot));
         let local_now = Utc::now();
         let credits_snapshot = normalize_credits_tick(credits_http, local_now);
 
@@ -2593,7 +2662,74 @@ mod individual_limit_tests {
                 12.5,
                 "{case}: windows intact"
             );
+            assert!(
+                snapshot.spend_control_unreadable,
+                "{case}: a stated but unreadable budget must be marked, or it reads as none"
+            );
         }
+    }
+
+    /// A null limit and a missing `spend_control` both mean "no budget", and are
+    /// not marked unreadable: wham sends null for an account without one.
+    #[test]
+    fn no_budget_is_not_marked_unreadable() {
+        for spend_control in [r#"{"reached":false,"individual_limit":null}"#, "null"] {
+            let snapshot =
+                normalize_usage_snapshot(&body_with_spend_control(spend_control)).expect("parses");
+            assert!(!snapshot.spend_control_unreadable, "{spend_control}");
+        }
+    }
+
+    fn budget_provider() -> CodexProvider {
+        CodexProvider::new_with_handle_loader(
+            CodexConfig::default(),
+            None,
+            Arc::new(VaultHandleLoader::default()),
+        )
+    }
+
+    fn settle(provider: &CodexProvider, account: &str, spend_control: &str) -> CodexUsageSnapshot {
+        let snapshot =
+            normalize_usage_snapshot(&body_with_spend_control(spend_control)).expect("parses");
+        provider.settle_budget(account, snapshot)
+    }
+
+    /// An unreadable budget keeps the account's last readable pool, so a
+    /// consumer that clears its budget on an absent pool doesn't clear a real
+    /// one. A later null (no budget) does clear it.
+    #[test]
+    fn an_unreadable_budget_keeps_the_last_pool_until_wham_says_none() {
+        let provider = budget_provider();
+        let unreadable = POPULATED_LIMIT.replace(r#""limit": "1000""#, r#""limit": "1,000""#);
+
+        assert!(limit_pool(&settle(&provider, "acct-a", POPULATED_LIMIT)).is_some());
+        let kept = settle(&provider, "acct-a", &unreadable);
+        assert_eq!(
+            limit_pool(&kept).map(|pool| pool.total.clone()),
+            Some(Some(credit(10000, 1))),
+            "{:?}",
+            kept.pools
+        );
+
+        let none = settle(
+            &provider,
+            "acct-a",
+            r#"{"reached":false,"individual_limit":null}"#,
+        );
+        assert!(limit_pool(&none).is_none());
+        assert!(
+            limit_pool(&settle(&provider, "acct-a", &unreadable)).is_none(),
+            "after an explicit none there's nothing to keep"
+        );
+    }
+
+    /// One account's budget is never lent to another.
+    #[test]
+    fn a_remembered_budget_belongs_to_its_own_account() {
+        let provider = budget_provider();
+        let unreadable = POPULATED_LIMIT.replace(r#""limit": "1000""#, r#""limit": "1,000""#);
+        settle(&provider, "acct-a", POPULATED_LIMIT);
+        assert!(limit_pool(&settle(&provider, "acct-b", &unreadable)).is_none());
     }
 
     /// An absent or unreadable `reset_at` leaves the reset unstated and still
