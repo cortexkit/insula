@@ -1,0 +1,11 @@
+# Files git doesn't hold that engram backs up nightly (one path per line).
+# Internal design notes, investigations and parity research.
+.cortexkit/internal-docs/
+# Worker briefs, design drafts, delivered artifacts and the review ledger.
+.cortexkit/alfonso/prompts/
+.cortexkit/alfonso/drafts/
+.cortexkit/alfonso/artifacts/
+.cortexkit/alfonso/loop-ledger.md
+# Local config: alfonso settings (remote execution) and the Magic Context project config.
+.cortexkit/alfonso.jsonc
+.cortexkit/magic-context/
