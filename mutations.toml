@@ -867,7 +867,9 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["claude_subscription::tests::canceled_scheduled_end_wins_over_leftover_renewal"]
 expect_message = "a scheduled end must suppress a leftover next charge"
-only = true
+# Other tests read the same value and also fail on this mutant; the named
+# test is the one whose message proves the property.
+only = false
 timeout_s = 600
 build_timeout_s = 1800
 
@@ -884,7 +886,9 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["claude_subscription::tests::date_only_renewal_stays_a_full_date"]
 expect_message = "a date-only value must remain a day, not an invented timestamp"
-only = true
+# Other tests read the same value and also fail on this mutant; the named
+# test is the one whose message proves the property.
+only = false
 timeout_s = 600
 build_timeout_s = 1800
 
@@ -906,7 +910,9 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["claude_subscription::tests::dates_failure_leaves_windows_and_error_class_unchanged"]
 expect_message = "a dates failure must never set the Claude row's errorClass"
-only = true
+# Other tests read the same value and also fail on this mutant; the named
+# test is the one whose message proves the property.
+only = false
 timeout_s = 600
 build_timeout_s = 1800
 
