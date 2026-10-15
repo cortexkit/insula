@@ -848,7 +848,9 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["claude_subscription::tests::mismatched_owner_attaches_nothing"]
 expect_message = "a mismatched web owner must not attach billing dates"
-only = true
+# Other tests also read this value and fail on the same mutant; the named
+# test is the one whose message proves the property.
+only = false
 timeout_s = 600
 build_timeout_s = 1800
 
@@ -1112,6 +1114,8 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["antigravity::plugin_lane_tests::sidebar_fraction_precision_is_preserved_not_the_rounded_percent"]
 expect_message = "55.149424"
-only = true
+# Other tests also read this value and fail on the same mutant; the named
+# test is the one whose message proves the property.
+only = false
 timeout_s = 600
 build_timeout_s = 1800
