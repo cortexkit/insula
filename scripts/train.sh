@@ -112,7 +112,13 @@ for _ in $(seq 1 6); do
   sleep 10
   run=$(gh api "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?head_sha=$sha" \
         --jq '[.workflow_runs[]] | sort_by(.created_at) | last | .id' 2>/dev/null)
-  [ -n "$run" ] && [ "$run" != "null" ] && break
+  # Only a numeric id is a run. On an HTTP error (a 403 from GitHub's rate
+  # limit) `gh api` prints the error body to stdout despite --jq, and that body
+  # used to be watched as if it were a run id.
+  case "$run" in
+    ''|*[!0-9]*) run="" ;;
+    *) break ;;
+  esac
 done
 
 # AN EMPTY RUN ID MUST REFUSE, NOT WATCH.
@@ -133,7 +139,16 @@ watch_rc=$?
 
 # Read the conclusion back rather than trusting the exit code, for the same
 # reason: one code, several meanings.
-conclusion=$(gh api "repos/$REPO/actions/runs/$run" --jq '.conclusion' 2>/dev/null)
+# Retry the readback: a rate-limited GitHub answers with an error body, which
+# is not a conclusion. Only a known word counts.
+conclusion=""
+for _ in $(seq 1 5); do
+  conclusion=$(gh api "repos/$REPO/actions/runs/$run" --jq '.conclusion' 2>/dev/null)
+  case "$conclusion" in
+    success|failure|cancelled|timed_out|skipped|neutral|action_required|startup_failure|stale) break ;;
+    *) conclusion=""; sleep 30 ;;
+  esac
+done
 echo "  run $run: ${conclusion:-unknown} (watch rc=$watch_rc)"
 
 if [ "$conclusion" != "success" ]; then
