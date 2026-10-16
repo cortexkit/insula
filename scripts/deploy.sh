@@ -33,6 +33,8 @@
 # restarts nothing: it writes a card under the fleet staging directory for the
 # daemon owner to place during a combined restart window, so insula restarts once
 # with everyone else instead of on its own.
+# `--dry-run` checks provenance and prints the plan, without building, signing,
+# placing a binary or restarting the module. It still fetches origin/master.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,11 +44,14 @@ DEST="$HOME/.local/share/cortexkit/bin/$BIN"
 STAGING="$HOME/.local/share/cortexkit/staging"
 ALLOW_DIRTY="${CK_DEPLOY_ALLOW_DIRTY:-0}"
 MODE=deploy
-case "${1:-}" in
-  "") ;;
-  --stage) MODE=stage ;;
-  *) echo "usage: $0 [--stage]" >&2; exit 2 ;;
-esac
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --stage) MODE=stage ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "usage: $0 [--stage] [--dry-run]" >&2; exit 2 ;;
+  esac
+done
 
 # Sign with the hardened runtime, under a fixed identifier, and refuse if either
 # did not take.
@@ -108,18 +113,39 @@ else
   fi
 fi
 
-# Against the REMOTE, not a local ref: the claim a deploy makes is "this is what
-# others can fetch", and a local master can be ahead, behind, or rebased.
-git fetch -q origin 2>/dev/null || echo "  (could not fetch; the remote comparison below may be stale)"
+# Compare against a freshly fetched master: local commits may run before CI
+# lands them, but deploying must never roll back or fork the landed history.
+# Even the work-in-progress override cannot bypass this ancestry check.
+if ! git fetch -q origin '+refs/heads/master:refs/remotes/origin/master'; then
+  echo "REFUSING: cannot fetch origin/master; cannot rule out a rollback or divergence." >&2
+  exit 1
+fi
 head_sha="$(git rev-parse --short=12 HEAD)"
-origin_sha="$(git rev-parse --short=12 origin/master 2>/dev/null || echo unknown)"
-if [ "$ALLOW_DIRTY" != "1" ] && [ "$head_sha" != "$origin_sha" ]; then
-  echo "REFUSING: HEAD $head_sha is not origin/master $origin_sha." >&2
-  echo "Land the train first, or the running image is one nobody else has." >&2
+origin_sha="$(git rev-parse refs/remotes/origin/master)"
+if ! git merge-base --is-ancestor "$origin_sha" HEAD; then
+  if git merge-base --is-ancestor HEAD "$origin_sha"; then
+    echo "REFUSING: local master is behind origin/master; fast-forward before deploying." >&2
+  else
+    echo "REFUSING: HEAD has diverged from origin/master; reconcile the histories before deploying." >&2
+  fi
   exit 1
 fi
 
+if [ "$(git rev-parse HEAD)" != "$origin_sha" ]; then
+  echo "  deploying commits not yet landed on origin/master (CI still required):"
+  git --no-pager log --oneline --reverse "$origin_sha..HEAD"
+fi
 echo "  ${MODE}ing $head_sha (branch $branch)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  dry-run: would build release, sign with hardened runtime as $BIN and verify execution"
+  if [ "$MODE" = stage ]; then
+    echo "  dry-run: would write a staging card under $STAGING; no restart"
+  else
+    echo "  dry-run: would atomically install $DEST, restart insula and verify buildCommit=$head_sha"
+  fi
+  echo "  dry-run: nothing built, signed, installed or restarted"
+  exit 0
+fi
 cargo build --release -q
 
 if [ "$MODE" = "stage" ]; then

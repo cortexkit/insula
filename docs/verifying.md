@@ -3,6 +3,7 @@
 ## The gates
 
 ```sh
+scripts/gates.sh --quick  # before deploy: host lint, units, launch/wire smoke
 scripts/gates.sh          # repository checks, fmt, clippy, unit tests, doctests
 scripts/gates.sh --e2e    # also the in-process wire tests, about 80 s more
 ```
@@ -12,6 +13,53 @@ first failure. [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gate) lists every step
 A change that guards a costly property also gets a mutation row; see
 [`mutations.md`](mutations.md).
 
+`--quick` runs fmt, workspace clippy on the host toolchain, **all** lib/bin
+tests in a scratch `TMPDIR`, and the cheap repo checks (including deploy-policy
+tests). The whole unit suite is cheap warm and avoids missing cross-crate
+dependents when selecting touched crates; it covers manifest and Codex reset
+journal invariants. Quick also builds the module, runs only
+`skeleton_round_trips_usage_get_over_the_wire` to protect the launch/route path,
+and runs `completeness-envelopes` to distinguish a withheld account from a
+genuinely removed account in consumer replies. It leaves
+newest-stable discovery/installation and duplicate clippy, doctests, and the
+minute-long refresh integration tests to the post-deploy/full loop.
+`--quick` and `--e2e` are separate modes, not combinable.
+
+### Deploy then land
+
+On a clean local `master`, run the tests for the changed provider, handler or
+script (for example `cargo test -p quota-core codex::tests::`), then:
+
+```sh
+scripts/gates.sh --quick && scripts/deploy.sh
+
+# After deploy succeeds, run full checks and push through CI in the background:
+log=$(mktemp "${TMPDIR:-/tmp}/insula-land.XXXXXX")
+nohup bash -c 'scripts/gates.sh && scripts/train.sh "$1"' _ usage-fix >"$log" 2>&1 </dev/null &
+printf 'landing pid=%s log=%s\n' "$!" "$log"
+```
+
+Use a descriptive train name instead of `usage-fix`; it names the temporary
+`train/usage-fix` branch CI checks before pushing master. Keep the tree unchanged
+until the train logs its captured SHA; never start overlapping trains. Watch
+the running module with the [post-deploy checkers](#checkers-after-deploying)
+and read the landing log (`tail -f "$log"`); backgrounding is not a CI waiver.
+If full gates or CI fail, fix forward on local `master`, rerun narrow tests,
+redeploy, and retry the same train name after the previous process exits; this
+replaces the failed train rather than leaving it stranded.
+Run `scripts/gates.sh --e2e` after deploy when changing integration behavior.
+
+`deploy.sh` fetches `origin/master` and accepts equal or ahead local master,
+printing each commit running before it lands. It refuses dirty trees, other
+branches, behind/diverged history, or an unavailable remote. The existing
+`CK_DEPLOY_ALLOW_DIRTY=1` diagnostic escape still warns loudly, but cannot bypass
+the ancestry/fetch check and is not the normal shipping path.
+`scripts/deploy.sh --dry-run` exercises the same provenance checks and prints
+the plan without building, signing, installing or restarting anything;
+`--stage` still builds and signs a real staging card. Required CI checks remain
+`Test (ubuntu)` and `Test (windows)`; only their wait moves off the local deploy
+path.
+
 ### What the gate does not run
 
 `--all-targets` does not include doctests, so they are a separate step in both
@@ -20,12 +68,12 @@ the gate and CI.
 | Target | Local gate | CI | How to run it |
 |---|---|---|---|
 | lib and bin unit tests | yes | yes | `cargo test --workspace --lib --bins` |
-| doctests | yes | yes | `cargo test --workspace --doc` |
-| `skeleton_e2e::` | with `--e2e` | yes | see below |
+| doctests | full only | yes | `cargo test --workspace --doc` |
+| `skeleton_e2e::` | wire smoke in quick; whole suite with `--e2e` | yes | see below |
 | `real_daemon_e2e::` | no | yes | `#[ignore]`d; needs a `ck-subc` build |
 | `*_live::` provider tests | no | no | `#[ignore]`d; needs a real provider session |
 | examples compile | yes | yes | via `clippy --all-targets` |
-| examples run | no | `completeness-envelopes` only | `cargo run -p <crate> --example <name>` |
+| examples run | `completeness-envelopes` in quick | `completeness-envelopes` only | `cargo run -p <crate> --example <name>` |
 
 The live provider tests are left out of both on purpose: they reach real
 upstreams, so a gate that ran them would depend on someone else's uptime. Run

@@ -2,9 +2,13 @@
 
 ## The gate
 
-Every change passes `scripts/gates.sh` before it lands:
+Iteration comes first: run `scripts/gates.sh --quick`, deploy, watch the live
+module, then run full gates and land in the background using the
+[commands below](docs/verifying.md#deploy-then-land). Every change still passes
+`scripts/gates.sh` and required CI before it lands:
 
 ```sh
+scripts/gates.sh --quick    # before deploy: host lint, units, launch/wire smoke
 scripts/gates.sh            # repository checks, fmt, clippy, unit tests, doctests
 scripts/gates.sh --e2e      # also builds ck-insula and runs skeleton_e2e
 ```
@@ -14,6 +18,7 @@ gate failed and `2` when it could not check. It runs, in order:
 
 1. repository path dependencies (`scripts/path-dependencies.py`, Python 3.11+);
 2. planted violations for every source scanner (`scripts/mutation-scans.sh`);
+   deploy-policy tests against local Git histories (`scripts/deploy-tests.py`);
 3. a compile of every Python instrument and a parse of every shell script;
 4. the endpoint host manifest (`scripts/endpoint-hosts.py`);
 5. the CI preconditions a train depends on (`scripts/check-train-preconditions.sh`);
@@ -33,6 +38,14 @@ gate failed and `2` when it could not check. It runs, in order:
 If the gates rewrite `Cargo.lock` they say so; commit that as its own
 dependency change or restore it. [`docs/verifying.md`](docs/verifying.md)
 covers what the gate does not run.
+
+`--quick` keeps all cheap repository checks, fmt, host-toolchain workspace
+clippy and the whole lib/bin suite (including manifest and Codex reset journal
+tests). It also builds the module and runs the single launch/`usage.get` wire
+smoke and consumer completeness-envelope example. It skips newest-stable
+installation/lint, doctests and the long refresh integration suite; those belong
+after deploy, not on the change-to-running path. See the
+[deploy-then-land commands](docs/verifying.md#deploy-then-land).
 
 ## Committing
 
@@ -55,7 +68,7 @@ git exits 0 and nothing else notices.
 
 `master` is protected: it accepts a push only when the commit being pushed
 has passing `Test (ubuntu)` and `Test (windows)` checks. Maintainers land with
-`scripts/train.sh`:
+`scripts/train.sh` (after deploying locally; see the background flow above):
 
 ```sh
 scripts/train.sh <name>
@@ -68,6 +81,14 @@ identifier. It then pushes `HEAD` to `train/<name>`, waits for the CI run on
 that commit, confirms every check branch protection requires has passed, and
 pushes the same commit to `master`. On failure it leaves the train branch in
 place for inspection and exits non-zero.
+
+Deployment accepts a clean local `master` ahead of freshly fetched
+`origin/master` and lists the unlanded commits; it refuses behind or diverged
+history. CI still gates the public push, not the local restart. If CI fails,
+fix forward on local `master`, redeploy, and retry the same train name after the
+previous run exits. The name identifies `train/<name>`; reusing it replaces the
+failed train instead of stranding it. Never force-push protected master or
+overlap trains.
 
 Outside contributors open a pull request; CI runs the same jobs on it.
 
