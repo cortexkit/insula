@@ -773,7 +773,13 @@ fn normalize_team_summary(
     summary: &serde_json::Value,
     now_ms: i64,
 ) -> Result<Option<TeamPlan>, TeamError> {
-    if summary.get("Data").is_some_and(serde_json::Value::is_null) {
+    // Qwen answers an account with no Team plan as `Data: null`, `Data: {}` or an
+    // empty group list; all three mean "no Team plan", not an unreadable reply.
+    // A missing `Data` key, or a non-empty object without groups, stays
+    // unreadable.
+    if summary.get("Data").is_some_and(|data| {
+        data.is_null() || data.as_object().is_some_and(serde_json::Map::is_empty)
+    }) {
         return Ok(None);
     }
     let data = summary
@@ -1307,6 +1313,7 @@ mod tests {
         inactive["Data"]["EndTime"] = serde_json::json!(TEAM_NOW_MS);
         for data in [
             serde_json::json!({"Data":null}),
+            serde_json::json!({"Data":{}}),
             serde_json::json!({"Data":{"SubscriptionGroupList":[]}}),
             inactive,
         ] {
