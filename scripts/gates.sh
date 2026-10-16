@@ -5,6 +5,7 @@
 #
 # Usage:
 #   scripts/gates.sh          fmt, clippy, unit tests
+#   scripts/gates.sh --quick  host clippy, unit tests, launch/wire smoke, repo checks
 #   scripts/gates.sh --e2e    also the integration suites (adds ~80s)
 #
 # Exit codes match every other checker here: 0 clean, 1 a gate failed, 2 could
@@ -15,12 +16,18 @@ set -u -o pipefail
 cd "$(dirname "$0")/.." || { echo "  cannot reach the workspace root" >&2; exit 2; }
 
 WITH_E2E=0
+QUICK=0
 for arg in "$@"; do
     case "$arg" in
         --e2e) WITH_E2E=1 ;;
+        --quick) QUICK=1 ;;
         *) echo "  unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+if [ "$QUICK" -eq 1 ] && [ "$WITH_E2E" -eq 1 ]; then
+    echo "  --quick and --e2e are separate modes" >&2
+    exit 2
+fi
 
 step() { printf '\n  == %s\n' "$1"; }
 fail() { printf '\n  GATE FAILED: %s\n' "$1" >&2; exit 1; }
@@ -41,6 +48,9 @@ done
 
 step "mutation scan controls"
 bash scripts/mutation-scans.sh || fail "planted scanner violations"
+
+step "deploy policy dry-run tests"
+python3 scripts/deploy-tests.py || fail "deploy policy"
 
 # Cargo commands without --locked can rewrite Cargo.lock after a local manifest
 # edit. Announce any write so it is reviewed as a dependency change rather than
@@ -137,6 +147,7 @@ cargo fmt --check || fail "formatting"
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings || fail "clippy"
 
+if [ "$QUICK" -eq 0 ]; then
 step "clippy on the newest stable (what CI runs)"
 # CI installs `dtolnay/rust-toolchain@stable`, so it lints with the NEWEST stable
 # the day it runs, while this machine lints with whatever stable was installed
@@ -176,6 +187,7 @@ if [ -n "$stable_line" ]; then
 else
     echo "  NOTE: rustup could not check for a newer stable (offline?); CI will lint with it"
 fi
+fi
 
 step "cargo test --workspace --lib --bins"
 # The unit tests run with TMPDIR pointed at a fresh empty folder, which must be
@@ -198,8 +210,23 @@ echo "  TMPDIR after the unit tests: 0 entries"
 # to rustdoc, so an ASCII table in a doc comment is compiled -- and this gate ran
 # green over a broken master until a consumer ran plain `cargo test --workspace`
 # and reported it (insula#13).
-step "cargo test --workspace --doc"
-cargo test --workspace --doc || fail "doctests"
+if [ "$QUICK" -eq 0 ]; then
+    step "cargo test --workspace --doc"
+    cargo test --workspace --doc || fail "doctests"
+fi
+
+if [ "$QUICK" -eq 1 ]; then
+    # The unit suite is cheap warm and includes the manifest and reset journal
+    # fences. This one integration smoke also launches the binary and dials the
+    # route consumers use, without the full suite's minute-long refresh wait.
+    step "cargo build -p quota-module --bins (the wire smoke spawns it)"
+    cargo build -p quota-module --bins || fail "building the module binary"
+    step "launch and usage.get wire smoke"
+    cargo test -p quota-module --test it skeleton_e2e::skeleton_round_trips_usage_get_over_the_wire -- --exact \
+        || fail "launch and usage.get wire smoke"
+    step "consumer completeness envelope pair"
+    cargo run -p quota-core --example completeness-envelopes || fail "consumer completeness envelope pair"
+fi
 
 if [ "$WITH_E2E" -eq 1 ]; then
     # The harness SPAWNS this binary; `cargo test --test` does not rebuild it,
