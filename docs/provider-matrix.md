@@ -1,6 +1,6 @@
 # Provider matrix
 
-38 providers registered.
+39 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -71,6 +71,7 @@ on every operating system. The public wire semantics are in
 | Provider | Credential sources / vault families | Main endpoints | Published windows / signals |
 |---|---|---|---|
 | `amp` | Vault `cookie:ampcode.com` | `GET https://ampcode.com/settings` | Free-tier utilization with reported `windowHours`; full-recovery reset projected from continuous replenishment |
+| `claude-console` | Vault `cookie:platform.claude.com` (several account-suffixed deposits supported) | `GET https://platform.claude.com/api/organizations`; `/api/organizations/{uuid}/prepaid/credits` | Organization API credit pools: subscription, purchased, promotional; no rate windows |
 | `factory` | Vault `cookie:factory.ai` | `GET https://api.factory.ai/api/billing/limits` | 5h / weekly / monthly pools |
 | `langdock` | Vault `cookie:langdock.com` | `GET https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` | Session (5h) / weekly |
 | `mimo` | Vault `cookie:xiaomimimo.com` | `https://platform.xiaomimimo.com/api/v1/tokenPlan/detail` and `/usage` | Token-plan billing-period window |

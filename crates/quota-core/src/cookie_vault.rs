@@ -50,10 +50,9 @@ pub(crate) struct CookieVault {
 
 /// The precedence rule of [`CookieVault::handles`] over a list of deposits.
 ///
-/// Separate from the loader because the loader already refuses a domain with
-/// two deposits outright (cookies carry no identity, so two deposits are
-/// ambiguous). This rule is the second line behind that refusal, and it has to
-/// be testable on its own input.
+/// Separate from the loader because the loader refuses multiple deposits for
+/// families without in-band identity. Console cookies resolve an organization
+/// UUID and may have several deposits; the suffixed-wins rule still applies.
 fn deposit_lanes(deposits: Vec<CredentialHandle>, family: &str) -> Vec<CredentialHandle> {
     match cookie_lane(deposits, family) {
         CookieLane::Suffixed(handles) => handles,
@@ -80,8 +79,8 @@ impl CookieVault {
     /// the fetch. Every handle a provider returns becomes its own SLOT and is
     /// fetched independently, so enumerating a bare deposit beside a suffixed
     /// one does not mean "prefer one" -- both fetch, both produce identity-less
-    /// entries (a cookie session discloses no account), and the emission gate
-    /// collapses them to a single representative chosen by a tie-break no
+    /// entries for most providers (their responses disclose no account), and the
+    /// emission gate collapses them to a single representative chosen by a tie-break no
     /// operator can see. `anthropic.rs` states the same consequence at its own
     /// `handles()`.
     ///

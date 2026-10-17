@@ -1957,6 +1957,7 @@ fn every_cookie_provider_publishes_the_vault_source_label() {
 
     let sources: std::collections::HashMap<&str, &str> = [
         ("amp", include_str!("amp.rs")),
+        ("claude_console", include_str!("claude_console.rs")),
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),
         ("langdock", include_str!("langdock.rs")),
@@ -11133,6 +11134,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
     .expect("docs/consumer-contract.md must be readable");
     let sources: std::collections::HashMap<&str, &str> = [
         ("claude", include_str!("claude_subscription.rs")),
+        ("claude-console", include_str!("claude_console.rs")),
         ("amp", include_str!("amp.rs")),
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),

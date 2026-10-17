@@ -38,6 +38,15 @@ Tests that need a real provider session or a running subc daemon are
 `#[ignore]`d; [`docs/verifying.md`](docs/verifying.md) lists them with their
 commands.
 
+## Providers
+
+The [provider matrix](docs/provider-matrix.md) lists all 39 registered providers.
+Balance-only providers include `deepseek`, `openrouter`, and `claude-console`.
+`claude-console` reads a Console organization's subscription, purchased, and
+promotional API credit from a `cookie:platform.claude.com:<account>` vault deposit
+captured by Cerebellum; several accounts can be deposited separately. It never
+reads a browser or an API key. See the [capture instructions](docs/consumer-contract.md#depositing-a-session-cookie-which-url-to-capture-against).
+
 ## Documentation
 
 | Doc | What it answers |

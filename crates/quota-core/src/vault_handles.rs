@@ -17,6 +17,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("chatgpt:openai", "codex"),
     ("oauth:anthropic", "claude"),
     ("cookie:claude.ai", "claude"),
+    ("cookie:platform.claude.com", "claude-console"),
     ("oauth:xai", "grok"),
     ("antigravity:google", "antigravity"),
     ("kimi-for-coding", "kimi-for-coding"),
@@ -69,6 +70,7 @@ pub const ENRICHMENT_FAMILIES: &[(&str, &str)] = &[
 enum ProviderKind {
     Codex,
     Anthropic,
+    ClaudeConsole,
     Grok,
     Antigravity,
     KimiForCoding,
@@ -551,6 +553,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
     match name {
         "codex" => Some(ProviderKind::Codex),
         "claude" => Some(ProviderKind::Anthropic),
+        "claude-console" => Some(ProviderKind::ClaudeConsole),
         "grok" => Some(ProviderKind::Grok),
         "antigravity" => Some(ProviderKind::Antigravity),
         "kimi-for-coding" => Some(ProviderKind::KimiForCoding),
@@ -592,6 +595,9 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
     let mut refused_families: Vec<(&str, Vec<&str>)> = CREDENTIAL_FAMILIES
         .iter()
         .filter(|(prefix, _)| prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
+        // Console sessions resolve an organization UUID before publishing. Other
+        // cookie/key lanes cannot distinguish two deposits from the same owner.
+        .filter(|(prefix, _)| *prefix != "cookie:platform.claude.com")
         .filter(|(prefix, _)| {
             !ENRICHMENT_FAMILIES
                 .iter()
