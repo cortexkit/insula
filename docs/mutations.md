@@ -16,7 +16,7 @@ The catalogue is replayed with a pinned runner:
 
 ```sh
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
+  --rev 8200b61fe4250989d315ed8064d16754c5032d10 cortexkit-mutate
 ckdev-mutate --version
 ```
 
