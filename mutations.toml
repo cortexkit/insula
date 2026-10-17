@@ -855,6 +855,44 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "jetbrains-junie-parser"
+guards = "Junie quota updates supersede older legacy readings after the Air migration"
+file = "crates/quota-core/src/jetbrains.rs"
+old = "parse_junie_log_quota(line)"
+new = "None /* NON-VACUITY BREAK: drop Junie quota updates */"
+edits = []
+test_file = "crates/quota-core/src/jetbrains.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["jetbrains::tests::a_newer_junie_quota_wins_over_legacy_records"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+tests = ["jetbrains::tests::a_newer_junie_quota_wins_over_legacy_records", "jetbrains::tests::jbai_quota_and_refill_keep_tariff_and_top_up_separate"]
+
+[[control]]
+id = "jetbrains-forbidden-exception-boundary"
+guards = "Only the disabled AI Assistant exception is skipped; other forbidden states invalidate older quota"
+file = "crates/quota-core/src/jetbrains.rs"
+old = "line.contains(DISABLED_ASSISTANT_MARKER)"
+new = 'line.contains("ForbiddenException") /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-core/src/jetbrains.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["jetbrains::tests::other_forbidden_exceptions_invalidate_older_quota"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+tests = ["jetbrains::tests::other_forbidden_exceptions_invalidate_older_quota", "jetbrains::tests::disabled_assistant_errors_do_not_hide_junie_quota"]
+
+[[control]]
 id = "claude-subscription-end-precedence"
 guards = "A scheduled subscription end suppresses leftover renewal data, including canceled subscriptions"
 file = "crates/quota-core/src/claude_subscription.rs"

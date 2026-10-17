@@ -236,14 +236,17 @@ fn discover_usage_from(
         })
 }
 
-// Read at most 4 MiB of complete UTF-8 lines and accept only recognized Available
-// quota / Known refill records with finite, nonnegative counters. Ported from
-// CodexBar v0.73.0 JetBrainsQuotaLogReader.swift.
+// Read at most 4 MiB of complete UTF-8 lines and accept only recognized quota
+// records with finite, nonnegative counters. Log formats are adapted from
+// CodexBar v0.77.0 JetBrainsQuotaLogReader.swift.
 // There is no line-age cutoff upstream: quota-line time is compared to XML mtime,
 // not log mtime (which unrelated IDE activity also updates).
 const LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 const QUOTA_MARKER: &str = "QuotaManager2Impl - New quota state is: ";
 const REFILL_MARKER: &str = "QuotaManager2Impl - New quota refill state is: ";
+const JUNIE_MARKER: &str = "AiaActivationTransmitter - Received message from junie: quota_update:";
+const DISABLED_ASSISTANT_MARKER: &str =
+    "QuotaManager2Impl - New quota state is: Error(exception=com.intellij.ml.llm.core.AIAssistantForbiddenException";
 
 struct LogEntry {
     timestamp: SystemTime,
@@ -283,15 +286,30 @@ fn latest_log_entry_in(content: &str) -> Option<LogEntry> {
     let mut refill = None;
     let mut found_refill = false;
     for line in content.lines().rev() {
-        if line.contains(QUOTA_MARKER) {
-            let Some(parsed) = parse_log_quota(line) else {
+        if line.contains(QUOTA_MARKER) || line.contains(JUNIE_MARKER) {
+            // Air disables the old assistant while Junie still reports quota.
+            // Only that specific error is noise; other errors end an account state.
+            if line.contains(DISABLED_ASSISTANT_MARKER) {
+                continue;
+            }
+            let parsed = if line.contains(JUNIE_MARKER) {
+                parse_junie_log_quota(line)
+                    .map(|(timestamp, quota, refill)| (timestamp, quota, Some(refill)))
+            } else {
+                parse_log_quota(line).map(|(timestamp, quota)| (timestamp, quota, None))
+            };
+            let Some(parsed) = parsed else {
                 // An unparseable quota-state line is an account boundary. Never
                 // resurrect an older quota or carry its refill across it.
                 quota.as_ref()?;
                 break;
             };
             if quota.is_none() {
+                let has_reset = parsed.2.is_some();
                 quota = Some(parsed);
+                if has_reset {
+                    break;
+                }
             }
         } else if !found_refill && line.contains(REFILL_MARKER) {
             found_refill = true;
@@ -301,10 +319,10 @@ fn latest_log_entry_in(content: &str) -> Option<LogEntry> {
             break;
         }
     }
-    let (timestamp, quota) = quota?;
-    // Insula requires an explicit reset from the log's own refill record.
+    let (timestamp, quota, own_refill) = quota?;
+    // Junie states its reset as `until`; text records use their own refill line.
     // Never borrow XML refill data: the XML may belong to a previous account.
-    let normalized = normalize_quota(quota, refill).ok()?;
+    let normalized = normalize_quota(quota, own_refill.or(refill)).ok()?;
     Some(LogEntry {
         timestamp,
         normalized,
@@ -349,13 +367,9 @@ fn log_number(raw: &str) -> Option<String> {
     (value.is_finite() && value >= 0.0).then(|| raw.to_string())
 }
 
-fn log_details(state: &mut &str) -> Option<SubQuota> {
+fn log_details(state: &mut &str, prefix: &str) -> Option<SubQuota> {
     Some(SubQuota {
-        current: Some(log_number(log_field(
-            state,
-            "QuotaDetails(current=",
-            ", ",
-        )?)?),
+        current: Some(log_number(log_field(state, prefix, ", ")?)?),
         maximum: Some(log_number(log_field(state, "maximum=", ", ")?)?),
         available: Some(log_number(log_field(state, "available=", ")")?)?),
     })
@@ -369,23 +383,92 @@ fn log_date(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
+fn junie_details(value: &serde_json::Value) -> Option<SubQuota> {
+    let amount = |key: &str| {
+        let value = value.get(key)?.get("amount")?;
+        match value {
+            serde_json::Value::String(raw) => log_number(raw),
+            serde_json::Value::Number(raw) => log_number(&raw.to_string()),
+            _ => None,
+        }
+    };
+    Some(SubQuota {
+        current: Some(amount("current")?),
+        maximum: Some(amount("maximum")?),
+        available: Some(amount("available")?),
+    })
+}
+
+fn parse_junie_log_quota(line: &str) -> Option<(SystemTime, QuotaInfo, NextRefill)> {
+    let (timestamp, state) = log_record(line, JUNIE_MARKER)?;
+    let state: serde_json::Value = serde_json::from_str(state).ok()?;
+    let tariff = junie_details(state.get("tariffQuota")?)?;
+    if tariff.maximum.as_deref()?.parse::<f64>().ok()? <= 0.0 {
+        return None;
+    }
+    let top_up = match state.get("topUpQuota").filter(|value| !value.is_null()) {
+        Some(value) => Some(junie_details(value)?),
+        None => None,
+    };
+    let until = i64::try_from(state.get("until")?.as_u64()?).ok()?;
+    let until = chrono::DateTime::from_timestamp_millis(until)?
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    Some((
+        timestamp,
+        QuotaInfo {
+            kind: Some("Available".to_string()),
+            current: None,
+            maximum: None,
+            tariff_quota: Some(tariff),
+            top_up_quota: top_up,
+        },
+        NextRefill {
+            next: Some(until),
+            tariff: None,
+        },
+    ))
+}
+
 fn parse_log_quota(line: &str) -> Option<(SystemTime, QuotaInfo)> {
     let (timestamp, mut state) = log_record(line, QUOTA_MARKER)?;
-    let current = log_number(log_field(&mut state, "Available(current=", ", ")?)?;
+    // Newer assistants wrap the same counters, adding identifiers that are not
+    // quota data. Validate their delimiters without retaining the identifiers.
+    let jbai = state.starts_with("Available(quota=JbaiQuota(");
+    let current_prefix = if jbai {
+        let license = log_field(&mut state, "Available(quota=JbaiQuota(license=", ", ")?;
+        if license.contains([',', '(', ')']) {
+            return None;
+        }
+        "current="
+    } else {
+        "Available(current="
+    };
+    let current = log_number(log_field(&mut state, current_prefix, ", ")?)?;
     let maximum = log_number(log_field(&mut state, "maximum=", ", ")?)?;
+    if jbai {
+        let id = log_field(&mut state, "quotaID=JbaiQuotaId(", "), ")?;
+        if id.contains(['(', ')']) {
+            return None;
+        }
+    }
     log_date(log_field(&mut state, "until=", ", ")?)?;
     state = state.strip_prefix("tariffQuota=")?;
-    let tariff = log_details(&mut state)?;
+    let details_prefix = if jbai {
+        "Details(current="
+    } else {
+        "QuotaDetails(current="
+    };
+    let tariff = log_details(&mut state, details_prefix)?;
     if tariff.maximum.as_deref()?.parse::<f64>().ok()? <= 0.0 {
         return None;
     }
     let top_up = if let Some(rest) = state.strip_prefix(", topUpQuota=") {
         state = rest;
-        Some(log_details(&mut state)?)
+        Some(log_details(&mut state, details_prefix)?)
     } else {
         None
     };
-    if state != ")" {
+    if state != if jbai { "))" } else { ")" } {
         return None;
     }
     Some((
@@ -402,19 +485,36 @@ fn parse_log_quota(line: &str) -> Option<(SystemTime, QuotaInfo)> {
 
 fn parse_log_refill(line: &str) -> Option<NextRefill> {
     let (_, mut state) = log_record(line, REFILL_MARKER)?;
-    let next = log_date(log_field(&mut state, "Known(next=", ", ")?)?;
-    let amount = log_number(log_field(
-        &mut state,
-        "tariff=QuotaRefillInfoTariff(amount=",
-        ", ",
-    )?)?;
-    let duration = log_field(&mut state, "duration=", "))")?;
-    if !state.is_empty()
-        || duration.is_empty()
-        || duration
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'))
-    {
+    let valid_token = |raw: &str| {
+        !raw.is_empty()
+            && !raw
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'))
+    };
+    let (next, amount, duration) = if state.starts_with("Known(refill=") {
+        let amount = log_number(log_field(
+            &mut state,
+            "Known(refill=JbaiQuotaRefill(tariff=JbaiQuotaTariff(amount=",
+            ", ",
+        )?)?;
+        let duration = log_field(&mut state, "period=", "), ")?;
+        let next = log_date(log_field(&mut state, "next=", ", ")?)?;
+        let last = log_field(&mut state, "last=", "))")?;
+        if !valid_token(last) {
+            return None;
+        }
+        (next, amount, duration)
+    } else {
+        let next = log_date(log_field(&mut state, "Known(next=", ", ")?)?;
+        let amount = log_number(log_field(
+            &mut state,
+            "tariff=QuotaRefillInfoTariff(amount=",
+            ", ",
+        )?)?;
+        let duration = log_field(&mut state, "duration=", "))")?;
+        (next, amount, duration)
+    };
+    if !state.is_empty() || !valid_token(duration) {
         return None;
     }
     Some(NextRefill {
@@ -1328,6 +1428,41 @@ mod tests {
         "Known(next=2026-10-11T17:00:30.231Z, tariff=QuotaRefillInfoTariff(amount=1000000, duration=30d))"
     );
 
+    // Transcribed from CodexBar v0.77.0 JetBrainsQuotaLogReaderTests.swift.
+    // These preserve the distinct tariff and purchased balances in each layout.
+    const JUNIE_QUOTA_LINE: &str = concat!(
+        "2026-10-12 04:47:16,090 [  67837]   INFO - #c.i.m.l.a.m.AiaActivationTransmitter - ",
+        "Received message from junie: quota_update:{\"license\":\"TESTLICENSE\",",
+        "\"current\":{\"amount\":\"16966.18\"},\"maximum\":{\"amount\":\"6489986.397\"},",
+        "\"until\":1853269200000,\"quotaID\":{\"quotaId\":\"TESTLICENSE\"},",
+        "\"tariffQuota\":{\"current\":{\"amount\":\"16966.18\"},\"maximum\":{\"amount\":\"1000000.0\"},",
+        "\"available\":{\"amount\":\"983033.82\"}},",
+        "\"topUpQuota\":{\"current\":{\"amount\":\"0.0\"},\"maximum\":{\"amount\":\"5489986.397\"},",
+        "\"available\":{\"amount\":\"5489986.397\"}}}"
+    );
+    const AIR_MIGRATION_REFILL_LINE: &str = concat!(
+        "2026-10-12 04:51:20,481 [ 312228]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota refill state is: ",
+        "Error(exception=com.intellij.ml.llm.core.AIAssistantForbiddenException: Usage of AI Assistant is ",
+        "prohibited by machine-wide settings (AirMigration))"
+    );
+    const JBAI_QUOTA_LINE: &str = concat!(
+        "2026-10-12 04:47:42,704 [  28196]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota state is: ",
+        "Available(quota=JbaiQuota(license=TESTLICENSE, current=16966.18, maximum=6489986.397, ",
+        "quotaID=JbaiQuotaId(quotaId=TESTLICENSE, userId=null), until=2028-09-22T21:00:00Z, ",
+        "tariffQuota=Details(current=16966.18, maximum=1000000, available=983033.82), ",
+        "topUpQuota=Details(current=0, maximum=5489986.397, available=5489986.397)))"
+    );
+    const JBAI_REFILL_LINE: &str = concat!(
+        "2026-10-12 04:47:51,747 [  37239]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota refill state is: ",
+        "Known(refill=JbaiQuotaRefill(tariff=JbaiQuotaTariff(amount=1000000, period=30d), ",
+        "next=2026-11-10T17:00:32.124Z, last=2026-10-11T17:00:32.124Z))"
+    );
+    const AIR_MIGRATION_QUOTA_LINE: &str = concat!(
+        "2026-10-12 04:51:43,486 [ 335233]   INFO - #c.i.m.l.c.q.QuotaManager2Impl - New quota state is: ",
+        "Error(exception=com.intellij.ml.llm.core.AIAssistantForbiddenException: Usage of AI Assistant is ",
+        "prohibited by machine-wide settings (AirMigration))"
+    );
+
     fn log_fixture() -> String {
         format!("{OLDER_QUOTA_LINE}\n{REFILL_LINE}\n{LATEST_QUOTA_LINE}\n")
     }
@@ -1764,6 +1899,237 @@ mod tests {
             primary.regeneration.unwrap().rate.unwrap().amount,
             1000000.0
         );
+    }
+
+    #[test]
+    fn a_newer_junie_quota_wins_over_legacy_records() {
+        let files = IdeFiles::new();
+        files.xml("DataGrip2026.2", ACTIVE_XML, SystemTime::UNIX_EPOCH);
+        files.log(
+            "DataGrip2026.2",
+            format!(
+                "{}{JUNIE_QUOTA_LINE}\n{AIR_MIGRATION_REFILL_LINE}\n",
+                log_fixture()
+            ),
+        );
+        let normalized = files
+            .fetch()
+            .expect("Junie quota must supersede the older log and XML");
+        let primary = normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 1.696618).abs() < 0.000001);
+        assert_eq!(primary.resets_at.as_deref(), Some("2028-09-22T21:00:00Z"));
+        assert_eq!(
+            primary.window_minutes, None,
+            "Junie states no refill period"
+        );
+        assert!(primary.regeneration.is_none());
+        let entry = latest_log_entry_in(&format!("{JUNIE_QUOTA_LINE}\n")).unwrap();
+        let expected_time = Local
+            .with_ymd_and_hms(2026, 10, 12, 4, 47, 16)
+            .single()
+            .unwrap()
+            + chrono::Duration::milliseconds(90);
+        assert_eq!(entry.timestamp, SystemTime::from(expected_time));
+    }
+
+    #[test]
+    fn junie_numeric_string_amounts_keep_tariff_and_top_up_separate() {
+        let entry = latest_log_entry_in(JUNIE_QUOTA_LINE).unwrap();
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 1.696618).abs() < 0.000001);
+        assert_eq!(
+            primary.used_count, None,
+            "fractional balances are not whole counts"
+        );
+        assert_eq!(primary.total_count, None);
+        let pool = entry.normalized.top_up.unwrap();
+        assert_eq!(pool.id, "topUpQuota");
+        assert_eq!(pool.funding, PoolFunding::Purchased);
+        let remaining = pool.remaining.unwrap();
+        assert_eq!(remaining.minor, 5489986397);
+        assert_eq!(remaining.exponent, 3);
+        assert_eq!(remaining.unit, "jetbrains-ai-quota");
+        assert_eq!(pool.total.unwrap().minor, 5489986397);
+    }
+
+    #[test]
+    fn junie_numeric_amounts_and_absent_top_up_do_not_invent_a_pool() {
+        let (prefix, payload) = JUNIE_QUOTA_LINE.split_once("quota_update:").unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        payload.as_object_mut().unwrap().remove("topUpQuota");
+        for field in ["current", "maximum", "available"] {
+            let amount = &mut payload["tariffQuota"][field]["amount"];
+            *amount = serde_json::from_str(amount.as_str().unwrap()).unwrap();
+        }
+        let line = format!("{prefix}quota_update:{payload}");
+        let entry = latest_log_entry_in(&line).unwrap();
+        assert!(
+            entry.normalized.top_up.is_none(),
+            "absent top-up is unknown, not zero"
+        );
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 1.696618).abs() < 0.000001);
+        assert_eq!(primary.resets_at.as_deref(), Some("2028-09-22T21:00:00Z"));
+    }
+
+    #[test]
+    fn a_newer_legacy_quota_wins_over_junie_updates() {
+        let later = LATEST_QUOTA_LINE.replace("2026-10-05 15:27:49,811", "2026-10-12 05:00:00,000");
+        let entry =
+            latest_log_entry_in(&format!("{JUNIE_QUOTA_LINE}\n{REFILL_LINE}\n{later}\n")).unwrap();
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 34.6495294).abs() < 0.000001);
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-10-11T17:00:30.231Z")
+        );
+    }
+
+    #[test]
+    fn disabled_assistant_errors_do_not_hide_junie_quota() {
+        let log = format!(
+            "{LATEST_QUOTA_LINE}\n{AIR_MIGRATION_QUOTA_LINE}\n{JUNIE_QUOTA_LINE}\n{AIR_MIGRATION_QUOTA_LINE}\n{AIR_MIGRATION_REFILL_LINE}\n{AIR_MIGRATION_QUOTA_LINE}\n"
+        );
+        let entry =
+            latest_log_entry_in(&log).expect("the disabled assistant must not hide Junie quota");
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 1.696618).abs() < 0.000001);
+        assert_eq!(primary.resets_at.as_deref(), Some("2028-09-22T21:00:00Z"));
+    }
+
+    #[test]
+    fn other_forbidden_exceptions_invalidate_older_quota() {
+        let error = AIR_MIGRATION_QUOTA_LINE.replace(
+            "com.intellij.ml.llm.core.AIAssistantForbiddenException",
+            "com.intellij.ml.llm.core.OtherForbiddenException",
+        );
+        assert!(
+            latest_log_entry_in(&format!("{JUNIE_QUOTA_LINE}\n{error}\n")).is_none(),
+            "only the disabled-assistant exception may be skipped"
+        );
+    }
+
+    #[test]
+    fn unsupported_latest_states_do_not_resurrect_junie_quota() {
+        for exception in ["java.net.SocketTimeoutException", "Unknown"] {
+            let error = AIR_MIGRATION_QUOTA_LINE.replace(
+                "com.intellij.ml.llm.core.AIAssistantForbiddenException",
+                exception,
+            );
+            assert!(
+                latest_log_entry_in(&format!("{JUNIE_QUOTA_LINE}\n{error}\n")).is_none(),
+                "unsupported newest state: {exception}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_latest_junie_quota_never_revives_older_quota() {
+        let prefix = JUNIE_QUOTA_LINE.split_once("quota_update:").unwrap().0;
+        for payload in [
+            r#"{"tariffQuota":{}}"#,
+            "not json",
+            r#"{"until":1,"tariffQuota":{"current":{"amount":"1"},"maximum":{"amount":"0"},"available":{"amount":"0"}}}"#,
+            r#"{"until":1,"tariffQuota":{"current":{"amount":"1"},"maximum":{"amount":"10"}}}"#,
+        ] {
+            let line = format!("{prefix}quota_update:{payload}");
+            assert!(
+                latest_log_entry_in(&format!("{}{line}\n", log_fixture())).is_none(),
+                "invalid latest Junie state: {payload}"
+            );
+        }
+        for invalid in [
+            JUNIE_QUOTA_LINE.replace("1853269200000", "-1"),
+            JUNIE_QUOTA_LINE.replace("1853269200000", "null"),
+            JUNIE_QUOTA_LINE.replace("\"until\":1853269200000,", ""),
+            JUNIE_QUOTA_LINE.replace("16966.18", "-1"),
+            JUNIE_QUOTA_LINE.replace("16966.18", "NaN"),
+            JUNIE_QUOTA_LINE.replace("1000000.0", "1e999"),
+            JUNIE_QUOTA_LINE.replace("5489986.397", "-1"),
+            JUNIE_QUOTA_LINE.replace("2026-10-12", "2026-02-30"),
+        ] {
+            assert!(
+                latest_log_entry_in(&format!("{}{invalid}\n", log_fixture())).is_none(),
+                "unreadable newest Junie record must not expose an older quota"
+            );
+        }
+    }
+
+    #[test]
+    fn jbai_quota_and_refill_keep_tariff_and_top_up_separate() {
+        let log = format!("{}{JBAI_QUOTA_LINE}\n{JBAI_REFILL_LINE}\n", log_fixture());
+        let entry = latest_log_entry_in(&log).unwrap();
+        let expected_time = Local
+            .with_ymd_and_hms(2026, 10, 12, 4, 47, 42)
+            .single()
+            .unwrap()
+            + chrono::Duration::milliseconds(704);
+        assert_eq!(entry.timestamp, SystemTime::from(expected_time));
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert!((primary.used_percent - 1.696618).abs() < 0.000001);
+        assert_eq!(
+            primary.resets_at.as_deref(),
+            Some("2026-11-10T17:00:32.124Z")
+        );
+        assert_eq!(
+            primary.window_minutes, None,
+            "30d is not an ISO-8601 duration"
+        );
+        let pool = entry.normalized.top_up.unwrap();
+        assert_eq!(pool.remaining.unwrap().minor, 5489986397);
+        assert_eq!(pool.total.unwrap().minor, 5489986397);
+
+        let refill = JBAI_REFILL_LINE.replace("period=30d", "period=PT720H");
+        let entry = latest_log_entry_in(&format!("{JBAI_QUOTA_LINE}\n{refill}\n")).unwrap();
+        let primary = entry.normalized.usage.primary.unwrap();
+        assert_eq!(primary.window_minutes, Some(43200));
+        assert_eq!(
+            primary.regeneration.unwrap().rate.unwrap().amount,
+            1000000.0
+        );
+    }
+
+    #[test]
+    fn a_jbai_quota_without_top_up_publishes_no_pool() {
+        let line = JBAI_QUOTA_LINE
+            .split_once(", topUpQuota=")
+            .unwrap()
+            .0
+            .to_string()
+            + "))";
+        let entry = latest_log_entry_in(&format!("{line}\n{JBAI_REFILL_LINE}\n")).unwrap();
+        assert!(entry.normalized.top_up.is_none());
+        assert!((entry.normalized.usage.primary.unwrap().used_percent - 1.696618).abs() < 0.000001);
+    }
+
+    #[test]
+    fn malformed_latest_jbai_records_never_revive_older_quota_or_refill() {
+        for invalid in [
+            JBAI_QUOTA_LINE.replace("tariffQuota=Details(", "tariffQuota=Other("),
+            JBAI_QUOTA_LINE.replace("maximum=1000000", "maximum=0"),
+            JBAI_QUOTA_LINE.replace("JbaiQuotaId(", "OtherId("),
+            JBAI_QUOTA_LINE.replace("license=TESTLICENSE", "license=(TESTLICENSE)"),
+            JBAI_QUOTA_LINE.replace("2028-09-22T21:00:00Z", "invalid"),
+        ] {
+            assert!(
+                latest_log_entry_in(&format!("{}{invalid}\n", log_fixture())).is_none(),
+                "invalid newest wrapped quota: {invalid}"
+            );
+        }
+        for invalid in [
+            JBAI_REFILL_LINE.replace("amount=1000000", "amount=1..0"),
+            JBAI_REFILL_LINE.replace("next=2026-11-10T17:00:32.124Z", "next=invalid"),
+            JBAI_REFILL_LINE.replace("period=30d", "period=bad period"),
+            JBAI_REFILL_LINE.replace("last=2026-10-11T17:00:32.124Z", "last="),
+        ] {
+            assert!(
+                latest_log_entry_in(&format!(
+                    "{JBAI_REFILL_LINE}\n{JBAI_QUOTA_LINE}\n{invalid}\n"
+                ))
+                .is_none(),
+                "invalid newest wrapped refill must not reuse an older refill: {invalid}"
+            );
+        }
     }
 
     /// CodexBar-shaped active quota: numbers are STRINGS, JSON is HTML-entity
