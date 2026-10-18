@@ -945,23 +945,34 @@ pub struct VaultClient {
 /// Reuses the vault transport with a separate connection and route lease so a
 /// stalled bus cannot occupy a credential lane. Bus routes never fall back to
 /// Direct: ck-bus requires the supervisor's reserved launch principal.
-pub(crate) struct BusRoute(Arc<ClientState>);
+pub(crate) struct BusRoute {
+    state: Arc<ClientState>,
+    runtime: tokio::runtime::Handle,
+}
 
 impl BusRoute {
     pub(crate) fn new(path: PathBuf) -> Self {
         let mut state = ClientState::new(path);
         state.target_module = "ckbus";
         state.require_identity = true;
-        Self(Arc::new(state))
+        Self {
+            state: Arc::new(state),
+            runtime: tokio::runtime::Handle::current(),
+        }
     }
 
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, &'static str> {
         let body = serde_json::to_vec(&serde_json::json!({"method": method, "params": params}))
             .map_err(|_| "bus_request_encode")?;
+        // Nonce callbacks run on a short-lived NATS runtime. Keep subc reader
+        // and writer tasks on the module runtime so renewing NATS cannot kill
+        // a freshly reconnected credential route underneath the next session.
+        let state = Arc::clone(&self.state);
         let frame = self
-            .0
-            .call(body)
+            .runtime
+            .spawn(async move { state.call(body).await })
             .await
+            .map_err(|_| "bus_route_task_failed")?
             .map_err(|_| "bus_route_unavailable")?;
         let reply: Value = serde_json::from_slice(&frame.body).map_err(|_| "bus_invalid_reply")?;
         if let Some(error) = reply.get("error") {
@@ -2614,6 +2625,56 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bus_subc_transport_outlives_a_nonce_callback_runtime() {
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("bus-runtime").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            reply_route(&mut stream, 7, 3).await;
+            for _ in 0..2 {
+                let request = read_frame(&mut stream)
+                    .await
+                    .unwrap()
+                    .expect("subc connection must survive NATS runtime shutdown");
+                write_frame(&mut stream, &get_success(&request, b"fixture"))
+                    .await
+                    .unwrap();
+            }
+        });
+        // Identity negotiation is covered separately. This fixture isolates the
+        // lifetime of the shared TCP dispatcher after its first nonce callback.
+        let route = Arc::new(BusRoute {
+            state: Arc::new(ClientState::new(path)),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let nonce_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let callback_route = Arc::clone(&route);
+        let first = nonce_runtime.spawn(async move {
+            callback_route
+                .call("ckbus.nonce_sign", serde_json::json!({}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        nonce_runtime.shutdown_background();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            route.call("ckbus.nonce_sign", serde_json::json!({})),
+        )
+        .await
+        .unwrap()
+        .expect("renewing NATS must not destroy the subc dispatcher");
+        assert_eq!(route.state.connections_established(), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]
