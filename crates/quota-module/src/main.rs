@@ -16,7 +16,7 @@
 // From the library target rather than `mod`, so the binary and any example use
 // ONE compiled copy. Declaring `mod` here as well would build the same source
 // twice and let the two drift while both continue to compile.
-use quota_module::{ids, vault_client};
+use quota_module::{bus, ids, vault_client};
 
 use ids::DEFAULT_MODULE_ID;
 
@@ -314,22 +314,34 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     // Process-lifetime consumption counters. Reset on restart like every other
     // process-lifetime metric here, which is why the AGES matter more than the
     // totals for an operator: a fresh process legitimately shows zero served.
-    let serve = Arc::new(ServeCounters::default());
 
     let credential_source: Arc<dyn CredentialSource> = vault.clone();
     let registry = Arc::new(Registry::with_defaults(
         quota_config,
         Some(credential_source),
     ));
+    let samples = Arc::new(bus::QuotaSamples::new(registry.drop_page(None).await.epoch));
+    let serve = Arc::new(ServeCounters {
+        samples: Arc::clone(&samples),
+        ..Default::default()
+    });
 
     // The background refresher owns all provider fetching: the serving path
     // (usage.get) only ever reads the slot store, so route reads never block on
     // the network. Cancelled when the frame loop ends so the task never leaks.
     let refresher_cancel = CancellationToken::new();
+    let publisher = samples.spawn(
+        config.connection_file_path.clone(),
+        refresher_cancel.clone(),
+    );
     let refresher = {
         let registry = Arc::clone(&registry);
         let cancel = refresher_cancel.clone();
-        tokio::spawn(async move { registry.refresh_loop(cancel).await })
+        tokio::spawn(async move {
+            registry
+                .refresh_loop_observed(cancel, |entries| samples.observe(entries))
+                .await
+        })
     };
 
     let loop_result = module_loop(
@@ -346,6 +358,7 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     // Stop the refresher and reap it before returning.
     refresher_cancel.cancel();
     let _ = refresher.await;
+    let _ = publisher.await;
 
     let writer_result = writer
         .await
@@ -525,6 +538,7 @@ struct RouteReply {
 
 #[derive(Debug, Default)]
 struct ServeCounters {
+    samples: Arc<bus::QuotaSamples>,
     served: AtomicU64,
     refused: AtomicU64,
     /// Monotonic instant of the last answered request, for an age at read time.
@@ -735,7 +749,7 @@ fn health_report(
     } else {
         None
     };
-    let metrics = json!({
+    let mut metrics = json!({
         // The commit this binary was built from. The module is supervised and
         // long-lived, so the repository's HEAD says nothing about what is actually
         // serving — a fix can be merged and green while an older binary still runs.
@@ -957,6 +971,10 @@ fn health_report(
         "lastFetchSuccessAgeSecs": snapshot.last_fetch_success_age.map(|d| d.as_secs()),
         "fetchBlackout": snapshot.fetch_blackout,
     });
+    metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(serve.samples.metrics().as_object().unwrap().clone());
     ModuleControlResponse::HealthCheck {
         status,
         detail,
@@ -974,6 +992,10 @@ struct UsageRequest {
 
 #[derive(Debug, Deserialize, Default)]
 struct UsageParams {
+    #[serde(default)]
+    event_key: Option<String>,
+    #[serde(default)]
+    event_name: Option<String>,
     #[serde(default)]
     provider: Option<String>,
     /// A sequence from a previous drop page. Absent means "everything retained".
@@ -1013,6 +1035,24 @@ async fn handle_usage_request(
             .await;
         }
     };
+
+    if request.method == bus::EVENTS_GET {
+        let body = serve.samples.events_get(
+            request.params.event_key.as_deref().unwrap_or(""),
+            request.params.event_name.as_deref().unwrap_or(""),
+        );
+        let response = Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            serde_json::to_vec(&body).map_err(|e| ModuleError::Message(e.to_string()))?,
+        )
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+        return send(writer, response).await;
+    }
 
     if request.method == USAGE_DROPS_OP {
         let page = registry.drop_page(request.params.since).await;
@@ -1066,7 +1106,7 @@ async fn handle_usage_request(
             serve,
             reply,
             "unknown_method",
-            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}' or '{USAGE_DROPS_OP}'"),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_DROPS_OP}' or 'events_get'"),
         )
         .await;
     }
@@ -1357,6 +1397,11 @@ fn manifest(
                             .to_string(),
                     ),
                 },
+                ManagementOperation {
+                    name: bus::EVENTS_GET.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some("Fetch a retained quota sample body by event key and verify its digest.".to_string()),
+                },
             ],
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),
@@ -1392,7 +1437,7 @@ fn manifest(
     // pointing at a module that no longer exists, which is exactly what the
     // ai-provider-quota -> insula flip did to three other call sites.
     .consumes(vec![ConsumerRole::ServiceClient {
-        of: vec![ids::CREDENTIALS_MODULE_ID.to_string()],
+        of: vec![ids::CREDENTIALS_MODULE_ID.to_string(), "ckbus".to_string()],
     }])
     .self_signals(Some(vec![
     // What this module does to the surfaces it reports on, so an analyst
@@ -1787,7 +1832,7 @@ mod tests {
 
         assert_eq!(
             named,
-            vec![ids::CREDENTIALS_MODULE_ID],
+            vec![ids::CREDENTIALS_MODULE_ID, "ckbus"],
             "this module calls credential.get on the vault, so an empty or \
              differently-named consumes is a false claim about what it depends on"
         );
@@ -1835,7 +1880,7 @@ mod tests {
         // construction and assert nothing.
         assert_eq!(
             advertised,
-            vec!["usage.get", "usage.drops"],
+            vec!["usage.get", "usage.drops", "events_get"],
             "the manifest advertises what catalog.list shows a consumer; an \
              operation listed here and not dispatched answers `unknown method` \
              to a caller who read the catalog and did nothing wrong"
@@ -2279,6 +2324,60 @@ mod tests {
     /// The health path reads only this client's frame-drop counters, which start
     /// at zero and need no connection to be read -- so a client pointed at a
     /// path that does not exist is the right fixture rather than a mock.
+    #[tokio::test]
+    async fn events_get_and_usage_get_answer_while_bus_is_unavailable() {
+        let registry = Arc::new(Registry::new(vec![]));
+        let samples = Arc::new(bus::QuotaSamples::new(registry.drop_page(None).await.epoch));
+        let cancel = CancellationToken::new();
+        let publisher = samples.spawn(
+            PathBuf::from("/missing/insula-bus-test.json"),
+            cancel.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while samples.metrics()["busPublishState"]["state"] != "unavailable" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unavailable bus state");
+        let serve = Arc::new(ServeCounters {
+            samples,
+            ..Default::default()
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        for method in ["events_get", "usage.get"] {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                5,
+                7,
+                91,
+                serde_json::to_vec(&json!({"method":method,"params":{
+                    "event_key":"a".repeat(64), "event_name":"quota_sampled"
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                handle_usage_request(frame, &tx, &registry, &serve),
+            )
+            .await
+            .expect("serving must not wait for publishing")
+            .unwrap();
+            let reply = rx.recv().await.unwrap();
+            assert_eq!(reply.header.epoch, 7);
+            let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            if method == "events_get" {
+                assert_eq!(value["error"]["code"], "event_not_found");
+            } else {
+                assert_eq!(value["result"], json!([]));
+            }
+        }
+        cancel.cancel();
+        publisher.await.unwrap();
+    }
+
     fn test_vault() -> VaultClient {
         VaultClient::new(std::path::PathBuf::from("/nonexistent/connection.json"))
     }
@@ -2812,6 +2911,9 @@ mod tests {
             "usageRequestsRefused",
             "lastServedAgeSecs",
             "lastRefusedAgeSecs",
+            "busPublishState",
+            "quotaSamplesPublished",
+            "quotaSamplesDropped",
         ];
         let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
         published.sort_unstable();

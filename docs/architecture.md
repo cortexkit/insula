@@ -36,10 +36,11 @@ The `ck-insula` binary.
 
 | File | Role |
 |---|---|
-| `src/main.rs` | startup, the module manifest, the subc frame loop, the `usage.get` / `usage.drops` handlers and the `health.check` report |
+| `src/main.rs` | startup, the module manifest, the subc frame loop, the `usage.get` / `usage.drops` / `events_get` handlers and the `health.check` report |
+| `src/bus.rs` | bounded quota sample queue and body cache, change detection, authenticated ck-bus connection, renewal and reconnect drain |
 | `src/vault_client.rs` | the client for the credential vault module; implements `CredentialSource` |
 | `src/ids.rs` | the module ids this module answers as and dials |
-| `src/lib.rs` | publishes `vault_client` and `ids` so diagnostic examples use the same client as the module |
+| `src/lib.rs` | publishes `vault_client`, `bus` and `ids` so callers use the same transport and publisher as the module |
 
 ## From enumeration to serving
 
@@ -57,9 +58,20 @@ the quota config from `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc` (default
 `~/.config/cortexkit/ck-quota.jsonc`; a missing or malformed file means the
 defaults, with banked resets off), builds `Registry::with_defaults` with the
 vault client as its credential source, sends `HELLO` with the manifest, and
-spawns `Registry::refresh_loop`. The manifest declares one management surface
-with two query operations, `usage.get` and `usage.drops`, and declares that the
-module consumes the credential vault.
+spawns `Registry::refresh_loop_observed`. The manifest declares one management
+surface with three query operations, `usage.get`, `usage.drops` and `events_get`,
+and declares that the module consumes the credential vault and ckbus.
+
+After each turn the observer enqueues changed serving entries without waiting
+for the bus. A separate task obtains ck-bus credentials over the existing subc
+client plumbing, presenting insula's supervisor-issued launch identity (never
+falling back to Direct), signs nonce challenges through ckbus, and publishes
+`ck.{acct}.event.insula.quota_sampled.v1` with the naming SDK. The bus carries
+only an event id, digest and small hints; `events_get` serves the redacted JSON
+body from a bounded in-memory cache. The queue drops its oldest sample on
+overflow. Outages back off to five minutes, reconnects replay current entries,
+and `usage.get` stays cache-only throughout. See the [consumer contract](consumer-contract.md#13-quota-sample-notices-on-ck-bus)
+for retention, per-account sequences and the shared `usage.drops` epoch.
 
 ### 2. Enumerate
 

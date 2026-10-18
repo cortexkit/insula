@@ -33,6 +33,7 @@ and `quota_drop.rs`, and tests marked `main.rs` are in
 10. [`usage.drops`](#usagedrops--recently-observed-decreases)
 11. [Health](#health-is-a-separate-axis)
 12. [Observed provider behaviour](#measured-behaviour-is-recorded-here-not-stamped-on-the-wire)
+13. [Quota sample notices on ck-bus](#13-quota-sample-notices-on-ck-bus)
 
 ## 1. Scope and the kinds of silence
 
@@ -1454,6 +1455,9 @@ not happened, never zero.
 | `vaultRouteWarmingRetries` | number | vault route opens refused while the vault was starting, then retried |
 | `vaultUnmatchedDrops` | number | vault replies discarded because their caller had gone |
 | `vaultStaleGenerationDrops` | number | vault replies discarded because they belonged to a previous connection |
+| `busPublishState` | object | quota publisher state and short structural reason; see [13](#13-quota-sample-notices-on-ck-bus) |
+| `quotaSamplesPublished` | number | acknowledged quota notices since process start |
+| `quotaSamplesDropped` | number | quota samples dropped from the bounded queue or failed publish attempts |
 
 **Event counters** (`staleEpisodes`, `staleEpisodesByProvider`, the
 `quotaDrops*` and `quotaComparisonsNoDrop` / `quotaNotComparable` counts) are
@@ -1634,3 +1638,82 @@ instant, which `resetsAt` already carries.
 A measurement taken on a host that is itself using a provider is shaped by that
 use. State what was driving the lane beside the method, and where nothing was
 known to be, say what was checked.
+
+## 13. Quota sample notices on ck-bus
+
+The subject is `ck.{acct}.event.insula.quota_sampled.v1`, built by
+`cortexkit-bus-naming`'s `AccountNames::event_subject("insula", "quota_sampled", 1)`.
+`{acct}` is the bus account, **not** the quota account. After a complete refresher
+turn, insula compares the serving entries per `(provider, account)` and enqueues
+at most one changed sample per key. An absent account label is a valid key (for
+example, DeepSeek). Entries absent from `usage.get`, including vault lanes held
+in `awaiting`, emit nothing. A changed `fetchedAt` counts as a new sample; an
+identical turn does not. Notices are a history aid, not an account deletion feed.
+
+### 13.1 Notice and body
+
+The broker carries **no JSON body**. Insula uses `Stream::publish` and waits for
+a JetStream `PublishReceipt` in its own drain task. A notice contains:
+
+- message id: lowercase-hex SHA-256 of the canonical identity object
+  `{provider, account, epoch, seq}`, omitting `account` when absent. Keys are
+  sorted, strings use JSON escaping, and the unsigned integer sequence is exact
+  (including values above 2^53);
+- digest: SHA-256 of the exact compact JSON body bytes;
+- small headers: `kind=quota_sampled`, `provider`, optional `account`, `epoch`,
+  and decimal `seq`. The SDK supplies `Nats-Msg-Id` and `Ck-Content-Digest`.
+
+Fetch the body on insula's management route:
+
+```json
+{"method":"events_get","params":{"event_key":"<64 lowercase hex characters>","event_name":"quota_sampled"}}
+```
+
+The response is `{"result":{"body":{...},"digest":"<sha256>",
+"event_key":"<key>","event_name":"quota_sampled","published_at":1234567890000}}`.
+`published_at` is the producer's Unix millisecond timestamp prepared before
+publishing, so a consumer receiving a notice before the producer receives its
+ack can already fetch the immutable body. Verify the notice digest against the
+compact JSON serialization of `result.body` (the exact body substring in the
+response); do not pretty-print or reorder its fields before hashing.
+
+`body` is the same account entry `Registry::get_usage` serves, with the same
+optional-field/absence semantics: `provider`, `apiProvider`, `account`, `source`,
+`fetchedAt`, `stale`, `usage`, the `spend` pools, `savedResets`, `errorClass`, and
+`error`, **minus `accountInfo`**, plus `epoch` and `seq`. No email, organization
+display name, token, or credential id is added to the body or hints. This keeps
+the existing `usage.get` wire spelling (`spend`, not a second `pools` field).
+
+Bodies live only in process memory: the newest 16 per quota account key, with
+a global cap of 1024 bodies. `event_not_found` means unknown, evicted, or from
+an earlier process: take a fresh `usage.get` snapshot. A malformed key gets
+`invalid_request`; another event name gets `event_name_mismatch`. This cache is
+not a durable history or a replay API.
+
+### 13.2 Sequences, outages, and backstop reads
+
+`epoch` is the **same opaque process run id returned by `usage.drops`**. Compare
+it for equality; do not parse or order it. `seq` is a u64, starting at 1 for each
+`(provider, account)` per process. Allocation happens at enqueue, so evicted or
+failed samples can leave gaps. A skipped sequence within one epoch means a
+missed sample: recover with `usage.get`. A new epoch means a restart: discard
+old sequence cursors and take a `usage.get` snapshot. Deduplicate repeated ids.
+
+Publishing never gates serving, provider refresh, or credential lookup. The
+bounded queue holds 256 samples; overflow evicts the oldest rather than waiting
+for capacity. Withdrawn entries are removed from the queue. A missing ckbus
+module, refused credential, or NATS outage is normal: insula reports the state,
+retries with exponential backoff capped at 5 minutes, and keeps serving. After
+reconnection it publishes the current entries again with the next sequences,
+including entries unchanged during the outage. Credential renewal rebuilds the
+authenticated connection before expiry. Consumers should keep a slow
+`usage.get` backstop (10 minutes) as well as snapshots on gaps, restarts and
+not-found bodies: the bus is not an exhaustive inventory.
+
+Health metrics (all process-lifetime):
+
+| Metric | Meaning |
+|---|---|
+| `busPublishState` | `{state, reason}`; `disabled` before startup/after shutdown, `connecting` on startup, `publishing` when connected, or `unavailable` with a short structural reason. State changes are logged once, without credential text. Bus unavailability does not degrade the provider health status. |
+| `quotaSamplesPublished` | acknowledged publishes, including idempotent duplicate acknowledgements |
+| `quotaSamplesDropped` | samples evicted by overflow, withdrawal, replacement with the current reconnect snapshot, or failed publish attempts (which can be ambiguous after a timeout) |

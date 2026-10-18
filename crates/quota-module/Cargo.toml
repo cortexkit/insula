@@ -30,6 +30,11 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+base64 = "0.22"
+cortexkit-bus-naming = "=0.2.1"
+cortexkit-bus-nats = "=0.3.0"
+cortexkit-bus-trait = "=0.3.0"
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "nkeys", "nuid", "ring", "server_2_10"] }
 
 # build.rs stamps a lock digest that the manifest publishes as provenance, and
 # subc-protocol validates it as exactly 64 lowercase hex -- a real SHA-256 rather
@@ -39,6 +44,8 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+nkeys = "=0.4.5"
+cortexkit-bus-testkit = "=0.1.1"
 cortexkit-paths = "=0.1.2"
 # For the diagnostic examples only: the module itself makes no HTTP calls.
 reqwest = { workspace = true }

@@ -61,6 +61,14 @@ fn subconscious_root() -> PathBuf {
 /// binary can linger in target/debug after the rename, so the build and the
 /// path must both use the current artifact name to avoid running an old daemon.
 fn build_subc_daemon() -> PathBuf {
+    // An isolated worktree need not have a sibling checkout. The caller can
+    // supply a prebuilt daemon; start_real_daemon still copies it to a ckdev path
+    // so tests never execute or modify the installed daemon in place.
+    if let Some(path) = std::env::var_os("CK_SUBC_BIN") {
+        let path = PathBuf::from(path);
+        assert!(path.is_file(), "CK_SUBC_BIN must name a daemon binary");
+        return path;
+    }
     let root = subconscious_root();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(&root)

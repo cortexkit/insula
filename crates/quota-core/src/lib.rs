@@ -1726,8 +1726,20 @@ impl Registry {
 
     /// Drive bounded scheduler turns until cancellation.
     pub async fn refresh_loop(&self, cancel: CancellationToken) {
+        self.refresh_loop_observed(cancel, |_| std::future::ready(()))
+            .await;
+    }
+
+    /// Observe the serving snapshot after a complete scheduler turn. Observers
+    /// must only enqueue local work: provider progress must not depend on a bus.
+    pub async fn refresh_loop_observed<F, Fut>(&self, cancel: CancellationToken, observe: F)
+    where
+        F: Fn(Vec<ProviderUsage>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         loop {
             self.refresh_tick(&cancel).await;
+            observe(self.get_usage(None).await).await;
             if cancel.is_cancelled() {
                 return;
             }
