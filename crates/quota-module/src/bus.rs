@@ -51,6 +51,7 @@ struct Pending {
 
 /// Process-lifetime metrics and queue; no network operation holds its mutex.
 pub struct QuotaSamples {
+    pub watches: crate::usage_watch::UsageWatches,
     epoch: String,
     capacity: usize,
     pending: Mutex<Pending>,
@@ -82,6 +83,7 @@ impl QuotaSamples {
     fn with_capacity(epoch: String, capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
+            watches: crate::usage_watch::UsageWatches::new(epoch.clone()),
             epoch,
             capacity,
             pending: Mutex::new(Pending::default()),
@@ -127,6 +129,7 @@ impl QuotaSamples {
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect::<Vec<_>>();
         for (key, entry) in changed {
+            self.watches.changed(&key.0, key.1.as_deref());
             pending.seen.insert(key.clone(), entry.clone());
             self.enqueue(&mut pending, key, entry);
         }
@@ -257,9 +260,14 @@ impl QuotaSamples {
 
     pub fn metrics(&self) -> Value {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        json!({"busPublishState": {"state": state.0, "reason": state.1},
+        let mut metrics = json!({"busPublishState": {"state": state.0, "reason": state.1},
             "quotaSamplesPublished": self.published.load(Ordering::Relaxed),
-            "quotaSamplesDropped": self.dropped.load(Ordering::Relaxed)})
+            "quotaSamplesDropped": self.dropped.load(Ordering::Relaxed)});
+        metrics
+            .as_object_mut()
+            .unwrap()
+            .extend(self.watches.metrics().as_object().unwrap().clone());
+        metrics
     }
 
     pub fn spawn(

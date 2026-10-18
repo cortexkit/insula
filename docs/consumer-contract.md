@@ -2,7 +2,7 @@
 
 What a consumer of this module can rely on, what it must not infer, and the test
 that holds each rule in place. It covers the `usage.get` envelope, the
-`usage.drops` operation and the `health.check` metrics.
+`usage.watch` subscription, the `usage.drops` operation and the `health.check` metrics.
 
 **This document owns the wire.** Field meanings, error classes, freshness and
 staleness semantics, and what a consumer may infer are settled here. Where any
@@ -24,6 +24,7 @@ and `quota_drop.rs`, and tests marked `main.rs` are in
 1. [Scope and the kinds of silence](#1-scope-and-the-kinds-of-silence)
 2. [The core rule](#the-core-rule)
 3. [Response shapes](#the-six-response-shapes)
+   - [`usage.watch`: route-level change notices](#34-usagewatch-route-level-change-notices)
 4. [Freshness](#freshness-comes-from-the-producer-never-from-the-poll)
 5. [Error classes](#degraded-means-we-cannot-read-it-not-the-provider-is-down)
 6. [Windows](#the-window-slots-are-positions-not-a-ranking)
@@ -186,6 +187,65 @@ cold for several turns. Do not decide this on elapsed time.
 `cancelled_tick_leaves_slots_pending_without_hanging`.
 
 <a id="freshness-comes-from-the-producer-never-from-the-poll"></a>
+
+### 3.4 `usage.watch`: route-level change notices
+
+Host plugins subscribe on their existing insula route rather than reading
+ck-bus. Send a `REQUEST` with body `{"method":"usage.watch"}` and the
+`SUBSCRIPTION` flag (bit 7) set. No parameters or provider filter are required;
+each stream covers all entries. A missing subscription flag is
+`invalid_request`; at most 64 watches may be open in one insula process, with
+additional requests refused as `usage_watch_limit`.
+
+The reply is a held-open stream on the request's correlation, channel and
+binding epoch, not a `RESPONSE`. Every notice is one JSON `STREAM_DATA` frame
+with `ADMISSION=2` (sheddable):
+
+```json
+{"kind":"changed","epoch":"process-drops-epoch","seq":1}
+{"kind":"changed","epoch":"process-drops-epoch","seq":2,"provider":"codex","account":"work"}
+```
+
+Notice 1 is queued immediately, with no `provider` or `account`: read
+`usage.get` now. Later notices name one changed `(provider, account)` entry
+from the same per-refresher-turn change detector as `quota_sampled` (section
+13). They omit `account` when the entry has none, and carry no quota data or
+account metadata. An unchanged turn emits nothing. Account metadata alone
+does not change a sample. These are invalidations, not account-deletion
+events; all completeness and absence rules for `usage.get` still apply.
+
+`seq` starts at 1 **per watch**, not per account. `epoch` is the same opaque
+process-lifetime epoch returned by `usage.drops`, not the frame's route-binding
+epoch. Re-read `usage.get` on every notice. On a sequence gap (including a
+first sequence other than 1), or a different epoch, re-read the entire
+snapshot instead of just the named account. Reconnect by opening a new watch;
+there is no replay cursor.
+
+Each watch retains at most 16 notices. A full queue drops the **oldest**;
+sequence numbers still advance so loss remains visible to readers. Serving
+and refreshing never await a watcher. Ordinary replies take precedence over
+queued notices. Neither this stream nor ck-bus is a durable history; a
+consumer needing periodic backstop snapshots may continue taking them.
+
+Send a pure-header `CANCEL` on the same channel, binding epoch and correlation
+to stop a watch and free its queue. Frames already in transport may still be
+in flight; ignore them after local cancellation. Route `GOODBYE` frees all
+watches on that binding. On module shutdown, active watches receive
+`STREAM_END` with `LAST=1` and normal admission (terminal frames are never
+sheddable). An insula predating this method replies `unknown_method` with an
+"unknown method" message: fall back to polling `usage.get`.
+
+**Proven by:** `usage_watch_immediate_notice_has_no_ids`,
+`usage_watch_changed_entry_names_its_identity`,
+`usage_watch_unchanged_turn_is_quiet`,
+`usage_watch_cancel_stops_the_correlation`,
+`usage_watch_cancel_discards_queued_notices_in_receive_order`,
+`usage_watch_shutdown_sends_a_reliable_terminal`,
+`usage_watch_overflow_keeps_newest_and_prioritizes_usage_get`,
+`usage_watch_stalled_transport_does_not_stall_serving`,
+`usage_watch_eof_ends_watches_and_reaps_writer` and
+`usage_watch_limit_and_route_goodbye_release_state`
+(`crates/quota-module/src/usage_watch_tests/mod.rs`, through the real frame loop).
 
 ## 4. Freshness
 
@@ -1445,6 +1505,8 @@ not happened, never zero.
 | `usageRequestsRefused` | number | requests refused (undecodable body, unknown method) |
 | `lastServedAgeSecs` | number or null | seconds since the last answered request |
 | `lastRefusedAgeSecs` | number or null | seconds since the last refused request |
+| `usageWatchers` | number | currently open `usage.watch` streams (at most 64); cancellation, route close and shutdown release them |
+| `usageWatchNoticesDropped` | number | oldest notices evicted from full per-watch queues since process start; sequence gaps tell each reader to reload |
 | `vaultHandleState` | string or null | `no_vault`, `awaiting`, `answered`, or null without a vault loader |
 | `scopedCredentialIds` | array | vault credential ids in the installed listing |
 | `vaultEnumerationFailure` | string or null | the latest vault listing failure |
