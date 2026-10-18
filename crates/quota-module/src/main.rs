@@ -16,6 +16,7 @@
 // From the library target rather than `mod`, so the binary and any example use
 // ONE compiled copy. Declaring `mod` here as well would build the same source
 // twice and let the two drift while both continue to compile.
+use quota_module::usage_watch::{UsageWatches, USAGE_WATCH_OP};
 use quota_module::{bus, ids, vault_client};
 
 use ids::DEFAULT_MODULE_ID;
@@ -68,6 +69,9 @@ const USAGE_GET_OP: &str = "usage.get";
 const USAGE_DROPS_OP: &str = "usage.drops";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
+
+#[cfg(test)]
+mod usage_watch_tests;
 /// The `ck-quota` name is a literal, deliberately not derived from the binary or
 /// module name — both of which have since been renamed, so beside a binary called
 /// `ck-insula` this reads like a leftover. It is the live config file.
@@ -304,7 +308,6 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let writer = tokio::spawn(drain_writer(write_half, rx));
 
     // Held concretely as well as behind the trait: the health path reads this
     // client's own frame-drop counters, which the CredentialSource trait does
@@ -321,6 +324,9 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
         Some(credential_source),
     ));
     let samples = Arc::new(bus::QuotaSamples::new(registry.drop_page(None).await.epoch));
+    let writer_samples = Arc::clone(&samples);
+    let writer =
+        tokio::spawn(async move { drain_writer(write_half, rx, &writer_samples.watches).await });
     let serve = Arc::new(ServeCounters {
         samples: Arc::clone(&samples),
         ..Default::default()
@@ -402,33 +408,53 @@ where
     send_hello(&writer, config).await?;
     expect_hello_ack(read_half).await?;
 
-    loop {
-        let Some(frame) = read_frame(read_half)
-            .await
-            .map_err(|e| ModuleError::Message(e.to_string()))?
-        else {
-            return Ok(()); // clean EOF: subc closed the connection.
-        };
-        if !handle_frame(frame, &writer, &registry, &vault, &serve).await? {
-            return Ok(());
+    let result = async {
+        loop {
+            let Some(frame) = read_frame(read_half)
+                .await
+                .map_err(|e| ModuleError::Message(e.to_string()))?
+            else {
+                return Ok(()); // clean EOF: subc closed the connection.
+            };
+            if !handle_frame(frame, &writer, &registry, &vault, &serve).await? {
+                return Ok(());
+            }
         }
     }
+    .await;
+    serve.samples.watches.shutdown();
+    result
 }
 
-async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), ModuleError>
+async fn drain_writer<W>(
+    write_half: W,
+    mut rx: mpsc::Receiver<Frame>,
+    watches: &UsageWatches,
+) -> Result<(), ModuleError>
 where
     W: AsyncWrite + Unpin,
 {
     let mut writer = BufWriter::new(write_half);
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            // Ordinary replies have priority over lossy notices. Watch queues
+            // never occupy the bounded reply channel or await its capacity.
+            biased;
+            frame = rx.recv() => match frame {
+                Some(frame) => frame,
+                None => {
+                    while let Some(frame) = watches.try_next() {
+                        write_frame(&mut writer, &frame).await
+                            .map_err(|e| ModuleError::Message(e.to_string()))?;
+                    }
+                    break;
+                }
+            },
+            frame = watches.next() => frame,
+        };
         write_frame(&mut writer, &frame)
             .await
             .map_err(|e| ModuleError::Message(e.to_string()))?;
-        while let Ok(frame) = rx.try_recv() {
-            write_frame(&mut writer, &frame)
-                .await
-                .map_err(|e| ModuleError::Message(e.to_string()))?;
-        }
         writer
             .flush()
             .await
@@ -594,12 +620,27 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
-        FrameType::Goodbye => Ok(true), // route goodbye: nothing to tear down (no per-route state).
+        FrameType::Goodbye => {
+            serve.samples.watches.close_route(&frame);
+            Ok(true)
+        }
+        FrameType::Cancel => {
+            serve.samples.watches.cancel(&frame);
+            Ok(true)
+        }
         FrameType::Request if frame.header.channel == 0 => {
             handle_control_request(frame, writer, registry, vault, serve).await?;
             Ok(true)
         }
         FrameType::Request => {
+            // Register watches in receive order: spawning registration would let
+            // an immediately following CANCEL run before the watch exists.
+            if serde_json::from_slice::<UsageRequest>(&frame.body)
+                .is_ok_and(|request| request.method == USAGE_WATCH_OP)
+            {
+                handle_usage_request(frame, writer, registry, serve).await?;
+                return Ok(true);
+            }
             // Data-plane request on a route channel. Spawn so a slow fetch never
             // head-of-line-blocks another route (ManagementSurface concurrency).
             let writer = writer.clone();
@@ -1036,6 +1077,13 @@ async fn handle_usage_request(
         }
     };
 
+    if request.method == USAGE_WATCH_OP {
+        return match serve.samples.watches.subscribe(&frame) {
+            Ok(()) => Ok(()),
+            Err((code, message)) => send_route_error(writer, serve, reply, code, message).await,
+        };
+    }
+
     if request.method == bus::EVENTS_GET {
         let body = serve.samples.events_get(
             request.params.event_key.as_deref().unwrap_or(""),
@@ -1106,7 +1154,7 @@ async fn handle_usage_request(
             serve,
             reply,
             "unknown_method",
-            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_DROPS_OP}' or 'events_get'"),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_WATCH_OP}', '{USAGE_DROPS_OP}' or 'events_get'"),
         )
         .await;
     }
@@ -1390,6 +1438,11 @@ fn manifest(
                 ),
                 },
                 ManagementOperation {
+                    name: USAGE_WATCH_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: Some("Lossy quota-change notices on a held-open subscription; re-read usage.get on a notice or sequence gap.".to_string()),
+                },
+                ManagementOperation {
                     name: USAGE_DROPS_OP.to_string(),
                     kind: ManagementOperationKind::Query,
                     description: Some(
@@ -1406,10 +1459,10 @@ fn manifest(
             config_schema: json!({ "type": "object" }),
             observability: Vec::new(),
             identity_scope: Vec::new(),
-            // Every data-plane request is spawned on arrival (see handle_frame),
-            // so responses may complete out of order even within one channel, and
-            // nothing inbound mutates state -- `usage.get` is a cache-only read of
-            // an in-memory snapshot. Declared from that behaviour rather than from
+            // Cache reads are spawned on arrival (see handle_frame), so responses
+            // may complete out of order even within one channel. Watches retain
+            // only correlation-local state; they do not serialize route reads.
+            // Declared from that behaviour rather than from
             // preference: claiming stricter ordering than the loop provides would
             // be a promise this module does not keep.
             concurrency: Concurrency::StatelessParallel,
@@ -1880,7 +1933,7 @@ mod tests {
         // construction and assert nothing.
         assert_eq!(
             advertised,
-            vec!["usage.get", "usage.drops", "events_get"],
+            vec!["usage.get", "usage.watch", "usage.drops", "events_get"],
             "the manifest advertises what catalog.list shows a consumer; an \
              operation listed here and not dispatched answers `unknown method` \
              to a caller who read the catalog and did nothing wrong"
@@ -2914,6 +2967,8 @@ mod tests {
             "busPublishState",
             "quotaSamplesPublished",
             "quotaSamplesDropped",
+            "usageWatchers",
+            "usageWatchNoticesDropped",
         ];
         let mut published: Vec<&str> = obj.keys().map(String::as_str).collect();
         published.sort_unstable();

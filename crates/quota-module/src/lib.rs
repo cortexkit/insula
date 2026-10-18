@@ -23,4 +23,5 @@
 
 pub mod bus;
 pub mod ids;
+pub mod usage_watch;
 pub mod vault_client;

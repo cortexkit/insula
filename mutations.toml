@@ -1302,3 +1302,63 @@ build_timeout_s = 1800
 
 [control.select]
 filter = "bus::tests::"
+
+[[control]]
+id = "usage-watch-immediate"
+guards = "Every admitted watch immediately tells its reader to reload usage.get"
+file = "crates/quota-module/src/usage_watch.rs"
+old = "self.enqueue(&mut watch, None);"
+new = "let _ = &mut watch; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/mod.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::usage_watch_immediate_notice_has_no_ids"]
+expect_message = "usage.watch must send immediate seq-1 notice"
+only = false
+timeout_s = 10
+build_timeout_s = 1800
+
+[control.select]
+tests = ["usage_watch_tests::usage_watch_immediate_notice_has_no_ids", "tests::every_advertised_operation_is_one_the_router_answers"]
+
+[[control]]
+id = "usage-watch-unchanged"
+guards = "Only changed quota entries notify usage watches"
+file = "crates/quota-module/src/bus.rs"
+old = ".filter(|(key, entry)| pending.seen.get(*key) != Some(*entry))"
+new = ".filter(|_| true /* NON-VACUITY BREAK */)"
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/mod.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::usage_watch_unchanged_turn_is_quiet"]
+expect_message = "unchanged entries must not notify a watch"
+only = false
+timeout_s = 10
+build_timeout_s = 1800
+
+[control.select]
+tests = ["usage_watch_tests::usage_watch_unchanged_turn_is_quiet", "tests::every_advertised_operation_is_one_the_router_answers"]
+
+[[control]]
+id = "usage-watch-cancel"
+guards = "CANCEL frees its watch and stops all subsequent notices"
+file = "crates/quota-module/src/main.rs"
+old = "serve.samples.watches.cancel(&frame);"
+new = "let _ = &frame; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/mod.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::usage_watch_cancel_stops_the_correlation"]
+expect_message = "CANCEL must stop further frames for its correlation"
+only = false
+timeout_s = 10
+build_timeout_s = 1800
+
+[control.select]
+tests = ["usage_watch_tests::usage_watch_cancel_stops_the_correlation", "tests::every_advertised_operation_is_one_the_router_answers"]
