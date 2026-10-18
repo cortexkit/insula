@@ -250,6 +250,8 @@ struct Pending {
 
 struct ClientState {
     connection_file_path: PathBuf,
+    target_module: &'static str,
+    require_identity: bool,
     connection: AsyncMutex<ConnectionState>,
     route: AsyncMutex<RouteState>,
     pending: Mutex<HashMap<(u32, u64), Pending>>,
@@ -277,6 +279,8 @@ impl ClientState {
     fn with_timeout(connection_file_path: PathBuf, request_timeout: Duration) -> Self {
         Self {
             connection_file_path,
+            target_module: CREDENTIALS_MODULE_ID,
+            require_identity: false,
             connection: AsyncMutex::new(ConnectionState::Empty { retry_after: None }),
             route: AsyncMutex::new(RouteState::Empty),
             pending: Mutex::new(HashMap::new()),
@@ -656,6 +660,14 @@ impl ClientState {
         connection: &Arc<LiveConnection>,
         route_generation: u64,
     ) -> Result<RouteLease, ClientFailure> {
+        if self.require_identity {
+            if consumer_identity().is_none() {
+                return Err(ClientFailure::IdentityRefused);
+            }
+            return self
+                .open_route_inner(connection, route_generation, true)
+                .await;
+        }
         match self
             .open_route_inner(connection, route_generation, true)
             .await
@@ -687,7 +699,7 @@ impl ClientState {
             "op": "route.open",
             "target": {
                 "kind": "management_surface",
-                "module_id": CREDENTIALS_MODULE_ID,
+                "module_id": self.target_module,
             },
             "identity": {
                 "project_root": "/",
@@ -928,6 +940,41 @@ impl Drop for PendingGuard {
 /// cannot stop ck-quota from registering and serving health.
 pub struct VaultClient {
     state: Arc<ClientState>,
+}
+
+/// Reuses the vault transport with a separate connection and route lease so a
+/// stalled bus cannot occupy a credential lane. Bus routes never fall back to
+/// Direct: ck-bus requires the supervisor's reserved launch principal.
+pub(crate) struct BusRoute(Arc<ClientState>);
+
+impl BusRoute {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        let mut state = ClientState::new(path);
+        state.target_module = "ckbus";
+        state.require_identity = true;
+        Self(Arc::new(state))
+    }
+
+    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, &'static str> {
+        let body = serde_json::to_vec(&serde_json::json!({"method": method, "params": params}))
+            .map_err(|_| "bus_request_encode")?;
+        let frame = self
+            .0
+            .call(body)
+            .await
+            .map_err(|_| "bus_route_unavailable")?;
+        let reply: Value = serde_json::from_slice(&frame.body).map_err(|_| "bus_invalid_reply")?;
+        if let Some(error) = reply.get("error") {
+            // Do not echo peer text: a malformed response may contain a JWT.
+            return Err(match error.get("code").and_then(Value::as_str) {
+                Some("ckbus_credential_superseded") => "ckbus_credential_superseded",
+                Some("ckbus_credential_revoked") => "ckbus_credential_revoked",
+                Some("ckbus_generation_not_live") => "ckbus_generation_not_live",
+                _ => "bus_credential_refused",
+            });
+        }
+        reply.get("result").cloned().ok_or("bus_missing_result")
+    }
 }
 
 /// The supervisor-issued identity that earns a `Reserved` principal, or `None`.

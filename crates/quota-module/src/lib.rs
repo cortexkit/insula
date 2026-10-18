@@ -21,5 +21,6 @@
 //! declaring `mod` again, which would compile the same source twice and let the
 //! binary and an example disagree while both look correct.
 
+pub mod bus;
 pub mod ids;
 pub mod vault_client;

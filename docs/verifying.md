@@ -107,6 +107,14 @@ cargo test -p quota-core --test it -- --ignored --nocapture jetbrains_live::
 # a standalone ck-subc daemon spawns the module from subc.jsonc and routes usage.get;
 # builds ck-subc from a sibling ../subconscious checkout
 cargo test -p quota-module --test it -- --ignored --nocapture real_daemon_e2e::
+
+# In an isolated worktree, use a prebuilt daemon instead of building a sibling.
+# The harness still executes a disposable ckdev copy, never the installed file.
+CK_SUBC_BIN=/absolute/path/to/ck-subc cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
+
+# Disposable authenticated JetStream; requires nats-server >= 2.10 on PATH
+# or CK_NATS_SERVER_BIN. Does not use a live daemon or provider credentials.
+cargo test -p quota-module --test it -- --ignored --nocapture quota_bus::
 ```
 
 ### Updating subc dependencies

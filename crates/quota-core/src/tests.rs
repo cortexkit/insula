@@ -96,6 +96,26 @@ fn registry(specs: &[(&'static str, bool, bool)]) -> Registry {
     )
 }
 
+#[tokio::test]
+async fn after_turn_observer_receives_the_serving_snapshot() {
+    let registry = registry(&[("deepseek", false, true)]);
+    let cancel = CancellationToken::new();
+    let observed = Mutex::new(Vec::new());
+    registry
+        .refresh_loop_observed(cancel.clone(), |entries| {
+            *observed.lock().unwrap() = entries;
+            cancel.cancel();
+            std::future::ready(())
+        })
+        .await;
+    let expected = registry.get_usage(None).await;
+    assert_eq!(expected.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&*observed.lock().unwrap()).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
 struct BlockingProvider {
     name: &'static str,
     started: Arc<Notify>,

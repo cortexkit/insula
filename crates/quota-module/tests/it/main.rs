@@ -23,5 +23,6 @@
 mod ckdev_names;
 #[path = "../common/mod.rs"]
 mod common;
+mod quota_bus;
 mod real_daemon_e2e;
 mod skeleton_e2e;

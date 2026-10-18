@@ -559,7 +559,7 @@ guards = "The manifest must declare the credential vault its production client a
 file = "crates/quota-module/src/main.rs"
 old = """
 .consumes(vec![ConsumerRole::ServiceClient {
-        of: vec![ids::CREDENTIALS_MODULE_ID.to_string()],
+        of: vec![ids::CREDENTIALS_MODULE_ID.to_string(), "ckbus".to_string()],
     }])"""
 new = ".consumes(Vec::new()) // NON-VACUITY BREAK"
 edits = []
@@ -1220,3 +1220,85 @@ expect_message = "billing denial is not session expiry"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "quota-sample-no-account-info"
+guards = "Quota notices must never expose account display metadata"
+file = "crates/quota-module/src/bus.rs"
+old = 'value.as_object_mut()?.remove("accountInfo");'
+new = "let _ = value.as_object_mut()?; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/bus.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["bus::tests::account_metadata_never_enters_a_sample"]
+expect_message = "accountInfo must not leave usage.get"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+filter = "bus::tests::"
+
+[[control]]
+id = "quota-sample-unchanged"
+guards = "An unchanged refresher turn must not generate another quota notice"
+file = "crates/quota-module/src/bus.rs"
+old = ".filter(|(key, entry)| pending.seen.get(*key) != Some(*entry))"
+new = ".filter(|_| true) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/bus.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["bus::tests::unchanged_turn_emits_nothing_and_changed_reading_advances_per_key"]
+expect_message = "an unchanged turn must publish nothing"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+filter = "bus::tests::"
+
+[[control]]
+id = "quota-sample-nonblocking"
+guards = "Refresher progress must not wait for bus queue capacity"
+file = "crates/quota-module/src/bus.rs"
+old = "self.offer(entries);"
+new = """
+while self.pending.lock().unwrap().queue.len() == self.capacity { tokio::task::yield_now().await; } // NON-VACUITY BREAK
+        self.offer(entries);"""
+edits = []
+test_file = "crates/quota-module/src/bus.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+# Other queue tests intentionally never drain a full queue. With a blocking
+# producer they hang; this test has its own deadline and names the violation.
+select = "expected"
+expect_red = ["bus::tests::refresher_never_waits_for_a_full_publish_queue"]
+expect_message = "refresher must not await publish queue capacity"
+only = false
+timeout_s = 10
+build_timeout_s = 1800
+
+[[control]]
+id = "quota-sample-body-digest"
+guards = "The fetched quota sample body must match the bus digest"
+file = "crates/quota-module/src/bus.rs"
+old = '"body": s.body,'
+new = '"body": {"tampered": true}, /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-module/src/bus.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["bus::tests::cached_body_digest_matches_notice"]
+expect_message = "served body must match the notice digest"
+only = false
+timeout_s = 10
+build_timeout_s = 1800
+
+[control.select]
+filter = "bus::tests::"
