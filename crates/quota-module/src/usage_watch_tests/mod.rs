@@ -375,13 +375,12 @@ async fn usage_watch_overflow_keeps_newest_and_prioritizes_usage_get() {
 #[tokio::test]
 async fn usage_watch_limit_and_route_goodbye_release_state() {
     let mut wire = Wire::new(false).await;
+    // A request without the SUBSCRIPTION flag is a watch too: the TypeScript
+    // subc client never sets bit 7, and the auth plugins subscribe through it.
     wire.send(request(5, 7, 90, USAGE_WATCH_OP, false)).await;
-    let error = wire.recv().await;
-    assert_eq!(error.header.ty, FrameType::Error);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&error.body).unwrap()["code"],
-        "invalid_request"
-    );
+    assert_eq!(notice(wire.recv().await, 5, 7, 90)["seq"], 1);
+    wire.send(Frame::build(FrameType::Cancel, control_flags(), 5, 7, 90, vec![]).unwrap())
+        .await;
     for corr in 1..=MAX_WATCHERS as u64 {
         wire.subscribe(5, 7, corr).await;
         assert_eq!(notice(wire.recv().await, 5, 7, corr)["seq"], 1);

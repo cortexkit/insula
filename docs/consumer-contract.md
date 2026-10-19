@@ -191,11 +191,12 @@ cold for several turns. Do not decide this on elapsed time.
 ### 3.4 `usage.watch`: route-level change notices
 
 Host plugins subscribe on their existing insula route rather than reading
-ck-bus. Send a `REQUEST` with body `{"method":"usage.watch"}` and the
-`SUBSCRIPTION` flag (bit 7) set. No parameters or provider filter are required;
-each stream covers all entries. A missing subscription flag is
-`invalid_request`; at most 64 watches may be open in one insula process, with
-additional requests refused as `usage_watch_limit`.
+ck-bus. Send a `REQUEST` with body `{"method":"usage.watch"}`. The method makes
+it a subscription: the `SUBSCRIPTION` flag (bit 7) is accepted but not
+required, because the TypeScript subc client doesn't send it yet. No parameters
+or provider filter are required; each stream covers all entries. At most 64
+watches may be open in one insula process, with additional requests refused as
+`usage_watch_limit`.
 
 The reply is a held-open stream on the request's correlation, channel and
 binding epoch, not a `RESPONSE`. Every notice is one JSON `STREAM_DATA` frame

@@ -89,12 +89,12 @@ impl UsageWatches {
     }
 
     pub fn subscribe(&self, frame: &Frame) -> Result<(), (&'static str, &'static str)> {
-        if !frame.header.flags.is_subscription() {
-            return Err((
-                "invalid_request",
-                "usage.watch requires the SUBSCRIPTION flag",
-            ));
-        }
+        // The method alone makes this a subscription; the SUBSCRIPTION flag
+        // (bit 7) is accepted but not required. The TypeScript subc client
+        // deliberately doesn't send bit 7 yet, because decoders built against
+        // subc-protocol 0.20.0 and older reject it as a reserved bit, so
+        // requiring it would refuse every host plugin. Claustrum's
+        // auth.watch_scoped accepts the same unflagged request.
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.stopped {
             return Err(("shutting_down", "usage watches are stopping"));
