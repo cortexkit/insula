@@ -2,17 +2,10 @@
 # Internal design notes, investigations and parity research.
 .cortexkit/internal-docs/
 # Worker briefs, design drafts, delivered artifacts and the review ledger.
-# Both spellings are listed while prefrontal's folder rename from "alfonso" is
-# in progress; drop the alfonso lines once the rename has run.
-.cortexkit/alfonso/prompts/
-.cortexkit/alfonso/drafts/
-.cortexkit/alfonso/artifacts/
-.cortexkit/alfonso/loop-ledger.md
 .cortexkit/prefrontal/prompts/
 .cortexkit/prefrontal/drafts/
 .cortexkit/prefrontal/artifacts/
 .cortexkit/prefrontal/loop-ledger.md
 # Local config: prefrontal settings (remote execution) and the Magic Context project config.
-.cortexkit/alfonso.jsonc
 .cortexkit/prefrontal.jsonc
 .cortexkit/magic-context/
