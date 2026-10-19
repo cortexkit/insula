@@ -376,6 +376,27 @@ async fn start_vault_stub_with_credentials(
                 }
                 FrameType::Request => {
                     let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                    if request["method"] == "auth.watch_scoped" {
+                        assert!(frame.header.flags.is_subscription());
+                        let notice = Frame::build_with_version(
+                            frame.header.ver,
+                            FrameType::StreamData,
+                            Flags::new(false, Priority::Interactive, false),
+                            frame.header.channel,
+                            frame.header.epoch,
+                            frame.header.corr,
+                            serde_json::to_vec(&serde_json::json!({
+                                "kind": "changed", "epoch": "stub-vault", "seq": 1,
+                                "view": "sha256:test-view", "keys": "stub-keys"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        if write_frame(&mut stream, &notice).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     let result = match request["method"].as_str() {
                         Some("credential.list_scoped") => serde_json::json!({
                             "result": {

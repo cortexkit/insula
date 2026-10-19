@@ -1362,3 +1362,67 @@ build_timeout_s = 1800
 
 [control.select]
 tests = ["usage_watch_tests::usage_watch_cancel_stops_the_correlation", "tests::every_advertised_operation_is_one_the_router_answers"]
+
+[[control]]
+id = "vault-watch-unchanged-view"
+guards = "An unchanged inventory view must not reread the account list"
+file = "crates/quota-module/src/vault_client/watch.rs"
+old = "WatchAction::Reread { inventory, .. } => self.dirty |= inventory,"
+new = "WatchAction::Reread { inventory, .. } => { let _ = inventory; self.dirty = true; /* NON-VACUITY BREAK */ },"
+edits = []
+test_file = "crates/quota-module/src/vault_client/watch/tests.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["vault_client::watch::tests::watch_unchanged_view_and_key_only_notices_do_not_read_inventory"]
+expect_message = "assertion failed: stub.turn().await.is_none()"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+filter = "vault_client::watch::tests"
+
+[[control]]
+id = "vault-watch-refusal-backoff"
+guards = "A watch ending before its first notice must confirm once without a reopen loop"
+file = "crates/quota-module/src/vault_client/watch.rs"
+old = "self.retry_later();"
+new = "self.next_attempt = None; /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/quota-module/src/vault_client/watch/tests.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["vault_client::watch::tests::watch_refused_before_first_notice_reads_once_without_resubscribe_loop"]
+expect_message = "assertion failed: stub.turn().await.is_none()"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.scope]
+after = "WatchAction::ReadListOnce => {"
+before = "WatchAction::ResubscribeAndReread"
+
+[control.select]
+filter = "vault_client::watch::tests"
+
+[[control]]
+id = "vault-watch-unreported-status"
+guards = "An unreported failure still polls status while the inventory watch is open"
+file = "crates/quota-core/src/lib.rs"
+old = "&& !(source.scoped_watch_open() && slot.last_failure_reported)"
+new = "&& !source.scoped_watch_open() /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["tests::watch_unreported_failures_keep_status_poll"]
+expect_message = "unreported failures still need status even with an open watch"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+filter = "tests::watch_"

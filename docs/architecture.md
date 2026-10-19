@@ -75,10 +75,25 @@ for retention, per-account sequences and the shared `usage.drops` epoch.
 
 ### 2. Enumerate
 
-Each refresher turn (`refresh_tick_with_deadline` in `lib.rs`) starts by asking
-the vault for the credentials granted to this module
-(`credential.list_scoped`) and installing the answer in `VaultHandleLoader`.
-It then calls every provider's `handles()`. A provider builds its handles from
+The vault client holds an `auth.watch_scoped` subscription on its existing
+claustrum route (REQUEST with subscription bit 7). Its immediate seq-1 notice
+and the connect read share one `credential.list_scoped` call. Notifications wake
+the refresher; `cortexkit-claustrum-client`'s `WatchTracker` requests another read
+when the installed `view` differs, or a sequence/epoch discontinuity could hide
+a missed change. Key-only changes do not enumerate accounts: insula holds no
+vault signing/KEM keys. Each read installs through the same `VaultHandleLoader`
+path, preserving its `no_vault`, `awaiting`, and `answered` states.
+
+While watching, there is no per-minute list read. A disconnected, refused, or
+unsupported watch falls back to 60 s enumeration. Unknown-method refusals disable
+watch attempts until the connection changes. Other endings retry no sooner than
+the next minute, then every five minutes after repeated refusals; an ending before
+the first notice gets one confirming list read, never an immediate reopen loop.
+An explicit refusal RESPONSE also stops the watch. A watch ending after notices
+gets one resubscription attempt on the next eligible turn, not an unbounded loop.
+
+Each refresher turn (`refresh_tick_with_deadline` in `lib.rs`) then calls every
+provider's `handles()`. A provider builds its handles from
 the installed vault rows for its id families, from local credential files, and
 from environment variables. `handles()` never touches the network.
 
@@ -96,6 +111,11 @@ retrying cannot fix, or an exponential backoff capped at
 `MAX_TRANSIENT_BACKOFF` (900 s) for a transient one. A vault row that comes
 back at a higher `record_version`, or is reactivated, makes its slot due
 immediately; a row in `needs_reauth` is not fetched at all.
+
+An open watch also replaces the per-minute status poll for a slot whose last
+failure passed the shared 401 report gate. Its latched `needs_reauth` repair changes
+the inventory view. Unreported failures (including 403s and cookie rejections)
+still poll status: replacing a still-active credential need not change that view.
 
 `select_due_round_robin` picks due slots starting after the provider admitted
 last, so no provider starves, and at most `CONCURRENCY_CAP` (8) fetches run at

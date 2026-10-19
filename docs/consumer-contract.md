@@ -1517,6 +1517,8 @@ not happened, never zero.
 | `vaultAuthFailuresReported` | number | upstream `401`s on vault credentials reported back to the vault |
 | `vaultRouteWarmingRetries` | number | vault route opens refused while the vault was starting, then retried |
 | `vaultUnmatchedDrops` | number | vault replies discarded because their caller had gone |
+| `vaultListWatch` | string | `watching` after an accepted inventory notice; `polling` while disconnected or re-subscribing; `refused` after a refused or invalid watch; `unsupported` after an older vault's `unknown_method`. Only `watching` suppresses routine list reads. |
+| `vaultListReads` | number | cumulative `credential.list_scoped` calls, including connect, change/discontinuity, confirming-refusal and fallback reads; never reset on reconnect |
 | `vaultStaleGenerationDrops` | number | vault replies discarded because they belonged to a previous connection |
 | `busPublishState` | object | quota publisher state and short structural reason; see [13](#13-quota-sample-notices-on-ck-bus) |
 | `quotaSamplesPublished` | number | acknowledged quota notices since process start |
