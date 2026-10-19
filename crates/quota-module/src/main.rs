@@ -924,6 +924,8 @@ fn health_report(
         // asking about, because it means replies are arriving that no caller is
         // waiting for.
         "vaultUnmatchedDrops": vault.unmatched_terminal_drops(),
+        "vaultListWatch": vault.vault_list_watch(),
+        "vaultListReads": vault.vault_list_reads(),
         "vaultStaleGenerationDrops": vault.stale_generation_drops(),
         // Vault connections this process has established. 1 means the first is
         // still in use; each increment is a reconnect after a transport failure.
@@ -2956,6 +2958,8 @@ mod tests {
             "lastFetchSuccessAgeSecs",
             "refresherStalled",
             "vaultUnmatchedDrops",
+            "vaultListWatch",
+            "vaultListReads",
             "vaultStaleGenerationDrops",
             "vaultConnectionsEstablished",
             "vaultAuthFailuresReported",

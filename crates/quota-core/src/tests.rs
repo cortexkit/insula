@@ -12395,3 +12395,117 @@ async fn real_codex_account_spends_its_reset_only_once_its_limit_is_reported() {
         );
     }
 }
+
+struct WatchStatusSource {
+    watching: std::sync::atomic::AtomicBool,
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl CredentialSource for WatchStatusSource {
+    async fn get(&self, _: &VaultCapability, _: u64) -> Result<VaultCredential, VaultGetError> {
+        Err(VaultGetError::NotFound)
+    }
+    async fn report_auth_failure(&self, _: &VaultCapability, _: u16, _: u64) {}
+    fn scoped_watch_open(&self) -> bool {
+        self.watching.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    async fn status_scoped(&self, id: &str) -> Result<CredentialStatus, VaultGetError> {
+        self.calls.lock().unwrap().push(id.to_string());
+        Ok(CredentialStatus {
+            ready: true,
+            record_version: Some(7),
+            stale_pending: None,
+        })
+    }
+}
+
+struct WatchStatusProvider {
+    source: Arc<dyn CredentialSource>,
+    status: u16,
+    report: bool,
+}
+
+#[async_trait]
+impl UsageProvider for WatchStatusProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![CredentialHandle::scoped(
+            "oauth:codex:watch-status",
+            "oauth",
+        )])
+    }
+    async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let error = FetchError::ProviderStatus(self.status, String::new());
+        if self.report {
+            credential_source::report_vault_auth_failure(Some(&self.source), handle, 7, &error);
+        }
+        FetchAttempt::failure(
+            Some(AccountObservation::new(Some("A".into()), Some(7))),
+            None,
+            error,
+        )
+    }
+}
+
+async fn watch_status_fixture(
+    status: u16,
+    report: bool,
+) -> (Registry, Arc<WatchStatusSource>, CredentialHandle) {
+    let source = Arc::new(WatchStatusSource {
+        watching: std::sync::atomic::AtomicBool::new(true),
+        calls: Mutex::new(Vec::new()),
+    });
+    let provider = WatchStatusProvider {
+        source: Arc::clone(&source) as Arc<dyn CredentialSource>,
+        status,
+        report,
+    };
+    let handle = provider.handles().unwrap().remove(0);
+    let mut registry = Registry::new(vec![Box::new(provider)]);
+    registry.attach_credential_source(Arc::clone(&source) as Arc<dyn CredentialSource>);
+    tick(&registry).await;
+    age_slot_into_status_poll(&registry, &handle);
+    (registry, source, handle)
+}
+
+#[tokio::test]
+async fn watch_reported_401_skips_status_until_watch_closes() {
+    let (registry, source, handle) = watch_status_fixture(401, true).await;
+    assert!(
+        slot_for(&registry, &handle).last_failure_reported,
+        "the shared report gate marked this fetch"
+    );
+    registry.poll_replaced_credentials(Instant::now()).await;
+    assert!(
+        source.calls.lock().unwrap().is_empty(),
+        "the open watch covers the latched credential's repair"
+    );
+    source
+        .watching
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    registry.poll_replaced_credentials(Instant::now()).await;
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["oauth:codex:watch-status"]
+    );
+}
+
+#[tokio::test]
+async fn watch_unreported_failures_keep_status_poll() {
+    for (status, report) in [(403, true), (401, false)] {
+        let (registry, source, handle) = watch_status_fixture(status, report).await;
+        assert!(
+            !slot_for(&registry, &handle).last_failure_reported,
+            "only an actually reported 401 is covered"
+        );
+        registry.poll_replaced_credentials(Instant::now()).await;
+        assert_eq!(
+            source.calls.lock().unwrap().as_slice(),
+            &["oauth:codex:watch-status"],
+            "unreported failures still need status even with an open watch"
+        );
+    }
+}

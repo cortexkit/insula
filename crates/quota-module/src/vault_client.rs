@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
 use crate::ids::CREDENTIALS_MODULE_ID;
+mod watch;
 /// Bounds both the TCP connect and the HMAC handshake that follows it.
 ///
 /// One constant covers two concerns because they share a budget: a peer that
@@ -255,6 +256,10 @@ struct ClientState {
     connection: AsyncMutex<ConnectionState>,
     route: AsyncMutex<RouteState>,
     pending: Mutex<HashMap<(u32, u64), Pending>>,
+    streams: Mutex<HashMap<(u32, u64), watch::StreamSender>>,
+    watch_changed: Notify,
+    watch_health: AtomicU8,
+    list_reads: AtomicU64,
     next_connection_generation: AtomicU64,
     next_route_generation: AtomicU64,
     /// Frames the reader loop discarded, by class. See [`Self::dispatch`].
@@ -284,6 +289,10 @@ impl ClientState {
             connection: AsyncMutex::new(ConnectionState::Empty { retry_after: None }),
             route: AsyncMutex::new(RouteState::Empty),
             pending: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            watch_changed: Notify::new(),
+            watch_health: AtomicU8::new(0),
+            list_reads: AtomicU64::new(0),
             next_connection_generation: AtomicU64::new(1),
             next_route_generation: AtomicU64::new(1),
             route_warming_retries: AtomicU64::new(0),
@@ -413,8 +422,36 @@ impl ClientState {
                             }
                         }
                     }
+                    Ok(Some(frame)) if frame.header.ty == FrameType::Goodbye => {
+                        if frame.header.channel == 0 {
+                            reader_state.invalidate_connection(generation).await;
+                            return;
+                        }
+                        let closed = {
+                            let route = reader_state.route.lock().await;
+                            match &*route {
+                                RouteState::Ready(route)
+                                    if route.connection_generation == generation
+                                        && route.route.channel == frame.header.channel
+                                        && route.route.epoch == frame.header.epoch =>
+                                {
+                                    Some(*route)
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(route) = closed {
+                            reader_state.invalidate_route(route).await;
+                        }
+                    }
                     Ok(Some(frame))
-                        if matches!(frame.header.ty, FrameType::Response | FrameType::Error) =>
+                        if matches!(
+                            frame.header.ty,
+                            FrameType::Response
+                                | FrameType::Error
+                                | FrameType::StreamData
+                                | FrameType::StreamEnd
+                        ) =>
                     {
                         reader_state.dispatch(generation, frame);
                     }
@@ -449,6 +486,23 @@ impl ClientState {
     /// clearing them would erase the evidence of the event that caused it.
     fn dispatch(&self, generation: u64, frame: Frame) {
         let key = (frame.header.epoch, frame.header.corr);
+        {
+            let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stream) = streams.get(&key) {
+                if stream.generation != generation {
+                    self.stale_generation_drops.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let terminal = frame.header.ty != FrameType::StreamData;
+                let sent = stream.sender.try_send(Ok(frame)).is_ok();
+                if terminal || !sent {
+                    streams.remove(&key);
+                    self.watch_health.store(0, Ordering::Relaxed);
+                }
+                self.watch_changed.notify_one();
+                return;
+            }
+        }
         let (pending, stale_generation) = {
             let mut pending = self
                 .pending
@@ -565,6 +619,17 @@ impl ClientState {
         for pending in failed {
             let _ = pending.sender.send(Err(ClientFailure::Transport));
         }
+        let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        streams.retain(|_, stream| {
+            if stream.generation == failed_generation {
+                let _ = stream.sender.try_send(Err(ClientFailure::Transport));
+                self.watch_health.store(0, Ordering::Relaxed);
+                self.watch_changed.notify_one();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     async fn route(
@@ -779,6 +844,17 @@ impl ClientState {
                     && current.route_generation == failed.route_generation
         ) {
             *state = RouteState::Empty;
+            let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+            streams.retain(|_, stream| {
+                if stream.route == failed {
+                    let _ = stream.sender.try_send(Err(ClientFailure::RouteGone));
+                    self.watch_health.store(0, Ordering::Relaxed);
+                    self.watch_changed.notify_one();
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
@@ -940,6 +1016,7 @@ impl Drop for PendingGuard {
 /// cannot stop ck-quota from registering and serving health.
 pub struct VaultClient {
     state: Arc<ClientState>,
+    watch: AsyncMutex<watch::InventoryWatch>,
 }
 
 /// Reuses the vault transport with a separate connection and route lease so a
@@ -1067,6 +1144,7 @@ impl VaultClient {
     pub fn new(connection_file_path: impl Into<PathBuf>) -> Self {
         Self {
             state: Arc::new(ClientState::new(connection_file_path.into())),
+            watch: AsyncMutex::new(watch::InventoryWatch::default()),
         }
     }
 
@@ -1077,6 +1155,7 @@ impl VaultClient {
                 connection_file_path.into(),
                 request_timeout,
             )),
+            watch: AsyncMutex::new(watch::InventoryWatch::default()),
         }
     }
 }
@@ -1975,6 +2054,7 @@ impl VaultClient {
     }
 
     async fn list_scoped(&self) -> Result<CompleteScopedListResult, VaultGetError> {
+        self.state.list_reads.fetch_add(1, Ordering::Relaxed);
         let body = serde_json::to_vec(&ListScopedRequest {
             method: "credential.list_scoped",
             params: ListScopedParams {},
@@ -2058,22 +2138,26 @@ impl VaultClient {
 
 #[async_trait]
 impl CredentialSource for VaultClient {
+    async fn refresh_scoped(&self) -> Option<Result<ScopedSnapshot, VaultGetError>> {
+        self.watch
+            .lock()
+            .await
+            .refresh(self)
+            .await
+            .map(|result| result.map(snapshot_from_wire))
+    }
+
+    fn scoped_watch_open(&self) -> bool {
+        self.vault_list_watch() == "watching"
+    }
+
+    async fn scoped_changed(&self) {
+        self.state.watch_changed.notified().await;
+    }
+
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
         let result = VaultClient::list_scoped(self).await?;
-        Ok(ScopedSnapshot {
-            grants: result.grants,
-            rows: result
-                .credentials
-                .into_iter()
-                .map(|row| ScopedRowState {
-                    credential_id: row.id,
-                    credential_type: row.kind,
-                    record_version: row.record_version,
-                    state: row.state,
-                    account_id: row.account_id,
-                })
-                .collect(),
-        })
+        Ok(snapshot_from_wire(result))
     }
 
     async fn get_scoped(
@@ -2173,6 +2257,23 @@ impl CredentialSource for VaultClient {
             .await
             .map_err(ClientFailure::vault_error)?;
         decode_status_response(&frame.body)
+    }
+}
+
+fn snapshot_from_wire(result: CompleteScopedListResult) -> ScopedSnapshot {
+    ScopedSnapshot {
+        grants: result.grants,
+        rows: result
+            .credentials
+            .into_iter()
+            .map(|row| ScopedRowState {
+                credential_id: row.id,
+                credential_type: row.kind,
+                record_version: row.record_version,
+                state: row.state,
+                account_id: row.account_id,
+            })
+            .collect(),
     }
 }
 
@@ -2500,7 +2601,7 @@ mod tests {
     /// connection file stays behind for inspection. This mirrors the scratch
     /// guard in quota-core's unit tests, which this crate cannot reach because
     /// test-only code is not exported across crates.
-    struct LoopbackDir(PathBuf);
+    pub(super) struct LoopbackDir(PathBuf);
 
     impl Drop for LoopbackDir {
         fn drop(&mut self) {
@@ -2519,7 +2620,7 @@ mod tests {
     /// daemon id, and the guard that removes the file's directory. Bind the
     /// guard to a named variable (`_dir`, not `_`) so it lives until the test
     /// ends; `_` would drop it, and remove the file, immediately.
-    async fn loopback_listener(
+    pub(super) async fn loopback_listener(
         label: &str,
     ) -> (TcpListener, PathBuf, Vec<u8>, [u8; 16], LoopbackDir) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -2570,7 +2671,7 @@ mod tests {
 
     static NEXT_LOOPBACK_ID: AtomicU64 = AtomicU64::new(0);
 
-    async fn accept_authenticated(
+    pub(super) async fn accept_authenticated(
         listener: &TcpListener,
         key: &[u8],
         daemon_id: &[u8; 16],
@@ -2588,7 +2689,7 @@ mod tests {
         stream
     }
 
-    async fn reply_route(stream: &mut TcpStream, channel: u16, epoch: u32) {
+    pub(super) async fn reply_route(stream: &mut TcpStream, channel: u16, epoch: u32) {
         let request = read_frame(stream).await.unwrap().unwrap();
         assert_eq!(request.header.ty, FrameType::Request);
         assert_eq!(request.header.channel, 0);

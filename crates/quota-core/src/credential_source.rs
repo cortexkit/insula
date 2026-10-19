@@ -233,6 +233,21 @@ pub trait CredentialSource: Send + Sync {
         Err(VaultGetError::FailClosed)
     }
 
+    /// Return a new enumeration only when a notification or fallback poll needs one.
+    async fn refresh_scoped(&self) -> Option<Result<ScopedSnapshot, VaultGetError>> {
+        Some(self.list_scoped().await)
+    }
+
+    /// Whether inventory notifications currently cover reported auth-failure repairs.
+    fn scoped_watch_open(&self) -> bool {
+        false
+    }
+
+    /// Wake the scheduler when the held inventory subscription receives a frame.
+    async fn scoped_changed(&self) {
+        std::future::pending::<()>().await;
+    }
+
     /// CAS-guarded report for the exact capability-addressed record version served.
     async fn report_auth_failure(
         &self,
@@ -319,6 +334,25 @@ pub async fn get_vault_credential(
 /// anything", which is the distinction that decides where to look next.
 static AUTH_FAILURES_REPORTED: AtomicU64 = AtomicU64::new(0);
 
+tokio::task_local! {
+    // Each provider fetch has its own scope; parallel accounts cannot mark one another.
+    static FETCH_REPORTED_AUTH_FAILURE: std::cell::Cell<bool>;
+}
+
+pub(crate) async fn track_auth_failure_report<F: std::future::Future>(
+    fetch: F,
+) -> (F::Output, bool) {
+    FETCH_REPORTED_AUTH_FAILURE
+        .scope(std::cell::Cell::new(false), async {
+            let result = fetch.await;
+            (
+                result,
+                FETCH_REPORTED_AUTH_FAILURE.with(|reported| reported.get()),
+            )
+        })
+        .await
+}
+
 /// How many auth failures this process has reported to the vault.
 pub fn auth_failures_reported() -> u64 {
     AUTH_FAILURES_REPORTED.load(Ordering::Relaxed)
@@ -401,6 +435,7 @@ pub fn report_vault_auth_failure<T: VaultAuthFailureTarget + ?Sized>(
     let source = Arc::clone(source);
     let status = *status;
     count_auth_failure_reported();
+    let _ = FETCH_REPORTED_AUTH_FAILURE.try_with(|reported| reported.set(true));
     tokio::spawn(async move {
         match address {
             VaultAuthFailureAddress::Capability(capability) => {

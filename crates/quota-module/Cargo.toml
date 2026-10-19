@@ -34,6 +34,7 @@ base64 = "0.22"
 cortexkit-bus-naming = "=0.2.1"
 cortexkit-bus-nats = "=0.3.0"
 cortexkit-bus-trait = "=0.3.0"
+cortexkit-claustrum-client = "=0.4.0"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "nkeys", "nuid", "ring", "server_2_10"] }
 
 # build.rs stamps a lock digest that the manifest publishes as provenance, and

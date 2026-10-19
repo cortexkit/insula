@@ -141,7 +141,7 @@ fn before_fetched_at_format() {
 }
 
 enum FetchOutcome {
-    Attempt(Box<FetchAttempt>),
+    Attempt(Box<FetchAttempt>, bool),
     TimedOut,
     Panicked,
     Cancelled,
@@ -1321,6 +1321,7 @@ impl Registry {
                 .into_iter()
                 .filter(|(key, slot)| {
                     refresh::should_poll_credential_status(slot, &key.handle, now)
+                        && !(source.scoped_watch_open() && slot.last_failure_reported)
                 })
                 .collect()
         };
@@ -1379,8 +1380,8 @@ impl Registry {
             self.credential_source.as_ref(),
             self.vault_handle_loader.as_ref(),
         ) {
-            match source.list_scoped().await {
-                Ok(snapshot) => {
+            match source.refresh_scoped().await {
+                Some(Ok(snapshot)) => {
                     let installed = loader.install_snapshot(snapshot, turn_start);
                     authoritative_vault_install = installed.authoritative;
                     reactivated_ids = installed.reactivated_ids;
@@ -1389,13 +1390,17 @@ impl Registry {
                 // has granted nothing: both say there is no vault inventory for
                 // this module here, so a loader still waiting for its first
                 // answer may let the local lanes serve.
-                Err(error @ (VaultGetError::Unavailable | VaultGetError::NotFound)) => {
+                Some(Err(error @ (VaultGetError::Unavailable | VaultGetError::NotFound))) => {
                     loader.mark_unavailable(format!("{error:?}"))
                 }
                 // Anything else, `module_warming` included, says nothing about
                 // what the vault holds. Keep what is installed, and keep waiting
                 // if nothing is.
-                Err(error) => loader.retain_after_failure(format!("{error:?}")),
+                Some(Err(error)) => loader.retain_after_failure(format!("{error:?}")),
+                None => {
+                    authoritative_vault_install =
+                        loader.snapshot().is_some() && loader.enumeration_failure().is_none();
+                }
             }
         }
 
@@ -1580,7 +1585,10 @@ impl Registry {
                 let attempt_start = scheduler_now();
                 let handle = unit.key.handle.clone();
                 // Broader blocking-I/O isolation is deferred until providers use the future credential store.
-                let mut task = tokio::spawn(async move { provider.fetch_handle(&handle).await });
+                let mut task = tokio::spawn(async move {
+                    credential_source::track_auth_failure_report(provider.fetch_handle(&handle))
+                        .await
+                });
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -1589,7 +1597,13 @@ impl Registry {
                         FetchOutcome::Cancelled
                     },
                     result = tokio::time::timeout(fetch_deadline, &mut task) => match result {
-                        Ok(Ok(attempt)) => FetchOutcome::Attempt(Box::new(attempt)),
+                        Ok(Ok((attempt, reported))) => {
+                            // A secondary endpoint can report a 401 while quota succeeds.
+                            // Only suppress polls for the failure this slot actually publishes.
+                            let reported = reported && matches!(attempt.usage,
+                                Err(provider::FetchError::ProviderStatus(401, _)));
+                            FetchOutcome::Attempt(Box::new(attempt), reported)
+                        },
                         Ok(Err(_join_error)) => FetchOutcome::Panicked,
                         Err(_elapsed) => {
                             task.abort();
@@ -1604,8 +1618,9 @@ impl Registry {
         .buffer_unordered(refresh::CONCURRENCY_CAP);
 
         while let Some((unit, attempt_start, completed_at, outcome)) = fetches.next().await {
-            let next = match outcome {
-                FetchOutcome::Attempt(attempt) => next_slot_after_attempt(
+            let reported = matches!(&outcome, FetchOutcome::Attempt(_, true));
+            let mut next = match outcome {
+                FetchOutcome::Attempt(attempt, _) => next_slot_after_attempt(
                     &unit.prev,
                     &unit.key.provider,
                     *attempt,
@@ -1635,6 +1650,7 @@ impl Registry {
                 ),
                 FetchOutcome::Cancelled => continue,
             };
+            next.last_failure_reported = reported;
             // Whether this attempt made the slot ENTER stale-serving. Decided
             // here, where the transition is computed, and applied under the
             // store lock below so the counter is consistent with the slot it
@@ -1747,6 +1763,12 @@ impl Registry {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
+                _ = async {
+                    match &self.credential_source {
+                        Some(source) => source.scoped_changed().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
                 _ = tokio::time::sleep(sleep_for) => {}
             }
         }
