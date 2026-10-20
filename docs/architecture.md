@@ -157,9 +157,10 @@ not affect the inventory.
 
 A forwarded reading can update only an already polled, verified Claude account.
 It patches the two usable windows in the held inventory, preserving Fable,
-tertiary, saved resets, overage, account metadata and source. The shared value-time
-fence rejects older readings; an applied reading advances `fetchedAt` and clears
-stale-serving. Poll completions compare against the current slot under the store
+tertiary, saved resets, overage, account metadata and source. A reading is
+applied only if its own time (`observedAtMs`) is newer than the time of the
+reading the slot holds, the same check polls go through. An applied reading
+advances `fetchedAt` and clears stale-serving. Poll completions compare against the current slot under the store
 lock, so a call arriving during a fetch cannot be rolled back by its completion.
 Call freshness does not reset endpoint failure backoff or vault-repair state.
 

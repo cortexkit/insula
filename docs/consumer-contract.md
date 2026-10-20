@@ -386,7 +386,9 @@ producer-wide outage. This module itself counts an entry as fresh for 120 s
 horizon of 215 s. A Claude account with a call reading applied in the last three
 minutes defers polling until fifteen minutes after its last completed poll.
 Once calls stop, the ordinary three-minute schedule resumes; cold accounts are
-never deferred. Failure backoff and vault-repair acceleration take precedence.
+never deferred. Failure backoff and vault-repair acceleration take precedence
+over this deferral: an account backing off after a 429 polls on the backoff
+schedule even while call readings arrive.
 
 **Proven by:** `claude_call_cadence_defers_only_recent_observations_and_keeps_backoff`.
 

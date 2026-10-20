@@ -1681,6 +1681,11 @@ impl Registry {
         next: ProviderSlot,
         completed_at: Instant,
     ) {
+        // Whether this reading made the slot ENTER stale-serving; a slot already
+        // stale is a continuation, not a new episode. The class and identity come
+        // from the attempt that caused the transition, not from what the slot
+        // keeps serving: that would name the success still on the wire rather
+        // than the failure that stalled it.
         if refresh::enters_stale_transient(prev, &next) {
             store.record_stale_episode(
                 &key.provider,
@@ -1689,6 +1694,12 @@ impl Registry {
                 next.account_id(),
             );
         }
+        // Whether this reading saw the account's used percent go DOWN. The
+        // identity check inside `detect` is the load-bearing argument, not the
+        // percentages: comparing one account's reading with another's fabricates
+        // a transition nobody made. A failed attempt produces no new reading and
+        // is counted as not comparable, which an operator needs told apart from
+        // a quiet host.
         let observation = match next
             .entry
             .as_ref()
@@ -1698,6 +1709,8 @@ impl Registry {
             Some(usage) => quota_drop::detect(
                 prev,
                 usage,
+                // The time the new reading describes. For a cache-backed lane or
+                // a forwarded call reading, that isn't when it reached insula.
                 next.last_success_wall,
                 refresh::observations_differ(prev.observation.as_ref(), next.observation.as_ref()),
                 completed_at,
