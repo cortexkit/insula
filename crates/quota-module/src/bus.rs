@@ -587,6 +587,42 @@ impl QuotaSamples {
 
 #[cfg(test)]
 mod tests {
+    struct ClaudePoll;
+    #[async_trait::async_trait]
+    impl quota_core::provider::UsageProvider for ClaudePoll {
+        fn name(&self) -> &str {
+            "claude"
+        }
+        async fn fetch_handle(
+            &self,
+            _: &quota_core::provider::CredentialHandle,
+        ) -> quota_core::provider::FetchAttempt {
+            quota_core::provider::FetchAttempt::from_provider_usage(Ok(serde_json::from_value(serde_json::json!({
+                "provider":"claude", "account":"work", "source":"oauth", "usage":{"primary":{"usedPercent":90.0}}
+            })).unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_applied_call_reading_enters_the_existing_quota_sample_queue() {
+        let registry = quota_core::Registry::new(vec![Box::new(ClaudePoll)]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let samples = super::QuotaSamples::new(registry.drop_page(None).await.epoch);
+        samples.observe(registry.get_usage(None).await).await;
+        assert!(samples.pop().is_some());
+        let result = registry.observe_calls(vec![serde_json::json!({"provider":"claude", "account":"work", "observedAtMs":1890394000123_i64,
+            "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21"}})]);
+        assert_eq!(result.accepted, 1);
+        samples.observe(registry.get_usage(None).await).await;
+        let sample = samples
+            .pop()
+            .expect("call reading must queue a quota sample");
+        assert_eq!(sample.body["usage"]["primary"]["usedPercent"], 21.0);
+        assert_eq!(sample.body["account"], "work");
+        assert!(samples.pop().is_none());
+    }
     use super::*;
 
     fn entry(account: Option<&str>, at: &str) -> ProviderUsage {

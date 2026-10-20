@@ -564,6 +564,9 @@ struct RouteReply {
 
 #[derive(Debug, Default)]
 struct ServeCounters {
+    /// Only daemon-attested route principals grant write access. Scope owners
+    /// and client-supplied bind identities are not the calling module.
+    observation_writers: Mutex<std::collections::HashSet<(u16, u32)>>,
     samples: Arc<bus::QuotaSamples>,
     served: AtomicU64,
     refused: AtomicU64,
@@ -621,6 +624,11 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            serve
+                .observation_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(frame.header.channel, frame.header.epoch));
             serve.samples.watches.close_route(&frame);
             Ok(true)
         }
@@ -687,9 +695,21 @@ async fn handle_control_request(
         }
     };
     let response_body = match request {
-        ModuleControlRequest::RouteBind { .. } => {
-            // Machine-global surface: accept every bind. We key on no identity,
-            // so there is nothing to validate or store — just ack.
+        ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch,
+            principal,
+            ..
+        } => {
+            let allowed = matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "prefrontal-routing");
+            let mut writers = serve
+                .observation_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            writers.retain(|(channel, _)| *channel != route_channel);
+            if allowed {
+                writers.insert((route_channel, epoch));
+            }
             ModuleControlResponse::RouteBindAck {}
         }
         ModuleControlRequest::HealthCheck {} => {
@@ -697,7 +717,12 @@ async fn handle_control_request(
             // a poisoned serving cache (a panicked serving task) is `failing`;
             // otherwise `ok`, because a provider degrading on a box without its
             // creds is this prober's normal state, carried as detail not status.
-            health_report(&registry.health(), vault, serve)
+            health_report(
+                &registry.health(),
+                vault,
+                serve,
+                &registry.call_observation_metrics(),
+            )
         }
     };
     let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
@@ -754,6 +779,7 @@ fn health_report(
     snapshot: &quota_core::health::HealthSnapshot,
     vault: &VaultClient,
     serve: &ServeCounters,
+    call_metrics: &quota_core::call_observations::CallObservationMetrics,
 ) -> ModuleControlResponse {
     let status = if snapshot.is_failing() {
         HealthStatus::Failing
@@ -885,6 +911,8 @@ fn health_report(
         // The denominator the drop counts were missing: comparisons that RAN and
         // found nothing. Without it a low drop count reads identically whether
         // the host was quiet or nothing was comparable.
+        "callObservationsApplied": call_metrics.applied,
+        "callObservationsIgnored": call_metrics.ignored,
         "quotaComparisonsNoDrop": snapshot.quota_comparisons_no_drop,
         // Readings that could not be compared, by reason. A long run of
         // `prior_reading_was_an_error` is a credential problem wearing the shape
@@ -1036,6 +1064,8 @@ struct UsageRequest {
 #[derive(Debug, Deserialize, Default)]
 struct UsageParams {
     #[serde(default)]
+    observations: Vec<serde_json::Value>,
+    #[serde(default)]
     event_key: Option<String>,
     #[serde(default)]
     event_name: Option<String>,
@@ -1065,6 +1095,28 @@ async fn handle_usage_request(
         corr,
     };
 
+    // Refuse writers before decoding their rows, so even malformed observations
+    // from an untrusted route cannot enter the write path or its counters.
+    let allowed = serve
+        .observation_writers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&(channel, epoch));
+    if !allowed
+        && serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|value| {
+            value.get("method").and_then(|m| m.as_str()) == Some("usage.observe")
+        })
+    {
+        return send_route_error(
+            writer,
+            serve,
+            reply,
+            "forbidden",
+            "usage.observe requires reserved:prefrontal-routing",
+        )
+        .await;
+    }
+
     let request: UsageRequest = match serde_json::from_slice(&frame.body) {
         Ok(r) => r,
         Err(e) => {
@@ -1078,6 +1130,25 @@ async fn handle_usage_request(
             .await;
         }
     };
+
+    if request.method == "usage.observe" {
+        let result = registry.observe_calls(request.params.observations);
+        // Reuse the poll observer: it owns both quota samples and watch notices.
+        if result.accepted > 0 {
+            serve.samples.observe(registry.get_usage(None).await).await;
+        }
+        let response = Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            serde_json::to_vec(&json!({"result":result})).map_err(ModuleError::Json)?,
+        )
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+        return send(writer, response).await;
+    }
 
     if request.method == USAGE_WATCH_OP {
         return match serve.samples.watches.subscribe(&frame) {
@@ -1156,7 +1227,7 @@ async fn handle_usage_request(
             serve,
             reply,
             "unknown_method",
-            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_WATCH_OP}', '{USAGE_DROPS_OP}' or 'events_get'"),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_WATCH_OP}', '{USAGE_DROPS_OP}', 'usage.observe' or 'events_get'"),
         )
         .await;
     }
@@ -1451,6 +1522,11 @@ fn manifest(
                         "Recently observed decreases in an account's used percent, as a cursor-paged in-memory ring."
                             .to_string(),
                     ),
+                },
+                ManagementOperation {
+                    name: "usage.observe".to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                    description: Some("Accept Claude model-call headers from reserved:prefrontal-routing only.".to_string()),
                 },
                 ManagementOperation {
                     name: bus::EVENTS_GET.to_string(),
@@ -1935,7 +2011,13 @@ mod tests {
         // construction and assert nothing.
         assert_eq!(
             advertised,
-            vec!["usage.get", "usage.watch", "usage.drops", "events_get"],
+            vec![
+                "usage.get",
+                "usage.watch",
+                "usage.drops",
+                "usage.observe",
+                "events_get"
+            ],
             "the manifest advertises what catalog.list shows a consumer; an \
              operation listed here and not dispatched answers `unknown method` \
              to a caller who read the catalog and did nothing wrong"
@@ -2194,6 +2276,7 @@ mod tests {
             &healthy_snapshot(),
             &test_vault(),
             &ServeCounters::default(),
+            &Default::default(),
         ) else {
             panic!("health_report must answer a HealthCheck");
         };
@@ -2472,9 +2555,12 @@ mod tests {
     }
 
     fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
-        let ModuleControlResponse::HealthCheck { status, .. } =
-            health_report(snapshot, &test_vault(), &ServeCounters::default())
-        else {
+        let ModuleControlResponse::HealthCheck { status, .. } = health_report(
+            snapshot,
+            &test_vault(),
+            &ServeCounters::default(),
+            &Default::default(),
+        ) else {
             panic!("health_report must produce a HealthCheck response");
         };
         status
@@ -2504,9 +2590,12 @@ mod tests {
             ..healthy_snapshot()
         };
 
-        let ModuleControlResponse::HealthCheck { detail, .. } =
-            health_report(&snapshot, &test_vault(), &ServeCounters::default())
-        else {
+        let ModuleControlResponse::HealthCheck { detail, .. } = health_report(
+            &snapshot,
+            &test_vault(),
+            &ServeCounters::default(),
+            &Default::default(),
+        ) else {
             panic!("health_report must produce a HealthCheck response");
         };
         let detail = detail.expect("a degraded provider produces a detail line");
@@ -2930,6 +3019,8 @@ mod tests {
         // enumeration -- a `contains_key` loop over a subset would still pass
         // with a key missing.
         let expected = [
+            "callObservationsApplied",
+            "callObservationsIgnored",
             "buildCommit",
             "providersTotal",
             "fresh",
@@ -3009,9 +3100,12 @@ mod tests {
             ..healthy_snapshot()
         };
 
-        let ModuleControlResponse::HealthCheck { metrics, .. } =
-            health_report(&snapshot, &test_vault(), &ServeCounters::default())
-        else {
+        let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
+            &snapshot,
+            &test_vault(),
+            &ServeCounters::default(),
+            &Default::default(),
+        ) else {
             panic!("health_report must produce a HealthCheck response");
         };
         let metrics = metrics.expect("health report carries metrics");

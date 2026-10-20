@@ -1426,3 +1426,71 @@ build_timeout_s = 1800
 
 [control.select]
 filter = "tests::watch_"
+
+[[control]]
+id = "claude-call-writer-principal"
+guards = "Only daemon-attested prefrontal-routing may change quota through usage.observe"
+file = "crates/quota-module/src/main.rs"
+old = 'let allowed = matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "prefrontal-routing");'
+new = 'let allowed = { let _ = principal; true }; // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/mod.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::usage_observe_requires_attested_routing_and_changes_get_samples_and_watch"]
+expect_message = "only attested routing may observe"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-call-preserves-inventory"
+guards = "A partial call reading must retain poll-only windows including Fable"
+file = "crates/quota-core/src/call_observations.rs"
+old = 'let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();'
+new = 'let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap(); *usage = windows.clone(); // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/call_observations.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["call_observations::tests::call_observation_preserves_poll_inventory_and_publishes_drop_and_value_time"]
+expect_message = "preserve tertiary"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-call-value-time"
+guards = "Forwarded call readings must be strictly newer than the held account reading"
+file = "crates/quota-core/src/call_observations.rs"
+old = 'if !refresh::value_time_supersedes(Some(incoming), held, true) {'
+new = 'if false && !refresh::value_time_supersedes(Some(incoming), held, true) { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/call_observations.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["call_observations::tests::older_call_observations_are_ignored_without_changing_the_held_reading"]
+expect_message = "an older or equal observation must not be accepted"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-call-defers-poll"
+guards = "Recent model calls defer the next successful Claude poll to the fifteen-minute backstop"
+file = "crates/quota-core/src/refresh.rs"
+old = 'return self.next_due_at.max(last_poll + CLAUDE_OBSERVED_INTERVAL);'
+new = 'return self.next_due_at.max(last_poll + CLAUDE_INTERVAL); // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/call_observations.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["call_observations::tests::claude_call_cadence_defers_only_recent_observations_and_keeps_backoff"]
+expect_message = "recent calls must defer real scheduler admission"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

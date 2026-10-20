@@ -2,7 +2,8 @@
 
 What a consumer of this module can rely on, what it must not infer, and the test
 that holds each rule in place. It covers the `usage.get` envelope, the
-`usage.watch` subscription, the `usage.drops` operation and the `health.check` metrics.
+`usage.watch` subscription, the `usage.drops` and `usage.observe` operations and
+the `health.check` metrics.
 
 **This document owns the wire.** Field meanings, error classes, freshness and
 staleness semantics, and what a consumer may infer are settled here. Where any
@@ -250,6 +251,54 @@ sheddable). An insula predating this method replies `unknown_method` with an
 
 ## 4. Freshness
 
+### `usage.observe`: routing's writer contract
+
+Only the daemon-attested principal `reserved:prefrontal-routing` may call
+`usage.observe`. Every other principal (including an absent attestation) receives
+a route error with code `forbidden`, without applying or counting any rows.
+Client-supplied identities and scope owners cannot grant this permission.
+
+```json
+{"method":"usage.observe","params":{"observations":[
+  {"provider":"claude","account":"vault-account-id","observedAtMs":1790394000123,
+   "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21",
+              "anthropic-ratelimit-unified-5h-reset":"1790394000"}}
+]}}
+```
+
+Routing forwards the newest reading per account, with every
+`anthropic-ratelimit-unified-*` header verbatim as a string; insula owns parsing.
+The account is the id published as `account` by `usage.get`, not a credential id.
+`observedAtMs` is the reading's Unix-millisecond value time, not its delivery time.
+Reply: `{"result":{"accepted":1,"ignored":[]}}`. Each ignored row names its
+`account` and `reason`; a bad row never refuses the rest of the batch:
+
+| Reason | Meaning |
+|---|---|
+| `unsupported_provider` | provider is not `claude` |
+| `unknown_account` | no current verified Claude slot names that account |
+| `no_poll_reading_yet` | the account has no usable successful poll inventory yet |
+| `older_than_held` | value time is older than or equal to the held reading |
+| `no_usable_window` | neither utilization header is a finite number |
+| `invalid_observation` | row shape or timestamp cannot be decoded |
+
+Only usable `5h-utilization` and `7d-utilization` update their matching windows,
+as fractions converted to percent and clamped to 0–100. Missing or malformed
+utilization leaves that window unchanged. Matching reset headers are Unix
+seconds, rendered as RFC 3339 Z; missing or malformed resets are absent. Overall
+status, representative claim and overage headers are ignored. Applied readings
+advance canonical `fetchedAt` to `observedAtMs` and clear `stale`. They preserve
+`source`, account metadata, tertiary and Fable windows, saved resets, breakdowns
+and the Extra-usage pool from the poll. They use the same drop comparison,
+quota-sample detector and `usage.watch` invalidations as polled readings.
+
+**Proven by:** `usage_observe_requires_attested_routing_and_changes_get_samples_and_watch`,
+`captured_call_headers_parse_and_missing_values_do_not_invent_windows`,
+`call_observation_preserves_poll_inventory_and_publishes_drop_and_value_time`,
+`older_call_observations_are_ignored_without_changing_the_held_reading`,
+`ignored_calls_name_unknown_cold_unsupported_and_unusable_rows_independently`,
+`an_applied_call_reading_enters_the_existing_quota_sample_queue`.
+
 ### 4.1 `fetchedAt` dates the reading
 
 Each entry carries `fetchedAt`: the wall-clock time at which the served reading
@@ -328,12 +377,18 @@ changing is the signal that a restart happened.
 
 ### 4.2 Sizing a staleness threshold
 
-A slot is refetched 60 s after its last success, and a fetch may run up to 35 s
+A slot is normally refetched 60 s after its last success, and a fetch may run up to 35 s
 before it is abandoned, so a healthy entry's age reaches up to about 95 s. A
 threshold must clear that sum, not the interval alone; below it, every healthy
 provider reads stale for part of every cycle, all at once, which looks like a
 producer-wide outage. This module itself counts an entry as fresh for 120 s
-(`FRESH_HORIZON`), and a healthy provider never exceeds it.
+(`FRESH_HORIZON`). Claude polls every 180 s instead, with a health freshness
+horizon of 215 s. A Claude account with a call reading applied in the last three
+minutes defers polling until fifteen minutes after its last completed poll.
+Once calls stop, the ordinary three-minute schedule resumes; cold accounts are
+never deferred. Failure backoff and vault-repair acceleration take precedence.
+
+**Proven by:** `claude_call_cadence_defers_only_recent_observations_and_keeps_backoff`.
 
 The threshold is a floor on time since the last *success*, so a provider
 retrying through failures legitimately ages past it. An entry aging past your
@@ -662,6 +717,11 @@ limit the provider named without a readable figure. A consumer that ignores
 
 #### Provider-specific window shapes
 
+- **`claude`** five-hour `primary` and weekly `secondary` may come from model-call
+  readings and then be fresher than Fable (`extraRateWindows`), tertiary, saved
+  resets, breakdowns and Extra usage. Those poll-only fields are at most about
+  fifteen minutes old during healthy operation; failed polls can leave them
+  older. `fetchedAt` dates the newest applied reading, not every retained field.
 - **`qwen-cloud`** tries the Team Token Plan before the personal plan. An active
   Team plan publishes exactly one named extra, `id: "team"`, `title: "Team"`,
   with all three slots empty. It is the shared subscription's `credit_value`
@@ -1505,6 +1565,8 @@ not happened, never zero.
 | `quotaDropsByProvider` | object | drops recorded per provider |
 | `quotaDropsObservedContinuously` | object | of those, the ones observed across a continuous interval |
 | `quotaComparisonsNoDrop` | number | paired readings that were compared and showed no drop |
+| `callObservationsApplied` | number | applied model-call observations since process start |
+| `callObservationsIgnored` | object | ignored observations counted by the `usage.observe` reasons above; forbidden callers do not enter these counters |
 | `quotaNotComparable` | object | readings that could not be compared, by reason |
 | `cookieCohortTotal` | number | providers whose credential is a web session cookie |
 | `cookieLoginsStale` | array | cookie providers whose deposited login stopped working |

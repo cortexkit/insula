@@ -499,6 +499,48 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     normalize_response(body).map(|(usage, _)| usage)
 }
 
+/// Parse only the account-wide windows carried on model responses. Missing or
+/// malformed utilization means no update, not an empty or zero-usage window.
+pub fn call_windows(headers: &std::collections::BTreeMap<String, String>) -> Usage {
+    let window = |suffix: &str, minutes, kind| {
+        let prefix = format!("anthropic-ratelimit-unified-{suffix}");
+        let fraction = headers
+            .get(&format!("{prefix}-utilization"))?
+            .parse::<f64>()
+            .ok()?;
+        if !fraction.is_finite() {
+            return None;
+        }
+        let resets_at = headers
+            .get(&format!("{prefix}-reset"))
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        to_window(
+            Some(&OAuthWindow {
+                utilization: Some(fraction.clamp(0.0, 1.0) * 100.0),
+                resets_at,
+            }),
+            minutes,
+            kind,
+        )
+    };
+    Usage {
+        primary: window(
+            "5h",
+            FIVE_HOUR_MINUTES,
+            cortexkit_provider_usage::window_kind::FIVE_HOUR,
+        ),
+        secondary: window(
+            "7d",
+            SEVEN_DAY_MINUTES,
+            cortexkit_provider_usage::window_kind::WEEKLY,
+        ),
+        tertiary: None,
+        extra_rate_windows: None,
+    }
+}
+
 /// Normalize the body to its rate windows and the paid-overage pool, if any.
 ///
 /// The pool never fails this call: see [`overage_pool`].

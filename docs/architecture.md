@@ -59,8 +59,9 @@ the quota config from `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc` (default
 defaults, with banked resets off), builds `Registry::with_defaults` with the
 vault client as its credential source, sends `HELLO` with the manifest, and
 spawns `Registry::refresh_loop_observed`. The manifest declares one management
-surface with three query operations, `usage.get`, `usage.drops` and `events_get`,
-and declares that the module consumes the credential vault and ckbus.
+surface with the queries `usage.get`, `usage.watch`, `usage.drops` and `events_get`
+and the writer operation `usage.observe`, and declares that the module consumes
+the credential vault and ckbus.
 
 After each turn the observer enqueues changed serving entries without waiting
 for the bus. A separate task obtains ck-bus credentials over the existing subc
@@ -105,7 +106,11 @@ longer enumerated.
 
 ### 3. Schedule
 
-A slot is due `BASE_INTERVAL` (60 s) after its last completion. A failed slot
+A slot is due at its provider's interval after its last completion: 180 s for
+Claude, `BASE_INTERVAL` (60 s) otherwise. When an account has an applied call
+reading in the last three minutes, its next Claude poll is deferred to fifteen
+minutes after its last poll. This is recomputed at admission, so calls stopping
+automatically restore the ordinary cadence and cold accounts remain due. A failed slot
 waits out a backoff instead: `NON_TRANSIENT_BACKOFF` (300 s) for a failure
 retrying cannot fix, or an exponential backoff capped at
 `MAX_TRANSIENT_BACKOFF` (900 s) for a transient one. A vault row that comes
@@ -132,6 +137,14 @@ its credential (reading a vault credential through `CredentialSource`, which
 returns it already refreshed), calls the provider, and normalizes the answer
 into rate windows and `spend` pools, or returns a `FetchError`.
 
+Routing also forwards account-keyed model-response headers through `usage.observe`.
+The module remembers the daemon-attested `principal` on each `route.bind`, keyed
+by channel and binding epoch, and permits only `reserved:prefrontal-routing` to
+write. Neither the client-supplied bind identity nor the scope owner's principal
+identifies the calling module. The pure parser in `anthropic.rs` extracts the
+five-hour and weekly fractions and their reset instants; unrelated headers do
+not affect the inventory.
+
 ### 5. Store
 
 `refresh.rs` turns the attempt into the slot's next state:
@@ -142,10 +155,21 @@ into rate windows and `spend` pools, or returns a `FetchError`.
 - a non-transient failure replaces the entry with a degraded one carrying its
   `errorClass`.
 
+A forwarded reading can update only an already polled, verified Claude account.
+It patches the two usable windows in the held inventory, preserving Fable,
+tertiary, saved resets, overage, account metadata and source. The shared value-time
+fence rejects older readings; an applied reading advances `fetchedAt` and clears
+stale-serving. Poll completions compare against the current slot under the store
+lock, so a call arriving during a fetch cannot be rolled back by its completion.
+Call freshness does not reset endpoint failure backoff or vault-repair state.
+
 `quota_drop::detect` compares the new reading with the previous one and
 records drops and not-comparable reasons. The slot is then published with
 `publish_if_current`, which discards the result if the slot was removed or
 replaced while the fetch was running.
+Both polled and forwarded readings use this same publication and drop-accounting
+path. After an applied batch the module calls the existing serving-snapshot
+observer, which fans changes out to quota samples and `usage.watch` notices.
 
 ### 6. Serve
 

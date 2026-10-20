@@ -10518,7 +10518,7 @@ async fn refresh_loop_reactivated_handle_is_admitted_within_one_discovery_interv
         &CredentialHandle::scoped("oauth:anthropic", "oauth"),
     );
     assert_eq!(slot.status, SlotStatus::Fresh);
-    assert_eq!(slot.next_due_at, scheduler_now() + refresh::BASE_INTERVAL);
+    assert_eq!(slot.next_due_at, scheduler_now() + refresh::CLAUDE_INTERVAL);
 }
 
 #[tokio::test(start_paused = true)]

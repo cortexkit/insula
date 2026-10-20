@@ -14,6 +14,7 @@ pub mod alibaba;
 pub mod amp;
 pub mod anthropic;
 pub mod antigravity;
+pub mod call_observations;
 pub mod claude_console;
 mod claude_subscription;
 pub mod clinepass;
@@ -181,7 +182,7 @@ fn select_due_round_robin(
         (0..providers.len()).map(|_| VecDeque::new()).collect();
 
     for (key, slot) in snapshot {
-        if slot.next_due_at > now {
+        if slot.poll_due_at(&key.provider, now) > now {
             continue;
         }
         if let Some(&index) = provider_index.get(key.provider.as_str()) {
@@ -501,6 +502,7 @@ impl UsageSnapshot {
 pub struct Registry {
     providers: Vec<RegisteredProvider>,
     store: Mutex<SlotStore>,
+    call_metrics: Mutex<call_observations::CallObservationMetrics>,
     last_admitted_provider: Mutex<Option<usize>>,
     /// Credential ids suppressed by the last turn's vault snapshot. Their due
     /// times cannot wake the loop, but bounded discovery still checks for login.
@@ -555,6 +557,7 @@ impl Registry {
         Self {
             providers,
             store: Mutex::new(SlotStore::new(scheduler_now())),
+            call_metrics: Mutex::new(Default::default()),
             last_admitted_provider: Mutex::new(None),
             latched_vault_ids: Mutex::new(HashSet::new()),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
@@ -1618,17 +1621,30 @@ impl Registry {
         .buffer_unordered(refresh::CONCURRENCY_CAP);
 
         while let Some((unit, attempt_start, completed_at, outcome)) = fetches.next().await {
+            // A call reading can arrive while the poll is in flight. Compare the
+            // completion with the currently held value, not its admission snapshot.
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(prev) = store
+                .get(&unit.key)
+                .filter(|slot| {
+                    slot.incarnation == unit.prev.incarnation
+                        && slot.attempt_sequence == unit.attempt_sequence
+                })
+                .cloned()
+            else {
+                continue;
+            };
             let reported = matches!(&outcome, FetchOutcome::Attempt(_, true));
             let mut next = match outcome {
                 FetchOutcome::Attempt(attempt, _) => next_slot_after_attempt(
-                    &unit.prev,
+                    &prev,
                     &unit.key.provider,
                     *attempt,
                     attempt_start,
                     completed_at,
                 ),
                 FetchOutcome::TimedOut => next_slot_after_unverified_failure(
-                    &unit.prev,
+                    &prev,
                     &unit.key.provider,
                     provider::FetchError::Upstream(format!(
                         "fetch exceeded {}ms deadline",
@@ -1642,7 +1658,7 @@ impl Registry {
                 // malformed payload and send anyone investigating to the
                 // provider's API rather than to this module.
                 FetchOutcome::Panicked => next_slot_after_unverified_failure(
-                    &unit.prev,
+                    &prev,
                     &unit.key.provider,
                     provider::FetchError::Internal("provider fetch panicked".to_string()),
                     attempt_start,
@@ -1651,93 +1667,58 @@ impl Registry {
                 FetchOutcome::Cancelled => continue,
             };
             next.last_failure_reported = reported;
-            // Whether this attempt made the slot ENTER stale-serving. Decided
-            // here, where the transition is computed, and applied under the
-            // store lock below so the counter is consistent with the slot it
-            // describes. A slot already stale is a continuation, not a new
-            // episode.
-            let enters_stale = refresh::enters_stale_transient(&unit.prev, &next);
             self.note_cookie_lifetime(&unit.key.handle, &next);
-            // Whether this attempt saw the account's used percent go DOWN.
-            // Decided here for the same reason as the line above: the comparison
-            // needs both readings, and this is the only place that holds them.
-            //
-            // The identity check is the load-bearing argument, not the
-            // percentages: comparing a reading of one account against a reading
-            // of another fabricates a transition nobody made.
-            //
-            // THIS attempt failing is itself a not-comparable reason, and is
-            // counted as one: a failed fetch produces no new reading, which is
-            // exactly the case an operator needs distinguished from a quiet host.
-            let observation = match next
-                .entry
-                .as_ref()
-                .filter(|entry| entry.error.is_none())
-                .and_then(|entry| entry.usage.as_ref())
-            {
-                Some(usage) => quota_drop::detect(
-                    &unit.prev,
-                    usage,
-                    // The time the NEW reading describes, which for a
-                    // cache-backed lane is not the time we fetched it.
-                    next.last_success_wall,
-                    refresh::observations_differ(
-                        unit.prev.observation.as_ref(),
-                        next.observation.as_ref(),
-                    ),
-                    completed_at,
-                    refresh::BASE_INTERVAL,
-                ),
-                None => quota_drop::DropObservation::NotComparable(
-                    quota_drop::NotComparable::PriorReadingWasAnError,
-                ),
-            };
-            let mut store = self
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if enters_stale {
-                // The class and the identity come from the attempt that CAUSED
-                // the transition, not from the slot's serving state: the slot
-                // keeps publishing its last healthy window, so reading the
-                // detail off what it serves would name the success that is
-                // still on the wire rather than the failure that stalled it.
-                store.record_stale_episode(
-                    &unit.key.provider,
-                    next.error_class,
-                    next.last_failure_message.as_deref(),
-                    next.observation
-                        .as_ref()
-                        .and_then(|observed| observed.account_id.as_deref()),
-                );
-            }
-            match observation {
-                quota_drop::DropObservation::Drop(drop) => {
-                    // The identity of the reading that dropped, taken from
-                    // this attempt rather than the previous one: a drop is a
-                    // statement about the account observed NOW, and the two
-                    // agree here because an account change is rejected as
-                    // not-comparable before reaching this arm.
-                    store.record_quota_drop(
-                        &unit.key.provider,
-                        next.observation
-                            .as_ref()
-                            .and_then(|observation| observation.account_id.as_deref()),
-                        drop.observed_continuously,
-                    );
-                }
-                quota_drop::DropObservation::NoDrop => store.record_comparable_no_drop(),
-                quota_drop::DropObservation::NotComparable(reason) => {
-                    store.record_not_comparable(reason);
-                }
-            }
-            store.publish_if_current(
-                &unit.key,
-                unit.prev.incarnation,
-                unit.attempt_sequence,
-                next,
+            self.publish_reading(&mut store, &unit.key, &prev, next, completed_at);
+        }
+    }
+
+    /// Polled and forwarded values share comparison, drop accounting and publication.
+    fn publish_reading(
+        &self,
+        store: &mut SlotStore,
+        key: &SlotKey,
+        prev: &ProviderSlot,
+        next: ProviderSlot,
+        completed_at: Instant,
+    ) {
+        if refresh::enters_stale_transient(prev, &next) {
+            store.record_stale_episode(
+                &key.provider,
+                next.error_class,
+                next.last_failure_message.as_deref(),
+                next.account_id(),
             );
         }
+        let observation = match next
+            .entry
+            .as_ref()
+            .filter(|e| e.error.is_none())
+            .and_then(|e| e.usage.as_ref())
+        {
+            Some(usage) => quota_drop::detect(
+                prev,
+                usage,
+                next.last_success_wall,
+                refresh::observations_differ(prev.observation.as_ref(), next.observation.as_ref()),
+                completed_at,
+                refresh::poll_interval(&key.provider),
+            ),
+            None => quota_drop::DropObservation::NotComparable(
+                quota_drop::NotComparable::PriorReadingWasAnError,
+            ),
+        };
+        match observation {
+            quota_drop::DropObservation::Drop(drop) => store.record_quota_drop(
+                &key.provider,
+                next.account_id(),
+                drop.observed_continuously,
+            ),
+            quota_drop::DropObservation::NoDrop => store.record_comparable_no_drop(),
+            quota_drop::DropObservation::NotComparable(reason) => {
+                store.record_not_comparable(reason)
+            }
+        }
+        store.publish_if_current(key, prev.incarnation, prev.attempt_sequence, next);
     }
 
     /// Drive bounded scheduler turns until cancellation.
@@ -1795,7 +1776,7 @@ impl Registry {
                     .vault_credential_id()
                     .is_some_and(|id| latched_ids.contains(id))
             })
-            .map(|(_, slot)| slot.next_due_at)
+            .map(|(key, slot)| slot.poll_due_at(&key.provider, now))
             .min()
             .map(|due| {
                 due.saturating_duration_since(now)
