@@ -197,7 +197,10 @@ echo "  restarted; waiting out the health refresh"
 # at ~20s on this host.
 sleep 50
 
-stamped="$(python3 scripts/health.py 2>/dev/null | grep -oE 'buildCommit = [0-9a-f]+' | awk '{print $3}')"
+# `|| true`: under `set -euo pipefail` a health read that fails or prints no
+# buildCommit (a slow `ck` on a loaded host) would end the script here with
+# exit 1 and no message. Reading nothing must reach the explicit refusal below.
+stamped="$(python3 scripts/health.py 2>/dev/null | grep -oE 'buildCommit = [0-9a-f]+' | awk '{print $3}' || true)"
 echo "  buildCommit: ${stamped:-<unread>}"
 if [ "$stamped" != "$head_sha" ]; then
   echo "REFUSING TO CLAIM SUCCESS: running $stamped, expected $head_sha." >&2
