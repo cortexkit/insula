@@ -92,6 +92,7 @@ fn pools_from(info: &BalanceInfo) -> Vec<Pool> {
             // to each pool would be this module's inference, not DeepSeek's.
             spendable: None,
             resets_at: None,
+            expires_at: None,
         });
     };
 

@@ -96,7 +96,8 @@ fn normalize_pools(body: &[u8], now: DateTime<Utc>) -> Result<Vec<Pool>, FetchEr
     ] {
         for (index, grant) in grants.into_iter().enumerate() {
             // Missing or malformed expiry means unknown, not expired. Expiry is
-            // never a reset: losing unused credit does not replenish the pool.
+            // never a reset: losing unused credit does not replenish the pool,
+            // so it is published as `expires_at` and `resets_at` stays unset.
             let expiry = grant
                 .expires_at
                 .as_ref()
@@ -131,6 +132,11 @@ fn normalize_pools(body: &[u8], now: DateTime<Utc>) -> Result<Vec<Pool>, FetchEr
                 basis: PoolBasis::Reported,
                 spendable: None,
                 resets_at: None,
+                // Whole seconds in UTC with a Z, the form pool `resets_at` uses.
+                expires_at: expiry.map(|at| {
+                    at.with_timezone(&Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                }),
             };
             ranked.push((
                 if subscription {
@@ -158,6 +164,7 @@ fn normalize_pools(body: &[u8], now: DateTime<Utc>) -> Result<Vec<Pool>, FetchEr
                 basis: PoolBasis::Reported,
                 spendable: None,
                 resets_at: None,
+                expires_at: None,
             },
         ));
     }
@@ -388,6 +395,42 @@ mod tests {
         assert!(pools.iter().all(|pool| pool.basis == PoolBasis::Reported
             && pool.resets_at.is_none()
             && pool.spendable.is_none()));
+    }
+
+    /// Each grant publishes its own stated expiry as `expires_at`, never as a
+    /// reset: lapsed credit isn't replaced by the same pool refilling.
+    #[test]
+    fn each_grant_publishes_its_expiry_and_no_reset() {
+        let listed = normalize_pools(CREDITS.as_bytes(), now()).unwrap();
+        assert_eq!(
+            listed[0].expires_at.as_deref(),
+            Some("2026-10-28T00:00:00Z")
+        );
+        assert_eq!(
+            listed[1].expires_at.as_deref(),
+            Some("2027-05-01T00:00:00Z")
+        );
+        assert!(listed.iter().all(|pool| pool.resets_at.is_none()));
+
+        // An offset expiry is published in UTC with whole seconds.
+        let offset = pools(json!({"amount": 100, "promo_tranches": [grant(
+            100, 100, SUBSCRIPTION_PROGRAM, Some("2026-11-06T02:00:00.123+02:00"))]}));
+        assert_eq!(
+            offset[0].expires_at.as_deref(),
+            Some("2026-11-06T00:00:00Z")
+        );
+
+        // Missing or malformed expiry is unknown: the grant still publishes.
+        for expiry in [None, Some("next month")] {
+            let unknown = pools(json!({"amount": 100, "promo_tranches": [grant(
+                100, 100, SUBSCRIPTION_PROGRAM, expiry)]}));
+            assert_eq!(unknown.len(), 1, "{expiry:?}");
+            assert_eq!(unknown[0].expires_at, None, "{expiry:?}");
+        }
+
+        // The aggregate balance states no expiry, so it publishes none.
+        let aggregate = pools(json!({"amount": 18725}));
+        assert_eq!(aggregate[0].expires_at, None);
     }
 
     #[test]

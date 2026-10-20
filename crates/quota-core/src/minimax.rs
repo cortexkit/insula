@@ -529,6 +529,7 @@ fn wallet_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
             // No per-pool enable flag on this endpoint.
             spendable: None,
             resets_at: None,
+            expires_at: None,
         });
     };
 

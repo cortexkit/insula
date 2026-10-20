@@ -712,6 +712,7 @@ fn purchased_pool(balance: Option<Amount>) -> Pool {
         total: None,
         spendable: None,
         resets_at: None,
+        expires_at: None,
     }
 }
 

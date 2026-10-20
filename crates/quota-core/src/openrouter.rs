@@ -202,6 +202,7 @@ pub fn normalize_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
         // No per-pool availability signal is present in this payload.
         spendable: None,
         resets_at: None,
+        expires_at: None,
     }])
 }
 

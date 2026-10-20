@@ -929,6 +929,7 @@ mod tests {
             basis: PoolBasis::Reported,
             spendable: None,
             resets_at: None,
+            expires_at: None,
         }
     }
 
@@ -1125,6 +1126,7 @@ mod tests {
             basis: PoolBasis::Reported,
             spendable: None,
             resets_at: None,
+            expires_at: None,
         }]);
 
         entry.fetched_at = Some(stamped_at());

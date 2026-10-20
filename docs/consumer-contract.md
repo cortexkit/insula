@@ -923,9 +923,15 @@ git diff cortexkit-provider-usage-v<yours>..cortexkit-provider-usage-v<latest> \
   `usage: {}` beside a non-empty `spend`, and the entry is healthy.
 - **A pool without `resetsAt`** means the period was not stated, never that the
   pool does not renew.
+- **`expiresAt`** is when unused credit in the pool lapses, as the provider
+  stated it. It is not a reset: what is left is lost and the pool does not
+  refill. A later grant (next month's plan credit, say) arrives as a separate
+  pool. Spend expiring credit first. Absent means not stated, never "does not
+  expire". `claude-console` publishes it on every grant that states one.
 
 **Proven by:** `a_null_balance_publishes_a_pool_with_no_amount_and_no_basis`,
-`an_absent_has_credits_publishes_no_pool`, `deepseek_pools_are_reported_not_derived`.
+`an_absent_has_credits_publishes_no_pool`, `deepseek_pools_are_reported_not_derived`,
+`each_grant_publishes_its_expiry_and_no_reset`.
 
 <a id="claude-paid-overage-as-the-extra_usage-pool"></a>
 

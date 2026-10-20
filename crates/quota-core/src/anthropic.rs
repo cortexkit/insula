@@ -336,6 +336,7 @@ fn overage_pool(
         basis: PoolBasis::Derived,
         spendable,
         resets_at: None,
+        expires_at: None,
     }))
 }
 

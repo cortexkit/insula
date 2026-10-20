@@ -503,6 +503,7 @@ fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
         },
         // The payload states no period for prepaid credit.
         resets_at: None,
+        expires_at: None,
     }]
 }
 
@@ -563,6 +564,7 @@ fn individual_limit_pool(spend_control: Option<&serde_json::Value>) -> Option<Po
             .get("reset_at")
             .and_then(serde_json::Value::as_i64)
             .and_then(crate::env::epoch_to_iso8601),
+        expires_at: None,
     })
 }
 
