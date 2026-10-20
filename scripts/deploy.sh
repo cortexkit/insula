@@ -197,10 +197,18 @@ echo "  restarted; waiting out the health refresh"
 # at ~20s on this host.
 sleep 50
 
-# `|| true`: under `set -euo pipefail` a health read that fails or prints no
-# buildCommit (a slow `ck` on a loaded host) would end the script here with
-# exit 1 and no message. Reading nothing must reach the explicit refusal below.
-stamped="$(python3 scripts/health.py 2>/dev/null | grep -oE 'buildCommit = [0-9a-f]+' | awk '{print $3}' || true)"
+# Read the stamp until it is the new build, for up to two more minutes. Until
+# the supervisor's first health probe after the restart, the status carries no
+# metrics, and a single read at a fixed time refused deploys that had worked
+# (seen 2026-10-20). A stamp that stays old or unreadable still refuses below.
+# `|| true`: under `set -euo pipefail` a read that prints no buildCommit would
+# otherwise end the script here with exit 1 and no message.
+stamped=""
+for _ in $(seq 1 12); do
+  stamped="$(python3 scripts/health.py 2>/dev/null | grep -oE 'buildCommit = [0-9a-f]+' | awk '{print $3}' || true)"
+  [ "$stamped" = "$head_sha" ] && break
+  sleep 10
+done
 echo "  buildCommit: ${stamped:-<unread>}"
 if [ "$stamped" != "$head_sha" ]; then
   echo "REFUSING TO CLAIM SUCCESS: running $stamped, expected $head_sha." >&2
