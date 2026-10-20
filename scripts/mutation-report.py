@@ -21,7 +21,14 @@ def self_check():
 
 def main():
     self_check()
-    rows = json.loads(Path(sys.argv[1]).read_text())
+    report = Path(sys.argv[1])
+    if not report.is_file():
+        # The replay stops before grading when its unmutated prebuild fails (a
+        # crates.io download error, say), so it writes no report. Say that,
+        # rather than a traceback that reads like a defect in this script.
+        print(f"no mutation report at {report}: the replay stopped before grading any row; see its log above")
+        return 2
+    rows = json.loads(report.read_text())
     if not isinstance(rows, list):
         raise ValueError("expected a replay report array")
     counts = Counter(row["outcome"] for row in rows)
