@@ -60,21 +60,25 @@ EXPECTED: dict[str, dict[str, str]] = {
         "ORGANIZATIONS_URL": "claude.ai",
     },
     "antigravity": {
+        "REMOTE_QUOTA_SUMMARY_URL": "daily-cloudcode-pa.googleapis.com",
         "REMOTE_QUOTA_URL": "cloudcode-pa.googleapis.com",
         "LOAD_CODE_ASSIST_URL": "cloudcode-pa.googleapis.com",
-        "TOKEN_URL": "oauth2.googleapis.com",
     },
     "codebuff": {"BASE_URL": "www.codebuff.com"},
     "codex": {"DEFAULT_BASE": "chatgpt.com"},
     "copilot": {"USAGE_URL": "api.github.com"},
     "cursor": {"USAGE_URL": "cursor.com"},
     "deepseek": {"BALANCE_URL": "api.deepseek.com"},
-    "doubao": {"API_URL": "ark.cn-beijing.volces.com"},
+    "doubao": {
+        "API_URL": "ark.cn-beijing.volces.com",
+        "CODING_PLAN_API_URL": "open.volcengineapi.com",
+    },
     "elevenlabs": {"DEFAULT_BASE": "api.elevenlabs.io"},
     "factory": {"BILLING_LIMITS_URL": "api.factory.ai"},
     "grok": {"USAGE_URL": "grok.com"},
     "kilo": {"DEFAULT_TRPC_BASE": "app.kilo.ai"},
-    "kimi_for_coding": {"USAGE_URL": "api.kimi.com"},
+    "kimi": {"USAGE_URL": "www.kimi.com", "SUBSCRIPTION_STATS_URL": "www.kimi.com"},
+    "kimi_for_coding": {"USAGE_URL": "api.kimi.com", "SUBSCRIPTION_STATS_URL": "www.kimi.com"},
     "langdock": {"USAGE_URL": "app.langdock.com", "REFERER_URL": "app.langdock.com"},
     "manus": {"CREDITS_URL": "api.manus.im"},
     "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
@@ -93,6 +97,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "qoder": {"USAGE_URL": "qoder.com"},
     "qwen_cloud": {
         "QUOTA_CONFIG_URL": "cs-data.qwencloud.com",
+        "TOKEN_PLAN_URL": "home.qwencloud.com",
         "SUBSCRIPTION_URL": "cs-data.qwencloud.com",
         "USAGE_URL": "cs-data.qwencloud.com",
         # Team discovery uses /tool/user/info.json and /data/api.json for
@@ -104,13 +109,16 @@ EXPECTED: dict[str, dict[str, str]] = {
         "TEAM_REFERER_URL": "home.qwencloud.com",
     },
     "sakana": {"BILLING_URL": "console.sakana.ai"},
+    "stepfun": {"API_URL": "platform.stepfun.com"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},
     "warp": {"API_URL": "app.warp.dev"},
     "zai": {"DEFAULT_BASE": "api.z.ai"},
     "zenmux": {"SUBSCRIPTION_DETAIL_URL": "zenmux.ai"},
 }
 
-CONST = re.compile(r'const ([A-Z_]*(?:URL|BASE)[A-Z_]*): &str = "(https://[^"]+)"')
+# `\s*` after `=`: rustfmt moves a long value onto the next line, and a
+# constant the pattern can't see is a constant this never checks.
+CONST = re.compile(r'const ([A-Z_]*(?:URL|BASE)[A-Z_]*): &str =\s*"(https://[^"]+)"')
 
 # Cut at the test MODULE, never at the first `#[cfg(test)]`.
 #
@@ -145,6 +153,7 @@ def main() -> int:
     findings: list[str] = []
     checked = 0
     seen_modules = 0
+    seen: set[tuple[str, str]] = set()
 
     for path in sorted(SRC.glob("*.rs")):
         source = path.read_text(encoding="utf-8", errors="replace")
@@ -163,6 +172,7 @@ def main() -> int:
             )
             continue
         for name, url in found:
+            seen.add((path.stem, name))
             host = urlparse(url).hostname or ""
             want = expected.get(name)
             if want is None:
@@ -175,6 +185,13 @@ def main() -> int:
                 findings.append(
                     f"{path.stem}::{name} points at {host}, manifest says {want}"
                 )
+
+    # A recorded constant that no longer appears was renamed, moved or reformatted
+    # out of the pattern's reach. Silence there would read as "checked and fine".
+    for module, names in sorted(EXPECTED.items()):
+        for name in sorted(names):
+            if (module, name) not in seen:
+                findings.append(f"{module}::{name} is recorded here but was not found in the source")
 
     if checked == 0:
         print("refusing: examined no endpoint constant at all -- the extractor is")
