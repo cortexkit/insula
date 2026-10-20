@@ -83,8 +83,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// `gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly` bucket ids the local
 /// probe returns, so [`parse_quota_summary`] handles both and the two lanes
 /// cannot describe one account differently.
+///
+/// **The host decides which Gemini pool answers.** On 2026-10-20, with one vault
+/// token in one minute, `daily-cloudcode-pa` returned the editor's Gemini pool
+/// (0% left, weekly reset 2026-10-23T22:00:53Z, the figures agy showed) while
+/// `cloudcode-pa` returned a different one (65% left, reset 2026-10-21T12:39:00Z).
+/// The User-Agent made no difference either way, and the Claude/GPT pool was
+/// identical on both hosts. The opencode antigravity-auth plugin polls the daily
+/// host. Re-check with `crates/quota-module/examples/antigravity-pool.rs` before
+/// moving this back.
 const REMOTE_QUOTA_SUMMARY_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const LOAD_CODE_ASSIST_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
 /// The per-model fallback, used only when the summary endpoint refuses.
@@ -275,13 +284,13 @@ fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
 /// paid-tier evidence, cloud usage remains available for free or unknown tiers.
 ///
 /// The wrong pool came from the opencode plugin's own OAuth token (measured
-/// 2026-09-08: 7.15% from the cloud against the editor's 58.41%). The vault's
-/// `antigravity:google` token does not have that problem: on 2026-10-14 it read
-/// the editor's pool exactly, every weekly reset anchor equal to the second, on
-/// both the production and the daily endpoint
-/// (`crates/quota-module/examples/antigravity-pool.rs`). So for a vault
-/// credential this guard is a safety net, not the only source of a correct
-/// number; with sidebar v2 carrying no tier, it currently doesn't fire.
+/// 2026-09-08: 7.15% from the cloud against the editor's 58.41%). With the
+/// vault's `antigravity:google` token, the summary on the daily host reads the
+/// editor's pool; the production host answered a different Gemini pool on
+/// 2026-10-20 (see [`REMOTE_QUOTA_SUMMARY_URL`]). On 2026-10-14 both hosts had
+/// agreed, so a single matching reading doesn't prove the pool: compare reset
+/// anchors on a day the pools have diverged. With sidebar v2 carrying no tier,
+/// this guard currently doesn't fire.
 fn cloud_lane_must_withhold(
     accounts: &[StoredAccount],
     plugin_account: Option<&StoredAccount>,

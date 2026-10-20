@@ -78,19 +78,36 @@ async fn main() {
         (os, "aarch64") => (os, "arm64"),
         (os, _) => (os, "amd64"),
     };
+    const PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+    const DAILY: &str =
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+    let hub = format!("antigravity/hub/2.9.1 {os}/{arch}");
+    let cli = format!(
+        "antigravity/cli/1.3.3 (aidev_client; os_type={os}; arch={arch}; \
+         cl=996823801; auth_method=consumer)"
+    );
+    // The two real shapes, then the two mixed ones, so a disagreement between
+    // the real shapes can be pinned on the host or on the User-Agent.
     let shapes = [
         Shape {
-            label: "insula today (prod, hub UA)",
-            url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-            user_agent: format!("antigravity/hub/2.9.1 {os}/{arch}"),
+            label: "insula (prod, hub UA)",
+            url: PROD,
+            user_agent: hub.clone(),
         },
         Shape {
             label: "plugin vault poller (daily, cli UA)",
-            url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-            user_agent: format!(
-                "antigravity/cli/1.3.3 (aidev_client; os_type={os}; arch={arch}; \
-                 cl=996823801; auth_method=consumer)"
-            ),
+            url: DAILY,
+            user_agent: cli.clone(),
+        },
+        Shape {
+            label: "mixed (prod, cli UA)",
+            url: PROD,
+            user_agent: cli,
+        },
+        Shape {
+            label: "mixed (daily, hub UA)",
+            url: DAILY,
+            user_agent: hub,
         },
     ];
     let body = match &project {
