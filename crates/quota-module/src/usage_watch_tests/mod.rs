@@ -30,9 +30,12 @@ impl Wire {
     }
 
     async fn with_capacity(paused_writer: bool, capacity: usize) -> Self {
+        Self::with_registry(paused_writer, capacity, Arc::new(Registry::new(vec![]))).await
+    }
+
+    async fn with_registry(paused_writer: bool, capacity: usize, registry: Arc<Registry>) -> Self {
         let (client, server) = tokio::io::duplex(capacity);
         let (mut read, write) = tokio::io::split(server);
-        let registry = Arc::new(Registry::new(vec![]));
         let epoch = registry.drop_page(None).await.epoch;
         let serve = Arc::new(ServeCounters {
             samples: Arc::new(bus::QuotaSamples::new(epoch.clone())),
@@ -497,6 +500,140 @@ async fn usage_watch_stalled_transport_does_not_stall_serving() {
         saw_gap,
         "the next delivered notices must expose the dropped sequence numbers"
     );
+    wire.stop().await;
+    wire.finish().await;
+}
+
+struct ClaudePoll;
+#[async_trait::async_trait]
+impl quota_core::provider::UsageProvider for ClaudePoll {
+    fn name(&self) -> &str {
+        "claude"
+    }
+    async fn fetch_handle(
+        &self,
+        _: &quota_core::provider::CredentialHandle,
+    ) -> quota_core::provider::FetchAttempt {
+        let entry = serde_json::from_value(
+            json!({"provider":"claude","account":"work","source":"oauth",
+            "usage":{"primary":{"usedPercent":90.0,"windowMinutes":300,"windowKind":"five_hour"},
+            "secondary":{"usedPercent":99.0,"windowMinutes":10080,"windowKind":"weekly"},
+            "extraRateWindows":[{"id":"fable","window":{"usedPercent":13.0}}]}}),
+        )
+        .unwrap();
+        quota_core::provider::FetchAttempt::from_provider_usage(Ok(entry))
+    }
+}
+
+async fn bind_writer(wire: &mut Wire, principal: Value, epoch: u32) {
+    // Scope ownership is deliberately routing even for untrusted callers. It
+    // attests the scope owner, not the module sending requests on this route.
+    let body = json!({"op":"route.bind","route_channel":5,"epoch":epoch,
+        "target":{"kind":"management_surface","module_id":"insula"},
+        "identity":{"project_root":"/tmp/x","harness":"prefrontal-routing","session":"s"},
+        "principal":principal,
+        "scope":{"owner":{"kind":"reserved","module_id":"prefrontal-routing"},
+            "ref":"head","scope_epoch":1,"kind":"worker","owner_authorized":true}});
+    wire.send(
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            400,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(wire.recv().await.header.ty, FrameType::Response);
+}
+
+async fn observe_wire(wire: &mut Wire, epoch: u32, corr: u64, at: i64) -> Frame {
+    let body = json!({"method":"usage.observe", "params":{"observations":[
+        {"provider":"claude","account":"missing","observedAtMs":at,"headers":{}},
+        {"provider":"claude","account":"work","observedAtMs":at,
+            "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21", "anthropic-ratelimit-unified-5h-reset":"1790394000",
+                "anthropic-ratelimit-unified-7d-utilization":"1.0","anthropic-ratelimit-unified-7d-reset":"1790740800"}}
+    ]}});
+    wire.send(
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            5,
+            epoch,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    wire.recv().await
+}
+
+#[tokio::test]
+async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_watch() {
+    let registry = Arc::new(Registry::new(vec![Box::new(ClaudePoll)]));
+    registry.refresh_tick(&CancellationToken::new()).await;
+    let before = serde_json::to_value(registry.get_usage(None).await).unwrap();
+    let at = 1890394000123;
+    let mut wire = Wire::with_registry(false, 64 * 1024, registry.clone()).await;
+    wire.serve
+        .samples
+        .observe(registry.get_usage(None).await)
+        .await;
+    for (epoch, principal) in [
+        (1, Value::Null),
+        (2, json!({"kind":"direct"})),
+        (3, json!({"kind":"unverified"})),
+        (4, json!({"kind":"reserved","module_id":"prefrontal-core"})),
+    ] {
+        bind_writer(&mut wire, principal, epoch).await;
+        let response = observe_wire(&mut wire, epoch, 401, at).await;
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["code"], "forbidden",
+            "only attested routing may observe"
+        );
+        assert_eq!(
+            serde_json::to_value(registry.get_usage(None).await).unwrap(),
+            before,
+            "a forbidden writer must change nothing"
+        );
+        assert_eq!(registry.call_observation_metrics().applied, 0);
+        assert!(registry.call_observation_metrics().ignored.is_empty());
+    }
+    bind_writer(
+        &mut wire,
+        json!({"kind":"reserved","module_id":"prefrontal-routing"}),
+        5,
+    )
+    .await;
+    wire.subscribe(5, 5, 91).await;
+    wire.recv().await;
+    let response = observe_wire(&mut wire, 5, 402, at).await;
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["result"]["accepted"], 1);
+    assert_eq!(body["result"]["ignored"][0]["reason"], "unknown_account");
+    let changed = notice(wire.recv().await, 5, 5, 91);
+    assert_eq!(changed["provider"], "claude");
+    assert_eq!(changed["account"], "work");
+    wire.send(request(5, 5, 403, USAGE_GET_OP, false)).await;
+    let served: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+    assert_eq!(served["result"][0]["usage"]["primary"]["usedPercent"], 21.0);
+    assert_eq!(
+        served["result"][0]["usage"]["extraRateWindows"][0]["window"]["usedPercent"],
+        13.0
+    );
+    assert_eq!(registry.drop_page(None).await.drops.len(), 1);
+    let metrics = wire.health_metrics().await;
+    assert_eq!(metrics["callObservationsApplied"], 1);
+    assert_eq!(metrics["callObservationsIgnored"]["unknown_account"], 1);
+
+    bind_writer(&mut wire, json!({"kind":"direct"}), 6).await;
+    let stale_epoch = observe_wire(&mut wire, 5, 404, at + 1).await;
+    let body: Value = serde_json::from_slice(&stale_epoch.body).unwrap();
+    assert_eq!(body["code"], "forbidden");
     wire.stop().await;
     wire.finish().await;
 }

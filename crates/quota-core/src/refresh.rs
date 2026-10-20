@@ -46,6 +46,19 @@ pub const STALE_MESSAGE_CHARS: usize = 160;
 /// means this constant changed rather than that scheduling broke -- which is
 /// correct, and only works if someone tells them. Say so in the same commit.
 pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Anthropic rate-limits the OAuth usage endpoint per account; model calls
+/// refresh its two routing windows without spending another endpoint request.
+pub const CLAUDE_INTERVAL: Duration = Duration::from_secs(180);
+pub const CLAUDE_OBSERVED_INTERVAL: Duration = Duration::from_secs(900);
+
+pub fn poll_interval(provider: &str) -> Duration {
+    if provider == "claude" {
+        CLAUDE_INTERVAL
+    } else {
+        BASE_INTERVAL
+    }
+}
 /// A served window is `fresh` while its last success is within this horizon.
 ///
 /// **Must exceed [`BASE_INTERVAL`] + [`FETCH_DEADLINE`].** A healthy unit falls
@@ -258,6 +271,10 @@ pub struct ProviderSlot {
     /// `stale.since`. Same reason as `last_success_wall`.
     pub failing_since_wall: Option<DateTime<Utc>>,
     pub last_attempt_at: Option<Instant>,
+    /// Keep poll completion separate from call readings, so frequent calls
+    /// cannot defer the next Claude poll indefinitely.
+    pub last_poll_completed_at: Option<Instant>,
+    pub last_call_observation_at: Option<Instant>,
     pub status: SlotStatus,
     /// Why the most recent attempt failed, as a stable class name.
     ///
@@ -322,6 +339,8 @@ impl ProviderSlot {
             last_success_at: None,
             last_success_wall: None,
             last_attempt_at: None,
+            last_poll_completed_at: None,
+            last_call_observation_at: None,
             status: SlotStatus::Pending,
             next_due_at: now,
             retry_count: 0,
@@ -331,7 +350,8 @@ impl ProviderSlot {
         }
     }
 
-    /// Whether this slot FETCHED recently. Not whether its value is recent.
+    /// Whether a poll or forwarded call succeeded recently. Not whether every
+    /// field in the held inventory is recent.
     ///
     /// Those were the same question until a lane began serving a value from a
     /// source it does not poll, and the difference is now load-bearing: an
@@ -352,9 +372,32 @@ impl ProviderSlot {
     /// readings in rotation, and a drop record stamped as continuously observed
     /// across an hour-wide gap. Both looked correct in review.
     pub fn is_fresh(&self, now: Instant) -> bool {
+        let horizon = self
+            .entry
+            .as_ref()
+            .map(|e| poll_interval(&e.provider) + FETCH_DEADLINE)
+            .unwrap_or(BASE_INTERVAL)
+            .max(FRESH_HORIZON);
         self.last_success_at
-            .map(|t| now.saturating_duration_since(t) <= FRESH_HORIZON)
+            .map(|t| now.saturating_duration_since(t) <= horizon)
             .unwrap_or(false)
+    }
+
+    /// Recompute the call-based delay whenever deciding whether to schedule a
+    /// poll, so call silence restores the normal polling cadence. Failed polls
+    /// and vault-repair deadlines keep priority.
+    pub fn poll_due_at(&self, provider: &str, now: Instant) -> Instant {
+        if provider == "claude"
+            && self.last_failure_class.is_none()
+            && self
+                .last_call_observation_at
+                .is_some_and(|at| now.saturating_duration_since(at) < CLAUDE_INTERVAL)
+        {
+            if let Some(last_poll) = self.last_poll_completed_at {
+                return self.next_due_at.max(last_poll + CLAUDE_OBSERVED_INTERVAL);
+            }
+        }
+        self.next_due_at
     }
 
     /// Resolved account label, if the credential source exposes one.
@@ -362,6 +405,19 @@ impl ProviderSlot {
         self.observation
             .as_ref()
             .and_then(|observation| observation.account_id.as_deref())
+    }
+}
+
+/// Both polled and forwarded readings use this intra-slot value-time fence.
+/// Polls may repeat a source timestamp; forwarded calls must be strictly newer.
+pub(crate) fn value_time_supersedes(
+    incoming: Option<DateTime<Utc>>,
+    held: Option<DateTime<Utc>>,
+    strict: bool,
+) -> bool {
+    match (incoming, held) {
+        (Some(incoming), Some(held)) => incoming > held || (!strict && incoming == held),
+        _ => true,
     }
 }
 
@@ -583,8 +639,10 @@ fn next_slot_after_attempt_inner(
             last_success_at: None,
             last_success_wall: None,
             last_attempt_at: Some(attempt_start),
+            last_poll_completed_at: Some(completed),
+            last_call_observation_at: prev.last_call_observation_at,
             status: prev.status,
-            next_due_at: completed + BASE_INTERVAL,
+            next_due_at: completed + poll_interval(provider_name),
             retry_count: prev.retry_count,
             last_failure_class: prev.last_failure_class,
             last_status_poll_at: None,
@@ -624,10 +682,8 @@ fn next_slot_after_attempt_inner(
     // Scoped to the same account: an identity change legitimately resets the wall
     // time to None, and a new account's first reading has nothing to be older
     // than.
-    let supersedes = match (value_observed_at, prev.last_success_wall) {
-        (Some(incoming), Some(held)) if !account_changed => incoming >= held,
-        _ => true,
-    };
+    let supersedes =
+        account_changed || value_time_supersedes(value_observed_at, prev.last_success_wall, false);
     if attempt.usage.is_ok() && !supersedes {
         // DISCLOSED, because the consumer-facing situation is the one `stale`
         // already describes: the reading served was not obtained by the latest
@@ -653,7 +709,9 @@ fn next_slot_after_attempt_inner(
         return ProviderSlot {
             last_success_at: Some(completed),
             last_attempt_at: Some(attempt_start),
-            next_due_at: completed + BASE_INTERVAL,
+            last_poll_completed_at: Some(completed),
+            last_call_observation_at: prev.last_call_observation_at,
+            next_due_at: completed + poll_interval(provider_name),
             retry_count: 0,
             status: SlotStatus::StaleTransient,
             // Set only if a preserved-serving run is not already open, so the
@@ -716,8 +774,14 @@ fn next_slot_after_attempt_inner(
             // the published wall timestamp may inherit the source's value-time.
             last_success_wall: Some(value_observed_at.unwrap_or_else(Utc::now)),
             last_attempt_at: Some(attempt_start),
+            last_poll_completed_at: Some(completed),
+            last_call_observation_at: if account_changed {
+                None
+            } else {
+                prev.last_call_observation_at
+            },
             status: SlotStatus::Fresh,
-            next_due_at: completed + BASE_INTERVAL,
+            next_due_at: completed + poll_interval(provider_name),
             retry_count: 0,
             last_failure_class: None,
             last_status_poll_at: None,
@@ -838,6 +902,12 @@ fn next_slot_after_attempt_inner(
                     retry_base.last_success_wall
                 },
                 last_attempt_at: Some(attempt_start),
+                last_poll_completed_at: Some(completed),
+                last_call_observation_at: if account_changed {
+                    None
+                } else {
+                    prev.last_call_observation_at
+                },
                 status,
                 next_due_at: completed + backoff(class, retry_count),
                 retry_count,
