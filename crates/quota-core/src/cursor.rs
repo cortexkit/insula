@@ -11,9 +11,16 @@
 //! Deposited-session usage gets an account ID and optional cached email only when
 //! the user ID in its WorkOS session cookie matches the ID decoded from Cursor's
 //! local app-auth access token.
+//!
+//! Unified personal accounts (`membershipType` `unified_*` with `limitType`
+//! `user`) also get their monthly on-demand spend, read from a second dashboard
+//! endpoint and published as the `on_demand` pool. That read is optional: when it
+//! fails the plan window is published exactly as it would have been without it.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -26,8 +33,9 @@ use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     cookie_jar::CookieJar,
     http::{Header, JsonRequest},
-    model::{AccountInfo, ProviderUsage, RateWindow, Usage},
+    model::{AccountInfo, Amount, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
+    LOG_TAG,
 };
 
 pub const PROVIDER_NAME: &str = "cursor";
@@ -40,6 +48,14 @@ const COOKIE_FAMILY: &str = "cookie:cursor.com";
 const APP_STORE_SOURCE: &str = "oauth";
 const USAGE_URL: &str = "https://cursor.com/api/usage-summary";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cursor's dashboard reading of a unified personal account's monthly spend.
+/// Unified accounts are billed for on-demand use through this reading; the
+/// usage summary can report a false zero for them.
+const USAGE_STATUS_URL: &str = "https://cursor.com/api/dashboard/v2/usage-status?scope=user";
+/// The spend read is optional, so it gets a 5-second timeout of its own. If it
+/// times out or fails in any other way, no `on_demand` pool is published and the
+/// plan window, already read, is returned unchanged.
+const USAGE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
 const CACHED_EMAIL_KEY: &str = "cursorAuth/cachedEmail";
 
@@ -410,6 +426,26 @@ async fn resolve_cursor_credential_async(
 struct CursorUsageSummary {
     billing_cycle_end: Option<String>,
     individual_usage: Option<IndividualUsage>,
+    membership_type: Option<String>,
+    limit_type: Option<String>,
+}
+
+impl CursorUsageSummary {
+    /// Whether the account is billed under Cursor's unified personal plan, the
+    /// one kind of account whose on-demand spend is read from the dashboard's
+    /// usage-status endpoint. A team limit (`limitType: team`) is a different
+    /// budget that endpoint does not describe, so it does not qualify.
+    fn uses_unified_personal_billing(&self) -> bool {
+        let unified = self
+            .membership_type
+            .as_deref()
+            .is_some_and(|kind| kind.to_ascii_lowercase().starts_with("unified_"));
+        let personal = self
+            .limit_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("user"));
+        unified && personal
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,10 +489,29 @@ fn parse_billing_cycle_end(s: &str) -> Option<String> {
 
 /// Normalize the usage summary JSON to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+    normalize_summary(body).map(|summary| summary.usage)
+}
+
+/// What one usage-summary response says: the plan window, and whether the
+/// account needs the separate monthly spend read.
+struct SummaryReading {
+    usage: Usage,
+    unified_personal: bool,
+}
+
+fn normalize_summary(body: &[u8]) -> Result<SummaryReading, FetchError> {
     let summary: CursorUsageSummary =
         crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
             .map_err(|e| FetchError::Decode(format!("cursor usage summary not decodable: {e}")))?;
+    let unified_personal = summary.uses_unified_personal_billing();
+    let usage = plan_usage(summary)?;
+    Ok(SummaryReading {
+        usage,
+        unified_personal,
+    })
+}
 
+fn plan_usage(summary: CursorUsageSummary) -> Result<Usage, FetchError> {
     let resets_at = summary
         .billing_cycle_end
         .as_deref()
@@ -504,6 +559,129 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     }
 }
 
+/// The usage-status response for a unified personal account. Every field is
+/// optional here so a missing one is a stated refusal reason rather than a
+/// decode error; a field of the wrong type is still a decode error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedUsageStatus {
+    availability: Option<String>,
+    monthly_usage: Option<MonthlyUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonthlyUsage {
+    used_cents: Option<f64>,
+    limit_cents: Option<f64>,
+    period_start: Option<String>,
+    resets_at: Option<String>,
+}
+
+/// Why a unified account's monthly spend was not published. Every variant
+/// publishes no pool and leaves the plan window alone; the reason only names
+/// the cause in the log. It never carries a value from the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendRefusal {
+    /// The request failed: transport error, timeout, or a non-2xx status.
+    RequestFailed,
+    /// The body is not the expected JSON shape.
+    Undecodable,
+    /// `availability` is absent or anything other than `available`.
+    NotAvailable,
+    /// `monthlyUsage` is absent.
+    MonthlyUsageMissing,
+    /// A cents figure is absent, negative, not finite, fractional, or above
+    /// 2^53.
+    AmountUnusable,
+    /// `periodStart` or `resetsAt` is absent or not an RFC 3339 time.
+    DateUnreadable,
+    /// The reading describes a period that does not contain the present.
+    OutsidePeriod,
+}
+
+impl SpendRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestFailed => "request failed",
+            Self::Undecodable => "undecodable",
+            Self::NotAvailable => "not available",
+            Self::MonthlyUsageMissing => "monthly usage missing",
+            Self::AmountUnusable => "amount unusable",
+            Self::DateUnreadable => "date unreadable",
+            Self::OutsidePeriod => "outside its period",
+        }
+    }
+}
+
+/// A cents figure as integer minor units, or `None` when it cannot be one.
+///
+/// The pool states amounts in exact minor units, so a fractional cent would
+/// have to be rounded one way or the other; that shape has not been observed,
+/// so it publishes nothing rather than a guess. The upper bound keeps the
+/// conversion exact: past 2^53 an `f64` no longer holds every whole number.
+fn whole_cents(cents: Option<f64>) -> Option<i64> {
+    const MAX_EXACT: f64 = 9_007_199_254_740_992.0;
+    let cents = cents?;
+    if !cents.is_finite() || cents < 0.0 || cents.fract() != 0.0 || cents > MAX_EXACT {
+        return None;
+    }
+    Some(cents as i64)
+}
+
+fn parse_instant(text: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(text?.trim())
+        .ok()
+        .map(|instant| instant.with_timezone(&chrono::Utc))
+}
+
+/// Turn a usage-status body into the monthly on-demand pool, or say why not.
+///
+/// Accepted only when Cursor says the reading is `available`, both cents
+/// figures are usable, and `now` falls inside the stated period. A reading for
+/// another month would publish last month's spend as this month's.
+fn on_demand_pool(body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Result<Pool, SpendRefusal> {
+    let status: UnifiedUsageStatus =
+        serde_json::from_slice(body).map_err(|_| SpendRefusal::Undecodable)?;
+    if status.availability.as_deref() != Some("available") {
+        return Err(SpendRefusal::NotAvailable);
+    }
+    let monthly = status
+        .monthly_usage
+        .ok_or(SpendRefusal::MonthlyUsageMissing)?;
+    let used = whole_cents(monthly.used_cents).ok_or(SpendRefusal::AmountUnusable)?;
+    let limit = whole_cents(monthly.limit_cents).ok_or(SpendRefusal::AmountUnusable)?;
+    let start =
+        parse_instant(monthly.period_start.as_deref()).ok_or(SpendRefusal::DateUnreadable)?;
+    let reset = parse_instant(monthly.resets_at.as_deref()).ok_or(SpendRefusal::DateUnreadable)?;
+    if !(start <= now && now < reset) {
+        return Err(SpendRefusal::OutsidePeriod);
+    }
+    let usd = |minor: i64| Amount {
+        minor,
+        exponent: 2,
+        unit: "USD".to_string(),
+    };
+    Ok(Pool {
+        id: "on_demand".to_string(),
+        label: "On-demand spend (monthly)".to_string(),
+        // On-demand use is billed after it happens. None of granted, purchased
+        // or subscription says that, and `unknown` is the value every consumer
+        // already reads as "spending this may cost money".
+        funding: PoolFunding::Unknown,
+        // Spend can run past the limit; a pool never goes below empty.
+        remaining: Some(usd(limit.saturating_sub(used).max(0))),
+        total: Some(usd(limit)),
+        // The usage figure covers this pool alone, so the limit minus it is the
+        // exact remainder, not a ceiling shared with other pools.
+        basis: PoolBasis::Reported,
+        // Cursor states no on/off switch for on-demand spend here.
+        spendable: None,
+        resets_at: Some(reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        expires_at: None,
+    })
+}
+
 fn provider_usage_from_credential(
     credential: &CursorCredential,
     source: &'static str,
@@ -534,6 +712,10 @@ pub struct CursorProvider {
     handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
     http: reqwest::Client,
     usage_url: String,
+    usage_status_url: String,
+    /// The last spend refusal per credential handle, so a refusal is logged
+    /// when it appears, changes or clears rather than on every poll.
+    spend_refusals: Mutex<HashMap<String, SpendRefusal>>,
 }
 
 impl CursorProvider {
@@ -551,7 +733,72 @@ impl CursorProvider {
             credential_source,
             handle_loader,
             usage_url: USAGE_URL.to_string(),
+            usage_status_url: USAGE_STATUS_URL.to_string(),
+            spend_refusals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read the usage summary with `cookie`, and for a unified personal account
+    /// also its monthly on-demand spend.
+    ///
+    /// Only the summary can fail this call. The spend read is a second, optional
+    /// request: whatever goes wrong with it leaves the pool out and the plan
+    /// window and error class exactly as the summary alone would give them.
+    async fn fetch_usage_and_spend(
+        &self,
+        handle_key: &str,
+        cookie: String,
+    ) -> Result<(Usage, Option<Pool>), FetchError> {
+        let body = JsonRequest::get(&self.usage_url)
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Cookie", cookie.clone()))
+            .send(&self.http)
+            .await?;
+        let summary = normalize_summary(&body)?;
+        // Accounts on any other plan have no reading at that endpoint, so they
+        // are never asked.
+        if !summary.unified_personal {
+            return Ok((summary.usage, None));
+        }
+        let spend = match JsonRequest::get(&self.usage_status_url)
+            .timeout(USAGE_STATUS_TIMEOUT)
+            .header(Header::new("Cookie", cookie))
+            .send(&self.http)
+            .await
+        {
+            Ok(body) => on_demand_pool(&body, chrono::Utc::now()),
+            Err(_) => Err(SpendRefusal::RequestFailed),
+        };
+        Ok((summary.usage, self.settle_spend(handle_key, spend)))
+    }
+
+    /// Log a handle's spend refusal when it first appears, changes, or clears,
+    /// and hand back the pool to publish (none when refused). Accounts are
+    /// polled repeatedly, so logging every refusal would repeat one line
+    /// forever.
+    fn settle_spend(&self, handle_key: &str, spend: Result<Pool, SpendRefusal>) -> Option<Pool> {
+        let current = spend.as_ref().err().copied();
+        let mut refusals = self
+            .spend_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = refusals.get(handle_key).copied();
+        if previous != current {
+            match current {
+                Some(reason) => eprintln!(
+                    "{LOG_TAG} warning: cursor monthly on-demand spend refused ({handle_key}): {}; no on_demand pool published",
+                    reason.as_str()
+                ),
+                None => eprintln!(
+                    "{LOG_TAG} cursor monthly on-demand spend readable again ({handle_key})"
+                ),
+            }
+        }
+        match current {
+            Some(reason) => refusals.insert(handle_key.to_string(), reason),
+            None => refusals.remove(handle_key),
+        };
+        spend.ok()
     }
 }
 
@@ -628,12 +875,7 @@ impl UsageProvider for CursorProvider {
                 Some(record_version),
             ));
             let cookie = app_auth_cookie_header(&user_id, &token);
-            let result = JsonRequest::get(&self.usage_url)
-                .timeout(REQUEST_TIMEOUT)
-                .header(Header::new("Cookie", cookie))
-                .send(&self.http)
-                .await
-                .and_then(|body| normalize_usage(&body));
+            let result = self.fetch_usage_and_spend(handle.stable_id(), cookie).await;
             if let Err(error) = &result {
                 crate::credential_source::report_vault_auth_failure(
                     self.credential_source.as_ref(),
@@ -643,8 +885,14 @@ impl UsageProvider for CursorProvider {
                 );
             }
             return match result {
-                Ok(usage) => {
-                    FetchAttempt::success(observed, "vault", usage).with_account_info(account_info)
+                Ok((usage, pool)) => {
+                    let mut attempt = FetchAttempt::success(observed, "vault", usage)
+                        .with_account_info(account_info);
+                    // No pool leaves `pools` absent rather than empty: an empty
+                    // list would state the account has no pools, which a
+                    // failed or skipped spend read does not establish.
+                    attempt.pools = pool.map(|pool| vec![pool]);
+                    attempt
                 }
                 Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error)
                     .with_account_info(account_info),
@@ -675,15 +923,12 @@ impl UsageProvider for CursorProvider {
             };
             let credential = resolve_cursor_credential_async(jar, app_path).await?;
             let cookie = credential.cookie_header();
-
-            let body_bytes = JsonRequest::get(USAGE_URL)
-                .timeout(REQUEST_TIMEOUT)
-                .header(Header::new("Cookie", cookie))
-                .send(&self.http)
+            let (usage, pool) = self
+                .fetch_usage_and_spend(handle.stable_id(), cookie)
                 .await?;
-
-            let usage = normalize_usage(&body_bytes)?;
-            Ok(provider_usage_from_credential(&credential, source, usage))
+            let mut provider_usage = provider_usage_from_credential(&credential, source, usage);
+            provider_usage.spend = pool.map(|pool| vec![pool]);
+            Ok(provider_usage)
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -1373,5 +1618,360 @@ mod tests {
         );
         let request = request.await.unwrap();
         assert!(request.contains("WorkosCursorSessionToken=cursor-user%3A%3Aheader."));
+    }
+
+    // ---- Monthly on-demand spend for unified personal accounts ----
+
+    /// A unified personal plan's usage summary, as Cursor sends it.
+    const UNIFIED_SUMMARY: &str = r#"{
+        "membershipType": "unified_ultra",
+        "limitType": "user",
+        "billingCycleEnd": "2026-07-24T03:00:00Z",
+        "individualUsage": { "plan": { "totalPercentUsed": 45.5 } }
+    }"#;
+
+    /// A usage-status body matching a captured unified-account response, with
+    /// the period dates passed in.
+    fn usage_status(period_start: &str, resets_at: &str) -> String {
+        format!(
+            r#"{{"availability":"available","monthlyUsage":{{"usedCents":93,"limitCents":1000,"creditsUsedCents":0,"periodStart":"{period_start}","resetsAt":"{resets_at}"}}}}"#
+        )
+    }
+
+    /// A usage-status body whose period contains the real present, for tests
+    /// that go through the provider, which reads the wall clock.
+    fn current_usage_status() -> String {
+        let now = chrono::Utc::now();
+        let format = "%Y-%m-%dT%H:%M:%S%.3fZ";
+        usage_status(
+            &(now - chrono::Duration::days(1)).format(format).to_string(),
+            &(now + chrono::Duration::days(1)).format(format).to_string(),
+        )
+    }
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn usd(minor: i64) -> Amount {
+        Amount {
+            minor,
+            exponent: 2,
+            unit: "USD".to_string(),
+        }
+    }
+
+    /// A loopback server answering the summary at `/usage-summary` and the
+    /// spend read at `/usage-status`, recording the head of every request it
+    /// receives so a test can count them.
+    async fn serve_cursor_routes(
+        summary: String,
+        status_code: u16,
+        status_body: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut chunk = [0; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => head.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                seen.lock().unwrap().push(head);
+                let (code, body) = if request_line.contains(" /usage-status") {
+                    (status_code, status_body.clone())
+                } else {
+                    (200, summary.clone())
+                };
+                let response = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    /// A Cursor provider on its app-token lane, pointed at a loopback server.
+    fn provider_against(base: &str) -> (CursorProvider, CredentialHandle) {
+        let loader = std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("oauth:cursor", "oauth")]);
+        let mut provider = CursorProvider::new_with_handle_loader(
+            Some(std::sync::Arc::new(ScopedCursorSource::default())),
+            loader,
+        );
+        provider.usage_url = format!("{base}/usage-summary");
+        provider.usage_status_url = format!("{base}/usage-status?scope=user");
+        let handle = provider.handles().unwrap().remove(0);
+        (provider, handle)
+    }
+
+    fn recorded_refusal(
+        provider: &CursorProvider,
+        handle: &CredentialHandle,
+    ) -> Option<SpendRefusal> {
+        provider
+            .spend_refusals
+            .lock()
+            .unwrap()
+            .get(handle.stable_id())
+            .copied()
+    }
+
+    /// The captured unified reading publishes limit and remainder in USD cents,
+    /// with Cursor's own reset.
+    #[test]
+    fn captured_unified_reading_publishes_the_on_demand_pool() {
+        let body = usage_status("2026-10-01T00:00:00.000Z", "2026-11-01T00:00:00.000Z");
+        let pool = on_demand_pool(body.as_bytes(), fixed_now()).unwrap();
+        assert_eq!(
+            pool,
+            Pool {
+                id: "on_demand".to_string(),
+                label: "On-demand spend (monthly)".to_string(),
+                funding: PoolFunding::Unknown,
+                remaining: Some(usd(907)),
+                total: Some(usd(1000)),
+                basis: PoolBasis::Reported,
+                spendable: None,
+                resets_at: Some("2026-11-01T00:00:00Z".to_string()),
+                expires_at: None,
+            }
+        );
+    }
+
+    /// Spend past the limit leaves the pool empty, never negative.
+    #[test]
+    fn overspent_reading_floors_remaining_at_zero() {
+        let body = usage_status("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z")
+            .replace("\"usedCents\":93", "\"usedCents\":1250");
+        let pool = on_demand_pool(body.as_bytes(), fixed_now()).unwrap();
+        assert_eq!(pool.remaining, Some(usd(0)));
+        assert_eq!(pool.total, Some(usd(1000)));
+    }
+
+    /// Only a unified membership with a personal (`user`) limit qualifies; a
+    /// unified team budget and every older plan do not.
+    #[test]
+    fn unified_personal_gate_needs_unified_membership_and_a_user_limit() {
+        let gate = |membership: Option<&str>, limit: Option<&str>| {
+            CursorUsageSummary {
+                billing_cycle_end: None,
+                individual_usage: None,
+                membership_type: membership.map(str::to_string),
+                limit_type: limit.map(str::to_string),
+            }
+            .uses_unified_personal_billing()
+        };
+        assert!(gate(Some("unified_ultra"), Some("user")));
+        assert!(gate(Some("UNIFIED_pro"), Some("user")));
+        assert!(!gate(Some("unified_ultra"), Some("team")));
+        assert!(!gate(Some("unified_ultra"), None));
+        assert!(!gate(Some("pro"), Some("user")));
+        assert!(!gate(Some("unifiedpro"), Some("user")));
+        assert!(!gate(None, Some("user")));
+    }
+
+    /// Through the provider: a unified personal account makes one extra,
+    /// cookie-authenticated JSON request and publishes the pool beside the
+    /// unchanged plan window.
+    #[tokio::test]
+    async fn a_unified_account_publishes_the_on_demand_pool_beside_the_window() {
+        let (base, requests) =
+            serve_cursor_routes(UNIFIED_SUMMARY.to_string(), 200, current_usage_status()).await;
+        let (provider, handle) = provider_against(&base);
+
+        let attempt = provider.fetch_handle(&handle).await;
+
+        assert_eq!(
+            attempt.usage.as_ref().unwrap(),
+            &normalize_usage(UNIFIED_SUMMARY.as_bytes()).unwrap()
+        );
+        let pools = attempt.pools.expect("a valid reading publishes a pool");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id, "on_demand");
+        assert_eq!(pools[0].total, Some(usd(1000)));
+        assert_eq!(pools[0].remaining, Some(usd(907)));
+        assert_eq!(recorded_refusal(&provider, &handle), None);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let status = requests[1].to_ascii_lowercase();
+        assert!(
+            status.starts_with("get /usage-status?scope=user "),
+            "{status}"
+        );
+        assert!(status.contains("accept: application/json"), "{status}");
+        assert!(
+            status.contains("cookie: workoscursorsessiontoken=cursor-user%3a%3aheader."),
+            "{status}"
+        );
+    }
+
+    /// Any other plan never asks for the spend reading: one request per poll.
+    #[tokio::test]
+    async fn a_non_unified_account_makes_no_spend_request() {
+        let summaries = [
+            UNIFIED_SUMMARY.replace("unified_ultra", "pro"),
+            UNIFIED_SUMMARY.replace("\"user\"", "\"team\""),
+        ];
+        for summary in summaries {
+            let (base, requests) =
+                serve_cursor_routes(summary.clone(), 200, current_usage_status()).await;
+            let (provider, handle) = provider_against(&base);
+
+            let attempt = provider.fetch_handle(&handle).await;
+
+            assert!(attempt.usage.is_ok(), "{summary}");
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "a non-unified account must make only the summary request: {summary}"
+            );
+            assert!(requests[0].starts_with("GET /usage-summary "));
+            assert!(
+                attempt.pools.is_none(),
+                "a non-unified account publishes no pool: {summary}"
+            );
+        }
+    }
+
+    /// Fetch a unified account whose spend endpoint answers `status_body` with
+    /// `status_code`, and check that no pool is published, the window and
+    /// error class are what the summary alone gives, and `expected` is the
+    /// recorded reason.
+    async fn assert_refused(status_code: u16, status_body: String, expected: SpendRefusal) {
+        let (base, requests) = serve_cursor_routes(
+            UNIFIED_SUMMARY.to_string(),
+            status_code,
+            status_body.clone(),
+        )
+        .await;
+        let (provider, handle) = provider_against(&base);
+
+        let attempt = provider.fetch_handle(&handle).await;
+
+        assert_eq!(
+            attempt.usage.as_ref().ok(),
+            Some(&normalize_usage(UNIFIED_SUMMARY.as_bytes()).unwrap()),
+            "the window must survive a refused spend reading: {status_body}"
+        );
+        assert!(
+            attempt.pools.is_none(),
+            "a refused spend reading must publish no pool: {status_body}"
+        );
+        assert_eq!(
+            recorded_refusal(&provider, &handle),
+            Some(expected),
+            "{status_body}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// A reading for a period that does not contain the present (last month's
+    /// or next month's) publishes no pool and leaves the window intact.
+    #[tokio::test]
+    async fn a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window() {
+        let now = chrono::Utc::now();
+        let at = |offset_days: i64| {
+            (now + chrono::Duration::days(offset_days))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+        // Already reset: the present is at or after `resetsAt`.
+        assert_refused(
+            200,
+            usage_status(&at(-30), &at(-1)),
+            SpendRefusal::OutsidePeriod,
+        )
+        .await;
+        // Not started: the present is before `periodStart`.
+        assert_refused(
+            200,
+            usage_status(&at(1), &at(30)),
+            SpendRefusal::OutsidePeriod,
+        )
+        .await;
+    }
+
+    /// Every other unusable reading also publishes no pool and leaves the
+    /// window and error class exactly as the summary gives them.
+    #[tokio::test]
+    async fn an_unusable_spend_reading_publishes_no_pool_and_keeps_the_window() {
+        let valid = current_usage_status();
+        let cases = [
+            (
+                200,
+                valid.replace("\"available\"", "\"identity_unlinked\""),
+                SpendRefusal::NotAvailable,
+            ),
+            (
+                200,
+                valid.replace("\"availability\":\"available\",", ""),
+                SpendRefusal::NotAvailable,
+            ),
+            (
+                200,
+                r#"{"availability":"available"}"#.to_string(),
+                SpendRefusal::MonthlyUsageMissing,
+            ),
+            (
+                200,
+                valid.replace("\"usedCents\":93", "\"usedCents\":-1"),
+                SpendRefusal::AmountUnusable,
+            ),
+            (
+                200,
+                valid.replace("\"limitCents\":1000", "\"limitCents\":-1"),
+                SpendRefusal::AmountUnusable,
+            ),
+            (
+                200,
+                valid.replace("\"limitCents\":1000", "\"limitCents\":null"),
+                SpendRefusal::AmountUnusable,
+            ),
+            (
+                200,
+                valid.replace("\"usedCents\":93", "\"usedCents\":93.5"),
+                SpendRefusal::AmountUnusable,
+            ),
+            (
+                200,
+                valid.replace("\"usedCents\":93", "\"usedCents\":\"93\""),
+                SpendRefusal::Undecodable,
+            ),
+            (
+                200,
+                usage_status("not-a-date", "2099-01-01T00:00:00Z"),
+                SpendRefusal::DateUnreadable,
+            ),
+            (
+                200,
+                usage_status("2000-01-01T00:00:00Z", "bad-date"),
+                SpendRefusal::DateUnreadable,
+            ),
+            (200, "not json".to_string(), SpendRefusal::Undecodable),
+            (403, valid.clone(), SpendRefusal::RequestFailed),
+            (500, valid.clone(), SpendRefusal::RequestFailed),
+        ];
+        for (status_code, body, expected) in cases {
+            assert_refused(status_code, body, expected).await;
+        }
     }
 }

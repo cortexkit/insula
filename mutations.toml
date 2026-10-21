@@ -1494,3 +1494,37 @@ expect_message = "recent calls must defer real scheduler admission"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "cursor-on-demand-period"
+guards = "A Cursor monthly spend reading whose period does not contain the present publishes no on_demand pool and leaves the plan window intact"
+file = "crates/quota-core/src/cursor.rs"
+old = 'if !(start <= now && now < reset) {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/cursor.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["cursor::tests::a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window"]
+expect_message = "a refused spend reading must publish no pool"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "cursor-on-demand-unified-gate"
+guards = "Only unified personal Cursor accounts make the extra monthly spend request"
+file = "crates/quota-core/src/cursor.rs"
+old = 'if !summary.unified_personal {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/cursor.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["cursor::tests::a_non_unified_account_makes_no_spend_request"]
+expect_message = "a non-unified account must make only the summary request"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

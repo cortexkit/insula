@@ -1109,6 +1109,51 @@ section with a missing or null amount has no remainder and basis `unstated`,
 never a zero balance. No total, `spendable` flag or refill time is inferred.
 A page with credits and no rate window is valid.
 
+<a id="cursor-monthly-on-demand-spend-as-the-on_demand-pool"></a>
+
+### 7.12 `cursor`: monthly on-demand spend as the `on_demand` pool
+
+A Cursor account on a unified personal plan (`membershipType` starting with
+`unified_`, `limitType: user`) is billed for on-demand use past its plan.
+For those accounts only, insula makes one extra request to Cursor's dashboard
+(`/api/dashboard/v2/usage-status?scope=user`, same session, 5-second timeout)
+and publishes the month's on-demand spend beside the plan window:
+
+```json
+"spend": [
+  { "id": "on_demand", "label": "On-demand spend (monthly)",
+    "funding": "unknown", "basis": "reported",
+    "total":     { "minor": 1000, "exponent": 2, "unit": "USD" },
+    "remaining": { "minor": 907,  "exponent": 2, "unit": "USD" },
+    "resetsAt": "2026-11-01T00:00:00Z" }
+]
+```
+
+- `total` is the account's monthly on-demand limit and `remaining` that limit
+  minus the month's on-demand spend, never below zero, both from Cursor's
+  whole-cent figures. `basis: reported`: the spend figure covers this pool
+  alone, so the remainder is exact rather than a ceiling.
+- `funding: unknown` here means post-paid: on-demand use is billed after it
+  happens. Spending it costs money.
+- `resetsAt` is Cursor's own end of the monthly period. `spendable` is absent:
+  Cursor states no on/off switch in this reading.
+- The pool is published only when Cursor marks the reading `available`, both
+  cents figures are finite, non-negative whole numbers no greater than 2^53,
+  both period dates parse as RFC 3339 times, and the present falls inside the
+  period (`periodStart <= now < resetsAt`). A reading for another month is
+  never published as this month's.
+- **No pool, and `spend` absent**, when the account is on any other plan
+  (including a unified team budget, `limitType: team`; no extra request is
+  made), or when the extra request fails, times out or returns a reading
+  that fails a check above. The plan window and the entry's error class are
+  exactly what they would be without the extra request: its failure is never
+  the entry's failure.
+
+**Proven by:** `a_unified_account_publishes_the_on_demand_pool_beside_the_window`,
+`a_non_unified_account_makes_no_spend_request`,
+`a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window`,
+`an_unusable_spend_reading_publishes_no_pool_and_keeps_the_window`.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys
