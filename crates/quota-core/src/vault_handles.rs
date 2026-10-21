@@ -51,6 +51,12 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // The Muse CLI's device-code login token (`dca:…`), deposited by hand: the
     // CLI keeps it in the macOS Keychain, which insula doesn't read.
     ("apikey:muse", "muse"),
+    // The Vercel AI Gateway key reads the team's credit balance. A separate
+    // family, not an account suffix of this one, holds the access token and
+    // team id for the personal budget: the two credentials go to different
+    // hosts and are read by different providers.
+    ("apikey:vercel", "vercel"),
+    ("apikey:vercel-budget", "vercel-budget"),
 ];
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
@@ -89,6 +95,8 @@ enum ProviderKind {
     OpenRouter,
     MiniMax,
     Muse,
+    Vercel,
+    VercelBudget,
 }
 
 #[derive(Clone, Default)]
@@ -474,6 +482,14 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Muse)
     }
 
+    pub fn vercel_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Vercel)
+    }
+
+    pub fn vercel_budget_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::VercelBudget)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -572,6 +588,8 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "openrouter" => Some(ProviderKind::OpenRouter),
         "minimax" => Some(ProviderKind::MiniMax),
         "muse" => Some(ProviderKind::Muse),
+        "vercel" => Some(ProviderKind::Vercel),
+        "vercel-budget" => Some(ProviderKind::VercelBudget),
         _ => None,
     }
 }

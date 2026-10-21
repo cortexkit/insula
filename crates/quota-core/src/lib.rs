@@ -71,6 +71,8 @@ pub mod synthetic;
 pub mod text;
 pub mod unread_keys;
 pub mod vault_handles;
+pub mod vercel;
+pub mod vercel_budget;
 pub mod warp;
 pub mod wire_sanity;
 pub mod zai;
@@ -444,6 +446,10 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         "alibaba" => Some("alibaba-coding-plan"),
         "qwen-cloud" => Some("alibaba-token-plan"),
         "mimo" => Some("xiaomi"),
+        // The AI Gateway is models.dev's `vercel` provider (env
+        // AI_GATEWAY_API_KEY). `vercel-budget` has no entry: slugs are unique
+        // per provider, and the gateway's credit balance holds this one.
+        "vercel" => Some("vercel"),
         _ => None,
     }
 }
@@ -732,6 +738,14 @@ impl Registry {
             Box::new(kilo::KiloProvider::new()),
             Box::new(alibaba::AlibabaProvider::new()),
             Box::new(amp::AmpProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(vercel::VercelProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(vercel_budget::VercelBudgetProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

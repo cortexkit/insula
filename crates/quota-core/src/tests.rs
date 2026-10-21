@@ -9927,6 +9927,8 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "apikey:opencode-go",
         "apikey:ollama-cloud",
         "apikey:minimax-coding-plan",
+        "apikey:vercel",
+        "apikey:vercel-budget",
     ] {
         assert!(
             crate::vault_handles::CREDENTIAL_FAMILIES

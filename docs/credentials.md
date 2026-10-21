@@ -61,6 +61,8 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:openrouter` | `openrouter` |
 | `apikey:minimax-coding-plan` | `minimax` |
 | `apikey:muse` | `muse` |
+| `apikey:vercel` | `vercel` (the AI Gateway key) |
+| `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
@@ -99,6 +101,13 @@ under the family the provider reads. The Muse CLI keeps its device token in the
 macOS Keychain, which insula does not read, so `muse` is served from a hand
 deposit under `apikey:muse` or from the environment variable or file below.
 
+The Vercel personal budget needs an access token and the team whose budget it
+reads, so its deposit under `apikey:vercel-budget` is a JSON object,
+`{"token": "<access token>", "team_id": "<team id or slug>"}`. The AI Gateway
+key for the team's credit balance is a separate deposit under `apikey:vercel`.
+They are separate families, never one id with an account suffix: each
+credential is sent only to its own host.
+
 ## Local logins and API keys
 
 Without a vault record, most providers fall back to what is already on the
@@ -136,6 +145,8 @@ provider's source state it.
 | `stepfun` | | `STEPFUN_TOKEN` |
 | `sub2api` | | `SUB2API_API_KEY`, `SUB2API_BASE_URL` |
 | `synthetic` | | `SYNTHETIC_API_KEY` |
+| `vercel` | | `AI_GATEWAY_API_KEY` |
+| `vercel-budget` | | `VERCEL_ACCESS_TOKEN` with `VERCEL_TEAM_ID`; the token alone is `credential_unusable` |
 | `warp` | | `WARP_API_KEY`, `WARP_TOKEN` |
 | `zai` | | `Z_AI_API_KEY` |
 | `zenmux` | | `ZENMUX_MANAGEMENT_API_KEY` |

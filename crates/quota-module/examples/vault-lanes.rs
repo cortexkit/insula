@@ -991,6 +991,39 @@ mod tests {
         assert_eq!(report.exit_code, 0, "{report:?}");
     }
 
+    /// The two Vercel families route to two providers, one each: the gateway
+    /// key to `vercel` and the budget token to `vercel-budget`. Both rows are
+    /// expected to serve, so a dark budget lane beside a serving balance is a
+    /// finding rather than being excused by its sibling.
+    #[test]
+    fn the_two_vercel_families_route_to_their_own_providers() {
+        let ids = ["apikey:vercel", "apikey:vercel-budget"];
+        let report = evaluate(
+            granted(&ids),
+            usage(vec![
+                healthy("vercel", "vault"),
+                healthy("vercel-budget", "vault"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        let counts = report.counts.expect("a checked report has counts");
+        assert_eq!(counts.routed, 2, "{report:?}");
+        assert_eq!(counts.expected, 2, "{report:?}");
+        assert_eq!(counts.checked, 2, "{report:?}");
+        assert_eq!(report.exit_code, 0, "{report:?}");
+
+        let dark_budget = evaluate(
+            granted(&ids),
+            usage(vec![healthy("vercel", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(dark_budget.exit_code, 1, "{dark_budget:?}");
+    }
+
     #[test]
     fn removing_a_required_family_mapping_is_not_excused_as_unsupported() {
         let families_without_anthropic: Vec<_> = quota_core::vault_handles::CREDENTIAL_FAMILIES
