@@ -80,7 +80,14 @@ struct OAuthUsageResponse {
     seven_day: Option<OAuthWindow>,
     seven_day_opus: Option<OAuthWindow>,
     seven_day_sonnet: Option<OAuthWindow>,
-    limits: Option<Vec<ApiLimitEntry>>,
+    /// The scoped weekly limits (one row per model, such as Fable), read by
+    /// [`limit_entries`].
+    ///
+    /// Held as raw JSON and decoded one element at a time, so an element of a
+    /// shape this decoder does not expect costs that element alone. Typed here,
+    /// a single `null` entry or a Boolean `percent` would fail the whole
+    /// response, and the account would publish no windows at all.
+    limits: Option<serde_json::Value>,
     /// Paid overage ("extra usage"), read into a spend pool by [`overage_pool`].
     ///
     /// Held as raw JSON and decoded separately, so a shape this decoder does not
@@ -350,12 +357,20 @@ fn refusal_needs_log(previous: Option<RefusalReason>, current: Option<RefusalRea
     previous != current
 }
 
+/// One element of `limits`.
+///
+/// Every leaf is raw JSON and read by type afterwards ([`json_str`],
+/// [`limit_percent`]), so a field of an unexpected type reads as absent rather
+/// than discarding the entry. `scope` and `model` stay typed so the unread-key
+/// report can still name keys inside them; an entry whose `scope` or `model` is
+/// not an object is dropped, which costs nothing, because such an entry has no
+/// model name and could never become a row.
 #[derive(Debug, Deserialize)]
 struct ApiLimitEntry {
-    kind: Option<String>,
-    group: Option<String>,
-    percent: Option<f64>,
-    resets_at: Option<String>,
+    kind: Option<serde_json::Value>,
+    group: Option<serde_json::Value>,
+    percent: Option<serde_json::Value>,
+    resets_at: Option<serde_json::Value>,
     scope: Option<ApiLimitScope>,
 }
 
@@ -366,8 +381,62 @@ struct ApiLimitScope {
 
 #[derive(Debug, Deserialize)]
 struct ApiLimitModel {
-    id: Option<String>,
-    display_name: Option<String>,
+    id: Option<serde_json::Value>,
+    display_name: Option<serde_json::Value>,
+}
+
+/// One `limits` element wrapped back under its own key.
+///
+/// The wrapper exists so each element decodes at the path it has in the full
+/// body: the unread-key report then names a key inside an entry as
+/// `limits[].<key>`, exactly as it did when `limits` was decoded with the rest
+/// of the response.
+#[derive(Debug, Deserialize)]
+struct LimitsView {
+    limits: Option<Vec<ApiLimitEntry>>,
+}
+
+/// Decode the raw `limits` value one element at a time.
+///
+/// Anything other than an array publishes no entries, and an element that does
+/// not decode (a non-object, or a `scope` that is not an object) is skipped
+/// without touching its siblings. Keys insula does not read inside the decoded
+/// entries are reported like the rest of the response's.
+fn limit_entries(raw: Option<&serde_json::Value>) -> Vec<ApiLimitEntry> {
+    let Some(serde_json::Value::Array(elements)) = raw else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    let mut unread = Vec::new();
+    for element in elements {
+        let Ok(body) = serde_json::to_vec(&serde_json::json!({ "limits": [element] })) else {
+            continue;
+        };
+        let (decoded, names) = crate::unread_keys::decode_collecting_unread::<LimitsView>(&body);
+        // A failed element reports nothing, matching the whole-body decode,
+        // which only reports keys for a response it actually uses.
+        let Ok(LimitsView { limits }) = decoded else {
+            continue;
+        };
+        entries.extend(limits.into_iter().flatten());
+        unread.extend(names);
+    }
+    crate::unread_keys::report_unread(PROVIDER_NAME, unread);
+    entries
+}
+
+/// A raw leaf as a string, or `None` when it is absent or not a string.
+fn json_str(raw: Option<&serde_json::Value>) -> Option<&str> {
+    raw?.as_str()
+}
+
+/// A limit's `percent`, or `None` when it is absent or not a JSON number.
+///
+/// `serde_json` keeps Booleans apart from numbers, so `true` is never read as
+/// 1% here. CodexBar's parser did read it that way until v0.78.0 (a Swift
+/// `NSNumber` cast accepts Booleans), which is why the case has a test.
+fn limit_percent(raw: Option<&serde_json::Value>) -> Option<f64> {
+    raw?.as_f64()
 }
 
 fn slug(value: &str) -> String {
@@ -396,13 +465,10 @@ fn is_all_models_scope(model_id: Option<&str>, model_name: &str) -> bool {
     id_slug == "all-models" || id_slug.ends_with("-all-models")
 }
 
-fn scoped_weekly_extras(
-    limits: Option<&[ApiLimitEntry]>,
-) -> Option<Vec<crate::model::ExtraWindow>> {
+fn scoped_weekly_extras(limits: &[ApiLimitEntry]) -> Option<Vec<crate::model::ExtraWindow>> {
     let mut seen = HashSet::new();
     let extras: Vec<_> = limits
-        .into_iter()
-        .flatten()
+        .iter()
         // Match CodexBar's ClaudeScopedWeeklyLimitMapper: filter on group +
         // kind only. Do NOT filter on `is_active` — that flag marks which single
         // limit is *currently binding* (the tightest one), not whether a window
@@ -413,26 +479,22 @@ fn scoped_weekly_extras(
         // regardless of their own `is_active`, so honoring it only here was an
         // inconsistency, not a rule.
         .filter(|entry| {
-            entry.kind.as_deref() == Some("weekly_scoped")
-                && entry.group.as_deref().unwrap_or("weekly") == "weekly"
+            json_str(entry.kind.as_ref()) == Some("weekly_scoped")
+                && json_str(entry.group.as_ref()).unwrap_or("weekly") == "weekly"
         })
         .filter_map(|entry| {
             let model = entry.scope.as_ref()?.model.as_ref()?;
-            let display_name = model
-                .display_name
-                .as_deref()
+            let display_name = json_str(model.display_name.as_ref())
                 .map(str::trim)
                 .filter(|name| !name.is_empty())?;
-            let model_id = model
-                .id
-                .as_deref()
+            let model_id = json_str(model.id.as_ref())
                 .map(str::trim)
                 .filter(|id| !id.is_empty());
             if is_all_models_scope(model_id, display_name) {
                 return None;
             }
             let identity = model_id.unwrap_or(display_name).to_string();
-            let percent = entry.percent?;
+            let percent = limit_percent(entry.percent.as_ref())?;
             if !percent.is_finite() || !seen.insert(identity.clone()) {
                 return None;
             }
@@ -443,7 +505,7 @@ fn scoped_weekly_extras(
                     window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
                     used_percent: percent.clamp(0.0, 100.0),
                     raw_used_percent: None,
-                    resets_at: entry.resets_at.clone(),
+                    resets_at: json_str(entry.resets_at.as_ref()).map(str::to_string),
                     window_minutes: Some(SEVEN_DAY_MINUTES),
                     used_count: None,
                     total_count: None,
@@ -608,7 +670,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
             SEVEN_DAY_MINUTES,
             cortexkit_provider_usage::window_kind::WEEKLY,
         ),
-        extra_rate_windows: scoped_weekly_extras(response.limits.as_deref()),
+        extra_rate_windows: scoped_weekly_extras(&limit_entries(response.limits.as_ref())),
     };
     Ok((usage, pool, resets, shape))
 }
@@ -2196,6 +2258,127 @@ mod tests {
         let usage =
             normalize_usage(br#"{"five_hour":{"utilization":1.0,"resets_at":null}}"#).unwrap();
         assert!(usage.extra_rate_windows.is_none());
+    }
+
+    /// A body shaped like Anthropic's, with live session and weekly windows and
+    /// the given raw `limits` value.
+    fn limits_body(limits: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "five_hour": {{"utilization": 12.0, "resets_at": "2026-07-18T12:00:00Z"}},
+                "seven_day": {{"utilization": 60.0, "resets_at": "2026-07-20T12:00:00Z"}},
+                "limits": {limits}
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    /// The session and weekly percents, which a bad `limits` must never cost.
+    fn main_windows(usage: &Usage) -> (Option<f64>, Option<f64>) {
+        (
+            usage.primary.as_ref().map(|window| window.used_percent),
+            usage.secondary.as_ref().map(|window| window.used_percent),
+        )
+    }
+
+    #[test]
+    fn a_non_object_limits_entry_keeps_the_main_windows() {
+        let usage = normalize_usage(&limits_body("[null]"))
+            .expect("a null entry must not fail the response");
+        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn a_string_percent_reads_as_absent_and_keeps_the_main_windows() {
+        let usage = normalize_usage(&limits_body(
+            r#"[{"kind": "weekly_scoped", "percent": "12",
+                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
+        ))
+        .expect("a string percent must not fail the response");
+        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn a_boolean_percent_is_not_one_percent() {
+        // Everything else about the entry is valid, so reading `true` as a
+        // number would publish a 1% Fable row here.
+        let usage = normalize_usage(&limits_body(
+            r#"[{"kind": "weekly_scoped", "percent": true,
+                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
+        ))
+        .expect("a Boolean percent must not fail the response");
+        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
+        assert!(usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn a_valid_scoped_entry_survives_bad_siblings() {
+        let usage = normalize_usage(&limits_body(
+            r#"[
+                null,
+                "weekly_scoped",
+                {"kind": 7, "percent": 90.0,
+                    "scope": {"model": {"id": "other", "display_name": "Other"}}},
+                {"kind": "weekly_scoped", "percent": false,
+                    "scope": {"model": {"id": "fable-v0", "display_name": "Fable"}}},
+                {"kind": "weekly_scoped", "percent": 30.0, "scope": "fable"},
+                {"kind": "weekly_scoped", "percent": 40.0, "resets_at": 5,
+                    "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}
+            ]"#,
+        ))
+        .expect("bad entries must not fail the response");
+        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
+        let extras = usage
+            .extra_rate_windows
+            .expect("the valid Fable entry must be kept");
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
+        assert_eq!(extras[0].id.as_deref(), Some("fable-v1"));
+        let window = extras[0].window.as_ref().unwrap();
+        assert_eq!(window.used_percent, 40.0);
+        // A reset that is not a string is unstated, not a reason to drop the row.
+        assert_eq!(window.resets_at, None);
+    }
+
+    #[test]
+    fn a_non_array_limits_keeps_the_main_windows_and_adds_no_rows() {
+        for limits in [
+            r#"{"kind": "weekly_scoped", "percent": 40.0,
+                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}"#,
+            r#""weekly_scoped""#,
+            "null",
+        ] {
+            let usage = normalize_usage(&limits_body(limits))
+                .unwrap_or_else(|e| panic!("limits {limits} must not fail the response: {e:?}"));
+            assert_eq!(
+                main_windows(&usage),
+                (Some(12.0), Some(60.0)),
+                "limits {limits}"
+            );
+            assert!(usage.extra_rate_windows.is_none(), "limits {limits}");
+        }
+    }
+
+    #[test]
+    fn unread_keys_inside_limits_entries_are_still_reported() {
+        // The key name is unique to this test because the reported set is
+        // shared by the whole process.
+        normalize_usage(&limits_body(
+            r#"[null, {"kind": "weekly_scoped", "percent": 5.0,
+                "limits_entry_unread_probe": 1,
+                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
+        ))
+        .unwrap();
+        assert!(crate::unread_keys::was_reported(
+            PROVIDER_NAME,
+            "limits[].limits_entry_unread_probe"
+        ));
+        assert!(!crate::unread_keys::was_reported(
+            PROVIDER_NAME,
+            "limits[].percent"
+        ));
     }
 
     #[test]
