@@ -18,9 +18,9 @@
 //!     `X-Codeium-Csrf-Token: <token>` (omitted for the CLI).
 //!  4. Parse the quota summary: groups → buckets, each with `remainingFraction`
 //!     (0..1) and `resetTime`. The two pools (native Gemini models vs external
-//!     Claude/GPT models) are independent meters: only the Gemini pool maps to
-//!     the unnamed `primary`; every bucket (both pools) is surfaced as a named
-//!     per-pool extra window.
+//!     Claude/GPT models) are independent meters, so every bucket is published as
+//!     a named extra window with its own id, and no `primary` is set: picking one
+//!     bucket as a headline would make one pool's exhaustion read as the other's.
 //!
 //! The local server uses a SELF-SIGNED cert on loopback, so this provider builds ONE
 //! dedicated reqwest client with cert validation disabled — used EXCLUSIVELY for
@@ -43,8 +43,9 @@
 //! Wire format + field mapping ported from CodexBar
 //! `Sources/CodexBarCore/Providers/Antigravity/AntigravityStatusProbe.swift`
 //! (ps :1013-1018, process match :1104-1156, csrf :1130-1184, lsof :1191-1232, paths
-//! :771-775, request/headers :1467-1505/:1651-1660, representative :231-244, bucket
-//! kinds :362-371) + `AntigravityQuotaSummaryParser.swift:96-173`.
+//! :771-775, request/headers :1467-1505/:1651-1660, bucket kinds :362-371) +
+//! `AntigravityQuotaSummaryParser.swift:96-173`. Upstream also picks a
+//! representative bucket for its menu bar; insula deliberately doesn't.
 //!
 //! Cadence precedence follows upstream at v0.70.0 (`quotaCadenceCandidates` in
 //! the same `AntigravityStatusProbe.swift`; fixtures in
@@ -1758,16 +1759,7 @@ struct RemoteQuotaBucket {
 /// are not what a reader wants, and they are not independent meters either --
 /// every model in a pool shares that pool's fraction and reset. So the models
 /// are folded back into their pools here, and the published shape is the same
-/// either way: the native Gemini pool in the unnamed `primary`, both pools as
-/// named extra windows.
-///
-/// So `primary` is a HEADLINE POINTING AT one of the extras, not an additional
-/// limit, and this provider is the only one on the wire where a slot and a named
-/// extra are the same window. That is invisible to the reduction the consumer
-/// contract recommends -- a maximum is duplication-insensitive -- and it double
-/// counts under a sum or a mean. Stated in docs/consumer-contract.md beside the
-/// place those other policies are invited; if this shape ever changes, that
-/// paragraph is the one that goes stale.
+/// either way: each pool's cadences as named extra windows, with no `primary`.
 ///
 /// A model whose bucket states no reset is skipped rather than pooled. Those are
 /// the always-available internal models, and folding a permanently-idle bucket
