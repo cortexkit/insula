@@ -1615,8 +1615,6 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
-
-[[control]]
 id = "vercel-budget-none-has-no-period"
 guards = "A cumulative (none) Vercel budget is published with no reset, length or period, never as a period that resets"
 file = "crates/quota-core/src/vercel_budget.rs"
