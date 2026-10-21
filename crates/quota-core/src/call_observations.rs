@@ -230,7 +230,14 @@ mod tests {
         );
         let parsed = anthropic::call_windows(&bad);
         assert!(parsed.primary.is_none() && parsed.secondary.is_none());
-        for (value, expected) in [("-0.3", 0.0), ("1.5", 100.0)] {
+        // 0.14 * 100 is 14.000000000000002 in floating point, live on 2026-10-21.
+        // The header said 0.14, so the window must say exactly 14.
+        for (value, expected) in [
+            ("-0.3", 0.0),
+            ("1.5", 100.0),
+            ("0.14", 14.0),
+            ("0.29", 29.0),
+        ] {
             bad.insert(
                 "anthropic-ratelimit-unified-5h-utilization".into(),
                 value.into(),

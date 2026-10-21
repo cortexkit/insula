@@ -518,7 +518,7 @@ pub fn call_windows(headers: &std::collections::BTreeMap<String, String>) -> Usa
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         to_window(
             Some(&OAuthWindow {
-                utilization: Some(fraction.clamp(0.0, 1.0) * 100.0),
+                utilization: Some(fraction_to_percent(fraction)),
                 resets_at,
             }),
             minutes,
@@ -539,6 +539,16 @@ pub fn call_windows(headers: &std::collections::BTreeMap<String, String>) -> Usa
         tertiary: None,
         extra_rate_windows: None,
     }
+}
+
+/// A header utilization fraction as a percent, rounded to six decimal places.
+///
+/// Multiplying a decimal fraction by 100 in floating point leaves binary noise
+/// (`0.14` becomes `14.000000000000002`), which then reaches the wire and every
+/// renderer. The header states at most a few decimal places, so rounding to six
+/// keeps every digit it gave while removing the noise.
+fn fraction_to_percent(fraction: f64) -> f64 {
+    (fraction.clamp(0.0, 1.0) * 100.0 * 1e6).round() / 1e6
 }
 
 /// Normalize the body to its rate windows and the paid-overage pool, if any.
