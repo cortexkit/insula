@@ -1513,6 +1513,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "cursor-on-demand-period"
+guards = "A Cursor monthly spend reading whose period does not contain the present publishes no on_demand pool and leaves the plan window intact"
+file = "crates/quota-core/src/cursor.rs"
+old = 'if !(start <= now && now < reset) {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/cursor.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["cursor::tests::a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window"]
+expect_message = "a refused spend reading must publish no pool"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "antigravity-ordinary-title-stable"
 guards = "Pool-wide Antigravity buckets keep their plain pool-and-cadence titles byte for byte"
 file = "crates/quota-core/src/antigravity.rs"
@@ -1525,6 +1542,23 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["antigravity::tests::ordinary_bucket_titles_stay_pool_and_cadence_only", "antigravity::tests::the_four_live_bucket_shapes_keep_their_cadence", "antigravity::tests::both_lanes_title_the_same_meter_identically", "antigravity::tests::a_model_specific_bucket_is_titled_apart_from_its_pool_wide_sibling"]
 expect_message = "pool-wide buckets keep the title consumers already know"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "cursor-on-demand-unified-gate"
+guards = "Only unified personal Cursor accounts make the extra monthly spend request"
+file = "crates/quota-core/src/cursor.rs"
+old = 'if !summary.unified_personal {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/cursor.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["cursor::tests::a_non_unified_account_makes_no_spend_request"]
+expect_message = "a non-unified account must make only the summary request"
 only = false
 timeout_s = 600
 build_timeout_s = 1800

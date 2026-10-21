@@ -67,7 +67,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "codebuff": {"BASE_URL": "www.codebuff.com"},
     "codex": {"DEFAULT_BASE": "chatgpt.com"},
     "copilot": {"USAGE_URL": "api.github.com"},
-    "cursor": {"USAGE_URL": "cursor.com"},
+    "cursor": {"USAGE_URL": "cursor.com", "USAGE_STATUS_URL": "cursor.com"},
     "deepseek": {"BALANCE_URL": "api.deepseek.com"},
     "doubao": {
         "API_URL": "ark.cn-beijing.volces.com",
