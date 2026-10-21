@@ -2286,7 +2286,10 @@ mod tests {
         let usage = normalize_usage(&limits_body("[null]"))
             .expect("a null entry must not fail the response");
         assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(usage.extra_rate_windows.is_none());
+        assert!(
+            usage.extra_rate_windows.is_none(),
+            "a bad limits entry must not become a row"
+        );
     }
 
     #[test]
@@ -2297,7 +2300,10 @@ mod tests {
         ))
         .expect("a string percent must not fail the response");
         assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(usage.extra_rate_windows.is_none());
+        assert!(
+            usage.extra_rate_windows.is_none(),
+            "a bad limits entry must not become a row"
+        );
     }
 
     #[test]
@@ -2310,7 +2316,10 @@ mod tests {
         ))
         .expect("a Boolean percent must not fail the response");
         assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(usage.extra_rate_windows.is_none());
+        assert!(
+            usage.extra_rate_windows.is_none(),
+            "a bad limits entry must not become a row"
+        );
     }
 
     #[test]
@@ -2333,7 +2342,7 @@ mod tests {
         let extras = usage
             .extra_rate_windows
             .expect("the valid Fable entry must be kept");
-        assert_eq!(extras.len(), 1);
+        assert_eq!(extras.len(), 1, "a bad limits entry must not become a row");
         assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
         assert_eq!(extras[0].id.as_deref(), Some("fable-v1"));
         let window = extras[0].window.as_ref().unwrap();
@@ -2370,7 +2379,7 @@ mod tests {
                 "limits_entry_unread_probe": 1,
                 "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
         ))
-        .unwrap();
+        .expect("a bad limits entry must not fail the response");
         assert!(crate::unread_keys::was_reported(
             PROVIDER_NAME,
             "limits[].limits_entry_unread_probe"
