@@ -1567,14 +1567,16 @@ impl Registry {
             candidates
                 .into_iter()
                 .filter_map(|candidate| {
-                    store.admit(&candidate.key, candidate.incarnation).map(
-                        |(prev, attempt_sequence)| DueUnit {
-                            provider_index: candidate.provider_index,
-                            key: candidate.key,
-                            prev,
-                            attempt_sequence,
-                        },
-                    )
+                    let (prev, attempt_sequence) =
+                        store.admit(&candidate.key, candidate.incarnation)?;
+                    // Count the admitted fetch before its outcome is known.
+                    store.record_fetch_attempt(&candidate.key.provider);
+                    Some(DueUnit {
+                        provider_index: candidate.provider_index,
+                        key: candidate.key,
+                        prev,
+                        attempt_sequence,
+                    })
                 })
                 .collect()
         };
@@ -1816,6 +1818,7 @@ impl Registry {
             created_at,
             stale_episodes,
             stale_episodes_by_provider,
+            fetch_attempts_by_provider,
             last_stale_episode,
             quota_drops_by_provider,
             quota_drops_observed_continuously,
@@ -1828,6 +1831,7 @@ impl Registry {
                 store.created_at(),
                 store.stale_episodes(),
                 store.stale_episodes_by_provider(),
+                store.fetch_attempts_by_provider(),
                 store.last_stale_episode(),
                 store.quota_drops_by_provider(),
                 store.quota_drops_observed_continuously(),
@@ -1996,6 +2000,7 @@ impl Registry {
             stale,
             stale_episodes,
             stale_episodes_by_provider,
+            fetch_attempts_by_provider,
             last_stale_episode,
             quota_drops_by_provider,
             quota_drops_observed_continuously,

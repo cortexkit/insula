@@ -869,6 +869,9 @@ fn health_report(
         // Membership is since boot, so a provider here is usually healthy now.
         // Not part of the conservation identity.
         "staleEpisodesByProvider": snapshot.stale_episodes_by_provider,
+        // Upstream fetches dispatched per provider since process start. Counted
+        // before the result is known, and separate from `usage.observe` readings.
+        "fetchAttemptsByProvider": snapshot.fetch_attempts_by_provider,
         // The counters say WHETHER and this says WHY. Flattened into one string
         // rather than nested, because these metrics are read at a glance in a
         // terminal and an operator chasing a climbing count wants the account and
@@ -2529,6 +2532,7 @@ mod tests {
             stale: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            fetch_attempts_by_provider: std::collections::BTreeMap::new(),
             last_stale_episode: None,
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,
@@ -3026,6 +3030,7 @@ mod tests {
             "fresh",
             "stale",
             "staleEpisodesByProvider",
+            "fetchAttemptsByProvider",
             "lastStaleEpisode",
             "quotaDropsByProvider",
             "quotaDropsObservedContinuously",

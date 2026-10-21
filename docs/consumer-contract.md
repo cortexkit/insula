@@ -1572,6 +1572,7 @@ not happened, never zero.
 | `fetchBlackout` | bool | `lastFetchSuccessAgeSecs` has passed the blackout horizon (1800 s) |
 | `staleEpisodes` | number | times any slot entered stale-serving |
 | `staleEpisodesByProvider` | object | `staleEpisodes` per provider |
+| `fetchAttemptsByProvider` | object | upstream fetches dispatched per provider since process start, regardless of outcome; excludes `usage.observe` call readings |
 | `lastStaleEpisode` | string or null | the most recent episode |
 | `quotaDropsByProvider` | object | drops recorded per provider |
 | `quotaDropsObservedContinuously` | object | of those, the ones observed across a continuous interval |
@@ -1603,10 +1604,15 @@ not happened, never zero.
 | `quotaSamplesPublished` | number | acknowledged quota notices since process start |
 | `quotaSamplesDropped` | number | quota samples dropped from the bounded queue or failed publish attempts |
 
-**Event counters** (`staleEpisodes`, `staleEpisodesByProvider`, the
+**Event counters** (`staleEpisodes`, `staleEpisodesByProvider`,
+`fetchAttemptsByProvider`, the
 `quotaDrops*` and `quotaComparisonsNoDrop` / `quotaNotComparable` counts) are
 not part of the conservation identity: they count events over time, not
 members of the current population. They reset on restart.
+
+`fetchAttemptsByProvider` increments once when the refresher dispatches an
+upstream fetch attempt, before its outcome is known. It measures upstream polling
+cadence by provider; `usage.observe` call readings do not increment it.
 
 **Stale episodes.** `stale` is a gauge; `staleEpisodes` counts transitions into
 stale-serving, so a slot stale across many turns counts once, and a transient

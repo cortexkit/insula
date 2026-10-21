@@ -75,6 +75,10 @@ pub struct HealthSnapshot {
     /// a partition of the current population. A provider named here may be
     /// perfectly healthy right now, and usually is.
     pub stale_episodes_by_provider: std::collections::BTreeMap<String, u64>,
+    /// Upstream fetch attempts dispatched per provider since process start.
+    /// A dispatch is counted regardless of outcome; `usage.observe` readings are
+    /// not upstream fetches and are excluded.
+    pub fetch_attempts_by_provider: std::collections::BTreeMap<String, u64>,
     /// The most recent stale-serving episode, carrying the class and account
     /// the counters cannot. Absent until one occurs.
     pub last_stale_episode: Option<crate::store::StaleEpisode>,
@@ -252,6 +256,7 @@ impl HealthSnapshot {
             pending: 0,
             stale_episodes: 0,
             stale_episodes_by_provider: std::collections::BTreeMap::new(),
+            fetch_attempts_by_provider: std::collections::BTreeMap::new(),
             last_stale_episode: None,
             quota_drops_by_provider: std::collections::BTreeMap::new(),
             quota_drops_observed_continuously: 0,

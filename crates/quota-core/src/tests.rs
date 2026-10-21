@@ -116,6 +116,48 @@ async fn after_turn_observer_receives_the_serving_snapshot() {
     );
 }
 
+#[tokio::test]
+async fn refresher_counts_each_dispatched_fetch_attempt_per_provider() {
+    let registry = registry(&[("due", false, true), ("not_due", false, true)]);
+    tick(&registry).await;
+
+    let defer_not_due = || {
+        let mut store = registry.store.lock().unwrap();
+        for (key, mut slot) in store.snapshot() {
+            if key.provider != "not_due" {
+                continue;
+            }
+            slot.next_due_at = Instant::now() + Duration::from_secs(60);
+            let incarnation = slot.incarnation;
+            let attempt_sequence = slot.attempt_sequence;
+            assert!(store.publish_if_current(&key, incarnation, attempt_sequence, slot));
+        }
+    };
+
+    defer_not_due();
+    tick(&registry).await;
+    assert_eq!(
+        registry.health().fetch_attempts_by_provider,
+        [("due".to_string(), 1), ("not_due".to_string(), 1)]
+            .into_iter()
+            .collect()
+    );
+
+    for expected_due_attempts in 2..=3 {
+        force_due(&registry, "due");
+        tick(&registry).await;
+        assert_eq!(
+            registry.health().fetch_attempts_by_provider,
+            [
+                ("due".to_string(), expected_due_attempts),
+                ("not_due".to_string(), 1)
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+}
+
 struct BlockingProvider {
     name: &'static str,
     started: Arc<Notify>,

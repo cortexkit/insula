@@ -198,6 +198,12 @@ pub struct SlotStore {
     /// Still bounded by the registry (37 keys at most) however long the process
     /// runs or how often a lane flaps, which is what the set was chosen for.
     stale_episodes_by_provider: BTreeMap<String, u64>,
+    /// Dispatched upstream fetch attempts per provider since process start.
+    ///
+    /// Counted when the refresher schedules each fetch, before the fetch runs, so
+    /// successes, failures, timeouts, and panics all describe the same unit of work.
+    /// Forwarded call readings are not fetch attempts and never enter this counter.
+    fetch_attempts_by_provider: BTreeMap<String, u64>,
     /// The most recent stale-serving episode, with the detail the counters
     /// cannot carry. See `record_stale_episode` for why only the last one.
     last_stale_episode: Option<StaleEpisode>,
@@ -270,6 +276,7 @@ impl SlotStore {
             next_attempt_sequence: 1,
             stale_episodes: 0,
             stale_episodes_by_provider: BTreeMap::new(),
+            fetch_attempts_by_provider: BTreeMap::new(),
             last_stale_episode: None,
             quota_drops_by_provider: BTreeMap::new(),
             quota_drops_observed_continuously: 0,
@@ -448,6 +455,11 @@ impl SlotStore {
         self.stale_episodes_by_provider.clone()
     }
 
+    /// Per-provider upstream fetch attempts dispatched since process start.
+    pub fn fetch_attempts_by_provider(&self) -> BTreeMap<String, u64> {
+        self.fetch_attempts_by_provider.clone()
+    }
+
     /// The most recent stale-serving episode, or None if none has occurred.
     pub fn last_stale_episode(&self) -> Option<StaleEpisode> {
         self.last_stale_episode.clone()
@@ -456,6 +468,14 @@ impl SlotStore {
     /// Per-provider counts of observed used-percent decreases, by provider name.
     pub fn quota_drops_by_provider(&self) -> BTreeMap<String, u64> {
         self.quota_drops_by_provider.clone()
+    }
+
+    /// Record one upstream fetch attempt when the refresher schedules it to run.
+    pub(crate) fn record_fetch_attempt(&mut self, provider: &str) {
+        *self
+            .fetch_attempts_by_provider
+            .entry(provider.to_string())
+            .or_insert(0) += 1;
     }
 
     /// How many observed decreases were seen across a continuous poll interval.
