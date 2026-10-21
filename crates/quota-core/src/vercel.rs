@@ -397,7 +397,7 @@ mod tests {
     fn a_vault_deposit_routes_to_vercel_and_replaces_the_environment_lane() {
         let loader = Arc::new(VaultHandleLoader::default());
         loader.install_rows_for_test(&[("apikey:vercel", "apikey")]);
-        let (source, _) = MockSource::new(&[]);
+        let (source, _) = MockSource::serving(&[]);
         let with_vault = provider(
             Some(source),
             Arc::clone(&loader),
@@ -408,7 +408,7 @@ mod tests {
 
         // The control: the same environment with no deposit enumerates the
         // environment lane, so the line above is the vault replacing it.
-        let (source, _) = MockSource::new(&[]);
+        let (source, _) = MockSource::serving(&[]);
         let without_vault = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -434,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn the_vault_key_reads_the_balance() {
         let (base, served) = routes(|_, _| (200, CREDITS.as_bytes().to_vec())).await;
-        let (source, reports) = MockSource::new(&[("apikey:vercel", credential("gw-key", 3))]);
+        let (source, reports) = MockSource::serving(&[("apikey:vercel", credential("gw-key", 3))]);
         let provider = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -492,7 +492,8 @@ mod tests {
             (503, "upstream_failed", false),
         ] {
             let (base, _) = routes(move |_, _| (status, b"private-response".to_vec())).await;
-            let (source, reports) = MockSource::new(&[("apikey:vercel", credential("gw-key", 11))]);
+            let (source, reports) =
+                MockSource::serving(&[("apikey:vercel", credential("gw-key", 11))]);
             let provider = provider(
                 Some(source),
                 Arc::new(VaultHandleLoader::default()),
@@ -526,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn a_bad_payload_is_decode_failed() {
         let (base, _) = routes(|_, _| (200, br#"{"balance":12}"#.to_vec())).await;
-        let (source, reports) = MockSource::new(&[("apikey:vercel", credential("gw-key", 1))]);
+        let (source, reports) = MockSource::serving(&[("apikey:vercel", credential("gw-key", 1))]);
         let provider = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -633,7 +634,7 @@ pub(crate) mod testkit {
     }
 
     impl MockSource {
-        pub(crate) fn new(
+        pub(crate) fn serving(
             credentials: &[(&str, VaultCredential)],
         ) -> (Arc<dyn CredentialSource>, Reports) {
             let reports: Reports = Arc::new(Mutex::new(Vec::new()));

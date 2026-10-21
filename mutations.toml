@@ -1494,3 +1494,38 @@ expect_message = "recent calls must defer real scheduler admission"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "vercel-gateway-key-stays-on-its-host"
+guards = "The AI Gateway key is sent only to ai-gateway.vercel.sh, never to the budget host api.vercel.com"
+file = "crates/quota-core/src/vercel.rs"
+old = 'format!("{}{CREDITS_PATH}", self.hosts.gateway)'
+new = 'format!("{}{CREDITS_PATH}", self.hosts.api) /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-core/src/vercel_budget.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["vercel_budget::tests::neither_credential_ever_reaches_the_other_lanes_host"]
+expect_message = "the gateway key reached the budget host"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "vercel-budget-none-has-no-period"
+guards = "A cumulative (none) Vercel budget is published with no reset, length or period, never as a period that resets"
+file = "crates/quota-core/src/vercel_budget.rs"
+old = 'Some("monthly") => {'
+new = 'Some("monthly") | Some("none") => { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/vercel_budget.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["vercel_budget::tests::a_cumulative_none_budget_has_no_reset_length_or_period"]
+expect_message = "a cumulative budget must not be published as a period that resets"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

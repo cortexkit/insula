@@ -20,7 +20,8 @@
 //! that are not Booleans, a `source` other than `default`, repeated or invalid
 //! cursors and a 21st page all fail the reading rather than publish a guess.
 //!
-//! The window is `currentSpend / limitAmount`. `refreshPeriod` sets the reset at
+//! The window's `usedPercent` is `currentSpend / limitAmount × 100`, capped at
+//! 100. `refreshPeriod` sets the reset at
 //! Vercel's documented UTC boundaries: `daily` at the next midnight, `weekly` on
 //! the next Monday, `monthly` on the 1st of next month. A `none` budget is
 //! cumulative: it never resets, so it is published with no reset, no length and
@@ -660,7 +661,8 @@ mod tests {
     /// Read through the vault lane against `pages`, with the deposit above.
     async fn fetch(pages: HashMap<String, String>) -> (FetchAttempt, Log) {
         let (base, log) = api(pages).await;
-        let (source, _) = MockSource::new(&[("apikey:vercel-budget", credential(&deposit(), 5))]);
+        let (source, _) =
+            MockSource::serving(&[("apikey:vercel-budget", credential(&deposit(), 5))]);
         let provider = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -1009,7 +1011,8 @@ mod tests {
     async fn a_user_answer_without_an_id_is_a_decode_failure() {
         let (base, _) =
             routes(|_, _| (200, br#"{"user":{"email":"x@example.com"}}"#.to_vec())).await;
-        let (source, _) = MockSource::new(&[("apikey:vercel-budget", credential(&deposit(), 1))]);
+        let (source, _) =
+            MockSource::serving(&[("apikey:vercel-budget", credential(&deposit(), 1))]);
         let provider = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -1058,7 +1061,7 @@ mod tests {
                 })
                 .await;
                 let (source, reports) =
-                    MockSource::new(&[("apikey:vercel-budget", credential(&deposit(), 8))]);
+                    MockSource::serving(&[("apikey:vercel-budget", credential(&deposit(), 8))]);
                 let provider = provider(
                     Some(source),
                     Arc::new(VaultHandleLoader::default()),
@@ -1102,7 +1105,8 @@ mod tests {
             r#"{"token":"fixture-token","team_id":"team/../x"}"#,
         ] {
             let (base, log) = api(HashMap::new()).await;
-            let (source, _) = MockSource::new(&[("apikey:vercel-budget", credential(payload, 1))]);
+            let (source, _) =
+                MockSource::serving(&[("apikey:vercel-budget", credential(payload, 1))]);
             let provider = provider(
                 Some(source),
                 Arc::new(VaultHandleLoader::default()),
@@ -1164,11 +1168,11 @@ mod tests {
         let env = [(TOKEN_ENV, "env-token"), (TEAM_ENV, TEAM)];
         let loader = Arc::new(VaultHandleLoader::default());
         loader.install_rows_for_test(&[("apikey:vercel-budget", "apikey")]);
-        let (source, _) = MockSource::new(&[]);
+        let (source, _) = MockSource::serving(&[]);
         let with_vault = provider(Some(source), loader, hosts("http://127.0.0.1:9"), &env);
         assert_eq!(with_vault.handles().unwrap(), vec![vault_handle()]);
 
-        let (source, _) = MockSource::new(&[]);
+        let (source, _) = MockSource::serving(&[]);
         let without_vault = provider(
             Some(source),
             Arc::new(VaultHandleLoader::default()),
@@ -1212,7 +1216,7 @@ mod tests {
             ("apikey:vercel", "apikey"),
             ("apikey:vercel-budget", "apikey"),
         ]);
-        let (source, _) = MockSource::new(&[
+        let (source, _) = MockSource::serving(&[
             ("apikey:vercel", credential("gateway-key", 1)),
             ("apikey:vercel-budget", credential(&deposit(), 1)),
         ]);
@@ -1287,7 +1291,7 @@ mod tests {
                 ("apikey:vercel", "apikey"),
                 ("apikey:vercel-budget", "apikey"),
             ]);
-            let (source, _) = MockSource::new(&[
+            let (source, _) = MockSource::serving(&[
                 ("apikey:vercel", credential("gateway-key", 1)),
                 ("apikey:vercel-budget", credential(&deposit(), 1)),
             ]);
