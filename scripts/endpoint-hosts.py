@@ -111,6 +111,10 @@ EXPECTED: dict[str, dict[str, str]] = {
     "sakana": {"BILLING_URL": "console.sakana.ai"},
     "stepfun": {"API_URL": "platform.stepfun.com"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},
+    # Both Vercel origins live in vercel.rs. The gateway key goes only to the
+    # first, read by `vercel`; the budget access token goes only to the second,
+    # read by `vercel-budget` (vercel_budget.rs holds no origin of its own).
+    "vercel": {"GATEWAY_BASE": "ai-gateway.vercel.sh", "API_BASE": "api.vercel.com"},
     "warp": {"API_URL": "app.warp.dev"},
     "zai": {"DEFAULT_BASE": "api.z.ai"},
     "zenmux": {"SUBSCRIPTION_DETAIL_URL": "zenmux.ai"},

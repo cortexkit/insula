@@ -40,8 +40,8 @@ commands.
 
 ## Providers
 
-The [provider matrix](docs/provider-matrix.md) lists all 39 registered providers.
-Balance-only providers include `deepseek`, `openrouter`, and `claude-console`.
+The [provider matrix](docs/provider-matrix.md) lists all 41 registered providers.
+Balance-only providers include `deepseek`, `openrouter`, `vercel`, and `claude-console`.
 `claude-console` reads a Console organization's subscription, purchased, and
 promotional API credit from a `cookie:platform.claude.com:<account>` vault deposit
 captured by Cerebellum; several accounts can be deposited separately. It never

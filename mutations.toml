@@ -1513,6 +1513,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "vercel-gateway-key-stays-on-its-host"
+guards = "The AI Gateway key is sent only to ai-gateway.vercel.sh, never to the budget host api.vercel.com"
+file = "crates/quota-core/src/vercel.rs"
+old = 'format!("{}{CREDITS_PATH}", self.hosts.gateway)'
+new = 'format!("{}{CREDITS_PATH}", self.hosts.api) /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-core/src/vercel_budget.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["vercel_budget::tests::neither_credential_ever_reaches_the_other_lanes_host"]
+expect_message = "the gateway key reached the budget host"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "claude-limits-one-bad-entry-fails-response"
 guards = "One malformed Claude limits entry costs only that entry, never the session and weekly windows or its valid siblings"
 file = "crates/quota-core/src/anthropic.rs"
@@ -1593,6 +1610,25 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["anthropic::tests::a_boolean_percent_is_not_one_percent", "anthropic::tests::a_valid_scoped_entry_survives_bad_siblings"]
 expect_message = "a bad limits entry must not become a row"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+
+[[control]]
+id = "vercel-budget-none-has-no-period"
+guards = "A cumulative (none) Vercel budget is published with no reset, length or period, never as a period that resets"
+file = "crates/quota-core/src/vercel_budget.rs"
+old = 'Some("monthly") => {'
+new = 'Some("monthly") | Some("none") => { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/vercel_budget.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["vercel_budget::tests::a_cumulative_none_budget_has_no_reset_length_or_period"]
+expect_message = "a cumulative budget must not be published as a period that resets"
 only = false
 timeout_s = 600
 build_timeout_s = 1800

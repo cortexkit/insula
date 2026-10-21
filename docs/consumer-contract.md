@@ -749,6 +749,9 @@ limit the provider named without a readable figure. A consumer that ignores
   cookie lane for that account. `Monthly credits used` and relative
   `Next refill` prose have no denominator or absolute time and are not
   published as a window or reset.
+- **`vercel-budget`** publishes one `primary` window for the user's personal AI
+  Gateway budget, including a cumulative budget with no reset, length or kind;
+  see [7.12](#vercel-and-vercel-budget-the-team-balance-and-a-personal-budget).
 
 **Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
 `a_page_with_monthly_and_session_blocks_publishes_both`,
@@ -1153,6 +1156,87 @@ and publishes the month's on-demand spend beside the plan window:
 `a_non_unified_account_makes_no_spend_request`,
 `a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window`,
 `an_unusable_spend_reading_publishes_no_pool_and_keeps_the_window`.
+
+<a id="vercel-and-vercel-budget-the-team-balance-and-a-personal-budget"></a>
+
+### 7.13 `vercel` and `vercel-budget`: the team balance and a personal budget
+
+Vercel's AI Gateway is read by two providers with two credentials, and neither
+credential is ever sent to the other's host. They are separate providers
+because the balance carries no account identity: as two credentials of one
+provider, the identity-less one would collapse both into one unlabelled entry
+([9.1](#an-absent-account-is-never-a-statement-that-the-account-is-gone)).
+Each entry fails, goes stale and recovers on its own.
+
+**`vercel`**, from the AI Gateway key (`apikey:vercel` or
+`AI_GATEWAY_API_KEY`), sent only to `ai-gateway.vercel.sh`:
+
+```json
+"usage": {},
+"spend": [
+  { "id": "balance", "label": "Team credit balance",
+    "funding": "unknown", "basis": "reported",
+    "remaining": { "minor": 9550, "exponent": 2, "unit": "USD" } }
+]
+```
+
+- `remaining` is the team's balance exactly as stated, at the provider's own
+  precision. Zero and negative balances are published as they are.
+- `basis: reported`: the endpoint states the remainder itself.
+  `funding: unknown`: one figure covers whatever credit the team holds, bought
+  or given.
+- No `total`, `spendable` or `resetsAt`. The endpoint's lifetime spend is not
+  the pool's size, a positive balance is not an enable flag, and no period is
+  stated.
+- There is no account: the key's answer names none.
+- A missing or malformed amount is `decode_failed`, never a zero balance.
+
+**`vercel-budget`**, from an access token and team id (`apikey:vercel-budget`
+holding `{"token", "team_id"}`, or `VERCEL_ACCESS_TOKEN` with `VERCEL_TEAM_ID`),
+sent only to `api.vercel.com`. It publishes the user's personal budget in that
+team as `primary`:
+
+| `refreshPeriod` | `resetsAt` | `windowMinutes` | `windowKind` |
+| --- | --- | --- | --- |
+| `daily` | next 00:00 UTC | `1440` | `daily` |
+| `weekly` | next Monday 00:00 UTC | `10080` | `weekly` |
+| `monthly` | the 1st of next month, 00:00 UTC | absent | `monthly` |
+| `none` | absent | absent | absent |
+
+- `usedPercent` is `currentSpend / limitAmount × 100`, capped at 100.
+- `none` is a cumulative budget that never resets. All three fields are absent,
+  and absent here means the allowance does not come back by waiting.
+- `account` is the Vercel user id; `accountInfo.orgName` is the team id and
+  `accountInfo.email` the user's email when Vercel sends one.
+- No budget for this user in the team is `no_quota_reported`, never a 0%
+  window.
+- The remaining allowance is not what can be spent. Team, project and key
+  budgets, or the team's balance, can stop requests first.
+- **`vercel-budget` carries no `apiProvider`.** `vercel` publishes the
+  models.dev slug `vercel`, and slugs are unique per provider
+  ([8.3](#which-field-to-key-on)). A consumer that joins on `apiProvider`
+  reaches only the balance. To use the budget for the same gateway, join it by
+  `provider`, so the two entries are never double-joined as one.
+
+Both providers' failures take the shared classes: no credential is
+`credential_absent`; a deposit that is not the documented JSON, a token without
+a team, or a team id outside 1-128 letters, digits, `_` or `-` is
+`credential_unusable` and sends nothing; 401 and 403 are `credential_rejected`,
+and only a 401 on a vault credential is reported to the vault (a 403 is
+Vercel refusing permission, for example a Contributor reading budgets); 429 and
+5xx are `upstream_failed` and keep the last reading served; an unexpected
+answer, ambiguous budgets, non-Boolean flags, repeated cursors and a 21st page
+are `decode_failed`. Both are tested against fixtures shaped from upstream
+CodexBar v0.79.0, not against a live Vercel account.
+
+**Proven by:** `the_documented_balance_is_one_reported_usd_pool_of_unknown_funding`,
+`zero_and_negative_balances_are_published_as_stated`,
+`each_period_resets_at_its_documented_utc_boundary`,
+`a_cumulative_none_budget_has_no_reset_length_or_period`,
+`a_budget_names_the_user_by_bare_or_usr_prefixed_id_only`,
+`no_budget_for_this_user_is_no_quota_reported_not_zero`,
+`neither_credential_ever_reaches_the_other_lanes_host`,
+`a_failure_on_one_lane_never_costs_the_other_its_reading`.
 
 <a id="fields-on-the-account-not-the-window"></a>
 

@@ -1,6 +1,6 @@
 # Provider matrix
 
-39 providers registered.
+41 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -60,6 +60,8 @@ on every operating system. The public wire semantics are in
 | `openrouter` | OpenCode `openrouter` API key; vault `apikey:openrouter` | `GET https://openrouter.ai/api/v1/credits`; `/api/v1/key` for owner | Derived USD balance; no rate window |
 | `stepfun` | `STEPFUN_TOKEN` | `POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit` | 5h / weekly quota |
 | `sub2api` | `SUB2API_API_KEY`, configured `SUB2API_BASE_URL` | `GET {base}/v1/usage` | Named rate-limit windows (5h / 1d / 7d recognized); money fields omitted |
+| `vercel` | `AI_GATEWAY_API_KEY`; vault `apikey:vercel` | `GET https://ai-gateway.vercel.sh/v1/credits` | Reported USD team credit balance; no rate window. Tested against upstream fixtures only |
+| `vercel-budget` | `VERCEL_ACCESS_TOKEN` with `VERCEL_TEAM_ID`; vault `apikey:vercel-budget` (JSON `{"token", "team_id"}`) | `GET https://api.vercel.com/v2/user`; `/ai-gateway/budgets/list?teamId=…&scopeType=user`, up to 20 pages | Personal AI Gateway budget: daily / weekly / monthly window at UTC boundaries, or a cumulative window with no reset. Tested against upstream fixtures only |
 | `warp` | `WARP_API_KEY`, `WARP_TOKEN` | `POST https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo` | Request-limit utilization and next refresh |
 | `synthetic` | `SYNTHETIC_API_KEY`; vault `apikey:synthetic`; `SYNTHETIC_API_URL` override | `GET https://api.synthetic.new/v2/quotas` | Subscription / weekly and additional reported quota windows |
 | `zai` | `Z_AI_API_KEY`; configurable base/region and optional organization/project scope | `GET https://api.z.ai/api/monitor/usage/quota/limit` (base configurable) | Token quota and named limits; durations from upstream units |
