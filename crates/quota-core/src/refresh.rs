@@ -36,6 +36,10 @@ use crate::provider::{
 /// So halving this would put every healthy recovery under their floor and read as
 /// a scheduling defect on their side, with nothing in either repository
 /// connecting the two. Their standing rule is that a reading below the floor
+/// means this constant changed rather than that scheduling broke -- which is
+/// correct, and only works if someone tells them. Say so in the same commit.
+pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How much of a failure's own words a stale-serving episode keeps.
 ///
 /// Shorter than the wire's 1 KiB cap because this rides a health metric read at
@@ -43,20 +47,22 @@ use crate::provider::{
 /// refusal, which is what separates a rate limit from a network fault.
 pub const STALE_MESSAGE_CHARS: usize = 160;
 
-/// means this constant changed rather than that scheduling broke -- which is
-/// correct, and only works if someone tells them. Say so in the same commit.
-pub const BASE_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Anthropic rate-limits the OAuth usage endpoint per account; model calls
 /// refresh its two routing windows without spending another endpoint request.
 pub const CLAUDE_INTERVAL: Duration = Duration::from_secs(180);
 pub const CLAUDE_OBSERVED_INTERVAL: Duration = Duration::from_secs(900);
 
+/// The Claude Console credit balance is a billing page read with the user's own
+/// browser session. API spend moves it slowly and grants arrive monthly, so a
+/// read every minute bought nothing and put one more automated client on a
+/// session the user is also signed in to.
+pub const CLAUDE_CONSOLE_INTERVAL: Duration = Duration::from_secs(900);
+
 pub fn poll_interval(provider: &str) -> Duration {
-    if provider == "claude" {
-        CLAUDE_INTERVAL
-    } else {
-        BASE_INTERVAL
+    match provider {
+        "claude" => CLAUDE_INTERVAL,
+        "claude-console" => CLAUDE_CONSOLE_INTERVAL,
+        _ => BASE_INTERVAL,
     }
 }
 /// A served window is `fresh` while its last success is within this horizon.

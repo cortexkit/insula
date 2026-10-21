@@ -11192,6 +11192,16 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
     );
 }
 
+/// Each provider's poll cadence. The Console billing page is read every 15
+/// minutes, Claude's usage endpoint every 3, and everything else every minute.
+#[test]
+fn poll_intervals_per_provider() {
+    use crate::refresh::poll_interval;
+    assert_eq!(poll_interval("claude-console"), Duration::from_secs(900));
+    assert_eq!(poll_interval("claude"), Duration::from_secs(180));
+    assert_eq!(poll_interval("codex"), Duration::from_secs(60));
+}
+
 /// The cookie-capture table in docs/consumer-contract.md names the URL each
 /// provider actually fetches.
 ///
