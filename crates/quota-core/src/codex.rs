@@ -590,6 +590,22 @@ fn spend_control_unreadable(spend_control: Option<&serde_json::Value>) -> bool {
     }
 }
 
+/// The workspace credit-limit pool when wham states a budget this module can't
+/// read and no earlier readable pool is remembered.
+fn unstated_individual_limit_pool() -> Pool {
+    Pool {
+        id: "individual_limit".to_string(),
+        label: "Workspace credit limit".to_string(),
+        funding: PoolFunding::Unknown,
+        remaining: None,
+        total: None,
+        basis: PoolBasis::Unstated,
+        spendable: None,
+        resets_at: None,
+        expires_at: None,
+    }
+}
+
 /// Restate two amounts at the larger of their two exponents.
 ///
 /// The limit and remainder arrive as independent decimal strings ("1000" beside
@@ -629,7 +645,42 @@ fn amount_from_json(value: &serde_json::Value) -> Option<(i64, u8)> {
         serde_json::Value::Number(number) => number.to_string(),
         _ => return None,
     };
-    crate::money::parse_amount(&text, CREDIT_UNIT).map(|amount| (amount.minor, amount.exponent))
+    let (text, inexact) = floor_fraction(&text, WHAM_MAX_FRACTION_DIGITS);
+    let amount = crate::money::parse_amount(&text, CREDIT_UNIT)?;
+    // `floor_fraction` cut a negative figure toward zero; one more minor unit
+    // down makes it a true floor, so the result never exceeds the stated amount.
+    let minor = if inexact && amount.minor < 0 {
+        amount.minor.checked_sub(1)?
+    } else {
+        amount.minor
+    };
+    Some((minor, amount.exponent))
+}
+
+/// wham's credit amounts are rendered from floats and can carry 12 to 14
+/// fractional digits (`remaining` with 12 was seen on a live workspace limit in
+/// October 2026). Those digits are float noise, not stated precision, and the
+/// shared money parser refuses fractions past nine places, so the whole pool
+/// was dropped. Nine places keeps every digit a credit figure could mean.
+const WHAM_MAX_FRACTION_DIGITS: usize = 9;
+
+/// Cut a decimal string's fraction to at most `max` digits, toward zero, and
+/// say whether any non-zero digit was dropped.
+///
+/// Toward zero is a floor for a positive figure, so a remaining balance is never
+/// overstated; the caller completes the floor for a negative one. Text that
+/// isn't a plain decimal passes through unchanged, so the strict parser still
+/// refuses it.
+fn floor_fraction(text: &str, max: usize) -> (String, bool) {
+    let trimmed = text.trim();
+    let Some((whole, fraction)) = trimmed.split_once('.') else {
+        return (trimmed.to_string(), false);
+    };
+    if fraction.len() <= max || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return (trimmed.to_string(), false);
+    }
+    let (kept, dropped) = fraction.split_at(max);
+    (format!("{whole}.{kept}"), dropped.chars().any(|c| c != '0'))
 }
 
 /// Raw usage plus the server's explicit wall indicator.
@@ -892,9 +943,16 @@ impl CodexProvider {
                 last.insert(account_id.to_string(), pool);
             }
             (None, true) => {
-                if let Some(pool) = last.get(account_id) {
-                    snapshot.pools.push(pool.clone());
-                }
+                // With nothing remembered (a first reading, or after a restart),
+                // publish the budget as existing with its amount unstated. An
+                // absent pool would tell a consumer "no budget" and clear the one
+                // it holds; `basis: unstated` with no amounts means "a budget
+                // exists, amount unknown", which is what this reading says.
+                snapshot.pools.push(
+                    last.get(account_id)
+                        .cloned()
+                        .unwrap_or_else(unstated_individual_limit_pool),
+                );
             }
             (None, false) => {
                 last.remove(account_id);
@@ -2719,9 +2777,67 @@ mod individual_limit_tests {
             r#"{"reached":false,"individual_limit":null}"#,
         );
         assert!(limit_pool(&none).is_none());
-        assert!(
-            limit_pool(&settle(&provider, "acct-a", &unreadable)).is_none(),
-            "after an explicit none there's nothing to keep"
+        let after_none = settle(&provider, "acct-a", &unreadable);
+        assert_eq!(
+            limit_pool(&after_none),
+            Some(&unstated_individual_limit_pool()),
+            "after an explicit none there's no amount to keep, but the budget still exists"
+        );
+    }
+
+    /// A stated budget that can't be read, with nothing remembered (a first
+    /// reading, or after a restart), publishes the pool with its amount unstated
+    /// rather than no pool, which a consumer would read as "no budget" (insula#35).
+    #[test]
+    fn an_unreadable_first_budget_publishes_an_unstated_pool() {
+        let provider = budget_provider();
+        let unreadable = POPULATED_LIMIT.replace(r#""limit": "1000""#, r#""limit": "1,000""#);
+        let settled = settle(&provider, "acct-a", &unreadable);
+        let pool = limit_pool(&settled).expect("a stated budget is never dropped");
+        assert_eq!(pool.basis, PoolBasis::Unstated);
+        assert_eq!((pool.remaining.clone(), pool.total.clone()), (None, None));
+    }
+
+    /// wham renders credit amounts from floats, with 12 to 14 fractional digits.
+    /// The live shape from insula#35 (2026-10-21): an integer `limit` and a
+    /// `remaining` with 12 fractional digits. It publishes, floored to nine places,
+    /// so the remainder is never overstated.
+    #[test]
+    fn an_over_long_wham_fraction_publishes_the_limit_floored() {
+        let live = POPULATED_LIMIT
+            .replace(r#""used": "250.5""#, r#""used": "250.50000000000003""#)
+            .replace(
+                r#""remaining": "749.5""#,
+                r#""remaining": "749.499999999999""#,
+            );
+        let snapshot = normalize_usage_snapshot(&body_with_spend_control(&live)).expect("parses");
+        let pool = limit_pool(&snapshot).expect("a readable limit with a long fraction publishes");
+        assert_eq!(pool.total, Some(credit(1_000_000_000_000, 9)));
+        assert_eq!(pool.remaining, Some(credit(749_499_999_999, 9)));
+        assert!(!snapshot.spend_control_unreadable);
+    }
+
+    /// The cut is a floor in both signs: a negative (overspent) remainder moves
+    /// away from zero, never toward it.
+    #[test]
+    fn the_fraction_cut_never_raises_a_figure() {
+        assert_eq!(
+            amount_from_json(&serde_json::json!("1.0000000009999")),
+            Some((1_000_000_000, 9))
+        );
+        assert_eq!(
+            amount_from_json(&serde_json::json!("-1.0000000001")),
+            Some((-1_000_000_001, 9))
+        );
+        assert_eq!(
+            amount_from_json(&serde_json::json!("-1.0000000000")),
+            Some((-1_000_000_000, 9)),
+            "dropped zeros are exact, so nothing moves"
+        );
+        assert_eq!(
+            amount_from_json(&serde_json::json!("1,000.0000000001")),
+            None,
+            "the strict parser still refuses what isn't a plain decimal"
         );
     }
 
@@ -2731,7 +2847,12 @@ mod individual_limit_tests {
         let provider = budget_provider();
         let unreadable = POPULATED_LIMIT.replace(r#""limit": "1000""#, r#""limit": "1,000""#);
         settle(&provider, "acct-a", POPULATED_LIMIT);
-        assert!(limit_pool(&settle(&provider, "acct-b", &unreadable)).is_none());
+        let other = settle(&provider, "acct-b", &unreadable);
+        assert_eq!(
+            limit_pool(&other),
+            Some(&unstated_individual_limit_pool()),
+            "acct-b gets no amount from acct-a, only an unstated pool"
+        );
     }
 
     /// An absent or unreadable `reset_at` leaves the reset unstated and still

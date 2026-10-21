@@ -1054,13 +1054,22 @@ and beside any `credits` pool:
   absent, which is not a promise that the pool can be drawn on.
 - `resetsAt` is the provider's period end for the limit. The pool is still
   published, without `resetsAt`, when the reset is missing or unreadable.
-- No pool when the account has no limit (`individual_limit: null`) or the limit
-  or remainder is missing or unreadable.
+- Amounts keep at most nine decimal places. The provider renders them from
+  floats with up to 14 places of noise, so a longer fraction is cut toward a
+  floor: `remaining` is never overstated.
+- **No pool means no limit**: the account has none (`individual_limit: null`)
+  or sends no `spend_control`. Clear a remembered budget only then.
+- **A limit that is stated but can't be read** (a field missing or not a plain
+  decimal) never drops the pool. It republishes the account's last readable
+  pool, or, with nothing remembered (a first reading, or after a restart), a
+  pool with `basis: unstated` and no amounts: a budget exists, amount unknown.
 
 **Proven by:** `a_populated_individual_limit_publishes_a_pool_with_its_reset`,
 `a_null_individual_limit_publishes_no_pool_and_keeps_the_windows`,
 `a_reached_limit_marks_the_pool_unspendable`,
-`an_unreadable_reset_publishes_the_pool_without_one`.
+`an_unreadable_reset_publishes_the_pool_without_one`,
+`an_over_long_wham_fraction_publishes_the_limit_floored`,
+`an_unreadable_first_budget_publishes_an_unstated_pool`.
 
 <a id="jetbrains-the-purchased-top-up-as-the-topupquota-pool"></a>
 
