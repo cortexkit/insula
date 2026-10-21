@@ -1513,6 +1513,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "claude-limits-one-bad-entry-fails-response"
+guards = "One malformed Claude limits entry costs only that entry, never the session and weekly windows or its valid siblings"
+file = "crates/quota-core/src/anthropic.rs"
+old = '    let shape = inventory_shape(response.cedar_ember.as_ref(), now);'
+new = '    serde_json::from_slice::<LimitsView>(body).map_err(|e| FetchError::Decode(format!("NON-VACUITY BREAK: {e}")))?; let shape = inventory_shape(response.cedar_ember.as_ref(), now);'
+edits = []
+test_file = "crates/quota-core/src/anthropic.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["anthropic::tests::a_non_array_limits_keeps_the_main_windows_and_adds_no_rows", "anthropic::tests::a_non_object_limits_entry_keeps_the_main_windows", "anthropic::tests::a_valid_scoped_entry_survives_bad_siblings", "anthropic::tests::unread_keys_inside_limits_entries_are_still_reported"]
+expect_message = "must not fail the response"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "cursor-on-demand-period"
 guards = "A Cursor monthly spend reading whose period does not contain the present publishes no on_demand pool and leaves the plan window intact"
 file = "crates/quota-core/src/cursor.rs"
@@ -1559,6 +1576,23 @@ package = "quota-core"
 target = "--lib"
 expect_red = ["cursor::tests::a_non_unified_account_makes_no_spend_request"]
 expect_message = "a non-unified account must make only the summary request"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-limits-boolean-percent"
+guards = "A JSON Boolean percent in a Claude limits entry is unstated, never a 1% or 0% scoped weekly row"
+file = "crates/quota-core/src/anthropic.rs"
+old = '    raw?.as_f64()'
+new = '    raw.and_then(|value| value.as_f64().or_else(|| value.as_bool().map(f64::from))) // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/anthropic.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["anthropic::tests::a_boolean_percent_is_not_one_percent", "anthropic::tests::a_valid_scoped_entry_survives_bad_siblings"]
+expect_message = "a bad limits entry must not become a row"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
