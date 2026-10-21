@@ -968,7 +968,14 @@ pub fn replaced_record_acceleration(
     if row_state == "needs_reauth" {
         return None;
     }
-    let replaced = observed_version.is_some_and(|observed| observed != row_version);
+    // Only a HIGHER listed version is a replacement. The listing is re-read only
+    // when the vault reports a set change, not on every token refresh, while
+    // each fetch observes the record's current version. So after any refresh a
+    // fetch triggers, the listed row is older than what the slot observed.
+    // Treating that difference as "replaced" made the slot due on every turn:
+    // measured 2026-10-21, an Antigravity handle fetched about 14 times a minute,
+    // and a Claude account in 429 backoff had 891 s of that backoff discarded.
+    let replaced = observed_version.is_some_and(|observed| row_version > observed);
     if !reactivated && !replaced {
         return None;
     }

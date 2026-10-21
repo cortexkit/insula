@@ -11164,6 +11164,19 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         None,
         "an unchanged record keeps its backoff"
     );
+    // The live loop of 2026-10-21: the listing is only re-read on a set change,
+    // so after a token refresh the slot has observed 2446 while the row still
+    // lists 2445. An older listing is never a replacement.
+    assert_eq!(
+        replaced_record_acceleration(Some(2446), 2445, "active", false, true, backoff, now),
+        None,
+        "a listing older than the observed version keeps the backoff"
+    );
+    assert_eq!(
+        replaced_record_acceleration(Some(2446), 2445, "active", false, false, backoff, now),
+        None,
+        "and a healthy slot is not pulled forward by it either"
+    );
     assert_eq!(
         replaced_record_acceleration(None, 213, "active", true, true, backoff, now),
         Some(ReplacedRecordAcceleration {
