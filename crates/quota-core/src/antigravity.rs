@@ -1490,6 +1490,37 @@ fn parse_reset(value: &Value) -> Option<String> {
     None
 }
 
+/// Pool prefixes an ordinary bucket id starts with: the native Gemini pool, and
+/// the external Claude/GPT pool under both spellings upstream recognises for it
+/// (`3p` and `third-party`, in `AntigravityQuotaFamilyVisibility.knownFamily`).
+const ORDINARY_BUCKET_POOL_PREFIXES: &[&str] = &["gemini-", "3p-", "third-party-"];
+
+/// Whether a bucket is one of a pool's ordinary, pool-wide limits.
+///
+/// Besides the pool-wide limits (`gemini-5h`, `gemini-weekly`, `3p-5h`,
+/// `3p-weekly`), Antigravity can also send a limit that applies to one model
+/// only, such as `gemini-synthetic-limited-weekly`. Such a bucket has the
+/// same pool and the same cadence as the pool-wide one. Titled only by pool and
+/// cadence, it would show up as a second "Gemini Models weekly" row, possibly at
+/// 100% while the real pool-wide limit is nearly unused, and a reader could not
+/// tell the two apart.
+///
+/// The rule matches upstream's (CodexBar v0.79.0,
+/// `AntigravityStatusProbe.quotaSummaryRepresentative`): lower-case the id,
+/// turn `_` into `-`, drop a trailing ` limit`, and the result must be a pool
+/// prefix followed by exactly one cadence word. Upstream applies it to Gemini
+/// only, because it only picks a Gemini representative; here it also covers the
+/// Claude/GPT pool, whose live ids have the same form.
+fn is_ordinary_bucket_id(bucket_id: &str) -> bool {
+    let normalized = bucket_id.to_ascii_lowercase().replace('_', "-");
+    let id = normalized.strip_suffix(" limit").unwrap_or(&normalized);
+    ORDINARY_BUCKET_POOL_PREFIXES.iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|cadence| {
+            SESSION_CADENCE_ALIASES.contains(&cadence) || cadence == "weekly"
+        })
+    })
+}
+
 /// A bucket that resolved to a usable window, tagged with its pool.
 struct ResolvedWindow {
     window: RateWindow,
@@ -1520,17 +1551,37 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
     // function of the same classification the id encodes, so the two cannot
     // disagree and neither can two lanes.
     let window_minutes = window_minutes_of(bucket);
-    let cadence = match window_minutes {
-        Some(300) => "5h".to_string(),
-        Some(10080) => "weekly".to_string(),
+    let (cadence, classified) = match window_minutes {
+        Some(300) => ("5h".to_string(), true),
+        Some(10080) => ("weekly".to_string(), true),
         // An unclassified cadence keeps the upstream text rather than inventing
         // one: a wrong cadence in a label is worse than an unfamiliar one, and
         // this is the branch a new window shape arrives through.
-        _ => bucket.display_name.trim().to_string(),
+        _ => (bucket.display_name.trim().to_string(), false),
     };
-    let title = format!("{} {}", group.display_name.trim(), cadence)
-        .trim()
-        .to_string();
+    // A model-specific limit must not share its pool-wide sibling's title (see
+    // `is_ordinary_bucket_id`), so it also names itself: by `displayName` when
+    // the server sent one, otherwise by its id. Ordinary buckets keep the plain
+    // "{pool} {cadence}" title that consumers already render for them.
+    // An unclassified cadence is left as it was: its title already uses the
+    // bucket's own `displayName` in place of the cadence, and when that name is
+    // blank the title is the pool name alone, as before.
+    let bucket_name = if classified && !is_ordinary_bucket_id(&bucket.bucket_id) {
+        let display_name = bucket.display_name.trim();
+        if display_name.is_empty() {
+            bucket.bucket_id.trim()
+        } else {
+            display_name
+        }
+    } else {
+        ""
+    };
+    let title = [group.display_name.trim(), bucket_name, cadence.as_str()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
     Some(ResolvedWindow {
         window: RateWindow {
             window_kind: {
@@ -3795,6 +3846,139 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The (id, title, window kind) of every window a summary publishes, in order.
+    fn published_titles(usage: &Usage) -> Vec<(String, String, Option<String>)> {
+        usage
+            .extra_rate_windows
+            .as_ref()
+            .expect("named windows")
+            .iter()
+            .map(|extra| {
+                let window = extra.window.as_ref().expect("a named window");
+                (
+                    extra.id.clone().unwrap_or_default(),
+                    extra.title.clone().unwrap_or_default(),
+                    window.window_kind.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Pool-wide buckets keep the plain "{pool} {cadence}" title, byte for byte.
+    ///
+    /// Titles are display text that consumers render, so a change is visible.
+    /// Naming model-specific buckets must not touch the four live pool-wide ones,
+    /// nor the other id spellings upstream treats as pool-wide: the session
+    /// aliases, `_` for `-`, a trailing ` limit`, any letter case, and
+    /// `third-party` for `3p`. Every bucket here carries a `displayName`, so a rule
+    /// that wrongly treated one as model-specific would put that name in its title.
+    #[test]
+    fn ordinary_bucket_titles_stay_pool_and_cadence_only() {
+        let body = r#"{"response":{"groups":[
+            {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-5h","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.8},
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.53},
+                {"bucketId":"gemini-session","displayName":"Session Limit","window":"5h",
+                 "remainingFraction":0.8},
+                {"bucketId":"Gemini_Five_Hour","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.8},
+                {"bucketId":"gemini-five hour limit","displayName":"Five Hour Limit",
+                 "window":"5h","remainingFraction":0.8}
+            ]},
+            {"displayName":"Claude and GPT models","buckets":[
+                {"bucketId":"3p-5h","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.95},
+                {"bucketId":"3p-weekly","displayName":"Weekly Limit","window":"weekly",
+                 "remainingFraction":0.4},
+                {"bucketId":"3p-5-hour","displayName":"Five Hour Limit","window":"5h",
+                 "remainingFraction":0.95},
+                {"bucketId":"third-party_weekly limit","displayName":"Weekly Limit",
+                 "window":"weekly","remainingFraction":0.4}
+            ]}
+        ]}}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        let row = |id: &str, title: &str, kind: &str| {
+            (id.to_string(), title.to_string(), Some(kind.to_string()))
+        };
+        assert_eq!(
+            published_titles(&usage),
+            vec![
+                row("gemini-5h", "Gemini Models 5h", "five_hour"),
+                row("gemini-weekly", "Gemini Models weekly", "weekly"),
+                row("gemini-session", "Gemini Models 5h", "five_hour"),
+                row("Gemini_Five_Hour", "Gemini Models 5h", "five_hour"),
+                row("gemini-five hour limit", "Gemini Models 5h", "five_hour"),
+                row("3p-5h", "Claude and GPT models 5h", "five_hour"),
+                row("3p-weekly", "Claude and GPT models weekly", "weekly"),
+                row("3p-5-hour", "Claude and GPT models 5h", "five_hour"),
+                row(
+                    "third-party_weekly limit",
+                    "Claude and GPT models weekly",
+                    "weekly"
+                ),
+            ],
+            "pool-wide buckets keep the title consumers already know"
+        );
+    }
+
+    /// A limit on one model is titled apart from its pool's pool-wide limit.
+    ///
+    /// Upstream (CodexBar v0.79.0) reports accounts that receive a model-specific
+    /// weekly bucket, `gemini-synthetic-limited-weekly`, beside the pool-wide
+    /// `gemini-weekly`. Titled by pool and cadence alone, both were "Gemini Models
+    /// weekly": two identical rows, one exhausted and one nearly unused, with only
+    /// the id telling them apart. The model-specific one now names itself by its
+    /// `displayName`, or by its id when there is none. The cadence stays in the
+    /// title and in `window_kind`, and the ids and figures are unchanged.
+    #[test]
+    fn a_model_specific_bucket_is_titled_apart_from_its_pool_wide_sibling() {
+        for (name_field, expected_title) in [
+            (
+                r#""displayName":"Gemini 3 Pro Synthetic","#,
+                "Gemini Models Gemini 3 Pro Synthetic weekly",
+            ),
+            ("", "Gemini Models gemini-synthetic-limited-weekly weekly"),
+        ] {
+            let body = format!(
+                r#"{{"response":{{"groups":[{{"displayName":"Gemini Models","buckets":[
+                    {{"bucketId":"gemini-weekly","displayName":"Weekly Limit",
+                     "window":"weekly","remainingFraction":0.9996,
+                     "resetTime":"2026-06-30T00:00:00Z"}},
+                    {{"bucketId":"gemini-synthetic-limited-weekly",{name_field}
+                     "window":"weekly","remainingFraction":0.0,
+                     "resetTime":"2026-06-28T00:00:00Z"}}
+                ]}}]}}}}"#
+            );
+            let usage = parse_quota_summary(&body).unwrap();
+            let weekly = Some("weekly".to_string());
+            assert_eq!(
+                published_titles(&usage),
+                vec![
+                    (
+                        "gemini-weekly".to_string(),
+                        "Gemini Models weekly".to_string(),
+                        weekly.clone()
+                    ),
+                    (
+                        "gemini-synthetic-limited-weekly".to_string(),
+                        expected_title.to_string(),
+                        weekly.clone()
+                    ),
+                ],
+                "the model-specific limit must be distinguishable from the pool-wide one \
+                 (displayName field: {name_field:?})"
+            );
+            assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 0.04);
+            assert_eq!(
+                pool_window(&usage, "gemini-synthetic-limited-weekly").used_percent,
+                100.0
+            );
+            assert_no_unnamed_slot(&usage);
+        }
     }
 
     #[test]
