@@ -12576,3 +12576,218 @@ async fn watch_unreported_failures_keep_status_poll() {
         );
     }
 }
+
+// ---- live config reload, through the real Codex provider ----
+
+/// A `ConfigReloader` over `path` with a plain JSON parser (valid JSONC), and
+/// the live handle it keeps in step.
+fn live_config_reloader(
+    path: &std::path::Path,
+) -> (
+    crate::config::ConfigReloader,
+    crate::config::LiveQuotaConfig,
+) {
+    let live = crate::config::LiveQuotaConfig::new(crate::config::QuotaConfig::default());
+    let reloader = crate::config::ConfigReloader::new(
+        path.to_path_buf(),
+        Box::new(|text: &str| serde_json::from_str(text).map_err(|error| error.to_string())),
+        live.clone(),
+    );
+    (reloader, live)
+}
+
+/// Answer `requests` Codex usage reads, each reporting the account at its wall,
+/// which is the reading that makes an armed provider redeem a banked reset.
+fn spawn_walled_usage_server(
+    listener: TcpListener,
+    requests: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = serde_json::json!({
+                "rate_limit": {
+                    "limit_reached": true,
+                    "primary_window": {
+                        "used_percent": 100.0,
+                        "reset_at": 1_900_000_000_i64,
+                        "limit_window_seconds": 604_800
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    })
+}
+
+/// A local Codex login under `temp` pointing its base URL at `address`.
+fn live_config_codex_home(
+    temp: &ResetTempDir,
+    address: std::net::SocketAddr,
+) -> std::path::PathBuf {
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        br#"{"tokens":{"access_token":"live-config-token","account_id":"live-config-account"}}"#,
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    codex_home
+}
+
+/// Editing `auto_use_resets` disarms and re-arms redemption on the next tick,
+/// with the same provider throughout.
+///
+/// THE DISARM TICK IS ONE THAT WOULD HAVE REDEEMED. The journal is aged past
+/// the thirty-minute same-account bound first, and the re-arm tick that
+/// follows, with nothing else changed, does redeem. So the zero POSTs on the
+/// disarm tick are the config's doing and not the spend bound's.
+///
+/// What this guards: a provider that read the setting once, at construction,
+/// would keep spending real credit after the operator set it to 0, and only a
+/// restart would stop it.
+#[tokio::test]
+async fn live_config_edit_disarms_and_rearms_redemption_without_rebuilding_the_provider() {
+    let temp = ResetTempDir::new("live-config-arm-disarm");
+    let config_path = temp.dir.join("ck-quota.jsonc");
+    // The three file bodies differ in length, so each edit is seen whatever
+    // the filesystem's timestamp resolution.
+    std::fs::write(&config_path, r#"{"codex":{"auto_use_resets":3600}}"#).unwrap();
+    let (mut reloader, live) = live_config_reloader(&config_path);
+    reloader.check();
+    assert!(live.codex().is_enabled(), "fixture: the file arms resets");
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_server = spawn_walled_usage_server(listener, 3);
+    let codex_home = live_config_codex_home(&temp, address);
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+    let provider = crate::codex::CodexProvider::new_for_test(
+        live.clone(),
+        None,
+        reset_transport,
+        Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        codex_home,
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    tick(&registry).await;
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "fixture: an armed walled account redeems"
+    );
+
+    std::fs::write(&config_path, r#"{"codex":{"auto_use_resets":0}}"#).unwrap();
+    assert_eq!(
+        reloader.check().as_deref(),
+        Some("[insula] config reloaded: codex.auto_use_resets 3600 -> 0 (disarmed)")
+    );
+    age_journal(&temp.journal(), 31 * 60);
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        1,
+        "a live disarm must stop the redemption this tick would otherwise have fired"
+    );
+
+    std::fs::write(&config_path, r#"{"codex":{"auto_use_resets":7200}}"#).unwrap();
+    assert_eq!(
+        reloader.check().as_deref(),
+        Some("[insula] config reloaded: codex.auto_use_resets 0 -> 7200 (armed)")
+    );
+    force_due(&registry, "codex");
+    tick(&registry).await;
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        2,
+        "re-arming must redeem on the next tick, with no rebuild of the provider"
+    );
+    tokio::time::timeout(Duration::from_secs(10), http_server)
+        .await
+        .expect("one usage read per tick")
+        .unwrap();
+}
+
+/// A config file that cannot be read never arms redemption.
+///
+/// Driven after the file was deleted, which disarms: the reloader then holds
+/// the defaults, and the file comes back as something that cannot be read (a
+/// directory at its path). Whatever the file used to say, nothing read from it
+/// now can justify spending a credit, so resets stay disarmed and the walled
+/// account keeps its banked reset.
+#[tokio::test]
+async fn an_unreadable_config_file_never_arms_redemption() {
+    let temp = ResetTempDir::new("live-config-unreadable");
+    let config_path = temp.dir.join("ck-quota.jsonc");
+    std::fs::write(&config_path, r#"{"codex":{"auto_use_resets":3600}}"#).unwrap();
+    let (mut reloader, live) = live_config_reloader(&config_path);
+    reloader.check();
+    std::fs::remove_file(&config_path).unwrap();
+    reloader.check();
+    assert!(!live.codex().is_enabled(), "fixture: deletion disarms");
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let http_server = spawn_walled_usage_server(listener, 1);
+    let codex_home = live_config_codex_home(&temp, address);
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let reset_transport: Arc<dyn ResetTransport> = transport.clone();
+    let provider = crate::codex::CodexProvider::new_for_test(
+        live.clone(),
+        None,
+        reset_transport,
+        Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        codex_home,
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+
+    std::fs::create_dir(&config_path).unwrap();
+    let line = reloader.check().expect("an unreadable file must be logged");
+    assert!(
+        line.contains("read failed")
+            && line.contains("keeping last good config: codex.auto_use_resets 0s (disarmed)"),
+        "{line}"
+    );
+    tick(&registry).await;
+    assert!(
+        !live.codex().is_enabled(),
+        "an unreadable config must never arm resets"
+    );
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "an unreadable config must never arm resets"
+    );
+    tokio::time::timeout(Duration::from_secs(10), http_server)
+        .await
+        .expect("one usage read")
+        .unwrap();
+}

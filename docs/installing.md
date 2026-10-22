@@ -75,8 +75,15 @@ After a deploy, run the checkers in
 
 The module reads `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc` (default
 `~/.config/cortexkit/ck-quota.jsonc`; on Windows `%APPDATA%\cortexkit\ck-quota.jsonc`)
-once at start. A missing or malformed file means the defaults. Today the file
-has one setting:
+at start and checks it again every 5 seconds, so an edit takes effect without
+a restart: once a check applies it, setting `auto_use_resets` to 0 stops every
+later redemption decision, and setting it back arms them again. Each applied change is logged once, for example
+`[insula] config reloaded: codex.auto_use_resets 3600 -> 0 (disarmed)`, and
+`health.check` reports the value in force and when it was loaded under
+`quotaConfig`. A missing file, or one deleted while the module runs, means the
+defaults. A file that cannot be read or parsed keeps the last good config
+(at start, the defaults), and the warning names the file and the reason.
+Today the file has one setting:
 
 ```jsonc
 {
@@ -91,6 +98,8 @@ has one setting:
 
 Redemption spends real Codex credit; see [`SECURITY.md`](../SECURITY.md) and
 [`consumer-contract.md`](consumer-contract.md#usedpercent-can-be-lower-than-what-the-provider-reported).
+Arm one host per account: the redemption journal is per host, so two hosts
+armed for the same Codex account do not coordinate.
 
 ## Remove
 

@@ -1700,3 +1700,37 @@ expect_message = "a Claude 429 with no retry-after must back off from five minut
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "codex-live-config-disarm"
+guards = "The Codex provider reads auto_use_resets from the live config handle on every tick, so an edit to 0 stops a redemption that tick would otherwise have fired, with no restart"
+file = "crates/quota-core/src/codex.rs"
+old = 'reset_config: live_config,'
+new = 'reset_config: LiveQuotaConfig::new(live_config.current()), // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["tests::live_config_edit_disarms_and_rearms_redemption_without_rebuilding_the_provider"]
+expect_message = "a live disarm must stop the redemption this tick would otherwise have fired"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "config-reload-unreadable-never-arms"
+guards = "A config file that cannot be read or parsed keeps the last good config and never arms Codex banked resets"
+file = "crates/quota-core/src/config.rs"
+old = 'FileRead::Failed(reason) => self.keep_last_good(reason, first),'
+new = 'FileRead::Failed(reason) => { if !self.live.codex().is_enabled() { self.live.apply(QuotaConfig { codex: CodexConfig { auto_use_resets: 3600 } }, Utc::now()); } self.keep_last_good(reason, first) } // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["tests::an_unreadable_config_file_never_arms_redemption"]
+expect_message = "an unreadable config must never arm resets"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

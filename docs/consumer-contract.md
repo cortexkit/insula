@@ -1722,6 +1722,7 @@ not happened, never zero.
 | Metric | Type | Meaning |
 |---|---|---|
 | `buildCommit` | string | the commit the running binary was built from |
+| `quotaConfig` | object or `null` | the `ck-quota.jsonc` settings in force now, which the module re-reads while it runs: `codexAutoUseResetsSecs` (number), `codexResetsArmed` (boolean), `loadedAt` (RFC 3339 time the config was last taken from the file or from the file's absence, `null` if never) and `lastError` (the latest stat, read or parse failure seen on the file, `null` once a usable file or the file's absence has been applied; the last good config stays in force meanwhile) |
 | `providersTotal` | number | providers registered |
 | `fresh` | number | providers serving a reading inside the freshness horizon |
 | `stale` | number | providers serving a reading preserved through transient failure |

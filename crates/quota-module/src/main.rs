@@ -33,7 +33,11 @@ use std::{
     time::Instant,
 };
 
-use quota_core::{config::QuotaConfig, credential_source::CredentialSource, Registry, LOG_TAG};
+use quota_core::{
+    config::{ConfigReloader, LiveQuotaConfig, QuotaConfig},
+    credential_source::CredentialSource,
+    Registry, LOG_TAG,
+};
 use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
@@ -76,15 +80,24 @@ mod usage_watch_tests;
 /// module name — both of which have since been renamed, so beside a binary called
 /// `ck-insula` this reads like a leftover. It is the live config file.
 ///
-/// It is read ONCE, at startup. Renaming it, or any restart that cannot find it,
-/// leaves the codex banked-resets feature OFF while the module comes up entirely
-/// healthy: nothing on the wire, in health metrics, or in the supervisor view
-/// records that a config was expected. The only way to tell the feature is armed
-/// is from its effect on the wire: while it is armed, a codex entry's windows
-/// carry `usedPercent` 0 with the provider's actual figure moved into
-/// `rawUsedPercent`. An unarmed module publishes the real figure in
-/// `usedPercent` and omits `rawUsedPercent` entirely.
+/// It is read at startup and then checked every [`CONFIG_RELOAD_INTERVAL`], so
+/// an edit takes effect without a restart (see `ConfigReloader`). Renaming it,
+/// or deleting it, applies the defaults and leaves the codex banked-resets
+/// feature OFF while the module stays entirely healthy. The startup and reload
+/// log lines name the file and the value in force, and `health.check` reports
+/// the live value under `quotaConfig`. On the wire the feature shows only by its
+/// effect: while it is armed, a codex entry's windows carry `usedPercent` 0
+/// with the provider's actual figure moved into `rawUsedPercent`. An unarmed
+/// module publishes the real figure in `usedPercent` and omits
+/// `rawUsedPercent` entirely.
 const QUOTA_CONFIG_RELATIVE_PATH: &str = "cortexkit/ck-quota.jsonc";
+
+/// How often the config file is checked for an edit. Each check is one `stat`;
+/// the file is read again only when its length or modification time changed.
+/// Five seconds is well inside one refresher turn (60 s), so an operator who
+/// sets `codex.auto_use_resets` to 0 stops every redemption decided after the
+/// next check; a tick already past its decision is not recalled.
+const CONFIG_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Answer `--version` / `--help` before anything else, and exit.
 ///
@@ -170,13 +183,8 @@ async fn main() -> Result<(), ModuleError> {
         ModuleError::Message(format!("launch nonce: {error}"))
     })?;
     let config = ModuleConfig::from_env(launch_nonce)?;
-    let quota_config = load_quota_config();
-    eprintln!(
-        "{LOG_TAG} codex banked resets armed={} auto_use_resets={}s (startup-only; arm one host per account)",
-        quota_config.codex.is_enabled(),
-        quota_config.codex.auto_use_resets
-    );
-    run(config, quota_config).await
+    let (live_config, config_reloader) = load_quota_config();
+    run(config, live_config, config_reloader).await
 }
 
 struct ModuleConfig {
@@ -278,33 +286,87 @@ fn parse_quota_config(contents: &str) -> Result<QuotaConfig, String> {
     serde_json::from_str(&json).map_err(|error| error.to_string())
 }
 
-fn load_quota_config_file(path: &std::path::Path) -> QuotaConfig {
-    let parsed = std::fs::read_to_string(path)
-        .map_err(|error| format!("read failed: {error}"))
-        .and_then(|contents| parse_quota_config(&contents));
-    match parsed {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!(
-                "{LOG_TAG} warning: {} unavailable or malformed ({error}); codex banked resets default OFF",
-                path.display()
-            );
-            QuotaConfig::default()
-        }
+/// The live config handle for the file at `path`, loaded once, and the
+/// reloader that keeps it in step afterwards.
+///
+/// The first check runs here, before any provider exists, so the first
+/// refresher turn already decides with what the file says. An absent,
+/// unreadable or malformed file leaves the defaults, which disarm resets.
+fn load_quota_config_file(path: &std::path::Path) -> (LiveQuotaConfig, ConfigReloader) {
+    let live = LiveQuotaConfig::new(QuotaConfig::default());
+    let mut reloader = ConfigReloader::new(
+        path.to_path_buf(),
+        Box::new(parse_quota_config),
+        live.clone(),
+    );
+    if let Some(line) = reloader.check() {
+        eprintln!("{line}");
     }
+    (live, reloader)
 }
 
-fn load_quota_config() -> QuotaConfig {
+fn load_quota_config() -> (LiveQuotaConfig, Option<ConfigReloader>) {
     let Some(path) = quota_config_path() else {
         eprintln!(
             "{LOG_TAG} warning: cannot resolve the quota config path; codex banked resets default OFF"
         );
-        return QuotaConfig::default();
+        return (LiveQuotaConfig::new(QuotaConfig::default()), None);
     };
-    load_quota_config_file(&path)
+    let (live, reloader) = load_quota_config_file(&path);
+    (live, Some(reloader))
 }
 
-async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), ModuleError> {
+/// Check the config file every [`CONFIG_RELOAD_INTERVAL`] until `cancel`.
+///
+/// The check runs on the blocking pool because it touches the filesystem; the
+/// reloader is moved there and back rather than shared, since only this task
+/// ever drives it.
+fn spawn_config_reloader(
+    reloader: Option<ConfigReloader>,
+    cancel: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut reloader = reloader?;
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CONFIG_RELOAD_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate, and startup has just checked.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            let checked = tokio::task::spawn_blocking(move || {
+                let line = reloader.check();
+                (reloader, line)
+            })
+            .await;
+            match checked {
+                Ok((back, line)) => {
+                    reloader = back;
+                    if let Some(line) = line {
+                        eprintln!("{line}");
+                    }
+                }
+                Err(error) => {
+                    // The config in force stays as last applied; only later
+                    // edits stop taking effect, so say so where it is noticed.
+                    eprintln!(
+                        "{LOG_TAG} warning: config reload stopped ({error}); edits to the quota \
+                         config now need a restart"
+                    );
+                    return;
+                }
+            }
+        }
+    }))
+}
+
+async fn run(
+    config: ModuleConfig,
+    quota_config: LiveQuotaConfig,
+    config_reloader: Option<ConfigReloader>,
+) -> Result<(), ModuleError> {
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
@@ -336,6 +398,7 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     // (usage.get) only ever reads the slot store, so route reads never block on
     // the network. Cancelled when the frame loop ends so the task never leaks.
     let refresher_cancel = CancellationToken::new();
+    let reload = spawn_config_reloader(config_reloader, refresher_cancel.clone());
     let publisher = samples.spawn(
         config.connection_file_path.clone(),
         refresher_cancel.clone(),
@@ -365,6 +428,9 @@ async fn run(config: ModuleConfig, quota_config: QuotaConfig) -> Result<(), Modu
     refresher_cancel.cancel();
     let _ = refresher.await;
     let _ = publisher.await;
+    if let Some(reload) = reload {
+        let _ = reload.await;
+    }
 
     let writer_result = writer
         .await
@@ -722,6 +788,7 @@ async fn handle_control_request(
                 vault,
                 serve,
                 &registry.call_observation_metrics(),
+                registry.live_config(),
             )
         }
     };
@@ -780,6 +847,7 @@ fn health_report(
     vault: &VaultClient,
     serve: &ServeCounters,
     call_metrics: &quota_core::call_observations::CallObservationMetrics,
+    live_config: Option<&LiveQuotaConfig>,
 ) -> ModuleControlResponse {
     let status = if snapshot.is_failing() {
         HealthStatus::Failing
@@ -1045,6 +1113,27 @@ fn health_report(
         "lastFetchSuccessAgeSecs": snapshot.last_fetch_success_age.map(|d| d.as_secs()),
         "fetchBlackout": snapshot.fetch_blackout,
     });
+    // The quota config in force NOW, which with live reload can differ from
+    // what the file said when this process started. `loadedAt` is when it was
+    // last taken from the file (or from the file's absence), and `lastError`
+    // is the latest stat, read or parse failure the reloader saw, cleared once
+    // a usable file (or its absence) is applied: meanwhile the module keeps
+    // the last good config rather than guessing.
+    // `null` for a registry with no config handle. Inserted after the literal
+    // above only because that literal is at `json!`'s recursion limit.
+    let quota_config = live_config.map(|live| {
+        let status = live.status();
+        json!({
+            "codexAutoUseResetsSecs": status.config.codex.auto_use_resets,
+            "codexResetsArmed": status.config.codex.is_enabled(),
+            "loadedAt": status.loaded_at.map(quota_core::rfc3339_canonical),
+            "lastError": status.last_error,
+        })
+    });
+    metrics
+        .as_object_mut()
+        .unwrap()
+        .insert("quotaConfig".to_string(), json!(quota_config));
     metrics
         .as_object_mut()
         .unwrap()
@@ -1674,12 +1763,14 @@ fn manifest(
                     .to_string(),
             },
             // Config-resolved rather than constant: the arming threshold is
-            // read from ck-quota.jsonc at STARTUP, so the effective value is
-            // whatever that file said when this process began. Naming the
+            // codex.auto_use_resets in ck-quota.jsonc, which is re-read while
+            // the module runs, so the effective value is the last one the
+            // reloader applied (health reports it under `quotaConfig`). Naming the
             // source rather than a number keeps the declaration from
             // claiming a cadence it cannot know.
             cadence: Some(SignalCadence::Derived {
-                source: "codex.auto_use_resets in ck-quota.jsonc, read at startup"
+                source: "codex.auto_use_resets in ck-quota.jsonc, reloaded live; \
+                         health.check quotaConfig reports the value in force"
                     .to_string(),
             }),
             domain: Some("provider-usage".to_string()),
@@ -2280,6 +2371,7 @@ mod tests {
             &test_vault(),
             &ServeCounters::default(),
             &Default::default(),
+            None,
         ) else {
             panic!("health_report must answer a HealthCheck");
         };
@@ -2564,6 +2656,7 @@ mod tests {
             &test_vault(),
             &ServeCounters::default(),
             &Default::default(),
+            None,
         ) else {
             panic!("health_report must produce a HealthCheck response");
         };
@@ -2599,6 +2692,7 @@ mod tests {
             &test_vault(),
             &ServeCounters::default(),
             &Default::default(),
+            None,
         ) else {
             panic!("health_report must produce a HealthCheck response");
         };
@@ -2949,7 +3043,7 @@ mod tests {
     fn quota_config_accepts_jsonc_and_unknown_fields() {
         let config = parse_quota_config(
             r#"{
-                // startup-only reset policy
+                // reset policy, reloaded live
                 "codex": { "auto_use_resets": 86400, },
                 "future_provider": true,
             }"#,
@@ -2964,10 +3058,56 @@ mod tests {
         let malformed = temp_config_path("malformed");
         std::fs::write(&malformed, "{ not-jsonc").unwrap();
 
-        assert_eq!(load_quota_config_file(&absent), QuotaConfig::default());
-        assert_eq!(load_quota_config_file(&malformed), QuotaConfig::default());
+        assert_eq!(
+            load_quota_config_file(&absent).0.current(),
+            QuotaConfig::default()
+        );
+        assert_eq!(
+            load_quota_config_file(&malformed).0.current(),
+            QuotaConfig::default()
+        );
 
         let _ = std::fs::remove_file(malformed);
+    }
+
+    /// Health reports the config in force after a reload, not the startup one.
+    ///
+    /// Through the real JSONC parser and the registry's own handle, so this
+    /// fails if the registry keeps a copy, or health reads anything other than
+    /// what the providers read.
+    #[test]
+    fn health_reports_the_live_quota_config_and_when_it_loaded() {
+        let path = temp_config_path("health-live");
+        std::fs::write(&path, "{ \"codex\": { \"auto_use_resets\": 3600 } }").unwrap();
+        let (live, mut reloader) = load_quota_config_file(&path);
+        let registry = Registry::with_defaults(live, None);
+        let quota_config = |registry: &Registry| {
+            let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
+                &healthy_snapshot(),
+                &test_vault(),
+                &ServeCounters::default(),
+                &Default::default(),
+                registry.live_config(),
+            ) else {
+                panic!("health_report must answer a HealthCheck");
+            };
+            metrics.unwrap()["quotaConfig"].clone()
+        };
+        let armed = quota_config(&registry);
+        assert_eq!(armed["codexAutoUseResetsSecs"], 3600);
+        assert_eq!(armed["codexResetsArmed"], true);
+        assert!(armed["loadedAt"].is_string(), "{armed}");
+
+        // JSONC with a comment, and a different length so the edit is seen
+        // whatever the timestamp resolution.
+        std::fs::write(&path, "{ // off\n \"codex\": { \"auto_use_resets\": 0 } }").unwrap();
+        assert!(reloader.check().is_some());
+        let disarmed = quota_config(&registry);
+        assert_eq!(disarmed["codexAutoUseResetsSecs"], 0);
+        assert_eq!(disarmed["codexResetsArmed"], false);
+        assert_eq!(disarmed["lastError"], serde_json::Value::Null);
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// Drive the REAL channel-0 control handler with a `health.check` Request and
@@ -3026,6 +3166,7 @@ mod tests {
             "callObservationsApplied",
             "callObservationsIgnored",
             "buildCommit",
+            "quotaConfig",
             "providersTotal",
             "fresh",
             "stale",
@@ -3110,6 +3251,7 @@ mod tests {
             &test_vault(),
             &ServeCounters::default(),
             &Default::default(),
+            None,
         ) else {
             panic!("health_report must produce a HealthCheck response");
         };

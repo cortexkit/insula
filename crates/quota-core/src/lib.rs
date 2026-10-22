@@ -537,6 +537,10 @@ pub struct Registry {
     pub(crate) backoffs_cleared: std::sync::atomic::AtomicU64,
     credential_source: Option<Arc<dyn CredentialSource>>,
     vault_handle_loader: Option<Arc<vault_handles::VaultHandleLoader>>,
+    /// The live config the providers read, kept here so health can report the
+    /// value in force and when it was loaded. `None` for a registry built from
+    /// an explicit provider list, which has no config of its own.
+    live_config: Option<config::LiveQuotaConfig>,
 }
 
 impl Registry {
@@ -571,6 +575,7 @@ impl Registry {
             backoffs_cleared: std::sync::atomic::AtomicU64::new(0),
             credential_source: None,
             vault_handle_loader: None,
+            live_config: None,
         }
     }
 
@@ -628,14 +633,19 @@ impl Registry {
         }
     }
     /// The default registry: every provider we support.
+    ///
+    /// `config` is the live handle when the caller reloads it (the module
+    /// does), or a plain config when nothing will change it. Providers keep the
+    /// handle, not a copy, so a reload reaches their next decision.
     pub fn with_defaults(
-        config: config::QuotaConfig,
+        config: impl Into<config::LiveQuotaConfig>,
         credential_source: Option<Arc<dyn CredentialSource>>,
     ) -> Self {
+        let config: config::LiveQuotaConfig = config.into();
         let vault_handle_loader = Arc::new(vault_handles::VaultHandleLoader::from_env());
         let mut registry = Self::new(vec![
             Box::new(codex::CodexProvider::new_with_handle_loader(
-                config.codex,
+                config.clone(),
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
@@ -758,7 +768,13 @@ impl Registry {
         }
         registry.credential_source = credential_source;
         registry.vault_handle_loader = Some(vault_handle_loader);
+        registry.live_config = Some(config);
         registry
+    }
+
+    /// The live config this registry's providers read, if it was built with one.
+    pub fn live_config(&self) -> Option<&config::LiveQuotaConfig> {
+        self.live_config.as_ref()
     }
 
     #[cfg(test)]

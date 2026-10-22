@@ -52,7 +52,7 @@ use crate::codex_resets::{
     normalize_credits, response_now, CreditsHttpResponse, CreditsSnapshot, ReqwestResetTransport,
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTickLogger, ResetTransport, UsageFacts,
 };
-use crate::config::CodexConfig;
+use crate::config::{CodexConfig, LiveQuotaConfig};
 #[cfg(test)]
 use crate::credential_source::VaultCapability;
 use crate::credential_source::{CredentialSource, VaultCredential};
@@ -868,9 +868,17 @@ fn reset_credentials_eligible(config: &CodexConfig, credentials: &CodexCredentia
 /// The codex usage provider.
 pub struct CodexProvider {
     http: reqwest::Client,
-    reset_config: CodexConfig,
+    /// The live config handle, shared with the reloader. Read on every
+    /// decision, never copied into the provider: a copy would keep spending
+    /// banked resets after the operator set `auto_use_resets` to 0.
+    reset_config: LiveQuotaConfig,
     reset_transport: Arc<dyn ResetTransport>,
-    reset_coordinator: Result<Arc<ResetCoordinator>, String>,
+    /// Built on the first turn that finds resets armed, then kept for the
+    /// life of the process, so arming at runtime needs no restart and a host
+    /// that never arms never touches the redemption journal. A build failure
+    /// is kept too: a journal directory that cannot be written is not retried
+    /// every turn, and each armed tick reports it instead.
+    reset_coordinator: std::sync::OnceLock<Result<Arc<ResetCoordinator>, String>>,
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     codex_home_override: Option<PathBuf>,
@@ -883,7 +891,7 @@ pub struct CodexProvider {
 
 impl CodexProvider {
     pub fn new(
-        reset_config: CodexConfig,
+        reset_config: impl Into<LiveQuotaConfig>,
         credential_source: Option<Arc<dyn CredentialSource>>,
     ) -> Self {
         Self::new_with_handle_loader(
@@ -894,23 +902,17 @@ impl CodexProvider {
     }
 
     pub(crate) fn new_with_handle_loader(
-        reset_config: CodexConfig,
+        reset_config: impl Into<LiveQuotaConfig>,
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         let http = crate::http::provider_client();
-        let reset_coordinator = if reset_config.is_enabled() {
-            ResetCoordinator::from_env()
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        } else {
-            Err("feature disabled".to_string())
-        };
+        let live_config: LiveQuotaConfig = reset_config.into();
         Self {
             reset_transport: Arc::new(ReqwestResetTransport::new(http.clone())),
             http,
-            reset_config,
-            reset_coordinator,
+            reset_config: live_config,
+            reset_coordinator: std::sync::OnceLock::new(),
             credential_source,
             handle_loader,
             codex_home_override: None,
@@ -961,25 +963,48 @@ impl CodexProvider {
         snapshot
     }
 
+    /// Built through the production constructor, so the tests exercise the
+    /// same handling of the config handle that a real registry gets; only the
+    /// transport, the coordinator and the Codex home are substituted.
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        reset_config: CodexConfig,
+        reset_config: impl Into<LiveQuotaConfig>,
         credential_source: Option<Arc<dyn CredentialSource>>,
         reset_transport: Arc<dyn ResetTransport>,
         reset_coordinator: Arc<ResetCoordinator>,
         handle_loader: VaultHandleLoader,
         codex_home_override: PathBuf,
     ) -> Self {
-        Self {
-            http: crate::http::provider_client(),
-            reset_config,
-            reset_transport,
-            reset_coordinator: Ok(reset_coordinator),
-            credential_source,
-            handle_loader: Arc::new(handle_loader),
-            codex_home_override: Some(codex_home_override),
-            reset_tick_logger: ResetTickLogger::default(),
-            last_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
+        let mut provider =
+            Self::new_with_handle_loader(reset_config, credential_source, Arc::new(handle_loader));
+        provider.reset_transport = reset_transport;
+        provider.reset_coordinator = std::sync::OnceLock::from(Ok(reset_coordinator));
+        provider.codex_home_override = Some(codex_home_override);
+        provider
+    }
+
+    /// The redemption coordinator, if one has been built.
+    fn coordinator(&self) -> Option<&Arc<ResetCoordinator>> {
+        self.reset_coordinator
+            .get()
+            .and_then(|built| built.as_ref().ok())
+    }
+
+    /// Build the coordinator the first time resets are found armed.
+    ///
+    /// Called while listing the turn's handles, before any fetch in the turn,
+    /// so the coordinator learns every served lane before it can authorize a
+    /// redemption. A coordinator that started mid-turn would know none of the
+    /// sibling accounts, and the sibling rules would have nothing to hold a
+    /// redemption back with. Once built it is kept while resets are disarmed,
+    /// and keeps observing lanes, so re-arming finds current sibling readings.
+    fn ensure_coordinator_if_armed(&self) {
+        if self.reset_config.codex().is_enabled() {
+            self.reset_coordinator.get_or_init(|| {
+                ResetCoordinator::from_env()
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            });
         }
     }
 
@@ -1043,7 +1068,7 @@ impl CodexProvider {
             .canonical_account_id
             .as_deref()
             .filter(|account_id| context.is_oauth && !account_id.trim().is_empty());
-        if let Ok(coordinator) = &self.reset_coordinator {
+        if let Some(coordinator) = self.coordinator() {
             coordinator.observe_handle_identity(
                 &context
                     .vault_handle
@@ -1052,9 +1077,12 @@ impl CodexProvider {
                 account_id,
             );
         }
+        // Read once here for the choices made before the network calls (the
+        // usage timeout, and whether this account counts as a redeemer for its
+        // siblings). The redemption itself reads the policy again below.
+        let reset_config = self.reset_config.codex();
         let reset_eligible = account_id.is_some_and(|account_id| {
-            reset_credentials_eligible(&self.reset_config, &credentials)
-                && !account_id.trim().is_empty()
+            reset_credentials_eligible(&reset_config, &credentials) && !account_id.trim().is_empty()
         });
 
         let Some(account_id) = account_id else {
@@ -1068,7 +1096,7 @@ impl CodexProvider {
             if let Err(error) = &usage {
                 self.report_auth_failure(&context, error);
             }
-            if self.reset_config.is_enabled() {
+            if reset_config.is_enabled() {
                 let facts = usage.as_ref().ok().map(|snapshot| {
                     UsageFacts::from_usage(&snapshot.usage, snapshot.limit_reached)
                 });
@@ -1154,7 +1182,7 @@ impl CodexProvider {
         // The credit half asks the same question the tick below asks before it
         // reaches the coordinator -- armed, and holding a credit it may safely
         // spend -- so an account the policy picks to redeem is one that would.
-        if let Ok(coordinator) = &self.reset_coordinator {
+        if let Some(coordinator) = self.coordinator() {
             let redeemable_credit = reset_eligible
                 && credits_snapshot
                     .as_ref()
@@ -1219,12 +1247,17 @@ impl CodexProvider {
                 .with_saved_resets(saved_resets);
         }
 
-        let coordinator = match &self.reset_coordinator {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                eprintln!(
-                    "{LOG_TAG} warning: codex reset journal path unavailable: {error}; tick disarmed"
-                );
+        let coordinator = match self.reset_coordinator.get() {
+            Some(Ok(coordinator)) => coordinator,
+            built => {
+                // `None`: resets were armed after this turn listed its handles,
+                // so the coordinator starts on the next turn, once it has seen
+                // every lane. Skipping one tick is the safe side of that race.
+                if let Some(Err(error)) = built {
+                    eprintln!(
+                        "{LOG_TAG} warning: codex reset journal path unavailable: {error}; tick disarmed"
+                    );
+                }
                 self.reset_tick_logger.emit(
                     Some(account_id),
                     Some(&facts),
@@ -1238,14 +1271,19 @@ impl CodexProvider {
                     .with_saved_resets(saved_resets);
             }
         };
+        // READ AGAIN AT THE MOMENT OF DECIDING. The usage and credits requests
+        // above can take seconds, and a reload in that time must reach this
+        // redemption: an operator who has just set `auto_use_resets` to 0 must
+        // not have a credit spent on the strength of the value it replaced.
+        let reset_config = self.reset_config.codex();
         let result = coordinator
             .process_tick(
                 account_id,
                 ResetTickInput {
-                    armed: true,
+                    armed: reset_config.is_enabled(),
                     now,
                     earliest_expiry: Some(earliest_expiry),
-                    auto_use_resets_secs: self.reset_config.auto_use_resets,
+                    auto_use_resets_secs: reset_config.auto_use_resets,
                     facts: facts.clone(),
                     elapsed_since_attempt_start: attempt_started.elapsed(),
                 },
@@ -1312,7 +1350,8 @@ impl UsageProvider for CodexProvider {
             handles.push(CredentialHandle::implicit());
         }
         handles.extend(vault);
-        if let Ok(coordinator) = &self.reset_coordinator {
+        self.ensure_coordinator_if_armed();
+        if let Some(coordinator) = self.coordinator() {
             coordinator.register_handles(&handles);
         }
         Ok(handles)
@@ -1373,14 +1412,14 @@ impl UsageProvider for CodexProvider {
                 let (context, config_toml) = match resolved {
                     Ok(Ok(resolved)) => resolved,
                     Ok(Err(error)) => {
-                        if self.reset_config.is_enabled() {
+                        if self.reset_config.codex().is_enabled() {
                             self.reset_tick_logger
                                 .emit(None, None, None, None, false, false);
                         }
                         return FetchAttempt::failure(None, None, error);
                     }
                     Err(_) => {
-                        if self.reset_config.is_enabled() {
+                        if self.reset_config.codex().is_enabled() {
                             self.reset_tick_logger
                                 .emit(None, None, None, None, false, false);
                         }
@@ -1399,7 +1438,7 @@ impl UsageProvider for CodexProvider {
         }
         .await;
         if attempt.usage.is_err() {
-            if let Ok(coordinator) = &self.reset_coordinator {
+            if let Some(coordinator) = self.coordinator() {
                 if let Some(observed) = &attempt.observed {
                     coordinator.observe_handle_identity(handle, observed.account_id.as_deref());
                 }
