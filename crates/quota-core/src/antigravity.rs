@@ -1556,23 +1556,35 @@ fn skipped_bucket_note(group: &QuotaGroup, bucket: &QuotaBucket) -> String {
     )
 }
 
-/// Log the skipped buckets once per distinct set, so a stable skip is reported
-/// once per process rather than on every fetch.
+/// Log each distinct skipped bucket once per process.
+///
+/// Keyed on the note itself, not on the last set seen: accounts are fetched in
+/// turn, and one with a skipped bucket alternating with one without made a
+/// "last set" comparison log the same line every minute. The note carries no
+/// values, so the set stays small; it is capped anyway.
 fn report_skipped_buckets(skipped: Vec<String>) {
-    static LAST: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-    let Ok(mut last) = LAST.lock() else {
+    const MAX_REMEMBERED: usize = 64;
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else {
         return;
     };
-    if skipped.is_empty() || last.as_ref() == Some(&skipped) {
-        *last = Some(skipped);
+    let new: Vec<String> = skipped
+        .into_iter()
+        .filter(|note| !seen.contains(note))
+        .collect();
+    if new.is_empty() {
         return;
     }
     eprintln!(
         "{} antigravity: quota summary buckets published no window: {}",
         crate::LOG_TAG,
-        skipped.join("; ")
+        new.join("; ")
     );
-    *last = Some(skipped);
+    for note in new {
+        if seen.len() < MAX_REMEMBERED {
+            seen.push(note);
+        }
+    }
 }
 
 /// A bucket that resolved to a usable window, tagged with its pool.
