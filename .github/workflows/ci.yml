@@ -160,9 +160,25 @@ jobs:
       # lock. A cold run compiles every crate from scratch, which was most of each
       # leg's wall time. A changed lock or toolchain misses the cache and builds
       # clean, so a stale cache can't hide a dependency change.
+      # Windows Defender scans every test binary and scratch file the suite
+      # creates, which made the Windows leg the slowest. These are throwaway CI
+      # VMs, so excluding the build, temp and cargo folders costs nothing and was
+      # measured on another fleet repository to cut its Windows test run by
+      # about 40%.
+      - name: Exclude build folders from Defender
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE", "$env:RUNNER_TEMP", "$env:TEMP", "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup"
+          Set-MpPreference -DisableRealtimeMonitoring $true
+
+      # The subconscious entry caches the ck-subc daemon build the Ubuntu-only
+      # real-daemon test compiles from the sibling checkout, its slowest step.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: insula -> target
+          workspaces: |
+            insula -> target
+            subconscious -> target
 
       - name: Format check
         run: cargo fmt --all -- --check
