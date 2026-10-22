@@ -1521,6 +1521,60 @@ fn is_ordinary_bucket_id(bucket_id: &str) -> bool {
     })
 }
 
+/// Why a summary bucket published no window, by id and field presence only.
+///
+/// A skipped bucket is a limit consumers can't see. A paid Pro account's
+/// separate Gemini 4 Argon group went missing this way (insula#39), and the
+/// only trace was an unread-key line that can't name the field. This names the
+/// group, the bucket id and what was missing. It never logs a value.
+fn skipped_bucket_note(group: &QuotaGroup, bucket: &QuotaBucket) -> String {
+    let reason = if bucket.disabled {
+        "disabled"
+    } else {
+        "no remaining fraction"
+    };
+    format!(
+        "{:?}/{:?} ({reason}; window {:?}, remainingFraction {}, remaining {}, resetTime {})",
+        group.display_name.trim(),
+        bucket.bucket_id.trim(),
+        bucket.window.as_deref().unwrap_or(""),
+        if bucket.remaining_fraction.is_some() {
+            "present"
+        } else {
+            "absent"
+        },
+        match &bucket.remaining {
+            None => "absent".to_string(),
+            Some(Value::Object(map)) => format!("keys {:?}", map.keys().collect::<Vec<_>>()),
+            Some(_) => "not an object".to_string(),
+        },
+        if bucket.reset_time.is_some() {
+            "present"
+        } else {
+            "absent"
+        },
+    )
+}
+
+/// Log the skipped buckets once per distinct set, so a stable skip is reported
+/// once per process rather than on every fetch.
+fn report_skipped_buckets(skipped: Vec<String>) {
+    static LAST: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if skipped.is_empty() || last.as_ref() == Some(&skipped) {
+        *last = Some(skipped);
+        return;
+    }
+    eprintln!(
+        "{} antigravity: quota summary buckets published no window: {}",
+        crate::LOG_TAG,
+        skipped.join("; ")
+    );
+    *last = Some(skipped);
+}
+
 /// A bucket that resolved to a usable window, tagged with its pool.
 struct ResolvedWindow {
     window: RateWindow,
@@ -1645,13 +1699,16 @@ pub fn parse_quota_summary(body: &str) -> Result<Usage, FetchError> {
 
 fn normalize_quota_summary(summary: QuotaSummary) -> Result<Usage, FetchError> {
     let mut resolved: Vec<ResolvedWindow> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for group in &summary.groups {
         for bucket in &group.buckets {
-            if let Some(w) = resolve_window(group, bucket) {
-                resolved.push(w);
+            match resolve_window(group, bucket) {
+                Some(w) => resolved.push(w),
+                None => skipped.push(skipped_bucket_note(group, bucket)),
             }
         }
     }
+    report_skipped_buckets(skipped);
 
     if resolved.is_empty() {
         return Err(FetchError::Decode(
@@ -4076,6 +4133,26 @@ mod tests {
             parse_quota_summary(body),
             Err(FetchError::Decode(_))
         ));
+    }
+
+    /// A skipped bucket is named by group, id and missing field, never by value.
+    #[test]
+    fn a_skipped_bucket_note_names_the_bucket_and_the_missing_field() {
+        let group = QuotaGroup {
+            display_name: "Gemini 4 Argon".to_string(),
+            buckets: Vec::new(),
+        };
+        let bucket: QuotaBucket = serde_json::from_str(
+            r#"{"bucketId":"argon-weekly","window":"weekly",
+                "remaining":{"amount":"secret-ish"},"resetTime":"2026-10-30T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let note = skipped_bucket_note(&group, &bucket);
+        assert_eq!(
+            note,
+            r#""Gemini 4 Argon"/"argon-weekly" (no remaining fraction; window "weekly", remainingFraction absent, remaining keys ["amount"], resetTime present)"#
+        );
+        assert!(!note.contains("secret-ish"), "values are never logged");
     }
 
     /// The nested fraction shape and an epoch-seconds reset both parse.
