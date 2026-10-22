@@ -148,6 +148,40 @@ fn remote_user_agent_header() -> Header {
     Header::new("User-Agent", remote_user_agent())
 }
 
+/// The Antigravity CLI identity, sent only on the quota summary call.
+///
+/// Google decides which quota groups a summary carries partly by client. A
+/// paid Pro account gets a separate "Gemini 4 Argon" group under the CLI
+/// identity, which the opencode antigravity-auth plugin sends, but not under
+/// the hub identity insula sent before (insula#39, antigravity-auth#43). For an
+/// Ultra account both identities returned byte-identical groups, buckets,
+/// fractions and resets (measured 2026-10-22 22:02Z on one vault token), so
+/// the switch costs nothing where Argon doesn't exist. The pinned values match
+/// the plugin's (`cl` is the 1.3.5 build id).
+const CLI_USER_AGENT_VERSION: &str = "1.3.5";
+const CLI_USER_AGENT_BUILD: &str = "998863838";
+
+fn cli_user_agent_for(platform: &str, architecture: &str) -> String {
+    let (platform, architecture) = hub_target(platform, architecture);
+    format!(
+        "antigravity/cli/{CLI_USER_AGENT_VERSION} (aidev_client; os_type={platform}; \
+         arch={architecture}; cl={CLI_USER_AGENT_BUILD}; auth_method=consumer)"
+    )
+}
+
+/// The User-Agent for a Cloud Code quota request: the CLI identity for the
+/// summary call, the hub identity for everything else.
+fn quota_user_agent_header(summary: bool) -> Header {
+    if summary {
+        Header::new(
+            "User-Agent",
+            cli_user_agent_for(std::env::consts::OS, std::env::consts::ARCH),
+        )
+    } else {
+        remote_user_agent_header()
+    }
+}
+
 /// Installation evidence only: never open the plugin's credential store.
 const ACCOUNTS_FILE: &str = ".config/opencode/antigravity-accounts.json";
 
@@ -2332,7 +2366,7 @@ impl AntigravityProvider {
             }))
             .map_err(|e| FetchError::Decode(e.to_string()))?;
             if let Ok(response) = self
-                .post_quota(&self.load_code_assist_url, body, access_token)
+                .post_quota(&self.load_code_assist_url, false, body, access_token)
                 .await
             {
                 if let Ok(code_assist) =
@@ -2370,7 +2404,7 @@ impl AntigravityProvider {
         // `windowMinutes` pair (300 and 10080) rather than a single null. If that
         // pair is ever absent again, this line is the first place to look.
         match self
-            .post_quota(&self.quota_summary_url, body.clone(), access_token)
+            .post_quota(&self.quota_summary_url, true, body.clone(), access_token)
             .await
         {
             Ok(response) => return parse_quota_summary(&String::from_utf8_lossy(&response.body)),
@@ -2383,20 +2417,24 @@ impl AntigravityProvider {
             Err(error) => return Err(error),
         }
 
-        let response = self.post_quota(&self.quota_url, body, access_token).await?;
+        let response = self
+            .post_quota(&self.quota_url, false, body, access_token)
+            .await?;
         parse_remote_quota(&response.body)
     }
 
     async fn post_quota(
         &self,
         url: &str,
+        summary: bool,
         body: Vec<u8>,
         access_token: &str,
     ) -> Result<crate::http::HttpResponse, FetchError> {
         JsonRequest::post_json(url, body)
             .bearer(access_token)
-            // This User-Agent identifies the client making the Cloud Code quota request.
-            .header(remote_user_agent_header())
+            // The summary call identifies as the CLI, so a Pro account's Argon
+            // group comes back; every other call keeps the hub identity.
+            .header(quota_user_agent_header(summary))
             .timeout(REQUEST_TIMEOUT)
             .send_provider_status_first(&self.remote_http, PROVIDER_NAME)
             .await
@@ -3111,8 +3149,19 @@ mod tests {
                 assert!(headers
                     .lines()
                     .any(|line| line == "authorization: bearer mock-token"));
-                assert!(headers.lines().any(|line| line
-                    == format!("user-agent: {}", remote_user_agent().to_ascii_lowercase())));
+                // The summary call identifies as the CLI so Google returns a Pro
+                // account's Argon group; every other call stays on the hub identity.
+                // `/quota-unauthorized` is a test's stand-in for the summary URL.
+                let expected_agent = if matches!(path, "/summary" | "/quota-unauthorized") {
+                    cli_user_agent_for(std::env::consts::OS, std::env::consts::ARCH)
+                } else {
+                    remote_user_agent()
+                };
+                assert!(
+                    headers.lines().any(|line| line
+                        == format!("user-agent: {}", expected_agent.to_ascii_lowercase())),
+                    "the summary call must identify as the Antigravity CLI: {path} sent {headers}"
+                );
                 assert!(headers
                     .lines()
                     .any(|line| line == "content-type: application/json"));
@@ -4629,6 +4678,15 @@ mod plugin_lane_tests {
         assert_eq!(hub_target("windows", "aarch64"), ("windows", "arm64"));
         assert_eq!(hub_target("windows", "x86_64"), ("windows", "amd64"));
         assert_eq!(hub_target("freebsd", "riscv64"), ("darwin", "amd64"));
+    }
+
+    #[test]
+    fn cli_identity_matches_the_plugins_string() {
+        assert_eq!(
+            cli_user_agent_for("macos", "aarch64"),
+            "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; \
+             cl=998863838; auth_method=consumer)"
+        );
     }
 
     #[test]
