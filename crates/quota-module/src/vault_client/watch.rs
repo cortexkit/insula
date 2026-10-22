@@ -4,6 +4,14 @@ use cortexkit_claustrum_client::{WatchAction, WatchNotice, WatchTracker};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const REFUSAL_BACKOFF: Duration = Duration::from_secs(300);
+/// How long a vault that answered `unknown_method` waits before it is asked again
+/// when nothing else suggests it changed.
+///
+/// The main signal for an upgraded vault is its route reopening, but an upgrade
+/// can keep the route (or the reopen can be missed), and without this backstop
+/// the module would stay on the 60 s list poll until a restart. Long, because
+/// each probe against a vault that still lacks the method is a wasted request.
+const UNSUPPORTED_REPROBE: Duration = Duration::from_secs(30 * 60);
 
 pub(super) struct StreamSender {
     pub generation: u64,
@@ -13,6 +21,18 @@ pub(super) struct StreamSender {
 
 #[cfg(test)]
 mod tests;
+
+/// The vault answered `unknown_method` to `auth.watch_scoped`.
+#[derive(Clone, Copy)]
+struct Unsupported {
+    /// The route the refusal arrived on. A vault module that restarts (for an
+    /// upgrade, say) re-registers with the daemon and this client opens a new
+    /// route to it, with a new route generation, on the same daemon connection.
+    /// A different generation is therefore the cue to ask once more.
+    route_generation: Option<u64>,
+    /// When to ask again even if the route never changes.
+    reprobe_at: Instant,
+}
 
 struct Subscription {
     state: Arc<ClientState>,
@@ -51,7 +71,7 @@ pub(super) struct InventoryWatch {
     next_attempt: Option<Instant>,
     last_read: Option<Instant>,
     failures: u32,
-    unsupported: bool,
+    unsupported: Option<Unsupported>,
     dirty: bool,
     confirming_refusal: bool,
 }
@@ -164,7 +184,13 @@ impl InventoryWatch {
                     .or_else(|| body.pointer("/error/code"))
                     .and_then(Value::as_str);
                 if code == Some("unknown_method") {
-                    self.unsupported = true;
+                    self.unsupported = Some(Unsupported {
+                        route_generation: self
+                            .subscription
+                            .as_ref()
+                            .map(|subscription| subscription.route.route_generation),
+                        reprobe_at: Instant::now() + UNSUPPORTED_REPROBE,
+                    });
                     self.health(client, 3);
                     self.tracker.unknown_method()
                 } else {
@@ -226,10 +252,27 @@ impl InventoryWatch {
             if self.generation != Some(connection.generation) {
                 self.subscription = None;
                 self.generation = Some(connection.generation);
-                self.unsupported = false;
+                self.unsupported = None;
                 self.next_attempt = None;
                 self.dirty = true;
                 self.health(client, 0);
+            }
+            // An older vault is asked again once its route has been reopened,
+            // or once the long backstop has passed, and never more often: the
+            // probe that follows either succeeds or records the current route
+            // and a fresh deadline, so a vault that still lacks the method costs
+            // one request per reopen or per backstop period.
+            if let Some(unsupported) = self.unsupported {
+                let reopened = client
+                    .state
+                    .ready_route_generation(connection.generation)
+                    .await
+                    .is_some_and(|generation| Some(generation) != unsupported.route_generation);
+                if reopened || now >= unsupported.reprobe_at {
+                    self.unsupported = None;
+                    // A reopen can land inside the backoff the refusal set.
+                    self.next_attempt = None;
+                }
             }
         }
         if let Some(subscription) = self.subscription.as_mut() {
@@ -249,7 +292,7 @@ impl InventoryWatch {
             }
         }
         if self.subscription.is_none()
-            && !self.unsupported
+            && self.unsupported.is_none()
             && self.next_attempt.is_none_or(|deadline| now >= deadline)
         {
             if let Some(connection) = connection {
@@ -287,7 +330,7 @@ impl InventoryWatch {
             self.subscription = None;
             self.health(
                 client,
-                if self.unsupported {
+                if self.unsupported.is_some() {
                     3
                 } else if client.vault_list_watch() == "refused" {
                     2
@@ -311,5 +354,18 @@ impl InventoryWatch {
             };
         }
         Some(result)
+    }
+}
+
+impl ClientState {
+    /// The generation of the route that is open right now on this connection,
+    /// without opening one.
+    async fn ready_route_generation(&self, connection_generation: u64) -> Option<u64> {
+        match &*self.route.lock().await {
+            RouteState::Ready(lease) if lease.connection_generation == connection_generation => {
+                Some(lease.route_generation)
+            }
+            _ => None,
+        }
     }
 }

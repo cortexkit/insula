@@ -60,6 +60,9 @@ impl Stub {
             let mut held = None;
             let mut view = "v1".to_string();
             let mut denied = false;
+            // Set when the stub "restarts" the vault onto a build that answers
+            // `auth.watch_scoped`; see `Stub::restart_vault`.
+            let mut upgraded = false;
             loop {
                 tokio::select! {
                     frame = read_frame(&mut socket) => {
@@ -72,7 +75,7 @@ impl Stub {
                                 assert!(frame.header.flags.is_subscription());
                                 assert_eq!(request["params"], serde_json::json!({}));
                                 opened.fetch_add(1, Ordering::Relaxed);
-                                let result = match if denied { Opening::Refused } else { opening } {
+                                let result = match if denied { Opening::Refused } else if upgraded { Opening::Notice } else { opening } {
                                     Opening::Notice => reply(&frame, FrameType::StreamData, notice(1, &view, "epoch", "keys")),
                                     Opening::Unknown => reply(&frame, FrameType::Error, serde_json::json!({"code":"unknown_method"})),
                                     Opening::End => reply(&frame, FrameType::StreamEnd, Value::Null),
@@ -102,6 +105,22 @@ impl Stub {
                     command = receive.recv() => {
                         let Some((ty, body)) = command else { return; };
                         if ty == FrameType::Response { denied = true; }
+                        if ty == FrameType::Goodbye && body["route"].as_bool() == Some(true) {
+                            // The daemon closes the vault's route when the vault
+                            // module goes away, and keeps this connection.
+                            upgraded |= body["upgrade"].as_bool() == Some(true);
+                            let goodbye = Frame::build(
+                                FrameType::Goodbye,
+                                Flags::new(false, Priority::Passive, false),
+                                4,
+                                5,
+                                0,
+                                Vec::new(),
+                            )
+                            .unwrap();
+                            write_frame(&mut socket, &goodbye).await.unwrap();
+                            continue;
+                        }
                         if ty == FrameType::Goodbye {
                             socket.shutdown().await.unwrap();
                             socket = accept_authenticated(&listener, &key, &daemon_id).await;
@@ -149,6 +168,47 @@ impl Stub {
         if let Some(at) = &mut watch.next_attempt {
             *at -= POLL_INTERVAL;
         }
+    }
+
+    /// Restart the vault module behind the daemon: its route closes and this
+    /// client's connection stays. With `upgrade`, the vault comes back on a build
+    /// that answers `auth.watch_scoped`.
+    async fn restart_vault(&self, upgrade: bool) {
+        self.commands
+            .send((
+                FrameType::Goodbye,
+                serde_json::json!({"route": true, "upgrade": upgrade}),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while matches!(&*self.client.state.route.lock().await, RouteState::Ready(_)) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the client never saw the vault's route close");
+    }
+
+    async fn reprobe_at(&self) -> Instant {
+        self.client
+            .watch
+            .lock()
+            .await
+            .unsupported
+            .expect("the watch is unsupported")
+            .reprobe_at
+    }
+
+    /// Bring the unsupported watch's backstop deadline `by` closer.
+    async fn reprobe_sooner(&self, by: Duration) {
+        if let Some(unsupported) = &mut self.client.watch.lock().await.unsupported {
+            unsupported.reprobe_at -= by;
+        }
+    }
+
+    fn opens(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
     }
 }
 
@@ -232,6 +292,107 @@ async fn watch_unknown_method_polls_each_minute_without_reopening() {
     }
     assert_eq!(stub.reads.load(Ordering::Relaxed), 4);
     assert_eq!(stub.opens.load(Ordering::Relaxed), 1);
+}
+
+/// An older vault that is upgraded in place is watched again once its route
+/// reopens.
+///
+/// A vault module restart keeps this client's daemon connection, so clearing
+/// `unsupported` only on a new connection left an upgraded vault on the 60 s
+/// list poll until a process restart. The restart does close and reopen the
+/// vault's route, which is the cue to ask once more.
+#[tokio::test]
+async fn watch_unsupported_asks_again_after_the_route_reopens_to_an_upgraded_vault() {
+    let stub = Stub::new(Opening::Unknown).await;
+    stub.turn().await.unwrap().unwrap();
+    assert_eq!(stub.client.vault_list_watch(), "unsupported");
+    stub.restart_vault(true).await;
+    assert!(stub.turn().await.is_none());
+    assert_eq!(stub.opens(), 1, "a closed route is not yet a reopened one");
+    // The next list poll reopens the route; the turn after it probes.
+    stub.minute().await;
+    stub.turn().await.unwrap().unwrap();
+    stub.turn().await;
+    assert_eq!(
+        stub.client.vault_list_watch(),
+        "watching",
+        "an upgraded vault behind a reopened route must be watched again"
+    );
+    assert_eq!(stub.opens(), 2);
+    for _ in 0..3 {
+        assert!(stub.turn().await.is_none());
+    }
+    assert_eq!(stub.opens(), 2);
+    assert_eq!(stub.client.connections_established(), 1);
+}
+
+/// Without a reopen, an unsupported watch is asked again once per backstop
+/// period, and not before.
+///
+/// The backstop covers an upgrade that keeps the route. A refused re-probe
+/// starts a fresh period rather than asking again on the next turn.
+#[tokio::test]
+async fn watch_unsupported_asks_again_once_after_the_backstop_and_not_before() {
+    let stub = Stub::new(Opening::Unknown).await;
+    stub.turn().await.unwrap().unwrap();
+    assert!(
+        stub.reprobe_at().await > Instant::now() + UNSUPPORTED_REPROBE - Duration::from_secs(10)
+    );
+    // One minute before the deadline: still unsupported, still polling.
+    stub.reprobe_sooner(UNSUPPORTED_REPROBE - POLL_INTERVAL)
+        .await;
+    stub.minute().await;
+    stub.turn().await.unwrap().unwrap();
+    assert_eq!(
+        stub.opens(),
+        1,
+        "the backstop must not ask before its deadline"
+    );
+    stub.reprobe_sooner(POLL_INTERVAL).await;
+    stub.minute().await;
+    stub.turn().await.unwrap().unwrap();
+    assert_eq!(
+        stub.opens(),
+        2,
+        "the backstop must ask once its deadline passes"
+    );
+    assert_eq!(stub.client.vault_list_watch(), "unsupported");
+    for _ in 0..3 {
+        stub.minute().await;
+        stub.turn().await.unwrap().unwrap();
+    }
+    assert_eq!(
+        stub.opens(),
+        2,
+        "a refused re-probe must wait a whole backstop period"
+    );
+    assert!(
+        stub.reprobe_at().await > Instant::now() + UNSUPPORTED_REPROBE - Duration::from_secs(10)
+    );
+}
+
+/// A vault that still lacks the method after its route reopens is asked once
+/// for that reopen and then left on the list poll.
+#[tokio::test]
+async fn watch_unsupported_refused_again_after_a_reopen_does_not_loop() {
+    let stub = Stub::new(Opening::Unknown).await;
+    stub.turn().await.unwrap().unwrap();
+    stub.restart_vault(false).await;
+    stub.minute().await;
+    stub.turn().await.unwrap().unwrap();
+    stub.turn().await;
+    assert_eq!(stub.opens(), 2, "one probe for the reopen");
+    assert_eq!(stub.client.vault_list_watch(), "unsupported");
+    for _ in 0..4 {
+        stub.minute().await;
+        stub.turn().await;
+    }
+    assert_eq!(
+        stub.opens(),
+        2,
+        "a refused re-probe on the same route must not ask again"
+    );
+    assert_eq!(stub.client.vault_list_watch(), "unsupported");
 }
 
 #[tokio::test]

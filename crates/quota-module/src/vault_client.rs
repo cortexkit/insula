@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -272,6 +272,15 @@ struct ClientState {
     /// path that never executed are the same observable from outside. Those have
     /// opposite investigations.
     route_warming_retries: AtomicU64,
+    /// Whether this route's "no such module" refusal has already been logged.
+    ///
+    /// A host without the target module answers every retry the same way, so
+    /// the warning is printed once when the module goes missing and again only
+    /// after a route to it has opened in between. Cleared in `open_route_inner`.
+    module_absence_logged: AtomicBool,
+    /// Every warning this state printed, so tests can assert what was logged.
+    #[cfg(test)]
+    warnings: Mutex<Vec<String>>,
     next_corr: AtomicU64,
     request_timeout: Duration,
 }
@@ -296,6 +305,9 @@ impl ClientState {
             next_connection_generation: AtomicU64::new(1),
             next_route_generation: AtomicU64::new(1),
             route_warming_retries: AtomicU64::new(0),
+            module_absence_logged: AtomicBool::new(false),
+            #[cfg(test)]
+            warnings: Mutex::new(Vec::new()),
             unmatched_terminal_drops: AtomicU64::new(0),
             stale_generation_drops: AtomicU64::new(0),
             next_corr: AtomicU64::new(1),
@@ -305,6 +317,32 @@ impl ClientState {
 
     fn next_corr(&self) -> u64 {
         self.next_corr.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn warn(&self, line: String) {
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.warnings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line);
+    }
+
+    /// Classify an error frame that arrived on this state's route.
+    ///
+    /// The vault client and the bus route share this type with different
+    /// `target_module`s, so warnings must name the route's own module: naming a
+    /// fixed id sent a reader to a healthy vault when the bus was the one absent.
+    fn classify_error_frame(&self, body: &[u8]) -> ClientFailure {
+        classify_error_frame(
+            body,
+            &RouteErrorSink {
+                target_module: self.target_module,
+                warming_retries: &self.route_warming_retries,
+                absence_logged: &self.module_absence_logged,
+                warn: &|line| self.warn(line),
+            },
+        )
     }
 
     async fn connection(self: &Arc<Self>) -> Result<Arc<LiveConnection>, ClientFailure> {
@@ -811,10 +849,7 @@ impl ClientState {
             .await
             .map_err(|_| ClientFailure::Transport)??;
         if response.header.ty == FrameType::Error {
-            return Err(classify_error_frame(
-                &response.body,
-                &self.route_warming_retries,
-            ));
+            return Err(self.classify_error_frame(&response.body));
         }
         let value: Value =
             serde_json::from_slice(&response.body).map_err(|_| ClientFailure::RouteSetup)?;
@@ -828,6 +863,9 @@ impl ClientState {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .ok_or(ClientFailure::RouteSetup)?;
+        // The module answered, so a later "no such module" is a new absence and
+        // is worth one more warning.
+        self.module_absence_logged.store(false, Ordering::Relaxed);
         Ok(RouteLease {
             route: Route { channel, epoch },
             connection_generation: connection.generation,
@@ -905,7 +943,7 @@ impl ClientState {
         .map_err(|_| ClientFailure::Protocol)?;
         let response = self.request(&connection, frame).await?;
         if response.header.ty == FrameType::Error {
-            let error = classify_error_frame(&response.body, &self.route_warming_retries);
+            let error = self.classify_error_frame(&response.body);
             if matches!(
                 error,
                 ClientFailure::RouteGone | ClientFailure::ModuleAbsent
@@ -1563,6 +1601,18 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
     }
 }
 
+/// The state of one route that its error frames are counted and reported against.
+struct RouteErrorSink<'a> {
+    /// The module the route was opened to. Warnings print this, never a fixed
+    /// id, because the vault and the bus route share this code.
+    target_module: &'a str,
+    warming_retries: &'a AtomicU64,
+    /// Set when a "no such module" refusal has been logged; see
+    /// `ClientState::module_absence_logged`.
+    absence_logged: &'a AtomicBool,
+    warn: &'a dyn Fn(String),
+}
+
 /// Map a control-plane error frame onto a retry policy.
 ///
 /// THE CODES ARE READ FROM `subc_protocol::error_codes` RATHER THAN SPELLED AS
@@ -1578,9 +1628,10 @@ fn read_error_to_outcome(class: &str, code: Option<&str>) -> VaultGetError {
 /// sent an unparseable payload and sends them to this repo hunting a parse bug.
 /// That is how a router's "try again in a moment" became a five-minute outage
 /// with a misleading cause, reported as insula#14.
-fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailure {
+fn classify_error_frame(body: &[u8], route: &RouteErrorSink<'_>) -> ClientFailure {
     use subc_protocol::error_codes as codes;
 
+    let module = route.target_module;
     let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
     match value.get("code").and_then(Value::as_str) {
         // The target is not there. Retrying is right for a module that is coming
@@ -1601,21 +1652,30 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
         // the `Direct` principal this client used before claims existed.
         Some("bad_consumer_identity") => ClientFailure::IdentityRefused,
         Some(code @ "unknown_channel") => {
-            eprintln!(
+            (route.warn)(format!(
                 "{LOG_TAG} warning: daemon answered {code:?} for module id \
-                 {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
-            );
+                 {module:?} -- restarting, renamed, or removed from the config?"
+            ));
             ClientFailure::RouteGone
         }
         // No credential module by this id on this daemon. Not retried: it is
         // what a host without a vault answers every time, and the enumeration
         // reads it as "no vault here" so the local lanes serve. The warning stays
         // because the same code is also what a wrong or retired id produces.
+        //
+        // Printed once per absence rather than per refusal: a host that never
+        // runs the module answers every retry identically, and repeating the
+        // line every few minutes buries everything else in the log. A route
+        // opening to the module re-arms it, so absent -> present -> absent logs
+        // twice.
         Some(code @ (codes::UNKNOWN_MODULE | codes::MODULE_REMOVED)) => {
-            eprintln!(
-                "{LOG_TAG} warning: daemon answered {code:?} for module id \
-                 {CREDENTIALS_MODULE_ID:?} -- restarting, renamed, or removed from the config?"
-            );
+            if !route.absence_logged.swap(true, Ordering::Relaxed) {
+                (route.warn)(format!(
+                    "{LOG_TAG} warning: daemon answered {code:?} for module id \
+                     {module:?} -- restarting, renamed, or removed from the config? \
+                     Not repeated until a route to {module:?} opens again."
+                ));
+            }
             ClientFailure::ModuleAbsent
         }
         // The target exists and is not ready yet. `module_warming` is emphatically
@@ -1639,7 +1699,7 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
         // size-capped to hours and loses them anyway. A monotonic count read off
         // the health surface has neither problem.
         Some(code @ (codes::MODULE_RELOADING | codes::MODULE_WARMING)) => {
-            warming_retries.fetch_add(1, Ordering::Relaxed);
+            route.warming_retries.fetch_add(1, Ordering::Relaxed);
             // The daemon's detail string is the half worth keeping, and it is
             // already in hand here rather than needing to be plumbed: `state=`
             // separates a restart mid-handshake from a module that is enabled and
@@ -1653,10 +1713,10 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
                 .map(str::trim)
                 .filter(|detail| !detail.is_empty())
             {
-                eprintln!(
-                    "{LOG_TAG} {CREDENTIALS_MODULE_ID} not ready ({code}), retrying: {}",
+                (route.warn)(format!(
+                    "{LOG_TAG} {module} not ready ({code}), retrying: {}",
                     quota_core::text::truncate_for_wire(detail, 200)
-                );
+                ));
             }
             ClientFailure::RouteGone
         }
@@ -1694,13 +1754,13 @@ fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailu
                     // A code with no vault `class` is a ROUTE-LAYER reply this
                     // match has not been taught, which in practice means the
                     // daemon grew a code since this was written.
-                    eprintln!(
+                    (route.warn)(format!(
                         "{LOG_TAG} warning: unclassified control error code {:?} from the \
                          daemon -- retrying next tick and serving the cached window. If \
                          this condition is permanent it will repeat forever while the wire \
                          reads healthy; give it an arm in classify_error_frame.",
                         code.unwrap_or("<absent>")
-                    );
+                    ));
                     ClientFailure::UnknownRouteCode
                 }
             }
@@ -2396,6 +2456,172 @@ mod tests {
             format!(r#"{{"code":"{code}"}}"#).as_bytes(),
             &AtomicU64::new(0),
         )
+    }
+
+    /// The production classifier as the credential route calls it, with a fresh
+    /// absence flag and warnings printed. The classification tests only read the
+    /// returned failure and the warming counter, so they need nothing else.
+    fn classify_error_frame(body: &[u8], warming_retries: &AtomicU64) -> ClientFailure {
+        super::classify_error_frame(
+            body,
+            &RouteErrorSink {
+                target_module: CREDENTIALS_MODULE_ID,
+                warming_retries,
+                absence_logged: &AtomicBool::new(false),
+                warn: &|line| eprintln!("{line}"),
+            },
+        )
+    }
+
+    fn warnings(state: &ClientState) -> Vec<String> {
+        state
+            .warnings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A refused bus route names `ckbus`, not the credential vault.
+    ///
+    /// The bus route reuses the vault's client state with a different target
+    /// module. When the warning printed a fixed id, a host without a bus logged
+    /// `module id "claustrum"` on every retry while the vault was registered and
+    /// serving, which sends a reader to the one module that is fine.
+    #[tokio::test]
+    async fn a_refused_bus_route_names_ckbus() {
+        let bus = BusRoute::new(PathBuf::from("/nonexistent/subc-connection.json"));
+        bus.state.classify_error_frame(
+            format!(
+                r#"{{"code":"{}"}}"#,
+                subc_protocol::error_codes::UNKNOWN_MODULE
+            )
+            .as_bytes(),
+        );
+        bus.state
+            .classify_error_frame(br#"{"code":"unknown_channel"}"#);
+        let logged = warnings(&bus.state);
+        assert_eq!(logged.len(), 2, "one warning per refusal kind: {logged:?}");
+        for line in &logged {
+            assert!(
+                line.contains(r#"module id "ckbus""#) && !line.contains(CREDENTIALS_MODULE_ID),
+                "a bus route refusal must name ckbus, not the vault: {line}"
+            );
+        }
+    }
+
+    /// The credential route still names its own module, so the bus fix did not
+    /// just swap one fixed id for another.
+    #[test]
+    fn a_refused_vault_route_names_claustrum() {
+        let vault = ClientState::new(PathBuf::from("/nonexistent/subc-connection.json"));
+        vault.classify_error_frame(
+            format!(
+                r#"{{"code":"{}"}}"#,
+                subc_protocol::error_codes::UNKNOWN_MODULE
+            )
+            .as_bytes(),
+        );
+        let logged = warnings(&vault);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].contains(&format!("module id {CREDENTIALS_MODULE_ID:?}")),
+            "a vault route refusal must name the vault's module id: {}",
+            logged[0]
+        );
+    }
+
+    fn error_reply(request: &Frame, code: &str) -> Frame {
+        Frame::build(
+            FrameType::Error,
+            Flags::new(false, Priority::Passive, false),
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&subc_protocol::ErrorBody::new(code, "no such module")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A module that stays absent is logged once per change of state, not once
+    /// per retry.
+    ///
+    /// The daemon refuses three route opens, then opens one and answers a call
+    /// on it, then refuses a call on that route and the reopen that follows.
+    /// That is absent, present, absent: two warnings. Logging every refusal
+    /// printed the same line every five minutes for the life of a host that
+    /// never runs the module.
+    #[tokio::test]
+    async fn an_absent_module_is_logged_once_per_absence() {
+        use subc_protocol::error_codes::UNKNOWN_MODULE;
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("absent-once").await;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            for _ in 0..3 {
+                let open = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(open.header.channel, 0, "expected route.open");
+                write_frame(&mut stream, &error_reply(&open, UNKNOWN_MODULE))
+                    .await
+                    .unwrap();
+            }
+            reply_route(&mut stream, 4, 5).await;
+            let call = read_frame(&mut stream).await.unwrap().unwrap();
+            let answer = Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                call.header.channel,
+                call.header.epoch,
+                call.header.corr,
+                br#"{"result":{"error":{"class":"permanent","code":"not_found"}}}"#.to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &answer).await.unwrap();
+            let call = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_ne!(call.header.channel, 0, "expected a call on the open route");
+            write_frame(&mut stream, &error_reply(&call, UNKNOWN_MODULE))
+                .await
+                .unwrap();
+            let open = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(open.header.channel, 0, "expected route.open");
+            write_frame(&mut stream, &error_reply(&open, UNKNOWN_MODULE))
+                .await
+                .unwrap();
+        });
+        let client = VaultClient::with_timeout(&path, Duration::from_secs(2));
+
+        for _ in 0..3 {
+            assert_eq!(
+                CredentialSource::list_scoped(&client).await.unwrap_err(),
+                VaultGetError::Unavailable
+            );
+        }
+        assert_eq!(
+            warnings(&client.state).len(),
+            1,
+            "repeated refusals of an absent module must log once: {:?}",
+            warnings(&client.state)
+        );
+        assert_eq!(
+            CredentialSource::list_scoped(&client).await.unwrap_err(),
+            VaultGetError::NotFound,
+            "the module answered on an open route"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                CredentialSource::list_scoped(&client).await.unwrap_err(),
+                VaultGetError::Unavailable
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("stub server did not finish")
+            .unwrap();
+        let logged = warnings(&client.state);
+        assert_eq!(
+            logged.len(),
+            2,
+            "a module that returns and goes missing again must log again: {logged:?}"
+        );
+        assert!(logged.iter().all(|line| line.contains(r#""claustrum""#)));
     }
 
     /// A daemon restart must not cost a vault lane a non-transient backoff.
