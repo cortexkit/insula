@@ -1632,3 +1632,37 @@ expect_message = "a cumulative budget must not be published as a period that res
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "route-warning-names-own-module"
+guards = "A refused bus route's warning names the bus route's own module (ckbus), never the credential vault's id"
+file = "crates/quota-module/src/vault_client.rs"
+old = "target_module: self.target_module,"
+new = "target_module: CREDENTIALS_MODULE_ID, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/vault_client.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["vault_client::tests::a_refused_bus_route_names_ckbus"]
+expect_message = "a bus route refusal must name ckbus, not the vault"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "unsupported-watch-reprobes-on-route-reopen"
+guards = "An unsupported inventory watch asks again once the vault's route reopens, so a vault upgraded in place is watched again"
+file = "crates/quota-module/src/vault_client/watch.rs"
+old = ".is_some_and(|generation| Some(generation) != unsupported.route_generation);"
+new = ".is_some_and(|_generation| false); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-module/src/vault_client/watch/tests.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--lib"
+expect_red = ["vault_client::watch::tests::watch_unsupported_asks_again_after_the_route_reopens_to_an_upgraded_vault"]
+expect_message = "an upgraded vault behind a reopened route must be watched again"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
