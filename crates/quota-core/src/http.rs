@@ -264,10 +264,7 @@ pub struct HttpResponse {
 impl HttpResponse {
     /// Case-insensitive lookup of a response header value.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        find_header(&self.headers, name)
     }
 
     /// The body, refusing a success response that carries nothing.
@@ -294,6 +291,69 @@ impl HttpResponse {
         }
         Ok(&self.body)
     }
+}
+
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Every response header as `(name, value)`, read before the body consumes the
+/// response. A value that is not visible ASCII reads as empty.
+fn response_headers(response: &reqwest::Response) -> Vec<(String, String)> {
+    response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+/// A failed status-first request, with the headers of the response that
+/// refused it.
+///
+/// Exists because a refusal's headers can say when to ask again -- `retry-after`
+/// on a 429 -- and the plain status-first helper drops them. `error` is exactly
+/// what [`JsonRequest::send_provider_status_first`] would have returned, so a
+/// caller that ignores the headers classifies the failure identically.
+pub(crate) struct Refusal {
+    pub error: FetchError,
+    /// Response headers of a non-2xx answer. Empty when no response arrived
+    /// (a transport failure) or when a 2xx failed the body checks.
+    pub headers: Vec<(String, String)>,
+}
+
+impl Refusal {
+    /// Case-insensitive lookup of a refusal's response header value.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        find_header(&self.headers, name)
+    }
+}
+
+/// Read a `retry-after` header value as seconds from `now`.
+///
+/// The header has two legal forms (RFC 9110 section 10.2.3): delta-seconds, or an
+/// HTTP-date. A date converts to its distance from `now` in whole seconds,
+/// truncated toward zero: negative once the date is a second or more in the past. A signed number is accepted here even though the RFC
+/// allows only digits, so a negative value reaches the caller as negative and can
+/// be rejected there as absurd, rather than vanishing as if the header were
+/// absent. `None` for anything else.
+///
+/// Dates are read in the RFC 2822 shape, which covers the IMF-fixdate form every
+/// current server sends (`Sun, 06 Nov 1994 08:49:37 GMT`); the two obsolete date
+/// forms the RFC still lets a recipient accept are read as absent.
+pub(crate) fn retry_after_seconds(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        at.with_timezone(&chrono::Utc)
+            .signed_duration_since(now)
+            .num_seconds(),
+    )
 }
 
 /// The wording [`Response::body_for_parsing`] uses for an empty success body.
@@ -552,6 +612,23 @@ impl JsonRequest {
         client: &reqwest::Client,
         provider: &'static str,
     ) -> Result<HttpResponse, FetchError> {
+        self.send_provider_status_first_keeping_headers(client, provider)
+            .await
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`send_provider_status_first`](Self::send_provider_status_first), with the
+    /// refusing response's headers kept beside the error. Same classification,
+    /// same excerpt bound; only the headers are added.
+    pub(crate) async fn send_provider_status_first_keeping_headers(
+        self,
+        client: &reqwest::Client,
+        provider: &'static str,
+    ) -> Result<HttpResponse, Refusal> {
+        let refused = |error: FetchError| Refusal {
+            error,
+            headers: Vec::new(),
+        };
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
             Method::Post(body) => client.post(&self.url).body(body.clone()),
@@ -561,9 +638,13 @@ impl JsonRequest {
             builder = builder.header(header.name, &header.value);
         }
 
-        let response = builder.send().await.map_err(transport_error)?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| refused(transport_error(error)))?;
         let status = response.status().as_u16();
         let final_url = response.url().to_string();
+        let headers = response_headers(&response);
         if !(200..300).contains(&status) {
             // The body was already read here to drain the connection and then
             // thrown away, which discarded the diagnosis at the one point it
@@ -591,19 +672,12 @@ impl JsonRequest {
                     String::new()
                 }
             };
-            return Err(FetchError::ProviderStatus(status, body));
+            return Err(Refusal {
+                error: FetchError::ProviderStatus(status, body),
+                headers,
+            });
         }
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.as_str().to_string(),
-                    value.to_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
-        let body = read_success_body(response).await?;
+        let body = read_success_body(response).await.map_err(refused)?;
         let response = HttpResponse {
             status,
             headers,
@@ -614,7 +688,7 @@ impl JsonRequest {
         // response rather than routing through that one, so a rule added there
         // does not reach these callers. Every caller of this method parses the
         // body, so none of them wants an empty one.
-        response.body_for_parsing()?;
+        response.body_for_parsing().map_err(refused)?;
         Ok(response)
     }
 
@@ -643,11 +717,7 @@ impl JsonRequest {
         let response = builder.send().await.map_err(transport_error)?;
         let status = response.status().as_u16();
         let final_url = response.url().to_string();
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        let headers = response_headers(&response);
         let body = if (200..300).contains(&status) {
             read_success_body(response).await?
         } else {
@@ -1151,6 +1221,68 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A refusal keeps the response headers that say when to ask again, beside
+    /// the same error the plain status-first helper returns.
+    #[tokio::test]
+    async fn a_refusal_keeps_its_response_headers_beside_the_unchanged_error() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let body = "slow down";
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 600\r\n\
+                 Anthropic-RateLimit-Unified-Status: rejected\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let Err(refusal) = JsonRequest::get(format!("http://{address}/response"))
+            .send_provider_status_first_keeping_headers(&reqwest::Client::new(), "test")
+            .await
+        else {
+            panic!("a 429 must be a refusal");
+        };
+        assert!(
+            matches!(&refusal.error, FetchError::ProviderStatus(429, body) if body == "slow down"),
+            "{:?}",
+            refusal.error
+        );
+        assert_eq!(refusal.header("Retry-After"), Some("600"));
+        assert_eq!(
+            refusal.header("anthropic-ratelimit-unified-status"),
+            Some("rejected")
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(retry_after_seconds("600", now), Some(600));
+        assert_eq!(retry_after_seconds(" 0 ", now), Some(0));
+        // Passed through signed, so the scheduler can reject it as absurd.
+        assert_eq!(retry_after_seconds("-5", now), Some(-5));
+        assert_eq!(
+            retry_after_seconds("Thu, 01 Oct 2026 12:10:00 GMT", now),
+            Some(600)
+        );
+        // A date already in the past reads as negative, not as zero.
+        assert_eq!(
+            retry_after_seconds("Thu, 01 Oct 2026 11:59:00 GMT", now),
+            Some(-60)
+        );
+        assert_eq!(retry_after_seconds("soon", now), None);
+        assert_eq!(retry_after_seconds("", now), None);
+    }
+
     /// The `error` text of a degraded entry is published to consumers, so a
     /// transport failure must not carry the request URL into it: a credential
     /// in a query parameter prints verbatim there.
@@ -1255,7 +1387,11 @@ mod tests {
         // rule it deliberately does not have.
         let exempt = ["send", "send_raw"];
         // Driven together by `every_classifying_helper_treats_an_empty_success_body_alike`.
-        let fenced = ["send_full", "send_provider_status_first"];
+        let fenced = [
+            "send_full",
+            "send_provider_status_first",
+            "send_provider_status_first_keeping_headers",
+        ];
 
         let unclassified: Vec<&String> = found
             .iter()
@@ -1287,17 +1423,26 @@ mod tests {
     /// and as a degrading parse failure on the other.
     #[tokio::test]
     async fn every_classifying_helper_treats_an_empty_success_body_alike() {
-        for label in ["send_full", "send_provider_status_first"] {
+        for label in [
+            "send_full",
+            "send_provider_status_first",
+            "send_provider_status_first_keeping_headers",
+        ] {
             let (url, server) = serve_fixed(200, Vec::new()).await;
             let request = JsonRequest::get(url);
             let client = reqwest::Client::new();
 
             let outcome = match label {
                 "send_full" => request.send_full(&client).await.err(),
-                _ => request
+                "send_provider_status_first" => request
                     .send_provider_status_first(&client, "test")
                     .await
                     .err(),
+                _ => request
+                    .send_provider_status_first_keeping_headers(&client, "test")
+                    .await
+                    .err()
+                    .map(|refusal| refusal.error),
             };
             let Some(error) = outcome else {
                 panic!("{label} accepted an empty success body");
@@ -1320,14 +1465,24 @@ mod tests {
     /// the rule above cannot pass by refusing everything.
     #[tokio::test]
     async fn every_classifying_helper_returns_a_present_body() {
-        for label in ["send_full", "send_provider_status_first"] {
+        for label in [
+            "send_full",
+            "send_provider_status_first",
+            "send_provider_status_first_keeping_headers",
+        ] {
             let (url, server) = serve_fixed(200, b"{}".to_vec()).await;
             let request = JsonRequest::get(url);
             let client = reqwest::Client::new();
 
             let response = match label {
                 "send_full" => request.send_full(&client).await,
-                _ => request.send_provider_status_first(&client, "test").await,
+                "send_provider_status_first" => {
+                    request.send_provider_status_first(&client, "test").await
+                }
+                _ => request
+                    .send_provider_status_first_keeping_headers(&client, "test")
+                    .await
+                    .map_err(|refusal| refusal.error),
             };
             let response =
                 response.unwrap_or_else(|error| panic!("{label} rejected a real body: {error:?}"));

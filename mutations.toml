@@ -1651,6 +1651,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "claude-429-retry-after-honoured"
+guards = "A Claude usage-endpoint 429's retry-after sets the next attempt through the provider and scheduler, instead of the retry ladder"
+file = "crates/quota-core/src/refresh.rs"
+old = '        .filter(|delay| *delay <= RETRY_AFTER_SANITY_LIMIT);'
+new = '        .filter(|_| false); // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/anthropic.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["anthropic::tests::a_429_with_retry_after_600_schedules_the_next_attempt_600_seconds_out"]
+expect_message = "the usage endpoint's retry-after must set the next attempt"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "unsupported-watch-reprobes-on-route-reopen"
 guards = "An unsupported inventory watch asks again once the vault's route reopens, so a vault upgraded in place is watched again"
 file = "crates/quota-module/src/vault_client/watch.rs"
@@ -1663,6 +1680,23 @@ package = "quota-module"
 target = "--lib"
 expect_red = ["vault_client::watch::tests::watch_unsupported_asks_again_after_the_route_reopens_to_an_upgraded_vault"]
 expect_message = "an upgraded vault behind a reopened route must be watched again"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "claude-429-ladder-not-generic"
+guards = "A Claude usage-endpoint 429 without retry-after backs off 5, 10, 20, 30 minutes, never on the generic 60 s transient ladder"
+file = "crates/quota-core/src/refresh.rs"
+old = '        None => claude_rate_limit_ladder(retry_count),'
+new = '        None => backoff(FetchClass::Transient, retry_count), // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/refresh.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["refresh::tests::a_claude_429_without_retry_after_backs_off_from_five_minutes_to_thirty"]
+expect_message = "a Claude 429 with no retry-after must back off from five minutes to a thirty-minute cap"
 only = false
 timeout_s = 600
 build_timeout_s = 1800

@@ -12,6 +12,7 @@ use crate::credential_source::CredentialStatus;
 use crate::model::{AccountInfo, ProviderUsage, SavedResets};
 use crate::provider::{
     AccountObservation, CredentialHandle, CredentialResolution, FetchAttempt, FetchError,
+    RateLimited,
 };
 
 /// Nominal refresh cadence for a healthy fetch unit.
@@ -107,6 +108,32 @@ pub const STALL_HORIZON: Duration = Duration::from_secs(300);
 pub const NON_TRANSIENT_BACKOFF: Duration = Duration::from_secs(300);
 /// Ceiling on the exponential transient backoff.
 pub const MAX_TRANSIENT_BACKOFF: Duration = Duration::from_secs(900);
+
+/// First delay after a Claude usage-endpoint 429 that carried no usable
+/// `retry-after`, doubling per consecutive failure up to
+/// [`CLAUDE_RATE_LIMIT_MAX_BACKOFF`].
+///
+/// Larger than the generic 60 s start because a rate limit is not a blip: after
+/// a module restart, two accounts were refused with 429 on every attempt for more
+/// than seventeen minutes while the generic ladder kept asking (insula#36). Each
+/// early retry is one more request against the per-account limit being
+/// enforced, so retrying quickly can only prolong the lockout. The last good
+/// reading keeps serving, marked stale, while the lane waits.
+pub const CLAUDE_RATE_LIMIT_INITIAL_BACKOFF: Duration = Duration::from_secs(300);
+/// Ceiling on the Claude 429 ladder above: 5, 10, 20, then 30 minutes.
+pub const CLAUDE_RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(1800);
+/// Longest wait taken on a Claude `retry-after`, however long it asks for.
+///
+/// Bounds how long a single upstream number can park a lane. Anthropic's real
+/// window is not yet known; the headers recorded with each 429 are the evidence
+/// that would justify moving this.
+pub const CLAUDE_RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
+/// A `retry-after` beyond this, or below zero, is treated as absent.
+///
+/// Such a value is a server or clock fault rather than a statement about this
+/// account, and honouring even its capped form would park the lane for an hour
+/// on a number nobody meant. The default 429 ladder applies instead.
+pub const RETRY_AFTER_SANITY_LIMIT: Duration = Duration::from_secs(86_400);
 /// Maximum fetch units admitted in one bounded scheduler turn.
 ///
 /// A turn drains every unit it admitted before the next one starts, so a turn
@@ -458,6 +485,55 @@ pub fn backoff(class: FetchClass, retry_count: u32) -> Duration {
             Duration::from_secs(secs).min(MAX_TRANSIENT_BACKOFF)
         }
     }
+}
+
+/// Delay after a failed attempt, measured from attempt completion.
+///
+/// Every failure takes [`backoff`], except a Claude usage-endpoint 429: the
+/// endpoint enforces a per-account limit, and asking again sooner than it allows
+/// only extends the refusal. That one case waits for the upstream's
+/// `retry-after` when it is believable, and otherwise for a ladder that starts
+/// at five minutes. Other providers' 429s keep the generic ladder, because
+/// nothing has been measured about their limits.
+pub fn failure_delay(
+    provider_name: &str,
+    class: FetchClass,
+    retry_count: u32,
+    rate_limited: Option<RateLimited>,
+) -> Duration {
+    match rate_limited {
+        Some(rate_limited) if provider_name == "claude" => {
+            claude_rate_limit_delay(rate_limited, retry_count)
+        }
+        _ => backoff(class, retry_count),
+    }
+}
+
+/// How long a Claude account waits after its usage endpoint answered 429.
+///
+/// A believable `retry-after` (0 s to a day) is honoured but never shortens the
+/// ordinary poll interval -- a lane is not polled more often because it was
+/// refused -- and never exceeds [`CLAUDE_RETRY_AFTER_CAP`]. Without one, the
+/// wait is 5, 10, 20, then 30 minutes for consecutive failures.
+pub fn claude_rate_limit_delay(rate_limited: RateLimited, retry_count: u32) -> Duration {
+    let stated = rate_limited
+        .retry_after_secs
+        .and_then(|secs| u64::try_from(secs).ok())
+        .map(Duration::from_secs)
+        .filter(|delay| *delay <= RETRY_AFTER_SANITY_LIMIT);
+    match stated {
+        Some(delay) => delay.max(CLAUDE_INTERVAL).min(CLAUDE_RETRY_AFTER_CAP),
+        None => claude_rate_limit_ladder(retry_count),
+    }
+}
+
+/// The Claude 429 wait when the upstream stated none: 5, 10, 20, then 30
+/// minutes, by consecutive failure.
+fn claude_rate_limit_ladder(retry_count: u32) -> Duration {
+    let exp = retry_count.saturating_sub(1).min(6);
+    CLAUDE_RATE_LIMIT_INITIAL_BACKOFF
+        .saturating_mul(1u32 << exp)
+        .min(CLAUDE_RATE_LIMIT_MAX_BACKOFF)
 }
 
 fn healthy_entry(
@@ -915,7 +991,8 @@ fn next_slot_after_attempt_inner(
                     prev.last_call_observation_at
                 },
                 status,
-                next_due_at: completed + backoff(class, retry_count),
+                next_due_at: completed
+                    + failure_delay(provider_name, class, retry_count, attempt.rate_limited),
                 retry_count,
                 last_failure_class: Some(class),
                 last_status_poll_at: None,
@@ -1333,6 +1410,7 @@ mod tests {
             pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
+            rate_limited: None,
         }
     }
 
@@ -1378,6 +1456,128 @@ mod tests {
     fn non_transient_backoff_is_fixed() {
         assert_eq!(backoff(FetchClass::NonTransient, 1), NON_TRANSIENT_BACKOFF);
         assert_eq!(backoff(FetchClass::NonTransient, 9), NON_TRANSIENT_BACKOFF);
+    }
+
+    /// A slot that served one healthy Claude reading, then one failed attempt.
+    /// Returns the slot after the failure and the instant the failure completed.
+    fn after_one_failure(
+        provider: &str,
+        error: FetchError,
+        rate_limited: Option<RateLimited>,
+    ) -> (ProviderSlot, Instant) {
+        let t0 = Instant::now();
+        let cold = ProviderSlot::due_now(t0, incarnation());
+        let good = next_slot_after_attempt(
+            &cold,
+            provider,
+            attempt(Some("A"), Ok(Usage::default())),
+            t0,
+            t0,
+        );
+        let t1 = t0 + Duration::from_secs(200);
+        let done = t1 + Duration::from_secs(1);
+        let failed = next_slot_after_attempt(
+            &good,
+            provider,
+            attempt(Some("A"), Err(error)).with_rate_limited(rate_limited),
+            t1,
+            done,
+        );
+        (failed, done)
+    }
+
+    fn rate_limited(retry_after_secs: Option<i64>) -> Option<RateLimited> {
+        Some(RateLimited { retry_after_secs })
+    }
+
+    fn claude_429() -> FetchError {
+        FetchError::ProviderStatus(429, "rate_limit_error".to_string())
+    }
+
+    #[test]
+    fn a_claude_429_with_retry_after_waits_as_long_as_asked() {
+        let (slot, done) = after_one_failure("claude", claude_429(), rate_limited(Some(600)));
+        assert_eq!(
+            slot.next_due_at,
+            done + Duration::from_secs(600),
+            "a believable retry-after must set the next attempt, not the generic ladder"
+        );
+        // Waiting longer does not drop the reading: the last good one keeps
+        // serving, marked stale, exactly as for any other transient failure.
+        assert_eq!(slot.status, SlotStatus::StaleTransient);
+        assert!(slot
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.usage.is_some()));
+    }
+
+    #[test]
+    fn a_claude_retry_after_never_shortens_the_poll_interval_and_is_capped_at_an_hour() {
+        let (short, done) = after_one_failure("claude", claude_429(), rate_limited(Some(30)));
+        assert_eq!(short.next_due_at, done + CLAUDE_INTERVAL);
+        let (long, done) = after_one_failure("claude", claude_429(), rate_limited(Some(7_200)));
+        assert_eq!(long.next_due_at, done + CLAUDE_RETRY_AFTER_CAP);
+    }
+
+    #[test]
+    fn a_claude_429_without_retry_after_backs_off_from_five_minutes_to_thirty() {
+        let t0 = Instant::now();
+        let mut slot = ProviderSlot::due_now(t0, incarnation());
+        let mut now = t0;
+        let mut delays = Vec::new();
+        for _ in 0..5 {
+            let done = now + Duration::from_secs(1);
+            slot = next_slot_after_attempt(
+                &slot,
+                "claude",
+                attempt(Some("A"), Err(claude_429())).with_rate_limited(rate_limited(None)),
+                now,
+                done,
+            );
+            delays.push(slot.next_due_at.saturating_duration_since(done).as_secs() / 60);
+            now = slot.next_due_at;
+        }
+        assert_eq!(
+            delays,
+            vec![5, 10, 20, 30, 30],
+            "a Claude 429 with no retry-after must back off from five minutes to a thirty-minute cap"
+        );
+    }
+
+    #[test]
+    fn an_absurd_retry_after_falls_back_to_the_claude_429_ladder() {
+        for absurd in [-5, -86_400, 86_401, i64::MAX] {
+            let (slot, done) =
+                after_one_failure("claude", claude_429(), rate_limited(Some(absurd)));
+            assert_eq!(
+                slot.next_due_at,
+                done + CLAUDE_RATE_LIMIT_INITIAL_BACKOFF,
+                "retry-after {absurd} must be treated as absent"
+            );
+        }
+        // The edge of believable is still honoured, capped.
+        let (slot, done) = after_one_failure("claude", claude_429(), rate_limited(Some(86_400)));
+        assert_eq!(slot.next_due_at, done + CLAUDE_RETRY_AFTER_CAP);
+    }
+
+    #[test]
+    fn a_codex_429_keeps_the_generic_backoff() {
+        // Even carrying a retry-after, another provider's 429 is not reshaped:
+        // nothing has been measured about its limits.
+        let (slot, done) = after_one_failure(
+            "codex",
+            FetchError::ProviderStatus(429, String::new()),
+            rate_limited(Some(600)),
+        );
+        assert_eq!(slot.next_due_at, done + backoff(FetchClass::Transient, 1));
+        assert_eq!(slot.next_due_at, done + Duration::from_secs(60));
+        // And a Claude failure that is not a rate limit keeps it too.
+        let (slot, done) = after_one_failure(
+            "claude",
+            FetchError::ProviderStatus(503, String::new()),
+            None,
+        );
+        assert_eq!(slot.next_due_at, done + Duration::from_secs(60));
     }
 
     #[test]

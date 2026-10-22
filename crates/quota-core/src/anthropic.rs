@@ -26,11 +26,11 @@ use serde::Deserialize;
 use crate::credential_source::CredentialSource;
 #[cfg(test)]
 use crate::credential_source::VaultCapability;
-use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
+use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt, RateLimited};
 use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
 use crate::{
-    http::{Header, JsonRequest},
+    http::{Header, JsonRequest, Refusal},
     model::{
         Amount, BreakdownRow, CreditExpiry, Pool, PoolBasis, PoolFunding, RateWindow, SavedResets,
         Usage, UsageBreakdown,
@@ -875,6 +875,114 @@ fn usage_request(url: &str, bearer: &str, user_agent: &str) -> JsonRequest {
         .header(Header::new("User-Agent", user_agent))
 }
 
+/// Names read off a usage-endpoint 429 as evidence: `retry-after` and every
+/// header starting with this prefix.
+///
+/// An allow-list of response header names, so nothing else in the response --
+/// and nothing from the request, including its `Authorization` header -- can
+/// reach an error message or a log line through this path.
+const RATE_LIMIT_HEADER_PREFIX: &str = "anthropic-ratelimit-";
+/// At most this many rate-limit headers are kept from one response.
+const MAX_RATE_LIMIT_HEADERS: usize = 16;
+/// Characters kept from each rate-limit header value.
+const RATE_LIMIT_VALUE_CHARS: usize = 80;
+/// Byte limit on the header text placed in front of a 429's message. The
+/// rendered prefix can run slightly longer: the brackets and, when cut, the
+/// truncation marker are added around it.
+const RATE_LIMIT_EVIDENCE_BYTES: usize = 512;
+
+/// What a usage-endpoint 429 said about the limit being enforced.
+///
+/// Recorded because nobody knew whether Anthropic sends `retry-after` on this
+/// endpoint or how long its window is: a restart once locked two accounts out
+/// for over seventeen minutes with nothing logged that could say why
+/// (insula#36). The headers ride in the attempt's error message, where the
+/// stale-episode health metric and the logs show them.
+struct RateLimitEvidence {
+    rate_limited: RateLimited,
+    /// `(name, value)`, `retry-after` first and the rest ordered by name, each
+    /// value bounded.
+    headers: Vec<(String, String)>,
+}
+
+impl RateLimitEvidence {
+    fn from_refusal(refusal: &Refusal, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let retry_after = refusal.header("retry-after");
+        let mut limits: Vec<(String, String)> = refusal
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .filter(|(name, _)| name.starts_with(RATE_LIMIT_HEADER_PREFIX))
+            .collect();
+        limits.sort();
+        let headers = retry_after
+            .map(|value| ("retry-after".to_string(), value.to_string()))
+            .into_iter()
+            .chain(limits)
+            .take(MAX_RATE_LIMIT_HEADERS)
+            .map(|(name, value)| {
+                let value: String = value.trim().chars().take(RATE_LIMIT_VALUE_CHARS).collect();
+                (name, value)
+            })
+            .collect();
+        Self {
+            rate_limited: RateLimited {
+                retry_after_secs: retry_after
+                    .and_then(|value| crate::http::retry_after_seconds(value, now)),
+            },
+            headers,
+        }
+    }
+
+    /// `[retry-after: 600; anthropic-ratelimit-...: ...]`, or `None` when the
+    /// response carried none of the recorded headers.
+    fn rendered(&self) -> Option<String> {
+        if self.headers.is_empty() {
+            return None;
+        }
+        let pairs: Vec<String> = self
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect();
+        Some(format!(
+            "[{}]",
+            crate::text::truncate_for_wire(&pairs.join("; "), RATE_LIMIT_EVIDENCE_BYTES)
+        ))
+    }
+
+    /// Which recorded headers were present, without their values. Values such
+    /// as a reset time change on every refusal, so logging on a value change
+    /// would log every 429; a change in which headers arrive is worth a line.
+    fn header_names(&self) -> String {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        names.join(",")
+    }
+
+    /// Put the headers in front of the refusal's own words, so a reader of a
+    /// bounded message (the health metric keeps a 160-byte prefix) sees them
+    /// before the body is cut. A 429 that carried none is left untouched.
+    fn annotate(&self, error: FetchError) -> FetchError {
+        let Some(prefix) = self.rendered() else {
+            return error;
+        };
+        let join = |rest: String| {
+            if rest.trim().is_empty() {
+                format!("{prefix} (no response body)")
+            } else {
+                format!("{prefix} {rest}")
+            }
+        };
+        match error {
+            FetchError::ProviderStatus(status, body) => {
+                FetchError::ProviderStatus(status, join(body))
+            }
+            FetchError::Upstream(detail) => FetchError::Upstream(join(detail)),
+            other => other,
+        }
+    }
+}
+
 /// The anthropic usage provider.
 pub struct AnthropicProvider {
     http: reqwest::Client,
@@ -892,6 +1000,10 @@ pub struct AnthropicProvider {
     /// Per handle stable id, the last logged reason a readable saved-reset
     /// block counted nothing. See [`inventory_shape`].
     inventory_shapes: Mutex<HashMap<String, String>>,
+    /// Per handle stable id, the rate-limit header names of the 429 last
+    /// logged; absent while the usage endpoint is answering. See
+    /// [`AnthropicProvider::settle_rate_limit`].
+    rate_limits: Mutex<HashMap<String, String>>,
     subscription: Arc<crate::claude_subscription::SubscriptionCache>,
 }
 
@@ -922,6 +1034,7 @@ impl AnthropicProvider {
             reset_refusals: Mutex::new(HashMap::new()),
             inventory_fallbacks: Mutex::new(HashMap::new()),
             inventory_shapes: Mutex::new(HashMap::new()),
+            rate_limits: Mutex::new(HashMap::new()),
             subscription: crate::claude_subscription::SubscriptionCache::new(),
         }
     }
@@ -1031,33 +1144,68 @@ impl AnthropicProvider {
         }
     }
 
+    /// Log a usage-endpoint 429's headers when this handle starts being rate
+    /// limited or the set of headers it is refused with changes, and log once
+    /// when the endpoint answers again. `None` means the endpoint answered.
+    fn settle_rate_limit(&self, handle_id: &str, evidence: Option<&RateLimitEvidence>) {
+        let mut limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = evidence.map(RateLimitEvidence::header_names);
+        if limits.get(handle_id) == current.as_ref() {
+            return;
+        }
+        match (evidence, current) {
+            (Some(evidence), Some(names)) => {
+                let headers = evidence.rendered().unwrap_or_else(|| {
+                    "no retry-after or anthropic-ratelimit-* headers".to_string()
+                });
+                eprintln!("{LOG_TAG} warning: anthropic usage endpoint answered HTTP 429 ({handle_id}): {headers}");
+                limits.insert(handle_id.to_string(), names);
+            }
+            _ => {
+                eprintln!("{LOG_TAG} anthropic usage endpoint answering again after HTTP 429 ({handle_id})");
+                limits.remove(handle_id);
+            }
+        }
+    }
+
     /// The optional query and CLI identity are rejected by some accounts or tiers.
     /// Retry only 400 and non-profile-scope 403, once, with the ordinary identity.
     /// 401 cannot change authentication; retrying 429 would spend Anthropic's
     /// per-account usage endpoint rate limit without helping the caller.
+    ///
+    /// A 429 also returns what it said about the limit, so the scheduler can
+    /// use the upstream's requested wait within its own bounds; every other
+    /// outcome returns `None` beside it.
     async fn inventory_body(
         &self,
         handle_id: &str,
         bearer: &str,
         vault: bool,
-    ) -> Result<Vec<u8>, FetchError> {
+    ) -> (Result<Vec<u8>, FetchError>, Option<RateLimited>) {
         let url = format!("{}?cedar_ember=1", self.usage_url);
         let cli_ua = format!(
             "{} (external, cli)",
             CLAUDE_CODE_UA.replace("claude-code/", "claude-cli/")
         );
         let mut result = usage_request(&url, bearer, &cli_ua)
-            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .send_provider_status_first_keeping_headers(&self.http, PROVIDER_NAME)
             .await;
         // The HTTP helper exposes only the first 200 characters of a refusal.
         // If a 403's missing user:profile permission appears later, retry once:
         // the ordinary request cannot change token permissions, so it returns
         // and publishes the same refusal. Anthropic's real scope error is shorter.
         let refused_with = match &result {
-            Err(FetchError::ProviderStatus(400, _)) => Some(400),
-            Err(FetchError::ProviderStatus(403, excerpt)) if !excerpt.contains("user:profile") => {
-                Some(403)
-            }
+            Err(Refusal {
+                error: FetchError::ProviderStatus(400, _),
+                ..
+            }) => Some(400),
+            Err(Refusal {
+                error: FetchError::ProviderStatus(403, excerpt),
+                ..
+            }) if !excerpt.contains("user:profile") => Some(403),
             _ => None,
         };
         // Only a decided outcome moves the record: a 401, 429 or transport
@@ -1067,17 +1215,31 @@ impl AnthropicProvider {
         }
         if refused_with.is_some() {
             result = usage_request(&self.usage_url, bearer, CLAUDE_CODE_UA)
-                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .send_provider_status_first_keeping_headers(&self.http, PROVIDER_NAME)
                 .await;
         }
-        result.map(|response| response.body).map_err(|error| {
-            if !vault {
-                if let FetchError::ProviderStatus(status, excerpt) = error {
-                    return crate::http::status_error(status, excerpt.as_bytes());
-                }
+        let refusal = match result {
+            Ok(response) => {
+                self.settle_rate_limit(handle_id, None);
+                return (Ok(response.body), None);
             }
-            error
-        })
+            Err(refusal) => refusal,
+        };
+        let evidence = matches!(refusal.error, FetchError::ProviderStatus(429, _))
+            .then(|| RateLimitEvidence::from_refusal(&refusal, chrono::Utc::now()));
+        let mut error = refusal.error;
+        if !vault {
+            if let FetchError::ProviderStatus(status, excerpt) = error {
+                error = crate::http::status_error(status, excerpt.as_bytes());
+            }
+        }
+        match evidence {
+            Some(evidence) => {
+                self.settle_rate_limit(handle_id, Some(&evidence));
+                (Err(evidence.annotate(error)), Some(evidence.rate_limited))
+            }
+            None => (Err(error), None),
+        }
     }
 
     fn report_auth_failure(
@@ -1095,10 +1257,8 @@ impl AnthropicProvider {
     }
 
     async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {
-        let result = self
-            .inventory_body(handle_id, bearer, false)
-            .await
-            .and_then(|body| normalize_inventory(&body));
+        let (body, rate_limited) = self.inventory_body(handle_id, bearer, false).await;
+        let result = body.and_then(|body| normalize_inventory(&body));
         match result {
             Ok((usage, overage, resets, shape)) => {
                 self.settle_shape(handle_id, shape);
@@ -1110,7 +1270,7 @@ impl AnthropicProvider {
                 )
                 .with_saved_resets(self.settle_resets(handle_id, resets))
             }
-            Err(error) => FetchAttempt::failure(None, None, error),
+            Err(error) => FetchAttempt::failure(None, None, error).with_rate_limited(rate_limited),
         }
     }
 
@@ -1160,10 +1320,8 @@ impl AnthropicProvider {
             &bearer,
         );
 
-        let result = self
-            .inventory_body(handle_id, &bearer, true)
-            .await
-            .and_then(|body| normalize_inventory(&body));
+        let (body, rate_limited) = self.inventory_body(handle_id, &bearer, true).await;
+        let result = body.and_then(|body| normalize_inventory(&body));
         if let Err(error) = &result {
             self.report_auth_failure(handle, record_version, error);
         }
@@ -1178,7 +1336,8 @@ impl AnthropicProvider {
                     .apply(&self.handle_loader, handle, &credential, &mut attempt);
                 attempt
             }
-            Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error),
+            Err(error) => FetchAttempt::failure(observed, Some("vault".to_string()), error)
+                .with_rate_limited(rate_limited),
         }
     }
 }
@@ -1335,6 +1494,18 @@ mod tests {
     async fn inventory_fetch(
         responses: Vec<(u16, String)>,
     ) -> (FetchAttempt, Vec<String>, Reports) {
+        let responses = responses
+            .into_iter()
+            .map(|(status, body)| (status, String::new(), body))
+            .collect();
+        inventory_fetch_with_headers(responses).await
+    }
+
+    /// [`inventory_fetch`], with extra response header lines (each ending in
+    /// `\r\n`) per response.
+    async fn inventory_fetch_with_headers(
+        responses: Vec<(u16, String, String)>,
+    ) -> (FetchAttempt, Vec<String>, Reports) {
         use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1350,12 +1521,13 @@ mod tests {
                     result = listener.accept() => result.unwrap(),
                 };
                 let request = crate::loopback::read_request(&mut stream).await;
-                let (status, body) = responses
-                    .get(requests.len())
-                    .cloned()
-                    .unwrap_or((500, "unexpected retry".into()));
+                let (status, headers, body) = responses.get(requests.len()).cloned().unwrap_or((
+                    500,
+                    String::new(),
+                    "unexpected retry".into(),
+                ));
                 requests.push(request);
-                let response = format!("HTTP/1.1 {status} Response\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let response = format!("HTTP/1.1 {status} Response\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             requests
@@ -1495,6 +1667,164 @@ mod tests {
             matches!(attempt.usage, Err(FetchError::ProviderStatus(429, body)) if body == "per-account rate limit")
         );
         assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// Anthropic's own 429 body, as observed: indented JSON naming the error.
+    const RATE_LIMIT_REFUSAL: &str =
+        "{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"rate_limit_error\"\n  }\n}";
+
+    /// Drive one vault 429 through the provider and the scheduler, as the
+    /// refresher does, and return the attempt's error text, the slot's health
+    /// message and how far out the next attempt was scheduled.
+    async fn claude_429_through_the_scheduler(headers: String) -> (String, String, Duration) {
+        let (attempt, requests, reports) =
+            inventory_fetch_with_headers(vec![(429, headers, RATE_LIMIT_REFUSAL.to_string())])
+                .await;
+        assert_eq!(requests.len(), 1, "a 429 must never be retried in-fetch");
+        assert!(reports.lock().unwrap().is_empty());
+        let error = attempt
+            .usage
+            .as_ref()
+            .expect_err("a 429 is a failed attempt")
+            .to_string();
+        let start = std::time::Instant::now();
+        let slot = next_slot_after_attempt(
+            &ProviderSlot::due_now(start, Incarnation::from_counter(1)),
+            PROVIDER_NAME,
+            attempt,
+            start,
+            start,
+        );
+        (
+            error,
+            slot.last_failure_message.unwrap_or_default(),
+            slot.next_due_at.saturating_duration_since(start),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_429_with_retry_after_600_schedules_the_next_attempt_600_seconds_out() {
+        let (_, _, wait) =
+            claude_429_through_the_scheduler("retry-after: 600\r\n".to_string()).await;
+        assert_eq!(
+            wait,
+            Duration::from_secs(600),
+            "the usage endpoint's retry-after must set the next attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_with_an_http_date_retry_after_schedules_from_that_date() {
+        let at = chrono::Utc::now() + chrono::Duration::seconds(600);
+        let header = format!(
+            "retry-after: {}\r\n",
+            at.format("%a, %d %b %Y %H:%M:%S GMT")
+        );
+        let (_, _, wait) = claude_429_through_the_scheduler(header).await;
+        // Whole seconds on the wire and the time the fetch took can each cost
+        // one second, never more.
+        assert!(
+            (Duration::from_secs(597)..=Duration::from_secs(600)).contains(&wait),
+            "an HTTP-date retry-after must set the next attempt: {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_records_its_rate_limit_headers_in_the_error_message() {
+        let headers = "retry-after: 600\r\n\
+                       anthropic-ratelimit-unified-status: rejected\r\n\
+                       anthropic-ratelimit-unified-reset: 1790000000\r\n\
+                       x-unrelated: not recorded\r\n"
+            .to_string();
+        let (error, health, _) = claude_429_through_the_scheduler(headers).await;
+        assert!(
+            error.starts_with(
+                "provider returned HTTP 429: [retry-after: 600; \
+                 anthropic-ratelimit-unified-reset: 1790000000; \
+                 anthropic-ratelimit-unified-status: rejected] {"
+            ),
+            "a 429's rate-limit headers must lead its error message: {error}"
+        );
+        assert!(error.contains("rate_limit_error"), "{error}");
+        // Only the allow-listed response headers, and never the request's
+        // credential.
+        assert!(!error.contains("x-unrelated"), "{error}");
+        assert!(!error.contains("synthetic-reset-token"), "{error}");
+        assert!(
+            !error.to_ascii_lowercase().contains("authorization"),
+            "{error}"
+        );
+        // The health metric keeps a 160-byte prefix; the stated wait is in it.
+        assert!(health.contains("retry-after: 600"), "{health}");
+    }
+
+    #[tokio::test]
+    async fn a_429_without_rate_limit_headers_still_marks_the_attempt_rate_limited() {
+        let (attempt, _, _) = inventory_fetch(vec![(429, RATE_LIMIT_REFUSAL.to_string())]).await;
+        assert_eq!(
+            attempt.rate_limited,
+            Some(RateLimited {
+                retry_after_secs: None
+            })
+        );
+        // Nothing to record, so the message is the refusal's own words alone.
+        assert!(
+            matches!(attempt.usage, Err(FetchError::ProviderStatus(429, body)) if body == RATE_LIMIT_REFUSAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_429_marks_the_attempt_rate_limited() {
+        for status in [401, 403, 500, 503] {
+            let (attempt, _, _) = inventory_fetch_with_headers(vec![(
+                status,
+                "retry-after: 600\r\n".to_string(),
+                "refused".to_string(),
+            )])
+            .await;
+            assert_eq!(attempt.rate_limited, None, "HTTP {status}");
+        }
+        let (attempt, _, _) = inventory_fetch(vec![(200, inventory_payload(None))]).await;
+        assert!(attempt.usage.is_ok());
+        assert_eq!(attempt.rate_limited, None);
+    }
+
+    #[tokio::test]
+    async fn a_local_bearer_429_carries_retry_after_and_its_headers_too() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            crate::loopback::read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 900\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{RATE_LIMIT_REFUSAL}",
+                RATE_LIMIT_REFUSAL.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let (source, _) = source(Ok(credential(b"synthetic-reset-token", 44)));
+        let attempt = test_provider(source, url)
+            .fetch_local_bearer("implicit", "synthetic-reset-token")
+            .await;
+        server.await.unwrap();
+        assert_eq!(
+            attempt.rate_limited,
+            Some(RateLimited {
+                retry_after_secs: Some(900)
+            })
+        );
+        let error = attempt.usage.expect_err("a 429 is a failed attempt");
+        assert!(matches!(error, FetchError::Upstream(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("upstream error: [retry-after: 900] HTTP 429: {"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
