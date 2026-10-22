@@ -92,8 +92,8 @@ mod usage_watch_tests;
 /// `rawUsedPercent` entirely.
 const QUOTA_CONFIG_RELATIVE_PATH: &str = "cortexkit/ck-quota.jsonc";
 
-/// How often the config file is checked for an edit. Each check is one `stat`;
-/// the file is read again only when its length or modification time changed.
+/// How often the config file is checked for an edit. Each check reads the small
+/// file; it is parsed again only when its bytes changed.
 /// Five seconds is well inside one refresher turn (60 s), so an operator who
 /// sets `codex.auto_use_resets` to 0 stops every redemption decided after the
 /// next check; a tick already past its decision is not recalled.

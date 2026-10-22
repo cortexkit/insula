@@ -16,7 +16,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
@@ -170,31 +169,25 @@ pub type ConfigParser = Box<dyn Fn(&str) -> Result<QuotaConfig, String> + Send>;
 
 /// The file facts compared between checks to decide whether to read it again.
 ///
-/// Length and modification time, not a content hash: hashing would mean
-/// reading the file on every check, and the point is to leave an unchanged
-/// file alone. An edit that keeps both the length and the modification time
-/// is missed: two same-length saves within one timestamp tick, whose size
-/// depends on the filesystem (well under a second on APFS and ext4).
+/// The file's bytes, not its length and modification time. Windows doesn't
+/// reliably advance a file's modification time on a quick rewrite, so a
+/// same-length edit such as `3600` to `7200` could go unnoticed and leave a
+/// stale setting live. The file is a few hundred bytes read once per check, so
+/// comparing its contents costs nothing, and only a real change is parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileStamp {
     Missing,
-    Present {
-        len: u64,
-        modified: Option<SystemTime>,
-    },
-    /// The file's metadata could not be read for a reason other than absence
-    /// (a permission error on a parent directory, say).
-    Unstattable(String),
+    Present(Vec<u8>),
+    /// The file could not be read for a reason other than absence (a
+    /// permission error, say).
+    Unreadable(String),
 }
 
 fn stamp_of(path: &Path) -> FileStamp {
-    match std::fs::metadata(path) {
-        Ok(metadata) => FileStamp::Present {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
+    match std::fs::read(path) {
+        Ok(bytes) => FileStamp::Present(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileStamp::Missing,
-        Err(error) => FileStamp::Unstattable(format!("stat failed: {error}")),
+        Err(error) => FileStamp::Unreadable(format!("read failed: {error}")),
     }
 }
 
@@ -209,8 +202,8 @@ enum FileRead {
 
 /// Keeps a [`LiveQuotaConfig`] in step with the config file.
 ///
-/// Polled rather than watched: a check is one `stat`, and the file is read
-/// again only when its length or modification time changed. Each change of
+/// Polled rather than watched: a check reads the small file, and it is parsed
+/// again only when its bytes changed. Each change of
 /// state produces exactly one log line, returned from [`Self::check`].
 ///
 /// THE FAILURE DIRECTION IS THE POINT. `codex.auto_use_resets` spends real
@@ -267,15 +260,13 @@ impl ConfigReloader {
         self.seen = Some(stamp.clone());
         let read = match stamp {
             FileStamp::Missing => FileRead::Missing,
-            FileStamp::Unstattable(reason) => FileRead::Failed(reason),
-            FileStamp::Present { .. } => match std::fs::read_to_string(&self.path) {
-                Ok(contents) => match (self.parse)(&contents) {
+            FileStamp::Unreadable(reason) => FileRead::Failed(reason),
+            FileStamp::Present(bytes) => match std::str::from_utf8(&bytes) {
+                Ok(contents) => match (self.parse)(contents) {
                     Ok(config) => FileRead::Loaded(config),
                     Err(error) => FileRead::Failed(format!("parse failed: {error}")),
                 },
-                // Deleted between the stat and the read.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileRead::Missing,
-                Err(error) => FileRead::Failed(format!("read failed: {error}")),
+                Err(error) => FileRead::Failed(format!("not UTF-8: {error}")),
             },
         };
         match read {
