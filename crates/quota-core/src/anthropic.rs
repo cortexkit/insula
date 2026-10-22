@@ -886,7 +886,9 @@ const RATE_LIMIT_HEADER_PREFIX: &str = "anthropic-ratelimit-";
 const MAX_RATE_LIMIT_HEADERS: usize = 16;
 /// Characters kept from each rate-limit header value.
 const RATE_LIMIT_VALUE_CHARS: usize = 80;
-/// Bytes of rendered rate-limit headers placed in front of a 429's message.
+/// Byte limit on the header text placed in front of a 429's message. The
+/// rendered prefix can run slightly longer: the brackets and, when cut, the
+/// truncation marker are added around it.
 const RATE_LIMIT_EVIDENCE_BYTES: usize = 512;
 
 /// What a usage-endpoint 429 said about the limit being enforced.
@@ -958,7 +960,7 @@ impl RateLimitEvidence {
     }
 
     /// Put the headers in front of the refusal's own words, so a reader of a
-    /// bounded message (the health metric keeps 160 characters) sees them
+    /// bounded message (the health metric keeps a 160-byte prefix) sees them
     /// before the body is cut. A 429 that carried none is left untouched.
     fn annotate(&self, error: FetchError) -> FetchError {
         let Some(prefix) = self.rendered() else {
@@ -1175,7 +1177,8 @@ impl AnthropicProvider {
     /// per-account usage endpoint rate limit without helping the caller.
     ///
     /// A 429 also returns what it said about the limit, so the scheduler can
-    /// wait as long as asked; every other outcome returns `None` beside it.
+    /// use the upstream's requested wait within its own bounds; every other
+    /// outcome returns `None` beside it.
     async fn inventory_body(
         &self,
         handle_id: &str,
@@ -1751,7 +1754,7 @@ mod tests {
             !error.to_ascii_lowercase().contains("authorization"),
             "{error}"
         );
-        // The health metric keeps 160 characters; the stated wait is in them.
+        // The health metric keeps a 160-byte prefix; the stated wait is in it.
         assert!(health.contains("retry-after: 600"), "{health}");
     }
 

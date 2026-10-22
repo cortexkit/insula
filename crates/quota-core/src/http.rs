@@ -334,8 +334,8 @@ impl Refusal {
 /// Read a `retry-after` header value as seconds from `now`.
 ///
 /// The header has two legal forms (RFC 9110 section 10.2.3): delta-seconds, or an
-/// HTTP-date. A date converts to its distance from `now`, which is negative when
-/// the date has passed. A signed number is accepted here even though the RFC
+/// HTTP-date. A date converts to its distance from `now` in whole seconds,
+/// truncated toward zero: negative once the date is a second or more in the past. A signed number is accepted here even though the RFC
 /// allows only digits, so a negative value reaches the caller as negative and can
 /// be rejected there as absurd, rather than vanishing as if the header were
 /// absent. `None` for anything else.

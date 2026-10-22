@@ -392,25 +392,27 @@ schedule even while call readings arrive.
 
 **Proven by:** `claude_call_cadence_defers_only_recent_observations_and_keeps_backoff`.
 
-**A Claude usage-endpoint 429 waits as long as Anthropic asks.** Anthropic
+**A Claude usage-endpoint 429 uses Anthropic's `retry-after`, within bounds.** Anthropic
 rate-limits `GET /api/oauth/usage` per account, and asking again early only
 extends the refusal. When a 429 carries a `retry-after` header (delta-seconds
 or an HTTP-date) between 0 s and one day, the account's next attempt is that
 many seconds after the failed attempt completed, but never sooner than the
 180 s poll interval and never later than one hour. Without a believable
 `retry-after`, consecutive 429s wait 5, 10, 20, then 30 minutes (capped at
-30). A negative value, a date in the past, or a value over a day counts as
-absent. The last good reading keeps serving through the wait with `stale`
+30). A negative value, a date a second or more in the past, or a value over
+a day counts as absent. The last good reading keeps serving through the wait with `stale`
 set and `class: "upstream_failed"`, as for any transient failure. Only Claude
-429s are scheduled this way; every other provider and every other status keep
-the generic transient backoff (60 s doubling to 900 s).
+429s are scheduled this way. Other providers' 429s keep the generic transient
+backoff (60 s doubling to 900 s), and every other failure keeps its usual
+transient or non-transient delay.
 
-The failure's message starts with the `retry-after` value and any
-`anthropic-ratelimit-*` response headers, for example `provider returned HTTP
+When a 429 carries `retry-after` or any `anthropic-ratelimit-*` response
+headers, the failure's message starts with them, for example `provider returned HTTP
 429: [retry-after: 600; anthropic-ratelimit-unified-status: rejected] {...}`,
-so `lastStaleEpisode` and a degraded entry's `error` show what Anthropic said.
-Each value is cut to 80 characters and the bracket to 512 bytes, and no other
-response header or any request header is ever included. The bracket is
+so `lastStaleEpisode` and a degraded entry's `error` show what Anthropic said;
+with neither present the message is unchanged. Each value is cut to 80
+characters and the header text to 512 bytes (plus a truncation marker when
+cut), and no other response header or any request header is ever included. The bracket is
 evidence, not an API; don't parse it. The module logs these headers when an
 account starts being rate limited, when the set of headers changes, and once
 when the endpoint answers again. A host whose only previously-working lanes

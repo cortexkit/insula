@@ -254,8 +254,8 @@ pub struct FetchAttempt {
     pub relax_eligible: bool,
     pub credential_resolution: CredentialResolution,
     /// Set when the upstream refused this fetch as rate limited (HTTP 429), so
-    /// the scheduler can wait as long as the upstream asked rather than retrying
-    /// on the generic transient ladder. `None` for every other outcome.
+    /// the scheduler can use the upstream's requested wait, within its own
+    /// bounds, rather than retrying on the generic transient ladder. `None` for every other outcome.
     ///
     /// Carried beside the error rather than inside `FetchError`, because the
     /// error's variant decides stale-serving and auth reporting for every
@@ -267,8 +267,8 @@ pub struct FetchAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimited {
     /// The `retry-after` response header as seconds from when the refusal
-    /// arrived, exactly as the upstream stated it: an HTTP-date in the past
-    /// reads as negative, and nothing is clamped here. `None` when the header
+    /// arrived, exactly as the upstream stated it: an HTTP-date a second or more
+    /// in the past reads as negative, and nothing is clamped here. `None` when the header
     /// was absent or unparseable. Whether a value is believable is the
     /// scheduler's decision, so an absurd one can fall back to a default there.
     pub retry_after_secs: Option<i64>,
