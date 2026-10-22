@@ -12774,7 +12774,7 @@ async fn an_unreadable_config_file_never_arms_redemption() {
     assert!(
         line.contains("read failed")
             && line.contains("keeping last good config: codex.auto_use_resets 0s (disarmed)"),
-        "{line}"
+        "an unreadable config must never arm resets: {line}"
     );
     tick(&registry).await;
     assert!(
