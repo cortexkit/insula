@@ -392,6 +392,39 @@ schedule even while call readings arrive.
 
 **Proven by:** `claude_call_cadence_defers_only_recent_observations_and_keeps_backoff`.
 
+**A Claude usage-endpoint 429 waits as long as Anthropic asks.** Anthropic
+rate-limits `GET /api/oauth/usage` per account, and asking again early only
+extends the refusal. When a 429 carries a `retry-after` header (delta-seconds
+or an HTTP-date) between 0 s and one day, the account's next attempt is that
+many seconds after the failed attempt completed, but never sooner than the
+180 s poll interval and never later than one hour. Without a believable
+`retry-after`, consecutive 429s wait 5, 10, 20, then 30 minutes (capped at
+30). A negative value, a date in the past, or a value over a day counts as
+absent. The last good reading keeps serving through the wait with `stale`
+set and `class: "upstream_failed"`, as for any transient failure. Only Claude
+429s are scheduled this way; every other provider and every other status keep
+the generic transient backoff (60 s doubling to 900 s).
+
+The failure's message starts with the `retry-after` value and any
+`anthropic-ratelimit-*` response headers, for example `provider returned HTTP
+429: [retry-after: 600; anthropic-ratelimit-unified-status: rejected] {...}`,
+so `lastStaleEpisode` and a degraded entry's `error` show what Anthropic said.
+Each value is cut to 80 characters and the bracket to 512 bytes, and no other
+response header or any request header is ever included. The bracket is
+evidence, not an API; don't parse it. The module logs these headers when an
+account starts being rate limited, when the set of headers changes, and once
+when the endpoint answers again. A host whose only previously-working lanes
+are Claude accounts can pass the 1800 s `fetchBlackout` horizon
+([11.4](#114-health-metrics)) while it honours a long `retry-after` or sits at
+the 30-minute step.
+
+**Proven by:** `a_429_with_retry_after_600_schedules_the_next_attempt_600_seconds_out`,
+`a_429_with_an_http_date_retry_after_schedules_from_that_date`,
+`a_claude_429_without_retry_after_backs_off_from_five_minutes_to_thirty`,
+`an_absurd_retry_after_falls_back_to_the_claude_429_ladder`,
+`a_codex_429_keeps_the_generic_backoff`,
+`a_429_records_its_rate_limit_headers_in_the_error_message`.
+
 The threshold is a floor on time since the last *success*, so a provider
 retrying through failures legitimately ages past it. An entry aging past your
 bound is a reason to discount the reading, never evidence that the producer is

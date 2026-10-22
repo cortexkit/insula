@@ -253,6 +253,25 @@ pub struct FetchAttempt {
     /// The slot may relax raw percentages only while this success remains fresh.
     pub relax_eligible: bool,
     pub credential_resolution: CredentialResolution,
+    /// Set when the upstream refused this fetch as rate limited (HTTP 429), so
+    /// the scheduler can wait as long as the upstream asked rather than retrying
+    /// on the generic transient ladder. `None` for every other outcome.
+    ///
+    /// Carried beside the error rather than inside `FetchError`, because the
+    /// error's variant decides stale-serving and auth reporting for every
+    /// provider, and this only informs WHEN the next attempt is made.
+    pub rate_limited: Option<RateLimited>,
+}
+
+/// What an upstream said about its rate limit when it answered HTTP 429.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimited {
+    /// The `retry-after` response header as seconds from when the refusal
+    /// arrived, exactly as the upstream stated it: an HTTP-date in the past
+    /// reads as negative, and nothing is clamped here. `None` when the header
+    /// was absent or unparseable. Whether a value is believable is the
+    /// scheduler's decision, so an absurd one can fall back to a default there.
+    pub retry_after_secs: Option<i64>,
 }
 
 impl FetchAttempt {
@@ -271,6 +290,7 @@ impl FetchAttempt {
             pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
+            rate_limited: None,
         }
     }
 
@@ -289,6 +309,7 @@ impl FetchAttempt {
             pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Verified,
+            rate_limited: None,
         }
     }
 
@@ -354,7 +375,14 @@ impl FetchAttempt {
             pools: None,
             relax_eligible: false,
             credential_resolution: CredentialResolution::Unverified,
+            rate_limited: None,
         }
+    }
+
+    /// Record that the upstream refused this fetch as rate limited.
+    pub fn with_rate_limited(mut self, rate_limited: Option<RateLimited>) -> Self {
+        self.rate_limited = rate_limited;
+        self
     }
 
     /// Preserve the source's wall timestamp when serving its cached value.
@@ -423,6 +451,7 @@ impl FetchAttempt {
                     pools: entry.spend,
                     relax_eligible: false,
                     credential_resolution: CredentialResolution::Verified,
+                    rate_limited: None,
                 }
             }
             Err(error) => Self::failure(None, None, error),
