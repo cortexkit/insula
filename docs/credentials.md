@@ -98,9 +98,11 @@ health metric. Capture the login again.
 ### Depositing a key by hand
 
 A credential with no `ck auth login` flow can be stored with `ck auth put`
-under the family the provider reads. The Muse CLI keeps its device token in the
-macOS Keychain, which insula does not read, so `muse` is served from a hand
-deposit under `apikey:muse` or from the environment variable or file below.
+under the family the provider reads. The Muse CLI may keep its device token in the
+operating system's credential store (the Keychain on macOS, Credential Manager on
+Windows, a secret service on Linux), which insula does not read. So `muse` is
+served from a hand deposit under `apikey:muse`, or from the environment variable
+or file below.
 
 The Vercel personal budget needs an access token and the team whose budget it
 reads, so its deposit under `apikey:vercel-budget` is a JSON object,

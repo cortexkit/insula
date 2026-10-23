@@ -25,9 +25,10 @@
 //! Credential: a vault deposit (`apikey:muse`) when one exists, otherwise
 //! `MUSE_DEVICE_TOKEN`, otherwise an inline `providers.meta.access_token` in the
 //! Muse CLI's metadata file (`MUSE_AUTH_PATH`, default `~/.config/muse/auth.json`).
-//! When the CLI keeps the token in the macOS Keychain the file holds only
-//! metadata, and this module does not read the Keychain: reading another
-//! program's Keychain item would prompt the user from a background daemon.
+//! When the CLI keeps the token in the operating system's credential store (the
+//! macOS Keychain, Windows Credential Manager, a Linux secret service), the file
+//! holds only metadata. This module doesn't read that store: reading another
+//! program's item can prompt the user from a background daemon.
 //! An optional `cookie:dev.meta.ai` vault deposit and explicit `muse.team_id`
 //! can fill an idle response after a restart. They never create a usage lane;
 //! the mint response still identifies the account and plan.
@@ -258,7 +259,7 @@ fn idle_usage(last: &Usage, now: chrono::DateTime<chrono::Utc>) -> Option<Usage>
 
 /// The device token inside a vault deposit: the bare `dca:` string, or a JSON
 /// object carrying it as `access_token` (the shape the CLI keeps in its
-/// Keychain item).
+/// credential-store item).
 fn token_from_payload(payload: &str) -> Option<String> {
     let payload = payload.trim();
     if payload.starts_with('{') {
@@ -569,7 +570,7 @@ impl UsageProvider for MuseProvider {
             if !vault.is_empty() {
                 // A vault deposit replaces the local lanes. Keeping both would put
                 // two slots on one account, and the local one can't be read on a
-                // host whose CLI keeps its token in the Keychain.
+                // host whose CLI keeps its token in the OS credential store.
                 return Ok(vault);
             }
         }
@@ -855,7 +856,7 @@ mod tests {
     }
 
     /// The CLI default on macOS: the file names the login, the token lives in
-    /// the Keychain. That's a configured credential we can't use, not an absent one.
+    /// the OS credential store. That's a configured credential we can't use, not an absent one.
     #[test]
     fn a_keychain_only_login_is_unusable_not_absent() {
         let dir = scratch("keychain");

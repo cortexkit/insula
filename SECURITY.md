@@ -40,7 +40,8 @@ over the connection the daemon hands it, and to providers over outbound HTTPS.
   uses (`credential.get_scoped`). The grant is by vault category:
   `llm-provider` for logins and API keys, `browser-session` for web session
   cookies captured by Cerebellum. insula never reads a browser's cookie store,
-  the macOS Keychain, or another application's data directory.
+  the operating system's credential store (Keychain, Credential Manager, Secret
+  Service), or another application's data directory.
 - **Local files** that provider tools already wrote, such as the Codex CLI's
   `~/.codex/auth.json`, OpenCode's auth store, Cursor's `state.vscdb`, and
   JetBrains IDE quota files. [`docs/credentials.md`](docs/credentials.md) lists
