@@ -280,7 +280,10 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
             // which is what a relay such as callosum uses.
             let decoded: subc_protocol::ErrorBody =
                 serde_json::from_value(body.clone()).expect("decodes as subc ErrorBody");
-            assert!(decoded.detail.is_some(), "detail lost through ErrorBody: {body}");
+            assert!(
+                decoded.detail.is_some(),
+                "detail lost through ErrorBody: {body}"
+            );
         }
     }
     wire.stop().await;
