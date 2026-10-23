@@ -853,7 +853,10 @@ limit the provider named without a readable figure. A consumer that ignores
   published as a window or reset.
 - **`vercel-budget`** publishes one `primary` window for the user's personal AI
   Gateway budget, including a cumulative budget with no reset, length or kind;
-  see [7.12](#vercel-and-vercel-budget-the-team-balance-and-a-personal-budget).
+  see [7.13](#vercel-and-vercel-budget-the-team-balance-and-a-personal-budget).
+- **`soniox`** publishes one `primary` window for an organization's monthly
+  budget, only when the budget is positive; see
+  [7.14](#soniox-an-organizations-prepaid-balance-and-monthly-budget).
 
 **Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
 `a_page_with_monthly_and_session_blocks_publishes_both`,
@@ -1339,6 +1342,63 @@ CodexBar v0.79.0, not against a live Vercel account.
 `no_budget_for_this_user_is_no_quota_reported_not_zero`,
 `neither_credential_ever_reaches_the_other_lanes_host`,
 `a_failure_on_one_lane_never_costs_the_other_its_reading`.
+
+<a id="soniox-an-organizations-prepaid-balance-and-monthly-budget"></a>
+
+### 7.14 `soniox`: an organization's prepaid balance and monthly budget
+
+`soniox` reads two answers with one organization API key (`apikey:soniox` or
+`SONIOX_ORG_API_KEY`), sent only to `api.soniox.com`:
+`GET /v1/organization/balance`, then `GET /v1/organization/usage/monthly`. A
+prepaid organization with a budget publishes:
+
+```json
+"usage": {
+  "primary": { "usedPercent": 6.0, "resetsAt": "2026-11-01T00:00:00Z",
+               "windowKind": "monthly" }
+},
+"spend": [
+  { "id": "balance", "label": "Prepaid balance",
+    "funding": "unknown", "basis": "reported",
+    "remaining": { "minor": 1850, "exponent": 2, "unit": "USD" } }
+]
+```
+
+- `primary` is the month's spend against the organization's monthly budget,
+  `usage_usd / monthly_budget_usd × 100`, clamped to 0-100. It resets at 00:00
+  UTC on the 1st of the month after the month Soniox reports, and carries no
+  `windowMinutes` because a month has no fixed length. It is published only
+  when the budget is positive: a zero budget has no denominator, so there is no
+  window rather than a 0% or 100% one.
+- The budget is a spending cap, not money held, so it is never a pool.
+- The `balance` pool is the prepaid balance exactly as stated, including zero,
+  sub-cent and negative amounts. `basis: reported`; `funding: unknown`,
+  because Soniox does not say whether the credit was bought or given. No
+  `total`, `spendable` or `resetsAt` is stated.
+- An organization on invoice billing publishes `spend: []`: its balance is not
+  money it holds, so a zero there is never read as exhausted credit. With no
+  budget either, the entry is `no_quota_reported`.
+- There is no account: the key's answers name none.
+- No key is `credential_absent`; a blank deposit is `credential_unusable` and
+  sends nothing. 401 and 403 are `credential_rejected`. A 403 means a project
+  key or an organization key without the Balance and spend and Usage and
+  limits permissions. Only a 401 on a vault key is reported to the vault. 429
+  and 5xx are `upstream_failed` and keep the last reading served. Any field
+  Soniox's documented shape does not allow (an amount that is not a decimal
+  string, a negative spend or budget, a non-Boolean `invoice_billing_enabled`,
+  a `month` that is not `YYYY-MM`) is `decode_failed`, never a zero. A balance
+  with more than nine decimal places is also `decode_failed`, because amounts
+  are published at most at exponent 9.
+- Tested against fixtures shaped from upstream CodexBar v0.80.0, not against a
+  live Soniox account.
+
+**Proven by:** `a_prepaid_organization_publishes_its_budget_window_and_balance_pool`,
+`invoice_billing_publishes_the_window_and_no_balance_pool`,
+`a_zero_budget_has_no_window_and_an_exceeded_one_reads_full`,
+`invoice_billing_with_no_budget_is_no_quota_reported`,
+`malformed_billing_is_decode_failed_rather_than_zero_usage`,
+`each_status_maps_to_its_class_and_only_a_vault_401_is_reported`,
+`a_vault_deposit_routes_to_soniox_and_replaces_the_environment_lane`.
 
 <a id="fields-on-the-account-not-the-window"></a>
 

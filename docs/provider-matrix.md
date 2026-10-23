@@ -1,6 +1,6 @@
 # Provider matrix
 
-41 providers registered.
+42 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -58,6 +58,7 @@ on every operating system. The public wire semantics are in
 | `minimax` | `MINIMAX_CODING_API_KEY`, `MINIMAX_API_KEY`; vault `apikey:minimax-coding-plan`; `MINIMAX_API_REGION` | `GET https://api.minimax.io/v1/api/openplatform/coding_plan/remains` (China: `api.minimaxi.com`); optional `/account/query_balance` | General interval / weekly, non-text model window; wallet pools |
 | `neuralwatt` | `NEURALWATT_API_KEY`; `NEURALWATT_API_URL` override | `GET https://api.neuralwatt.com/v1/quota` | Subscription utilization and named extra quotas; resetless balance fields are not published |
 | `openrouter` | OpenCode `openrouter` API key; vault `apikey:openrouter` | `GET https://openrouter.ai/api/v1/credits`; `/api/v1/key` for owner | Derived USD balance; no rate window |
+| `soniox` | `SONIOX_ORG_API_KEY`; vault `apikey:soniox` | `GET https://api.soniox.com/v1/organization/balance`; `/v1/organization/usage/monthly` | Monthly budget window resetting on the 1st (UTC), only when a budget is set; reported USD prepaid balance unless invoice-billed. Tested against upstream fixtures only |
 | `stepfun` | `STEPFUN_TOKEN` | `POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit` | 5h / weekly quota |
 | `sub2api` | `SUB2API_API_KEY`, configured `SUB2API_BASE_URL` | `GET {base}/v1/usage` | Named rate-limit windows (5h / 1d / 7d recognized); money fields omitted |
 | `vercel` | `AI_GATEWAY_API_KEY`; vault `apikey:vercel` | `GET https://ai-gateway.vercel.sh/v1/credits` | Reported USD team credit balance; no rate window. Tested against upstream fixtures only |

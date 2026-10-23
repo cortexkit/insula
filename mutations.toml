@@ -1928,3 +1928,20 @@ expect_message = "membership"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "soniox-vault-replaces-env"
+guards = "A Soniox apikey deposit replaces the SONIOX_ORG_API_KEY lane, so the vault key is the one sent and no second identity-less row appears"
+file = "crates/quota-core/src/soniox.rs"
+old = "return Ok(vault);"
+new = "let _ = vault; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/soniox.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["soniox::tests::a_vault_deposit_routes_to_soniox_and_replaces_the_environment_lane", "soniox::tests::the_vault_key_is_sent_and_the_environment_key_is_not"]
+expect_message = "a soniox deposit must replace the environment lane"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

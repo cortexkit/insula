@@ -63,6 +63,7 @@ pub mod quota_drop;
 pub mod qwen_cloud;
 pub mod refresh;
 pub mod sakana;
+pub mod soniox;
 pub mod stepfun;
 pub mod store;
 pub mod sub2api;
@@ -784,6 +785,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(vercel_budget::VercelBudgetProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(soniox::SonioxProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
