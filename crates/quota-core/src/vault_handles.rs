@@ -51,6 +51,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // The Muse CLI's device-code login token (`dca:…`), deposited by hand: the
     // CLI keeps it in the macOS Keychain, which insula doesn't read.
     ("apikey:muse", "muse"),
+    ("cookie:dev.meta.ai", "muse"),
     // The Vercel AI Gateway key reads the team's credit balance. A separate
     // family, not an account suffix of this one, holds the access token and
     // team id for the personal budget: the two credentials go to different
@@ -70,6 +71,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
 pub const ENRICHMENT_FAMILIES: &[(&str, &str)] = &[
     ("cookie:kimi.com", "kimi-for-coding"),
     ("cookie:claude.ai", "claude"),
+    ("cookie:dev.meta.ai", "muse"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

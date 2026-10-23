@@ -61,6 +61,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:openrouter` | `openrouter` |
 | `apikey:minimax-coding-plan` | `minimax` |
 | `apikey:muse` | `muse` |
+| `cookie:dev.meta.ai` | `muse` (idle-window enrichment only; `llama_dev_sess`) |
 | `apikey:vercel` | `vercel` (the AI Gateway key) |
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 

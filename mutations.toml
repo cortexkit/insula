@@ -1734,3 +1734,68 @@ expect_message = "an unreadable config must never arm resets"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "muse-web-email-binding"
+guards = "A deposited web session must belong to the Muse mint login before supplying team quota"
+file = "crates/quota-core/src/muse/web.rs"
+old = "if web_email != email {"
+new = "if false { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/muse/web_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["muse::web::tests::email_mismatch_withholds_web_reading"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "muse-web-tier-binding"
+guards = "The selected team's subscription tier must match the Muse mint login"
+file = "crates/quota-core/src/muse/web.rs"
+old = 'if plan.is_none() || quota["tier"].as_str().map(str::trim) != plan {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/muse/web_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["muse::web::tests::tier_mismatch_withholds_web_reading"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "muse-idle-memory-first"
+guards = "An exact remembered reading avoids all dev.meta.ai requests"
+file = "crates/quota-core/src/muse.rs"
+old = "Some(idle) => Some(idle),"
+new = "Some(idle) => self.web.fetch(email, reading.plan.as_deref()).await.or(Some(idle)), // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/muse/web_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["muse::web::tests::remembered_reading_wins_without_any_web_requests"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "muse-web-device-token-isolation"
+guards = "Only the deposited session cookie authenticates dev.meta.ai requests, never the Muse device bearer"
+file = "crates/quota-core/src/muse/web.rs"
+old = '.header(Header::new("Cookie", cookie))'
+new = '.header(Header::new("Cookie", cookie)).bearer("dca:fixture-device") // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/muse/web_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["muse::web::tests::web_never_receives_device_token"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

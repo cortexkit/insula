@@ -734,6 +734,7 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(muse::MuseProvider::new_with_handle_loader(
+                config.clone(),
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
