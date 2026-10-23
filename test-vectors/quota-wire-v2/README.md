@@ -6,8 +6,8 @@ The fixed clock is 2026-07-14T12:00:00Z; the blocking reservation is 12 minutes 
 
 `use-saved-reset-request.json` is the routed request envelope; its `params` is the
 operation request body. Success files are Response frame bodies, error files are
-Error frame bodies. `recently_reset` includes RFC 3339 `details.last_reset_at`.
-`provider_refused` includes the bounded (200-character) provider excerpt in details.
+Error frame bodies. `recently_reset` includes RFC 3339 `detail.last_reset_at`.
+`provider_refused` includes the bounded (200-character) provider excerpt in `detail.excerpt`.
 The before/after files are individual rows from `usage.get`, with availableCount
 changing from 2 to 1 after the due slot is refreshed. The operation reply does not
 wait for that refresh. A repeated request_id replays its durable outcome; a new id

@@ -270,12 +270,17 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         assert_eq!(body["code"], code);
         if code == "recently_reset" {
             assert_eq!(
-                body["details"]["last_reset_at"],
+                body["detail"]["last_reset_at"],
                 "2026-07-14T11:48:00.000000000+00:00"
             );
         }
         if code == "provider_refused" {
-            assert_eq!(body["details"]["excerpt"], "synthetic refusal");
+            assert_eq!(body["detail"]["excerpt"], "synthetic refusal");
+            // The detail must survive a decode through subc's own error type,
+            // which is what a relay such as callosum uses.
+            let decoded: subc_protocol::ErrorBody =
+                serde_json::from_value(body.clone()).expect("decodes as subc ErrorBody");
+            assert!(decoded.detail.is_some(), "detail lost through ErrorBody: {body}");
         }
     }
     wire.stop().await;

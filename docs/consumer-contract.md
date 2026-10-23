@@ -293,7 +293,7 @@ Success Response frame bodies are:
 
 `outcome` is one of `reset`, `nothing_to_reset`, `no_credit`, `already_redeemed`.
 All four are completed outcomes and are replayed as stored. Failures use the normal
-Error frame body (`code`, `message`, optional `details`); branch on `code`, not prose:
+Error frame body (`code`, `message`, optional `detail`, the `subc_protocol::ErrorBody` field); branch on `code`, not prose:
 
 | Code | Meaning |
 |---|---|
@@ -301,15 +301,15 @@ Error frame body (`code`, `message`, optional `details`); branch on `code`, not 
 | `forbidden` | route is not an attested callosum phone route |
 | `unsupported_provider` | provider is not `codex` |
 | `unknown_account` | no current Codex slot/credential matches that row's account |
-| `recently_reset` | a different reservation is inside the 30-minute bound; `details.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted) |
-| `provider_refused` | OpenAI refused the consume or returned an unrecognized outcome; `details.excerpt` contains its existing bounded excerpt, at most 200 characters |
+| `recently_reset` | a different reservation is inside the 30-minute bound; `detail.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted) |
+| `provider_refused` | OpenAI refused the consume or returned an unrecognized outcome; `detail.excerpt` contains its existing bounded excerpt, at most 200 characters |
 | `provider_unavailable` | timeout, transport failure, 5xx, or unavailable journal/credential; retry the same id |
 
 An unsuccessful provider attempt leaves the record pending rather than guessing
 whether a credit was spent. For example:
 
 ```json
-{"code":"recently_reset","message":"account has a reservation within 30 minutes","details":{"last_reset_at":"2026-07-14T11:48:00.000000000+00:00"}}
+{"code":"recently_reset","detail":{"last_reset_at":"2026-07-14T11:48:00.000000000+00:00"},"message":"account has a reservation within 30 minutes"}
 ```
 
 Generated synthetic request, every outcome/error and before/after rows (saved-reset

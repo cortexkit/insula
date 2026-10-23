@@ -1540,16 +1540,19 @@ fn saved_reset_error_body(error: quota_core::codex_resets::SavedResetError) -> s
             "saved reset is temporarily unavailable; retry the same request_id",
         ),
     };
-    let mut body =
-        serde_json::to_value(ErrorBody::new(code, message)).expect("error bodies serialize");
-    match error {
-        RecentlyReset(at) => {
-            body["details"] = json!({"last_reset_at": quota_core::rfc3339_canonical(at)})
-        }
-        ProviderRefused(excerpt) => body["details"] = json!({"excerpt": excerpt}),
-        _ => {}
+    // Structured details ride in subc's own `ErrorBody.detail` field, so any
+    // reader decoding the fleet's error type (callosum's relay to the phone)
+    // keeps them. A hand-added member of another name would be dropped.
+    let detail = match error {
+        RecentlyReset(at) => Some(json!({"last_reset_at": quota_core::rfc3339_canonical(at)})),
+        ProviderRefused(excerpt) => Some(json!({"excerpt": excerpt})),
+        _ => None,
+    };
+    let mut body = ErrorBody::new(code, message);
+    if let Some(detail) = detail {
+        body = body.with_detail(detail);
     }
-    body
+    serde_json::to_value(body).expect("error bodies serialize")
 }
 
 async fn send_route_error_body(
