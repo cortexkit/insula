@@ -1948,23 +1948,31 @@ and the weekly figure stays unchanged until its reset passes (then 0% without
 a known next reset). This memory is per process, not durable.
 
 Without a remembered reading, a deposited dev.meta.ai session can supply the
-quota for an explicitly selected team. Configure the optional string
-`muse.team_id` in the quota config, for example `{"muse":{"team_id":"424242424242"}}`.
-It reloads live on the same schedule as `codex.auto_use_resets`. No team is
-chosen automatically. When none is configured, a verified session's visible
-team IDs and names are logged once, and again only when that list changes.
+quota of the team that holds the login's subscription. With no team configured,
+insula reads each visible team's subscription quota and uses the team whose
+`tier` matches the login's `subs_tier_name`, when exactly one does. The session
+is already proven to belong to the login's account, so a single plan match is
+that subscription. Two or more teams on the same plan are ambiguous: nothing is
+served, and their IDs and names are logged once (and again only when that list
+changes). Teams beyond the request budget are not guessed at. To choose
+explicitly, set the optional string `muse.team_id` in the quota config, for
+example `{"muse":{"team_id":"424242424242"}}`; it reloads live on the same
+schedule as `codex.auto_use_resets`, and then only that team is read. A web
+reading that serves is remembered like a full one, so later idle answers cost
+no further requests.
 
 The web lane follows CodexBar v0.79.0:
 
 1. `GET https://dev.meta.ai/api/auth/me`, with only `llama_dev_sess` as the
    credential. Its email must match the mint email case-insensitively.
-2. `GET /api/portal/teams`; the chosen team's ID must be visible.
+2. `GET /api/portal/teams`; a configured team's ID must be visible.
 3. Only for a blank session email, use `userId` to find the member with the same
    `user_id` in `/api/portal/teams/{team_id}/members` and match that member's email
    to the mint email. When no selected team is visible, the first team may prove
    identity for listing purposes, but is never chosen for quota. A members 403
    ignores the session without expiring it.
-4. `GET /api/portal/teams/{team_id}/subscription-quota`; its `tier` must match
+4. `GET /api/portal/teams/{team_id}/subscription-quota` for the configured team,
+   or for each visible team when none is configured; its `tier` must match
    `subs_tier_name` from the mint response.
 
 Percentages are weighted used / limit, including decimal-string counts, capped
@@ -1972,8 +1980,7 @@ at 100%. A missing 5h reset with zero usage, or a valid reset already passed,
 means 0% with no reset. As in the pinned source, zero usage with an explicitly
 future reset retains that reset. Malformed resets, nonzero usage without a
 reset, a weekly reset not in the future, zero/missing limits, or an invalid
-window duration withhold the entire web reading. The team is the user's choice;
-the responses do not prove that team's subscription belongs to the CLI login.
+window duration withhold the entire web reading.
 
 The web lane is attempted at most once per Muse fetch, only when remembered
 usage cannot serve. It makes at most five requests across deposits, with an

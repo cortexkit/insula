@@ -28,6 +28,7 @@ struct Team {
 #[derive(Default)]
 struct State {
     teams: HashMap<String, Vec<Team>>,
+    chosen: HashMap<String, Team>,
     expired: HashSet<(String, u64)>,
     lifetimes: CookieLifetimes,
 }
@@ -143,7 +144,8 @@ impl TeamQuota {
                 .map(|team| format!("{} ({})", team.id, team.name))
                 .collect();
             let line = format!(
-                "{} muse browser teams for {email}: [{}]; set muse.team_id to choose a team",
+                "{} muse browser teams for {email}: [{}]; no single team on the login's plan, \
+                 so set muse.team_id to choose one",
                 crate::LOG_TAG,
                 listing.join(", ")
             );
@@ -273,14 +275,58 @@ impl TeamQuota {
                 return Err(Unavailable::Other);
             }
         }
-        if selected.is_empty() {
-            if let Some(line) = self.team_listing(email, &teams) {
+        let Some(plan) = plan else { return Ok(None) };
+        if !selected.is_empty() {
+            // An explicit choice: only that team, and only if visible.
+            let Some(team) = team else { return Ok(None) };
+            let quota = self.subscription_quota(cookie, team, budget).await?;
+            if quota["tier"].as_str().map(str::trim) != Some(plan) {
+                return Ok(None);
+            }
+            return Ok(parse_quota(&quota, chrono::Utc::now().timestamp() as f64));
+        }
+        // No team configured: pick the team whose subscription is on the
+        // login's plan, when exactly one is. The session is already proven to
+        // be the login's own account, and the login's subscription is one of
+        // the teams it can see, so a single plan match is that subscription.
+        // Two or more on the same plan are ambiguous: serve nothing, and list
+        // them so `muse.team_id` can choose. Each team checked costs one
+        // request from the shared budget; teams past it are not guessed at.
+        let mut matches: Vec<(Team, Value)> = Vec::new();
+        let mut checked_all = true;
+        for team in &teams {
+            if *budget == 0 {
+                checked_all = false;
+                break;
+            }
+            let quota = self.subscription_quota(cookie, team, budget).await?;
+            if quota["tier"].as_str().map(str::trim) == Some(plan) {
+                matches.push((team.clone(), quota));
+            }
+        }
+        if !checked_all || matches.len() != 1 {
+            let listed: Vec<Team> = if matches.is_empty() {
+                teams
+            } else {
+                matches.into_iter().map(|(team, _)| team).collect()
+            };
+            if let Some(line) = self.team_listing(email, &listed) {
                 eprintln!("{line}");
             }
             return Ok(None);
         }
-        let Some(team) = team else { return Ok(None) };
-        let response = self
+        let (team, quota) = matches.pop().expect("exactly one match");
+        self.note_chosen(email, &team);
+        Ok(parse_quota(&quota, chrono::Utc::now().timestamp() as f64))
+    }
+
+    async fn subscription_quota(
+        &self,
+        cookie: &str,
+        team: &Team,
+        budget: &mut usize,
+    ) -> Result<Value, Unavailable> {
+        let mut response = self
             .get(
                 cookie,
                 &format!("/api/portal/teams/{}/subscription-quota", team.id),
@@ -288,12 +334,24 @@ impl TeamQuota {
                 budget,
             )
             .await?;
-        let quota = &response["subscription_quota"];
-        // Visibility proves access, not which subscription the CLI login uses.
-        if plan.is_none() || quota["tier"].as_str().map(str::trim) != plan {
-            return Ok(None);
+        Ok(response["subscription_quota"].take())
+    }
+
+    /// Log, once per account and team, which team was chosen by plan.
+    fn note_chosen(&self, email: &str, team: &Team) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.chosen.get(email) != Some(team) {
+            eprintln!(
+                "{} muse: using dev.meta.ai team {} ({}) for {email}, the only visible team on \
+                 its plan; set muse.team_id to choose another",
+                crate::LOG_TAG,
+                team.id,
+                team.name
+            );
+            state.chosen.insert(email.to_string(), team.clone());
         }
-        Ok(parse_quota(quota, chrono::Utc::now().timestamp() as f64))
     }
 }
 

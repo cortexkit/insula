@@ -237,26 +237,71 @@ async fn email_mismatch_withholds_web_reading() {
 }
 
 #[tokio::test]
-async fn no_configured_team_lists_visible_teams_once_without_reading_quota() {
+async fn no_configured_team_uses_the_only_team_on_the_logins_plan() {
     let f = Fixture::new(None, vec![]).await;
-    f.withheld().await;
-    f.withheld().await;
+    let usage = f
+        .fetch()
+        .await
+        .usage
+        .expect("one team on the plan is served");
+    assert!((usage.secondary.unwrap().used_percent - 15.07297103).abs() < 0.00001);
     assert_eq!(
         f.web.paths(),
         [
             "/api/auth/me",
             "/api/portal/teams",
-            "/api/auth/me",
-            "/api/portal/teams"
+            &format!("/api/portal/teams/{TEAM}/subscription-quota")
         ]
     );
     let state = f.provider.web.state.lock().unwrap();
     assert_eq!(
-        state.teams.get("ada@example.com"),
-        Some(&vec![Team {
-            id: TEAM.into(),
-            name: "My Team".into()
-        }])
+        state.chosen.get("ada@example.com").map(|t| t.id.as_str()),
+        Some(TEAM)
+    );
+}
+
+/// Two teams on the login's plan can't be told apart, so nothing is served and
+/// both are listed for `muse.team_id`.
+#[tokio::test]
+async fn two_teams_on_the_logins_plan_serve_nothing_and_are_listed() {
+    let teams = r#"{"teams":[{"team_id":424242424242,"team_name":"My Team"},{"team_id":777,"team_name":"Work"}]}"#;
+    let f = Fixture::new(None, vec![("/api/portal/teams", 200, teams.into())]).await;
+    f.withheld().await;
+    let state = f.provider.web.state.lock().unwrap();
+    let listed: Vec<&str> = state
+        .teams
+        .get("ada@example.com")
+        .unwrap()
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+    assert_eq!(listed, [TEAM, "777"]);
+    assert!(state.chosen.is_empty());
+}
+
+/// A second team on a different plan doesn't make the choice ambiguous.
+#[tokio::test]
+async fn a_team_on_another_plan_is_ignored_when_choosing() {
+    let teams = r#"{"teams":[{"team_id":777,"team_name":"Free"},{"team_id":424242424242,"team_name":"My Team"}]}"#;
+    let mut other = quota();
+    other["subscription_quota"]["tier"] = "Muse Code Free".into();
+    let f = Fixture::new(
+        None,
+        vec![
+            ("/api/portal/teams", 200, teams.into()),
+            (
+                "/api/portal/teams/777/subscription-quota",
+                200,
+                other.to_string(),
+            ),
+        ],
+    )
+    .await;
+    assert!(f.fetch().await.usage.is_ok());
+    let state = f.provider.web.state.lock().unwrap();
+    assert_eq!(
+        state.chosen.get("ada@example.com").map(|t| t.id.as_str()),
+        Some(TEAM)
     );
 }
 
@@ -518,7 +563,9 @@ async fn no_cookie_deposit_makes_no_web_request() {
 
 #[tokio::test]
 async fn team_selection_reloads_on_the_existing_provider() {
-    let mut f = Fixture::new(None, vec![]).await;
+    // Two teams on the login's plan: ambiguous until a team is configured.
+    let teams = r#"{"teams":[{"team_id":424242424242,"team_name":"My Team"},{"team_id":777,"team_name":"Work"}]}"#;
+    let mut f = Fixture::new(None, vec![("/api/portal/teams", 200, teams.into())]).await;
     let live = LiveQuotaConfig::new(QuotaConfig::default());
     f.provider.web.config = live.clone();
     f.withheld().await;
@@ -531,14 +578,17 @@ async fn team_selection_reloads_on_the_existing_provider() {
         live,
     );
     reloader.check();
+    let before = f.web.paths().len();
     assert!(f.fetch().await.usage.is_ok());
+    let quota_reads: Vec<String> = f.web.paths()[before..]
+        .iter()
+        .filter(|path| path.ends_with("/subscription-quota"))
+        .cloned()
+        .collect();
     assert_eq!(
-        f.web
-            .paths()
-            .iter()
-            .filter(|path| path.ends_with("/subscription-quota"))
-            .count(),
-        1
+        quota_reads,
+        [format!("/api/portal/teams/{TEAM}/subscription-quota")],
+        "after the reload only the configured team is read"
     );
 }
 
