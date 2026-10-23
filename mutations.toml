@@ -31,7 +31,7 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 [control.select]
-filter = "saved_reset_caller_requires_callosum_principal"
+filter = "saved_reset_caller_requires"
 
 [[control]]
 id = "saved-reset-phone-harness"
@@ -50,26 +50,26 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 [control.select]
-filter = "saved_reset_caller_requires_phone_harness"
+filter = "saved_reset_caller_requires"
 
 [[control]]
 id = "saved-reset-client-redeem-id"
-guards = "A manual redemption durably reserves the client's id, not a fresh generated id"
+guards = "A pending manual redemption sends the original client id to consume, not a fresh generated id"
 file = "crates/quota-core/src/codex_resets.rs"
-old = 'redeem_request_id: request_id.to_owned(),'
-new = 'redeem_request_id: Uuid::new_v4().to_string(), // NON-VACUITY BREAK'
+old = 'transport.consume_manual(request, request_id),'
+new = 'transport.consume_manual(request, &Uuid::new_v4().to_string()), // NON-VACUITY BREAK'
 edits = []
 test_file = "crates/quota-core/src/codex_resets/saved_reset_tests.rs"
 runner = "cargo"
 package = "quota-core"
 target = "--lib"
-expect_red = ["codex_resets::saved_reset_tests::saved_reset_resend_after_restart_returns_stored_outcome_without_second_post"]
-expect_message = "assertion `left == right` failed"
+expect_red = ["codex_resets::saved_reset_tests::saved_reset_pending_resumes_with_same_redeem_request_id"]
+expect_message = "pending retries must reuse the original redeem id"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
 [control.select]
-filter = "saved_reset_resend_after_restart_returns_stored_outcome_without_second_post"
+filter = "saved_reset_"
 
 [[control]]
 id = "saved-reset-manual-spend-bound"
@@ -88,7 +88,7 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 [control.select]
-filter = "saved_reset_fresh_id_within_bound_refuses_with_reservation_time_and_no_post"
+filter = "saved_reset_"
 
 
 [[control]]
