@@ -1818,3 +1818,20 @@ expect_red = ["muse::web::tests::web_never_receives_device_token"]
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "kimi-lapsed-plan-membership"
+guards = "A Kimi GetUsages reply without FEATURE_CODING usage (a lapsed Code plan) publishes the membership windows instead of a decode error"
+file = "crates/quota-core/src/kimi.rs"
+old = "None => match membership {"
+new = "None => match None::<Vec<ExtraWindow>> { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/kimi.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["kimi::tests::lapsed_web_session_still_shows_the_membership_balance", "kimi::tests::usages_without_feature_coding_publish_the_membership_windows"]
+expect_message = "membership"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
