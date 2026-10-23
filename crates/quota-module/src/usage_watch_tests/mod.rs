@@ -7,6 +7,7 @@ use subc_protocol::{AdmissionClass, FLAG_SUBSCRIPTION};
 use tokio::{io::DuplexStream, sync::oneshot, task::JoinHandle};
 
 mod quota_wire_vectors;
+mod saved_reset_tests;
 
 const DEADLINE: Duration = Duration::from_secs(2);
 

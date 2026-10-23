@@ -62,6 +62,7 @@ use tokio_util::sync::CancellationToken;
 use vault_client::VaultClient;
 
 const USAGE_GET_OP: &str = "usage.get";
+const USE_SAVED_RESET_OP: &str = "usage.use_saved_reset";
 
 /// Recently observed quota drops, as a cursor-paged ring.
 ///
@@ -633,6 +634,7 @@ struct ServeCounters {
     /// Only daemon-attested route principals grant write access. Scope owners
     /// and client-supplied bind identities are not the calling module.
     observation_writers: Mutex<std::collections::HashSet<(u16, u32)>>,
+    phone_reset_writers: Mutex<std::collections::HashSet<(u16, u32)>>,
     samples: Arc<bus::QuotaSamples>,
     served: AtomicU64,
     refused: AtomicU64,
@@ -690,6 +692,11 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
+            serve
+                .phone_reset_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(frame.header.channel, frame.header.epoch));
             serve
                 .observation_writers
                 .lock()
@@ -765,8 +772,19 @@ async fn handle_control_request(
             route_channel,
             epoch,
             principal,
+            identity,
             ..
         } => {
+            let phone_allowed =
+                saved_reset_caller_allowed(principal.as_ref(), Some(identity.harness.as_str()));
+            let mut phones = serve
+                .phone_reset_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            phones.retain(|(channel, _)| *channel != route_channel);
+            if phone_allowed {
+                phones.insert((route_channel, epoch));
+            }
             let allowed = matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "prefrontal-routing");
             let mut writers = serve
                 .observation_writers
@@ -1156,6 +1174,10 @@ struct UsageRequest {
 #[derive(Debug, Deserialize, Default)]
 struct UsageParams {
     #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
     observations: Vec<serde_json::Value>,
     #[serde(default)]
     event_key: Option<String>,
@@ -1186,6 +1208,28 @@ async fn handle_usage_request(
         epoch,
         corr,
     };
+
+    // The route.bind harness is trustworthy only with the daemon-attested
+    // reserved:callosum principal and a fed-phone: harness. Check permission for
+    // this bound channel and epoch before decoding mutation parameters.
+    let is_reset = serde_json::from_slice::<serde_json::Value>(&frame.body)
+        .is_ok_and(|v| v.get("method").and_then(|m| m.as_str()) == Some(USE_SAVED_RESET_OP));
+    if is_reset
+        && !serve
+            .phone_reset_writers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&(channel, epoch))
+    {
+        return send_route_error(
+            writer,
+            serve,
+            reply,
+            "forbidden",
+            "usage.use_saved_reset requires reserved:callosum with fed-phone: harness",
+        )
+        .await;
+    }
 
     // Refuse writers before decoding their rows, so even malformed observations
     // from an untrusted route cannot enter the write path or its counters.
@@ -1222,6 +1266,53 @@ async fn handle_usage_request(
             .await;
         }
     };
+
+    if request.method == USE_SAVED_RESET_OP {
+        let params = request.params;
+        let Some(request_id) = params.request_id.filter(|id| valid_reset_request_id(id)) else {
+            return send_route_error(
+                writer,
+                serve,
+                reply,
+                "invalid_request",
+                "request_id must be 8-128 ASCII letters, digits or hyphens",
+            )
+            .await;
+        };
+        let (Some(provider), Some(account)) = (params.provider, params.account) else {
+            return send_route_error(
+                writer,
+                serve,
+                reply,
+                "invalid_request",
+                "provider and account are required",
+            )
+            .await;
+        };
+        return match registry
+            .use_saved_reset(&provider, &account, &request_id)
+            .await
+        {
+            Ok(outcome) => {
+                let response = Frame::build_with_version(
+                    ver,
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    channel,
+                    epoch,
+                    corr,
+                    serde_json::to_vec(&saved_reset_reply(outcome, &request_id))
+                        .map_err(ModuleError::Json)?,
+                )
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                serve.record_served();
+                send(writer, response).await
+            }
+            Err(error) => {
+                send_route_error_body(writer, serve, reply, saved_reset_error_body(error)).await
+            }
+        };
+    }
 
     if request.method == "usage.observe" {
         let result = registry.observe_calls(request.params.observations);
@@ -1319,7 +1410,7 @@ async fn handle_usage_request(
             serve,
             reply,
             "unknown_method",
-            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_WATCH_OP}', '{USAGE_DROPS_OP}', 'usage.observe' or 'events_get'"),
+            &format!("unknown method '{echoed}', expected '{USAGE_GET_OP}', '{USAGE_WATCH_OP}', '{USAGE_DROPS_OP}', '{USE_SAVED_RESET_OP}', 'usage.observe' or 'events_get'"),
         )
         .await;
     }
@@ -1400,8 +1491,75 @@ async fn send_route_error(
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
+    send_route_error_body(
+        writer,
+        serve,
+        reply,
+        serde_json::to_value(ErrorBody::new(code, message)).map_err(ModuleError::Json)?,
+    )
+    .await
+}
+
+fn saved_reset_caller_allowed(
+    principal: Option<&subc_protocol::Principal>,
+    harness: Option<&str>,
+) -> bool {
+    matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "callosum")
+        && harness.is_some_and(|harness| harness.starts_with("fed-phone:"))
+}
+
+fn valid_reset_request_id(id: &str) -> bool {
+    (8..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn saved_reset_reply(
+    outcome: quota_core::codex_resets::ConsumeOutcome,
+    request_id: &str,
+) -> serde_json::Value {
+    json!({"outcome": outcome.as_code(), "request_id": request_id})
+}
+
+fn saved_reset_error_body(error: quota_core::codex_resets::SavedResetError) -> serde_json::Value {
+    use quota_core::codex_resets::SavedResetError::*;
+    let (code, message) = match &error {
+        UnsupportedProvider => (
+            "unsupported_provider",
+            "saved resets are supported only for codex",
+        ),
+        UnknownAccount => (
+            "unknown_account",
+            "no Codex credential matches this account",
+        ),
+        RecentlyReset(_) => (
+            "recently_reset",
+            "account has a reservation within 30 minutes",
+        ),
+        ProviderRefused(_) => ("provider_refused", "OpenAI refused the saved reset"),
+        ProviderUnavailable(_) => (
+            "provider_unavailable",
+            "saved reset is temporarily unavailable; retry the same request_id",
+        ),
+    };
+    let mut body =
+        serde_json::to_value(ErrorBody::new(code, message)).expect("error bodies serialize");
+    match error {
+        RecentlyReset(at) => {
+            body["details"] = json!({"last_reset_at": quota_core::rfc3339_canonical(at)})
+        }
+        ProviderRefused(excerpt) => body["details"] = json!({"excerpt": excerpt}),
+        _ => {}
+    }
+    body
+}
+
+async fn send_route_error_body(
+    writer: &mpsc::Sender<Frame>,
+    serve: &Arc<ServeCounters>,
+    reply: RouteReply,
+    body: serde_json::Value,
+) -> Result<(), ModuleError> {
     serve.record_refused();
-    let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(ModuleError::Json)?;
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         reply.ver,
         FrameType::Error,
@@ -1619,6 +1777,11 @@ fn manifest(
                     name: "usage.observe".to_string(),
                     kind: ManagementOperationKind::Mutate,
                     description: Some("Accept Claude model-call headers from reserved:prefrontal-routing only.".to_string()),
+                },
+                ManagementOperation {
+                    name: USE_SAVED_RESET_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                    description: Some("Redeem a Codex saved reset idempotently from an attested callosum phone route.".to_string()),
                 },
                 ManagementOperation {
                     name: bus::EVENTS_GET.to_string(),
@@ -1946,7 +2109,12 @@ mod tests {
             manifest.is_watch_operation(USAGE_WATCH_OP),
             "usage.watch must be declared a watch, or daemon-routed subscribers are refused"
         );
-        for unary in [USAGE_GET_OP, USAGE_DROPS_OP, "usage.observe"] {
+        for unary in [
+            USAGE_GET_OP,
+            USAGE_DROPS_OP,
+            "usage.observe",
+            USE_SAVED_RESET_OP,
+        ] {
             assert!(
                 !manifest.is_watch_operation(unary),
                 "{unary} must stay unary"
@@ -2138,6 +2306,7 @@ mod tests {
                 "usage.watch",
                 "usage.drops",
                 "usage.observe",
+                "usage.use_saved_reset",
                 "events_get"
             ],
             "the manifest advertises what catalog.list shows a consumer; an \

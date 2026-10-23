@@ -300,6 +300,122 @@ async fn committed_quota_wire_vectors_match() {
     );
 }
 
+const V2_README: &str = "# Quota wire v2: explicit Codex saved reset\n\nSynthetic identities only: account `synthetic-codex-id`, email `phone@example.com`,\nprincipal `reserved:callosum`, harness `fed-phone:synthetic-fp`. No credentials.\nThe fixed clock is 2026-07-14T12:00:00Z; the blocking reservation is 12 minutes older.\n\n`use-saved-reset-request.json` is the routed request envelope; its `params` is the\noperation request body. Success files are Response frame bodies, error files are\nError frame bodies. `recently_reset` includes RFC 3339 `details.last_reset_at`.\n`provider_refused` includes the bounded (200-character) provider excerpt in details.\nThe before/after files are individual rows from `usage.get`, with availableCount\nchanging from 2 to 1 after the due slot is refreshed. The operation reply does not\nwait for that refresh. A repeated request_id replays its durable outcome; a new id\nis not a retry. Only callosum's attested fed-phone: routes may spend a credit.\n\nGenerated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:\n`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v2_vectors_match`\n\nv1 remains unchanged. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.\n";
+
+async fn generated_v2_files() -> Vec<(String, Vec<u8>)> {
+    use super::saved_reset_tests::{self as phone, *};
+    use quota_core::codex_resets::{ConsumeOutcome, SavedResetError};
+    let (registry, _, result) = fixture().await;
+    let mut wire = Wire::with_registry(false, 65536, registry.clone()).await;
+    let mut files = vec![
+        ("README.md".to_owned(), V2_README.as_bytes().to_vec()),
+        (
+            "use-saved-reset-request.json".into(),
+            serde_json::to_vec(&json!({"method":USE_SAVED_RESET_OP,"params":reset_params()}))
+                .unwrap(),
+        ),
+    ];
+    let forbidden = call(&mut wire, 1, reset_params()).await;
+    assert_eq!(forbidden.header.ty, FrameType::Error);
+    files.push(("error-forbidden.json".into(), forbidden.body));
+    bind(&mut wire, 1, callosum(), Some("fed-phone:synthetic-fp")).await;
+    wire.send(request(5, 1, 702, USAGE_GET_OP, false)).await;
+    let before: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+    files.push((
+        "usage-get-row-before.json".into(),
+        serde_json::to_vec(&before["result"][0]).unwrap(),
+    ));
+    for (field, value, code) in [
+        ("request_id", "short", "invalid_request"),
+        ("provider", "claude", "unsupported_provider"),
+        ("account", "missing", "unknown_account"),
+    ] {
+        let mut params = reset_params();
+        params[field] = json!(value);
+        let frame = call(&mut wire, 1, params).await;
+        assert_eq!(frame.header.ty, FrameType::Error);
+        files.push((format!("error-{code}.json"), frame.body));
+    }
+    for (error, code) in [
+        (
+            SavedResetError::RecentlyReset(phone::AT.parse().unwrap()),
+            "recently_reset",
+        ),
+        (
+            SavedResetError::ProviderRefused("synthetic provider refusal".into()),
+            "provider_refused",
+        ),
+        (
+            SavedResetError::ProviderUnavailable("synthetic timeout".into()),
+            "provider_unavailable",
+        ),
+    ] {
+        *result.lock().unwrap() = Err(error);
+        let frame = call(&mut wire, 1, reset_params()).await;
+        assert_eq!(frame.header.ty, FrameType::Error);
+        files.push((format!("error-{code}.json"), frame.body));
+    }
+    for outcome in [
+        ConsumeOutcome::Reset,
+        ConsumeOutcome::NothingToReset,
+        ConsumeOutcome::NoCredit,
+        ConsumeOutcome::AlreadyRedeemed,
+    ] {
+        *result.lock().unwrap() = Ok(outcome);
+        let frame = call(&mut wire, 1, reset_params()).await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        files.push((format!("success-{}.json", outcome.as_code()), frame.body));
+    }
+    registry.refresh_tick(&CancellationToken::new()).await;
+    wire.send(request(5, 1, 702, USAGE_GET_OP, false)).await;
+    let after: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+    files.push((
+        "usage-get-row-after.json".into(),
+        serde_json::to_vec(&after["result"][0]).unwrap(),
+    ));
+    wire.stop().await;
+    wire.finish().await;
+    let mut sums = String::new();
+    for (name, bytes) in &files {
+        use sha2::Digest as _;
+        let digest: String = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sums.push_str(&format!("{digest}  {name}\n"));
+    }
+    files.push(("SHA256SUMS".into(), sums.into_bytes()));
+    files
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_quota_wire_v2_vectors_match() {
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/quota-wire-v2");
+    let files = generated_v2_files().await;
+    if std::env::var_os("INSULA_WRITE_VECTORS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, bytes) in &files {
+            std::fs::write(directory.join(name), bytes).unwrap();
+        }
+    }
+    let mut differences = Vec::new();
+    for (name, bytes) in &files {
+        if std::fs::read(directory.join(name)).ok().as_ref() != Some(bytes) {
+            differences.push(name.clone());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if !files.iter().any(|(expected, _)| *expected == name) {
+                differences.push(name);
+            }
+        }
+    }
+    assert!(differences.is_empty(), "committed quota wire v2 vectors differ: {}. Regenerate with INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v2_vectors_match", differences.join(", "));
+}
+
 const VECTOR_README: &str = "# Quota wire v1\n\n\
 `usage-get.json` is the exact compact response body from the module's `usage.get` handler, driven by stub providers through the real Registry. It includes fresh 5h and weekly windows, a retained stale reading and fetchedAt, an exhausted (100%) window, subscription-funded and bought pools with expiry, saved reset expiry, a degraded account with no reading, and named extra rate windows. Amount edges include an overdrawn DeepSeek remaining balance (-2 minor, exponent 2, USD) and a large Codex balance (55598241861500 minor, exponent 9). All identities are synthetic example.com addresses; all clocks are fixed.\n\n\
 `usage-watch-read-now.json` is the exact first StreamData body produced by the real watch handler: sequence 1 tells the consumer to read now, with no row identity. The epoch is a made-up UUID fixed for reproducibility.\n\n\

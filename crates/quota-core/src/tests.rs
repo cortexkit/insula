@@ -5339,6 +5339,109 @@ fn adapter_distinguishes_absent_label_from_unavailable_observation() {
 
 static RESET_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
+#[tokio::test]
+async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_identity() {
+    use crate::codex_resets::SavedResetError;
+    let temp = ResetTempDir::new("manual-registry");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = spawn_walled_usage_server(listener, 2);
+    let home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    write_owner_only_test_file(
+        &home.join("auth.json"),
+        br#"{"tokens":{"access_token":"local-token","account_id":"shared-account"}}"#,
+    );
+    write_owner_only_test_file(
+        &home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    let loader = VaultHandleLoader::default();
+    loader.install_rows_for_test(&[("chatgpt:openai", "oauth")]);
+    let source = Arc::new(SameAccountVaultSource {
+        gets: AtomicUsize::new(0),
+        account_id: "shared-account",
+        token: b"vault-token",
+    });
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Outcome(
+        ConsumeOutcome::Reset,
+    )));
+    let coordinator = Arc::new(ResetCoordinator::new(temp.journal()).unwrap());
+    let provider = crate::codex::CodexProvider::new_for_test(
+        crate::config::CodexConfig { auto_use_resets: 0 },
+        Some(source),
+        transport.clone(),
+        coordinator,
+        loader,
+        home.clone(),
+    );
+    let registry = Registry::new(vec![Box::new(provider)]);
+    tick(&registry).await;
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("both credential lanes must be read")
+        .unwrap();
+    assert_eq!(registry.get_usage(Some("codex")).await.len(), 1);
+    assert_eq!(
+        transport.posts.load(Ordering::SeqCst),
+        0,
+        "automatic spending is disabled"
+    );
+    assert_eq!(
+        registry
+            .use_saved_reset("codex", "shared-account", "phone-request-0001")
+            .await,
+        Ok(ConsumeOutcome::Reset)
+    );
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *transport.consume_accounts.lock().unwrap(),
+        vec!["shared-account".to_owned()]
+    );
+    {
+        let store = registry.store.lock().unwrap();
+        for handle in [
+            CredentialHandle::implicit(),
+            CredentialHandle::scoped("chatgpt:openai", "oauth"),
+        ] {
+            assert!(
+                store
+                    .get(&SlotKey::new("codex", handle))
+                    .unwrap()
+                    .next_due_at
+                    <= Instant::now(),
+                "every lane for the redeemed account must be due"
+            );
+        }
+    }
+    write_owner_only_test_file(
+        &home.join("auth.json"),
+        br#"{"tokens":{"access_token":"replacement-token","account_id":"rotated-account"}}"#,
+    );
+    assert_eq!(
+        registry
+            .use_saved_reset("codex", "shared-account", "phone-request-0002")
+            .await,
+        Err(SavedResetError::UnknownAccount),
+        "a stale row must not authorize a replacement identity"
+    );
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+    // A completed retry is a journal read, even when the credential has rotated.
+    assert_eq!(
+        registry
+            .use_saved_reset("codex", "shared-account", "phone-request-0001")
+            .await,
+        Ok(ConsumeOutcome::Reset)
+    );
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
+}
+
 /// A scratch directory under the OS temp root that removes itself when dropped.
 ///
 /// Shared by the unit tests across this crate (hence `pub(crate)`) so every

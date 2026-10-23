@@ -249,6 +249,73 @@ sheddable). An insula predating this method replies `unknown_method` with an
 `usage_watch_limit_and_route_goodbye_release_state`
 (`crates/quota-module/src/usage_watch_tests/mod.rs`, through the real frame loop).
 
+### `usage.use_saved_reset`: explicit phone redemption
+
+This **Mutate** operation spends one Codex saved reset. OpenAI chooses the credit;
+there is no credit selector. Send the `account` from the Codex `usage.get` row,
+not its email or a vault credential id:
+
+```json
+{"method":"usage.use_saved_reset","params":{"provider":"codex","account":"synthetic-codex-id","request_id":"phone-request-0001"}}
+```
+
+Only a route with **both** daemon-attested principal `reserved:callosum` and
+`route.bind` identity `harness` beginning with the literal `fed-phone:` may call
+this operation. A phone identity without that principal grants nothing. Simulator,
+Mac, unknown, missing-harness and all other principals receive `forbidden` before
+parameters are decoded or any reservation is made. Scope ownership is not caller
+attestation. Bind permission is scoped to the route channel and epoch and is
+revoked on rebind or route goodbye.
+
+Generate one `request_id` per deliberate press: 8–128 ASCII letters, digits or
+hyphens (`[A-Za-z0-9-]`). Persist it on the phone until the reply is known. **Resend
+the same id after a lost reply**, including after either side restarts. The durable
+journal returns a resolved id's stored outcome without another consume POST; a
+pending id resumes OpenAI's consume with that exact `redeem_request_id`. Manual
+results remain in the journal beyond automatic record retention. A fresh id is
+refused if this account has any reservation within the 30-minute spend bound,
+regardless of outcome. A retry does not become a new intent when the bound expires.
+
+The operation works even with `codex.auto_use_resets = 0`. Manual intent bypasses
+automation's sibling-headroom policy and provider-wide ten-minute floor, **not**
+the account bound or journal. Its reservation counts toward the automatic path's
+bound and floor. The chosen credential lane is re-resolved and its current Codex
+identity checked before spending, so a rotated credential cannot spend for a stale
+row. After a provider attempt, all lanes for that account are made due for refresh;
+the normal refresher publishes the new row and `usage.watch` invalidation. The
+operation reply does not wait for that refreshed reading.
+
+Success Response frame bodies are:
+
+```json
+{"outcome":"reset","request_id":"phone-request-0001"}
+```
+
+`outcome` is one of `reset`, `nothing_to_reset`, `no_credit`, `already_redeemed`.
+All four are completed outcomes and are replayed as stored. Failures use the normal
+Error frame body (`code`, `message`, optional `details`); branch on `code`, not prose:
+
+| Code | Meaning |
+|---|---|
+| `invalid_request` | malformed request, missing fields, or invalid `request_id` |
+| `forbidden` | route is not an attested callosum phone route |
+| `unsupported_provider` | provider is not `codex` |
+| `unknown_account` | no current Codex slot/credential matches that row's account |
+| `recently_reset` | a different reservation is inside the 30-minute bound; `details.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted) |
+| `provider_refused` | OpenAI refused the consume or returned an unrecognized outcome; `details.excerpt` contains its existing bounded excerpt, at most 200 characters |
+| `provider_unavailable` | timeout, transport failure, 5xx, or unavailable journal/credential; retry the same id |
+
+An unsuccessful provider attempt leaves the record pending rather than guessing
+whether a credit was spent. For example:
+
+```json
+{"code":"recently_reset","message":"account has a reservation within 30 minutes","details":{"last_reset_at":"2026-07-14T11:48:00.000000000+00:00"}}
+```
+
+Generated synthetic request, every outcome/error and before/after rows (saved-reset
+`availableCount` 2 → 1) are pinned in `test-vectors/quota-wire-v2/`, with in-process
+SHA256SUMS and a drift test. v1 is unchanged.
+
 ## 4. Freshness
 
 ### `usage.observe`: routing's writer contract

@@ -14,6 +14,82 @@ prebuild = [
   { name = "module-fixture", command = ["cargo", "build", "-p", "quota-module", "--bins", "--locked"] },
 ]
 
+[[control]]
+id = "saved-reset-callosum-principal"
+guards = "A phone harness alone cannot authorize a saved reset without callosum attestation"
+file = "crates/quota-module/src/main.rs"
+old = 'matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "callosum")'
+new = '({ let _ = principal; true }) /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/saved_reset_tests.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::saved_reset_tests::saved_reset_caller_requires_callosum_principal"]
+expect_message = "a phone harness is trusted only under callosum's attested principal"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "saved_reset_caller_requires"
+
+[[control]]
+id = "saved-reset-phone-harness"
+guards = "Callosum may spend saved resets only for phone routes, never other federated devices"
+file = "crates/quota-module/src/main.rs"
+old = '&& harness.is_some_and(|harness| harness.starts_with("fed-phone:"))'
+new = '&& { let _ = harness; true } /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-module/src/usage_watch_tests/saved_reset_tests.rs"
+runner = "cargo"
+package = "quota-module"
+target = "--bin ck-insula"
+expect_red = ["usage_watch_tests::saved_reset_tests::saved_reset_caller_requires_phone_harness"]
+expect_message = "callosum may spend only for a fed-phone: route"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "saved_reset_caller_requires"
+
+[[control]]
+id = "saved-reset-client-redeem-id"
+guards = "A pending manual redemption sends the original client id to consume, not a fresh generated id"
+file = "crates/quota-core/src/codex_resets.rs"
+old = 'transport.consume_manual(request, request_id),'
+new = 'transport.consume_manual(request, &Uuid::new_v4().to_string()), // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/codex_resets/saved_reset_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::saved_reset_tests::saved_reset_pending_resumes_with_same_redeem_request_id"]
+expect_message = "pending retries must reuse the original redeem id"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "saved_reset_"
+
+[[control]]
+id = "saved-reset-manual-spend-bound"
+guards = "A new client id cannot bypass a recent reservation on the manual path"
+file = "crates/quota-core/src/codex_resets.rs"
+old = 'if now.signed_duration_since(at).num_seconds() < SPEND_BOUND_SECS {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/codex_resets/saved_reset_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["codex_resets::saved_reset_tests::saved_reset_fresh_id_within_bound_refuses_with_reservation_time_and_no_post"]
+expect_message = "a fresh id must obey the manual 30-minute bound"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "saved_reset_"
+
 
 [[control]]
 id = "codex-unknown-sibling"

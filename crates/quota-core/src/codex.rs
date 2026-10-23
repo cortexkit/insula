@@ -892,6 +892,33 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
+    fn reset_request(
+        &self,
+        context: &ServedCodexContext,
+        config_toml: Option<&str>,
+        account_id: &str,
+    ) -> ResetRequest {
+        let auth_failure = match (
+            self.credential_source.as_ref(),
+            context.vault_handle.as_ref(),
+            context.record_version,
+        ) {
+            (Some(source), Some(handle), Some(record_version)) => {
+                Some(crate::codex_resets::AuthFailureContext {
+                    source: Arc::clone(source),
+                    handle: handle.clone(),
+                    record_version,
+                })
+            }
+            _ => None,
+        };
+        ResetRequest {
+            base_url: resolve_base_url(config_toml),
+            bearer: context.bearer.clone(),
+            account_id: account_id.to_owned(),
+            auth_failure,
+        }
+    }
     pub fn new(
         reset_config: impl Into<LiveQuotaConfig>,
         credential_source: Option<Arc<dyn CredentialSource>>,
@@ -1115,26 +1142,7 @@ impl CodexProvider {
             };
         };
 
-        let auth_failure = match (
-            self.credential_source.as_ref(),
-            context.vault_handle.as_ref(),
-            context.record_version,
-        ) {
-            (Some(credential_source), Some(handle), Some(record_version)) => {
-                Some(crate::codex_resets::AuthFailureContext {
-                    source: Arc::clone(credential_source),
-                    handle: handle.clone(),
-                    record_version,
-                })
-            }
-            _ => None,
-        };
-        let reset_request = ResetRequest {
-            base_url: resolve_base_url(config_toml.as_deref()),
-            bearer: context.bearer.clone(),
-            account_id: account_id.to_string(),
-            auth_failure,
-        };
+        let reset_request = self.reset_request(&context, config_toml.as_deref(), account_id);
         let usage_timeout = if reset_eligible {
             ARMED_USAGE_TIMEOUT
         } else {
@@ -1448,6 +1456,95 @@ impl UsageProvider for CodexProvider {
             }
         }
         attempt
+    }
+
+    async fn use_saved_reset(
+        &self,
+        handle: &CredentialHandle,
+        account_id: &str,
+        request_id: &str,
+    ) -> crate::codex_resets::SavedResetResult {
+        use crate::codex_resets::{SavedResetError, SavedResetResult, CONSUME_TIMEOUT};
+        // Manual intent is independent of auto_use_resets, but both paths must
+        // share this coordinator's journal lock for whole-file writes.
+        let coordinator = match self.reset_coordinator.get_or_init(|| {
+            ResetCoordinator::from_env()
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                    error.clone(),
+                ))
+            }
+        };
+        match coordinator.saved_reset_outcome(account_id, request_id) {
+            Ok(Some(outcome)) => {
+                return SavedResetResult {
+                    result: Ok(outcome),
+                    consume_attempted: false,
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                    error.to_string(),
+                ))
+            }
+        }
+        let resolved = async {
+            let home = self.resolved_codex_home();
+            let config_toml = home
+                .as_ref()
+                .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok());
+            let context = if handle.is_vault() {
+                let source = self
+                    .credential_source
+                    .as_ref()
+                    .ok_or(SavedResetError::UnknownAccount)?;
+                let credential = crate::credential_source::get_vault_credential(
+                    source,
+                    handle,
+                    crate::credential_source::VAULT_READ_MIN_TTL_MS,
+                )
+                .await
+                .map_err(|_| {
+                    SavedResetError::ProviderUnavailable("credential unavailable".into())
+                })?;
+                ServedCodexContext::vault(handle.clone(), credential)
+                    .map_err(|_| SavedResetError::UnknownAccount)?
+            } else {
+                let home = home.ok_or(SavedResetError::UnknownAccount)?;
+                let data =
+                    crate::env::read_credential_file(&home.join("auth.json"), "codex auth.json")
+                        .map_err(|_| SavedResetError::UnknownAccount)?;
+                ServedCodexContext::local(
+                    parse_credentials(&data).map_err(|_| SavedResetError::UnknownAccount)?,
+                )
+            };
+            // A credential can rotate after the usage row was read. Never spend
+            // on the replacement identity using the old row's account label.
+            if !context.is_oauth || context.canonical_account_id.as_deref() != Some(account_id) {
+                return Err(SavedResetError::UnknownAccount);
+            }
+            Ok(self.reset_request(&context, config_toml.as_deref(), account_id))
+        }
+        .await;
+        let request = match resolved {
+            Ok(request) => request,
+            Err(error) => return SavedResetResult::before_post(error),
+        };
+        coordinator
+            .use_saved_reset(
+                account_id,
+                request_id,
+                Utc::now(),
+                self.reset_transport.as_ref(),
+                &request,
+                CONSUME_TIMEOUT,
+            )
+            .await
     }
 }
 
