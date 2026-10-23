@@ -1638,6 +1638,15 @@ fn manifest(
             concurrency: Concurrency::StatelessParallel,
         }]
     )
+    // The daemon learns which operations are subscriptions only from this map.
+    // Without it, a caller that subscribes to `usage.watch` through the daemon
+    // (the iPhone app, via callosum) is refused as "not exposed", while a direct
+    // connection's unflagged request still works because insula itself treats
+    // the method as a subscription.
+    .operation_delivery(std::collections::BTreeMap::from([(
+        USAGE_WATCH_OP.to_string(),
+        subc_protocol::manifest::OperationDelivery::WATCH,
+    )]))
     // THIS MODULE DIALS ANOTHER, AND SAID OTHERWISE UNTIL 2026-09-06. Every vault
     // lane here opens a route to the credential vault and calls `credential.get`
     // (crates/quota-module/src/vault_client.rs), so an empty `consumes` was a
@@ -1926,6 +1935,25 @@ mod tests {
     /// rewritten the surface's history for every later reader. Losing that
     /// declaration would leave this module spending banked credits while
     /// telling the fleet it only observes.
+    /// The daemon admits a subscription to an operation only when the manifest
+    /// marks it as a watch. Without the mark, the iPhone app's `usage.watch`
+    /// through callosum is refused as not exposed. The plain reads must stay
+    /// unary, or the daemon would treat them as streams.
+    #[test]
+    fn manifest_marks_only_usage_watch_as_a_watch() {
+        let manifest = manifest(DEFAULT_MODULE_ID, None);
+        assert!(
+            manifest.is_watch_operation(USAGE_WATCH_OP),
+            "usage.watch must be declared a watch, or daemon-routed subscribers are refused"
+        );
+        for unary in [USAGE_GET_OP, USAGE_DROPS_OP, "usage.observe"] {
+            assert!(
+                !manifest.is_watch_operation(unary),
+                "{unary} must stay unary"
+            );
+        }
+    }
+
     #[test]
     fn manifest_declares_every_self_signal_including_the_mutators() {
         let m = manifest("insula", None);
@@ -3329,18 +3357,16 @@ mod tests {
         use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
         use subc_protocol::Principal;
 
-        let stamp = ScopeStamp {
-            owner: Principal::Reserved {
+        let mut stamp = ScopeStamp::new(
+            Principal::Reserved {
                 module_id: "prefrontal-core".to_string(),
             },
-            scope_ref: "head-1".to_string(),
-            scope_epoch: 3,
-            kind: ScopeKind::Worker,
-            parent: None,
-            parent_state: None,
-            attributes: ScopeAttributes::new().with_flow_id(Some("flow:7".to_string())),
-            owner_authorized: true,
-        };
+            "head-1",
+            3,
+            ScopeKind::Worker,
+        );
+        stamp.attributes = ScopeAttributes::new().with_flow_id(Some("flow:7".to_string()));
+        stamp.owner_authorized = true;
         let mut bind = serde_json::json!({
             "op": "route.bind",
             "route_channel": 7,

@@ -244,7 +244,7 @@ dependencies = [
  "subc-client-rs",
  "subc-control 0.31.0",
  "subc-os",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.32.11",
  "subc-transport 0.13.0",
  "tempfile",
  "tokio",
@@ -1283,8 +1283,8 @@ dependencies = [
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.30.2",
- "subc-transport 0.11.1",
+ "subc-protocol 0.32.11",
+ "subc-transport 0.13.0",
  "tokio",
  "tokio-util",
 ]
@@ -1817,22 +1817,11 @@ dependencies = [
  "sha2",
  "subc-control 0.31.0",
  "subc-os",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.32.11",
  "subc-transport 0.13.0",
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "subc-control"
-version = "0.29.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60e3c777df76c6cef2cc00963143220146f07e057a14be6798fd1890d1c14047"
-dependencies = [
- "serde",
- "serde_json",
- "subc-protocol 0.30.2",
 ]
 
 [[package]]
@@ -1843,15 +1832,27 @@ checksum = "b2b017b243c6247349195d24385b70b627f81136e1b95ca371b592138d4348fe"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.32.11",
+]
+
+[[package]]
+name = "subc-control"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e9da09d60f35c31755ddf4e2fb5733cc1177dd59a663c604ff597c215e6c24"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol 0.32.11",
 ]
 
 [[package]]
 name = "subc-daemon"
-version = "0.33.12"
+version = "0.36.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e05a33c8d2d073fe905739ce655f0c254e3e7c8b924a81bd120ec6ee54b400c"
+checksum = "a4df5c2db7a902a09a5591599c0ae9bc13942801f119f2a844a6ec62462ae500"
 dependencies = [
+ "base64",
  "cortexkit-log",
  "cortexkit-paths",
  "fs4",
@@ -1863,23 +1864,24 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-cgroup",
- "subc-control 0.29.5",
+ "subc-control 0.32.0",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol 0.30.2",
- "subc-transport 0.11.1",
+ "subc-protocol 0.32.11",
+ "subc-transport 0.13.0",
  "subc-uptime",
+ "subtle",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac4734f44009281f03ad97049846c7258f0b2e339ae7f51c2d8c599d78b33412"
+checksum = "f4af7f809884e34da3d67be947fca6855bdb305e4a2474d94d913cb06b2b21d4"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
@@ -1896,9 +1898,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.16"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a11e335d083934ba54cf8c689252986ea6ca1c6cfac6894b46c83dbc394a8136"
+checksum = "77e0354f2b2355622be4d9659627d5277a812c37ba36cf5edfa9cf5619489d49"
 dependencies = [
  "libc",
  "rustix",
@@ -1923,16 +1925,6 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.30.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bfd1f67cd15ec1f002ca0bbf08d635d3189fe05fb559467299f6adc479df7bc"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "subc-protocol"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b6252f827f7763153d01487298f9163d26a58432c5a5d6acba7303ad2390dc2"
@@ -1943,30 +1935,12 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.32.4"
+version = "0.32.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53b464124236ea21cb154d41fde47cb712b29b1ea50e5c8cadc933fa9e5ea1b2"
+checksum = "dc461ba2c7ca2398243ca127583ba41da9f14c0f653fb5449def5f3300982401"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "subc-transport"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a1a42de77027539a24d0de74e250e51e48a9d4b91e111ee675f995de9e8b057"
-dependencies = [
- "getrandom 0.2.17",
- "hmac",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "subc-os",
- "subc-protocol 0.30.2",
- "subtle",
- "tokio",
 ]
 
 [[package]]
@@ -2000,7 +1974,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.32.11",
  "subtle",
  "tokio",
 ]
