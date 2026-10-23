@@ -528,6 +528,12 @@ pub struct Registry {
     /// the wire: same provider, same account, same `source`, a value time that
     /// steps backwards.
     dedup_winner: Mutex<std::collections::HashMap<String, String>>,
+    /// Every slot that has won each contested account so far. The winner line
+    /// is logged only when a slot wins for the first time: two slots that take
+    /// turns as the newest reading (a local and a vault lane for one Codex
+    /// account) otherwise logged a line on every alternation, 780 lines in one
+    /// night on this host, burying everything else.
+    dedup_winners_seen: Mutex<std::collections::HashMap<String, HashSet<String>>>,
     /// How long each deposited session cookie kept working before its site
     /// rejected it. See `cookie_lifetime` for why the fetches are the measurement.
     pub(crate) cookie_lifetimes: Mutex<cookie_lifetime::CookieLifetimes>,
@@ -544,6 +550,26 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Record `winner` as the slot serving a contested account. Returns whether
+    /// to announce it: `Some(changed)` when this slot wins the account for the
+    /// first time, `None` otherwise.
+    ///
+    /// Only a first win is news. Two slots taking turns as the newest reading is
+    /// the contest working as designed, and announcing every turn put 780 lines
+    /// in one night's log on this host.
+    fn record_dedup_winner(&self, account_id: &str, winner: &str) -> Option<bool> {
+        let mut latest = self.dedup_winner.lock().ok()?;
+        let previous = latest.insert(account_id.to_string(), winner.to_string());
+        let first_win = self
+            .dedup_winners_seen
+            .lock()
+            .ok()?
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(winner.to_string());
+        first_win.then(|| previous.is_some_and(|held| held != winner))
+    }
+
     /// Build a registry and cache provider metadata before the scheduler starts.
     /// Hot paths never call provider-owned naming or classification methods.
     pub fn new(providers: Vec<Box<dyn UsageProvider>>) -> Self {
@@ -571,6 +597,7 @@ impl Registry {
             last_admitted_provider: Mutex::new(None),
             latched_vault_ids: Mutex::new(HashSet::new()),
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
+            dedup_winners_seen: Mutex::new(std::collections::HashMap::new()),
             cookie_lifetimes: Mutex::new(cookie_lifetime::CookieLifetimes::default()),
             backoffs_cleared: std::sync::atomic::AtomicU64::new(0),
             credential_source: None,
@@ -1235,8 +1262,8 @@ impl Registry {
                     continue;
                 }
                 let winner = format!("{} [{}]", key.handle.stable_id(), key.provider);
-                let Ok(mut seen) = self.dedup_winner.lock() else {
-                    break;
+                let Some(changed) = self.record_dedup_winner(account_id, &winner) else {
+                    continue;
                 };
                 // THE FIRST OBSERVATION IS ANNOUNCED TOO, unlike the per-lane
                 // logger in antigravity.rs, and the difference is what the silence
@@ -1248,24 +1275,19 @@ impl Registry {
                 // contested this account OR the same slot kept winning, and a
                 // diagnostic that merges those two readings is the defect this
                 // whole line was added to fix.
-                let previous_winner = seen.get(account_id);
-                let changed = previous_winner.is_some_and(|held| held != &winner);
-                if changed || previous_winner.is_none() {
-                    eprintln!(
-                        "{tag} {provider} dedup winner for {account_id} {verb} \
-                         {winner}, reading {reading} \
-                         (several credentials resolve this account; the row follows \
-                         whichever holds the newest reading)",
-                        tag = LOG_TAG,
-                        provider = name,
-                        verb = if changed { "changed to" } else { "is" },
-                        reading = slot
-                            .last_success_wall
-                            .map(rfc3339_canonical)
-                            .unwrap_or_else(|| "none".to_string()),
-                    );
-                }
-                seen.insert(account_id.clone(), winner);
+                eprintln!(
+                    "{tag} {provider} dedup winner for {account_id} {verb} \
+                     {winner}, reading {reading} \
+                     (several credentials resolve this account; the row follows \
+                     whichever holds the newest reading)",
+                    tag = LOG_TAG,
+                    provider = name,
+                    verb = if changed { "changed to" } else { "is" },
+                    reading = slot
+                        .last_success_wall
+                        .map(rfc3339_canonical)
+                        .unwrap_or_else(|| "none".to_string()),
+                );
             }
             let candidates_published: HashSet<String> = candidates.keys().cloned().collect();
             let mut selected: Vec<_> = candidates.into_iter().collect();

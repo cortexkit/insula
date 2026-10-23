@@ -2626,6 +2626,38 @@ async fn a_contested_identity_names_its_winner_and_an_uncontested_one_stays_sile
     );
 }
 
+/// Slots that take turns winning one account are each announced once, then
+/// stay silent.
+///
+/// Two slots of one Codex account alternate as the newest reading every
+/// minute, and announcing every alternation put 780 lines in one night's log.
+/// A slot winning for the first time is still announced, because that is the
+/// event the line exists to catch.
+#[test]
+fn a_slot_that_has_won_before_is_not_announced_again() {
+    let registry = Registry::new(vec![]);
+    let announced: Vec<Option<bool>> = ["H1", "H2", "H1", "H2", "H1", "H3"]
+        .into_iter()
+        .map(|winner| registry.record_dedup_winner("A", winner))
+        .collect();
+    assert_eq!(
+        announced,
+        [Some(false), Some(true), None, None, None, Some(true)],
+        "the first winner is announced as `is`, a new one as `changed to`, \
+         and a slot that has won before is silent"
+    );
+    assert_eq!(
+        registry
+            .dedup_winner
+            .lock()
+            .unwrap()
+            .get("A")
+            .map(String::as_str),
+        Some("H3"),
+        "the latest winner is still recorded"
+    );
+}
+
 #[tokio::test]
 async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
     // The mixed case: one handle resolves an account and the other cannot. The
