@@ -851,6 +851,24 @@ limit the provider named without a readable figure. A consumer that ignores
   cookie lane for that account. `Monthly credits used` and relative
   `Next refill` prose have no denominator or absolute time and are not
   published as a window or reset.
+- **`cursor`** publishes the plan's monthly window as `primary`
+  (`windowMinutes: 43200`, reset at the billing cycle's end), except on an
+  account on The X Subscription, whose real limit is a weekly pool shared
+  across Cursor and Grok while the monthly figure goes stale (often at 100%).
+  After a successful summary read, each refresh also POSTs Cursor's Grok Bot
+  usage status
+  (`/api/dashboard/get-sand-usage-status` on `cursor.com`, same session,
+  5-second timeout). When that reply carries `isUnified: true`, a paid
+  allowance (`includedLimitZero: false`, or `hasNonZeroIncludedLimit: true`
+  when that field is absent), a `usagePercent` and a `nextResetTimestampUtc`
+  still in the future, the pool replaces the monthly window as `primary`:
+  `usedPercent` from `usagePercent` (clamped to 0-100), `resetsAt` the stated
+  reset, `windowMinutes: 10080`. `windowKind` is absent: the reply states a
+  reset time but names no period, and the seven-day length is the known
+  cadence of paid Grok Bot allowances rather than something the reply says.
+  Any other reply, a trial, a reset already past, or a failed read publishes
+  the monthly window exactly as before, and never changes the entry's error
+  class.
 - **`vercel-budget`** publishes one `primary` window for the user's personal AI
   Gateway budget, including a cumulative budget with no reset, length or kind;
   see [7.13](#vercel-and-vercel-budget-the-team-balance-and-a-personal-budget).
@@ -861,7 +879,10 @@ limit the provider named without a readable figure. A consumer that ignores
 **Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
 `a_page_with_monthly_and_session_blocks_publishes_both`,
 `active_team_plan_publishes_one_distinct_credit_window`,
-`a_monthly_window_beside_the_rolling_windows_is_an_extra`.
+`a_monthly_window_beside_the_rolling_windows_is_an_extra`,
+`an_x_subscription_account_publishes_the_weekly_pool_as_primary`,
+`an_account_without_the_unified_flag_keeps_its_monthly_window_byte_for_byte`,
+`unified_readings_that_are_not_a_current_paid_pool_are_ignored`.
 
 <a id="breakdown-who-consumed-a-window"></a>
 
@@ -1251,7 +1272,7 @@ and publishes the month's on-demand spend beside the plan window:
   period (`periodStart <= now < resetsAt`). A reading for another month is
   never published as this month's.
 - **No pool, and `spend` absent**, when the account is on any other plan
-  (including a unified team budget, `limitType: team`; no extra request is
+  (including a unified team budget, `limitType: team`; no spend request is
   made), or when the extra request fails, times out or returns a reading
   that fails a check above. The plan window and the entry's error class are
   exactly what they would be without the extra request: its failure is never

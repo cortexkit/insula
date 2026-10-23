@@ -16,6 +16,15 @@
 //! `user`) also get their monthly on-demand spend, read from a second dashboard
 //! endpoint and published as the `on_demand` pool. That read is optional: when it
 //! fails the plan window is published exactly as it would have been without it.
+//!
+//! Accounts on The X Subscription (Cursor and Grok billed together) draw on a
+//! shared weekly pool, while the usage summary keeps reporting a stale monthly
+//! cycle for them, often at 100%. After a successful summary read, the provider
+//! therefore also reads Cursor's Grok Bot ("Sand") usage status; when that
+//! reading flags the account as unified and describes a paid weekly pool that
+//! has not yet reset, the pool replaces the monthly window as `primary`. Any
+//! other answer, or a failed read, leaves the monthly window exactly as the
+//! summary gives it.
 
 use std::{
     collections::HashMap,
@@ -56,6 +65,21 @@ const USAGE_STATUS_URL: &str = "https://cursor.com/api/dashboard/v2/usage-status
 /// times out or fails in any other way, no `on_demand` pool is published and the
 /// plan window, already read, is returned unchanged.
 const USAGE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cursor's dashboard reading of the Grok Bot (internally "Sand") allowance.
+/// For an X Subscription account the same reading is the weekly pool shared
+/// across Cursor and Grok, which is the limit that actually binds it.
+const SAND_USAGE_URL: &str = "https://cursor.com/api/dashboard/get-sand-usage-status";
+/// The dashboard answers this POST from its own page, so the request carries the
+/// dashboard's origin, as the browser would.
+const SAND_USAGE_ORIGIN: &str = "https://cursor.com";
+/// The Sand read is optional, like the spend read: a timeout or any other
+/// failure leaves the monthly window in place.
+const SAND_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cursor states the pool's next reset but not its length. Paid Grok Bot
+/// allowances reset every seven days (CodexBar models them the same way), and
+/// the reading's `currentPeriodStart` can fall mid-week, so it cannot supply the
+/// length either.
+const SHARED_WEEKLY_POOL_MINUTES: i64 = 7 * 24 * 60;
 const ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
 const CACHED_EMAIL_KEY: &str = "cursorAuth/cachedEmail";
 
@@ -683,6 +707,63 @@ fn on_demand_pool(body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Result<Poo
     })
 }
 
+/// The fields of Cursor's Grok Bot ("Sand") usage status that decide whether
+/// it is an X Subscription account's shared weekly pool. The reply carries more
+/// (upsell links, plan labels, on-demand settings); none of it bears on the
+/// pool. Every field is optional so an absent one simply fails the check below.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SandUsageStatus {
+    next_reset_timestamp_utc: Option<String>,
+    usage_percent: Option<f64>,
+    has_non_zero_included_limit: Option<bool>,
+    included_limit_zero: Option<bool>,
+    is_unified: Option<bool>,
+}
+
+/// The X Subscription's shared weekly pool, read from a Sand usage-status body,
+/// or `None` when the body does not describe one that applies now.
+///
+/// Mirrors CodexBar's rule: the account must be flagged unified, hold a paid
+/// allowance (`includedLimitZero: false`, or when that field is absent
+/// `hasNonZeroIncludedLimit: true`), report a percentage, and state a next
+/// reset that is still in the future. A free trial has no recurring reset, and
+/// a reset already past means the reading is stale, so neither replaces the
+/// monthly window.
+///
+/// The reply names no period, only a reset time, so `window_kind` stays unset;
+/// the seven-day length is the known cadence of paid Grok Bot allowances.
+fn shared_weekly_pool(body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Option<RateWindow> {
+    let status: SandUsageStatus = serde_json::from_slice(body).ok()?;
+    if status.is_unified != Some(true) {
+        return None;
+    }
+    // The newer `includedLimitZero` field wins when Cursor sends both.
+    let paid_allowance = status
+        .included_limit_zero
+        .map(|zero| !zero)
+        .or(status.has_non_zero_included_limit);
+    if paid_allowance != Some(true) {
+        return None;
+    }
+    let used_percent = status.usage_percent?;
+    let reset = parse_instant(status.next_reset_timestamp_utc.as_deref())?;
+    if reset <= now {
+        return None;
+    }
+    Some(RateWindow {
+        window_kind: None,
+        used_percent: used_percent.clamp(0.0, 100.0),
+        raw_used_percent: None,
+        resets_at: Some(reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        window_minutes: Some(SHARED_WEEKLY_POOL_MINUTES),
+        used_count: None,
+        total_count: None,
+        regeneration: None,
+        breakdown: None,
+    })
+}
+
 fn provider_usage_from_credential(
     credential: &CursorCredential,
     source: &'static str,
@@ -714,6 +795,7 @@ pub struct CursorProvider {
     http: reqwest::Client,
     usage_url: String,
     usage_status_url: String,
+    sand_usage_url: String,
     /// The last spend refusal per credential handle, so a refusal is logged
     /// when it appears, changes or clears rather than on every poll.
     spend_refusals: Mutex<HashMap<String, SpendRefusal>>,
@@ -735,16 +817,19 @@ impl CursorProvider {
             handle_loader,
             usage_url: USAGE_URL.to_string(),
             usage_status_url: USAGE_STATUS_URL.to_string(),
+            sand_usage_url: SAND_USAGE_URL.to_string(),
             spend_refusals: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Read the usage summary with `cookie`, and for a unified personal account
-    /// also its monthly on-demand spend.
+    /// Read the usage summary with `cookie`, the Grok Bot ("Sand") usage status
+    /// that holds an X Subscription account's shared weekly pool, and for a
+    /// unified personal account also its monthly on-demand spend.
     ///
-    /// Only the summary can fail this call. The spend read is a second, optional
-    /// request: whatever goes wrong with it leaves the pool out and the plan
-    /// window and error class exactly as the summary alone would give them.
+    /// Only the summary can fail this call. The other two reads are optional
+    /// requests, made side by side once the summary has answered: whatever goes
+    /// wrong with either leaves the plan window, the pool list and the error
+    /// class exactly as the summary alone would give them.
     async fn fetch_usage_and_spend(
         &self,
         handle_key: &str,
@@ -756,21 +841,47 @@ impl CursorProvider {
             .send(&self.http)
             .await?;
         let summary = normalize_summary(&body)?;
-        // Accounts on any other plan have no reading at that endpoint, so they
-        // are never asked.
-        if !summary.unified_personal {
-            return Ok((summary.usage, None));
-        }
-        let spend = match JsonRequest::get(&self.usage_status_url)
-            .timeout(USAGE_STATUS_TIMEOUT)
-            .header(Header::new("Cookie", cookie))
-            .send(&self.http)
-            .await
-        {
-            Ok(body) => on_demand_pool(&body, chrono::Utc::now()),
-            Err(_) => Err(SpendRefusal::RequestFailed),
+        let unified_personal = summary.unified_personal;
+        let mut usage = summary.usage;
+        let spend = async {
+            // Accounts on any other plan have no reading at that endpoint, so
+            // they are never asked.
+            if !unified_personal {
+                return None;
+            }
+            let spend = match JsonRequest::get(&self.usage_status_url)
+                .timeout(USAGE_STATUS_TIMEOUT)
+                .header(Header::new("Cookie", cookie.clone()))
+                .send(&self.http)
+                .await
+            {
+                Ok(body) => on_demand_pool(&body, chrono::Utc::now()),
+                Err(_) => Err(SpendRefusal::RequestFailed),
+            };
+            self.settle_spend(handle_key, spend)
         };
-        Ok((summary.usage, self.settle_spend(handle_key, spend)))
+        // No plan field in the summary identifies an X Subscription account
+        // (the captured one reads `enterprise`/`team`), so every account whose
+        // summary succeeded is asked. The reply's own `isUnified` flag is
+        // required; `shared_weekly_pool` also checks it is a current paid pool.
+        let sand = async {
+            let body = JsonRequest::post_json(&self.sand_usage_url, b"{}".to_vec())
+                .timeout(SAND_USAGE_TIMEOUT)
+                .header(Header::new("Cookie", cookie.clone()))
+                .header(Header::new("Origin", SAND_USAGE_ORIGIN))
+                .send(&self.http)
+                .await
+                .ok()?;
+            shared_weekly_pool(&body, chrono::Utc::now())
+        };
+        let (pool, weekly) = tokio::join!(spend, sand);
+        // The summary's monthly figure for these accounts is a stale cycle
+        // that commonly reads 100% used; the weekly pool is the limit that
+        // actually throttles them, so it takes the primary slot.
+        if let Some(weekly) = weekly {
+            usage.primary = Some(weekly);
+        }
+        Ok((usage, pool))
     }
 
     /// Log a handle's spend refusal when it first appears, changes, or clears,
@@ -1580,6 +1691,14 @@ mod tests {
         (format!("http://{address}/usage"), received)
     }
 
+    /// A loopback URL nothing listens on: its port was bound and released.
+    async fn closed_loopback_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}/sand-usage")
+    }
+
     #[tokio::test]
     async fn oauth_cursor_fetches_scoped_jwt_and_records_sub_derived_account() {
         let loader = std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default());
@@ -1594,6 +1713,9 @@ mod tests {
         assert_eq!(handles[0].vault_credential_id(), Some("oauth:cursor"));
         let (url, request) = serve_cursor_usage().await;
         provider.usage_url = url;
+        // The loopback server answers one request; the Sand read goes to a
+        // closed port so it fails at once instead of reaching cursor.com.
+        provider.sand_usage_url = closed_loopback_url().await;
 
         let attempt = provider.fetch_handle(&handles[0]).await;
 
@@ -1664,13 +1786,25 @@ mod tests {
         }
     }
 
-    /// A loopback server answering the summary at `/usage-summary` and the
-    /// spend read at `/usage-status`, recording the head of every request it
-    /// receives so a test can count them.
+    /// A loopback server answering the summary at `/usage-summary`, the spend
+    /// read at `/usage-status` and the Sand read at `/sand-usage`, recording the
+    /// head of every request it receives so a test can count them. The Sand
+    /// read answers 404, which publishes no weekly pool, so these tests see the
+    /// summary and spend reads alone.
     async fn serve_cursor_routes(
         summary: String,
         status_code: u16,
         status_body: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        serve_cursor_routes_with_sand(summary, status_code, status_body, 404, String::new()).await
+    }
+
+    async fn serve_cursor_routes_with_sand(
+        summary: String,
+        status_code: u16,
+        status_body: String,
+        sand_code: u16,
+        sand_body: String,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1695,6 +1829,8 @@ mod tests {
                 seen.lock().unwrap().push(head);
                 let (code, body) = if request_line.contains(" /usage-status") {
                     (status_code, status_body.clone())
+                } else if request_line.contains(" /sand-usage") {
+                    (sand_code, sand_body.clone())
                 } else {
                     (200, summary.clone())
                 };
@@ -1708,6 +1844,16 @@ mod tests {
         (format!("http://{address}"), requests)
     }
 
+    /// The recorded requests whose request line starts with `prefix`, compared
+    /// case-insensitively (for example `"get /usage-status"`).
+    fn requests_starting(requests: &[String], prefix: &str) -> Vec<String> {
+        requests
+            .iter()
+            .map(|head| head.to_ascii_lowercase())
+            .filter(|head| head.starts_with(prefix))
+            .collect()
+    }
+
     /// A Cursor provider on its app-token lane, pointed at a loopback server.
     fn provider_against(base: &str) -> (CursorProvider, CredentialHandle) {
         let loader = std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default());
@@ -1718,6 +1864,7 @@ mod tests {
         );
         provider.usage_url = format!("{base}/usage-summary");
         provider.usage_status_url = format!("{base}/usage-status?scope=user");
+        provider.sand_usage_url = format!("{base}/sand-usage");
         let handle = provider.handles().unwrap().remove(0);
         (provider, handle)
     }
@@ -1811,13 +1958,13 @@ mod tests {
         assert_eq!(pools[0].remaining, Some(usd(907)));
         assert_eq!(recorded_refusal(&provider, &handle), None);
 
+        // Summary, spend and the Sand read every account gets; the spend and
+        // Sand reads run side by side, so their order is not fixed.
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "{requests:?}");
-        let status = requests[1].to_ascii_lowercase();
-        assert!(
-            status.starts_with("get /usage-status?scope=user "),
-            "{status}"
-        );
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        let spend = requests_starting(&requests, "get /usage-status?scope=user ");
+        assert_eq!(spend.len(), 1, "{requests:?}");
+        let status = &spend[0];
         assert!(status.contains("accept: application/json"), "{status}");
         assert!(
             status.contains("cookie: workoscursorsessiontoken=cursor-user%3a%3aheader."),
@@ -1825,7 +1972,8 @@ mod tests {
         );
     }
 
-    /// Any other plan never asks for the spend reading: one request per poll.
+    /// Any other plan never asks for the spend reading. (Every account still
+    /// gets the summary and the Sand read.)
     #[tokio::test]
     async fn a_non_unified_account_makes_no_spend_request() {
         let summaries = [
@@ -1841,10 +1989,9 @@ mod tests {
 
             assert!(attempt.usage.is_ok(), "{summary}");
             let requests = requests.lock().unwrap();
-            assert_eq!(
-                requests.len(),
-                1,
-                "a non-unified account must make only the summary request: {summary}"
+            assert!(
+                requests_starting(&requests, "get /usage-status").is_empty(),
+                "a non-unified account must make no spend request: {summary}"
             );
             assert!(requests[0].starts_with("GET /usage-summary "));
             assert!(
@@ -1883,7 +2030,10 @@ mod tests {
             Some(expected),
             "{status_body}"
         );
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            requests_starting(&requests.lock().unwrap(), "get /usage-status").len(),
+            1
+        );
     }
 
     /// A reading for a period that does not contain the present (last month's
@@ -1975,5 +2125,318 @@ mod tests {
         for (status_code, body, expected) in cases {
             assert_refused(status_code, body, expected).await;
         }
+    }
+
+    // ---- The X Subscription's shared weekly pool ----
+
+    /// The usage summary from CodexBar's `CursorSandUsageTests` (CodexBar
+    /// issue #4545),
+    /// captured from one Enterprise account on The X Subscription. Its monthly
+    /// plan reads 100% used even though the account's real limit is the
+    /// weekly pool below.
+    const X_SUBSCRIPTION_SUMMARY: &str = r#"{
+      "billingCycleStart": "2026-10-01T00:00:00.000Z",
+      "billingCycleEnd": "2026-11-01T00:00:00.000Z",
+      "membershipType": "enterprise",
+      "limitType": "team",
+      "isUnlimited": false,
+      "individualUsage": {
+        "plan": {
+          "enabled": true,
+          "used": 4615,
+          "limit": 4615,
+          "remaining": 0,
+          "breakdown": { "included": 4615, "bonus": 2288, "total": 6903 },
+          "autoPercentUsed": 62.860238353196095,
+          "apiPercentUsed": 0,
+          "totalPercentUsed": 100
+        },
+        "onDemand": { "enabled": true, "used": 447, "limit": null, "remaining": null }
+      },
+      "teamUsage": {
+        "onDemand": { "enabled": true, "used": 447, "limit": 0, "remaining": 0 }
+      }
+    }"#;
+
+    /// The reset the captured Sand reading states.
+    const CAPTURED_WEEKLY_RESET: &str = "2026-10-22T10:27:36.178Z";
+
+    /// The Sand usage status from the same capture. `is_unified: None` drops
+    /// the flag entirely; `next_reset` replaces the captured reset so tests
+    /// that go through the provider, which reads the wall clock, can state one
+    /// that is still in the future.
+    fn x_subscription_sand_status(is_unified: Option<bool>, next_reset: &str) -> String {
+        let flag = is_unified
+            .map(|value| format!("\n      \"isUnified\": {value},"))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+      "currentPeriodStart": "2026-10-15T10:27:36.178Z",
+      "nextResetTimestampUtc": "{next_reset}",
+      "usagePercent": 10.205850487540628,
+      "hasAvailableUsage": true,
+      "hasNonZeroIncludedLimit": true,
+      "onDemandSettings": {{
+        "visible": true,
+        "eligible": true,
+        "enabled": true,
+        "dashboardUrl": "https://cursor.com/dashboard/spending?for=redacted"
+      }},
+      "grokPlanLabel": "Grok Bot Plan",
+      "cursorPlanName": "Premium",{flag}
+      "billingBrand": "SAND_BILLING_BRAND_GROK",
+      "unifiedBillingUrl": "https://cursor.com/dashboard?tab=billing",
+      "unifiedUpsellButtons": [
+        {{ "label": "Buy Credits", "url": {{ "url": "https://cursor.com/dashboard?tab=billing" }} }}
+      ]
+    }}"#
+        )
+    }
+
+    /// The moment CodexBar's test evaluates the captured reading at.
+    fn capture_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-16T06:50:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// A weekly reset three days after the real present, in Cursor's format.
+    fn current_weekly_reset() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(3))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    /// The weekly window the captured reading describes, with `resets_at` as
+    /// given.
+    fn weekly_window(resets_at: &str) -> RateWindow {
+        RateWindow {
+            window_kind: None,
+            used_percent: 10.205850487540628,
+            raw_used_percent: None,
+            resets_at: Some(resets_at.to_string()),
+            window_minutes: Some(10_080),
+            used_count: None,
+            total_count: None,
+            regeneration: None,
+            breakdown: None,
+        }
+    }
+
+    /// The captured unified reading is a paid pool with a future reset, so it
+    /// is the shared weekly pool: about 10% used, seven days long, resetting
+    /// when Cursor says. The reply names no period, so no `window_kind`.
+    #[test]
+    fn the_captured_x_subscription_reading_is_the_shared_weekly_pool() {
+        let body = x_subscription_sand_status(Some(true), CAPTURED_WEEKLY_RESET);
+        assert_eq!(
+            shared_weekly_pool(body.as_bytes(), capture_now()),
+            Some(weekly_window(CAPTURED_WEEKLY_RESET))
+        );
+    }
+
+    /// Without `isUnified: true` the same reading is only the Grok Bot
+    /// allowance, never the account's pool.
+    #[test]
+    fn a_sand_reading_without_the_unified_flag_is_no_weekly_pool() {
+        for flag in [Some(false), None] {
+            let body = x_subscription_sand_status(flag, CAPTURED_WEEKLY_RESET);
+            assert_eq!(
+                shared_weekly_pool(body.as_bytes(), capture_now()),
+                None,
+                "a reading without the unified flag must not become the weekly pool: {flag:?}"
+            );
+        }
+    }
+
+    /// A unified reading still has to be a paid allowance with a percentage
+    /// and a reset that has not passed; a trial, a missing figure or a stale
+    /// reset leaves the monthly window in place.
+    #[test]
+    fn unified_readings_that_are_not_a_current_paid_pool_are_ignored() {
+        let unified = x_subscription_sand_status(Some(true), CAPTURED_WEEKLY_RESET);
+        let at = |body: String| shared_weekly_pool(body.as_bytes(), capture_now());
+        // The paid-allowance fields, alone and together (`includedLimitZero`
+        // is the newer field and wins), and a trial with no paid allowance.
+        let no_allowance = unified.replace("\"hasNonZeroIncludedLimit\": true,", "");
+        assert_eq!(at(no_allowance.clone()), None, "no allowance field");
+        assert_eq!(
+            at(no_allowance.replace(
+                "\"hasAvailableUsage\": true,",
+                "\"includedLimitZero\": false,"
+            )),
+            Some(weekly_window(CAPTURED_WEEKLY_RESET)),
+            "includedLimitZero: false alone is a paid allowance"
+        );
+        assert_eq!(
+            at(unified.replace(
+                "\"hasNonZeroIncludedLimit\": true,",
+                "\"hasNonZeroIncludedLimit\": true, \"includedLimitZero\": true,"
+            )),
+            None,
+            "includedLimitZero: true overrides hasNonZeroIncludedLimit"
+        );
+        assert_eq!(
+            at(unified.replace(
+                "\"hasNonZeroIncludedLimit\": true,",
+                "\"includedLimitZero\": true, \"sandTrialExpiresAt\": \"2026-10-30T00:00:00Z\","
+            )),
+            None,
+            "an unexpired trial is not a recurring weekly pool"
+        );
+        assert_eq!(
+            at(unified.replace("\"usagePercent\": 10.205850487540628,", "")),
+            None,
+            "no percentage"
+        );
+        // The reset: absent, unreadable, already passed (CodexBar's own two
+        // cases are the empty string and a 2020 date), and exactly now.
+        for reset in [
+            "",
+            "not-a-date",
+            "2020-01-01T00:00:00Z",
+            "2026-10-16T06:50:00Z",
+        ] {
+            assert_eq!(
+                at(x_subscription_sand_status(Some(true), reset)),
+                None,
+                "reset {reset:?}"
+            );
+        }
+        assert_eq!(
+            at(unified.replace(
+                &format!("\"nextResetTimestampUtc\": \"{CAPTURED_WEEKLY_RESET}\","),
+                ""
+            )),
+            None,
+            "no reset"
+        );
+        assert_eq!(at("not json".to_string()), None);
+        // A percentage past the ends is clamped like the plan's.
+        assert_eq!(
+            at(unified.replace("10.205850487540628", "140")).map(|window| window.used_percent),
+            Some(100.0)
+        );
+    }
+
+    /// Through the provider: an X Subscription account's weekly pool replaces
+    /// the stale 100% monthly window, read with one cookie-authenticated JSON
+    /// POST that carries the dashboard's origin. The account is not a unified
+    /// personal one, so it makes no monthly spend request and publishes no
+    /// on-demand pool.
+    #[tokio::test]
+    async fn an_x_subscription_account_publishes_the_weekly_pool_as_primary() {
+        let reset = current_weekly_reset();
+        let (base, requests) = serve_cursor_routes_with_sand(
+            X_SUBSCRIPTION_SUMMARY.to_string(),
+            200,
+            current_usage_status(),
+            200,
+            x_subscription_sand_status(Some(true), &reset),
+        )
+        .await;
+        let (provider, handle) = provider_against(&base);
+
+        let attempt = provider.fetch_handle(&handle).await;
+
+        let expected_reset = chrono::DateTime::parse_from_rfc3339(&reset)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        assert_eq!(
+            attempt.usage.as_ref().unwrap(),
+            &Usage {
+                primary: Some(weekly_window(&expected_reset)),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: None,
+            }
+        );
+        assert!(attempt.pools.is_none());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let sand = requests_starting(&requests, "post /sand-usage ");
+        assert_eq!(sand.len(), 1, "{requests:?}");
+        let sand = &sand[0];
+        for header in [
+            "accept: application/json",
+            "content-type: application/json",
+            "content-length: 2",
+            "origin: https://cursor.com",
+            "cookie: workoscursorsessiontoken=cursor-user%3a%3aheader.",
+        ] {
+            assert!(sand.contains(header), "missing {header}: {sand}");
+        }
+    }
+
+    /// Accounts the Sand reading does not flag as unified -- or whose Sand
+    /// read fails or is not a current paid pool -- publish exactly what they
+    /// published before that read existed, byte for byte, on both the captured
+    /// X Subscription summary and this module's existing summary fixtures.
+    #[tokio::test]
+    async fn an_account_without_the_unified_flag_keeps_its_monthly_window_byte_for_byte() {
+        let reset = current_weekly_reset();
+        let summaries = [
+            X_SUBSCRIPTION_SUMMARY.to_string(),
+            UNIFIED_SUMMARY.to_string(),
+            UNIFIED_SUMMARY.replace("unified_ultra", "pro"),
+        ];
+        let sand_replies = [
+            (200, x_subscription_sand_status(Some(false), &reset)),
+            (200, x_subscription_sand_status(None, &reset)),
+            (
+                200,
+                x_subscription_sand_status(Some(true), "2020-01-01T00:00:00Z"),
+            ),
+            (200, "not json".to_string()),
+            (500, x_subscription_sand_status(Some(true), &reset)),
+            (403, x_subscription_sand_status(Some(true), &reset)),
+        ];
+        for summary in &summaries {
+            let today =
+                serde_json::to_string(&normalize_usage(summary.as_bytes()).unwrap()).unwrap();
+            for (sand_code, sand_body) in &sand_replies {
+                let (base, _requests) = serve_cursor_routes_with_sand(
+                    summary.clone(),
+                    200,
+                    current_usage_status(),
+                    *sand_code,
+                    sand_body.clone(),
+                )
+                .await;
+                let (provider, handle) = provider_against(&base);
+
+                let attempt = provider.fetch_handle(&handle).await;
+
+                let published = serde_json::to_string(attempt.usage.as_ref().unwrap()).unwrap();
+                assert_eq!(
+                    published, today,
+                    "an account without the unified flag must keep today's monthly window: \
+                     Sand {sand_code} {sand_body}"
+                );
+            }
+        }
+        // Pinned literally as well, so the comparison cannot pass by both sides
+        // changing together: the captured summary's monthly window.
+        assert_eq!(
+            normalize_usage(X_SUBSCRIPTION_SUMMARY.as_bytes()).unwrap(),
+            Usage {
+                primary: Some(RateWindow {
+                    window_kind: None,
+                    used_percent: 100.0,
+                    raw_used_percent: None,
+                    resets_at: Some("2026-11-01T00:00:00Z".to_string()),
+                    window_minutes: Some(43200),
+                    used_count: None,
+                    total_count: None,
+                    regeneration: None,
+                    breakdown: None,
+                }),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: None,
+            }
+        );
     }
 }

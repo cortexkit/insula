@@ -1640,6 +1640,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "cursor-x-subscription-unified-flag"
+guards = "Only a Sand reading flagged isUnified replaces a Cursor account's monthly window with the shared weekly pool; every other account publishes its monthly window byte for byte"
+file = "crates/quota-core/src/cursor.rs"
+old = 'if status.is_unified != Some(true) {'
+new = 'if false { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/cursor.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["cursor::tests::a_sand_reading_without_the_unified_flag_is_no_weekly_pool", "cursor::tests::an_account_without_the_unified_flag_keeps_its_monthly_window_byte_for_byte"]
+expect_message = "without the unified flag must"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "antigravity-ordinary-title-stable"
 guards = "Pool-wide Antigravity buckets keep their plain pool-and-cadence titles byte for byte"
 file = "crates/quota-core/src/antigravity.rs"
@@ -1679,7 +1696,7 @@ build_timeout_s = 1800
 id = "cursor-on-demand-unified-gate"
 guards = "Only unified personal Cursor accounts make the extra monthly spend request"
 file = "crates/quota-core/src/cursor.rs"
-old = 'if !summary.unified_personal {'
+old = 'if !unified_personal {'
 new = 'if false { // NON-VACUITY BREAK'
 edits = []
 test_file = "crates/quota-core/src/cursor.rs"
@@ -1687,7 +1704,7 @@ runner = "cargo"
 package = "quota-core"
 target = "--lib"
 expect_red = ["cursor::tests::a_non_unified_account_makes_no_spend_request"]
-expect_message = "a non-unified account must make only the summary request"
+expect_message = "a non-unified account must make no spend request"
 only = false
 timeout_s = 600
 build_timeout_s = 1800

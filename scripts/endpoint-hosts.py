@@ -67,7 +67,13 @@ EXPECTED: dict[str, dict[str, str]] = {
     "codebuff": {"BASE_URL": "www.codebuff.com"},
     "codex": {"DEFAULT_BASE": "chatgpt.com"},
     "copilot": {"USAGE_URL": "api.github.com"},
-    "cursor": {"USAGE_URL": "cursor.com", "USAGE_STATUS_URL": "cursor.com"},
+    # The Sand (Grok Bot) usage-status endpoint is served from cursor.com, like
+    # the other two; it carries an X Subscription account's shared weekly pool.
+    "cursor": {
+        "USAGE_URL": "cursor.com",
+        "USAGE_STATUS_URL": "cursor.com",
+        "SAND_USAGE_URL": "cursor.com",
+    },
     "deepseek": {"BALANCE_URL": "api.deepseek.com"},
     "doubao": {
         "API_URL": "ark.cn-beijing.volces.com",
