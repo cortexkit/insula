@@ -83,7 +83,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "manus": {"CREDITS_URL": "api.manus.im"},
     "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
     "minimax": {"CHINA_API_BASE": "api.minimaxi.com", "GLOBAL_API_BASE": "api.minimax.io"},
-    "muse": {"KEY_URL": "api.meta.ai"},
+    "muse": {"KEY_URL": "api.meta.ai", "WEB_URL": "dev.meta.ai"},
     "neuralwatt": {"DEFAULT_BASE": "api.neuralwatt.com"},
     # Balance-only lane: this provider publishes no rate window, just a prepaid
     # credit pool, so its single constant is the credits endpoint rather than a

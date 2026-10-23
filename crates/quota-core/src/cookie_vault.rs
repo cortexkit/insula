@@ -106,6 +106,64 @@ impl CookieVault {
         Ok(deposit_lanes(self.deposits()?, self.family))
     }
 
+    /// Enrichment cookies never become scheduler lanes. Read their active rows
+    /// directly, retaining the usual suffixed-deposit precedence.
+    pub(crate) fn enrichment_deposits(&self) -> Vec<CredentialHandle> {
+        if self.credential_source.is_none() {
+            return Vec::new();
+        }
+        let rows = self
+            .handle_loader
+            .snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.state == "active"
+                            && row.credential_type == "cookie"
+                            && crate::vault_handles::handle_id_names_family(
+                                &row.credential_id,
+                                self.family,
+                            )
+                    })
+                    .map(|row| CredentialHandle::scoped(&row.credential_id, &row.credential_type))
+                    .collect()
+            })
+            .unwrap_or_default();
+        deposit_lanes(rows, self.family)
+    }
+
+    /// The vault record version returned with the cookie identifies which
+    /// deposited cookie's working lifetime is measured, even if the inventory
+    /// already lists a newer version.
+    pub(crate) async fn session_cookie_for(
+        &self,
+        handle: &CredentialHandle,
+        name: &str,
+    ) -> Option<(String, u64)> {
+        let source = self.credential_source.as_ref()?;
+        let mut credential = crate::credential_source::get_vault_credential(
+            source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        .ok()?;
+        let header = crate::credential_source::take_utf8_payload(&mut credential.payload).ok()?;
+        let jar = CookieJar::from_header(&header);
+        Some((
+            format!(
+                "{name}={}",
+                jar.cookies
+                    .iter()
+                    .find(|cookie| cookie.name == name && !cookie.value.is_empty())?
+                    .value
+            ),
+            credential.record_version,
+        ))
+    }
+
     /// The cookie header to fetch with, and the `source` label to publish.
     pub(crate) async fn cookie_for(
         &self,

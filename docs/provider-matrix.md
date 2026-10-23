@@ -40,7 +40,7 @@ on every operating system. The public wire semantics are in
 | `jetbrains` | IDE quota XML and `idea.log` | Local `options/AIAssistantQuotaManager2.xml` or newer same-installation quota log record (legacy AI Assistant, 262.x `JbaiQuota`/`JbaiQuotaRefill`, Junie/Air `quota_update`); no network call | Tariff quota window, stated refill duration; purchased top-up pool |
 | `kimi` | `KIMI_AUTH_TOKEN` / `kimi_auth_token`; JWT-derived headers and account identity when available | `POST https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages`; membership `GetSubscriptionStats` | Weekly / 5h plus optional monthly and Code 7-day extras |
 | `manus` | `MANUS_SESSION_TOKEN`, `MANUS_SESSION_ID`, `MANUS_COOKIE` | `POST https://api.manus.im/user.v1.UserService/GetAvailableCredits` | Refilling refresh allotment; resetless credit fields are not published as windows |
-| `muse` | `MUSE_DEVICE_TOKEN`, JSON at `MUSE_AUTH_PATH` or `~/.config/muse/auth.json`; vault `apikey:muse` | `POST https://api.meta.ai/muse-code/key` | 5h / weekly; Meta omits both while the 5h window is idle, and this module then serves 5h at 0% and the last weekly figure (0% once its reset passes) |
+| `muse` | `MUSE_DEVICE_TOKEN`, JSON at `MUSE_AUTH_PATH` or `~/.config/muse/auth.json`; vault `apikey:muse`; optional `cookie:dev.meta.ai` enrichment and `muse.team_id` | `POST https://api.meta.ai/muse-code/key`; optional `GET https://dev.meta.ai/api/portal/teams/{team_id}/subscription-quota` | 5h / weekly; idle mint responses use remembered usage first, otherwise verified team quota from the deposited session (see consumer contract) |
 
 ## API-key and signed-request providers
 

@@ -7,8 +7,9 @@
 //! - The answer states the plan (`subs_tier_name`), the login's email
 //!   (`user_email`), whether a subscription is active, whether billing is
 //!   incomplete, and `subs_usage` with the two windows.
-//! - Reference: CodexBar's `Sources/CodexBarCore/Resources/Plugins/muse.ts` and
-//!   `docs/muse.md` (main branch, read 2026-10-13).
+//! - Reference: CodexBar v0.79.0, `Sources/CodexBarCore/Resources/Plugins/muse.ts`
+//!   and `docs/muse.md` in https://github.com/steipete/CodexBar. Insula's lane
+//!   contract is documented in `docs/consumer-contract.md` in this repository.
 //!
 //! The same response also carries the account's inference key (`api_key`) and
 //! its `payment_method`. Neither is declared in [`KeyResponse`], so serde drops
@@ -27,6 +28,9 @@
 //! When the CLI keeps the token in the macOS Keychain the file holds only
 //! metadata, and this module does not read the Keychain: reading another
 //! program's Keychain item would prompt the user from a background daemon.
+//! An optional `cookie:dev.meta.ai` vault deposit and explicit `muse.team_id`
+//! can fill an idle response after a restart. They never create a usage lane;
+//! the mint response still identifies the account and plan.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -43,8 +47,11 @@ use crate::provider::{
 };
 use crate::vault_handles::VaultHandleLoader;
 
+mod web;
+
 pub const PROVIDER_NAME: &str = "muse";
 const KEY_URL: &str = "https://api.meta.ai/muse-code/key";
+const WEB_URL: &str = "https://dev.meta.ai";
 const TOKEN_ENV: &str = "MUSE_DEVICE_TOKEN";
 const AUTH_PATH_ENV: &str = "MUSE_AUTH_PATH";
 const DEVICE_TOKEN_PREFIX: &str = "dca:";
@@ -220,7 +227,7 @@ fn parse(body: &[u8]) -> Result<Reading, FetchError> {
 /// open window makes Meta send `subs_usage` again. So the last weekly figure is
 /// still the current one, until its own reset passes, after which it's 0% with
 /// the next reset unknown. With no earlier full reading (just after a restart)
-/// there's nothing to build from, and the caller reports a transient failure.
+/// there's nothing to build from, so the caller may try the deposited web session.
 fn idle_usage(last: &Usage, now: chrono::DateTime<chrono::Utc>) -> Option<Usage> {
     let short = last.primary.as_ref()?;
     let weekly = last.secondary.as_ref()?;
@@ -303,16 +310,19 @@ pub struct MuseProvider {
     /// Each account's last full reading, keyed by Meta's `user_email`, so an
     /// idle answer can be filled in (see [`idle_usage`]). Process memory only.
     last_full: std::sync::Mutex<std::collections::HashMap<String, Usage>>,
+    web: web::TeamQuota,
 }
 
 impl MuseProvider {
     pub(crate) fn new_with_handle_loader(
+        config: crate::config::LiveQuotaConfig,
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         Self {
             url: KEY_URL.to_string(),
             http: crate::http::provider_client(),
+            web: web::TeamQuota::new(config, credential_source.clone(), handle_loader.clone()),
             credential_source,
             handle_loader,
             env: default_env(),
@@ -447,13 +457,18 @@ impl MuseProvider {
                             let last = self.last_full.lock().ok()?.get(email).cloned()?;
                             idle_usage(&last, chrono::Utc::now())
                         });
+                        let idle = match idle {
+                            Some(idle) => Some(idle),
+                            None => self.web.fetch(email, reading.plan.as_deref()).await,
+                        };
                         let Some(idle) = idle else {
                             // Nothing to build from, so keep the last served
                             // reading (if any) with a transient class, rather
                             // than publish a weekly figure nobody sent.
                             let error = FetchError::Upstream(
                                 "Muse Code omitted usage, which Meta does while the 5-hour \
-                                 window is idle, and no earlier reading is held to fill it"
+                                 window is idle, and neither a remembered reading nor a verified \
+                                 dev.meta.ai team quota is available"
                                     .to_string(),
                             );
                             return (
@@ -592,8 +607,11 @@ mod tests {
     }
 
     fn provider(env: EnvLookup) -> MuseProvider {
-        let mut provider =
-            MuseProvider::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()));
+        let mut provider = MuseProvider::new_with_handle_loader(
+            crate::config::QuotaConfig::default().into(),
+            None,
+            Arc::new(VaultHandleLoader::default()),
+        );
         provider.env = env;
         provider
     }
@@ -972,7 +990,11 @@ mod tests {
             payload: payload.to_vec(),
             reports: Arc::clone(&reports),
         });
-        let mut provider = MuseProvider::new_with_handle_loader(Some(source), loader);
+        let mut provider = MuseProvider::new_with_handle_loader(
+            crate::config::QuotaConfig::default().into(),
+            Some(source),
+            loader,
+        );
         provider.env = env_with(&[]);
         (provider, reports)
     }

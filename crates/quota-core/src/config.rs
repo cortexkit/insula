@@ -30,6 +30,14 @@ pub const MAX_AUTO_USE_RESETS_SECS: u64 = 30 * 24 * 60 * 60;
 #[serde(default)]
 pub struct QuotaConfig {
     pub codex: CodexConfig,
+    pub muse: MuseConfig,
+}
+
+/// The team is an explicit choice: a web session can see several subscriptions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MuseConfig {
+    pub team_id: Option<String>,
 }
 
 /// Codex banked-reset policy.
@@ -117,6 +125,10 @@ impl LiveQuotaConfig {
         self.read().config.codex.clone()
     }
 
+    pub fn muse(&self) -> MuseConfig {
+        self.read().config.muse.clone()
+    }
+
     /// The config in force, when it was loaded, and any pending load error.
     pub fn status(&self) -> LiveConfigStatus {
         self.read().clone()
@@ -160,7 +172,10 @@ impl From<QuotaConfig> for LiveQuotaConfig {
 
 impl From<CodexConfig> for LiveQuotaConfig {
     fn from(codex: CodexConfig) -> Self {
-        Self::new(QuotaConfig { codex })
+        Self::new(QuotaConfig {
+            codex,
+            ..QuotaConfig::default()
+        })
     }
 }
 

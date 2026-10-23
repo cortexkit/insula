@@ -1889,6 +1889,7 @@ match. Capture tools take the URL from this table:
 | Deposit id | Provider(s) | Fetch URL |
 |---|---|---|
 | `cookie:claude.ai:<account>` | claude | `https://claude.ai/api/account` |
+| `cookie:dev.meta.ai:<account>` | muse | `https://dev.meta.ai/api/auth/me` |
 | `cookie:platform.claude.com:<account>` | claude-console | `https://platform.claude.com/api/organizations` |
 | `cookie:ollama.com:<account>` | ollama | `https://ollama.com/settings` |
 | `cookie:opencode.ai:<account>` | opencode, opencodego | `https://opencode.ai/console/api/go/status` |
@@ -1910,6 +1911,9 @@ match. Capture tools take the URL from this table:
 - **kimi.com**: not a lane. `kimi-for-coding` reads usage with its API key and
   uses the session's `kimi-auth` cookie only for two optional subscription
   extras.
+- **muse**: enrichment only, never another handle or row. Deposit `llama_dev_sess`
+  scoped to `/api` as `cookie:dev.meta.ai` or `cookie:dev.meta.ai:<account>`.
+  Insula reads no browser. See the Muse idle-window rules below.
 - **claude-console**: sign in at `https://platform.claude.com/login`, then
   capture the request header containing `sessionKey` against the organizations
   check URL above. The first API organization with readable billing is selected;
@@ -1934,6 +1938,63 @@ against the provider's source, and every cookie family against the table),
 Some facts a consumer needs are not stated by any upstream, so they are recorded
 here as observations rather than published as wire fields. A wire field would
 assert an upstream claim indefinitely; an observation here carries its method.
+
+### Muse: idle subscription windows
+
+Muse's `POST https://api.meta.ai/muse-code/key` omits `subs_usage` while the
+5-hour window is idle, even when weekly usage is nonzero. A remembered full
+reading for the mint response's `user_email` wins: 5h becomes 0% without a reset,
+and the weekly figure stays unchanged until its reset passes (then 0% without
+a known next reset). This memory is per process, not durable.
+
+Without a remembered reading, a deposited dev.meta.ai session can supply the
+quota for an explicitly selected team. Configure the optional string
+`muse.team_id` in the quota config, for example `{"muse":{"team_id":"424242424242"}}`.
+It reloads live on the same schedule as `codex.auto_use_resets`. No team is
+chosen automatically. When none is configured, a verified session's visible
+team IDs and names are logged once, and again only when that list changes.
+
+The web lane follows CodexBar v0.79.0:
+
+1. `GET https://dev.meta.ai/api/auth/me`, with only `llama_dev_sess` as the
+   credential. Its email must match the mint email case-insensitively.
+2. `GET /api/portal/teams`; the chosen team's ID must be visible.
+3. Only for a blank session email, use `userId` to find the member with the same
+   `user_id` in `/api/portal/teams/{team_id}/members` and match that member's email
+   to the mint email. When no selected team is visible, the first team may prove
+   identity for listing purposes, but is never chosen for quota. A members 403
+   ignores the session without expiring it.
+4. `GET /api/portal/teams/{team_id}/subscription-quota`; its `tier` must match
+   `subs_tier_name` from the mint response.
+
+Percentages are weighted used / limit, including decimal-string counts, capped
+at 100%. A missing 5h reset with zero usage, or a valid reset already passed,
+means 0% with no reset. As in the pinned source, zero usage with an explicitly
+future reset retains that reset. Malformed resets, nonzero usage without a
+reset, a weekly reset not in the future, zero/missing limits, or an invalid
+window duration withhold the entire web reading. The team is the user's choice;
+the responses do not prove that team's subscription belongs to the CLI login.
+
+The web lane is attempted at most once per Muse fetch, only when remembered
+usage cannot serve. It makes at most five requests across deposits, with an
+8-second timeout per request; it has no independent poll. Direct email matches
+are tried before blank-email sessions. Device tokens go only to api.meta.ai;
+cookies go only to dev.meta.ai, and redirects are not followed. A 401, a login
+redirect, or a non-members 403 expires the session locally and is logged on
+change (including the deposited-cookie lifetime after a successful reading).
+Cookie failures are never reported to the vault.
+
+If no lane can supply usage, the Muse row keeps the mint account identity and
+reports transient `upstream_failed`, rather than inventing weekly usage. The
+web lane also keeps the mint account identity; cookie deposits create no Muse
+rows of their own.
+
+**Proven by:** `web_email_team_and_tier_match_publish_windows_with_mint_identity`,
+`blank_email_is_bound_by_the_session_users_membership`,
+`email_mismatch_withholds_web_reading`, `tier_mismatch_withholds_web_reading`,
+`remembered_reading_wins_without_any_web_requests`,
+`web_never_receives_device_token`, `mint_never_receives_cookie`,
+`team_selection_reloads_on_the_existing_provider` (`muse/web_tests.rs`).
 
 **Anthropic five-hour windows reset at a boundary; they do not slide.** Polling
 one account repeatedly within an active window shows its `resetsAt` constant

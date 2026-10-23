@@ -11253,6 +11253,10 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
     .expect("docs/consumer-contract.md must be readable");
     let sources: std::collections::HashMap<&str, &str> = [
         ("claude", include_str!("claude_subscription.rs")),
+        (
+            "muse",
+            concat!(include_str!("muse.rs"), include_str!("muse/web.rs")),
+        ),
         ("claude-console", include_str!("claude_console.rs")),
         ("amp", include_str!("amp.rs")),
         ("cursor", include_str!("cursor.rs")),
