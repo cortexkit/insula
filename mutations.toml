@@ -1583,6 +1583,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "antigravity-versioned-group-title"
+guards = "A model-specific Antigravity bucket named after its own group (Gemini 4 Argon) is titled without repeating the group name or cadence"
+file = "crates/quota-core/src/antigravity.rs"
+old = 'model_specific_name(group.display_name.trim(), display_name, window_minutes)'
+new = 'display_name /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/quota-core/src/antigravity.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["antigravity::tests::a_versioned_gemini_group_title_does_not_repeat_its_name_or_cadence"]
+expect_message = "the Argon title must not repeat its group name or cadence"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "cursor-on-demand-unified-gate"
 guards = "Only unified personal Cursor accounts make the extra monthly spend request"
 file = "crates/quota-core/src/cursor.rs"
