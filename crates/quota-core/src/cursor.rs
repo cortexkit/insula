@@ -679,6 +679,7 @@ fn on_demand_pool(body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Result<Poo
         spendable: None,
         resets_at: Some(reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         expires_at: None,
+        unlimited: None,
     })
 }
 
@@ -1751,6 +1752,7 @@ mod tests {
                 spendable: None,
                 resets_at: Some("2026-11-01T00:00:00Z".to_string()),
                 expires_at: None,
+                unlimited: None,
             }
         );
     }

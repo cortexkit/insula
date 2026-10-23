@@ -283,6 +283,7 @@ mod pool_bound_tests {
             spendable: None,
             resets_at: None,
             expires_at: None,
+            unlimited: None,
         }]);
 
         let mut entries = [entry];

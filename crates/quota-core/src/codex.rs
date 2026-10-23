@@ -461,11 +461,10 @@ fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
         return Vec::new();
     }
 
-    // `unlimited` means the plan carries no credit cap. A pool with no ceiling
-    // is not a quantity, and publishing one with an absent remaining would read
-    // as "we could not determine it" rather than "there is no limit" -- so the
-    // pool is emitted with its balance and the spendable flag, and the absence
-    // of a total is the only honest statement about the ceiling.
+    // An absent `total` only says no ceiling was stated. `unlimited` carries
+    // wham's own statement that there is none (or that there is one), passed
+    // through as given, so a router can tell an uncapped workspace from one
+    // with an unstated balance.
     let remaining = details
         .balance
         .as_ref()
@@ -504,6 +503,7 @@ fn credit_pools(credits: Option<&CreditDetails>) -> Vec<Pool> {
         // The payload states no period for prepaid credit.
         resets_at: None,
         expires_at: None,
+        unlimited: details.unlimited,
     }]
 }
 
@@ -565,6 +565,7 @@ fn individual_limit_pool(spend_control: Option<&serde_json::Value>) -> Option<Po
             .and_then(serde_json::Value::as_i64)
             .and_then(crate::env::epoch_to_iso8601),
         expires_at: None,
+        unlimited: None,
     })
 }
 
@@ -603,6 +604,7 @@ fn unstated_individual_limit_pool() -> Pool {
         spendable: None,
         resets_at: None,
         expires_at: None,
+        unlimited: None,
     }
 }
 
@@ -2478,6 +2480,28 @@ mod credit_pool_tests {
         "credits": { "has_credits": true, "unlimited": false,
                      "overage_limit_reached": false, "balance": "24.02" }
     }"#;
+
+    /// The credits pool carries wham's `unlimited` exactly as stated: `true` and
+    /// `false` pass through, and an absent key stays absent rather than being
+    /// read as "finite".
+    #[test]
+    fn the_credits_pool_carries_unlimited_as_wham_states_it() {
+        let pool_for = |body: &str| {
+            let response: UsageResponse = serde_json::from_str(body).unwrap();
+            credit_pools(response.credits.as_ref())
+                .into_iter()
+                .find(|pool| pool.id == "credits")
+                .expect("has_credits is true, so a credits pool is published")
+        };
+        let base = std::str::from_utf8(WITH_CREDIT).unwrap();
+        assert_eq!(pool_for(base).unlimited, Some(false));
+        let unlimited = base.replacen(r#""unlimited": false"#, r#""unlimited": true"#, 1);
+        assert_ne!(base, unlimited);
+        assert_eq!(pool_for(&unlimited).unlimited, Some(true));
+        let unstated = base.replacen(r#""unlimited": false,"#, "", 1);
+        assert_ne!(base, unstated);
+        assert_eq!(pool_for(&unstated).unlimited, None);
+    }
 
     /// A key added to the live usage body is reported by name, and it is the
     /// only name the addition contributes. The key is unique to this test, so

@@ -530,6 +530,7 @@ fn wallet_pools(body: &[u8]) -> Result<Vec<Pool>, FetchError> {
             spendable: None,
             resets_at: None,
             expires_at: None,
+            unlimited: None,
         });
     };
 

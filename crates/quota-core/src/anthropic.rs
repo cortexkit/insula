@@ -344,6 +344,7 @@ fn overage_pool(
         spendable,
         resets_at: None,
         expires_at: None,
+        unlimited: None,
     }))
 }
 

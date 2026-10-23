@@ -93,6 +93,7 @@ fn pools_from(info: &BalanceInfo) -> Vec<Pool> {
             spendable: None,
             resets_at: None,
             expires_at: None,
+            unlimited: None,
         });
     };
 

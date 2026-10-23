@@ -137,6 +137,7 @@ fn normalize_pools(body: &[u8], now: DateTime<Utc>) -> Result<Vec<Pool>, FetchEr
                     at.with_timezone(&Utc)
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 }),
+                unlimited: None,
             };
             ranked.push((
                 if subscription {
@@ -165,6 +166,7 @@ fn normalize_pools(body: &[u8], now: DateTime<Utc>) -> Result<Vec<Pool>, FetchEr
                 spendable: None,
                 resets_at: None,
                 expires_at: None,
+                unlimited: None,
             },
         ));
     }

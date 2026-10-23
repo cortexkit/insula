@@ -745,6 +745,7 @@ fn top_up_pool(top_up: &SubQuota) -> Option<Pool> {
         // The top-up does not refill; `nextRefill` belongs to the tariff.
         resets_at: None,
         expires_at: None,
+        unlimited: None,
     })
 }
 

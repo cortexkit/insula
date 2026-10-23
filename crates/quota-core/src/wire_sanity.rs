@@ -930,6 +930,7 @@ mod tests {
             spendable: None,
             resets_at: None,
             expires_at: None,
+            unlimited: None,
         }
     }
 
@@ -1127,6 +1128,7 @@ mod tests {
             spendable: None,
             resets_at: None,
             expires_at: None,
+            unlimited: None,
         }]);
 
         entry.fetched_at = Some(stamped_at());

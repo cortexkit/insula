@@ -139,6 +139,7 @@ fn pool(id: &str, funding: PoolFunding, minor: i64, exponent: u8, unit: &str) ->
         spendable: Some(minor > 0),
         resets_at: None,
         expires_at: Some("2026-02-01T00:00:00Z".into()),
+        unlimited: None,
     }
 }
 
