@@ -19,7 +19,7 @@ id = "saved-reset-callosum-principal"
 guards = "A phone harness alone cannot authorize a saved reset without callosum attestation"
 file = "crates/quota-module/src/main.rs"
 old = 'matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "callosum")'
-new = '{ let _ = principal; true } /* NON-VACUITY BREAK */'
+new = '({ let _ = principal; true }) /* NON-VACUITY BREAK */'
 edits = []
 test_file = "crates/quota-module/src/usage_watch_tests/saved_reset_tests.rs"
 runner = "cargo"
