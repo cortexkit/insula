@@ -388,6 +388,23 @@ async fn remembered_reading_wins_without_any_web_requests() {
     assert_eq!(usage.secondary.unwrap().used_percent, 40.0);
 }
 
+/// A verified team reading is remembered, so the next idle answer is filled
+/// from memory instead of calling dev.meta.ai again on every poll.
+#[tokio::test]
+async fn a_web_reading_is_remembered_so_the_next_idle_answer_costs_no_web_request() {
+    let f = Fixture::new(Some(TEAM), vec![]).await;
+    assert!(f.fetch().await.usage.is_ok());
+    let after_first = f.web.paths().len();
+    assert_eq!(after_first, 3, "the first idle answer reads the team quota");
+    let usage = f.fetch().await.usage.unwrap();
+    assert_eq!(
+        f.web.paths().len(),
+        after_first,
+        "the second idle answer must come from memory"
+    );
+    assert!((usage.secondary.unwrap().used_percent - 15.07297103).abs() < 0.00001);
+}
+
 #[tokio::test]
 async fn idle_or_expired_five_hour_window_has_no_usage_or_reset() {
     for expired in [false, true] {
@@ -541,6 +558,9 @@ async fn served_cookie_lifetime_records_first_expiry_only() {
     );
     let expired = Server::new(|_| (401, "{}".into(), String::new())).await;
     f.provider.web.base = expired.base.clone();
+    // The first reading is remembered and would serve the next idle answers
+    // without touching dev.meta.ai; forget it so each fetch reaches the session.
+    f.provider.last_full.lock().unwrap().clear();
     f.withheld().await;
     f.withheld().await;
     assert_eq!(

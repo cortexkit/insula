@@ -459,7 +459,16 @@ impl MuseProvider {
                         });
                         let idle = match idle {
                             Some(idle) => Some(idle),
-                            None => self.web.fetch(email, reading.plan.as_deref()).await,
+                            None => {
+                                let web = self.web.fetch(email, reading.plan.as_deref()).await;
+                                // A verified team reading is a full reading: remember
+                                // it, so the next idle answer fills from memory
+                                // instead of calling dev.meta.ai again every minute.
+                                if let (Some(email), Some(usage)) = (email, web.as_ref()) {
+                                    self.remember(email, usage);
+                                }
+                                web
+                            }
                         };
                         let Some(idle) = idle else {
                             // Nothing to build from, so keep the last served
