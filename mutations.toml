@@ -1723,7 +1723,7 @@ id = "config-reload-unreadable-never-arms"
 guards = "A config file that cannot be read or parsed keeps the last good config and never arms Codex banked resets"
 file = "crates/quota-core/src/config.rs"
 old = 'FileRead::Failed(reason) => self.keep_last_good(reason, first),'
-new = 'FileRead::Failed(reason) => { if !self.live.codex().is_enabled() { self.live.apply(QuotaConfig { codex: CodexConfig { auto_use_resets: 3600 } }, Utc::now()); } self.keep_last_good(reason, first) } // NON-VACUITY BREAK'
+new = 'FileRead::Failed(reason) => { if !self.live.codex().is_enabled() { self.live.apply(QuotaConfig { codex: CodexConfig { auto_use_resets: 3600 }, ..QuotaConfig::default() }, Utc::now()); } self.keep_last_good(reason, first) } // NON-VACUITY BREAK'
 edits = []
 test_file = "crates/quota-core/src/tests.rs"
 runner = "cargo"
@@ -1754,9 +1754,9 @@ build_timeout_s = 1800
 
 [[control]]
 id = "muse-web-tier-binding"
-guards = "The selected team's subscription tier must match the Muse mint login"
+guards = "A configured team's subscription tier must match the Muse mint login"
 file = "crates/quota-core/src/muse/web.rs"
-old = 'if plan.is_none() || quota["tier"].as_str().map(str::trim) != plan {'
+old = 'if quota["tier"].as_str().map(str::trim) != Some(plan) {'
 new = 'if false { // NON-VACUITY BREAK'
 edits = []
 test_file = "crates/quota-core/src/muse/web_tests.rs"
@@ -1767,6 +1767,25 @@ expect_red = ["muse::web::tests::tier_mismatch_withholds_web_reading"]
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "muse-web-single-plan-match"
+guards = "With no team configured, a team is chosen only when exactly one visible team is on the login's plan"
+file = "crates/quota-core/src/muse/web.rs"
+old = "if !checked_all || matches.len() != 1 {"
+new = "if !checked_all || matches.is_empty() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/muse/web_tests.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["muse::web::tests::two_teams_on_the_logins_plan_serve_nothing_and_are_listed"]
+only = true
+timeout_s = 600
+build_timeout_s = 1800
+
+[control.select]
+tests = ["muse::web::tests::two_teams_on_the_logins_plan_serve_nothing_and_are_listed", "muse::web::tests::no_configured_team_uses_the_only_team_on_the_logins_plan"]
 
 [[control]]
 id = "muse-idle-memory-first"
