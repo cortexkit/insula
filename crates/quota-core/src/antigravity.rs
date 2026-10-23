@@ -1628,6 +1628,73 @@ struct ResolvedWindow {
     id: String,
 }
 
+/// The part of a model-specific bucket's `displayName` that its title adds.
+///
+/// The title is "{group} {name} {cadence}". A model with its own quota group,
+/// such as "Gemini 4 Argon" (bucket `gemini-argon-wtu-weekly`, displayName
+/// "Gemini 4 Argon Weekly Limit"), names the bucket after the group and the
+/// cadence again, so using the name verbatim gave "Gemini 4 Argon Gemini 4 Argon
+/// Weekly Limit weekly". Upstream (CodexBar v0.80.0, #4585) titles it "Gemini 4
+/// Argon weekly". So a leading copy of the group name is dropped (whole words,
+/// any letter case), and so is a trailing cadence phrase ("Weekly Limit",
+/// "5h limit remaining", ...) that says the same cadence the title already ends
+/// with.
+///
+/// The cadence phrase is dropped only when the window was classified with that
+/// cadence. A name that is nothing but a cadence phrase, with no group name in
+/// front, is kept whole: emptying it would title the bucket exactly like its
+/// pool-wide sibling ("Gemini Models weekly"), which is the confusion naming
+/// model-specific buckets exists to prevent.
+fn model_specific_name<'a>(
+    group_name: &str,
+    display_name: &'a str,
+    window_minutes: Option<i64>,
+) -> &'a str {
+    let mut name = display_name;
+    let mut dropped_group = false;
+    if !group_name.is_empty() {
+        if let (Some(head), Some(rest)) =
+            (name.get(..group_name.len()), name.get(group_name.len()..))
+        {
+            if head.eq_ignore_ascii_case(group_name)
+                && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            {
+                name = rest.trim_start();
+                dropped_group = true;
+            }
+        }
+    }
+    let aliases: &[&str] = match window_minutes {
+        Some(SESSION_WINDOW_MINUTES) => SESSION_CADENCE_ALIASES,
+        Some(WEEKLY_WINDOW_MINUTES) => &["weekly"],
+        _ => &[],
+    };
+    // Lower-casing and mapping `_`/`-` to spaces only rewrites single ASCII bytes,
+    // so a byte offset in `normalized` is the same offset in `name`.
+    let normalized = name.to_ascii_lowercase().replace(['_', '-'], " ");
+    for alias in aliases {
+        let alias = alias.replace('-', " ");
+        for phrase in [
+            format!("{alias} limit remaining"),
+            format!("{alias} limit"),
+            alias.clone(),
+        ] {
+            let Some(kept) = normalized.strip_suffix(phrase.as_str()) else {
+                continue;
+            };
+            if !(kept.is_empty() || kept.ends_with(char::is_whitespace)) {
+                continue;
+            }
+            let kept = name[..kept.len()].trim_end();
+            if kept.is_empty() && !dropped_group {
+                return name;
+            }
+            return kept;
+        }
+    }
+    name
+}
+
 fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWindow> {
     if bucket.disabled {
         return None;
@@ -1661,7 +1728,8 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
     };
     // A model-specific limit must not share its pool-wide sibling's title (see
     // `is_ordinary_bucket_id`), so it also names itself: by `displayName` when
-    // the server sent one, otherwise by its id. Ordinary buckets keep the plain
+    // the server sent one, less any group name and cadence the title already
+    // carries (see `model_specific_name`), otherwise by its id. Ordinary buckets keep the plain
     // "{pool} {cadence}" title that consumers already render for them.
     // An unclassified cadence is left as it was: its title already uses the
     // bucket's own `displayName` in place of the cadence, and when that name is
@@ -1671,7 +1739,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
         if display_name.is_empty() {
             bucket.bucket_id.trim()
         } else {
-            display_name
+            model_specific_name(group.display_name.trim(), display_name, window_minutes)
         }
     } else {
         ""
@@ -4096,6 +4164,119 @@ mod tests {
                 100.0
             );
             assert_no_unnamed_slot(&usage);
+        }
+    }
+
+    /// A versioned model with its own group keeps a clean title: "Gemini 4 Argon weekly".
+    ///
+    /// Upstream's fixture (CodexBar v0.80.0, #4585, `CLI report keeps a
+    /// model-specific Gemini group name` in
+    /// `Tests/CodexBarTests/AntigravityCLIUsageReportTests.swift`), recast from the
+    /// CLI report's field names (`name`, `id`, `remaining_fraction`, `reset_time`)
+    /// into the quota summary's (`displayName`, `bucketId`, `remainingFraction`,
+    /// `resetTime`). The Argon bucket is not a pool-wide id, so it is titled by its
+    /// `displayName`, which repeats both the group name and the cadence; using it
+    /// verbatim gave "Gemini 4 Argon Gemini 4 Argon Weekly Limit weekly". Upstream
+    /// expects "Gemini 4 Argon weekly" (its ordinary row reads "Gemini weekly",
+    /// where insula keeps the group name "Gemini Models"). Ids, figures and
+    /// cadence are unchanged.
+    #[test]
+    fn a_versioned_gemini_group_title_does_not_repeat_its_name_or_cadence() {
+        let body = r#"{"response":{"groups":[
+            {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining",
+                 "window":"weekly","remainingFraction":0.99}
+            ]},
+            {"displayName":"Gemini 4 Argon",
+             "description":"For paid Pro plans, Argon quota is separate.","buckets":[
+                {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit",
+                 "window":"weekly","remainingFraction":0.53,
+                 "resetTime":"2026-10-23T10:24:14Z"}
+            ]}
+        ]}}"#;
+        let usage = parse_quota_summary(body).unwrap();
+        let weekly = Some("weekly".to_string());
+        assert_eq!(
+            published_titles(&usage),
+            vec![
+                (
+                    "gemini-weekly".to_string(),
+                    "Gemini Models weekly".to_string(),
+                    weekly.clone()
+                ),
+                (
+                    "gemini-argon-wtu-weekly".to_string(),
+                    "Gemini 4 Argon weekly".to_string(),
+                    weekly.clone()
+                ),
+            ],
+            "the Argon title must not repeat its group name or cadence"
+        );
+        let argon = pool_window(&usage, "gemini-argon-wtu-weekly");
+        assert_eq!(argon.used_percent, 47.0);
+        assert_eq!(argon.window_minutes, Some(10080));
+        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 1.0);
+        assert_no_unnamed_slot(&usage);
+    }
+
+    /// What a model-specific bucket's `displayName` contributes to its title.
+    ///
+    /// The group name is dropped only as whole leading words, and a trailing
+    /// cadence phrase only when it matches the classified cadence. A name that is
+    /// only a cadence phrase is kept, so the bucket cannot end up titled exactly
+    /// like its pool-wide sibling.
+    #[test]
+    fn a_model_specific_name_drops_only_a_repeated_group_name_and_cadence() {
+        let weekly = Some(WEEKLY_WINDOW_MINUTES);
+        let five_hour = Some(SESSION_WINDOW_MINUTES);
+        for (group, name, minutes, expected) in [
+            ("Gemini 4 Argon", "Gemini 4 Argon Weekly Limit", weekly, ""),
+            (
+                "Gemini 4 Argon",
+                "gemini 4 argon weekly_limit remaining",
+                weekly,
+                "",
+            ),
+            (
+                "Gemini 4 Argon",
+                "Gemini 4 Argon Pro 5h Limit",
+                five_hour,
+                "Pro",
+            ),
+            (
+                "Gemini Models",
+                "Gemini 3 Pro Synthetic",
+                weekly,
+                "Gemini 3 Pro Synthetic",
+            ),
+            (
+                "Gemini Models",
+                "Gemini 3 Pro Synthetic Weekly Limit",
+                weekly,
+                "Gemini 3 Pro Synthetic",
+            ),
+            // A different cadence is not a repetition.
+            (
+                "Gemini 4 Argon",
+                "Gemini 4 Argon Weekly Limit",
+                five_hour,
+                "Weekly Limit",
+            ),
+            // "Argonaut" is not the word "Argon".
+            (
+                "Gemini 4 Argon",
+                "Gemini 4 Argonaut",
+                weekly,
+                "Gemini 4 Argonaut",
+            ),
+            // Only a cadence, no group name: kept whole.
+            ("Gemini Models", "Weekly Limit", weekly, "Weekly Limit"),
+        ] {
+            assert_eq!(
+                model_specific_name(group, name, minutes),
+                expected,
+                "group {group:?}, name {name:?}, minutes {minutes:?}"
+            );
         }
     }
 
