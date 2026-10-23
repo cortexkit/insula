@@ -1,0 +1,4 @@
+# Test vectors are pinned by SHA256SUMS, so their bytes must survive checkout
+# unchanged. Without this, Git on Windows rewrites line endings in README.md
+# and SHA256SUMS, and both the drift test and a consumer's checksum fail.
+test-vectors/** -text
