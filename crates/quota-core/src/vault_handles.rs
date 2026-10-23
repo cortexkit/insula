@@ -58,6 +58,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // hosts and are read by different providers.
     ("apikey:vercel", "vercel"),
     ("apikey:vercel-budget", "vercel-budget"),
+    // A Soniox organization API key. Project keys cannot read organization
+    // billing, so a project key deposited here reads as credential_rejected.
+    ("apikey:soniox", "soniox"),
 ];
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
@@ -99,6 +102,7 @@ enum ProviderKind {
     Muse,
     Vercel,
     VercelBudget,
+    Soniox,
 }
 
 #[derive(Clone, Default)]
@@ -492,6 +496,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::VercelBudget)
     }
 
+    pub fn soniox_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Soniox)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -592,6 +600,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "muse" => Some(ProviderKind::Muse),
         "vercel" => Some(ProviderKind::Vercel),
         "vercel-budget" => Some(ProviderKind::VercelBudget),
+        "soniox" => Some(ProviderKind::Soniox),
         _ => None,
     }
 }

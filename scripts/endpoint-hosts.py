@@ -109,6 +109,7 @@ EXPECTED: dict[str, dict[str, str]] = {
         "TEAM_REFERER_URL": "home.qwencloud.com",
     },
     "sakana": {"BILLING_URL": "console.sakana.ai"},
+    "soniox": {"API_BASE": "api.soniox.com"},
     "stepfun": {"API_URL": "platform.stepfun.com"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},
     # Both Vercel origins live in vercel.rs. The gateway key goes only to the

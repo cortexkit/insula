@@ -64,6 +64,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:dev.meta.ai` | `muse` (idle-window enrichment only; `llama_dev_sess`) |
 | `apikey:vercel` | `vercel` (the AI Gateway key) |
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
+| `apikey:soniox` | `soniox` (an organization API key) |
 
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
@@ -143,6 +144,7 @@ provider's source state it.
 | `opencodego` | | `OPENCODE_API_KEY` |
 | `openrouter` | OpenCode's `openrouter` entry | |
 | `sakana` | | `SAKANA_COOKIE` |
+| `soniox` | | `SONIOX_ORG_API_KEY` (an organization key; `SONIOX_API_KEY`, a project key, is not read) |
 | `stepfun` | | `STEPFUN_TOKEN` |
 | `sub2api` | | `SUB2API_API_KEY`, `SUB2API_BASE_URL` |
 | `synthetic` | | `SYNTHETIC_API_KEY` |

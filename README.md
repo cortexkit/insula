@@ -40,8 +40,10 @@ commands.
 
 ## Providers
 
-The [provider matrix](docs/provider-matrix.md) lists all 41 registered providers.
+The [provider matrix](docs/provider-matrix.md) lists all 42 registered providers.
 Balance-only providers include `deepseek`, `openrouter`, `vercel`, and `claude-console`.
+`soniox` publishes an organization's prepaid balance beside a monthly budget
+window, read with a Soniox organization API key.
 `claude-console` reads a Console organization's subscription, purchased, and
 promotional API credit from a `cookie:platform.claude.com:<account>` vault deposit
 captured by Cerebellum; several accounts can be deposited separately. It never
