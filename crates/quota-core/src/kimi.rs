@@ -3,7 +3,9 @@
 //! POST `BillingService/GetUsages` with Bearer + `kimi-auth` cookie and the
 //! browser-style client fingerprint CodexBar sends. Weekly quota → `primary`,
 //! first 5h rate limit → `secondary`; a best-effort `GetSubscriptionStats` POST
-//! adds the monthly and Code 7-day windows to `extra_rate_windows`.
+//! adds the monthly and Code 7-day windows to `extra_rate_windows`. A lapsed
+//! Code plan, whose GetUsages reply has no FEATURE_CODING usage, publishes
+//! those membership windows alone; with none of them it is a decode error.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! `KIMI_AUTH_TOKEN` on this machine. Endpoint, headers, body, and response
@@ -44,7 +46,10 @@ const RATE_LIMIT_WINDOW_MINUTES: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct KimiUsageResponse {
-    usages: Vec<KimiUsage>,
+    /// Absent (or null) once a Code plan has lapsed: GetUsages then answers
+    /// with only a `totalQuota` object and no Code usage pools. Upstream does
+    /// not read `totalQuota` either, so neither does this.
+    usages: Option<Vec<KimiUsage>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,18 +266,26 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
     })
 }
 
-/// Normalize GetUsages JSON to [`Usage`]. Pure — unit-testable.
-pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+/// Normalize GetUsages JSON to the Code plan's weekly and rate-limit windows.
+/// Pure — unit-testable.
+///
+/// `Ok(None)` means the reply carries no FEATURE_CODING usage: `usages` is
+/// absent, null, or lists only other scopes. A lapsed Code plan answers this
+/// way, so it is not an error on its own; [`publishable_usage`] decides once
+/// the membership windows are known. A body of the wrong shape is still a
+/// decode error.
+fn normalize_coding_usage(body: &[u8]) -> Result<Option<Usage>, FetchError> {
     let response: KimiUsageResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("kimi usages not decodable: {e}")))?;
 
-    let coding = response
+    let Some(coding) = response
         .usages
         .into_iter()
+        .flatten()
         .find(|u| u.scope == "FEATURE_CODING")
-        .ok_or_else(|| {
-            FetchError::Decode("FEATURE_CODING scope not found in response".to_string())
-        })?;
+    else {
+        return Ok(None);
+    };
 
     let primary = detail_to_window(&coding.detail, None);
     let secondary = coding
@@ -281,12 +294,46 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .and_then(|limits| limits.first())
         .and_then(|rl| detail_to_window(&rl.detail, Some(RATE_LIMIT_WINDOW_MINUTES)));
 
-    Ok(Usage {
+    Ok(Some(Usage {
         primary,
         secondary,
         tertiary: None,
         extra_rate_windows: None,
-    })
+    }))
+}
+
+/// Join the Code plan windows from GetUsages with the membership windows from
+/// GetSubscriptionStats (the monthly balance and the Code 7-day limit).
+///
+/// A lapsed Code plan has no FEATURE_CODING usage but can still have a live
+/// membership quota, so it publishes the membership windows alone. The weekly
+/// and rate-limit slots stay empty: there is no reading for them, and filling
+/// them with 0% would claim a fresh quota the account does not have. With no
+/// Code usage and no membership window there is nothing to publish, and the
+/// reply stays the scope error it has always been. This is CodexBar's rule
+/// (`KimiUsageFetcher.fetchUsage`, v0.80.0).
+fn publishable_usage(
+    coding: Option<Usage>,
+    membership: Option<Vec<ExtraWindow>>,
+) -> Result<Usage, FetchError> {
+    let membership = membership.filter(|windows| !windows.is_empty());
+    match coding {
+        Some(mut usage) => {
+            usage.extra_rate_windows = membership;
+            Ok(usage)
+        }
+        None => match membership {
+            Some(windows) => Ok(Usage {
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: Some(windows),
+            }),
+            None => Err(FetchError::Decode(
+                "FEATURE_CODING scope not found in response".to_string(),
+            )),
+        },
+    }
 }
 
 fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<ExtraWindow> {
@@ -462,11 +509,13 @@ impl UsageProvider for KimiProvider {
             let response = web_request(USAGE_URL, body, &auth_token, session.as_ref())
                 .send(&self.http)
                 .await?;
-            let mut usage = normalize_usage(&response)?;
+            let coding = normalize_coding_usage(&response)?;
 
             // Subscription data is optional enrichment: a failed request or malformed
             // response must not discard the already-normalized GetUsages windows.
-            if let Ok(response) = web_request(
+            // When GetUsages had no Code usage (a lapsed plan), these windows are
+            // all that can be published.
+            let membership = match web_request(
                 SUBSCRIPTION_STATS_URL,
                 b"{}".to_vec(),
                 &auth_token,
@@ -475,11 +524,11 @@ impl UsageProvider for KimiProvider {
             .send(&self.http)
             .await
             {
-                if let Ok(extra_rate_windows) = normalize_subscription_stats(&response) {
-                    usage.extra_rate_windows = extra_rate_windows;
-                }
-            }
+                Ok(response) => normalize_subscription_stats(&response).unwrap_or(None),
+                Err(_) => None,
+            };
 
+            let usage = publishable_usage(coding, membership)?;
             Ok(web_entry(usage, session.as_ref()))
         }
         .await;
@@ -490,6 +539,96 @@ impl UsageProvider for KimiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GetUsages alone, as published when GetSubscriptionStats yields nothing.
+    fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+        publishable_usage(normalize_coding_usage(body)?, None)
+    }
+
+    /// CodexBar's lapsed-plan GetUsages reply (`KimiLapsedSubscriptionTests`,
+    /// v0.80.0): after a paid Code plan lapses, GetUsages answers with only a
+    /// `totalQuota` object and no `usages` at all.
+    const LAPSED_USAGE_JSON: &[u8] =
+        br#"{"totalQuota":{"limit":"100","used":"36","remaining":"64"}}"#;
+
+    /// The GetSubscriptionStats reply from the same upstream test: a live
+    /// membership balance with nothing used yet.
+    const LAPSED_STATS_JSON: &[u8] = br#"{"subscriptionBalance":{"feature":"FEATURE_OMNI","type":"SUBSCRIPTION","unit":"UNIT_CREDIT",
+    "amountUsedRatio":0,"expireTime":"2026-11-22T00:00:00Z"}}"#;
+
+    fn lapsed_usage(stats: &[u8]) -> Result<Usage, FetchError> {
+        publishable_usage(
+            normalize_coding_usage(LAPSED_USAGE_JSON)?,
+            normalize_subscription_stats(stats)?,
+        )
+    }
+
+    #[test]
+    fn decodes_usage_response_without_code_usage_pools() {
+        assert!(normalize_coding_usage(LAPSED_USAGE_JSON).unwrap().is_none());
+        assert!(normalize_coding_usage(br#"{"usages":null}"#)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The lapsed plan publishes its membership balance, and nothing in the
+    /// weekly or rate-limit slots: there is no Code reading to put there.
+    #[test]
+    fn lapsed_web_session_still_shows_the_membership_balance() {
+        let usage = lapsed_usage(LAPSED_STATS_JSON).expect("lapsed plan must publish membership");
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+        let windows = usage.extra_rate_windows.expect("membership windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id.as_deref(), Some("kimi-monthly"));
+        let monthly = windows[0].window.as_ref().unwrap();
+        assert_eq!(monthly.used_percent, 0.0);
+        assert_eq!(monthly.resets_at.as_deref(), Some("2026-11-22T00:00:00Z"));
+    }
+
+    #[test]
+    fn lapsed_web_session_without_membership_balances_keeps_the_scope_error() {
+        let err = lapsed_usage(b"{}").unwrap_err();
+        assert!(
+            matches!(&err, FetchError::Decode(message) if message == "FEATURE_CODING scope not found in response"),
+            "{err:?}"
+        );
+    }
+
+    /// Upstream treats a `usages` list without FEATURE_CODING exactly like an
+    /// absent one: membership windows publish, and only their absence errors
+    /// (`missing_feature_coding_scope_is_decode_error`).
+    #[test]
+    fn usages_without_feature_coding_publish_the_membership_windows() {
+        let body = br#"{ "usages": [{ "scope": "OTHER", "detail": { "limit": "1" } }] }"#;
+        let usage = publishable_usage(
+            normalize_coding_usage(body).unwrap(),
+            normalize_subscription_stats(&subscription_fixture(true)).unwrap(),
+        )
+        .expect("membership windows must publish without Code usage");
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+        let ids: Vec<_> = usage
+            .extra_rate_windows
+            .unwrap()
+            .into_iter()
+            .map(|window| window.id.unwrap())
+            .collect();
+        assert_eq!(ids, ["kimi-monthly", "kimi-code-7d"]);
+    }
+
+    /// A live Code plan keeps its own windows and gains the membership ones.
+    #[test]
+    fn coding_usage_carries_membership_windows_alongside() {
+        let usage = publishable_usage(
+            normalize_coding_usage(&fixture_body()).unwrap(),
+            normalize_subscription_stats(&subscription_fixture(false)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 25.0);
+        assert_eq!(usage.secondary.unwrap().used_percent, 20.0);
+        assert_eq!(usage.extra_rate_windows.unwrap().len(), 1);
+    }
 
     fn fixture_body() -> Vec<u8> {
         serde_json::to_vec(&json!({
