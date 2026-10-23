@@ -6,6 +6,8 @@ use std::time::Duration;
 use subc_protocol::{AdmissionClass, FLAG_SUBSCRIPTION};
 use tokio::{io::DuplexStream, sync::oneshot, task::JoinHandle};
 
+mod quota_wire_vectors;
+
 const DEADLINE: Duration = Duration::from_secs(2);
 
 struct Wire {
