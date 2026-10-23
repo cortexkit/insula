@@ -475,6 +475,19 @@ pub trait UsageProvider: Send + Sync {
     /// Resolve and fetch one credential handle.
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt;
 
+    /// Redeem only through the selected account's credential lane. Providers
+    /// without saved resets never perform a mutation through this hook.
+    async fn use_saved_reset(
+        &self,
+        _handle: &CredentialHandle,
+        _account_id: &str,
+        _request_id: &str,
+    ) -> crate::codex_resets::SavedResetResult {
+        crate::codex_resets::SavedResetResult::before_post(
+            crate::codex_resets::SavedResetError::UnsupportedProvider,
+        )
+    }
+
     /// Whether this provider authenticates with a web session cookie, which it
     /// reads from a `cookie:<domain>` vault deposit.
     fn is_cookie_based(&self) -> bool {

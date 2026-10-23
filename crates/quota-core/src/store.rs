@@ -391,6 +391,22 @@ impl SlotStore {
             .collect()
     }
 
+    /// Refresh every lane for the redeemed identity, not only the chosen handle:
+    /// a duplicate lane must not keep serving its pre-reset credit count.
+    pub(crate) fn mark_account_due(&mut self, provider: &str, account_id: &str, now: Instant) {
+        for (key, slot) in &mut self.slots {
+            if key.provider == provider
+                && slot
+                    .observation
+                    .as_ref()
+                    .and_then(|o| o.account_id.as_deref())
+                    == Some(account_id)
+            {
+                slot.next_due_at = now;
+            }
+        }
+    }
+
     /// Reserve an ordered attempt for an active incarnation. Concurrent attempts
     /// may overlap, but only the newest reservation is allowed to publish.
     pub fn admit(

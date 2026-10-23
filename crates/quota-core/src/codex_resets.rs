@@ -459,6 +459,40 @@ pub struct RedemptionRecord {
     pub attempt_count: u32,
     pub status: JournalStatus,
     pub outcome: Option<ConsumeOutcome>,
+    /// Client ids must remain replayable after the automatic retention horizon.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualReservation {
+    Pending,
+    Resolved(ConsumeOutcome),
+    RecentlyReset(DateTime<Utc>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedResetError {
+    UnsupportedProvider,
+    UnknownAccount,
+    RecentlyReset(DateTime<Utc>),
+    ProviderRefused(String),
+    ProviderUnavailable(String),
+}
+
+#[derive(Debug)]
+pub struct SavedResetResult {
+    pub result: Result<ConsumeOutcome, SavedResetError>,
+    pub consume_attempted: bool,
+}
+
+impl SavedResetResult {
+    pub fn before_post(error: SavedResetError) -> Self {
+        Self {
+            result: Err(error),
+            consume_attempted: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,9 +822,10 @@ impl RedemptionJournal {
         }
 
         let mut records = self.load()?;
-        // THE PROVIDER-WIDE FLOOR, checked here because every redemption passes
-        // this point before its POST, whatever triggered it and whatever the
-        // policy above decided. Deliberately written against the raw records
+        // THE AUTOMATION'S PROVIDER-WIDE FLOOR, checked here because every
+        // automatic redemption passes this point before its POST, whatever the
+        // trigger policy decided. Manual reservations bypass this floor but
+        // still count in the records below. Written against the raw records
         // rather than reusing `recent_elsewhere` or anything else the policy
         // reads: a bug shared with the cross-account fence would open both at
         // once, and this exists to hold when that fence does not.
@@ -826,12 +861,67 @@ impl RedemptionJournal {
             attempt_count: 0,
             status: JournalStatus::Pending,
             outcome: None,
+            manual: false,
         });
         self.save(&records)?;
         eprintln!(
             "{LOG_TAG} codex reset journal reserve account_id={account_id} redeem_request_id={id}"
         );
         Ok(Reservation::New(id))
+    }
+
+    /// Manual intent bypasses automation's sibling-headroom policy and
+    /// provider-wide ten-minute floor, but still obeys the account's durable
+    /// thirty-minute spend bound and reuses the supplied request id on retry.
+    pub fn reserve_manual(
+        &self,
+        account_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ManualReservation, JournalError> {
+        let mut records = self.load()?;
+        if let Some(record) = records.iter_mut().find(|record| {
+            record.account_id == account_id && record.redeem_request_id == request_id
+        }) {
+            let reservation = match record.status {
+                JournalStatus::Pending => ManualReservation::Pending,
+                JournalStatus::Resolved => ManualReservation::Resolved(
+                    record
+                        .outcome
+                        .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?,
+                ),
+            };
+            // A phone can resume an automatic pending redemption too. Preserve
+            // its result for subsequent phone retries instead of pruning it.
+            record.manual = true;
+            self.save(&records)?;
+            return Ok(reservation);
+        }
+        let mut latest = None;
+        for record in records
+            .iter()
+            .filter(|record| record.account_id == account_id)
+        {
+            let at = parse_record_latest_time(record)?;
+            if now.signed_duration_since(at).num_seconds() < SPEND_BOUND_SECS {
+                latest = Some(latest.map_or(at, |last: DateTime<Utc>| last.max(at)));
+            }
+        }
+        if let Some(at) = latest {
+            return Ok(ManualReservation::RecentlyReset(at));
+        }
+        records.push(RedemptionRecord {
+            account_id: account_id.to_owned(),
+            redeem_request_id: request_id.to_owned(),
+            created_at: now.to_rfc3339(),
+            last_attempt_at: None,
+            attempt_count: 0,
+            status: JournalStatus::Pending,
+            outcome: None,
+            manual: true,
+        });
+        self.save(&records)?;
+        Ok(ManualReservation::Pending)
     }
 
     /// Persist attempt metadata immediately before sending a consume POST.
@@ -1010,6 +1100,10 @@ fn prune_records(
     for record in records.drain(..) {
         let latest = parse_record_latest_time(&record)?;
         let age = now.signed_duration_since(latest).num_seconds();
+        if record.manual {
+            keep.push(record);
+            continue;
+        }
         if record.status == JournalStatus::Resolved && age > RESOLVED_RETENTION_SECS {
             continue;
         }
@@ -1283,6 +1377,15 @@ pub trait ResetTransport: Send + Sync {
         request: &ResetRequest,
         redeem_request_id: &str,
     ) -> Result<Vec<u8>, FetchError>;
+
+    /// Manual replies distinguish a provider refusal from a retryable 5xx.
+    async fn consume_manual(
+        &self,
+        request: &ResetRequest,
+        redeem_request_id: &str,
+    ) -> Result<Vec<u8>, FetchError> {
+        self.consume(request, redeem_request_id).await
+    }
 }
 
 /// Production reset endpoint transport.
@@ -1293,6 +1396,31 @@ pub struct ReqwestResetTransport {
 impl ReqwestResetTransport {
     pub fn new(http: reqwest::Client) -> Self {
         Self { http }
+    }
+
+    async fn consume_request(
+        &self,
+        request: &ResetRequest,
+        redeem_request_id: &str,
+        preserve_status: bool,
+    ) -> Result<Vec<u8>, FetchError> {
+        let body = serde_json::to_vec(&serde_json::json!({"redeem_request_id": redeem_request_id}))
+            .map_err(|error| FetchError::Decode(format!("encoding consume request: {error}")))?;
+        let mut http_request =
+            JsonRequest::post_json(endpoint(&request.base_url, CONSUME_PATH), body)
+                .timeout(CONSUME_TIMEOUT)
+                .bearer(&request.bearer);
+        for header in reset_headers(request) {
+            http_request = http_request.header(header);
+        }
+        if preserve_status {
+            http_request
+                .send_provider_status_first(&self.http, "codex")
+                .await
+                .map(|response| response.body)
+        } else {
+            http_request.send(&self.http).await
+        }
     }
 }
 
@@ -1339,25 +1467,16 @@ impl ResetTransport for ReqwestResetTransport {
         request: &ResetRequest,
         redeem_request_id: &str,
     ) -> Result<Vec<u8>, FetchError> {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "redeem_request_id": redeem_request_id
-        }))
-        .map_err(|error| FetchError::Decode(format!("encoding consume request: {error}")))?;
-        let mut http_request =
-            JsonRequest::post_json(endpoint(&request.base_url, CONSUME_PATH), body)
-                .timeout(CONSUME_TIMEOUT)
-                .bearer(&request.bearer);
-        for header in reset_headers(request) {
-            http_request = http_request.header(header);
-        }
-        if request.auth_failure.is_some() {
-            http_request
-                .send_provider_status_first(&self.http, "codex")
-                .await
-                .map(|response| response.body)
-        } else {
-            http_request.send(&self.http).await
-        }
+        self.consume_request(request, redeem_request_id, request.auth_failure.is_some())
+            .await
+    }
+
+    async fn consume_manual(
+        &self,
+        request: &ResetRequest,
+        redeem_request_id: &str,
+    ) -> Result<Vec<u8>, FetchError> {
+        self.consume_request(request, redeem_request_id, true).await
     }
 }
 
@@ -1859,6 +1978,118 @@ impl ResetCoordinator {
         &self.journal
     }
 
+    /// A completed retry needs no live credential or provider availability.
+    pub fn saved_reset_outcome(
+        &self,
+        account_id: &str,
+        request_id: &str,
+    ) -> Result<Option<ConsumeOutcome>, JournalError> {
+        let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
+        let outcome = self
+            .journal
+            .records()?
+            .iter()
+            .find(|record| {
+                record.account_id == account_id
+                    && record.redeem_request_id == request_id
+                    && record.status == JournalStatus::Resolved
+            })
+            .and_then(|record| record.outcome);
+        if outcome.is_some() {
+            self.journal
+                .reserve_manual(account_id, request_id, Utc::now())?;
+        }
+        Ok(outcome)
+    }
+
+    /// The journal lock is shared with automatic ticks, including when automatic
+    /// spending is disabled. No provider policy can replace the durable fence.
+    pub async fn use_saved_reset(
+        &self,
+        account_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+        transport: &dyn ResetTransport,
+        request: &ResetRequest,
+        timeout: Duration,
+    ) -> SavedResetResult {
+        let unavailable =
+            |error: JournalError| SavedResetError::ProviderUnavailable(error.to_string());
+        let reserved = {
+            let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
+            self.journal
+                .reserve_manual(account_id, request_id, now)
+                .and_then(|reservation| {
+                    if reservation == ManualReservation::Pending {
+                        self.journal.record_attempt(account_id, request_id, now)?;
+                    }
+                    Ok(reservation)
+                })
+        };
+        match reserved {
+            Ok(ManualReservation::Resolved(outcome)) => {
+                return SavedResetResult {
+                    result: Ok(outcome),
+                    consume_attempted: false,
+                }
+            }
+            Ok(ManualReservation::RecentlyReset(at)) => {
+                return SavedResetResult::before_post(SavedResetError::RecentlyReset(at))
+            }
+            Err(error) => return SavedResetResult::before_post(unavailable(error)),
+            Ok(ManualReservation::Pending) => {}
+        }
+        let result = match tokio::time::timeout(
+            timeout,
+            transport.consume_manual(request, request_id),
+        )
+        .await
+        {
+            Ok(Ok(body)) => normalize_consume_response(&body)
+                .map_err(|_| SavedResetError::ProviderRefused(crate::http::refusal_excerpt(&body))),
+            Ok(Err(error)) => {
+                request.report_auth_failure(&error);
+                match error {
+                    FetchError::ProviderStatus(status, excerpt) if status < 500 => {
+                        Err(SavedResetError::ProviderRefused(excerpt))
+                    }
+                    FetchError::Unauthorized(excerpt) => {
+                        Err(SavedResetError::ProviderRefused(excerpt))
+                    }
+                    error => Err(SavedResetError::ProviderUnavailable(error.to_string())),
+                }
+            }
+            Err(_) => Err(SavedResetError::ProviderUnavailable(
+                "consume timed out".into(),
+            )),
+        };
+        let result = result.and_then(|outcome| {
+            let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
+            // Concurrent retries use the same upstream id. The first resolution
+            // wins locally too, so a late already_redeemed cannot replace reset.
+            match self
+                .journal
+                .reserve_manual(account_id, request_id, now)
+                .map_err(unavailable)?
+            {
+                ManualReservation::Resolved(stored) => Ok(stored),
+                ManualReservation::Pending => {
+                    self.journal
+                        .resolve(account_id, request_id, outcome)
+                        .map_err(unavailable)?;
+                    Ok(outcome)
+                }
+                ManualReservation::RecentlyReset(_) => {
+                    unreachable!("the reserved id remains in the journal")
+                }
+            }
+        });
+        SavedResetResult {
+            result,
+            consume_attempted: true,
+        }
+    }
+
     fn account_mutation(&self, account_id: &str) -> Arc<AccountMutation> {
         self.accounts
             .lock()
@@ -2238,6 +2469,9 @@ impl ResetCoordinator {
             });
     }
 }
+
+#[cfg(test)]
+mod saved_reset_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2773,6 +3007,7 @@ mod tests {
     /// A pending record, the state whose loss costs money.
     fn pending_record(account: &str, request: &str) -> RedemptionRecord {
         RedemptionRecord {
+            manual: false,
             account_id: account.to_string(),
             redeem_request_id: request.to_string(),
             created_at: "2026-08-20T12:00:00+00:00".to_string(),

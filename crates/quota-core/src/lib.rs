@@ -925,6 +925,48 @@ impl Registry {
         self.usage_snapshot(provider_filter).await.entries
     }
 
+    pub async fn use_saved_reset(
+        &self,
+        provider: &str,
+        account: &str,
+        request_id: &str,
+    ) -> Result<codex_resets::ConsumeOutcome, codex_resets::SavedResetError> {
+        use codex_resets::SavedResetError;
+        if provider != "codex" {
+            return Err(SavedResetError::UnsupportedProvider);
+        }
+        let fetcher = self
+            .providers
+            .iter()
+            .find(|p| p.name == provider)
+            .ok_or(SavedResetError::UnknownAccount)?;
+        let selected = {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slots = store.snapshot();
+            slots.sort_by(|(a, _), (b, _)| stable_handle_key(a).cmp(&stable_handle_key(b)));
+            slots.into_iter().find_map(|(key, slot)| {
+                if key.provider != provider || slot.label_in_flux {
+                    return None;
+                }
+                let entry = slot.entry.as_ref()?;
+                let id = slot.observation.as_ref()?.account_id.as_ref()?;
+                (entry.account.as_deref() == Some(account)).then(|| (key, id.clone()))
+            })
+        };
+        let (key, id) = selected.ok_or(SavedResetError::UnknownAccount)?;
+        let result = fetcher
+            .fetcher
+            .use_saved_reset(&key.handle, &id, request_id)
+            .await;
+        if result.consume_attempted {
+            self.store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mark_account_due(provider, &id, scheduler_now());
+        }
+        result.result
+    }
+
     /// Serve usage together with the providers whose account set is complete.
     ///
     /// The completeness claim is built by the SAME walk that emits the entries,
