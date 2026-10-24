@@ -875,6 +875,11 @@ limit the provider named without a readable figure. A consumer that ignores
 - **`soniox`** publishes one `primary` window for an organization's monthly
   budget, only when the budget is positive; see
   [7.14](#soniox-an-organizations-prepaid-balance-and-monthly-budget).
+- **`chatbox`** publishes one `primary` window for a usable Chatbox AI plan,
+  with the stated next refresh as `resetsAt` only when it is still ahead and
+  before the license ends, and neither `windowMinutes` nor `windowKind`; its
+  other allowances are pools. See
+  [7.15](#chatbox-a-licenses-plan-window-and-its-separate-credit-pools).
 
 **Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
 `a_page_with_monthly_and_session_blocks_publishes_both`,
@@ -1420,6 +1425,101 @@ prepaid organization with a budget publishes:
 `malformed_billing_is_decode_failed_rather_than_zero_usage`,
 `each_status_maps_to_its_class_and_only_a_vault_401_is_reported`,
 `a_vault_deposit_routes_to_soniox_and_replaces_the_environment_lane`.
+
+<a id="chatbox-a-licenses-plan-window-and-its-separate-credit-pools"></a>
+
+### 7.15 `chatbox`: a license's plan window and its separate credit pools
+
+`chatbox` reads one answer with a Chatbox AI license key (`apikey:chatbox` or
+`CHATBOX_LICENSE_KEY`), sent only to `api.chatboxai.app` as the whole
+`Authorization` header, with no `Bearer` prefix:
+`GET /api/license/detail/realtime`. An active plan with rewards, a top-up
+and image generations publishes:
+
+```json
+"usage": {
+  "primary": { "usedPercent": 20.0, "resetsAt": "2026-11-01T00:00:00Z",
+               "usedCount": 200.0, "totalCount": 1000.0 }
+},
+"accountInfo": { "planType": "Chatbox AI Pro",
+                 "subscriptionEndsAt": "2027-01-01T00:00:00Z" },
+"spend": [
+  { "id": "aggregated_reward", "label": "Credits",
+    "funding": "granted", "basis": "derived",
+    "total":     { "minor": 500, "exponent": 0, "unit": "chatbox-compute-point" },
+    "remaining": { "minor": 400, "exponent": 0, "unit": "chatbox-compute-point" } },
+  { "id": "expansion_pack", "label": "Top-up credits",
+    "funding": "purchased", "basis": "derived",
+    "total":     { "minor": 400, "exponent": 0, "unit": "chatbox-compute-point" },
+    "remaining": { "minor": 350, "exponent": 0, "unit": "chatbox-compute-point" } },
+  { "id": "image", "label": "Image Generation",
+    "funding": "unknown", "basis": "derived",
+    "total":     { "minor": 20, "exponent": 0, "unit": "chatbox-image" },
+    "remaining": { "minor": 17, "exponent": 0, "unit": "chatbox-image" } }
+]
+```
+
+- **The window is the plan, and only the plan.** `primary` is the single
+  `type: "plan"` item of `unified_token_usage_details`, `token_usage /
+  token_limit × 100`, clamped to 0-100, with both counts. It is published only
+  while the plan is usable: `status` absent or `active`, the license not
+  expired, and a positive limit. A trial, an expired, disabled, refunded or
+  unrecognised plan, or a zero plan limit publishes no window.
+- **The reset is conditional.** `resetsAt` is `token_next_refresh_time` only
+  when it is in the future and before the license ends. Otherwise the window
+  has no `resetsAt`. Chatbox states when the plan refreshes but never how
+  often, so there is no `windowMinutes` and no `windowKind`, even when the
+  refreshes happen to be a month apart.
+- **The license's end is not a reset.** `token_expire_time` (else
+  `expires_at`) is published as `accountInfo.subscriptionEndsAt`, even when it
+  is already past. Nothing refills at that time. `planType` is the license's
+  `name`.
+- **Everything else is a pool, and no pool carries a reset.** These are
+  allowances that do not refill with the plan, counted in Chatbox's compute
+  points or in images, never money. `basis` is `derived`, because Chatbox
+  states a limit and a used figure, and `remaining` is the limit minus the used
+  figure, never below zero:
+  - `aggregated_reward` (Credits, `funding: granted`): the
+    `aggregated_reward_details` counters, or when that object is absent, the
+    sum of the non-plan detail items that have not expired.
+  - `expansion_pack` (Top-up credits, `funding: purchased`). Upstream shows it
+    as a second meter. It is a pool here because it has no period.
+  - `image` (Image Generation, `funding: unknown`).
+  - `unified_token` (Quota, `funding: unknown`): the combined
+    `unified_token_usage` / `unified_token_limit`, published only when the
+    answer has no plan item (an older answer). The combined counters already
+    include the plan and the rewards, so they are never published beside a plan
+    and never add to it. Beside `aggregated_reward` they overlap: do not sum the
+    two.
+- A pool whose used figure and limit are both zero is not published. With no
+  window and no pool left (an expired plan and nothing else, or every
+  allowance at zero) the entry is `no_quota_reported`, not a rejected key.
+- There is no account: the license key's answer names none.
+- No key is `credential_absent`; a blank deposit is `credential_unusable`. A
+  key that Chatbox's client would never send (whitespace or control characters,
+  or more than 4096 UTF-16 code units) is `credential_unusable` and is not sent. 401
+  and 403 are `credential_rejected`, and only a 401 on a vault key is reported
+  to the vault. 429 and 5xx are `upstream_failed` and keep the last reading
+  served; any other status (a 409 conflict, say) is `upstream_failed` too.
+  Refusal bodies are never quoted. An answer that is not a JSON object with a
+  `data` object, carries an `error`, has a counter that is not a non-negative
+  whole number up to 2^53 − 1, has a second `type: "plan"` item after one
+  with readable counters, or states no counter at all is
+  `decode_failed`, never a zero.
+- Timestamps without a zone offset are read as absent, so a reset never
+  depends on the host's time zone.
+- Tested against fixtures from upstream CodexBar v0.81.0, not against a live
+  Chatbox license.
+
+**Proven by:** `the_fixture_publishes_the_plan_window_and_each_credit_pool_apart`,
+`no_pool_ever_carries_the_plan_reset`,
+`the_plan_and_the_combined_total_are_never_added_together`,
+`trials_and_the_legacy_total_never_invent_a_recurring_plan`,
+`expired_disabled_and_unknown_plans_keep_their_pools_without_a_window`,
+`an_expired_plan_with_nothing_else_is_no_quota_reported`,
+`malformed_answers_are_decode_failed_without_echoing_them`,
+`each_status_maps_to_its_class_and_only_a_vault_401_is_reported`,
+`a_vault_deposit_replaces_the_environment_lane`.
 
 <a id="fields-on-the-account-not-the-window"></a>
 
