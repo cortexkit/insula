@@ -556,8 +556,8 @@ mod tests {
             let error = attempt.usage.unwrap_err();
             assert_eq!(error.error_class(), class, "HTTP {status}: {error:?}");
             // 429 and 5xx keep the last reading served while they last.
-            // Other refusals (404 here) take whatever the shared
-            // `upstream_failed` class gives them, so they are not pinned.
+            // A 404 is checked only for its `upstream_failed` class; whether it
+            // is retried is the shared policy's choice, so it is not asserted.
             if status == 429 || status >= 500 {
                 assert_eq!(
                     crate::refresh::classify(&error),
