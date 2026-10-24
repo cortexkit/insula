@@ -1723,6 +1723,20 @@ fn classify_error_frame(body: &[u8], route: &RouteErrorSink<'_>) -> ClientFailur
         Some(codes::TARGET_UNAVAILABLE | codes::MODULE_TIMEOUT | "backend_error") => {
             ClientFailure::Transport
         }
+        // ck-bus's transient refusals to issue a bus credential, relayed by the
+        // daemon. ck-bus issues nothing while it can't read the module's
+        // credential census (broker down, census stream missing, no reply in 5 s),
+        // so a retry with backoff while serving on the current credential is the
+        // whole remedy. Documented in subconscious docs/ck-bus.md; ck-bus has no
+        // published client crate, so the strings are matched as written there.
+        // Without this arm, a bus outage logs an "unclassified" warning on every
+        // retry for as long as it lasts.
+        Some(
+            "ckbus_census_unavailable"
+            | "ckbus_not_ready"
+            | "ckbus_spawn_snapshot_unavailable"
+            | "ckbus_signing_failed",
+        ) => ClientFailure::Transport,
         _ => {
             // The code sits beside the class wherever the VAULT sends one, so it
             // is read from the same object rather than defaulted -- otherwise a
@@ -2807,6 +2821,21 @@ mod tests {
             "these daemon error codes reach the fallthrough rather than a named arm, \
              so this client is guessing at their retry policy: {unclassified:?}"
         );
+
+        // ck-bus's documented transient issuance refusals are named too, so a
+        // bus outage reads as one in the log, not as an unknown daemon code.
+        for code in [
+            "ckbus_census_unavailable",
+            "ckbus_not_ready",
+            "ckbus_spawn_snapshot_unavailable",
+            "ckbus_signing_failed",
+        ] {
+            assert_eq!(
+                classify(code),
+                ClientFailure::Transport,
+                "ck-bus refusal {code} must be a transient transport failure"
+            );
+        }
 
         // THE CONTROL, and it is what keeps the filter above from being vacuous.
         // The filter looks for codes landing on `UnknownRouteCode`; if the
