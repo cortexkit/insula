@@ -171,7 +171,13 @@ fn text(value: Option<&Value>) -> Option<String> {
     let cleaned: String = value?
         .as_str()?
         .chars()
-        .map(|c| if (c as u32) < 32 || c as u32 == 127 { ' ' } else { c })
+        .map(|c| {
+            if (c as u32) < 32 || c as u32 == 127 {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed: String = cleaned.trim().chars().take(MAX_TEXT_CHARS).collect();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -187,10 +193,13 @@ fn date(value: Option<&Value>) -> Option<DateTime<Utc>> {
     let text = value?.as_str()?;
     let bytes = text.as_bytes();
     let shaped = bytes.len() > 10
-        && bytes[..10]
-            .iter()
-            .enumerate()
-            .all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() })
+        && bytes[..10].iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
         && bytes[10] == b'T';
     if !shaped {
         return None;
@@ -311,28 +320,26 @@ fn parse(body: &[u8], now: DateTime<Utc>) -> Result<Reading, FetchError> {
     let usable = (status.is_none() || status.as_deref() == Some("active"))
         && expires.is_none_or(|at| at > now);
 
-    let primary = plan
-        .filter(|plan| usable && plan.limit > 0)
-        .map(|plan| {
-            // The next refresh is a reset only while it is still ahead and
-            // comes before the license ends; a refresh after the end never
-            // happens.
-            let resets_at = next
-                .filter(|at| *at > now && expires.is_none_or(|end| *at < end))
-                .and_then(iso);
-            RateWindow {
-                used_percent: (plan.used as f64 / plan.limit as f64 * 100.0).clamp(0.0, 100.0),
-                raw_used_percent: None,
-                resets_at,
-                // Chatbox states when the plan refreshes, never how often.
-                window_minutes: None,
-                window_kind: None,
-                used_count: Some(plan.used as f64),
-                total_count: Some(plan.limit as f64),
-                regeneration: None,
-                breakdown: None,
-            }
-        });
+    let primary = plan.filter(|plan| usable && plan.limit > 0).map(|plan| {
+        // The next refresh is a reset only while it is still ahead and
+        // comes before the license ends; a refresh after the end never
+        // happens.
+        let resets_at = next
+            .filter(|at| *at > now && expires.is_none_or(|end| *at < end))
+            .and_then(iso);
+        RateWindow {
+            used_percent: (plan.used as f64 / plan.limit as f64 * 100.0).clamp(0.0, 100.0),
+            raw_used_percent: None,
+            resets_at,
+            // Chatbox states when the plan refreshes, never how often.
+            window_minutes: None,
+            window_kind: None,
+            used_count: Some(plan.used as f64),
+            total_count: Some(plan.limit as f64),
+            regeneration: None,
+            breakdown: None,
+        }
+    });
 
     let mut pools = Vec::new();
     // The combined total includes the plan, so it stands in only when no plan
@@ -756,7 +763,10 @@ mod tests {
         let mut free = data();
         free.insert("plan".into(), "free".into());
         free.remove("token_expire_time");
-        free.insert("token_next_refresh_time".into(), "2026-10-21T16:00:00Z".into());
+        free.insert(
+            "token_next_refresh_time".into(),
+            "2026-10-21T16:00:00Z".into(),
+        );
         let mut legacy = data();
         legacy.remove("unified_token_usage_details");
         for body in [FIXTURE.to_string(), body(free), body(legacy)] {
@@ -788,7 +798,10 @@ mod tests {
         let mut data = data();
         data.insert("plan".into(), "free".into());
         data.remove("token_expire_time");
-        data.insert("token_next_refresh_time".into(), "2026-10-21T16:00:00Z".into());
+        data.insert(
+            "token_next_refresh_time".into(),
+            "2026-10-21T16:00:00Z".into(),
+        );
         let reading = read(&body(data)).unwrap();
         let window = reading.usage.primary.unwrap();
         assert_eq!(window.resets_at.as_deref(), Some("2026-10-21T16:00:00Z"));
@@ -863,7 +876,11 @@ mod tests {
         assert!(reading.usage.primary.is_none());
         assert!(find(&reading.pools, "expansion_pack").is_some());
         assert_eq!(
-            reading.account_info.unwrap().subscription_ends_at.as_deref(),
+            reading
+                .account_info
+                .unwrap()
+                .subscription_ends_at
+                .as_deref(),
             Some("2026-10-19T00:00:00Z")
         );
     }
@@ -1000,8 +1017,7 @@ mod tests {
             (503, "upstream_failed", false),
         ] {
             let (base, requests) = chatbox(status, "private-response-key").await;
-            let (source, reports) =
-                MockSource::serving(&[("apikey:chatbox", credential(KEY, 11))]);
+            let (source, reports) = MockSource::serving(&[("apikey:chatbox", credential(KEY, 11))]);
             let provider = provider(
                 Some(source),
                 Arc::new(VaultHandleLoader::default()),
