@@ -64,6 +64,7 @@ EXPECTED: dict[str, dict[str, str]] = {
         "REMOTE_QUOTA_URL": "cloudcode-pa.googleapis.com",
         "LOAD_CODE_ASSIST_URL": "cloudcode-pa.googleapis.com",
     },
+    "chatbox": {"API_BASE": "api.chatboxai.app"},
     "codebuff": {"BASE_URL": "www.codebuff.com"},
     "codex": {"DEFAULT_BASE": "chatgpt.com"},
     "copilot": {"USAGE_URL": "api.github.com"},

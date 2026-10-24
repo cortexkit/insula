@@ -15,6 +15,7 @@ pub mod amp;
 pub mod anthropic;
 pub mod antigravity;
 pub mod call_observations;
+pub mod chatbox;
 pub mod claude_console;
 mod claude_subscription;
 pub mod clinepass;
@@ -789,6 +790,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(soniox::SonioxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(chatbox::ChatboxProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
