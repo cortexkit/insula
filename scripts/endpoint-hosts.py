@@ -119,6 +119,15 @@ EXPECTED: dict[str, dict[str, str]] = {
     "soniox": {"API_BASE": "api.soniox.com"},
     "stepfun": {"API_URL": "platform.stepfun.com"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},
+    # The session cookie and the exchanged token go only to the API host. The
+    # dashboard origin is sent as the Origin and Referer header values, never
+    # as a request target.
+    "traecn": {
+        "TOKEN_URL": "api.trae.cn",
+        "ENTITLEMENT_URL": "api.trae.cn",
+        "ORIGIN_URL": "www.trae.cn",
+        "REFERER_URL": "www.trae.cn",
+    },
     # Both Vercel origins live in vercel.rs. The gateway key goes only to the
     # first, read by `vercel`; the budget access token goes only to the second,
     # read by `vercel-budget` (vercel_budget.rs holds no origin of its own).

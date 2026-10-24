@@ -1,6 +1,6 @@
 # Provider matrix
 
-43 providers registered.
+44 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -85,3 +85,4 @@ on every operating system. The public wire semantics are in
 | `qoder` | Vault `cookie:qoder.com` | `GET https://qoder.com/api/v2/me/usages/big_model_credits` | Combined base/shared primary quota; duration unstated |
 | `qwen-cloud` | Vault `cookie:qwencloud.com` | Personal plan gateway at `https://cs-data.qwencloud.com/data/api.json`; Team inventory/seat calls at `https://home.qwencloud.com` | Personal 5h / weekly / monthly; Team seat quota |
 | `sakana` | `SAKANA_COOKIE` environment request header | `GET https://console.sakana.ai/billing` | 5h / weekly subscription cards |
+| `traecn` | Vault `cookie:trae.cn` (parent-domain session or a header captured on `api.trae.cn`) | `POST https://api.trae.cn/cloudide/api/v3/common/GetUserToken`, then `/trae/api/v2/pay/user_current_entitlement_list` with the exchanged token | Derived credit pool (total and remaining across all packs); plan label; no rate window, reset or renewal. Tested against upstream fixtures only |

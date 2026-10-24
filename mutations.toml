@@ -1996,3 +1996,42 @@ expect_message = "an abliteration deposit must replace the environment lane"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "traecn-session-only-to-api-origin"
+guards = "The Trae CN session cookie is imported from the parent domain trae.cn but is sent only to api.trae.cn, never to trae.cn itself"
+file = "crates/quota-core/src/traecn.rs"
+old = 'const TOKEN_URL: &str = "https://api.trae.cn/cloudide/api/v3/common/GetUserToken";'
+new = 'const TOKEN_URL: &str = "https://trae.cn/cloudide/api/v3/common/GetUserToken"; // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/quota-core/src/traecn.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["traecn::tests::the_session_and_token_reach_only_the_api_origin"]
+expect_message = "api.trae.cn"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "traecn::"
+
+[[control]]
+id = "traecn-api-failure-is-transient"
+guards = "A Trae CN API failure (rate limit, outage, other status) stays a transient upstream_failed and is never reported as a rejected session"
+file = "crates/quota-core/src/traecn.rs"
+old = "    if status != 200 {"
+new = '''    if status != 200 { return Err(FetchError::Unauthorized(format!("traecn HTTP {status}"))); } // NON-VACUITY BREAK
+    if status != 200 {'''
+edits = []
+test_file = "crates/quota-core/src/traecn.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["traecn::tests::api_failures_stay_transient_and_distinct_from_session_rejection"]
+expect_message = "upstream_failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+[control.select]
+filter = "traecn::"
