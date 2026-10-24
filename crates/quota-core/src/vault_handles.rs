@@ -61,6 +61,8 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // A Soniox organization API key. Project keys cannot read organization
     // billing, so a project key deposited here reads as credential_rejected.
     ("apikey:soniox", "soniox"),
+    // An abliteration.ai API key, which reads the account's USD credits.
+    ("apikey:abliteration", "abliteration"),
 ];
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
@@ -103,6 +105,7 @@ enum ProviderKind {
     Vercel,
     VercelBudget,
     Soniox,
+    Abliteration,
 }
 
 #[derive(Clone, Default)]
@@ -500,6 +503,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Soniox)
     }
 
+    pub fn abliteration_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Abliteration)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -601,6 +608,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "vercel" => Some(ProviderKind::Vercel),
         "vercel-budget" => Some(ProviderKind::VercelBudget),
         "soniox" => Some(ProviderKind::Soniox),
+        "abliteration" => Some(ProviderKind::Abliteration),
         _ => None,
     }
 }

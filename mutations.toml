@@ -1962,3 +1962,37 @@ expect_message = "a soniox deposit must replace the environment lane"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "abliteration-remaining-clamp"
+guards = "An overspent or zero-credit abliteration.ai account publishes 0 remaining, never a negative balance"
+file = "crates/quota-core/src/abliteration.rs"
+old = "minor: (total.minor - used.minor).max(0),"
+new = "minor: total.minor - used.minor, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/abliteration.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["abliteration::tests::zero_usage_overspending_and_zero_credits_keep_honest_amounts"]
+expect_message = "an overspent account must read as nothing left"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "abliteration-vault-replaces-env"
+guards = "An abliteration.ai apikey deposit replaces the ABLITERATION_API_KEY lane, so the vault key is the one sent and no second identity-less row appears"
+file = "crates/quota-core/src/abliteration.rs"
+old = "return Ok(vault);"
+new = "let _ = vault; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/abliteration.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["abliteration::tests::a_vault_deposit_routes_to_abliteration_and_replaces_the_environment_lane", "abliteration::tests::the_vault_key_is_sent_and_the_environment_key_is_not"]
+expect_message = "an abliteration deposit must replace the environment lane"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

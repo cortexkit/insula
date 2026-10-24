@@ -65,6 +65,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:vercel` | `vercel` (the AI Gateway key) |
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 | `apikey:soniox` | `soniox` (an organization API key) |
+| `apikey:abliteration` | `abliteration` (an abliteration.ai API key) |
 
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
@@ -122,6 +123,7 @@ provider's source state it.
 
 | Provider | Local file | Environment |
 |---|---|---|
+| `abliteration` | | `ABLITERATION_API_KEY` |
 | `alibaba` | | `ALIBABA_CODING_PLAN_API_KEY`, `ALIBABA_QWEN_API_KEY`, `DASHSCOPE_API_KEY` |
 | `antigravity` | the running editor or `agy` CLI (loopback); the opencode antigravity-auth plugin's sidebar file | `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE` |
 | `claude` | OpenCode's `anthropic` OAuth entry | |
