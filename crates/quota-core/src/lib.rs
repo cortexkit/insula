@@ -70,6 +70,7 @@ pub mod sub2api;
 mod subprocess;
 pub mod synthetic;
 pub mod text;
+pub mod traecn;
 pub mod unread_keys;
 pub mod vault_handles;
 pub mod vercel;
@@ -789,6 +790,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(soniox::SonioxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(traecn::TraeCnProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

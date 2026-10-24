@@ -52,6 +52,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:qoder.com` | `qoder` |
 | `cookie:factory.ai` | `factory` |
 | `cookie:langdock.com` | `langdock` |
+| `cookie:trae.cn` | `traecn` |
 | `cookie:xiaomimimo.com` | `mimo` |
 | `cookie:ollama.com`, `apikey:ollama-cloud` | `ollama` |
 | `cookie:opencode.ai` | `opencode` and `opencodego` |
@@ -156,8 +157,8 @@ provider's source state it.
 | `zai` | | `Z_AI_API_KEY` |
 | `zenmux` | | `ZENMUX_MANAGEMENT_API_KEY` |
 
-The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `qoder`
-and `qwen-cloud` have no local lane: without a vault deposit they are not
+The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `qoder`,
+`qwen-cloud` and `traecn` have no local lane: without a vault deposit they are not
 configured. Endpoint and region overrides are listed in
 [`provider-matrix.md`](provider-matrix.md).
 

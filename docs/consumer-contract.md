@@ -2048,6 +2048,7 @@ match. Capture tools take the URL from this table:
 | `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
 | `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
 | `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
+| `cookie:trae.cn:<account>` | traecn | `https://api.trae.cn/cloudide/api/v3/common/GetUserToken` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 
 - **claude**: enrichment only, never a usage lane. Use the same account suffix
@@ -2069,7 +2070,17 @@ match. Capture tools take the URL from this table:
   this login lacks billing access, not that its session needs re-capturing.
 - The login page can be any page where the user signs in; for factory it is
   `app.factory.ai` while the fetch is on `api.factory.ai`.
-- Langdock and the claude.ai capture URL are fixture-verified only.
+- **traecn**: sign in at `https://www.trae.cn/dashboard`, then capture the
+  request header against the token-exchange URL above. The session cookies
+  (`sessionid` in upstream's fixtures) are set on the parent domain `.trae.cn`,
+  so a header captured for that URL carries them; a header copied by hand from
+  a dashboard request to `api.trae.cn` works the same way. No cookie name is
+  required: every cookie in the deposit is sent, to `api.trae.cn` only. The
+  second call, `https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list`,
+  sends the same header plus a token exchanged from it for that refresh only.
+  A 401, 403, redirect, or in-band `code: 1001` means re-capture the login;
+  any other failure is transient.
+- Langdock, Trae CN and the claude.ai capture URL are fixture-verified only.
 
 insula logs a deposit's first rejection after it has served, with its age
 (`deposited cookie ... first rejected after working <h>h<mm>m`): the site's

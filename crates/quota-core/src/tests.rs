@@ -1721,6 +1721,23 @@ async fn langdock_is_registered_as_cookie_based_without_a_guessed_catalog_slug()
     assert_eq!(entries[0].api_provider, None);
 }
 
+/// models.dev has no Trae provider, so no catalog slug is published for it.
+#[tokio::test]
+async fn traecn_is_registered_as_cookie_based_without_a_guessed_catalog_slug() {
+    let defaults = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    assert!(defaults.provider_names().contains(&"traecn"));
+    assert!(defaults.cookie_based_provider_names().contains(&"traecn"));
+    assert_eq!(
+        crate::vault_handles::cookie_family_for("traecn"),
+        Some("cookie:trae.cn")
+    );
+    let registry = registry(&[("traecn", true, true)]);
+    tick(&registry).await;
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].api_provider, None);
+}
+
 #[test]
 fn langdock_replacement_changes_the_single_deposit_and_two_deposits_are_refused() {
     let registry = Registry::with_defaults(
@@ -2029,6 +2046,7 @@ fn every_cookie_provider_publishes_the_vault_source_label() {
         ("opencodego", include_str!("opencodego.rs")),
         ("qoder", include_str!("qoder.rs")),
         ("qwen_cloud", include_str!("qwen_cloud.rs")),
+        ("traecn", include_str!("traecn.rs")),
     ]
     .into_iter()
     .collect();
@@ -11373,6 +11391,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("qoder", include_str!("qoder.rs")),
         ("qwen-cloud", include_str!("qwen_cloud.rs")),
         ("kimi-for-coding", include_str!("kimi_for_coding.rs")),
+        ("traecn", include_str!("traecn.rs")),
     ]
     .into_iter()
     .collect();

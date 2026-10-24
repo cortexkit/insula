@@ -29,6 +29,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("cookie:qoder.com", "qoder"),
     ("cookie:factory.ai", "factory"),
     ("cookie:langdock.com", "langdock"),
+    // Trae CN's dashboard and API share session cookies set on the parent
+    // domain `trae.cn`. The deposit is sent only to `api.trae.cn`.
+    ("cookie:trae.cn", "traecn"),
     ("cookie:xiaomimimo.com", "mimo"),
     ("cookie:ollama.com", "ollama"),
     ("apikey:ollama-cloud", "ollama"),
@@ -91,6 +94,7 @@ enum ProviderKind {
     Qoder,
     Factory,
     Langdock,
+    TraeCn,
     Mimo,
     Ollama,
     OpenCode,
@@ -589,6 +593,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "qoder" => Some(ProviderKind::Qoder),
         "factory" => Some(ProviderKind::Factory),
         "langdock" => Some(ProviderKind::Langdock),
+        "traecn" => Some(ProviderKind::TraeCn),
         "mimo" => Some(ProviderKind::Mimo),
         "ollama" => Some(ProviderKind::Ollama),
         "opencode" => Some(ProviderKind::OpenCode),
