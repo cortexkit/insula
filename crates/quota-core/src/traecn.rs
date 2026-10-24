@@ -122,8 +122,8 @@ impl Transport for HttpTransport {
     async fn post(&self, call: &Call) -> Result<Reply, FetchError> {
         let mut request = JsonRequest::post_json(call.url, call.body.as_bytes().to_vec())
             .timeout(REQUEST_TIMEOUT);
-        for (name, value) in &call.headers {
-            request = request.header(Header::new(*name, value.clone()));
+        for &(name, ref value) in &call.headers {
+            request = request.header(Header::new(name, value.clone()));
         }
         let response = request.send_raw(&self.client).await?;
         Ok(Reply {
