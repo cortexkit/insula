@@ -10,6 +10,7 @@
 //! assembles the silent-degrade `/usage` array Alfonso consumes. The subc module
 //! (`quota-module`) wraps this behind the `usage.get` route op.
 
+pub mod abliteration;
 pub mod alibaba;
 pub mod amp;
 pub mod anthropic;
@@ -451,6 +452,9 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         // AI_GATEWAY_API_KEY). `vercel-budget` has no entry: slugs are unique
         // per provider, and the gateway's credit balance holds this one.
         "vercel" => Some("vercel"),
+        // models.dev's `abliteration-ai` provider serves api.abliteration.ai/v1,
+        // the same origin and key this lane reads credits with.
+        "abliteration" => Some("abliteration-ai"),
         _ => None,
     }
 }
@@ -789,6 +793,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(soniox::SonioxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(abliteration::AbliterationProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
