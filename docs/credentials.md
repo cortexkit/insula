@@ -67,6 +67,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 | `apikey:soniox` | `soniox` (an organization API key) |
 | `apikey:abliteration` | `abliteration` (an abliteration.ai API key) |
+| `apikey:chatbox` | `chatbox` (a Chatbox AI license key) |
 
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
@@ -127,6 +128,7 @@ provider's source state it.
 | `abliteration` | | `ABLITERATION_API_KEY` |
 | `alibaba` | | `ALIBABA_CODING_PLAN_API_KEY`, `ALIBABA_QWEN_API_KEY`, `DASHSCOPE_API_KEY` |
 | `antigravity` | the running editor or `agy` CLI (loopback); the opencode antigravity-auth plugin's sidebar file | `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE` |
+| `chatbox` | | `CHATBOX_LICENSE_KEY` |
 | `claude` | OpenCode's `anthropic` OAuth entry | |
 | `clinepass` | | `CLINE_API_KEY`, `CLINEPASS_API_KEY` |
 | `codebuff` | `~/.config/manicode/credentials.json` | `CODEBUFF_API_KEY` |

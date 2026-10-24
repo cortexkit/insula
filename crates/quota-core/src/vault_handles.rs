@@ -66,6 +66,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:soniox", "soniox"),
     // An abliteration.ai API key, which reads the account's USD credits.
     ("apikey:abliteration", "abliteration"),
+    // A Chatbox AI license key. Chatbox sends it as the whole Authorization
+    // header, and it also authorizes AI requests, not only quota reads.
+    ("apikey:chatbox", "chatbox"),
 ];
 
 /// Credential-id families a provider reads WITHOUT enumerating a lane for them.
@@ -110,6 +113,7 @@ enum ProviderKind {
     VercelBudget,
     Soniox,
     Abliteration,
+    Chatbox,
 }
 
 #[derive(Clone, Default)]
@@ -511,6 +515,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Abliteration)
     }
 
+    pub fn chatbox_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Chatbox)
+    }
+
     pub fn cookie_handles(&self, family: &str) -> Result<Vec<CredentialHandle>, HandlesError> {
         let mut handles = Vec::new();
         for kind in providers_for_id(family) {
@@ -614,6 +622,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "vercel-budget" => Some(ProviderKind::VercelBudget),
         "soniox" => Some(ProviderKind::Soniox),
         "abliteration" => Some(ProviderKind::Abliteration),
+        "chatbox" => Some(ProviderKind::Chatbox),
         _ => None,
     }
 }

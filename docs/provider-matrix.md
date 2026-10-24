@@ -1,6 +1,6 @@
 # Provider matrix
 
-44 providers registered.
+45 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -48,6 +48,7 @@ on every operating system. The public wire semantics are in
 |---|---|---|---|
 | `abliteration` | `ABLITERATION_API_KEY`; vault `apikey:abliteration` | `GET https://api.abliteration.ai/v1/credits` | Derived USD credit balance (`max(0, total − usage)`) beside the stated total; no rate window or reset. Tested against upstream fixtures only |
 | `alibaba` | `ALIBABA_CODING_PLAN_API_KEY`, `ALIBABA_QWEN_API_KEY`, `DASHSCOPE_API_KEY`; region/URL overrides | `POST https://modelstudio.console.alibabacloud.com/data/api.json` or `https://bailian.console.aliyun.com/data/api.json`, `queryCodingPlanInstanceInfoV2` | 5h / weekly / monthly |
+| `chatbox` | `CHATBOX_LICENSE_KEY`; vault `apikey:chatbox` | `GET https://api.chatboxai.app/api/license/detail/realtime` (the bare license key as `Authorization`) | Usable plan's compute-point window with the stated next refresh as reset, no stated cadence; reward, top-up, image and legacy combined allowances as resetless pools; license end as `subscriptionEndsAt`. Tested against upstream fixtures only |
 | `codebuff` | `CODEBUFF_API_KEY` or `~/.config/manicode/credentials.json` | `POST https://www.codebuff.com/api/v1/usage`; `GET /api/user/subscription` | Credit quota utilization and weekly subscription window |
 | `copilot` | `COPILOT_API_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN` | `GET https://api.github.com/copilot_internal/user` | Monthly premium-request quota |
 | `deepseek` | `DEEPSEEK_API_KEY`, `DEEPSEEK_TOKEN`, OpenCode `deepseek`; vault `apikey:deepseek` | `GET https://api.deepseek.com/user/balance` | Granted and purchased balances in reported currencies; no rate window |

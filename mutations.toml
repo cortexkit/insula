@@ -1981,6 +1981,23 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
+id = "chatbox-pool-never-carries-plan-reset"
+guards = "Chatbox reward, top-up, image and combined-total pools never inherit the plan window's next refresh as a reset"
+file = "crates/quota-core/src/chatbox.rs"
+old = "if primary.is_none() && pools.is_empty() {"
+new = "for pool in pools.iter_mut() { pool.resets_at = primary.as_ref().and_then(|window| window.resets_at.clone()); } /* NON-VACUITY BREAK */ if primary.is_none() && pools.is_empty() {"
+edits = []
+test_file = "crates/quota-core/src/chatbox.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["chatbox::tests::no_pool_ever_carries_the_plan_reset"]
+expect_message = "must not reset"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
 id = "abliteration-vault-replaces-env"
 guards = "An abliteration.ai apikey deposit replaces the ABLITERATION_API_KEY lane, so the vault key is the one sent and no second identity-less row appears"
 file = "crates/quota-core/src/abliteration.rs"
@@ -2035,3 +2052,37 @@ timeout_s = 600
 build_timeout_s = 1800
 [control.select]
 filter = "traecn::"
+
+[[control]]
+id = "chatbox-plan-window-never-sums-combined-total"
+guards = "The Chatbox plan window is the plan item's own counters, never the plan added to the combined unified_token counters that already include it"
+file = "crates/quota-core/src/chatbox.rs"
+old = ".map(|plan| {"
+new = ".map(|plan| { let plan = Counted { used: plan.used + total.map_or(0, |t| t.used), limit: plan.limit + total.map_or(0, |t| t.limit) }; /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/quota-core/src/chatbox.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["chatbox::tests::the_plan_and_the_combined_total_are_never_added_together"]
+expect_message = "the window is the plan item alone"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "chatbox-vault-replaces-env"
+guards = "A Chatbox apikey deposit replaces the CHATBOX_LICENSE_KEY lane, so no second identity-less row appears beside it"
+file = "crates/quota-core/src/chatbox.rs"
+old = "return Ok(vault);"
+new = "let _ = vault; // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/quota-core/src/chatbox.rs"
+runner = "cargo"
+package = "quota-core"
+target = "--lib"
+expect_red = ["chatbox::tests::a_vault_deposit_replaces_the_environment_lane"]
+expect_message = "a chatbox deposit must replace the environment lane"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

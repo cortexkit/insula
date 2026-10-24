@@ -10084,6 +10084,7 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "apikey:vercel-budget",
         "apikey:soniox",
         "apikey:abliteration",
+        "apikey:chatbox",
     ] {
         assert!(
             crate::vault_handles::CREDENTIAL_FAMILIES
