@@ -102,9 +102,8 @@ fi
 # reports success while the push is rejected for "required status checks are
 # cancelled" -- which is exactly what happened, with a green run I had watched.
 #
-# Only ci.yml produces the required checks. The mutation-proofs workflow starts
-# on the same push, often in the same second, and can finish first when a change
-# touches no catalogue row; watching it pushed a sha whose required checks were
+# Only ci.yml produces the required checks. Any other workflow on the same push
+# can finish first; watching one once pushed a sha whose required checks were
 # still running, and protection refused it.
 CI_WORKFLOW=ci.yml
 run=""

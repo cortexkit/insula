@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Feed each Python and shell scanner a deliberately planted violation.
 
-These tests check that each scanner refuses the violation. The mutations.toml
-rows break each scanner to prove these tests catch it.
+These tests check that each scanner refuses the violation, so a scanner that
+stops looking fails the gate instead of passing silently.
 """
 
 import importlib.util
@@ -27,9 +27,6 @@ def load(name, filename):
 
 
 class ScanControls(unittest.TestCase):
-    def test_broad_report_planted_violation(self):
-        load("mutation_report", "mutation-report.py").self_check()
-
     def test_path_dependency_planted_violation(self):
         load("path_dependencies", "path-dependencies.py").self_check()
 

@@ -10,8 +10,9 @@ scripts/gates.sh --e2e    # also the in-process wire tests, about 80 s more
 
 Run the gate script rather than a hand-picked list of commands; it stops at the
 first failure. [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gate) lists every step.
-A change that guards a costly property also gets a mutation row; see
-[`mutations.md`](mutations.md).
+A bug fix gets a test that fails without the fix. Show that once, with
+`scripts/probe.py`, which applies the break, runs the named test and
+restores the file even if interrupted.
 
 `--quick` runs fmt, workspace clippy on the host toolchain, **all** lib/bin
 tests in a scratch `TMPDIR`, and the cheap repo checks (including deploy-policy

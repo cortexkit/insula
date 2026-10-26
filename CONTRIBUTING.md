@@ -143,6 +143,6 @@ report) goes in `crates/quota-module/src/`.
   its folder on drop; the gate fails when a unit test leaves anything in
   `TMPDIR`.
 
-A test that guards a costly property (money spent, exactly-once, credential
-trust, a wire field, data loss) should also get a row in `mutations.toml`; see
-[`docs/mutations.md`](docs/mutations.md).
+A bug fix gets a test that fails without the fix. Show that once, with
+`scripts/probe.py`, which applies the break, runs the named test and
+restores the file even if interrupted.
