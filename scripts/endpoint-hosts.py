@@ -142,29 +142,20 @@ EXPECTED: dict[str, dict[str, str]] = {
 # constant the pattern can't see is a constant this never checks.
 CONST = re.compile(r'const ([A-Z_]*(?:URL|BASE)[A-Z_]*): &str =\s*"(https://[^"]+)"')
 
-# Cut at the test MODULE, never at the first `#[cfg(test)]`.
-#
-# That attribute also sits on production items in this crate -- a test-only
-# constructor beside the real one, a `pub mod` used only by tests -- and four
-# provider modules have one BEFORE their test module today. Splitting on the
-# first occurrence would silently stop reading those files partway, so an
-# endpoint constant declared after that point would never be checked and the
-# run would still report success.
-#
-# The mirror failure is over-inclusion: reading the whole file pulls in fixture
-# URLs from the test module, which no credential ever reaches, and pins them as
-# though they were real endpoints. Both directions report a clean, plausible
-# number, which is why the boundary is stated here rather than left to a split.
-#
-# Same rule as scripts/prod_body.py, whose docstring records what a truncated
-# scan costs.
-TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?://[^\n]*\n\s*)*mod\s+tests\b")
+# Production only, cut by the shared rule in scripts/prod_body.py: every test
+# module is removed, whatever it is named, and production code after a test
+# module is kept. A fixture URL in a test module is not a request this ever
+# makes, and reading less than the whole production body would leave an
+# endpoint constant unchecked while the run still reported success. Importing
+# the rule rather than copying it keeps the two from drifting apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prod_body import production_body as _production_body  # noqa: E402
 
 
 def production_body(source: str) -> str:
-    """Return the source up to the test module."""
-    match = TEST_MODULE.search(source)
-    return source[: match.start()] if match else source
+    """Return the source with every test module removed."""
+    body, _ = _production_body(source)
+    return body
 
 
 def main() -> int:

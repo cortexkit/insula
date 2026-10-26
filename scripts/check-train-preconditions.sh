@@ -48,7 +48,15 @@ DEFAULT_BRANCH="master"
 [ -f "$WORKFLOW" ] || { echo "cannot check: $WORKFLOW is absent" >&2; exit 2; }
 
 python3 - "$WORKFLOW" "$DEFAULT_BRANCH" <<'PY'
-import sys, yaml
+import sys
+
+# Without PyYAML this cannot read the workflow at all. Exit 2 (could not
+# check) with the reason, rather than a traceback that reads as a failed rule.
+try:
+    import yaml
+except ImportError:
+    print("cannot check: PyYAML is not installed (python3 -m pip install pyyaml)", file=sys.stderr)
+    sys.exit(2)
 
 path, default_branch = sys.argv[1], sys.argv[2]
 

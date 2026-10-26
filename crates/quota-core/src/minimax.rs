@@ -984,7 +984,12 @@ mod tests {
     #[test]
     fn garbage_body_is_decode_error() {
         let err = normalize_usage(b"not json").unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        // The message names the provider, so the published error says where it
+        // came from.
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.starts_with("minimax remains not decodable")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1279,32 +1284,6 @@ mod wallet_tests {
         assert_eq!(summed, 9_800, "the pools must sum to the stated total");
     }
 
-    /// The wallet must be asked on the host that accepted the credential.
-    ///
-    /// A key minted in one region is rejected by the other, and the rate-window
-    /// request already falls back from global to China on a 401. If the wallet
-    /// then used the originally configured host, an account that only works in
-    /// China would have its windows fetched from China and its wallet asked in
-    /// the wrong place -- earning a 401 for a credential that is perfectly good.
-    ///
-    /// Worse, the failure would be invisible: wallet errors are deliberately
-    /// discarded, so this would present as "MiniMax reports no pools" forever
-    /// rather than as anything anyone could debug.
-    #[test]
-    fn the_wallet_url_follows_the_host_that_answered() {
-        assert_eq!(
-            balance_url(CHINA_API_BASE),
-            format!("{CHINA_API_BASE}{BALANCE_PATH}")
-        );
-        assert_eq!(
-            balance_url(GLOBAL_API_BASE),
-            format!("{GLOBAL_API_BASE}{BALANCE_PATH}")
-        );
-        // The two must differ, or the assertion above proves nothing about
-        // which host a fallback ends up using.
-        assert_ne!(balance_url(CHINA_API_BASE), balance_url(GLOBAL_API_BASE));
-    }
-
     /// A wallet body that states nothing readable is an error, not an empty
     /// wallet: the two are opposite facts about an account's money.
     #[test]
@@ -1566,6 +1545,94 @@ mod vault_lane_tests {
 
         assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
         assert!(settled(&reports).await.is_empty());
+    }
+
+    /// Serve every request with `respond(path)`, recording each path asked.
+    async fn serve_paths(
+        respond: fn(&str) -> (u16, &'static str),
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&paths);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, body) = respond(&path);
+                recorded.lock().unwrap().push(path);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("http://{address}"), paths)
+    }
+
+    /// The wallet is asked on the host that accepted the credential.
+    ///
+    /// A key minted in one region is rejected by the other, and the rate-window
+    /// request already falls back from global to China on a 401. If the wallet
+    /// then used the originally configured host, an account that only works in
+    /// China would have its windows fetched from China and its wallet asked in
+    /// the wrong place -- earning a 401 for a credential that is perfectly good.
+    ///
+    /// Worse, the failure would be invisible: wallet errors are deliberately
+    /// discarded, so this would present as "MiniMax reports no pools" forever
+    /// rather than as anything anyone could debug.
+    #[tokio::test]
+    async fn the_wallet_follows_the_host_that_answered() {
+        let (global, global_paths) = serve_paths(|_| (401, "")).await;
+        let (china, china_paths) = serve_paths(|path| {
+            if path == REMAINS_PATH {
+                (
+                    200,
+                    r#"{"base_resp":{"status_code":0},"model_remains":[{"model_name":"general",
+                    "current_interval_total_count":100,"current_interval_usage_count":80}]}"#,
+                )
+            } else {
+                (
+                    200,
+                    r#"{"available_amount":"98.00","cash_balance":"0.00",
+                    "voucher_balance":"98.00","credit_balance":"0.00","owed_amount":"0.00",
+                    "base_resp":{"status_code":0}}"#,
+                )
+            }
+        })
+        .await;
+        let provider = provider_at(None, &global, &china);
+
+        let attempt = provider
+            .fetch_handle_from(
+                &CredentialHandle::implicit(),
+                env_of(&[("MINIMAX_API_KEY", "minimax-env-key")]),
+            )
+            .await;
+
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(
+            attempt.pools.is_some(),
+            "the wallet answered on the China host"
+        );
+        assert_eq!(
+            *global_paths.lock().unwrap(),
+            vec![REMAINS_PATH.to_string()],
+            "the global host refused the key and must not be asked for the wallet"
+        );
+        assert_eq!(
+            *china_paths.lock().unwrap(),
+            vec![REMAINS_PATH.to_string(), BALANCE_PATH.to_string()]
+        );
     }
 
     /// The environment lane still reads the environment key.

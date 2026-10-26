@@ -29,7 +29,7 @@ HOW THE CROSS IS BUILT, and why each half is derived rather than listed:
                        whatever its source looks like. This is the discriminator
                        that turns a static over-approximation into a finding.
 
-  slug per provider    parsed out of `api_provider_name` in lib.rs, which is
+  slug per provider    parsed out of `API_PROVIDER_SLUGS` in lib.rs, which is
                        the map this module already maintains for the wire. The
                        store is keyed by models.dev slug and this module by its
                        own provider names, so nothing can be matched without it.
@@ -141,12 +141,12 @@ def env_only_providers() -> tuple[list[str], list[str]]:
 def slug_map() -> dict[str, str]:
     """The provider -> models.dev slug map this module publishes as apiProvider."""
     text = (SRC / "lib.rs").read_text(encoding="utf-8", errors="replace")
-    start = text.find("fn api_provider_name")
+    start = text.find("const API_PROVIDER_SLUGS")
     if start < 0:
-        sys.exit("refusing: api_provider_name not found in lib.rs -- has it been renamed?")
+        sys.exit("refusing: API_PROVIDER_SLUGS not found in lib.rs -- has it been renamed?")
     body = text[start:]
-    end = body.find("\n}")
-    return dict(re.findall(r'"([^"]+)" => Some\("([^"]+)"\)', body[:end]))
+    end = body.find("\n];")
+    return dict(re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', body[:end]))
 
 
 def main() -> int:

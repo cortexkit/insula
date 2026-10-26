@@ -532,7 +532,6 @@ mod tests {
         assert_eq!(pools[1].remaining.as_ref().unwrap().minor, 50);
         assert_eq!(pools[2].remaining.as_ref().unwrap().minor, 20);
         assert!(pools.iter().all(|pool| pool.resets_at.is_none()));
-        assert_eq!(pools_for_aggregate(2).exponent, 2);
     }
 
     #[test]

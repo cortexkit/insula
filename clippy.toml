@@ -1,0 +1,16 @@
+# Every provider gets its HTTP client from `crate::http::provider_client()`.
+#
+# reqwest keeps an idle connection pooled for 90 seconds by default, and the
+# refresher re-fetches every provider every 60 seconds, so a default client
+# never lets a pooled connection age out. After a host sleep every pool held
+# dead sockets, and every provider failed for ten hours until a restart.
+# `provider_client()` sets an idle bound below the refresh cadence.
+#
+# A site that really needs its own client (for example to turn off redirects
+# so a session cookie cannot follow one) allows this lint locally and says why
+# beside the allow. Test modules allow it too, because a test client never
+# outlives one test.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use crate::http::provider_client(); a default client pools idle connections longer than the refresh cadence" },
+    { path = "reqwest::Client::builder", reason = "use crate::http::provider_client(), or allow this lint with a stated reason and set POOL_IDLE_TIMEOUT on the builder" },
+]

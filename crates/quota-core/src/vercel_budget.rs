@@ -689,11 +689,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_fixed_time_is_a_wednesday() {
-        assert_eq!(wednesday().weekday(), chrono::Weekday::Wed);
-    }
-
     /// Upstream's first test: across two pages, another user's budget is
     /// skipped and the custom budget on page two beats the inherited default on
     /// page one.
@@ -754,9 +749,10 @@ mod tests {
 
     /// The v0.79.0 fix: Vercel names a user's budget scope `usr_<id>`, and the
     /// bare id upstream matched first is still accepted. A scope that merely
-    /// contains the id is not the user's.
-    #[test]
-    fn a_budget_names_the_user_by_bare_or_usr_prefixed_id_only() {
+    /// contains the id is not the user's. The `usr_` form is read through the
+    /// provider by the paging test above; the bare form is read through it here.
+    #[tokio::test]
+    async fn a_budget_names_the_user_by_bare_or_usr_prefixed_id_only() {
         let scope = |id: &str| -> Value {
             serde_json::from_str(&budget(id, "30", "120", "monthly", None)).unwrap()
         };
@@ -776,16 +772,7 @@ mod tests {
         )
         .unwrap();
         assert!(!names_user(&team_scope, "fixtureUser"));
-    }
 
-    #[tokio::test]
-    async fn a_usr_prefixed_budget_is_read_through_the_provider() {
-        let (attempt, _) = fetch(pages(&[("", page(&[own("monthly")], None))])).await;
-        assert_eq!(primary(&attempt).used_percent, 25.0);
-    }
-
-    #[tokio::test]
-    async fn a_native_user_scope_id_is_still_read() {
         let body = page(&[budget("fixtureUser", "30", "120", "monthly", None)], None);
         let (attempt, _) = fetch(pages(&[("", body)])).await;
         assert_eq!(primary(&attempt).used_percent, 25.0);

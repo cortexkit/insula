@@ -655,8 +655,11 @@ mod tests {
             (VaultGetError::Transient, "Transient"),
             (VaultGetError::AuthRequired, "AuthRequired"),
             (VaultGetError::Permanent, "Permanent"),
+            (VaultGetError::NotFound, "NotFound"),
             (VaultGetError::EmptyPayload, "EmptyPayload"),
+            (VaultGetError::Corrupt, "Corrupt"),
             (VaultGetError::FailClosed, "FailClosed"),
+            (VaultGetError::Unavailable, "Unavailable"),
         ] {
             assert_eq!(format!("{error:?}"), expected);
         }

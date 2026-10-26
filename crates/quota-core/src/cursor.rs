@@ -1389,97 +1389,77 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// Browser usage still publishes, but unlabelled, whenever the app store
+    /// cannot vouch for the browser's user: another user signed into the app,
+    /// no app store, an unreadable one, or a session cookie that names no user.
+    /// This is identity and pruning, so every cause is its own row.
     #[test]
-    fn differing_browser_and_app_user_ids_leave_browser_usage_unlabelled() {
-        let path = test_path("differing-browser-app.vscdb");
-        let access_token = synthetic_jwt("organization|app-user-id");
-        create_state_db(&path, &access_token, Some("account@example.test"));
+    fn browser_usage_stays_unlabelled_unless_the_app_store_names_the_same_user() {
+        enum Store {
+            App(&'static str),
+            Absent,
+            Unreadable,
+        }
+        for (case, label, cookie, store) in [
+            (
+                "differing user ids",
+                "differing-browser-app.vscdb",
+                "browser-user-id%3A%3Asynthetic-browser-session",
+                Store::App("organization|app-user-id"),
+            ),
+            (
+                "absent app store",
+                "missing-browser-app.vscdb",
+                "user-id%3A%3Asynthetic-browser-session",
+                Store::Absent,
+            ),
+            (
+                "unreadable app store",
+                "unreadable-browser-app",
+                "user-id%3A%3Asynthetic-browser-session",
+                Store::Unreadable,
+            ),
+            (
+                "malformed WorkOS cookie",
+                "malformed-browser-cookie.vscdb",
+                "user-id",
+                Store::App("organization|user-id"),
+            ),
+        ] {
+            let path = test_path(label);
+            match &store {
+                Store::App(subject) => {
+                    create_state_db(&path, &synthetic_jwt(subject), Some("account@example.test"))
+                }
+                Store::Absent => {}
+                Store::Unreadable => fs::create_dir(&path).unwrap(),
+            }
 
-        let credential = resolve_cursor_credential(
-            &browser_jar("browser-user-id%3A%3Asynthetic-browser-session"),
-            Some(&path),
-        )
-        .unwrap();
-        let provider_usage =
-            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
+            let credential = resolve_cursor_credential(&browser_jar(cookie), Some(&path)).unwrap();
+            let provider_usage =
+                provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
 
-        assert!(
-            provider_usage.usage.is_some(),
-            "browser usage must still publish"
-        );
-        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
-        assert!(
-            provider_usage.account.is_none(),
-            "different accounts must not label usage"
-        );
-        assert!(provider_usage.account_info.is_none());
+            assert!(
+                provider_usage.usage.is_some(),
+                "{case}: browser usage must still publish"
+            );
+            assert_eq!(
+                provider_usage.source.as_deref(),
+                Some(DEPOSIT_SOURCE),
+                "{case}"
+            );
+            assert!(
+                provider_usage.account.is_none(),
+                "{case}: an unvouched account must not label usage"
+            );
+            assert!(provider_usage.account_info.is_none(), "{case}");
 
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn absent_app_auth_store_leaves_browser_usage_unlabelled() {
-        let path = test_path("missing-browser-app.vscdb");
-        let credential = resolve_cursor_credential(
-            &browser_jar("user-id%3A%3Asynthetic-browser-session"),
-            Some(&path),
-        )
-        .unwrap();
-        let provider_usage =
-            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
-
-        assert!(
-            provider_usage.usage.is_some(),
-            "browser usage must still publish"
-        );
-        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
-        assert!(provider_usage.account.is_none());
-        assert!(provider_usage.account_info.is_none());
-    }
-
-    #[test]
-    fn unreadable_app_auth_store_leaves_browser_usage_unlabelled() {
-        let path = test_path("unreadable-browser-app");
-        fs::create_dir(&path).unwrap();
-
-        let credential = resolve_cursor_credential(
-            &browser_jar("user-id%3A%3Asynthetic-browser-session"),
-            Some(&path),
-        )
-        .unwrap();
-        let provider_usage =
-            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
-
-        assert!(
-            provider_usage.usage.is_some(),
-            "browser usage must still publish"
-        );
-        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
-        assert!(provider_usage.account.is_none());
-        assert!(provider_usage.account_info.is_none());
-
-        fs::remove_dir(path).unwrap();
-    }
-
-    #[test]
-    fn malformed_workos_cookie_leaves_browser_usage_unlabelled() {
-        let path = test_path("malformed-browser-cookie.vscdb");
-        let access_token = synthetic_jwt("organization|user-id");
-        create_state_db(&path, &access_token, Some("account@example.test"));
-
-        let credential = resolve_cursor_credential(&browser_jar("user-id"), Some(&path)).unwrap();
-        let provider_usage =
-            provider_usage_from_credential(&credential, DEPOSIT_SOURCE, healthy_usage());
-
-        assert!(
-            provider_usage.usage.is_some(),
-            "browser usage must still publish"
-        );
-        assert_eq!(provider_usage.source.as_deref(), Some(DEPOSIT_SOURCE));
-        assert!(provider_usage.account.is_none());
-        assert!(provider_usage.account_info.is_none());
-
-        fs::remove_file(path).unwrap();
+            match store {
+                Store::App(_) => fs::remove_file(&path).unwrap(),
+                Store::Absent => {}
+                Store::Unreadable => fs::remove_dir(&path).unwrap(),
+            }
+        }
     }
 
     #[test]
@@ -1537,27 +1517,17 @@ mod tests {
     }
 
     #[test]
-    fn percent_without_billing_cycle_end_drops_window() {
-        let json = r#"{
-            "individualUsage": {
-                "plan": {
-                    "totalPercentUsed": 45.5
-                }
-            }
-        }"#;
-        let res = normalize_usage(json.as_bytes());
-        assert!(matches!(res, Err(FetchError::Decode(_))));
-    }
-
-    #[test]
     fn missing_usage_window_is_decode_error() {
-        let json = r#"{
-            "billingCycleEnd": "2026-07-24T03:00:00Z"
-        }"#;
-        let res = normalize_usage(json.as_bytes());
-        assert!(matches!(res, Err(FetchError::Decode(_))));
+        // No usage block at all, or a percent with no billing cycle end to
+        // reset at: either way there is no window to publish.
+        for json in [
+            r#"{ "billingCycleEnd": "2026-07-24T03:00:00Z" }"#,
+            r#"{ "individualUsage": { "plan": { "totalPercentUsed": 45.5 } } }"#,
+        ] {
+            let res = normalize_usage(json.as_bytes());
+            assert!(matches!(res, Err(FetchError::Decode(_))), "{json}");
+        }
     }
-
     /// With no deposit, the one lane is Cursor's own app store on this machine.
     ///
     /// Cursor is the cookie provider with a local lane that is not a browser:
@@ -1892,6 +1862,31 @@ mod tests {
         assert_eq!(pool.total, Some(usd(1000)));
     }
 
+    /// The edges of the pool rule, each next to the case that just passes it.
+    /// Spend exactly at the limit is an empty pool, not a refusal; a period
+    /// that starts now is current; a period that resets now is over.
+    #[test]
+    fn the_on_demand_pool_edges_are_exact() {
+        let now = fixed_now();
+        let at_limit = usage_status("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z")
+            .replace("\"usedCents\":93", "\"usedCents\":1000");
+        let pool = on_demand_pool(at_limit.as_bytes(), now).unwrap();
+        assert_eq!(pool.remaining, Some(usd(0)));
+        assert_eq!(pool.total, Some(usd(1000)));
+
+        let starts_now = usage_status("2026-10-15T12:00:00Z", "2026-11-01T00:00:00Z");
+        assert!(on_demand_pool(starts_now.as_bytes(), now).is_ok());
+
+        let resets_now = usage_status("2026-10-01T00:00:00Z", "2026-10-15T12:00:00Z");
+        assert_eq!(
+            on_demand_pool(resets_now.as_bytes(), now),
+            Err(SpendRefusal::OutsidePeriod)
+        );
+        // One second before the reset the period is still current.
+        let resets_next_second = usage_status("2026-10-01T00:00:00Z", "2026-10-15T12:00:01Z");
+        assert!(on_demand_pool(resets_next_second.as_bytes(), now).is_ok());
+    }
+
     /// Only a unified membership with a personal (`user`) limit qualifies; a
     /// unified team budget and every older plan do not.
     #[test]
@@ -2014,38 +2009,31 @@ mod tests {
         );
     }
 
-    /// A reading for a period that does not contain the present (last month's
-    /// or next month's) publishes no pool and leaves the window intact.
+    /// Every unusable reading publishes no pool and leaves the window and error
+    /// class exactly as the summary gives them. That includes a reading for a
+    /// period that does not contain the present: last month's, or next month's.
     #[tokio::test]
-    async fn a_reading_outside_its_period_publishes_no_pool_and_keeps_the_window() {
+    async fn an_unusable_spend_reading_publishes_no_pool_and_keeps_the_window() {
+        let valid = current_usage_status();
         let now = chrono::Utc::now();
         let at = |offset_days: i64| {
             (now + chrono::Duration::days(offset_days))
                 .format("%Y-%m-%dT%H:%M:%SZ")
                 .to_string()
         };
-        // Already reset: the present is at or after `resetsAt`.
-        assert_refused(
-            200,
-            usage_status(&at(-30), &at(-1)),
-            SpendRefusal::OutsidePeriod,
-        )
-        .await;
-        // Not started: the present is before `periodStart`.
-        assert_refused(
-            200,
-            usage_status(&at(1), &at(30)),
-            SpendRefusal::OutsidePeriod,
-        )
-        .await;
-    }
-
-    /// Every other unusable reading also publishes no pool and leaves the
-    /// window and error class exactly as the summary gives them.
-    #[tokio::test]
-    async fn an_unusable_spend_reading_publishes_no_pool_and_keeps_the_window() {
-        let valid = current_usage_status();
         let cases = [
+            // Already reset: the present is at or after `resetsAt`.
+            (
+                200,
+                usage_status(&at(-30), &at(-1)),
+                SpendRefusal::OutsidePeriod,
+            ),
+            // Not started: the present is before `periodStart`.
+            (
+                200,
+                usage_status(&at(1), &at(30)),
+                SpendRefusal::OutsidePeriod,
+            ),
             (
                 200,
                 valid.replace("\"available\"", "\"identity_unlinked\""),

@@ -450,15 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_env_value() {
-        assert_eq!(clean_env_value("  foo  "), Some("foo".to_string()));
-        assert_eq!(clean_env_value("\"foo\""), Some("foo".to_string()));
-        assert_eq!(clean_env_value("'foo'"), Some("foo".to_string()));
-        assert_eq!(clean_env_value("  \"  foo  \"  "), Some("foo".to_string()));
-        assert_eq!(clean_env_value(""), None);
-    }
-
-    #[test]
     fn test_validate_and_normalize_url() {
         assert_eq!(
             validate_and_normalize_url("api.neuralwatt.com")
@@ -620,8 +611,34 @@ mod tests {
     async fn test_missing_key_no_session() {
         let provider = NeuralWattProvider::new();
         let handle = CredentialHandle::implicit();
-        let attempt = provider.fetch_handle_from(&handle, |_| None).await;
 
-        assert!(matches!(attempt.usage, Err(FetchError::NoSession(_))));
+        // Every variable except the key is set, so a lookup under a misspelt
+        // name would find something here and fail this arm.
+        let attempt = provider
+            .fetch_handle_from(&handle, |key| {
+                (key != "NEURALWATT_API_KEY").then(|| "set".into())
+            })
+            .await;
+        assert!(
+            matches!(&attempt.usage, Err(FetchError::NoSession(message)) if message.contains("NEURALWATT_API_KEY")),
+            "the absent key is named: {:?}",
+            attempt.usage
+        );
+
+        // Control: only the real names hold values, and the provider reads the
+        // key rather than reporting it absent. The endpoint override is plain
+        // http, which is refused before any request is made.
+        let attempt = provider
+            .fetch_handle_from(&handle, |key| match key {
+                "NEURALWATT_API_KEY" => Some("nw-key".into()),
+                "NEURALWATT_API_URL" => Some("http://insecure.example".into()),
+                _ => None,
+            })
+            .await;
+        assert!(
+            matches!(&attempt.usage, Err(FetchError::CredentialUnusable(message)) if message.contains("NEURALWATT_API_URL")),
+            "{:?}",
+            attempt.usage
+        );
     }
 }

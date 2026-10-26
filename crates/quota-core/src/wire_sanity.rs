@@ -1587,77 +1587,61 @@ mod tests {
             "both amounts present means the bound rule ran"
         );
         assert!(bounded_report.findings.is_empty());
-    }
 
-    /// The pool rules report their own denominator.
-    ///
-    /// Windows and pools are independent populations: most providers publish
-    /// windows and no pools at all, so a sweep can check dozens of windows while
-    /// every pool rule sits idle. Reported separately because a run that
-    /// examined no pool otherwise looks identical to one that examined
-    /// hundreds — both say `findings: none`, and the six pool rules are then
-    /// indistinguishable from rules that never fire.
-    #[test]
-    fn the_pool_rules_report_how_many_pools_they_examined() {
+        // Pools are counted across entries, and an entry without pools adds
+        // none: windows and pools are independent populations, and most
+        // providers publish no pools at all.
         let mut with_pools = entry(window(10.0));
         with_pools.spend = Some(vec![
             pool("granted", Some((500, 2, "USD")), None),
             pool("purchased", Some((250, 2, "USD")), None),
         ]);
-
         let report = check_entries(&[with_pools, entry(window(10.0))], at(FIXTURE_NOW));
         assert_eq!(
             report.pools_checked, 2,
             "both pools of the one entry that has them must be counted"
         );
 
-        // Zero is reported rather than hidden, which is the whole point: an
-        // entry set with no pools must be visibly different from one with them.
+        // Zero is reported rather than hidden: a run that examined no pool must
+        // be visibly different from one with them, and is still a clean run.
         let none = check_entries(&[entry(window(10.0))], at(FIXTURE_NOW));
         assert_eq!(none.pools_checked, 0);
-        assert!(
-            none.findings.is_empty(),
-            "and a run examining no pool is still a clean run, not a finding"
-        );
+        assert!(none.findings.is_empty());
     }
 
+    /// A count that is not a whole number is reported, in either field: a cap is
+    /// as much a count as the consumption is, and a rule written for one field
+    /// is exactly how the other goes unchecked.
     #[test]
     fn a_count_that_is_not_a_whole_number_is_reported() {
-        let mut w = window(45.052_361_473_854_994);
-        w.used_count = Some(18_020.944_589_542);
-        w.total_count = Some(40_000.0);
+        for (percent, used, total, field, only_finding) in [
+            (
+                45.052_361_473_854_994,
+                18_020.944_589_542,
+                40_000.0,
+                "usedCount",
+                true,
+            ),
+            (10.0, 100.0, 1_000.5, "totalCount", false),
+        ] {
+            let mut w = window(percent);
+            w.used_count = Some(used);
+            w.total_count = Some(total);
 
-        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
+            let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
 
-        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
-        assert!(
-            report.findings[0].contains("usedCount")
-                && report.findings[0].contains("not a whole number"),
-            "{}",
-            report.findings[0]
-        );
-    }
-
-    /// A fractional TOTAL is reported too, not only the used half.
-    ///
-    /// The paired direction: a cap is as much a count as the consumption is, and
-    /// a rule written for one field is exactly how the other goes unchecked.
-    #[test]
-    fn a_fractional_total_is_reported() {
-        let mut w = window(10.0);
-        w.used_count = Some(100.0);
-        w.total_count = Some(1_000.5);
-
-        let report = check_entries(&[entry(w)], at("2026-07-28T10:00:00Z"));
-
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.contains("totalCount") && f.contains("not a whole number")),
-            "{:?}",
-            report.findings
-        );
+            if only_finding {
+                assert_eq!(report.findings.len(), 1, "{field}: {:?}", report.findings);
+            }
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.contains(field) && f.contains("not a whole number")),
+                "{field}: {:?}",
+                report.findings
+            );
+        }
     }
 
     /// Whole-number counts are silent.

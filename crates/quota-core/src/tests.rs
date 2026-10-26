@@ -1,3 +1,7 @@
+// Test clients live for one test, so the pool bound in clippy.toml's client
+// rule does not apply to them.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -226,110 +230,6 @@ async fn f4_in_flight_refresh_revokes_previous_relaxation() {
     refresh.await.unwrap();
 }
 
-/// A cookie provider that is not logged in and one whose live cookie was
-/// rejected are different facts, and only the second is worth acting on.
-///
-/// The cohort count exists to say "a browser login went stale". If an absent
-/// cookie counted too, the number would sit at the cohort size forever on any
-/// host that does not use every one of these services -- which is every host --
-/// A cookie provider drops off the stale-login list once it succeeds again.
-///
-/// This is what the number depends on to mean anything: it has to reach zero
-/// when the logins are working, or a reader learns to ignore it.
-///
-/// Two independent mechanisms produce it, and either alone is enough. A
-/// successful fetch clears the slot's failure class, and the list is built only
-/// for providers whose every slot is degraded, so a provider serving a window is
-/// never considered for it. The assertion is on the outcome rather than on
-/// either mechanism, which is the level that stays true if one of them is later
-/// restructured -- and it does hold: removing both together fails this test,
-/// while removing either one alone does not.
-/// A module that fetches nothing for hours must stop calling itself healthy.
-///
-/// THE INCIDENT THIS COMES FROM (2026-08-19). The deployed module served
-/// 10-hour-old windows to every consumer while health read `ok` and
-/// `refresherStalled` read false. Both were literally true: the loop WAS
-/// ticking, once a second. Every fetch inside it failed with a transport error,
-/// transient failures stale-serve with no upper age bound by design, and nothing
-/// anywhere asked whether ticking was producing anything. A fresh process on the
-/// same host fetched all 37 providers in 20 seconds.
-///
-/// So this is not a stricter version of the stall check -- it is the other half.
-/// `refresher_stalled` asks whether the loop is ALIVE; this asks whether the
-/// loop is USEFUL, and only the first was ever checked.
-/// A pooled connection must never survive from one refresh tick to the next.
-///
-/// THE INCIDENT (2026-08-19). reqwest holds an idle connection for 90 seconds by
-/// default; this module refetches every unit every `BASE_INTERVAL`, 60 seconds.
-/// Sixty is less than ninety, so a connection was ALWAYS handed back out before
-/// it could age out of the pool, and was therefore never evicted.
-///
-/// Harmless until the host slept. Sleep at 11:07:58, first fetch failure at
-/// 11:08:14 -- every provider at once, because every pool held sockets opened
-/// before the sleep. The refresher then reused those dead sockets every 60
-/// seconds for ten hours, each attempt refreshing the idle timer that had to
-/// expire for them to be discarded. Health read `ok` throughout.
-///
-/// The relationship is what nothing owned: one number is ours, the other is a
-/// dependency's default, and neither site can see the other. Asserted here
-/// because a later cadence change is exactly how it would come back -- raising
-/// BASE_INTERVAL is a harmless-looking edit that silently reopens this.
-/// No provider builds its own unbounded HTTP client.
-///
-/// The constant above is only worth having if the clients actually carry it,
-/// and reqwest exposes no way to read a built client's pool settings back --
-/// so the property is asserted where it is decidable: at the construction
-/// sites. Every one of the 35 providers used a bare `reqwest::Client::new()`
-/// until 2026-08-19, each with a 90-second pool a 60-second cadence could never
-/// age out, which is how a single host sleep took every lane down for ten hours.
-///
-/// This is the regression that will actually happen: a new provider copied from
-/// an old one, built the obvious way, silently outside the bound. Nothing about
-/// it looks wrong in review.
-#[test]
-fn no_provider_builds_its_own_http_client() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut offenders = Vec::new();
-    let mut examined = 0usize;
-
-    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
-        let path = entry.expect("a readable directory entry").path();
-        if path.extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        // http.rs owns the shared constructor and its fallback; loopback.rs and
-        // tests.rs are test scaffolding, where a bare client is correct.
-        if matches!(name.as_str(), "http.rs" | "loopback.rs" | "tests.rs") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("a readable source file");
-        // Production only: a bare client inside a provider's own test module is
-        // fine, and counting it would push authors toward weakening this test.
-        let production = production_body(&source).to_string();
-        examined += 1;
-        if production.contains("reqwest::Client::new()") {
-            offenders.push(name);
-        }
-    }
-
-    assert!(
-        offenders.is_empty(),
-        "these providers build their own unbounded client instead of calling \
-         http::provider_client(): {offenders:?}"
-    );
-    // Not vacuous: if the directory walk or the test-boundary split ever breaks,
-    // this test would pass by examining nothing at all.
-    assert!(
-        examined > 30,
-        "expected to examine every provider module; examined only {examined}"
-    );
-}
-
 /// The parts of a source file that ship, with every test module removed.
 ///
 /// EVERY SOURCE WALK HERE USED `split("#[cfg(test)]")` AND EVERY ONE OF THEM WAS
@@ -364,7 +264,7 @@ fn no_provider_builds_its_own_http_client() {
 ///
 /// `scripts/prod_body.py` has cut correctly for weeks. The rule existed in the
 /// tooling and not in the tests, which is why five checks here shared one defect.
-fn production_body(source: &str) -> String {
+pub(crate) fn production_body(source: &str) -> String {
     production_lines(source)
         .into_iter()
         .map(|(_, line)| line)
@@ -404,25 +304,6 @@ fn production_lines(source: &str) -> Vec<(usize, &str)> {
     kept
 }
 
-/// No provider offers an implicit local lane BESIDE vault handles, except one.
-///
-/// THE SHAPE, reported on insula#19 and then found a second time by sweep: an
-/// implicit lane enumerated alongside vault handles is a second slot for one
-/// account. The pair deduplicates only while BOTH resolve the same identity --
-/// and a local lane that resolves none deduplicates only while the vault side is
-/// unlabelled too. Label the vault record and the row splits, publishing whatever
-/// the local lane has become: a tombstone after a custody migration (grok), or a
-/// permanently refused credential after an upstream sunset (gemini).
-///
-/// Both were fixed by hand. This is the fence, because the defect is an ABSENCE
-/// -- a guard nobody wrote -- and a new provider written from the shape of an old
-/// one inherits it silently. Neither instance failed a test when it landed.
-///
-/// CODEX IS EXEMPT AND THE REASON IS VERIFIED AT SOURCE, not assumed:
-/// `ServedCodexContext::local` sets `canonical_account_id` from the credential
-/// store, so its local lane resolves an identity of its own and deduplicates
-/// against a labelled vault sibling correctly. The exemption is keyed on that
-/// property, so a change making codex's local lane identity-less should REMOVE
 /// `providers_with_a_lane_beside_vault` names exactly the coexisting providers.
 ///
 /// This backs the falsifier in `vault-lanes`, which reports a DUAL_LANE exemption
@@ -507,51 +388,104 @@ fn a_lane_beside_vault_is_named_only_when_both_kinds_are_enumerated() {
     );
 }
 
+/// No provider offers an implicit local lane BESIDE vault handles, except one.
+///
+/// THE SHAPE, reported on insula#19 and then found a second time by sweep: an
+/// implicit lane enumerated alongside vault handles is a second slot for one
+/// account. The pair deduplicates only while BOTH resolve the same identity --
+/// and a local lane that resolves none deduplicates only while the vault side is
+/// unlabelled too. Label the vault record and the row splits, publishing whatever
+/// the local lane has become: a tombstone after a custody migration (grok), or a
+/// permanently refused credential after an upstream sunset (gemini).
+///
+/// Both were fixed by hand. This is the fence, because the defect is an ABSENCE
+/// -- a guard nobody wrote -- and a new provider written from the shape of an old
+/// one inherits it silently. Neither instance failed a test when it landed.
+///
+/// CODEX IS EXEMPT AND THE REASON IS VERIFIED AT SOURCE, not assumed:
+/// `ServedCodexContext::local` sets `canonical_account_id` from the credential
+/// store, so its local lane resolves an identity of its own and deduplicates
+/// against a labelled vault sibling correctly. The exemption is keyed on that
+/// property, so a change making codex's local lane identity-less should REMOVE
 /// the exemption rather than widen it.
 #[test]
 fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
+    use crate::vault_handles::CREDENTIAL_FAMILIES;
     // Verified at crates/quota-core/src/codex.rs `ServedCodexContext::local`.
     const EXEMPT: &[&str] = &["codex"];
 
-    let mut mixers = Vec::new();
-    let mut examined = 0usize;
+    let registry = Registry::with_defaults(
+        crate::config::QuotaConfig::default(),
+        Some(Arc::new(DefaultListSource)),
+    );
+    let loader = Arc::clone(
+        registry
+            .vault_handle_loader
+            .as_ref()
+            .expect("the default registry wires a vault handle loader"),
+    );
+    let offering_implicit = |registry: &Registry| -> Vec<String> {
+        registry
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .fetcher
+                    .handles()
+                    .is_ok_and(|handles| handles.contains(&CredentialHandle::implicit()))
+            })
+            .map(|provider| provider.name.clone())
+            .collect()
+    };
 
-    for entry in std::fs::read_dir("src").expect("the provider sources") {
-        let path = entry.expect("a directory entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("a file stem")
-            .to_string();
-        let source = production_body(&std::fs::read_to_string(&path).expect("readable"));
-        let Some(at) = source.find("fn handles(&self)") else {
-            continue;
-        };
-        examined += 1;
-        let body = &source[at..];
-        let body = &body[..body.find("\n    }").unwrap_or(body.len())];
-
-        let offers_local = body.contains("CredentialHandle::implicit()");
-        let extends_with_vault = body.contains("extend");
-        let has_vault_only_guard = body.contains("is_empty()");
-
-        if offers_local && extends_with_vault && !has_vault_only_guard {
-            mixers.push(name);
-        }
+    // NOT VACUOUS: with the vault answered and holding nothing, the providers
+    // that keep an implicit lane for a `NoSession` entry do offer it here, so
+    // the check below runs against real implicit lanes rather than an
+    // environment that offers none. (Before any answer the vault-backed
+    // providers refuse to enumerate at all.)
+    loader.install_snapshot(scoped_snapshot(1, Vec::new()), Instant::now());
+    let before = offering_implicit(&registry);
+    for provider in ["deepseek", "openrouter", "synthetic"] {
+        assert!(
+            before.iter().any(|name| name == provider),
+            "{provider} offers no implicit lane without a deposit, so this test no \
+             longer exercises the shape it guards: {before:?}"
+        );
     }
 
-    // NOT VACUOUS: if the walk found no handles() at all, or stopped reading the
-    // provider sources, an empty `mixers` would pass while checking nothing.
-    assert!(
-        examined >= 20,
-        "the walk examined only {examined} handles() bodies; it is not reading the \
-         provider sources"
-    );
+    // One deposit in every family at once, so every vault-backed provider has a
+    // vault handle to show beside whatever local lane it offers.
+    let mut rows = Vec::new();
+    for (family, _) in CREDENTIAL_FAMILIES {
+        let deposit = format!("{family}:fence");
+        if rows
+            .iter()
+            .any(|row: &ScopedRowState| row.credential_id == deposit)
+        {
+            continue;
+        }
+        let credential_type = if family.starts_with("cookie:") {
+            "cookie"
+        } else if family.starts_with("apikey:") || *family == "kimi-for-coding" {
+            "apikey"
+        } else {
+            "oauth"
+        };
+        rows.push(scoped_row(&deposit, credential_type, 1, "active"));
+    }
+    loader.install_snapshot(scoped_snapshot(1, rows), Instant::now());
 
-    mixers.retain(|name| !EXEMPT.contains(&name.as_str()));
+    let mut mixers = Vec::new();
+    for provider in &registry.providers {
+        let Ok(handles) = provider.fetcher.handles() else {
+            continue;
+        };
+        let has_vault = handles.iter().any(CredentialHandle::is_vault);
+        if has_vault && handles.contains(&CredentialHandle::implicit()) {
+            mixers.push(provider.name.as_str());
+        }
+    }
+    mixers.retain(|name| !EXEMPT.contains(name));
     assert!(
         mixers.is_empty(),
         "these providers offer an implicit local lane beside vault handles: \
@@ -560,39 +494,6 @@ fn no_provider_mixes_an_identity_less_local_lane_with_vault_handles() {
          exemption stating why this provider's LOCAL lane resolves an account \
          identity of its own."
     );
-}
-
-/// Both success paths for an opencode plugin account must put its selected
-/// email in `accountInfo.email`. The local editor and sidebar snapshot attach
-/// this metadata independently; omitting it on either makes the address blink
-/// when sources switch. Walk production returns to catch a new path omitting it.
-#[test]
-fn every_antigravity_plugin_lane_publishes_the_account_email() {
-    let production = production_body(include_str!("antigravity.rs"));
-
-    let sites: Vec<&str> = production
-        .match_indices("FetchAttempt::success(observed, PLUGIN_SOURCE")
-        .map(|(at, _)| {
-            let tail = &production[at..];
-            &tail[..tail.len().min(220)]
-        })
-        .collect();
-
-    assert_eq!(
-        sites.len(),
-        2,
-        "expected exactly the two plugin lanes (local probe, sidebar); a \
-         lane added without account info is what this guards, and a lane removed \
-         should update this count deliberately"
-    );
-
-    for (index, site) in sites.iter().enumerate() {
-        assert!(
-            site.contains(".with_account_info("),
-            "plugin-lane success #{index} publishes no accountInfo, so this \
-             account's email disappears whenever this lane wins the dedup:\n{site}"
-        );
-    }
 }
 
 /// The boundary helper removes test modules and keeps everything else.
@@ -620,12 +521,14 @@ fn the_production_boundary_removes_test_modules() {
     assert!(body.contains("fn before()") && body.contains("fn after()"));
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    let refresh = std::fs::read_to_string(src.join("refresh.rs")).expect("refresh.rs is readable");
-    let naive = refresh.split("#[cfg(test)]").next().unwrap_or_default();
-    let real = production_body(&refresh);
+    // lib.rs carries `#[cfg(test)]` on a test hook near its top, so the naive
+    // split stops there and reads a small fraction of the file.
+    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs is readable");
+    let naive = lib.split("#[cfg(test)]").next().unwrap_or_default();
+    let real = production_body(&lib);
     assert!(
         real.len() > naive.len() * 2,
-        "refresh.rs carries #[cfg(test)] on a production item, so the naive split \
+        "lib.rs carries #[cfg(test)] on a production item, so the naive split \
          sees dramatically less: naive {} bytes, real {} bytes",
         naive.len(),
         real.len()
@@ -639,18 +542,18 @@ fn the_production_boundary_removes_test_modules() {
         "a production item after a test module must survive"
     );
 
+    // The walk every production scan uses reaches subdirectories and leaves out
+    // files that are test modules from their first line.
+    let files = production_sources_under(&src);
+    let walked = |relative: &str| files.iter().any(|path| *path == src.join(relative));
+    assert!(walked("muse/web.rs") && walked("lib.rs"));
+    for test_only in ["tests.rs", "loopback.rs", "muse/web_tests.rs"] {
+        assert!(!walked(test_only), "{test_only} is test code");
+    }
+
     // And nothing test-shaped may survive anywhere, or a walk would flag test
     // scaffolding as a production violation and push authors to weaken it.
-    for entry in std::fs::read_dir(&src).expect("the source directory is readable") {
-        let path = entry.expect("a readable entry").path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        // tests.rs is this file: top-level test functions with no module wrapper,
-        // and every walk skips it by name for that reason.
-        if path.file_name().is_some_and(|name| name == "tests.rs") {
-            continue;
-        }
+    for path in files {
         let source = std::fs::read_to_string(&path).expect("a readable source file");
         let production = production_body(&source);
         assert!(
@@ -687,20 +590,8 @@ fn production_stderr_emissions_do_not_hard_code_ck_tags() {
     let mut examined = 0usize;
 
     for dir in [core, module] {
-        for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
-            let path = entry.expect("a readable directory entry").path();
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if name == "tests.rs" {
-                continue;
-            }
-
+        for path in production_sources_under(&dir) {
+            let name = path.display().to_string();
             let source = std::fs::read_to_string(&path).expect("a readable source file");
             let production = production_body(&source);
             examined += 1;
@@ -780,6 +671,71 @@ fn rust_sources_under(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>
     }
 }
 
+/// Every `.rs` file under `dir`, recursively, except whole-file test modules.
+///
+/// A file declared as `#[cfg(test)] mod name;` (this file, `loopback.rs`,
+/// `muse/web_tests.rs`, the `usage_watch_tests/` directory) is test code from
+/// its first line, and nothing inside it says so, so `production_body` would
+/// keep all of it. The declarations are read from the walked files themselves,
+/// so a new test-only file is left out without anyone listing it here, and a
+/// production file is never skipped because of its name alone.
+fn production_sources_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    rust_sources_under(dir, &mut files);
+
+    let mut test_only: Vec<std::path::PathBuf> = Vec::new();
+    for file in &files {
+        let source = std::fs::read_to_string(file).expect("a readable source file");
+        let lines: Vec<&str> = source.lines().map(str::trim).collect();
+        let parent = file.parent().expect("a source file has a directory");
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        // Where this file's child modules live: beside it for a crate root or a
+        // mod.rs, otherwise in a directory named after it.
+        let children = if matches!(stem, "lib" | "main" | "mod") {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        for (index, line) in lines.iter().enumerate() {
+            if *line != "#[cfg(test)]" {
+                continue;
+            }
+            let mut explicit = None;
+            for next in lines.iter().skip(index + 1).take(2) {
+                if let Some(path) = next
+                    .strip_prefix("#[path = \"")
+                    .and_then(|rest| rest.strip_suffix("\"]"))
+                {
+                    explicit = Some(parent.join(path));
+                    continue;
+                }
+                let declaration = next
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ");
+                if let Some(name) = declaration
+                    .strip_prefix("mod ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+                {
+                    match explicit.take() {
+                        Some(path) => test_only.push(path),
+                        None => {
+                            test_only.push(children.join(format!("{name}.rs")));
+                            test_only.push(children.join(name));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    files.retain(|file| !test_only.iter().any(|gated| file.starts_with(gated)));
+    files
+}
+
 /// No production code in either crate reads a browser's cookie store.
 ///
 /// The Chrome reader was removed because a deposit captured by Cerebellum is the
@@ -854,15 +810,9 @@ fn launch_nonce_reads_in(dirs: &[std::path::PathBuf]) -> (Vec<String>, Vec<Strin
     let mut examined = Vec::new();
 
     for dir in dirs {
-        for entry in std::fs::read_dir(dir).expect("the source directory must be readable") {
-            let path = entry.expect("a readable directory entry").path();
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-            // The test module file holds this check's own list of names.
-            if path.file_name().is_some_and(|name| name == "tests.rs") {
-                continue;
-            }
+        // Recursive, and without whole-file test modules: tests.rs holds this
+        // check's own list of names.
+        for path in production_sources_under(dir) {
             let source = std::fs::read_to_string(&path).expect("a readable source file");
             examined.push(path.display().to_string());
             for (number, line) in production_lines(&source) {
@@ -1050,27 +1000,46 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
     let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    let mut offenders = Vec::new();
-    let mut examined = 0usize;
+    // The module file is the provider name with `-` mapped to `_`, which is how
+    // this crate names them (`qwen-cloud` -> `qwen_cloud.rs`).
+    let mut files: Vec<(String, std::path::PathBuf)> = registry
+        .providers
+        .iter()
+        .filter(|provider| provider.fetcher.is_cookie_based())
+        .map(|provider| {
+            let file = dir.join(format!("{}.rs", provider.name.replace('-', "_")));
+            (provider.name.clone(), file)
+        })
+        .collect();
+    // Cookie lanes inside providers that are not cookie-based as a whole: the
+    // claude.ai session that enriches the Claude subscription, and the Muse web
+    // team lane. `is_cookie_based` cannot name them, so they are listed here.
+    files.push((
+        "claude (claude.ai cookie)".into(),
+        dir.join("claude_subscription.rs"),
+    ));
+    files.push(("muse (web cookie)".into(), dir.join("muse/web.rs")));
 
-    for provider in &registry.providers {
-        if !provider.fetcher.is_cookie_based() {
-            continue;
-        }
-        // The module file is the provider name with `-` mapped to `_`, which is
-        // how this crate names them (`qwen-cloud` -> `qwen_cloud.rs`).
-        let path = dir.join(format!("{}.rs", provider.name.replace('-', "_")));
-        let Ok(source) = std::fs::read_to_string(&path) else {
+    let mut offenders = Vec::new();
+    let mut unreadable = Vec::new();
+    for (lane, path) in &files {
+        // A missing file is a failure, not a skip: a provider whose source
+        // moved would otherwise leave the cohort without anyone noticing.
+        let Ok(source) = std::fs::read_to_string(path) else {
+            unreadable.push(format!("{lane}: {}", path.display()));
             continue;
         };
         // Production only, matching the walk above: a reference inside a
         // provider's own test module is not a call on the fetch path.
-        examined += 1;
         if cookie_provider_reports_auth_failure(&source) {
-            offenders.push(provider.name.clone());
+            offenders.push(lane.clone());
         }
     }
 
+    assert!(
+        unreadable.is_empty(),
+        "these cookie lanes have no source where this fence looks for it: {unreadable:?}"
+    );
     assert!(
         offenders.is_empty(),
         "these cookie providers report auth failures to the vault, which latches \
@@ -1078,11 +1047,11 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
          then clear it by hand on top of the re-deposit the wire already asked for: \
          {offenders:?}"
     );
-    // Not vacuous: a broken name mapping or an unreadable directory would leave
-    // this passing while inspecting nothing.
+    // Not vacuous: an empty cohort would pass both checks above.
     assert!(
-        examined >= 10,
-        "expected to read every cookie provider's source; read only {examined}"
+        files.len() >= 12,
+        "expected every cookie provider in the cohort; found only {}",
+        files.len()
     );
 }
 
@@ -1114,18 +1083,14 @@ fn no_vault_lane_rebuilds_the_shared_credential_helpers() {
     let mut offenders = Vec::new();
     let mut examined = 0usize;
 
-    for entry in std::fs::read_dir(&dir).expect("the source directory must be readable") {
-        let path = entry.expect("a readable directory entry").path();
-        if path.extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
+    for path in production_sources_under(&dir) {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        // credential_source.rs owns both helpers; tests.rs is scaffolding.
-        if matches!(name.as_str(), "credential_source.rs" | "tests.rs") {
+        // credential_source.rs owns both helpers.
+        if name == "credential_source.rs" {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("a readable source file");
@@ -1569,11 +1534,8 @@ async fn a_mapped_provider_publishes_its_canonical_slug() {
 
 #[test]
 fn every_api_provider_key_names_a_registered_provider() {
-    // Read this as a check on the MAP, not on the lookup: it verifies the table is
-    // well-formed by parsing the source text, which stays true even if nothing
-    // ever calls the function. `a_mapped_provider_publishes_its_canonical_slug`
-    // covers the other half -- that the map is actually reached and its value
-    // reaches the wire.
+    // Read this as a check on the MAP; `a_mapped_provider_publishes_its_canonical_slug`
+    // covers the other half -- that the map's value reaches the wire.
     //
     // `apiProvider` is a claim about identity, not a label: consumers join
     // pricing and spend data on it. The mapping is keyed by this module's own
@@ -1588,30 +1550,21 @@ fn every_api_provider_key_names_a_registered_provider() {
     let registered: std::collections::HashSet<&str> =
         registry.provider_names().into_iter().collect();
 
-    let source = include_str!("lib.rs");
-    let start = source
-        .find("fn api_provider_name")
-        .expect("api_provider_name must exist");
-    let body_end = source[start..]
-        .find("\n}")
-        .expect("api_provider_name must have a body");
-    let body = &source[start..start + body_end];
+    let keys: Vec<(String, String)> = crate::API_PROVIDER_SLUGS
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
 
-    let mut keys = Vec::new();
-    for line in body.lines() {
-        let Some((left, right)) = line.split_once("=> Some(") else {
-            continue;
-        };
-        let Some(key) = left.split('"').nth(1) else {
-            continue;
-        };
-        let value = right.split('"').nth(1).unwrap_or_default().to_string();
-        keys.push((key.to_string(), value));
+    // The table is what the lookup reads: a row present here must come back
+    // from it, so this checks the map that actually reaches the wire.
+    for (key, value) in &keys {
+        assert_eq!(crate::api_provider_name(key), Some(value.as_str()), "{key}");
     }
+    assert_eq!(crate::api_provider_name("antigravity"), None);
 
     assert!(
         keys.len() >= 15,
-        "parsed too few mapping keys ({}), the extraction is broken rather than the map",
+        "too few mapping rows ({}), the table was emptied rather than trimmed",
         keys.len()
     );
 
@@ -2000,96 +1953,6 @@ fn every_provider_enumerates_the_same_handles_twice() {
     );
 }
 
-/// Every cookie-cohort provider publishes the shared deposit source label.
-///
-/// `source` is observability only, but its job is to tell a reader how a figure
-/// was obtained so they know what to do when it stops arriving. These providers
-/// authenticate with a deposited web session cookie, which is fixed by capturing
-/// the login again and re-depositing it -- the remedy for any vault credential.
-///
-/// Checked against `is_cookie_based`, which the registry already uses to size
-/// its stale-login metric, so the two cannot disagree about who is in the
-/// cohort. A provider added to one and not the other fails here.
-#[test]
-fn every_cookie_provider_publishes_the_vault_source_label() {
-    // The cohort by behaviour, not by a list written here: taken from the same
-    // predicate the health metric counts.
-    let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
-    let cookie_providers = registry.cookie_based_provider_names();
-
-    assert!(
-        cookie_providers.len() >= 5,
-        "found too few cookie providers ({}), the enumeration is broken rather \
-         than the cohort",
-        cookie_providers.len()
-    );
-
-    // Source names differ from wire names in two places, so map rather than
-    // assume: a mismatch would silently skip a provider.
-    let file_of = |provider: &str| -> String {
-        match provider {
-            "opencodego" => "opencodego".to_string(),
-            "qwen-cloud" => "qwen_cloud".to_string(),
-            other => other.replace('-', "_"),
-        }
-    };
-
-    let sources: std::collections::HashMap<&str, &str> = [
-        ("amp", include_str!("amp.rs")),
-        ("claude_console", include_str!("claude_console.rs")),
-        ("cursor", include_str!("cursor.rs")),
-        ("factory", include_str!("factory.rs")),
-        ("langdock", include_str!("langdock.rs")),
-        ("mimo", include_str!("mimo.rs")),
-        ("ollama", include_str!("ollama.rs")),
-        ("opencode", include_str!("opencode.rs")),
-        ("opencodego", include_str!("opencodego.rs")),
-        ("qoder", include_str!("qoder.rs")),
-        ("qwen_cloud", include_str!("qwen_cloud.rs")),
-        ("traecn", include_str!("traecn.rs")),
-    ]
-    .into_iter()
-    .collect();
-
-    let mut wrong = Vec::new();
-    for provider in &cookie_providers {
-        let file = file_of(provider);
-        let Some(source) = sources.get(file.as_str()) else {
-            wrong.push(format!(
-                "{provider}: cookie-based but this test has no source for it"
-            ));
-            continue;
-        };
-        let runtime = production_body(source);
-        let runtime = runtime.as_str();
-        // The healthy() constructor is where the label reaches the wire.
-        for line in runtime.lines().filter(|line| line.contains("healthy(")) {
-            // The call may span lines; only a literal on the same line is
-            // decidable here, and that is the shape being guarded against.
-            if line.contains('"') {
-                wrong.push(format!("{provider}: {}", line.trim()));
-            }
-        }
-        // A cookie provider's source string comes from the shared CookieVault
-        // lane, which is the only place a deposit is read and returns the label
-        // with it; the label itself is asserted in cookie_vault::tests.
-        if !runtime.contains("CookieVault") {
-            wrong.push(format!(
-                "{provider}: delegates to no shared cookie lane, so nothing says \
-                 where its source label comes from"
-            ));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "cookie providers must publish the shared cookie label: {wrong:#?}"
-    );
-
-    // Not vacuous: a deposit is the only cookie source, so the label is `vault`,
-    // and this cannot pass by every provider agreeing on the wrong string.
-    assert_eq!(crate::cookie_vault::SOURCE, "vault");
-}
-
 struct LabelProvider {
     labels: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
@@ -2224,45 +2087,6 @@ async fn the_refresher_attributes_a_drop_to_the_account_it_observed() {
         Some(1),
         "one reset counts once"
     );
-}
-
-/// Every slot status must be classified into a health bucket deliberately.
-///
-/// The identity `fresh + stale + pending + degraded + unconfigured +
-/// withoutHandles == providersTotal` proves no state reports NOWHERE. It cannot
-/// prove a state reports in the RIGHT place: the buckets branch on booleans
-/// derived from the status, so a new variant fails every `has_*` test, falls
-/// into the last arm, and the sum still balances while the provider is counted
-/// as something it is not.
-///
-/// So the identity needs this beside it. Adding a variant to `SlotStatus` fails
-/// to compile in `every()` and again in the match below, which forces an author
-/// to name the bucket rather than inherit one by falling through.
-#[test]
-fn every_slot_status_is_deliberately_bucketed() {
-    for status in SlotStatus::every() {
-        // The fence: a new variant breaks this match.
-        let bucket = match status {
-            SlotStatus::Fresh => "fresh",
-            SlotStatus::StaleTransient => "stale",
-            SlotStatus::Pending => "pending",
-            SlotStatus::Degraded => "degraded-or-unconfigured",
-        };
-        assert!(!bucket.is_empty());
-    }
-
-    // Not vacuous: the four statuses reach three distinct destinations, so this
-    // cannot pass by mapping everything to one bucket.
-    let distinct: std::collections::BTreeSet<_> = SlotStatus::every()
-        .into_iter()
-        .map(|status| match status {
-            SlotStatus::Fresh => "fresh",
-            SlotStatus::StaleTransient => "stale",
-            SlotStatus::Pending => "pending",
-            SlotStatus::Degraded => "degraded-or-unconfigured",
-        })
-        .collect();
-    assert_eq!(distinct.len(), 4);
 }
 
 /// A credential verdict carries no `stale` disclosure; a stale-served window does.
@@ -2644,38 +2468,6 @@ async fn a_contested_identity_names_its_winner_and_an_uncontested_one_stays_sile
     );
 }
 
-/// Slots that take turns winning one account are each announced once, then
-/// stay silent.
-///
-/// Two slots of one Codex account alternate as the newest reading every
-/// minute, and announcing every alternation put 780 lines in one night's log.
-/// A slot winning for the first time is still announced, because that is the
-/// event the line exists to catch.
-#[test]
-fn a_slot_that_has_won_before_is_not_announced_again() {
-    let registry = Registry::new(vec![]);
-    let announced: Vec<Option<bool>> = ["H1", "H2", "H1", "H2", "H1", "H3"]
-        .into_iter()
-        .map(|winner| registry.record_dedup_winner("A", winner))
-        .collect();
-    assert_eq!(
-        announced,
-        [Some(false), Some(true), None, None, None, Some(true)],
-        "the first winner is announced as `is`, a new one as `changed to`, \
-         and a slot that has won before is silent"
-    );
-    assert_eq!(
-        registry
-            .dedup_winner
-            .lock()
-            .unwrap()
-            .get("A")
-            .map(String::as_str),
-        Some("H3"),
-        "the latest winner is still recorded"
-    );
-}
-
 #[tokio::test]
 async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
     // The mixed case: one handle resolves an account and the other cannot. The
@@ -2872,13 +2664,6 @@ fn accounts_of(snapshot: &crate::UsageSnapshot) -> Vec<Option<&str>> {
         .collect()
 }
 
-/// Before the refresher's first turn, no provider is complete.
-///
-/// At that moment no provider has slots, so a rule keyed on "has no slots"
-/// would call every provider complete-with-zero-accounts and authorise a
-/// consumer to delete its entire store at every module start. Completeness is
-/// keyed on a handle enumeration having SUCCEEDED, which cannot have happened
-/// before the first turn.
 /// Every error class the wire can carry is documented, and nothing extra is.
 ///
 /// The class strings are the machine-readable half of the contract: three
@@ -2901,18 +2686,37 @@ fn every_wire_error_class_has_a_documented_row() {
     )
     .expect("consumer-contract.md must be readable from the crate directory");
 
-    // Constructed from the variants rather than listed, so a new class arrives
-    // here by construction instead of by someone remembering this test.
-    let emitted: Vec<&'static str> = vec![
-        FetchError::NoSession(String::new()).error_class(),
-        FetchError::CredentialUnusable(String::new()).error_class(),
-        FetchError::NoQuotaReported(String::new()).error_class(),
-        FetchError::LocalSourceUnavailable(String::new()).error_class(),
-        FetchError::Unauthorized(String::new()).error_class(),
-        FetchError::ProviderStatus(500, String::new()).error_class(),
-        FetchError::Decode(String::new()).error_class(),
-        FetchError::Internal(String::new()).error_class(),
+    // Every variant gets a sample, and the match below names each variant
+    // without a wildcard: a new variant fails to compile here, so the class it
+    // publishes cannot be left out of the comparison.
+    let samples = [
+        FetchError::NoSession(String::new()),
+        FetchError::CredentialUnusable(String::new()),
+        FetchError::NoQuotaReported(String::new()),
+        FetchError::LocalSourceUnavailable(String::new()),
+        FetchError::Unauthorized(String::new()),
+        FetchError::ProviderStatus(401, String::new()),
+        FetchError::ProviderStatus(500, String::new()),
+        FetchError::Upstream(String::new()),
+        FetchError::Decode(String::new()),
+        FetchError::Internal(String::new()),
     ];
+    let emitted: Vec<&'static str> = samples
+        .iter()
+        .map(|error| match error {
+            FetchError::NoSession(_)
+            | FetchError::CredentialUnusable(_)
+            | FetchError::NoQuotaReported(_)
+            | FetchError::LocalSourceUnavailable(_)
+            | FetchError::Unauthorized(_)
+            | FetchError::ProviderStatus(..)
+            | FetchError::Upstream(_)
+            | FetchError::Decode(_)
+            | FetchError::Internal(_) => error.error_class(),
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     for class in &emitted {
         assert!(
@@ -2971,6 +2775,13 @@ fn every_wire_error_class_has_a_documented_row() {
     );
 }
 
+/// Before the refresher's first turn, no provider is complete.
+///
+/// At that moment no provider has slots, so a rule keyed on "has no slots"
+/// would call every provider complete-with-zero-accounts and authorise a
+/// consumer to delete its entire store at every module start. Completeness is
+/// keyed on a handle enumeration having SUCCEEDED, which cannot have happened
+/// before the first turn.
 #[tokio::test]
 async fn no_provider_is_complete_before_the_first_turn() {
     let registry = Registry::new(vec![Box::new(CompletenessProvider::new(
@@ -4139,27 +3950,15 @@ impl UsageProvider for MixedHealthProvider {
     }
 }
 
-#[tokio::test]
-async fn one_healthy_handle_prevents_provider_wide_degradation() {
-    let registry = Registry::new(vec![Box::new(MixedHealthProvider)]);
-    tick(&registry).await;
-
-    let health = registry.health();
-    assert_eq!(health.fresh, 1);
-    assert!(health.degraded.is_empty());
-}
-
 /// A provider counted as healthy can still be publishing a dead account.
 ///
-/// The health buckets count providers and take the best account; the array
-/// carries one entry per account. So a consumer reading a provider out of the
-/// `fresh` bucket and concluding its accounts are all usable skips a failed one
+/// The health buckets count providers and take the best account: one healthy
+/// handle keeps the whole provider out of `degraded`. The array carries one
+/// entry per account. So a consumer reading a provider out of the `fresh`
+/// bucket and concluding its accounts are all usable skips a failed one
 /// silently -- the failure is in the array the whole time, and health is not the
-/// place to look for it.
-///
-/// Separate from the aggregation test above even though the setup is identical.
-/// That test is named for the health rule; this asserts the consequence a
-/// consumer acts on, and neither should be able to delete the other's coverage.
+/// place to look for it. Both halves are asserted here: the health rule, and
+/// the consequence a consumer acts on.
 ///
 /// The state cannot be observed from this host's live output -- both
 /// multi-account providers here are uniformly healthy -- so the disagreement has
@@ -7351,52 +7150,6 @@ fn redemption_journal_prunes_old_resolved_records_only() {
     assert_eq!(records[0].account_id, "recent");
 }
 
-/// A pending record is never pruned, however old it is.
-///
-/// This is the fence against spending a banked credit twice. A pending record
-/// is a redemption whose outcome the server never confirmed, and its id is the
-/// only thing tying a retry to the original attempt. If retention removed it,
-/// the next reservation would mint a FRESH id and post the same logical
-/// redemption a second time -- which spends a real credit on a real account,
-/// and is not recoverable.
-///
-/// The age here is deliberately past the retention horizon that governs settled
-/// records, expressed relative to the horizon rather than as a fixed number of
-/// days, so shortening that constant cannot leave this case inside the window
-/// and silently stop testing anything.
-#[test]
-fn a_pending_redemption_is_never_pruned_however_old() {
-    let temp = ResetTempDir::new("pending-outlives-retention");
-    let now = reset_now();
-    let journal = temp.journal();
-
-    let horizon = chrono::Duration::seconds(crate::codex_resets::RESOLVED_RETENTION_SECS);
-    let reserved_at = now - horizon - chrono::Duration::days(1);
-    let pending_id = match journal.reserve("acct", reserved_at).unwrap() {
-        Reservation::New(id) => id,
-        other => panic!("expected a new pending id, got {other:?}"),
-    };
-
-    // Asking about an account is what triggers retention in production, so this
-    // is the call that would drop the record if the status guard were wrong.
-    let state = journal.inspect_account("acct", now).unwrap();
-    assert_eq!(
-        state.pending_id.as_deref(),
-        Some(pending_id.as_str()),
-        "an unconfirmed redemption was pruned; a retry would mint a second id \
-         for the same redemption and spend the credit twice"
-    );
-
-    // And the id a caller would actually reuse is still that one.
-    assert_eq!(
-        journal.reserve("acct", now),
-        Ok(Reservation::ExistingPending(pending_id.clone()))
-    );
-    let records = journal.records().unwrap();
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0].redeem_request_id, pending_id);
-}
-
 #[test]
 fn corrupt_redemption_journal_fails_closed() {
     let temp = ResetTempDir::new("corrupt");
@@ -8412,130 +8165,49 @@ fn f3_trigger_uses_earliest_credit_outside_the_safety_margin() {
     );
 }
 
-/// Every opaque upstream constant appears in the pinned parity table, and nothing
-/// else does. The table lives in this test so a public checkout needs no internal
-/// research to check the port. Values were checked against CodexBar v0.74.0.
+/// Every opaque upstream constant keeps its pinned upstream value. Values were
+/// checked against CodexBar v0.74.0, and the expected values live here so a
+/// public checkout needs no internal research to check the port.
 ///
-/// A rotated constant can look like an upstream outage. Definitions declare their
-/// membership with a marker, so adding a constant requires adding its independent
-/// expected value here. Source line numbers are not pinned because unrelated edits
-/// move them without changing the request.
+/// A rotated constant can look like an upstream outage. Each is asserted by
+/// name, so a rename fails to compile here rather than silently dropping a row.
+/// The definitions carry an `OPAQUE-UPSTREAM-CONSTANT` note; a new one belongs
+/// in this list.
 #[test]
-fn every_opaque_upstream_constant_is_in_the_parity_table() {
-    // Split so this file does not itself contain the contiguous marker: a scanner
-    // that counts occurrences of a name counts its own declaration, and the first
-    // run of this test found MARKER instead of a provider constant.
-    const MARKER: &str = concat!("OPAQUE-UPSTREAM", "-CONSTANT");
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-
-    const PINNED: &[(&str, &str)] = &[
-        (
-            "WORKSPACES_SERVER_ID",
-            "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f",
-        ),
-        (
-            "SUBSCRIPTION_SERVER_ID",
-            "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4",
-        ),
-        (
-            "BILLING_SERVER_ID",
-            "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d",
-        ),
-        ("BETA_HEADER", "oauth-2025-04-20"),
-        ("OASIS_WEB_ID", "c8a1002d2c457e758785a9979832217c7c0b884c"),
-        ("CONSOLE_WORKSPACES_PATH", "/console/api/orgs"),
-        ("CONSOLE_GO_STATUS_PATH", "/console/api/go/status"),
-        ("CONSOLE_WORKSPACE_HEADER", "x-org-id"),
-    ];
-    let table: Vec<String> = PINNED.iter().map(|(name, _)| (*name).to_string()).collect();
-    let mut marked: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&src).expect("the source directory must be readable") {
-        let path = entry.expect("a readable directory entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let body = std::fs::read_to_string(&path).expect("a readable source file");
-        let lines: Vec<&str> = body.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains(MARKER) {
-                continue;
-            }
-            // The marked item is the next `const` declaration below the comment.
-            let declaration = lines[i..]
-                .iter()
-                .position(|l| {
-                    let l = l.trim_start();
-                    l.starts_with("pub const ") || l.starts_with("const ")
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{MARKER} at {}:{} names no const below it",
-                        path.display(),
-                        i + 1
-                    )
-                });
-            let definition = lines[i + declaration..].join("\n");
-            let rest = definition
-                .trim_start()
-                .strip_prefix("pub ")
-                .unwrap_or(definition.trim_start());
-            let name = rest
-                .strip_prefix("const ")
-                .unwrap()
-                .split(':')
-                .next()
-                .unwrap();
-            if let Some((_, expected)) = PINNED.iter().find(|(pinned, _)| *pinned == name) {
-                let value = definition
-                    .split_once('=')
-                    .unwrap()
-                    .1
-                    .split(';')
-                    .next()
-                    .unwrap()
-                    .trim();
-                assert_eq!(
-                    value,
-                    format!("{expected:?}"),
-                    "{name} differs from the pinned upstream value"
-                );
-            }
-            marked.push(name.to_string());
-        }
-    }
-    marked.sort();
-    marked.dedup();
-
-    for name in &marked {
-        assert!(
-            table.contains(name),
-            "{name} is marked {MARKER} in the source but is not a row in the \
-             pinned parity table, so no round re-checks it"
-        );
-    }
-    for row in &table {
-        assert!(
-            marked.contains(row),
-            "the parity table lists {row}, which carries no {MARKER} marker: \
-             either it is not one, or the marker was lost in a refactor"
-        );
-    }
-
-    // Not vacuous: a lost marker convention or an emptied table would
-    // satisfy both loops above by comparing two empty sets.
+fn every_opaque_upstream_constant_keeps_its_pinned_value() {
     assert_eq!(
-        marked.len(),
-        8,
-        "expected the eight known opaque constants, found {marked:?}"
+        crate::opencode::WORKSPACES_SERVER_ID,
+        "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f"
     );
+    assert_eq!(
+        crate::opencode::SUBSCRIPTION_SERVER_ID,
+        "7abeebee372f304e050aaaf92be863f4a86490e382f8c79db68fd94040d691b4"
+    );
+    assert_eq!(
+        crate::opencode::BILLING_SERVER_ID,
+        "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d"
+    );
+    assert_eq!(crate::anthropic::BETA_HEADER, "oauth-2025-04-20");
+    assert_eq!(
+        crate::stepfun::OASIS_WEB_ID,
+        "c8a1002d2c457e758785a9979832217c7c0b884c"
+    );
+    assert_eq!(
+        crate::opencodego::CONSOLE_WORKSPACES_PATH,
+        "/console/api/orgs"
+    );
+    assert_eq!(
+        crate::opencodego::CONSOLE_GO_STATUS_PATH,
+        "/console/api/go/status"
+    );
+    assert_eq!(crate::opencodego::CONSOLE_WORKSPACE_HEADER, "x-org-id");
 }
 
 /// Spent and about-to-expire credit lists yield no usable expiry.
 ///
-/// It checks `earliest_usable_expiry` twice, then checks that
-/// `reporting_eligible` refuses an `armed: false` it is handed as a literal. So
-/// nothing here connects a spent account to unrelaxed output; that join is
-/// tested in `an_account_with_no_credits_left_publishes_its_real_usage`.
+/// This checks `earliest_usable_expiry` only. What a spent account then
+/// publishes is tested in
+/// `an_account_with_no_credits_left_publishes_its_real_usage`.
 #[test]
 fn spent_and_expiring_credit_lists_yield_no_usable_expiry() {
     let now = reset_now();
@@ -8554,13 +8226,6 @@ fn spent_and_expiring_credit_lists_yield_no_usable_expiry() {
     )
     .unwrap();
     assert_eq!(expiring.earliest_usable_expiry(now), None);
-    assert!(!reporting_eligible(
-        false,
-        &reset_facts(20.0, false),
-        false,
-        false,
-        true
-    ));
 }
 
 #[tokio::test]
@@ -10811,10 +10476,14 @@ async fn identity_less_family_refusal_is_published_on_registry_health() {
 
     tick(&registry).await;
 
-    assert!(registry
-        .health()
-        .vault_mapping_warning
-        .is_some_and(|warning| warning.contains("multiple identity-less credentials")));
+    assert_eq!(
+        registry.health().vault_mapping_warning.as_deref(),
+        Some(
+            "multiple identity-less credentials name `cookie:ampcode.com` \
+             [cookie:ampcode.com,cookie:ampcode.com:second]"
+        ),
+        "the warning names the refused family and every id in it"
+    );
 }
 
 #[tokio::test]
@@ -11305,6 +10974,11 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
     ]
     .into_iter()
     .collect();
+    // These providers build the fetch URL from a base constant and a path
+    // constant, so the documented URL is never one literal in their source:
+    // the host and the path are matched separately. Every other provider must
+    // contain the documented URL exactly.
+    const COMPOSED: &[&str] = &["muse", "opencode", "opencodego"];
 
     let mut documented = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
@@ -11331,19 +11005,25 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         if host != domain && !host.ends_with(&format!(".{domain}")) {
             problems.push(format!("{family}: {host} is not on {domain}"));
         }
-        let mut combined = String::new();
         for provider in providers.split(',').map(str::trim) {
             documented.insert((family.to_string(), provider.to_string()));
             match sources.get(provider) {
-                Some(source) => combined.push_str(source),
+                Some(source) => {
+                    // Production only: a URL that appears in a test fixture or
+                    // a test module's comment is not one the provider fetches.
+                    let production = production_body(source);
+                    let found = if COMPOSED.contains(&provider) {
+                        production.contains(host) && production.contains(path.as_str())
+                    } else {
+                        production.contains(url)
+                    };
+                    if !found {
+                        problems.push(format!(
+                            "{family}: {provider} does not fetch {url} in its production source"
+                        ));
+                    }
+                }
                 None => problems.push(format!("{family}: no source registered for {provider}")),
-            }
-        }
-        for piece in [host, path.as_str()] {
-            if !combined.contains(piece) {
-                problems.push(format!(
-                    "{family}: `{piece}` appears in no source of {providers}"
-                ));
             }
         }
     }

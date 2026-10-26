@@ -527,9 +527,14 @@ mod tests {
             "data": serde_json::to_string(&inner).unwrap()
         });
         let usage = normalize_usage(payload.to_string().as_bytes()).unwrap();
-        assert!(usage.primary.is_some());
-        assert!(usage.secondary.is_some());
-        assert!(usage.tertiary.is_some());
+        // The same readings as the unwrapped payload above.
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 25.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
+        let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 20.0);
+        assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(usage.tertiary.unwrap().used_percent, 20.0);
     }
 
     #[test]
@@ -564,13 +569,20 @@ mod tests {
         let payload = json!({ "codingPlanQuotaInfo": quota });
         let usage = normalize_usage(payload.to_string().as_bytes()).unwrap();
         assert!(usage.secondary.is_none());
+        // Only that window: the others keep their readings.
+        assert_eq!(usage.primary.unwrap().used_percent, 25.0);
+        assert_eq!(usage.tertiary.unwrap().used_percent, 20.0);
     }
 
     #[test]
     fn intl_quota_url_has_expected_query() {
         let url = quota_url_from_host(INTL_GATEWAY, &INTL_REGION).unwrap();
-        assert!(url.contains("/data/api.json"));
-        assert!(url.contains("queryCodingPlanInstanceInfoV2"));
-        assert!(url.contains("ap-southeast-1"));
+        assert_eq!(
+            url,
+            "https://modelstudio.console.alibabacloud.com/data/api.json\
+             ?action=zeldaEasy.broadscope-bailian.codingPlan.queryCodingPlanInstanceInfoV2\
+             &product=broadscope-bailian&api=queryCodingPlanInstanceInfoV2\
+             &currentRegionId=ap-southeast-1"
+        );
     }
 }

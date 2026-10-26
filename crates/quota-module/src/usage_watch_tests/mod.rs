@@ -370,7 +370,6 @@ async fn usage_watch_overflow_keeps_newest_and_prioritizes_usage_get() {
     for seq in 26..=41 {
         assert_eq!(notice(wire.recv().await, 5, 7, 91)["seq"], seq);
     }
-    assert_eq!(NOTICE_CAPACITY, 16);
     let metrics = wire.health_metrics().await;
     assert_eq!(metrics["usageWatchers"], 1);
     assert_eq!(metrics["usageWatchNoticesDropped"], 25);

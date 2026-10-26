@@ -330,6 +330,27 @@ pub fn windows_mut(usage: &mut Usage) -> impl Iterator<Item = &mut RateWindow> {
 #[cfg(test)]
 mod tests {
 
+    /// Counts are published only as a whole-number pair.
+    ///
+    /// A fractional count is refused rather than rounded: a fraction means the
+    /// field is not the count it looks like, and rounding would invent a
+    /// precision the upstream never claimed. A count with no usable total, or a
+    /// total with no usable count, is refused too, since the consumer would
+    /// have to guess the missing half. Non-finite and negative values are
+    /// refused on the same footing.
+    #[test]
+    fn window_counts_publish_only_a_whole_number_pair() {
+        for (used, total, expected) in [
+            (25.0, 100.0, (Some(25.0), Some(100.0))),
+            (45.05, 100.0, (None, None)),
+            (25.0, 99.5, (None, None)),
+            (25.0, f64::NAN, (None, None)),
+            (f64::INFINITY, 100.0, (None, None)),
+            (-1.0, 100.0, (None, None)),
+        ] {
+            assert_eq!(window_counts(used, total), expected, "{used} of {total}");
+        }
+    }
     /// `accountInfo`'s emitted key set is CLOSED, in both directions.
     ///
     /// This type lives in the shared `cortexkit-provider-usage` crate, so a field

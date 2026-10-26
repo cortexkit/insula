@@ -141,6 +141,8 @@ impl Transport for HttpTransport {
 /// If this client cannot be built, the shared `provider_client()` is used
 /// instead; it follows redirects, but drops the Cookie and Authorization
 /// headers whenever a redirect leaves the host.
+// Redirects are turned off (see above); the shared pool idle bound is kept.
+#[allow(clippy::disallowed_methods)]
 fn no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

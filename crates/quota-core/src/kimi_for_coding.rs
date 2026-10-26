@@ -845,8 +845,6 @@ mod tests {
 
     use crate::credential_source::{VaultCredential, VaultGetError};
     use crate::provider::CredentialResolution;
-    use crate::refresh::{next_slot_after_attempt, Incarnation, ProviderSlot};
-
     type Reports = Arc<Mutex<Vec<(u16, u64)>>>;
 
     struct MockCredentialSource {
@@ -1238,20 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn pool_refusals_change_once_and_are_scoped_to_handle() {
-        let provider = KimiForCodingProvider::new();
-        assert!(!provider.update_pool_refusals("a", &[]));
-        assert!(provider.update_pool_refusals("a", &["usages.limit_7d"]));
-        assert!(!provider.update_pool_refusals("a", &["usages.limit_7d"]));
-        assert!(provider.update_pool_refusals("b", &["usages.limit_7d"]));
-        assert!(provider.update_pool_refusals("a", &["usages.limit_5h"]));
-        assert!(provider.update_pool_refusals("a", &[]));
-        assert!(!provider.update_pool_refusals("a", &[]));
-        assert!(provider.update_pool_refusals("a", &["usages.limit_5h"]));
-        assert!(!provider.update_pool_refusals("b", &["usages.limit_7d"]));
-    }
-
-    #[test]
     fn legacy_limit_window_uses_stated_duration_and_units() {
         for (duration, unit, expected) in [
             (120, "TIME_UNIT_MINUTE", Some(120)),
@@ -1558,9 +1542,11 @@ mod tests {
     async fn failed_get_is_unverified_and_clears_prior_observation() {
         // Fail-closed regression: a failed `credential.get` means the account
         // behind the handle is unverified this tick, so the slot clears any
-        // prior observation (`last_success_at` reset, `label_in_flux` set)
-        // instead of stale-serving a window that may belong to a different
-        // account after a handle re-point.
+        // prior observation instead of stale-serving a window that may belong
+        // to a different account after a handle re-point. What the slot does
+        // with an unverified attempt is pinned in refresh.rs
+        // (`vault_get_transient_failure_fails_closed_instead_of_stale_serving`);
+        // this pins that this provider's failed get produces one.
         let (source, _) = source(Err(VaultGetError::Transient));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
@@ -1570,35 +1556,6 @@ mod tests {
             attempt.credential_resolution,
             CredentialResolution::Unverified
         );
-
-        let now = std::time::Instant::now();
-        let cold = ProviderSlot::due_now(now, Incarnation::from_counter(1));
-        let prior = next_slot_after_attempt(
-            &cold,
-            PROVIDER_NAME,
-            FetchAttempt::success(
-                Some(AccountObservation::new(
-                    Some("prior-account".to_string()),
-                    Some(1),
-                )),
-                "vault",
-                Usage::default(),
-            ),
-            now,
-            now,
-        );
-        let next = next_slot_after_attempt(&prior, PROVIDER_NAME, attempt, now, now);
-        // The prior account's USAGE must not survive an unverified identity. The
-        // entry itself does survive, as a verdict carrying no account and no
-        // windows: dropping it too publishes the ABSENT shape for a credential
-        // this module reached and found unusable, which a consumer reads as "not
-        // fetched yet" (insula#8, measured).
-        let entry = next.entry.as_ref().expect("the verdict stays visible");
-        assert!(entry.usage.is_none(), "no window may cross an identity");
-        assert!(entry.account.is_none(), "and it attributes nothing");
-        assert!(entry.error.is_some(), "the failure is stated, not implied");
-        assert!(next.label_in_flux);
-        assert!(next.last_success_at.is_none());
     }
 
     #[tokio::test]

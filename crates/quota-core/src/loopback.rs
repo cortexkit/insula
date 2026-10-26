@@ -85,6 +85,9 @@ pub async fn serve_once(status: u16, body: Vec<u8>) -> (String, tokio::task::Joi
 
 #[cfg(test)]
 mod tests {
+    // Test clients live for one test, so the pool bound in clippy.toml's
+    // client rule does not apply to them.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// A request split across TCP segments is still read whole.

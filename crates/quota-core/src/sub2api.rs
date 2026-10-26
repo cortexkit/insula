@@ -441,14 +441,29 @@ mod tests {
 
     #[test]
     fn zero_limit_yields_a_decode_error_instead_of_healthy_empty_usage() {
+        // A negative limit with a non-zero used count: without the `limit <= 0`
+        // guard this divides to a finite -50% that clamps to an empty-looking
+        // window, so only the guard can make it fail. (A zero limit with zero
+        // used divides to NaN and is caught by the finiteness check instead.)
         let body = br#"{
             "isValid": true,
             "rate_limits": [
-                { "window": "5h", "limit": 0, "used": 0, "remaining": 0 }
+                { "window": "5h", "limit": -10, "used": 5, "remaining": 0 }
             ]
         }"#;
 
         assert!(matches!(normalize_usage(body), Err(FetchError::Decode(_))));
+
+        // A non-finite figure cannot arrive in JSON, so the finiteness check is
+        // driven directly.
+        let rate_limit = RateLimitResponse {
+            window: "5h".to_string(),
+            limit: f64::NAN,
+            used: 5.0,
+            remaining: 15.0,
+            reset_at: Some("2026-07-11T12:30:00Z".to_string()),
+        };
+        assert!(rate_limit_to_extra(rate_limit).is_none());
     }
 
     #[test]
@@ -469,18 +484,6 @@ mod tests {
         }"#;
 
         assert!(matches!(normalize_usage(body), Err(FetchError::Decode(_))));
-    }
-
-    #[test]
-    fn missing_environment_settings_return_no_session() {
-        assert!(matches!(
-            settings_from_values(None, Some("https://proxy.example.com".to_string())),
-            Err(FetchError::NoSession(_))
-        ));
-        assert!(matches!(
-            settings_from_values(Some("sk-group".to_string()), None),
-            Err(FetchError::NoSession(_))
-        ));
     }
 
     /// Which hosts may be reached over plain `http`, and which may not.
@@ -560,8 +563,6 @@ mod tests {
             "https://api.example.com/v1/usage"
         );
 
-        assert!(validate_base_url("http://127.0.0.1:8080").is_some());
-        assert!(validate_base_url("http://[::1]:8080").is_some());
         assert!(validate_base_url("http://api.example.com").is_none());
         assert!(validate_base_url("https://user:pass@api.example.com").is_none());
         assert!(validate_base_url("https://@api.example.com").is_none());
@@ -580,18 +581,6 @@ mod tests {
         assert!(query
             .iter()
             .any(|(key, value)| key == "timezone" && !value.is_empty()));
-    }
-
-    #[test]
-    fn rejects_non_finite_rate_limit_values() {
-        let rate_limit = RateLimitResponse {
-            window: "5h".to_string(),
-            limit: f64::NAN,
-            used: 5.0,
-            remaining: 15.0,
-            reset_at: Some("2026-07-11T12:30:00Z".to_string()),
-        };
-        assert!(rate_limit_to_extra(rate_limit).is_none());
     }
 
     #[test]

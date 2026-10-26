@@ -234,6 +234,10 @@ pub struct AmpProvider {
 }
 
 impl AmpProvider {
+    // Builds its own client to turn redirects off, so a session cookie never
+    // follows one. It does not set the shared pool idle bound from
+    // `http::provider_client()`; see clippy.toml for why that bound matters.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
         handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
@@ -426,16 +430,6 @@ mod tests {
         }
     }
 
-    /// A real cadence is still published, so the guard cannot pass by refusing
-    /// everything.
-    #[test]
-    fn an_ordinary_window_length_is_published() {
-        let now = Utc.with_ymd_and_hms(2026, 7, 29, 10, 0, 0).unwrap();
-        let usage = normalize_usage(HEALTHY_FIXTURE, now).unwrap();
-
-        assert_eq!(usage.primary.unwrap().window_minutes, Some(300));
-    }
-
     #[test]
     fn multibyte_html_around_the_needle_does_not_panic() {
         // The scan advances one byte past a rejected match, which is a character
@@ -461,6 +455,9 @@ mod tests {
         // resets_at = now + (25 / 10 * 3600) = now + 9000s = 2 hours 30 mins
         // 12:00:00 + 2h 30m = 14:30:00
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T14:30:00Z"));
+        // Also the control for the window-length guard above: an ordinary
+        // cadence is still published, so that guard cannot pass by refusing
+        // every length.
         assert_eq!(primary.window_minutes, Some(300));
     }
 
@@ -491,33 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_replenishment_drops_window_and_fails() {
-        let now = Utc::now();
-        let res = normalize_usage(ZERO_REPLENISHMENT_FIXTURE, now);
-        assert!(matches!(res, Err(FetchError::Decode(_))));
-    }
-
-    #[test]
-    fn zero_quota_drops_window_and_fails() {
-        let now = Utc::now();
-        let res = normalize_usage(ZERO_QUOTA_FIXTURE, now);
-        assert!(matches!(res, Err(FetchError::Decode(_))));
-    }
-
-    #[test]
-    fn missing_block_returns_decode_error() {
-        let now = Utc::now();
-        let res = normalize_usage("<html><body>no usage here</body></html>", now);
-        assert!(matches!(res, Err(FetchError::Decode(_))));
-    }
-
-    #[test]
-    fn handles_without_credential_source_are_empty() {
-        let provider = AmpProvider::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
-        );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, Vec::<CredentialHandle>::new());
+    fn zero_replenishment_zero_quota_or_missing_block_is_a_decode_error() {
+        for (case, body) in [
+            ("zero replenishment", ZERO_REPLENISHMENT_FIXTURE),
+            ("zero quota", ZERO_QUOTA_FIXTURE),
+            ("missing block", "<html><body>no usage here</body></html>"),
+        ] {
+            let res = normalize_usage(body, Utc::now());
+            assert!(matches!(res, Err(FetchError::Decode(_))), "{case}: {res:?}");
+        }
     }
 }

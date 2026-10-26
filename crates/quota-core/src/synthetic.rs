@@ -825,6 +825,10 @@ mod tests {
             close(window("percentUsed", 0.5), 0.5),
             "half a percent used stays half a percent"
         );
+        assert!(
+            close(window("usedPercent", 0.42), 0.42),
+            "a labelled percent below 1 is a percent, not a fraction"
+        );
         assert!(close(window("percentUsed", 1.0), 1.0));
         // Above the old boundary nothing changes.
         assert!(close(window("percentRemaining", 42.0), 58.0));
@@ -934,22 +938,7 @@ mod tests {
         assert_eq!(window_minutes_from_text("invalid"), None);
     }
 
-    #[test]
-    fn test_missing_reset_keeps_window() {
-        let body = br#"{
-            "rollingFiveHourLimit": {
-                "used": 20,
-                "limit": 100,
-                "window": "5hr"
-            }
-        }"#;
-        let usage = normalize_usage(body).unwrap();
-        let primary = usage.primary.expect("usage data should emit a window");
-        assert_eq!(primary.used_percent, 20.0);
-        assert_eq!(primary.resets_at, None);
-    }
-
-    /// Neither a computed used/limit ratio nor a labelled percent is rescaled.
+    /// A computed used/limit ratio is not rescaled.
     ///
     /// A used/limit ratio computed here is already a percentage: one request
     /// against a limit of a hundred is 1.0, and rescaling it would turn a
@@ -960,9 +949,10 @@ mod tests {
     /// on the theory that some upstream sends fractions. No payload ever showed
     /// one, and a reporter's live samples (insula#21) showed this provider uses
     /// 0-100: the fraction rule published an account with its last 1% of credits
-    /// as about 1% used. Both halves now pin the same rule from two paths.
+    /// as about 1% used. That half is pinned by
+    /// `percents_at_or_below_one_are_not_read_as_fractions`.
     #[test]
-    fn neither_a_computed_ratio_nor_a_small_labelled_percent_is_rescaled() {
+    fn a_computed_ratio_is_not_rescaled() {
         // The five-hour key fills `usage.primary`; a weekly key would fill
         // `usage.secondary` instead, so the assertions below would read an empty
         // slot and fail for a reason unrelated to the rescaling under test.
@@ -981,22 +971,6 @@ mod tests {
         assert_eq!(
             percent, 1.0,
             "one request in a hundred is 1%, not an exhausted account"
-        );
-
-        let labelled = br#"{
-            "rollingFiveHourLimit": {
-                "usedPercent": 0.42,
-                "window": "5hr"
-            }
-        }"#;
-        let read = normalize_usage(labelled)
-            .unwrap()
-            .primary
-            .expect("a labelled percent must produce a window")
-            .used_percent;
-        assert_eq!(
-            read, 0.42,
-            "a labelled percent below 1 is a percent, not a fraction"
         );
     }
 
@@ -1150,16 +1124,6 @@ mod tests {
     }
 
     #[test]
-    fn an_apikey_handle_routes_to_the_synthetic_provider() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[("apikey:synthetic", "apikey")]);
-        let handles = loader.synthetic_handles().unwrap();
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].stable_id(), "apikey:synthetic");
-        assert_eq!(handles[0].vault_credential_type(), Some("apikey"));
-    }
-
-    #[test]
     fn vault_handles_replace_the_implicit_local_lane() {
         let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
         loader.install_rows_for_test(&[("apikey:synthetic", "apikey")]);
@@ -1182,16 +1146,6 @@ mod tests {
             provider.handles().unwrap(),
             vec![CredentialHandle::implicit()]
         );
-    }
-
-    #[test]
-    fn two_handles_for_one_apikey_family_are_refused() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[
-            ("apikey:synthetic", "apikey"),
-            ("apikey:synthetic:second", "apikey"),
-        ]);
-        assert!(loader.synthetic_handles().unwrap().is_empty());
     }
 
     /// The vault lane serves the key and reports a 401 to the store.

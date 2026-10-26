@@ -43,7 +43,7 @@ const API_URL: &str =
 ///
 /// Fallback device identifier, used only when the token carries no `device_id`
 /// claim.
-const OASIS_WEB_ID: &str = "c8a1002d2c457e758785a9979832217c7c0b884c";
+pub(crate) const OASIS_WEB_ID: &str = "c8a1002d2c457e758785a9979832217c7c0b884c";
 const OASIS_APP_ID: &str = "10300";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
@@ -673,9 +673,11 @@ mod tests {
 
     #[test]
     fn garbage_body_is_decode_error() {
+        // The message names the provider, so the published error says where it
+        // came from.
         assert!(matches!(
             normalize_usage(b"not json"),
-            Err(FetchError::Decode(_))
+            Err(FetchError::Decode(m)) if m.starts_with("stepfun rate limit not decodable")
         ));
     }
 

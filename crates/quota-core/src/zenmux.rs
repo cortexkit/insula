@@ -247,46 +247,6 @@ impl UsageProvider for ZenMuxProvider {
 
 #[cfg(test)]
 mod tests {
-
-    /// Whole flow counts reach the wire beside the percentage.
-    ///
-    /// ZenMux states used_flows and max_flows and this normalizer discarded
-    /// both, so a consumer asking "how many requests are left" had to multiply a
-    /// percentage by a total it was never given.
-    #[test]
-    fn whole_flow_counts_are_published_beside_the_percentage() {
-        assert_eq!(
-            crate::model::window_counts(25.0, 100.0),
-            (Some(25.0), Some(100.0))
-        );
-    }
-
-    /// A fractional count is refused rather than rounded.
-    ///
-    /// The rule the qwen-cloud round established: usedCount is emitted only when
-    /// the provider states a whole count. A fraction means the field is not the
-    /// count it looks like, and "45.05 requests" is worse than no number --
-    /// rounding it would invent a precision the upstream never claimed.
-    #[test]
-    fn a_fractional_flow_count_is_refused() {
-        assert_eq!(crate::model::window_counts(45.05, 100.0), (None, None));
-        assert_eq!(crate::model::window_counts(25.0, 99.5), (None, None));
-    }
-
-    /// A count with no total is refused, and so is a total with no count.
-    ///
-    /// A numerator whose denominator the consumer must guess is the shape this
-    /// module refuses everywhere else -- the openrouter grant landed for exactly
-    /// this reason. Non-finite and negative are refused on the same footing.
-    #[test]
-    fn a_count_without_its_denominator_is_refused() {
-        assert_eq!(crate::model::window_counts(25.0, f64::NAN), (None, None));
-        assert_eq!(
-            crate::model::window_counts(f64::INFINITY, 100.0),
-            (None, None)
-        );
-        assert_eq!(crate::model::window_counts(-1.0, 100.0), (None, None));
-    }
     use super::*;
 
     #[test]
@@ -323,12 +283,19 @@ mod tests {
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-11T12:30:00Z"));
         assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
         assert_eq!(primary.window_minutes, Some(300));
+        // Whole flow counts reach the wire beside the percentage, so a consumer
+        // asking how many requests are left need not multiply a percentage by
+        // a total it was never given.
+        assert_eq!(primary.used_count, Some(25.0));
+        assert_eq!(primary.total_count, Some(100.0));
 
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 40.0);
         assert_eq!(secondary.resets_at.as_deref(), Some("2026-07-18T12:30:00Z"));
         assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10080));
+        assert_eq!(secondary.used_count, Some(400.0));
+        assert_eq!(secondary.total_count, Some(1000.0));
 
         let info = account_info.unwrap();
         assert_eq!(info.plan_type.as_deref(), Some("Pro plan"));

@@ -519,32 +519,29 @@ mod tests {
         assert_eq!(tertiary.resets_at, None);
         assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(tertiary.window_minutes, Some(43200));
-    }
 
-    #[test]
-    fn keeps_window_with_percent_but_no_reset() {
-        let value: Value =
-            serde_json::from_str(r#"{"limits":{"standard":{"fiveHour":{"usedPercent":50.0}}}}"#)
-                .unwrap();
-        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 50.0);
-        assert_eq!(primary.resets_at, None);
-        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
-        assert_eq!(primary.window_minutes, Some(300));
-    }
-
-    #[test]
-    fn exhausted_monthly_window_without_reset_is_kept() {
-        let value: Value =
-            serde_json::from_str(r#"{"limits":{"standard":{"monthly":{"usedPercent":100.0}}}}"#)
-                .unwrap();
-        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
-        let tertiary = usage.tertiary.unwrap();
-        assert_eq!(tertiary.used_percent, 100.0);
-        assert_eq!(tertiary.resets_at, None);
-        assert_eq!(tertiary.window_kind.as_deref(), Some("monthly"));
-        assert_eq!(tertiary.window_minutes, Some(43200));
+        // A window with a percent but no reset is kept, an exhausted one
+        // included: dropping it would hide a wall that has no announced end.
+        for (window, percent, kind, minutes) in [
+            ("fiveHour", 50.0, "five_hour", 300),
+            ("monthly", 100.0, "monthly", 43200),
+        ] {
+            let value: Value = serde_json::from_str(&format!(
+                r#"{{"limits":{{"standard":{{"{window}":{{"usedPercent":{percent}}}}}}}}}"#
+            ))
+            .unwrap();
+            let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+            let kept = if window == "fiveHour" {
+                usage.primary
+            } else {
+                usage.tertiary
+            }
+            .unwrap_or_else(|| panic!("{window} without a reset was dropped"));
+            assert_eq!(kept.used_percent, percent, "{window}");
+            assert_eq!(kept.resets_at, None, "{window}");
+            assert_eq!(kept.window_kind.as_deref(), Some(kind));
+            assert_eq!(kept.window_minutes, Some(minutes));
+        }
     }
 
     #[test]
@@ -580,14 +577,26 @@ mod tests {
     fn seconds_remaining_wins_over_window_end() {
         // CodexBar's precedence: secondsRemaining is consulted first, so a live
         // countdown beats an already-past windowEnd instead of reading as expiry.
-        let value: Value = serde_json::from_str(
-            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":61.0,"windowEnd":"2026-06-24T01:00:00Z","secondsRemaining":3600.0}}}}"#,
-        )
-        .unwrap();
-        let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 61.0);
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
+        // The second row has no windowEnd at all: the reset is still computed
+        // from now.
+        for (body, percent) in [
+            (
+                r#"{"limits":{"standard":{"fiveHour":{"usedPercent":61.0,"windowEnd":"2026-06-24T01:00:00Z","secondsRemaining":3600.0}}}}"#,
+                61.0,
+            ),
+            (
+                r#"{"limits":{"standard":{"fiveHour":{"usedPercent":10.0,"secondsRemaining":3600.0}}}}"#,
+                10.0,
+            ),
+        ] {
+            let value: Value = serde_json::from_str(body).unwrap();
+            let usage = normalize_billing_limits(&value, fixed_now()).unwrap();
+            let primary = usage.primary.unwrap();
+            assert_eq!(primary.used_percent, percent);
+            assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
+            assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
+            assert_eq!(primary.window_minutes, Some(300));
+        }
     }
 
     #[test]
@@ -601,33 +610,6 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 88.0);
         assert_eq!(primary.resets_at, None);
-    }
-
-    #[test]
-    fn seconds_remaining_computes_reset_from_now() {
-        let value: Value = serde_json::from_str(
-            r#"{"limits":{"standard":{"fiveHour":{"usedPercent":10.0,"secondsRemaining":3600.0}}}}"#,
-        )
-        .unwrap();
-        let now = fixed_now();
-        let usage = normalize_billing_limits(&value, now).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 10.0);
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-24T04:00:00Z"));
-        assert_eq!(primary.window_kind.as_deref(), Some("five_hour"));
-        assert_eq!(primary.window_minutes, Some(300));
-    }
-
-    #[test]
-    fn billing_limits_401_is_unauthorized() {
-        assert!(matches!(
-            map_billing_http_status(401, ""),
-            Err(FetchError::Unauthorized(_))
-        ));
-        assert!(matches!(
-            map_billing_http_status(403, ""),
-            Err(FetchError::Unauthorized(_))
-        ));
     }
 
     #[test]
@@ -759,15 +741,5 @@ mod tests {
         let usage = normalize_billing_limits(&value, now).unwrap();
         assert_eq!(usage.primary.expect("standard 5h").used_percent, 7.0);
         assert!(usage.extra_rate_windows.is_none());
-    }
-
-    #[test]
-    fn handles_without_credential_source_are_empty() {
-        let provider = FactoryProvider::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
-        );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

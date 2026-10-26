@@ -1028,6 +1028,9 @@ impl UsageProvider for OpenCodeProvider {
 
 #[cfg(test)]
 mod stage_tests {
+    // Test clients live for one test, so the pool bound in clippy.toml's
+    // client rule does not apply to them.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// The stage name reaches the published error, for every call this provider makes.
@@ -1101,28 +1104,87 @@ mod stage_tests {
         );
     }
 
-    /// Every server-function body this provider parses is checked for a null.
+    /// Answer every request by its method: `get` for a GET and `post` for a
+    /// POST, recording the methods seen in order.
+    async fn serve_by_method(
+        get: (u16, &'static str),
+        post: (u16, &'static str),
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&methods);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = crate::loopback::read_request(&mut stream).await;
+                let method = request.split_whitespace().next().unwrap_or("").to_string();
+                let (status, body) = if method == "POST" { post } else { get };
+                recorded.lock().unwrap().push(method);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("http://{address}/_server"), methods)
+    }
+
+    /// Which server call to drive against the loopback base.
+    #[derive(Clone, Copy, Debug)]
+    enum Call {
+        Workspaces,
+        Subscription,
+    }
+
+    async fn drive(call: Call, base: &str) -> Result<String, FetchError> {
+        let client = reqwest::Client::new();
+        match call {
+            Call::Workspaces => fetch_workspace_id_at(&client, "auth=test", base, None).await,
+            Call::Subscription => {
+                fetch_subscription_text_at(&client, "auth=test", "wrk_TEST", base).await
+            }
+        }
+    }
+
+    /// Every server-function body this provider parses is checked for a null:
+    /// the workspaces GET and its POST retry, and the subscription GET and its
+    /// POST retry.
     ///
     /// The subscription call was fixed first and the workspaces call had the
     /// identical defect one level up: a stated "nothing here" yields no ids,
-    /// falls through, and is published as our parse failure. Counting the sites
-    /// rather than testing one, so the next call added to this provider cannot
-    /// quietly reintroduce it.
-    #[test]
-    fn every_parsed_server_body_is_checked_for_a_null() {
-        let source = include_str!("opencode.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
-        // Four bodies get parsed: workspaces GET and its POST retry,
-        // subscription GET and its POST retry.
-        // Calls take a reference, so this counts uses and not the definition.
-        let checks = production.matches("is_explicit_null(&").count();
-        assert_eq!(
-            checks, 4,
-            "{checks} null check(s) for 4 parsed bodies: an unchecked body \
-             publishes a fact about the account as a defect of ours"
-        );
+    /// falls through, and is published as our parse failure. Each of the four
+    /// bodies is driven here, so a null check dropped from any one of them
+    /// fails its own row.
+    #[tokio::test]
+    async fn every_parsed_server_body_is_checked_for_a_null() {
+        // `{}` is neither a null nor a usable answer, so it sends each call on
+        // to its POST retry.
+        for (call, get, methods) in [
+            (Call::Workspaces, "null", vec!["GET"]),
+            (Call::Workspaces, "{}", vec!["GET", "POST"]),
+            (Call::Subscription, "null", vec!["GET"]),
+            (Call::Subscription, "{}", vec!["GET", "POST"]),
+        ] {
+            let (base, seen) = serve_by_method((200, get), (200, "null")).await;
+            let error = drive(call, &base)
+                .await
+                .expect_err("a stated null must not read as an answer");
+            assert!(
+                matches!(error, FetchError::NoQuotaReported(_)),
+                "{call:?} with GET {get:?}: a null publishes a fact about the account, \
+                 not a defect of ours: {error:?}"
+            );
+            assert_eq!(*seen.lock().unwrap(), methods, "{call:?} with GET {get:?}");
+        }
     }
 
     /// A payload carrying data is not mistaken for a null.
@@ -1153,24 +1215,26 @@ balance:0,monthlyLimit:null,monthlyUsage:null})(self.$R))";
     /// error was unchanged, because both server functions retry as a POST when
     /// the GET parses to nothing and those two sends bypass `server_get`. The
     /// live 500 comes from the subscription RETRY, not the call, which is a
-    /// materially different fact -- the GET answers.
-    ///
-    /// Counts sites rather than asserting on one, so a new unstaged send fails
-    /// here instead of silently publishing an anonymous error.
-    #[test]
-    fn every_send_in_this_provider_names_its_stage() {
-        let source = include_str!("opencode.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(before, _)| before);
-        let sends = production.matches(".send(client)").count();
-        let staged = production.matches("error.stage(").count();
-        assert_eq!(
-            sends, staged,
-            "{sends} send(s) and {staged} stage name(s): an unstaged send publishes \
-             an error naming no call, which is what made a retry failure read as a \
-             site outage"
-        );
+    /// materially different fact -- the GET answers. The GET's own stage is
+    /// driven through `server_get` above; this drives a 500 on each retry.
+    #[tokio::test]
+    async fn every_send_in_this_provider_names_its_stage() {
+        for (call, stage) in [
+            (Call::Workspaces, "workspaces POST"),
+            (Call::Subscription, "subscription POST"),
+        ] {
+            let (base, seen) = serve_by_method((200, "{}"), (500, "{\"status\":500}")).await;
+            let published = drive(call, &base)
+                .await
+                .expect_err("a 500 on the retry must fail")
+                .to_string();
+            assert!(
+                published.contains(stage),
+                "the failing retry must name itself on the wire: {published}"
+            );
+            assert!(published.contains("500"), "{published}");
+            assert_eq!(*seen.lock().unwrap(), vec!["GET", "POST"]);
+        }
     }
 
     /// Naming a stage must not change how the failure is classified.
@@ -1453,20 +1517,14 @@ mod tests {
         // used=1, limit=100 -> a genuine 1% computed ratio. The fraction
         // heuristic must NOT touch the computed path, else 1.0 is misread as a
         // 0..1 fraction and rescaled to a false 100% (CodexBar v0.45.2 fix).
-        let map = serde_json::json!({ "used": 1, "limit": 100 })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert_eq!(percent_from_map(&map), Some(1.0));
-    }
-
-    #[test]
-    fn computed_half_percent_stays_half() {
-        let map = serde_json::json!({ "used": 1, "limit": 200 })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert_eq!(percent_from_map(&map), Some(0.5));
+        // Half a percent likewise stays half a percent.
+        for (limit, percent) in [(100, 1.0), (200, 0.5)] {
+            let map = serde_json::json!({ "used": 1, "limit": limit })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert_eq!(percent_from_map(&map), Some(percent), "1 of {limit}");
+        }
     }
 
     #[test]

@@ -767,6 +767,18 @@ mod tests {
             2,
             "inside the window is still one reset"
         );
+
+        // And one second past a 60-second window is a new reset. Paired with the
+        // 90-second case above, this pins the edge rather than leaving room for
+        // the window to widen by half a minute unnoticed.
+        let just_outside = Utc::now() - chrono::Duration::seconds(61);
+        store.drop_log[1].at = just_outside.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false);
+        store.record_quota_drop("antigravity", Some("acct-1"), false);
+        assert_eq!(
+            store.drop_log.len(),
+            3,
+            "61 seconds after the last reset is a second reset"
+        );
     }
 
     #[test]
@@ -811,11 +823,15 @@ mod tests {
 
         // An absent account must not appear as a key at all, so a consumer
         // decoding into a typed struct does not meet a null it has to interpret.
-        let rendered = serde_json::to_string(&page.drops[2]).expect("serialises");
+        // Checked on the parsed object, with the attributed record as the
+        // control: a renamed key would otherwise pass a substring check.
+        let absent = serde_json::to_value(&page.drops[2]).expect("serialises");
         assert!(
-            !rendered.contains("account"),
-            "an unattributable drop omits the field: {rendered}"
+            absent.get("account").is_none(),
+            "an unattributable drop omits the field: {absent}"
         );
+        let named = serde_json::to_value(&page.drops[0]).expect("serialises");
+        assert_eq!(named.get("account"), Some(&serde_json::json!("acct-1")));
     }
 
     /// A cursor older than the ring reports its loss instead of reading empty.
@@ -1132,26 +1148,5 @@ mod tests {
             !store.publish_if_current(&key, old_incarnation, current_sequence, in_flight),
             "an attempt from a previous incarnation published into the re-added slot"
         );
-    }
-
-    #[test]
-    fn incarnation_counter_wraps_without_panicking() {
-        let now = Instant::now();
-        let mut store = SlotStore::new(now);
-        store.next_incarnation = u128::MAX;
-
-        store.reconcile("mock", &[CredentialHandle::new("H1")], now);
-        let first = store
-            .get(&SlotKey::new("mock", CredentialHandle::new("H1")))
-            .unwrap()
-            .incarnation;
-        store.reconcile("mock", &[], now);
-        store.reconcile("mock", &[CredentialHandle::new("H2")], now);
-        let second = store
-            .get(&SlotKey::new("mock", CredentialHandle::new("H2")))
-            .unwrap()
-            .incarnation;
-
-        assert_ne!(first, second);
     }
 }

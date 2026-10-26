@@ -111,7 +111,7 @@ Outside contributors open a pull request; CI runs the same jobs on it.
    `cookie_capture_urls_match_the_providers_fetch_urls` checks that row against
    the source.
 4. If the provider has a canonical models.dev slug, add it to
-   `api_provider_name` in `lib.rs`.
+   `API_PROVIDER_SLUGS` in `lib.rs`.
 5. Record each endpoint constant's host in `scripts/endpoint-hosts.py`.
 6. Add the provider to [`docs/provider-matrix.md`](docs/provider-matrix.md) and
    update its `N providers registered.` line;

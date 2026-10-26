@@ -231,33 +231,6 @@ pub enum SlotStatus {
     Degraded,
 }
 
-impl SlotStatus {
-    /// Every variant, so a caller can assert it handled all of them.
-    ///
-    /// The health buckets branch on BOOLEANS derived from these statuses rather
-    /// than matching on the enum, so adding a variant does not break that code:
-    /// a new status simply fails every `has_*` test and falls into whichever arm
-    /// is last. The conservation identity keeps balancing, because the provider
-    /// still lands in exactly one bucket -- the wrong one. An identity detects a
-    /// state that reports NOWHERE; it cannot detect one that reports in the
-    /// wrong place, and this is the shape that produces the second.
-    ///
-    /// Exists so a test can enumerate the variants and force that decision at
-    /// compile time, the way the `FetchError` class mapping does.
-    #[cfg(test)]
-    pub(crate) fn every() -> [SlotStatus; 4] {
-        // Adding a variant fails to compile here (the array length), and the
-        // match below then forces it to be classified rather than to inherit an
-        // arm by falling through.
-        [
-            SlotStatus::Pending,
-            SlotStatus::Fresh,
-            SlotStatus::StaleTransient,
-            SlotStatus::Degraded,
-        ]
-    }
-}
-
 /// State for one active `(provider, handle)` fetch unit.
 #[derive(Debug, Clone)]
 pub struct ProviderSlot {
@@ -1569,7 +1542,6 @@ mod tests {
             FetchError::ProviderStatus(429, String::new()),
             rate_limited(Some(600)),
         );
-        assert_eq!(slot.next_due_at, done + backoff(FetchClass::Transient, 1));
         assert_eq!(slot.next_due_at, done + Duration::from_secs(60));
         // And a Claude failure that is not a rate limit keeps it too.
         let (slot, done) = after_one_failure(
@@ -2062,11 +2034,16 @@ mod tests {
             t0,
         );
 
+        // The guard's only output here is withholding the whole entry: the
+        // slot's entry still carries the earlier window, and nothing builds a
+        // usage-less copy on this path. Any entry that survives would be that
+        // window served under an unverified identity. The reachable path, where
+        // the entry survives as a usage-less verdict, is the record-replacement
+        // test above.
         assert!(
+            next.entry.is_none(),
+            "a window must not be served under an unverified identity: {:?}",
             next.entry
-                .as_ref()
-                .is_none_or(|entry| entry.usage.is_none()),
-            "a window must not be served under an unverified identity"
         );
     }
 

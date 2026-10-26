@@ -48,6 +48,9 @@ enum Unavailable {
 }
 
 impl TeamQuota {
+    // Redirects are turned off so a copied session never travels to another
+    // host; the pool idle bound is set below the refresh cadence.
+    #[allow(clippy::disallowed_methods)]
     pub(super) fn new(
         config: LiveQuotaConfig,
         source: Option<Arc<dyn CredentialSource>>,

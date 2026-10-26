@@ -407,57 +407,64 @@ fn stable_handle_key(key: &SlotKey) -> (u8, &str) {
 /// Recorded here rather than in a runbook because this line is what someone edits
 /// to break it. Verified with the routing seat 2026-09-11.
 fn api_provider_name(provider: &str) -> Option<&'static str> {
-    match provider {
-        "codex" => Some("openai"),
-        "claude" => Some("anthropic"),
-        "grok" => Some("xai"),
-        "copilot" => Some("github-copilot"),
-        "deepseek" => Some("deepseek"),
-        // models.dev RETIRED `kimi-for-coding` and split the plan into
-        // `kimi-code-plan-global` (api.kimi.ai) and `kimi-code-plan-cn`
-        // (api.kimi.com). This lane READS kimi.com -- the only host whose usage
-        // endpoint answers this key (kimi.ai's returns 403) -- yet publishes the
-        // GLOBAL slug, and that is deliberate, not a host mismatch:
-        //
-        //   - the operator's account is the kimi.ai plan, and OpenCode routes it
-        //     as `kimi-code-plan-global` against api.kimi.ai;
-        //   - measured 2026-09-22: 20 requests sent ONLY to api.kimi.ai moved the
-        //     5h counter read here from 0% to 1%, with nothing else drawing on
-        //     the account. One pool, reached through two hosts.
-        //
-        // So consumers joining on this slug bind the window to the route that
-        // actually spends it. Should the plans ever separate, the evidence above
-        // is what to re-run: a burst through one host, a read through the other.
-        "kimi-for-coding" => Some("kimi-code-plan-global"),
-        "kilo" => Some("kilo"),
-        "minimax" => Some("minimax"),
-        // The Muse Code plan's inference key is served at api.meta.ai/v1, which
-        // is exactly models.dev's `meta` provider, so routing that spends this
-        // quota reaches it under that slug.
-        "muse" => Some("meta"),
-        "stepfun" => Some("stepfun"),
-        "zai" => Some("zai"),
-        "synthetic" => Some("synthetic"),
-        "opencode" => Some("opencode"),
-        "opencodego" => Some("opencode-go"),
-        "openrouter" => Some("openrouter"),
-        "ollama" => Some("ollama-cloud"),
-        "sakana" => Some("sakana"),
-        "neuralwatt" => Some("neuralwatt"),
-        "zenmux" => Some("zenmux"),
-        "alibaba" => Some("alibaba-coding-plan"),
-        "qwen-cloud" => Some("alibaba-token-plan"),
-        "mimo" => Some("xiaomi"),
-        // The AI Gateway is models.dev's `vercel` provider (env
-        // AI_GATEWAY_API_KEY). `vercel-budget` has no entry: slugs are unique
-        // per provider, and the gateway's credit balance holds this one.
-        "vercel" => Some("vercel"),
-        // models.dev's `abliteration-ai` provider serves api.abliteration.ai/v1,
-        // the same origin and key this lane reads credits with.
-        "abliteration" => Some("abliteration-ai"),
-        _ => None,
-    }
+    API_PROVIDER_SLUGS
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, slug)| *slug)
 }
+
+/// `(this module's provider name, canonical slug)` for every provider that has
+/// a counterpart; see [`api_provider_name`]. Data rather than a `match`, so a
+/// test can check every row against the registry without parsing source.
+const API_PROVIDER_SLUGS: &[(&str, &str)] = &[
+    ("codex", "openai"),
+    ("claude", "anthropic"),
+    ("grok", "xai"),
+    ("copilot", "github-copilot"),
+    ("deepseek", "deepseek"),
+    // models.dev RETIRED `kimi-for-coding` and split the plan into
+    // `kimi-code-plan-global` (api.kimi.ai) and `kimi-code-plan-cn`
+    // (api.kimi.com). This lane READS kimi.com -- the only host whose usage
+    // endpoint answers this key (kimi.ai's returns 403) -- yet publishes the
+    // GLOBAL slug, and that is deliberate, not a host mismatch:
+    //
+    //   - the operator's account is the kimi.ai plan, and OpenCode routes it
+    //     as `kimi-code-plan-global` against api.kimi.ai;
+    //   - measured 2026-09-22: 20 requests sent ONLY to api.kimi.ai moved the
+    //     5h counter read here from 0% to 1%, with nothing else drawing on
+    //     the account. One pool, reached through two hosts.
+    //
+    // So consumers joining on this slug bind the window to the route that
+    // actually spends it. Should the plans ever separate, the evidence above
+    // is what to re-run: a burst through one host, a read through the other.
+    ("kimi-for-coding", "kimi-code-plan-global"),
+    ("kilo", "kilo"),
+    ("minimax", "minimax"),
+    // The Muse Code plan's inference key is served at api.meta.ai/v1, which
+    // is exactly models.dev's `meta` provider, so routing that spends this
+    // quota reaches it under that slug.
+    ("muse", "meta"),
+    ("stepfun", "stepfun"),
+    ("zai", "zai"),
+    ("synthetic", "synthetic"),
+    ("opencode", "opencode"),
+    ("opencodego", "opencode-go"),
+    ("openrouter", "openrouter"),
+    ("ollama", "ollama-cloud"),
+    ("sakana", "sakana"),
+    ("neuralwatt", "neuralwatt"),
+    ("zenmux", "zenmux"),
+    ("alibaba", "alibaba-coding-plan"),
+    ("qwen-cloud", "alibaba-token-plan"),
+    ("mimo", "xiaomi"),
+    // The AI Gateway is models.dev's `vercel` provider (env
+    // AI_GATEWAY_API_KEY). `vercel-budget` has no entry: slugs are unique
+    // per provider, and the gateway's credit balance holds this one.
+    ("vercel", "vercel"),
+    // models.dev's `abliteration-ai` provider serves api.abliteration.ai/v1,
+    // the same origin and key this lane reads credits with.
+    ("abliteration", "abliteration-ai"),
+];
 
 /// One usage read: the entries, and which providers' account sets are complete.
 ///
@@ -544,7 +551,9 @@ pub struct Registry {
     pub(crate) cookie_lifetimes: Mutex<cookie_lifetime::CookieLifetimes>,
     /// How many "backoff cleared" lines this process has printed. Kept beside
     /// the line so a test driving real turns can see what it reports; the line
-    /// itself goes to stderr, where no test can read it.
+    /// itself goes to stderr, where no test can read it. Test builds only:
+    /// nothing in production reads it.
+    #[cfg(test)]
     pub(crate) backoffs_cleared: std::sync::atomic::AtomicU64,
     credential_source: Option<Arc<dyn CredentialSource>>,
     vault_handle_loader: Option<Arc<vault_handles::VaultHandleLoader>>,
@@ -604,6 +613,7 @@ impl Registry {
             dedup_winner: Mutex::new(std::collections::HashMap::new()),
             dedup_winners_seen: Mutex::new(std::collections::HashMap::new()),
             cookie_lifetimes: Mutex::new(cookie_lifetime::CookieLifetimes::default()),
+            #[cfg(test)]
             backoffs_cleared: std::sync::atomic::AtomicU64::new(0),
             credential_source: None,
             vault_handle_loader: None,
@@ -1614,6 +1624,7 @@ impl Registry {
                     // window is usually shorter than a consumer's polling interval,
                     // so nothing on the wire shows it either.
                     if let Some(discarded) = acceleration.discarded_backoff {
+                        #[cfg(test)]
                         self.backoffs_cleared
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         eprintln!(

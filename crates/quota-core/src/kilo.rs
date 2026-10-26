@@ -636,12 +636,13 @@ mod tests {
     #[test]
     fn batch_url_matches_codexbar_shape() {
         let url = batch_url("https://app.kilo.ai/api/trpc").unwrap();
-        assert!(
-            url.contains("user.getCreditBlocks,kiloPass.getState,user.getAutoTopUpPaymentMethod")
+        assert_eq!(
+            url,
+            "https://app.kilo.ai/api/trpc/\
+             user.getCreditBlocks,kiloPass.getState,user.getAutoTopUpPaymentMethod\
+             ?batch=1&input=%7B%220%22%3A%7B%22json%22%3Anull%7D%2C\
+             %221%22%3A%7B%22json%22%3Anull%7D%2C%222%22%3A%7B%22json%22%3Anull%7D%7D"
         );
-        assert!(url.contains("batch=1"));
-        assert!(url.contains("input="));
-        assert!(url.contains("%22json%22"));
     }
 
     #[test]
@@ -798,7 +799,11 @@ mod tests {
           }
         ]
         "#;
-        assert!(normalize_usage(body).unwrap().primary.is_some());
+        // The failed optional procedure costs nothing: the pass is still read
+        // in full.
+        let primary = normalize_usage(body).unwrap().primary.unwrap();
+        assert_eq!(primary.used_percent, 50.0);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-01T00:00:00Z"));
     }
 
     #[test]
