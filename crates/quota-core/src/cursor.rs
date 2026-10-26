@@ -1086,7 +1086,6 @@ mod tests {
             cookies: vec![crate::cookie_jar::Cookie {
                 name: "WorkosCursorSessionToken".to_string(),
                 value: session_cookie_value.to_string(),
-                host_key: "cursor.com".to_string(),
             }],
         }
     }
@@ -1307,7 +1306,6 @@ mod tests {
             cookies: vec![crate::cookie_jar::Cookie {
                 name: "analytics".to_string(),
                 value: "synthetic".to_string(),
-                host_key: "cursor.com".to_string(),
             }],
         };
 
@@ -1352,7 +1350,6 @@ mod tests {
             cookies: vec![crate::cookie_jar::Cookie {
                 name: "WorkosCursorSessionToken".to_string(),
                 value: "synthetic-browser-session".to_string(),
-                host_key: "cursor.com".to_string(),
             }],
         };
 
@@ -1570,7 +1567,7 @@ mod tests {
     fn without_a_deposit_the_app_store_is_the_only_lane() {
         let provider = CursorProvider::new_with_handle_loader(
             None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
@@ -1623,17 +1620,6 @@ mod tests {
 
     #[async_trait]
     impl crate::credential_source::CredentialSource for ScopedCursorSource {
-        async fn get(
-            &self,
-            _capability: &crate::credential_source::VaultCapability,
-            _min_ttl_ms: u64,
-        ) -> Result<
-            crate::credential_source::VaultCredential,
-            crate::credential_source::VaultGetError,
-        > {
-            Err(crate::credential_source::VaultGetError::FailClosed)
-        }
-
         async fn get_scoped(
             &self,
             credential_id: &str,
@@ -1655,14 +1641,6 @@ mod tests {
                 email: None,
                 org_name: None,
             })
-        }
-
-        async fn report_auth_failure(
-            &self,
-            _capability: &crate::credential_source::VaultCapability,
-            _provider_status: u16,
-            _record_version: u64,
-        ) {
         }
     }
 

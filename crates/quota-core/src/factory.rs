@@ -648,12 +648,10 @@ mod tests {
                 crate::cookie_jar::Cookie {
                     name: "access-token".to_string(),
                     value: "eyJhb.header.sig".to_string(),
-                    host_key: "app.factory.ai".to_string(),
                 },
                 crate::cookie_jar::Cookie {
                     name: "session".to_string(),
                     value: "other".to_string(),
-                    host_key: "app.factory.ai".to_string(),
                 },
             ],
         };
@@ -767,7 +765,7 @@ mod tests {
     fn handles_without_credential_source_are_empty() {
         let provider = FactoryProvider::new_with_handle_loader(
             None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, Vec::<CredentialHandle>::new());

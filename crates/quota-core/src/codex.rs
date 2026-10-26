@@ -53,8 +53,6 @@ use crate::codex_resets::{
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTickLogger, ResetTransport, UsageFacts,
 };
 use crate::config::{CodexConfig, LiveQuotaConfig};
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::credential_source::{CredentialSource, VaultCredential};
 use crate::model::{Amount, Pool, PoolBasis, PoolFunding};
 use crate::provider::AccountObservation;
@@ -926,7 +924,7 @@ impl CodexProvider {
         Self::new_with_handle_loader(
             reset_config,
             credential_source,
-            Arc::new(VaultHandleLoader::from_env()),
+            Arc::new(VaultHandleLoader::default()),
         )
     }
 
@@ -1066,7 +1064,7 @@ impl CodexProvider {
     }
 
     fn report_auth_failure(&self, context: &ServedCodexContext, error: &FetchError) {
-        // A served context may carry neither capability nor version: a local
+        // A served context may carry neither vault handle nor version: a local
         // credential has no custodian to report to. Resolve those first, then let
         // the shared helper decide whether the error itself is reportable.
         let (Some(handle), Some(record_version)) =
@@ -1563,17 +1561,17 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for ReportingSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             _min_ttl_ms: u64,
         ) -> Result<VaultCredential, crate::credential_source::VaultGetError> {
             unreachable!("reporting test does not fetch")
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -1754,7 +1752,7 @@ mod tests {
             None,
             Arc::clone(&transport) as Arc<dyn ResetTransport>,
             coordinator,
-            VaultHandleLoader::new(None),
+            VaultHandleLoader::default(),
             home.clone(),
         );
         let registry = crate::Registry::new(vec![Box::new(provider)]);
@@ -1837,7 +1835,7 @@ mod tests {
             None,
             Arc::clone(&transport) as Arc<dyn ResetTransport>,
             coordinator,
-            VaultHandleLoader::new(None),
+            VaultHandleLoader::default(),
             home.clone(),
         );
         let registry = crate::Registry::new(vec![Box::new(provider)]);
@@ -1922,7 +1920,7 @@ mod tests {
             None,
             Arc::new(ReqwestResetTransport::new(reqwest::Client::new())),
             coordinator,
-            VaultHandleLoader::new(None),
+            VaultHandleLoader::default(),
             home.clone(),
         );
         let registry = crate::Registry::new(vec![Box::new(provider)]);
@@ -1972,7 +1970,7 @@ mod tests {
             None,
             Arc::clone(&transport) as Arc<dyn ResetTransport>,
             coordinator,
-            VaultHandleLoader::new(None),
+            VaultHandleLoader::default(),
             state_dir.clone(),
         );
         let attempt = provider
@@ -2031,10 +2029,7 @@ mod tests {
                     email: None,
                     org_name: None,
                     record_version: Some(4),
-                    vault_handle: Some(CredentialHandle::vault(
-                        "chatgpt:openai",
-                        VaultCapability::new("ckh_test"),
-                    )),
+                    vault_handle: Some(CredentialHandle::scoped("chatgpt:openai", "oauth")),
                     is_oauth: true,
                     source: "vault",
                 },
@@ -2066,10 +2061,7 @@ mod tests {
                     email: None,
                     org_name: None,
                     record_version: Some(44),
-                    vault_handle: Some(CredentialHandle::vault(
-                        "chatgpt:openai",
-                        VaultCapability::new("ckh_truncated"),
-                    )),
+                    vault_handle: Some(CredentialHandle::scoped("chatgpt:openai", "oauth")),
                     is_oauth: true,
                     source: "vault",
                 },
@@ -2120,7 +2112,7 @@ mod tests {
         );
         let token = format!("header.{payload}.signature");
         let context = ServedCodexContext::vault(
-            CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_context_secret")),
+            CredentialHandle::scoped("chatgpt:openai", "oauth"),
             VaultCredential {
                 payload: token.into_bytes(),
                 expires_at_ms: None,
@@ -2138,7 +2130,6 @@ mod tests {
             context.account_info(None).unwrap().email.as_deref(),
             Some("vault@example.com")
         );
-        assert!(!format!("{context:?}").contains("ckh_context_secret"));
     }
 
     #[test]
@@ -2162,10 +2153,7 @@ mod tests {
             email: None,
             org_name: None,
             record_version: Some(23),
-            vault_handle: Some(CredentialHandle::vault(
-                "chatgpt:openai",
-                VaultCapability::new("ckh_report_secret"),
-            )),
+            vault_handle: Some(CredentialHandle::scoped("chatgpt:openai", "oauth")),
             is_oauth: true,
             source: "vault",
         };

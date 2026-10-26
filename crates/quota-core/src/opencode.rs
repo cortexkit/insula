@@ -1330,7 +1330,6 @@ mod tests {
                 .map(|(name, value)| Cookie {
                     name: (*name).to_string(),
                     value: (*value).to_string(),
-                    host_key: ".opencode.ai".to_string(),
                 })
                 .collect(),
         };
@@ -1419,12 +1418,10 @@ mod tests {
                 Cookie {
                     name: "auth".into(),
                     value: "tok".into(),
-                    host_key: "opencode.ai".into(),
                 },
                 Cookie {
                     name: "other".into(),
                     value: "x".into(),
-                    host_key: "opencode.ai".into(),
                 },
             ],
         };
@@ -1558,17 +1555,6 @@ mod console_check_tests {
 
         #[async_trait]
         impl CredentialSource for DepositedCookie {
-            async fn get(
-                &self,
-                _capability: &crate::credential_source::VaultCapability,
-                _min_ttl_ms: u64,
-            ) -> Result<
-                crate::credential_source::VaultCredential,
-                crate::credential_source::VaultGetError,
-            > {
-                Err(crate::credential_source::VaultGetError::FailClosed)
-            }
-
             async fn get_scoped(
                 &self,
                 _credential_id: &str,
@@ -1586,14 +1572,6 @@ mod console_check_tests {
                     org_name: None,
                     project_id: None,
                 })
-            }
-
-            async fn report_auth_failure(
-                &self,
-                _capability: &crate::credential_source::VaultCapability,
-                _provider_status: u16,
-                _record_version: u64,
-            ) {
             }
         }
 

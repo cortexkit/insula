@@ -25,8 +25,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::credential_source::CredentialSource;
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::http::JsonRequest;
 use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
@@ -418,7 +416,7 @@ impl OpenRouterProvider {
             key_url: KEY_URL.to_string(),
             http: crate::http::provider_client(),
             credential_source: None,
-            handle_loader: Arc::new(VaultHandleLoader::new(None)),
+            handle_loader: Arc::new(VaultHandleLoader::default()),
             accounts: Mutex::new(HashMap::new()),
         }
     }
@@ -623,18 +621,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -723,17 +721,14 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"openrouter-vault-key", 9)));
         let mut provider = OpenRouterProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/api/v1/credits");
         // The one-shot server is gone by the account lookup, so it fails fast
         // on loopback instead of reaching the real host.
         provider.key_url = format!("{base}/api/v1/key");
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:openrouter",
-                VaultCapability::new("ckh_openrouter"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:openrouter", "apikey"))
             .await;
         assert_eq!(attempt.source.as_deref(), Some("vault"));
         let pools = attempt.pools.as_ref().unwrap();
@@ -795,7 +790,7 @@ mod tests {
     fn provider_at(base: &str, source: Option<Arc<dyn CredentialSource>>) -> OpenRouterProvider {
         let mut provider = OpenRouterProvider::new_with_handle_loader(
             source,
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/api/v1/credits");
         provider.key_url = format!("{base}/api/v1/key");
@@ -910,7 +905,7 @@ mod tests {
         let (vault_base, vault_requests) = serve_openrouter(200, ORG_KEY).await;
         let (source, _) = source(Ok(credential(b"openrouter-vault-key", 7)));
         let provider = provider_at(&vault_base, Some(source));
-        let handle = CredentialHandle::vault("apikey:openrouter", VaultCapability::new("ckh_or"));
+        let handle = CredentialHandle::scoped("apikey:openrouter", "apikey");
         for _ in 0..2 {
             let attempt = provider.fetch_handle(&handle).await;
             assert_eq!(
@@ -931,14 +926,11 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"openrouter-vault-key", 44)));
         let mut provider = OpenRouterProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/api/v1/credits");
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:openrouter",
-                VaultCapability::new("ckh_openrouter"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:openrouter", "apikey"))
             .await;
         assert!(matches!(
             attempt.usage,

@@ -11,9 +11,6 @@
 pub struct Cookie {
     pub name: String,
     pub value: String,
-    /// The domain the cookie belongs to, when known. Empty for a cookie parsed
-    /// from a request header, which does not carry one.
-    pub host_key: String,
 }
 
 /// The cookies for one provider domain, plus a `Cookie:` header built from them.
@@ -36,10 +33,6 @@ impl CookieJar {
     /// captured header has only trackers in it" versus "your session expired"
     /// are different instructions to a human, and an opaque string could give
     /// neither.
-    ///
-    /// `host_key` is empty because a request header does not carry one. Absent
-    /// rather than wrong: inventing the provider's own domain there would assert
-    /// a provenance nobody established.
     pub fn from_header(header: &str) -> Self {
         let cookies = header
             .split(';')
@@ -56,7 +49,6 @@ impl CookieJar {
                 Some(Cookie {
                     name: name.to_string(),
                     value: value.trim().to_string(),
-                    host_key: String::new(),
                 })
             })
             .collect();
@@ -121,12 +113,10 @@ mod tests {
                 Cookie {
                     name: "session".into(),
                     value: "abc123".into(),
-                    host_key: ".x.com".into(),
                 },
                 Cookie {
                     name: "other".into(),
                     value: "v".into(),
-                    host_key: ".x.com".into(),
                 },
             ],
         };
@@ -185,7 +175,6 @@ mod tests {
                 .map(|name| Cookie {
                     name: (*name).to_string(),
                     value: "x".to_string(),
-                    host_key: "example.test".to_string(),
                 })
                 .collect(),
         };
@@ -225,12 +214,10 @@ mod tests {
                 Cookie {
                     name: "aid".into(),
                     value: "1".into(),
-                    host_key: "ollama.com".into(),
                 },
                 Cookie {
                     name: "__Secure-session".into(),
                     value: "tok".into(),
-                    host_key: "ollama.com".into(),
                 },
             ],
         };

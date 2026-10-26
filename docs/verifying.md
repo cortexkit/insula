@@ -180,16 +180,13 @@ cache-only, so each example warms its own registry first.
 | `cargo run -p quota-core --example completeness-envelopes` | reference `usage.get` envelopes for each account-completeness case |
 | `cargo run -p quota-core --example ollama-labels -- --cookie-file <file>` | which usage labels the live ollama settings page renders; exits non-zero on a label the parser does not read |
 | `cargo run -p quota-core --example opencode-stage -- --cookie-file <file>` | which of opencode's three server calls fails |
-| `cargo run -p quota-module --example grok-resets` | whether grok's reset endpoint answers the vault credential, with a control call first |
-| `cargo run -p quota-module --example antigravity-pool` | which Antigravity pool the vault's cloud credential reaches |
-| `cargo run -p quota-module --example unread-fields -- <claude\|codex>` | what the response fields insula does not read hold, with identity values redacted |
+| `cargo run -p quota-module --example unread-fields -- <claude\|codex> <credential-id>` | what the response fields insula does not read hold, with identity values redacted; needs a scoped grant for the id |
 | `cargo run -p quota-module --example scoped-list` | what `credential.list_scoped` returns to a standalone caller |
 
 Cookie files are read from disk (create them with mode `600`), never from argv
-or the environment, which leak into `ps` and shell history. The examples that
-need a vault credential take a capability handle in a file, minted with
-`ck auth mint-handle --id <credential-id>`. Revoke it afterwards using only the
-`revoke with:` line `mint-handle` printed for that handle.
+or the environment, which leak into `ps` and shell history. Vault-backed examples
+use the caller's scoped grants to authorize reads. A standalone
+direct caller may be refused; a refusal does not mean the vault has no credentials.
 
 ## Repository checkers
 
@@ -202,9 +199,7 @@ need a vault credential take a capability handle in a file, minted with
 | `python3 scripts/models-dev-slugs.py` | every published `apiProvider` slug still exists on models.dev; needs the network |
 | `python3 scripts/unread-credentials.py` | providers reporting no credential while a key they could read sits in OpenCode's auth store |
 | `python3 scripts/vault-id-families.py` | every vault credential id against the family table that routes it to a provider |
-| `python3 scripts/audit-checker-rules.py` | every rule in the wire checkers has a test that fails without it |
 | `python3 scripts/module_id_callers.py` | callers of this module's id across sibling repositories, before a rename |
 | `python3 scripts/witness-transient.py 1` | makes one provider fail transiently against a loopback endpoint, so stale-serving can be observed |
-| `python3 scripts/witness-gap-drop.py` | makes a quota drop happen across a gap, so `observedContinuously: false` can be observed |
 | `python3 scripts/prod_body.py <files>` | prints a Rust file with its test module removed, for source sweeps |
 | `python3 scripts/public-flip-verifier.py` | scans every blob and commit message in history for credential and identity patterns |

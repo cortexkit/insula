@@ -225,7 +225,7 @@ impl CookieVault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential_source::{VaultCapability, VaultCredential, VaultGetError};
+    use crate::credential_source::{VaultCredential, VaultGetError};
     use async_trait::async_trait;
 
     const FAMILY: &str = "cookie:ollama.com";
@@ -236,14 +236,6 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for EchoSource {
-        async fn get(
-            &self,
-            _capability: &VaultCapability,
-            _min_ttl_ms: u64,
-        ) -> Result<VaultCredential, VaultGetError> {
-            Err(VaultGetError::FailClosed)
-        }
-
         async fn get_scoped(
             &self,
             credential_id: &str,
@@ -258,14 +250,6 @@ mod tests {
                 org_name: None,
                 project_id: None,
             })
-        }
-
-        async fn report_auth_failure(
-            &self,
-            _capability: &VaultCapability,
-            _provider_status: u16,
-            _record_version: u64,
-        ) {
         }
     }
 

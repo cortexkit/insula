@@ -5,7 +5,6 @@
 //! handles. Reads never perform I/O and never clear the retained snapshot.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -192,25 +191,13 @@ pub struct VaultHandleLoader {
 
 impl Default for VaultHandleLoader {
     fn default() -> Self {
-        Self::new(None)
-    }
-}
-
-impl VaultHandleLoader {
-    /// Compatibility constructor for callers that used to pass a file path.
-    ///
-    /// The argument is deliberately ignored: no runtime file source remains.
-    pub fn new(_retired_path: Option<PathBuf>) -> Self {
         Self {
             state: Mutex::new(LoaderState::default()),
         }
     }
+}
 
-    /// Construct an empty in-memory loader. Environment variables are not read.
-    pub fn from_env() -> Self {
-        Self::default()
-    }
-
+impl VaultHandleLoader {
     /// Declare that a real credential source is wired to this loader, so an
     /// empty mapping must not be read as "no vault credentials" until the vault
     /// has answered once.

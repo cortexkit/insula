@@ -1221,17 +1221,6 @@ mod tests {
 
         #[async_trait::async_trait]
         impl crate::credential_source::CredentialSource for MockCookieSource {
-            async fn get(
-                &self,
-                _capability: &crate::credential_source::VaultCapability,
-                _min_ttl_ms: u64,
-            ) -> Result<
-                crate::credential_source::VaultCredential,
-                crate::credential_source::VaultGetError,
-            > {
-                Err(crate::credential_source::VaultGetError::FailClosed)
-            }
-
             async fn get_scoped(
                 &self,
                 _credential_id: &str,
@@ -1254,18 +1243,6 @@ mod tests {
             async fn report_auth_failure_scoped(
                 &self,
                 _credential_id: &str,
-                provider_status: u16,
-                record_version: u64,
-            ) {
-                self.reports
-                    .lock()
-                    .unwrap()
-                    .push((provider_status, record_version));
-            }
-
-            async fn report_auth_failure(
-                &self,
-                _capability: &crate::credential_source::VaultCapability,
                 provider_status: u16,
                 record_version: u64,
             ) {

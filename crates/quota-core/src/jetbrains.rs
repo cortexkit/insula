@@ -77,9 +77,9 @@ pub const PROVIDER_NAME: &str = "jetbrains";
 ///
 /// JetBrains is the one third-party source here that DOES follow host
 /// convention, so it is the one that needs a Windows branch. The others read by
-/// this module -- Codex, Gemini, OpenCode, Kilo, Codebuff -- are Node CLIs built
+/// this module -- Codex, OpenCode, Kilo, Codebuff -- are Node CLIs built
 /// on `os.homedir()` and keep their POSIX-shaped paths on Windows, so mapping
-/// their `~/.config` to `%APPDATA%` would break five sources to fix one. This is
+/// their `~/.config` to `%APPDATA%` would break four sources to fix one. This is
 /// a native application and stores under `%APPDATA%\JetBrains` there.
 ///
 /// Every candidate is probed rather than selected by `cfg`: a path that does not

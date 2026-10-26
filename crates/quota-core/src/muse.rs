@@ -592,7 +592,7 @@ impl UsageProvider for MuseProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential_source::{VaultCapability, VaultCredential, VaultGetError};
+    use crate::credential_source::{VaultCredential, VaultGetError};
     use std::sync::Mutex;
 
     const FULL: &str = r#"{
@@ -965,9 +965,9 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             _min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             Ok(VaultCredential {
@@ -981,9 +981,9 @@ mod tests {
             })
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -1033,10 +1033,10 @@ mod tests {
         let (base, _) = crate::loopback::serve_once(200, FULL.as_bytes().to_vec()).await;
         let (mut provider, reports) = vault_provider(
             br#"{"access_token": "dca:vault"}"#,
-            Arc::new(VaultHandleLoader::new(None)),
+            Arc::new(VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/muse-code/key");
-        let handle = CredentialHandle::vault("apikey:muse", VaultCapability::new("ckh_muse"));
+        let handle = CredentialHandle::scoped("apikey:muse", "apikey");
         let attempt = provider.fetch_handle(&handle).await;
         assert_eq!(attempt.source.as_deref(), Some("vault"));
         assert!(attempt.usage.is_ok());

@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::credential_source::{CredentialStatus, VaultCapability, VaultGetError};
+    use crate::credential_source::{CredentialStatus, VaultGetError};
     use crate::model::Usage;
 
     fn incarnation() -> Incarnation {
@@ -2144,7 +2144,7 @@ mod tests {
     }
 
     fn vault_handle() -> CredentialHandle {
-        CredentialHandle::vault("oauth:codex", VaultCapability::new("ckh_test"))
+        CredentialHandle::scoped("oauth:codex", "oauth")
     }
 
     fn local_handle() -> CredentialHandle {
@@ -2352,7 +2352,7 @@ mod tests {
         let local = non_transient_slot(t0, Some(7));
         assert!(
             !should_poll_credential_status(&local, &local_handle(), t1),
-            "a local-lane slot has no capability and must not be polled"
+            "a local-lane slot has no vault address and must not be polled"
         );
 
         assert!(

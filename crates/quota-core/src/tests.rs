@@ -17,8 +17,8 @@ use crate::codex_resets::{
     ResetCoordinator, ResetRequest, ResetTickInput, ResetTransport, TriggerInput, UsageFacts,
 };
 use crate::credential_source::{
-    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCapability,
-    VaultCredential, VaultGetError,
+    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCredential,
+    VaultGetError,
 };
 use crate::model::{AccountInfo, ExtraWindow, RateWindow, Usage};
 use crate::provider::{AccountObservation, CredentialHandle, FetchError, HandlesError};
@@ -3743,10 +3743,7 @@ impl UsageProvider for UnresolvedSelectionProvider {
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         Ok(vec![
             CredentialHandle::implicit(),
-            CredentialHandle::vault(
-                "chatgpt:openai",
-                crate::credential_source::VaultCapability::new("ckh_selection_secret"),
-            ),
+            CredentialHandle::scoped("chatgpt:openai", "oauth"),
         ])
     }
 
@@ -3766,11 +3763,7 @@ impl UsageProvider for UnresolvedSelectionProvider {
 #[tokio::test]
 async fn unresolved_selection_prefers_fresh_local_over_cold_vault() {
     assert!(
-        CredentialHandle::vault(
-            "chatgpt:openai",
-            crate::credential_source::VaultCapability::new("ckh_sort_proof"),
-        )
-        .sort_cmp(&CredentialHandle::implicit())
+        CredentialHandle::scoped("chatgpt:openai", "oauth").sort_cmp(&CredentialHandle::implicit())
             == std::cmp::Ordering::Less,
         "the regression must put the degraded vault slot first in stable order"
     );
@@ -5715,17 +5708,17 @@ struct MockReportingCredentialSource {
 
 #[async_trait]
 impl CredentialSource for MockReportingCredentialSource {
-    async fn get(
+    async fn get_scoped(
         &self,
-        _capability: &VaultCapability,
+        _credential_id: &str,
         _min_ttl_ms: u64,
     ) -> Result<VaultCredential, VaultGetError> {
         Err(VaultGetError::Permanent)
     }
 
-    async fn report_auth_failure(
+    async fn report_auth_failure_scoped(
         &self,
-        _capability: &VaultCapability,
+        _credential_id: &str,
         provider_status: u16,
         record_version: u64,
     ) {
@@ -5747,10 +5740,7 @@ fn reporting_reset_request(
         account_id: "acct-reset".to_string(),
         auth_failure: Some(AuthFailureContext {
             source,
-            handle: CredentialHandle::vault(
-                "chatgpt:openai",
-                VaultCapability::new("ckh_reporting_secret"),
-            ),
+            handle: CredentialHandle::scoped("chatgpt:openai", "oauth"),
             record_version: 31,
         }),
     }
@@ -5840,12 +5830,11 @@ async fn credits_and_consume_auth_failures_report_served_version() {
 }
 
 #[test]
-fn reset_request_debug_redacts_bearer_and_capability() {
+fn reset_request_debug_redacts_bearer() {
     let source = Arc::new(MockReportingCredentialSource::default());
     let request = reporting_reset_request(source, "reset-debug-secret");
     let debug = format!("{request:?}");
     assert!(!debug.contains("reset-debug-secret"));
-    assert!(!debug.contains("ckh_reporting_secret"));
     assert!(debug.contains("redacted"));
 }
 
@@ -5873,14 +5862,6 @@ impl SameAccountVaultSource {
 
 #[async_trait]
 impl CredentialSource for SameAccountVaultSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        self.serve(min_ttl_ms)
-    }
-
     async fn get_scoped(
         &self,
         credential_id: &str,
@@ -5888,14 +5869,6 @@ impl CredentialSource for SameAccountVaultSource {
     ) -> Result<VaultCredential, VaultGetError> {
         assert_eq!(credential_id, "chatgpt:openai");
         self.serve(min_ttl_ms)
-    }
-
-    async fn report_auth_failure(
-        &self,
-        _capability: &VaultCapability,
-        _provider_status: u16,
-        _record_version: u64,
-    ) {
     }
 }
 
@@ -5992,7 +5965,7 @@ async fn an_account_with_no_credits_left_publishes_its_real_usage() {
         None,
         reset_transport,
         Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
-        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        VaultHandleLoader::default(),
         codex_home,
     );
     let registry = Registry::new(vec![Box::new(provider)]);
@@ -6284,10 +6257,7 @@ impl UsageProvider for TwoUnitResetProvider {
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         Ok(vec![
             CredentialHandle::implicit(),
-            CredentialHandle::vault(
-                "chatgpt:openai:gmail",
-                crate::credential_source::VaultCapability::new("ckh_same_account"),
-            ),
+            CredentialHandle::scoped("chatgpt:openai:gmail", "oauth"),
         ])
     }
 
@@ -9136,10 +9106,7 @@ impl UsageProvider for TwoLaneProvider {
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         Ok(vec![
             CredentialHandle::implicit(),
-            CredentialHandle::vault(
-                "remote:lane",
-                crate::credential_source::VaultCapability::new("ckh_two_lane"),
-            ),
+            CredentialHandle::scoped("remote:lane", "oauth"),
         ])
     }
 
@@ -9857,33 +9824,6 @@ struct RecordingStatusSource {
 
 #[async_trait]
 impl CredentialSource for RecordingStatusSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        _min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        Err(VaultGetError::Permanent)
-    }
-
-    async fn report_auth_failure(
-        &self,
-        _capability: &VaultCapability,
-        _provider_status: u16,
-        _record_version: u64,
-    ) {
-    }
-
-    async fn status(
-        &self,
-        capability: &VaultCapability,
-    ) -> Result<CredentialStatus, VaultGetError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(capability.expose_secret().to_string());
-        self.result.lock().unwrap().clone()
-    }
-
     async fn status_scoped(&self, credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
         self.calls.lock().unwrap().push(credential_id.to_string());
         self.result.lock().unwrap().clone()
@@ -10197,14 +10137,6 @@ impl ScriptedScopedSource {
 
 #[async_trait]
 impl CredentialSource for ScriptedScopedSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        _min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        Err(VaultGetError::FailClosed)
-    }
-
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         self.replies
@@ -10212,14 +10144,6 @@ impl CredentialSource for ScriptedScopedSource {
             .unwrap()
             .pop_front()
             .unwrap_or(Err(VaultGetError::Transient))
-    }
-
-    async fn report_auth_failure(
-        &self,
-        _capability: &VaultCapability,
-        _provider_status: u16,
-        _record_version: u64,
-    ) {
     }
 }
 
@@ -10842,23 +10766,7 @@ async fn handles_without_account_uses_scoped_type_and_registry_provider_names() 
 struct DefaultListSource;
 
 #[async_trait]
-impl CredentialSource for DefaultListSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        _min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        Err(VaultGetError::Permanent)
-    }
-
-    async fn report_auth_failure(
-        &self,
-        _capability: &VaultCapability,
-        _provider_status: u16,
-        _record_version: u64,
-    ) {
-    }
-}
+impl CredentialSource for DefaultListSource {}
 
 #[tokio::test]
 async fn default_fail_closed_list_does_not_condemn_or_reap_a_slot() {
@@ -11502,14 +11410,6 @@ struct FlakyCodexVaultSource {
 
 #[async_trait]
 impl CredentialSource for FlakyCodexVaultSource {
-    async fn get(
-        &self,
-        _capability: &VaultCapability,
-        _min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        Err(VaultGetError::FailClosed)
-    }
-
     async fn get_scoped(
         &self,
         credential_id: &str,
@@ -11532,14 +11432,6 @@ impl CredentialSource for FlakyCodexVaultSource {
 
     async fn list_scoped(&self) -> Result<ScopedSnapshot, VaultGetError> {
         self.list.list_scoped().await
-    }
-
-    async fn report_auth_failure(
-        &self,
-        _capability: &VaultCapability,
-        _provider_status: u16,
-        _record_version: u64,
-    ) {
     }
 }
 
@@ -12603,7 +12495,7 @@ async fn real_codex_account_spends_its_reset_only_once_its_limit_is_reported() {
             None,
             reset_transport,
             Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
-            VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+            VaultHandleLoader::default(),
             codex_home,
         );
         let registry = Registry::new(vec![Box::new(provider)]);
@@ -12631,10 +12523,6 @@ struct WatchStatusSource {
 
 #[async_trait]
 impl CredentialSource for WatchStatusSource {
-    async fn get(&self, _: &VaultCapability, _: u64) -> Result<VaultCredential, VaultGetError> {
-        Err(VaultGetError::NotFound)
-    }
-    async fn report_auth_failure(&self, _: &VaultCapability, _: u16, _: u64) {}
     fn scoped_watch_open(&self) -> bool {
         self.watching.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -12848,7 +12736,7 @@ async fn live_config_edit_disarms_and_rearms_redemption_without_rebuilding_the_p
         None,
         reset_transport,
         Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
-        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        VaultHandleLoader::default(),
         codex_home,
     );
     let registry = Registry::new(vec![Box::new(provider)]);
@@ -12925,7 +12813,7 @@ async fn an_unreadable_config_file_never_arms_redemption() {
         None,
         reset_transport,
         Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
-        VaultHandleLoader::new(Some(temp.dir.join("absent-handles.json"))),
+        VaultHandleLoader::default(),
         codex_home,
     );
     let registry = Registry::new(vec![Box::new(provider)]);

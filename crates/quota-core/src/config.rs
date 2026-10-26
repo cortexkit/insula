@@ -116,6 +116,7 @@ impl LiveQuotaConfig {
     }
 
     /// The config in force right now.
+    #[cfg(test)]
     pub fn current(&self) -> QuotaConfig {
         self.status().config
     }
@@ -249,11 +250,8 @@ impl ConfigReloader {
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn live(&self) -> &LiveQuotaConfig {
+    #[cfg(test)]
+    fn live(&self) -> &LiveQuotaConfig {
         &self.live
     }
 

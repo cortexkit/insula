@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{ConfigReloader, MuseConfig, QuotaConfig};
-use crate::credential_source::{VaultCapability, VaultCredential, VaultGetError};
+use crate::credential_source::{VaultCredential, VaultGetError};
 use crate::muse::MuseProvider;
 use crate::provider::UsageProvider;
 use async_trait::async_trait;
@@ -27,9 +27,6 @@ fn quota() -> Value {
 struct Source;
 #[async_trait]
 impl CredentialSource for Source {
-    async fn get(&self, _: &VaultCapability, _: u64) -> Result<VaultCredential, VaultGetError> {
-        panic!("all fixture deposits use scoped reads")
-    }
     async fn get_scoped(&self, id: &str, _: u64) -> Result<VaultCredential, VaultGetError> {
         let payload = if id.starts_with("cookie:dev.meta.ai") {
             COOKIE
@@ -46,9 +43,7 @@ impl CredentialSource for Source {
             project_id: None,
         })
     }
-    async fn report_auth_failure(&self, _: &VaultCapability, _: u16, _: u64) {
-        panic!("cookie failures must not reach the vault")
-    }
+
     async fn report_auth_failure_scoped(&self, _: &str, _: u16, _: u64) {
         panic!("cookie failures must not reach the vault")
     }

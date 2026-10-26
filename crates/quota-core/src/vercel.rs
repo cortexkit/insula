@@ -557,9 +557,7 @@ pub(crate) mod testkit {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
-    use crate::credential_source::{
-        CredentialSource, VaultCapability, VaultCredential, VaultGetError,
-    };
+    use crate::credential_source::{CredentialSource, VaultCredential, VaultGetError};
 
     /// One request a loopback server answered.
     #[derive(Clone, Debug)]
@@ -664,14 +662,6 @@ pub(crate) mod testkit {
 
     #[async_trait]
     impl CredentialSource for MockSource {
-        async fn get(
-            &self,
-            _capability: &VaultCapability,
-            _min_ttl_ms: u64,
-        ) -> Result<VaultCredential, VaultGetError> {
-            Err(VaultGetError::FailClosed)
-        }
-
         async fn get_scoped(
             &self,
             credential_id: &str,
@@ -681,14 +671,6 @@ pub(crate) mod testkit {
                 .get(credential_id)
                 .cloned()
                 .ok_or(VaultGetError::NotFound)
-        }
-
-        async fn report_auth_failure(
-            &self,
-            _capability: &VaultCapability,
-            _provider_status: u16,
-            _record_version: u64,
-        ) {
         }
 
         async fn report_auth_failure_scoped(
