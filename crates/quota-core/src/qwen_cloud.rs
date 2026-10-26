@@ -1531,7 +1531,7 @@ mod tests {
             let (base, server) = fixture_server(replies).await;
             let provider = QwenCloudProvider::new_with_handle_loader(
                 None,
-                std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+                std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
             );
             let team_urls = [
                 format!("{base}/info"),
@@ -2388,7 +2388,7 @@ mod tests {
     fn handles_without_credential_source_are_empty() {
         let provider = QwenCloudProvider::new_with_handle_loader(
             None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, Vec::<CredentialHandle>::new());

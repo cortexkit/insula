@@ -17,8 +17,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::credential_source::CredentialSource;
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
 use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
@@ -1104,18 +1102,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -1205,14 +1203,11 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"synthetic-vault-key", 9)));
         let mut provider = SyntheticProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.base_url = Some(format!("{base}/v2/quotas"));
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:synthetic",
-                VaultCapability::new("ckh_synthetic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:synthetic", "apikey"))
             .await;
         assert_eq!(attempt.source.as_deref(), Some("vault"));
         assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 20.0);
@@ -1231,14 +1226,11 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"synthetic-vault-key", 44)));
         let mut provider = SyntheticProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.base_url = Some(format!("{base}/v2/quotas"));
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:synthetic",
-                VaultCapability::new("ckh_synthetic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:synthetic", "apikey"))
             .await;
         assert!(matches!(
             attempt.usage,

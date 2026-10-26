@@ -24,8 +24,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::credential_source::CredentialSource;
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt, RateLimited};
 use crate::vault_handles::VaultHandleLoader;
 use crate::LOG_TAG;
@@ -1405,18 +1403,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -1455,7 +1453,7 @@ mod tests {
     fn test_provider(source: Arc<dyn CredentialSource>, usage_url: String) -> AnthropicProvider {
         let mut provider = AnthropicProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(None)),
+            Arc::new(VaultHandleLoader::default()),
         );
         provider.usage_url = usage_url;
         provider
@@ -1535,10 +1533,7 @@ mod tests {
         });
         let (source, reports) = source(Ok(credential(b"synthetic-reset-token", 44)));
         let attempt = test_provider(source, url)
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:anthropic", "oauth"))
             .await;
         // Yield so the asynchronously dispatched vault auth-failure report
         // can reach the mock before the test examines its recorded calls.
@@ -1987,10 +1982,7 @@ mod tests {
         let (source, _) = source(Ok(credential(b"synthetic-reset-token", 44)));
         let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
             provider: test_provider(source, url),
-            handle: CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ),
+            handle: CredentialHandle::scoped("oauth:anthropic", "oauth"),
         })]);
         registry
             .refresh_tick(&tokio_util::sync::CancellationToken::new())
@@ -2100,10 +2092,7 @@ mod tests {
         let (source, _) = source(Ok(vault_credential));
         let provider = test_provider(source, url);
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:anthropic", "oauth"))
             .await;
 
         assert_eq!(attempt.source.as_deref(), Some("vault"));
@@ -2128,8 +2117,7 @@ mod tests {
         let body = br#"{"five_hour":{"utilization":7.0,"resets_at":null}}"#.to_vec();
         let (url, _) = serve_once(200, body).await;
         let (source, _) = source(Ok(credential(b"anthropic-vault-token", 28)));
-        let handle =
-            CredentialHandle::vault("oauth:anthropic", VaultCapability::new("ckh_anthropic"));
+        let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
         let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
             provider: test_provider(source, url),
             handle,
@@ -2159,10 +2147,7 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Transient));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:anthropic", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,
@@ -2205,10 +2190,7 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"anthropic-vault-token", 44)));
         let mut provider = test_provider(Arc::clone(&source), vault_url);
         let vault = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:anthropic", "oauth"))
             .await;
         assert!(matches!(
             vault.usage,
@@ -2241,10 +2223,7 @@ mod tests {
         let (source, _) = source(Ok(credential(&[0xff, 0xfe], 8)));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:anthropic",
-                VaultCapability::new("ckh_anthropic"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:anthropic", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,
@@ -3014,8 +2993,7 @@ mod tests {
             .into_bytes();
         let (url, _) = serve_once(200, body).await;
         let (source, _) = source(Ok(credential(b"anthropic-vault-token", 31)));
-        let handle =
-            CredentialHandle::vault("oauth:anthropic", VaultCapability::new("ckh_anthropic"));
+        let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
         let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
             provider: test_provider(source, url),
             handle,

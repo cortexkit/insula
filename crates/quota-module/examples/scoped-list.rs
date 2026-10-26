@@ -1,21 +1,9 @@
 //! Exercise `credential.list_scoped` against the running vault and report what
 //! came back.
 //!
-//! WHY THIS EXISTS AS A TOOL RATHER THAN A ONE-OFF. The scoped-grant migration
-//! retires `~/.config/cortexkit/ck-quota/vault-handles.json`: the module will
-//! enumerate credentials from this call instead, so `ck auth login` alone makes
-//! an account appear in `ck quota`. That hand-maintained map has failed three
-//! ways on this host in a single day -- an active credential never mapped (an
-//! invisible account), a mapped credential later deleted from the vault (a dead
-//! row that ALSO suppressed `completeProviders` for four healthy siblings), and
-//! a handle minted by an operator that no consumer claimed.
-//!
-//! THE OP HAS NEVER SERVED A REAL CONSUMER. Its owner says so plainly: its
-//! correctness today is warranted by tests written against the behaviour their
-//! author imagined. So the first call from here is a MEASUREMENT, and the boring
-//! outcome is the one worth reporting -- a consumer confirming the specified
-//! shape is the single piece of evidence a producer's own tests structurally
-//! cannot produce.
+//! The module enumerates credentials through scoped grants. This diagnostic
+//! checks the listing shape without fetching credential payloads. It needs an
+//! authorized caller principal; a standalone direct caller may be refused.
 //!
 //! PRINTS NO SECRET. The reply carries no credential material: `list_scoped`
 //! enumerates identities and states, and the bearer is fetched separately by
@@ -24,23 +12,7 @@
 //!
 //! Exit 0 clean, 1 findings, 2 could not check.
 
-use quota_core::credential_source::{CredentialSource, VaultCapability};
 use quota_module::vault_client::VaultClient;
-
-/// Any capability from the module's own handle map, purely to address the control
-/// op with. Never printed, and the op it drives (`credential.status`) returns no
-/// secret -- it reports readiness and a record version.
-fn control_handle() -> Option<VaultCapability> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(home).join(".config/cortexkit/ck-quota/vault-handles.json");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let handles = parsed.get("handles")?.as_object()?;
-    handles
-        .values()
-        .find_map(|value| value.as_str())
-        .map(VaultCapability::new)
-}
 
 #[path = "support/connection.rs"]
 mod connection;
@@ -53,53 +25,9 @@ async fn main() {
     let listing = match client.list_scoped_report().await {
         Ok(listing) => listing,
         Err(error) => {
-            // A REFUSAL IS AMBIGUOUS UNTIL A CONTROL SAYS OTHERWISE, and this one
-            // has two very different readings: the vault has nothing for us, or
-            // this PROCESS may not ask. Reporting the first without checking is
-            // how a correct refusal gets filed as a defect -- which the vault's
-            // own maintainer nearly did with their probe, for this exact reason.
-            //
-            // THE CONTROL: a handle-addressed op from this same process, over the
-            // same connection. Scoped ops are authorised by the caller's bus
-            // principal, and a standalone example binds as a DIRECT caller rather
-            // than as the supervised module, so scoped ops refuse it while handle
-            // ops do not. If the control succeeds, the discriminator is the OP
-            // CLASS and not the connection, the credentials, or the daemon.
             eprintln!("  credential.list_scoped refused: {error:?}");
-            let control = control_handle();
-            match control {
-                None => {
-                    eprintln!("  control: SKIPPED, no handle available to address one with");
-                    eprintln!("  exit 2: the refusal is unexplained, which is itself the finding");
-                }
-                Some(capability) => match client.status(&capability).await {
-                    Ok(_) => {
-                        eprintln!(
-                            "  control: a handle-addressed op from this SAME process SUCCEEDED"
-                        );
-                        eprintln!(
-                            "  so the refusal is about this caller's principal, not the vault:"
-                        );
-                        eprintln!(
-                            "  a standalone probe is a Direct caller, and scoped ops admit the"
-                        );
-                        eprintln!(
-                            "  supervised module by its bus principal or an ENROLLED consumer"
-                        );
-                        eprintln!(
-                            "  holding a token. Neither is a plain dial, so this op cannot be"
-                        );
-                        eprintln!(
-                            "  measured by running this file as-is: the first real call has to"
-                        );
-                        eprintln!("  come from inside the deployed binary.");
-                    }
-                    Err(control_error) => {
-                        eprintln!("  control: the handle op ALSO refused ({control_error:?})");
-                        eprintln!("  so this is the connection or the vault, not the op class");
-                    }
-                },
-            }
+            eprintln!("  check the caller's scoped grants and daemon connection");
+            eprintln!("  exit 2: no credential inventory was observed");
             std::process::exit(2);
         }
     };

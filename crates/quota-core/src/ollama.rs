@@ -1263,13 +1263,6 @@ mod tests {
         struct Source(AuthReports);
         #[async_trait]
         impl CredentialSource for Source {
-            async fn get(
-                &self,
-                _: &VaultCapability,
-                _: u64,
-            ) -> Result<VaultCredential, VaultGetError> {
-                Err(VaultGetError::FailClosed)
-            }
             async fn get_scoped(&self, _: &str, _: u64) -> Result<VaultCredential, VaultGetError> {
                 Ok(VaultCredential {
                     payload: b"fixture_key".to_vec(),
@@ -1282,9 +1275,6 @@ mod tests {
                 })
             }
             async fn report_auth_failure_scoped(&self, _: &str, status: u16, version: u64) {
-                self.0.lock().unwrap().push((status, version));
-            }
-            async fn report_auth_failure(&self, _: &VaultCapability, status: u16, version: u64) {
                 self.0.lock().unwrap().push((status, version));
             }
         }

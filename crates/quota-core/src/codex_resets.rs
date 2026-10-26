@@ -591,7 +591,8 @@ impl RedemptionJournal {
         Ok(journal)
     }
 
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -1134,10 +1135,6 @@ const LEGACY_STATE_SEGMENT: &str = "cortexkit/ck-quota";
 /// operator-facing knob that may be set in a live config, and renaming it would
 /// silently relocate the journal for anyone who set it — the exact failure this
 /// whole migration exists to avoid, arriving through the escape hatch.
-pub fn redemption_journal_path() -> Result<PathBuf, JournalError> {
-    journal_path_from(&cortexkit_paths::SystemEnv, cfg!(windows))
-}
-
 fn journal_path_from(
     env: &impl cortexkit_paths::EnvSource,
     windows: bool,

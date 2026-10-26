@@ -351,7 +351,6 @@ mod tests {
                 .map(|name| crate::cookie_jar::Cookie {
                     name: (*name).to_string(),
                     value: "x".to_string(),
-                    host_key: "qoder.com".to_string(),
                 })
                 .collect(),
         }
@@ -575,7 +574,7 @@ mod tests {
     fn handles_without_credential_source_are_empty() {
         let provider = QoderProvider::new_with_handle_loader(
             None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, Vec::<CredentialHandle>::new());

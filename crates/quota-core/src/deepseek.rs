@@ -17,8 +17,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::credential_source::CredentialSource;
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::env;
 use crate::http::JsonRequest;
 use crate::model::{Pool, PoolBasis, PoolFunding, Usage};
@@ -485,18 +483,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -586,14 +584,11 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"deepseek-vault-key", 9)));
         let mut provider = DeepSeekProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/user/balance");
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:deepseek",
-                VaultCapability::new("ckh_deepseek"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:deepseek", "apikey"))
             .await;
         assert_eq!(attempt.source.as_deref(), Some("vault"));
         let pools = attempt.pools.as_ref().unwrap();
@@ -613,14 +608,11 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"deepseek-vault-key", 44)));
         let mut provider = DeepSeekProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(crate::vault_handles::VaultHandleLoader::new(None)),
+            Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         provider.url = format!("{base}/user/balance");
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "apikey:deepseek",
-                VaultCapability::new("ckh_deepseek"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("apikey:deepseek", "apikey"))
             .await;
         assert!(matches!(
             attempt.usage,

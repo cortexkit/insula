@@ -1326,9 +1326,7 @@ mod vault_lane_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use crate::credential_source::{
-        VaultCapability, VaultCredential, VaultGetError, VAULT_READ_MIN_TTL_MS,
-    };
+    use crate::credential_source::{VaultCredential, VaultGetError, VAULT_READ_MIN_TTL_MS};
 
     /// A remains body with one readable window.
     const REMAINS: &[u8] = br#"{
@@ -1352,18 +1350,18 @@ mod vault_lane_tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, VAULT_READ_MIN_TTL_MS);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -1400,10 +1398,7 @@ mod vault_lane_tests {
     }
 
     fn vault_handle() -> CredentialHandle {
-        CredentialHandle::vault(
-            "apikey:minimax-coding-plan:main",
-            VaultCapability::new("ckh_minimax"),
-        )
+        CredentialHandle::scoped("apikey:minimax-coding-plan:main", "apikey")
     }
 
     /// A provider whose two regional hosts are the given URLs.

@@ -340,7 +340,7 @@ impl UsageProvider for ClaudeConsoleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential_source::{VaultCapability, VaultCredential, VaultGetError};
+    use crate::credential_source::{VaultCredential, VaultGetError};
     use serde_json::json;
     use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
 
@@ -563,10 +563,6 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for CookieSource {
-        async fn get(&self, _: &VaultCapability, _: u64) -> Result<VaultCredential, VaultGetError> {
-            Err(VaultGetError::FailClosed)
-        }
-
         async fn get_scoped(&self, id: &str, ttl: u64) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(ttl, 120_000);
             Ok(VaultCredential {
@@ -579,10 +575,6 @@ mod tests {
                 org_name: None,
                 project_id: None,
             })
-        }
-
-        async fn report_auth_failure(&self, _: &VaultCapability, _: u16, _: u64) {
-            panic!("cookie sessions cannot be refreshed by the vault");
         }
 
         async fn report_auth_failure_scoped(&self, _: &str, _: u16, _: u64) {

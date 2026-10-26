@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use quota_core::credential_source::{
-    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCapability,
-    VaultCredential, VaultGetError,
+    CredentialSource, CredentialStatus, ScopedRowState, ScopedSnapshot, VaultCredential,
+    VaultGetError,
 };
 use quota_core::LOG_TAG;
 use serde::{Deserialize, Serialize};
@@ -1208,18 +1208,6 @@ impl std::fmt::Debug for VaultClient {
 }
 
 #[derive(Serialize)]
-struct GetRequest<'a> {
-    method: &'static str,
-    params: GetParams<'a>,
-}
-
-#[derive(Serialize)]
-struct GetParams<'a> {
-    handle: &'a str,
-    min_ttl_ms: u64,
-}
-
-#[derive(Serialize)]
 struct GetScopedRequest {
     method: &'static str,
     params: GetScopedParams,
@@ -1239,8 +1227,9 @@ struct ReportRequest {
 
 #[derive(Serialize)]
 struct ReportParams {
-    handle: Option<String>,
-    credential_id: Option<String>,
+    // Keep the null field for wire compatibility; credential_id is the only address.
+    handle: (),
+    credential_id: String,
     provider_status: u16,
     record_version: u64,
 }
@@ -1253,69 +1242,32 @@ struct StatusRequest {
 
 #[derive(Serialize)]
 struct StatusParams {
-    handle: Option<String>,
-    credential_id: Option<String>,
-}
-
-const INVALID_PARAMS: &str = "invalid_params";
-
-fn validate_address(
-    handle: &Option<String>,
-    credential_id: &Option<String>,
-) -> Result<(), &'static str> {
-    if handle.is_some() ^ credential_id.is_some() {
-        Ok(())
-    } else {
-        Err(INVALID_PARAMS)
-    }
+    // Keep the null field for wire compatibility; credential_id is the only address.
+    handle: (),
+    credential_id: String,
 }
 
 impl StatusParams {
-    fn for_handle(handle: &str) -> Self {
-        Self {
-            handle: Some(handle.to_string()),
-            credential_id: None,
-        }
-    }
-
     fn for_credential_id(credential_id: &str) -> Self {
         Self {
-            handle: None,
-            credential_id: Some(credential_id.to_string()),
+            handle: (),
+            credential_id: credential_id.to_string(),
         }
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
-        validate_address(&self.handle, &self.credential_id)
     }
 }
 
 impl ReportParams {
-    fn for_handle(handle: &str, provider_status: u16, record_version: u64) -> Self {
-        Self {
-            handle: Some(handle.to_string()),
-            credential_id: None,
-            provider_status,
-            record_version,
-        }
-    }
-
     fn for_credential_id(credential_id: &str, provider_status: u16, record_version: u64) -> Self {
         Self {
-            handle: None,
-            credential_id: Some(credential_id.to_string()),
+            handle: (),
+            credential_id: credential_id.to_string(),
             provider_status,
             record_version,
         }
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
-        validate_address(&self.handle, &self.credential_id)
     }
 }
 
 fn encode_status_request(params: StatusParams) -> Result<Vec<u8>, VaultGetError> {
-    params.validate().map_err(|_| VaultGetError::FailClosed)?;
     serde_json::to_vec(&StatusRequest {
         method: "credential.status",
         params,
@@ -1324,7 +1276,6 @@ fn encode_status_request(params: StatusParams) -> Result<Vec<u8>, VaultGetError>
 }
 
 fn encode_report_request(params: ReportParams) -> Result<Vec<u8>, VaultGetError> {
-    params.validate().map_err(|_| VaultGetError::FailClosed)?;
     serde_json::to_vec(&ReportRequest {
         method: "credential.report_auth_failure",
         params,
@@ -1367,11 +1318,13 @@ struct ListScopedParams {}
 
 #[derive(Deserialize)]
 struct VaultStatusResult {
-    ready: bool,
+    // Validate metadata types without treating readiness as proof of repair.
+    #[serde(rename = "ready")]
+    _ready: bool,
     #[serde(default)]
     record_version: Option<u64>,
-    #[serde(default)]
-    stale_pending: Option<bool>,
+    #[serde(default, rename = "stale_pending")]
+    _stale_pending: Option<bool>,
 }
 
 /// The only recovery cursor exposed by scoped status.
@@ -1877,7 +1830,7 @@ fn decode_get_response(body: &[u8]) -> Result<VaultCredential, VaultGetError> {
 
 /// Decode a `credential.list_scoped` reply.
 ///
-/// Mirrors [`decode_status_response`]: a result object is either a success or an
+/// Mirrors [`decode_status_result`]: a result object is either a success or an
 /// error, never both and never neither, and an ambiguous reply fails closed.
 ///
 /// SUCCESS IS DISCRIMINATED ON `view`, NOT ON `credentials`. An authorised caller
@@ -2022,9 +1975,8 @@ fn decode_list_scoped_inner(body: &[u8]) -> Result<CompleteScopedListResult, Vau
 ///
 /// Same two-level shape as [`decode_get_response`]: a `result` object is either
 /// a success body or an `error` body, never both, never neither. Extra wire
-/// fields (`last_error_code`, `lease_held`) are ignored. Handle-addressed status
-/// exposes the metadata fields it historically carried; scoped status projects
-/// only the monotonic record version.
+/// fields (`last_error_code`, `lease_held`) are ignored. Status metadata is
+/// validated, but only the monotonic record version is exposed to callers.
 ///
 /// A decode failure here is returned to the caller. It must not be fed into
 /// slot transition: status is an accelerator, and an accelerator that can
@@ -2054,12 +2006,13 @@ fn decode_status_result(body: &[u8]) -> Result<VaultStatusResult, VaultGetError>
     }
 }
 
+#[cfg(test)]
 fn decode_status_response(body: &[u8]) -> Result<CredentialStatus, VaultGetError> {
     let success = decode_status_result(body)?;
     Ok(CredentialStatus {
-        ready: success.ready,
+        ready: success._ready,
         record_version: success.record_version,
-        stale_pending: success.stale_pending,
+        stale_pending: success._stale_pending,
     })
 }
 
@@ -2090,14 +2043,6 @@ fn decode_report_response(body: &[u8]) -> Result<(), VaultGetError> {
 
 impl VaultClient {
     /// Enumerate the credentials our grants cover.
-    ///
-    /// The read half of retiring the hand-maintained handle map: today a
-    /// credential reaches this module only if someone pastes a capability into
-    /// `vault-handles.json`, which is a step no tool owns and which has failed
-    /// three ways on this host in one day -- an active credential never mapped
-    /// (invisible account), a mapped credential later deleted from the vault (a
-    /// dead row that also suppressed `completeProviders` for four healthy
-    /// siblings), and a handle minted by an operator that no consumer claimed.
     ///
     /// ABSENCE FROM THE LIST MEANS UNGRANTED, NEVER BROKEN. A `needs_reauth`
     /// credential is PRESENT with that state (verified at the vault's source: the
@@ -2264,73 +2209,6 @@ impl CredentialSource for VaultClient {
             record_version,
         )
         .await;
-    }
-
-    async fn get(
-        &self,
-        capability: &VaultCapability,
-        min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError> {
-        let body = serde_json::to_vec(&GetRequest {
-            method: "credential.get",
-            params: GetParams {
-                handle: capability.expose_secret(),
-                min_ttl_ms,
-            },
-        })
-        .map_err(|_| VaultGetError::FailClosed)?;
-        let frame = self
-            .state
-            .call(body)
-            .await
-            .map_err(ClientFailure::vault_error)?;
-        decode_get_response(&frame.body)
-    }
-
-    /// Tell the vault a served credential was refused upstream.
-    ///
-    /// **The least-proven shape this module emits.** Every other emitted shape
-    /// has a receiver that accepts or refuses it continuously: the `usage.get`
-    /// reply is decoded by consumers on every poll, the `credential.get` request
-    /// is honoured by the vault whenever a lane serves, and the health report is
-    /// rendered by the daemon. Those are proven by use.
-    ///
-    /// This one is sent only when an upstream returns 401 or 403, which on a
-    /// healthy host is never. So a rename or a shape change here is not caught
-    /// by anything running today — it surfaces on the first real auth failure,
-    /// which is the worst moment to discover the report does not arrive, since
-    /// that report is what invalidates a static API key that has no refresh
-    /// adapter to notice for itself.
-    ///
-    /// It is not testable by sending one: a synthetic report would mutate the
-    /// vault's record state. The bounded gap is stated here rather than closed,
-    /// and the acceptance evidence is the absence of the warning below during a
-    /// genuine failure.
-    async fn report_auth_failure(
-        &self,
-        capability: &VaultCapability,
-        provider_status: u16,
-        record_version: u64,
-    ) {
-        self.send_auth_failure_report(ReportParams::for_handle(
-            capability.expose_secret(),
-            provider_status,
-            record_version,
-        ))
-        .await;
-    }
-
-    async fn status(
-        &self,
-        capability: &VaultCapability,
-    ) -> Result<CredentialStatus, VaultGetError> {
-        let body = encode_status_request(StatusParams::for_handle(capability.expose_secret()))?;
-        let frame = self
-            .state
-            .call(body)
-            .await
-            .map_err(ClientFailure::vault_error)?;
-        decode_status_response(&frame.body)
     }
 }
 
@@ -3336,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn status_params_accept_exactly_one_address() {
+    fn status_params_address_the_scoped_credential() {
         let by_id = StatusParams::for_credential_id("oauth:anthropic:umutaday");
         let by_id_body: Value =
             serde_json::from_slice(&encode_status_request(by_id).unwrap()).unwrap();
@@ -3350,31 +3228,6 @@ mod tests {
                 }
             })
         );
-
-        let by_handle = StatusParams::for_handle("ckh_existing");
-        let by_handle_body: Value =
-            serde_json::from_slice(&encode_status_request(by_handle).unwrap()).unwrap();
-        assert_eq!(
-            by_handle_body,
-            serde_json::json!({
-                "method": "credential.status",
-                "params": {
-                    "handle": "ckh_existing",
-                    "credential_id": null
-                }
-            })
-        );
-
-        let both = StatusParams {
-            handle: Some("ckh_existing".to_string()),
-            credential_id: Some("oauth:anthropic:umutaday".to_string()),
-        };
-        assert_eq!(both.validate(), Err("invalid_params"));
-        let neither = StatusParams {
-            handle: None,
-            credential_id: None,
-        };
-        assert_eq!(neither.validate(), Err("invalid_params"));
     }
 
     #[test]
@@ -3426,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_params_are_xor_and_record_version_is_required() {
+    fn auth_failure_params_address_the_scoped_credential_and_require_record_version() {
         let by_id = ReportParams::for_credential_id("apikey:deepseek", 401, 17);
         let body: Value = serde_json::from_slice(&encode_report_request(by_id).unwrap()).unwrap();
         assert_eq!(
@@ -3440,29 +3293,6 @@ mod tests {
                     "record_version": 17
                 }
             })
-        );
-        assert!(ReportParams::for_handle("ckh_existing", 401, 17)
-            .validate()
-            .is_ok());
-        assert_eq!(
-            ReportParams {
-                handle: Some("ckh_existing".to_string()),
-                credential_id: Some("apikey:deepseek".to_string()),
-                provider_status: 401,
-                record_version: 17,
-            }
-            .validate(),
-            Err("invalid_params")
-        );
-        assert_eq!(
-            ReportParams {
-                handle: None,
-                credential_id: None,
-                provider_status: 401,
-                record_version: 17,
-            }
-            .validate(),
-            Err("invalid_params")
         );
 
         let malformed_request = serde_json::json!({
@@ -3588,9 +3418,7 @@ mod tests {
         });
         let client = VaultClient::with_timeout(&path, Duration::from_millis(600));
 
-        let first = client
-            .get(&VaultCapability::new("ckh_wedged"), 120_000)
-            .await;
+        let first = client.get_scoped("oauth:test:wedged", 120_000).await;
         assert_eq!(first.unwrap_err(), VaultGetError::Transient);
         assert_eq!(
             client.state.connections_established(),
@@ -3598,9 +3426,7 @@ mod tests {
             "precondition: exactly one connection was built for the first call"
         );
 
-        let second = client
-            .get(&VaultCapability::new("ckh_wedged"), 120_000)
-            .await;
+        let second = client.get_scoped("oauth:test:wedged", 120_000).await;
         assert_eq!(second.unwrap_err(), VaultGetError::Transient);
         assert_eq!(
             client.state.connections_established(),
@@ -3631,9 +3457,7 @@ mod tests {
         });
         let client = VaultClient::with_timeout(&path, Duration::from_secs(1));
 
-        let result = client
-            .get(&VaultCapability::new("ckh_timeout"), 120_000)
-            .await;
+        let result = client.get_scoped("oauth:test:timeout", 120_000).await;
         assert_eq!(result.unwrap_err(), VaultGetError::Transient);
         // The caller's own pending entry is removed by its drop guard at
         // cancellation, but the detached single-flight route opener may still
@@ -3656,7 +3480,7 @@ mod tests {
             .await
             .expect("stub server did not finish: the get request never reached it")
             .unwrap();
-        // The late credential.get response arrived after the timeout: it must
+        // The late credential.get_scoped response arrived after the timeout: it must
         // have been discarded without reviving or leaking a pending entry.
         assert!(client.state.pending.lock().unwrap().is_empty());
     }
@@ -3672,10 +3496,8 @@ mod tests {
             drop(listener);
         });
         let client = VaultClient::with_timeout(&path, Duration::from_millis(200));
-        let first_capability = VaultCapability::new("ckh_dead_one");
-        let second_capability = VaultCapability::new("ckh_dead_two");
-        let first = client.get(&first_capability, 120_000);
-        let second = client.get(&second_capability, 120_000);
+        let first = client.get_scoped("oauth:test:dead-one", 120_000);
+        let second = client.get_scoped("oauth:test:dead-two", 120_000);
         let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(first, second)
         })
@@ -3720,7 +3542,7 @@ mod tests {
         let client = VaultClient::with_timeout(&path, Duration::from_millis(500));
 
         let credential = client
-            .get(&VaultCapability::new("ckh_route"), 120_000)
+            .get_scoped("oauth:test:route", 120_000)
             .await
             .unwrap();
         assert_eq!(credential.payload, b"recovered-token");

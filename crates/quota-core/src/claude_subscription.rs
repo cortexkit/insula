@@ -445,7 +445,7 @@ impl SubscriptionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential_source::{VaultCapability, VaultGetError};
+    use crate::credential_source::VaultGetError;
     use async_trait::async_trait;
     use serde_json::json;
     use tokio::io::AsyncWriteExt;
@@ -660,9 +660,6 @@ mod tests {
     }
     #[async_trait]
     impl CredentialSource for Source {
-        async fn get(&self, _: &VaultCapability, _: u64) -> Result<VaultCredential, VaultGetError> {
-            Err(VaultGetError::FailClosed)
-        }
         async fn get_scoped(&self, id: &str, ttl: u64) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(ttl, VAULT_READ_MIN_TTL_MS);
             let mut credential = credential();
@@ -673,9 +670,7 @@ mod tests {
             }
             Ok(credential)
         }
-        async fn report_auth_failure(&self, _: &VaultCapability, _: u16, _: u64) {
-            *self.reports.lock().unwrap() += 1;
-        }
+
         async fn report_auth_failure_scoped(&self, _: &str, _: u16, _: u64) {
             *self.reports.lock().unwrap() += 1;
         }

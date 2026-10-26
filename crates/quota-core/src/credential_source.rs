@@ -1,6 +1,6 @@
 //! Subc-free seam for resolving credentials from the external vault.
 //!
-//! Capability values and payloads are bearer secrets. Their formatting is
+//! Credential payloads are bearer secrets. Their formatting is
 //! deliberately redacted, and vault errors are fixed classes with no upstream
 //! text so provider degradation can never put secret material on the usage wire.
 
@@ -11,27 +11,6 @@ use async_trait::async_trait;
 
 use crate::model::AccountInfo;
 use crate::provider::CredentialHandle;
-
-/// An owned snapshot of one opaque vault capability.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct VaultCapability(String);
-
-impl VaultCapability {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Expose the capability only to the transport that must put it on the wire.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for VaultCapability {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("VaultCapability(<redacted>)")
-    }
-}
 
 /// One credential result served by the vault.
 #[derive(Clone, PartialEq, Eq)]
@@ -213,12 +192,6 @@ pub struct ScopedSnapshot {
 /// Vault access supplied by the subc-aware module crate.
 #[async_trait]
 pub trait CredentialSource: Send + Sync {
-    async fn get(
-        &self,
-        capability: &VaultCapability,
-        min_ttl_ms: u64,
-    ) -> Result<VaultCredential, VaultGetError>;
-
     /// Resolve a credential by id under the caller's scoped grant.
     async fn get_scoped(
         &self,
@@ -248,14 +221,6 @@ pub trait CredentialSource: Send + Sync {
         std::future::pending::<()>().await;
     }
 
-    /// CAS-guarded report for the exact capability-addressed record version served.
-    async fn report_auth_failure(
-        &self,
-        capability: &VaultCapability,
-        provider_status: u16,
-        record_version: u64,
-    );
-
     /// CAS-guarded report for the exact scoped record version served.
     async fn report_auth_failure_scoped(
         &self,
@@ -265,15 +230,7 @@ pub trait CredentialSource: Send + Sync {
     ) {
     }
 
-    /// Handle resolution plus plaintext metadata. No decrypt, no refresh, no audit.
-    async fn status(
-        &self,
-        _capability: &VaultCapability,
-    ) -> Result<CredentialStatus, VaultGetError> {
-        Err(VaultGetError::FailClosed)
-    }
-
-    /// Scoped status lookup mirrors [`Self::status`]. An error means only that
+    /// Plaintext metadata lookup without decrypting, refreshing, or auditing. An error means only that
     /// the lookup could not answer, not that the credential is invalid.
     async fn status_scoped(&self, _credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
         Err(VaultGetError::FailClosed)
@@ -307,9 +264,6 @@ pub async fn get_vault_credential(
         CredentialHandle::Vault { credential_id, .. } => {
             source.get_scoped(credential_id, min_ttl_ms).await
         }
-        CredentialHandle::LegacyVault { capability, .. } => {
-            source.get(capability, min_ttl_ms).await
-        }
         CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => {
             Err(VaultGetError::FailClosed)
         }
@@ -328,8 +282,7 @@ pub async fn get_vault_credential(
 /// asks -- did WE do this, or did the credential die on its own -- and the report
 /// is fire-and-forget, so nothing else records it either.
 ///
-/// Deliberately a bare count rather than a per-credential map: the capability is a
-/// bearer secret and the credential id is not in scope at the gate. A count
+/// Deliberately a bare count rather than a per-credential map: a count
 /// separates "this module latched something" from "this module has never reported
 /// anything", which is the distinction that decides where to look next.
 static AUTH_FAILURES_REPORTED: AtomicU64 = AtomicU64::new(0);
@@ -377,49 +330,14 @@ fn count_auth_failure_reported() {
     REPORTED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
 }
 
-#[doc(hidden)]
-pub enum VaultAuthFailureAddress {
-    Capability(VaultCapability),
-    Scoped(String),
-}
-
-/// An address accepted by the shared auth-failure reporting gate.
-#[doc(hidden)]
-pub trait VaultAuthFailureTarget {
-    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress>;
-}
-
-impl VaultAuthFailureTarget for VaultCapability {
-    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress> {
-        Some(VaultAuthFailureAddress::Capability(self.clone()))
-    }
-}
-
-impl VaultAuthFailureTarget for CredentialHandle {
-    fn auth_failure_address(&self) -> Option<VaultAuthFailureAddress> {
-        if !self.is_vault() {
-            return None;
-        }
-        match self {
-            CredentialHandle::Vault { credential_id, .. } => {
-                Some(VaultAuthFailureAddress::Scoped(credential_id.clone()))
-            }
-            CredentialHandle::LegacyVault { capability, .. } => {
-                Some(VaultAuthFailureAddress::Capability(capability.clone()))
-            }
-            CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => None,
-        }
-    }
-}
-
 /// Report a rejected vault credential to the store that issued it.
 ///
 /// Only a provider 401 is evidence that the served credential itself was
 /// rejected. A 403 can describe entitlement instead, so reporting it would
 /// invalidate a credential that may still be healthy.
-pub fn report_vault_auth_failure<T: VaultAuthFailureTarget + ?Sized>(
+pub fn report_vault_auth_failure(
     source: Option<&Arc<dyn CredentialSource>>,
-    target: &T,
+    target: &CredentialHandle,
     record_version: u64,
     error: &crate::provider::FetchError,
 ) {
@@ -429,26 +347,18 @@ pub fn report_vault_auth_failure<T: VaultAuthFailureTarget + ?Sized>(
     let Some(source) = source else {
         return;
     };
-    let Some(address) = target.auth_failure_address() else {
+    let Some(credential_id) = target.vault_credential_id() else {
         return;
     };
     let source = Arc::clone(source);
+    let credential_id = credential_id.to_owned();
     let status = *status;
     count_auth_failure_reported();
     let _ = FETCH_REPORTED_AUTH_FAILURE.try_with(|reported| reported.set(true));
     tokio::spawn(async move {
-        match address {
-            VaultAuthFailureAddress::Capability(capability) => {
-                source
-                    .report_auth_failure(&capability, status, record_version)
-                    .await;
-            }
-            VaultAuthFailureAddress::Scoped(credential_id) => {
-                source
-                    .report_auth_failure_scoped(&credential_id, status, record_version)
-                    .await;
-            }
-        }
+        source
+            .report_auth_failure_scoped(&credential_id, status, record_version)
+            .await;
     });
 }
 
@@ -505,7 +415,7 @@ mod tests {
     async fn the_counter_moves_only_when_a_credential_is_actually_latched() {
         let source = RecordingSource::default();
         let source: Arc<dyn CredentialSource> = Arc::new(source);
-        let capability = VaultCapability::new("ckh_counter");
+        let handle = CredentialHandle::scoped("oauth:test:counter", "oauth");
 
         let before = reported_here();
         let global_before = auth_failures_reported();
@@ -514,7 +424,7 @@ mod tests {
         for _ in 0..3 {
             report_vault_auth_failure(
                 Some(&source),
-                &capability,
+                &handle,
                 1,
                 &crate::provider::FetchError::ProviderStatus(403, String::new()),
             );
@@ -522,7 +432,7 @@ mod tests {
         // Nor an error that never reaches the gate at all.
         report_vault_auth_failure(
             Some(&source),
-            &capability,
+            &handle,
             1,
             &crate::provider::FetchError::Upstream("timeout".into()),
         );
@@ -537,7 +447,7 @@ mod tests {
                 .block_on(async {
                     report_vault_auth_failure(
                         Some(&other_source),
-                        &VaultCapability::new("ckh_other_thread"),
+                        &CredentialHandle::scoped("oauth:test:other-thread", "oauth"),
                         1,
                         &crate::provider::FetchError::ProviderStatus(401, String::new()),
                     );
@@ -554,7 +464,7 @@ mod tests {
         // A 401 with a served bearer does.
         report_vault_auth_failure(
             Some(&source),
-            &capability,
+            &handle,
             1,
             &crate::provider::FetchError::ProviderStatus(401, String::new()),
         );
@@ -582,7 +492,7 @@ mod tests {
 
         report_vault_auth_failure(
             Some(&source),
-            &VaultCapability::new("ckh_test"),
+            &CredentialHandle::scoped("oauth:test", "oauth"),
             7,
             &crate::provider::FetchError::ProviderStatus(401, String::new()),
         );
@@ -615,7 +525,7 @@ mod tests {
 
         report_vault_auth_failure(
             Some(&source),
-            &VaultCapability::new("ckh_test"),
+            &CredentialHandle::scoped("oauth:test", "oauth"),
             7,
             &crate::provider::FetchError::ProviderStatus(403, String::new()),
         );
@@ -641,7 +551,7 @@ mod tests {
 
         report_vault_auth_failure(
             Some(&source),
-            &VaultCapability::new("ckh_test"),
+            &CredentialHandle::scoped("oauth:test", "oauth"),
             7,
             &crate::provider::FetchError::ProviderStatus(500, String::new()),
         );
@@ -660,21 +570,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CredentialSource for RecordingSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             _min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             Err(VaultGetError::Transient)
-        }
-
-        async fn report_auth_failure(
-            &self,
-            _capability: &VaultCapability,
-            status: u16,
-            record_version: u64,
-        ) {
-            self.reports.lock().unwrap().push((status, record_version));
         }
 
         async fn report_auth_failure_scoped(
@@ -683,6 +584,7 @@ mod tests {
             status: u16,
             record_version: u64,
         ) {
+            self.reports.lock().unwrap().push((status, record_version));
             self.scoped_reports.lock().unwrap().push((
                 credential_id.to_string(),
                 status,
@@ -719,25 +621,6 @@ mod tests {
     }
 
     use super::*;
-
-    /// The capability is the bearer of vault authority: anything holding it can
-    /// fetch the credential. Its `Debug` is the redaction site, and it is
-    /// reached by every `{:?}` of a type that merely *contains* a capability,
-    /// so a leak here escapes through diagnostics that never mention secrets.
-    #[test]
-    fn a_capability_never_appears_in_its_own_debug() {
-        let capability = VaultCapability::new("ckh_capability_secret");
-        let debug = format!("{capability:?}");
-
-        assert!(!debug.contains("ckh_capability_secret"));
-        // Not vacuous: the value really is retrievable, so the assertion above
-        // is about redaction rather than about an empty capability.
-        assert_eq!(capability.expose_secret(), "ckh_capability_secret");
-        // And the debug output is present rather than blank, so a formatter
-        // that wrote nothing at all could not pass this.
-        assert!(debug.contains("VaultCapability"));
-        assert!(debug.contains("redacted"));
-    }
 
     /// The payload is the credential itself. It is redacted at this type rather
     /// than at each caller, so this test guards every lane that formats one.

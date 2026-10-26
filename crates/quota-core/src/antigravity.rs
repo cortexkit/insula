@@ -91,8 +91,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// `cloudcode-pa` returned a different one (65% left, reset 2026-10-21T12:39:00Z).
 /// The User-Agent made no difference either way, and the Claude/GPT pool was
 /// identical on both hosts. The opencode antigravity-auth plugin polls the daily
-/// host. Re-check with `crates/quota-module/examples/antigravity-pool.rs` before
-/// moving this back.
+/// host. Compare both hosts' Gemini pools again before changing the endpoint's host.
 const REMOTE_QUOTA_SUMMARY_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const LOAD_CODE_ASSIST_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
@@ -1989,7 +1988,7 @@ struct RemoteQuotaBucket {
 ///
 /// Pooling also keeps this provider's identifiers out of a namespace it shares
 /// with another. Antigravity and Gemini are separate products on the same Google
-/// API, and every model id the Gemini provider publishes appears in this
+/// API, and every model id the former Gemini provider published appears in this
 /// response too. Publishing per-model detail here would emit identifiers
 /// byte-identical to that provider's while describing a different quota pool
 /// under a different credential -- so a consumer keying on the identifier alone
@@ -2248,7 +2247,7 @@ pub struct AntigravityProvider {
 
 impl AntigravityProvider {
     pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::new(None)))
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()))
     }
 
     pub fn new_with_handle_loader(
@@ -2511,7 +2510,7 @@ impl AntigravityProvider {
     /// Fetch quota from the cloud, needing no local process.
     ///
     /// The credential is Antigravity's own Google login, served by the vault.
-    /// This is the same Code Assist endpoint the Gemini provider calls, and the
+    /// This is the same Code Assist endpoint the former Gemini provider called, and the
     /// account behind the token is what makes the answers differ: an Antigravity
     /// login's quota covers Antigravity's model pool, Claude and GPT included.
     async fn fetch_remote(&self, handle: &CredentialHandle) -> FetchAttempt {
@@ -2546,9 +2545,8 @@ impl AntigravityProvider {
             Some(record_version),
         ));
 
-        // KEYED ON THE EMAIL, NEVER THE CAPABILITY. The capability is the bearer of
-        // vault authority and must not reach a log line; the email is already
-        // published as `accountInfo` on this entry, so it adds no exposure.
+        // Key logs on the email, never on the credential payload. The email is
+        // already published as `accountInfo` on this entry, so it adds no exposure.
         let lane_key = observed_email
             .clone()
             .unwrap_or_else(|| "vault-unidentified".to_string());
@@ -3407,9 +3405,9 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for PreflightVaultSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _: &crate::credential_source::VaultCapability,
+            _: &str,
             _: u64,
         ) -> Result<crate::credential_source::VaultCredential, VaultGetError> {
             Ok(crate::credential_source::VaultCredential {
@@ -3423,12 +3421,7 @@ mod tests {
             })
         }
 
-        async fn report_auth_failure(
-            &self,
-            _: &crate::credential_source::VaultCapability,
-            _: u16,
-            _: u64,
-        ) {
+        async fn report_auth_failure_scoped(&self, _: &str, _: u16, _: u64) {
             self.reports.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -3443,10 +3436,7 @@ mod tests {
             email: None,
             reports,
         }));
-        CredentialHandle::vault(
-            "antigravity:test",
-            crate::credential_source::VaultCapability::new("ckh_test"),
-        )
+        CredentialHandle::scoped("antigravity:test", "oauth")
     }
 
     #[tokio::test]

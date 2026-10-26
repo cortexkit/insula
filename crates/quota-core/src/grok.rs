@@ -44,8 +44,6 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 
 use crate::credential_source::CredentialSource;
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
 use crate::vault_handles::VaultHandleLoader;
 use crate::{
@@ -421,7 +419,7 @@ pub struct GrokProvider {
 
 impl GrokProvider {
     pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()))
     }
 
     pub(crate) fn new_with_handle_loader(
@@ -640,18 +638,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -690,7 +688,7 @@ mod tests {
     fn test_provider(source: Arc<dyn CredentialSource>, usage_url: String) -> GrokProvider {
         let mut provider = GrokProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(None)),
+            Arc::new(VaultHandleLoader::default()),
         );
         provider.usage_url = usage_url;
         provider
@@ -799,10 +797,7 @@ mod tests {
         let (source, _) = source(Ok(credential(b"grok-vault-token", 31)));
         let provider = test_provider(source, url);
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
 
         assert_eq!(attempt.source.as_deref(), Some("vault"));
@@ -820,7 +815,7 @@ mod tests {
     async fn vault_happy_path_serves_one_unlabeled_entry() {
         let (url, _) = serve_once(200, decode_b64(LIVE_FIXTURE_B64)).await;
         let (source, _) = source(Ok(credential(b"grok-vault-token", 32)));
-        let handle = CredentialHandle::vault("oauth:xai", VaultCapability::new("ckh_grok"));
+        let handle = CredentialHandle::scoped("oauth:xai", "oauth");
         let registry = crate::Registry::new(vec![Box::new(VaultOnlyProvider {
             provider: test_provider(source, url),
             handle,
@@ -875,10 +870,7 @@ mod tests {
         let (source, _) = source(Ok(credential(token.as_bytes(), 33)));
         let provider = test_provider(source, url);
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
 
         assert_eq!(
@@ -936,10 +928,7 @@ mod tests {
         let (source, _) = source(Ok(record));
         let provider = test_provider(source, url);
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
 
         assert_eq!(
@@ -953,10 +942,7 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Transient));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,
@@ -999,10 +985,7 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"grok-vault-token", 52)));
         let mut provider = test_provider(Arc::clone(&source), vault_url);
         let vault = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
         assert!(matches!(
             vault.usage,
@@ -1033,10 +1016,7 @@ mod tests {
         let (source, _) = source(Ok(credential(&[0xff, 0xfe], 9)));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "oauth:xai",
-                VaultCapability::new("ckh_grok"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("oauth:xai", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,

@@ -3259,11 +3259,11 @@ mod tests {
         std::fs::write(&malformed, "{ not-jsonc").unwrap();
 
         assert_eq!(
-            load_quota_config_file(&absent).0.current(),
+            load_quota_config_file(&absent).0.status().config,
             QuotaConfig::default()
         );
         assert_eq!(
-            load_quota_config_file(&malformed).0.current(),
+            load_quota_config_file(&malformed).0.status().config,
             QuotaConfig::default()
         );
 

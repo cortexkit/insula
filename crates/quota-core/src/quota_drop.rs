@@ -93,7 +93,7 @@ const NOISE_FLOOR_PERCENT: f64 = 1.0;
 ///
 /// WITNESSED ON THE WIRE 2026-08-26, after thirteen recorded drops across two
 /// hosts had all read `true` and neither of us could say whether the false arm
-/// worked in production or only in tests. `scripts/witness-gap-drop.py` served a
+/// worked in production or only in tests. A loopback witness served a
 /// healthy window at 80%, then 503 (transient, so the prior reading survives)
 /// through four backoff rungs, then a healthy window at 10%:
 ///

@@ -1023,12 +1023,10 @@ mod tests {
     }
 
     #[test]
-    fn replacing_a_legacy_handle_with_scoped_fields_rekeys_and_is_immediately_due() {
-        use crate::credential_source::VaultCapability;
-
+    fn changing_a_scoped_handles_type_rekeys_and_is_immediately_due() {
         let now = Instant::now();
-        let first_handle =
-            CredentialHandle::vault("chatgpt:openai", VaultCapability::new("ckh_first_secret"));
+        // The row's type participates in its key even when the id is unchanged.
+        let first_handle = CredentialHandle::scoped("chatgpt:openai", "apikey");
         let second_handle = CredentialHandle::scoped("chatgpt:openai", "oauth");
         assert_ne!(first_handle, second_handle);
 

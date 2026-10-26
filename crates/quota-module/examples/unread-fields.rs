@@ -12,19 +12,16 @@
 //! redacted wherever they appear. Nothing is written anywhere; it prints to
 //! the terminal that ran it.
 //!
-//! THE CREDENTIAL. A standalone binary reaches the vault as a direct
-//! principal, which the scoped listing refuses, so this takes a capability
-//! handle minted for one credential and read from a file (never argv, which
-//! other processes can read). Revoke the handle afterwards; `ck auth
-//! mint-handle` prints the exact revoke command on stderr.
+//! THE CREDENTIAL. Supply a non-secret credential id covered by the caller's
+//! scoped grant. A standalone direct caller may be refused; this probe does not
+//! bypass scoped authorization.
 //!
-//!     umask 077; ck auth mint-handle --id oauth:anthropic > /tmp/h 2> /tmp/h.revoke
-//!     QUOTA_PROBE_HANDLE_FILE=/tmp/h cargo run -p quota-module --example unread-fields -- claude
+//!     cargo run -p quota-module --example unread-fields -- claude oauth:anthropic
 //!
 //! Exit 0 printed a response; 2 could not get one (no daemon, refused
 //! credential, non-2xx), so nothing was learned.
 
-use quota_core::credential_source::{CredentialSource, VaultCapability, VAULT_READ_MIN_TTL_MS};
+use quota_core::credential_source::VAULT_READ_MIN_TTL_MS;
 use quota_module::vault_client::VaultClient;
 use serde_json::Value;
 
@@ -86,21 +83,16 @@ async fn main() {
     let keys = match provider.as_str() {
         "claude" => CLAUDE_KEYS,
         "codex" => CODEX_KEYS,
-        _ => refuse("usage: unread-fields <claude|codex> (handle in QUOTA_PROBE_HANDLE_FILE)"),
+        _ => refuse("usage: unread-fields <claude|codex> <credential-id>"),
     };
-    let Ok(handle_file) = std::env::var("QUOTA_PROBE_HANDLE_FILE") else {
-        refuse("QUOTA_PROBE_HANDLE_FILE is not set");
-    };
-    let handle = match std::fs::read_to_string(&handle_file) {
-        Ok(text) => text.trim().to_string(),
-        Err(error) => refuse(&format!("cannot read the handle file: {error}")),
-    };
-    if handle.is_empty() {
-        refuse("the handle file is empty");
-    }
+    let credential_id = positional
+        .get(1)
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string_lossy().into_owned())
+        .unwrap_or_else(|| refuse("a scoped credential id is required"));
     let client = VaultClient::new(path);
     let mut credential = match client
-        .get(&VaultCapability::new(handle), VAULT_READ_MIN_TTL_MS)
+        .get_scoped(&credential_id, VAULT_READ_MIN_TTL_MS)
         .await
     {
         Ok(credential) => credential,

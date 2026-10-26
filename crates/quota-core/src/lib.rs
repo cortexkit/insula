@@ -368,15 +368,13 @@ fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now
 ///
 /// `CredentialHandle` is deliberately not `Ord` -- these values have no natural
 /// order and inventing one on the type would invite sorting by it somewhere it
-/// would look meaningful. Keyed on the vault credential id rather than the
-/// capability, so RE-MINTING a handle for the same credential does not change
-/// the winner: the capability rotates, the id does not.
+/// would look meaningful. Vault slots use the stable credential id, so a refreshed
+/// payload or record version does not change the winner.
 fn stable_handle_key(key: &SlotKey) -> (u8, &str) {
     match &key.handle {
         CredentialHandle::ImplicitLocal => (0, ""),
         CredentialHandle::Named(name) => (1, name.as_str()),
-        CredentialHandle::Vault { credential_id, .. }
-        | CredentialHandle::LegacyVault { credential_id, .. } => (2, credential_id.as_str()),
+        CredentialHandle::Vault { credential_id, .. } => (2, credential_id.as_str()),
     }
 }
 
@@ -676,7 +674,7 @@ impl Registry {
         credential_source: Option<Arc<dyn CredentialSource>>,
     ) -> Self {
         let config: config::LiveQuotaConfig = config.into();
-        let vault_handle_loader = Arc::new(vault_handles::VaultHandleLoader::from_env());
+        let vault_handle_loader = Arc::new(vault_handles::VaultHandleLoader::default());
         let mut registry = Self::new(vec![
             Box::new(codex::CodexProvider::new_with_handle_loader(
                 config.clone(),
@@ -858,7 +856,8 @@ impl Registry {
     }
 
     /// Provider names registered, for discovery and observability.
-    pub fn provider_names(&self) -> Vec<&str> {
+    #[cfg(test)]
+    fn provider_names(&self) -> Vec<&str> {
         self.providers
             .iter()
             .map(|provider| provider.name.as_str())
@@ -870,7 +869,8 @@ impl Registry {
     /// Derived from the same predicate the stale-login health metric counts, so
     /// a caller asking "who is in the cookie cohort" cannot get a different
     /// answer from the one the metric is sized against.
-    pub fn cookie_based_provider_names(&self) -> Vec<&str> {
+    #[cfg(test)]
+    fn cookie_based_provider_names(&self) -> Vec<&str> {
         self.providers
             .iter()
             .filter(|provider| provider.fetcher.is_cookie_based())
@@ -904,7 +904,8 @@ impl Registry {
     /// provider whose handles cannot be enumerated is OMITTED rather than assumed
     /// dual-lane: a checker that skips on an unreadable config is the failure this
     /// exists to catch, wearing the costume of an exemption.
-    pub fn providers_with_a_lane_beside_vault(&self) -> Vec<&str> {
+    #[cfg(test)]
+    fn providers_with_a_lane_beside_vault(&self) -> Vec<&str> {
         self.providers
             .iter()
             .filter(|provider| {
@@ -1451,7 +1452,6 @@ impl Registry {
                 CredentialHandle::Vault { credential_id, .. } => {
                     source.status_scoped(credential_id).await
                 }
-                CredentialHandle::LegacyVault { capability, .. } => source.status(capability).await,
                 CredentialHandle::ImplicitLocal | CredentialHandle::Named(_) => continue,
             };
             let next = match status {

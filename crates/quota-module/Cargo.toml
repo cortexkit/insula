@@ -12,9 +12,8 @@ repository = "https://github.com/cortexkit/insula"
 # renames the CARGO_BIN_EXE_* env var the integration tests use to locate the
 # built binary, which is why those fail to compile if this changes alone.
 #
-# It does NOT move any of this module's on-disk paths: the redemption journal,
-# the quota config, and the vault handle file each come from their own hardcoded
-# literal spelled `ck-quota`. Those are load-bearing and deliberately unchanged.
+# It does not move the quota config or redemption journal. Configuration keeps
+# its `ck-quota` path; the journal's legacy-path adoption is handled separately.
 [[bin]]
 name = "ck-insula"
 path = "src/main.rs"

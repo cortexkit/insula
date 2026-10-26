@@ -51,8 +51,6 @@ use std::{
 use async_trait::async_trait;
 use serde::Deserialize;
 
-#[cfg(test)]
-use crate::credential_source::VaultCapability;
 use crate::credential_source::{CredentialSource, ScopedSnapshot};
 use crate::env;
 use crate::provider::{AccountObservation, CredentialHandle, FetchAttempt};
@@ -612,7 +610,7 @@ pub struct KimiForCodingProvider {
 
 impl KimiForCodingProvider {
     pub fn new() -> Self {
-        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::from_env()))
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()))
     }
 
     pub(crate) fn new_with_handle_loader(
@@ -858,18 +856,18 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for MockCredentialSource {
-        async fn get(
+        async fn get_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             min_ttl_ms: u64,
         ) -> Result<VaultCredential, VaultGetError> {
             assert_eq!(min_ttl_ms, 120_000);
             self.get_result.clone()
         }
 
-        async fn report_auth_failure(
+        async fn report_auth_failure_scoped(
             &self,
-            _capability: &VaultCapability,
+            _credential_id: &str,
             provider_status: u16,
             record_version: u64,
         ) {
@@ -911,7 +909,7 @@ mod tests {
     ) -> KimiForCodingProvider {
         let mut provider = KimiForCodingProvider::new_with_handle_loader(
             Some(source),
-            Arc::new(VaultHandleLoader::new(None)),
+            Arc::new(VaultHandleLoader::default()),
         );
         provider.usage_url = usage_url;
         provider
@@ -1511,7 +1509,7 @@ mod tests {
         // so a `NoSession` degraded entry is produced by the scheduler.
         let provider = KimiForCodingProvider::new_with_handle_loader(
             None,
-            Arc::new(VaultHandleLoader::new(None)),
+            Arc::new(VaultHandleLoader::default()),
         );
         let handles = provider.handles().unwrap();
         assert_eq!(handles, vec![CredentialHandle::implicit()]);
@@ -1539,10 +1537,7 @@ mod tests {
         let (source, _) = source(Ok(credential(b"kimi-coding-vault-token", 27)));
         let provider = test_provider(source, url);
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "kimi-for-coding",
-                VaultCapability::new("ckh_kimi"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("kimi-for-coding", "oauth"))
             .await;
 
         assert_eq!(attempt.source.as_deref(), Some("vault"));
@@ -1569,10 +1564,7 @@ mod tests {
         let (source, _) = source(Err(VaultGetError::Transient));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "kimi-for-coding",
-                VaultCapability::new("ckh_kimi"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("kimi-for-coding", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,
@@ -1618,10 +1610,7 @@ mod tests {
         let (source, reports) = source(Ok(credential(b"kimi-coding-vault-token", 44)));
         let mut provider = test_provider(Arc::clone(&source), vault_url);
         let vault = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "kimi-for-coding",
-                VaultCapability::new("ckh_kimi"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("kimi-for-coding", "oauth"))
             .await;
         assert!(matches!(
             vault.usage,
@@ -1652,10 +1641,7 @@ mod tests {
         let (source, _) = source(Ok(credential(&[0xff, 0xfe], 8)));
         let provider = test_provider(source, "http://unused.invalid".to_string());
         let attempt = provider
-            .fetch_handle(&CredentialHandle::vault(
-                "kimi-for-coding",
-                VaultCapability::new("ckh_kimi"),
-            ))
+            .fetch_handle(&CredentialHandle::scoped("kimi-for-coding", "oauth"))
             .await;
         assert_eq!(
             attempt.credential_resolution,
@@ -1673,14 +1659,6 @@ mod tests {
 
     #[async_trait]
     impl CredentialSource for WebCookieSource {
-        async fn get(
-            &self,
-            _capability: &VaultCapability,
-            _min_ttl_ms: u64,
-        ) -> Result<VaultCredential, VaultGetError> {
-            Err(VaultGetError::FailClosed)
-        }
-
         async fn get_scoped(
             &self,
             credential_id: &str,
@@ -1688,14 +1666,6 @@ mod tests {
         ) -> Result<VaultCredential, VaultGetError> {
             self.read.lock().unwrap().push(credential_id.to_string());
             Ok(credential(b"tracker=1; kimi-auth=web-token", 1))
-        }
-
-        async fn report_auth_failure(
-            &self,
-            _capability: &VaultCapability,
-            _provider_status: u16,
-            _record_version: u64,
-        ) {
         }
     }
 
