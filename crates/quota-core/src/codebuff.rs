@@ -304,52 +304,53 @@ mod tests {
 
     #[test]
     fn credits_without_reset_keeps_real_window() {
-        let usage = br#"{ "usage": 50, "quota": 100 }"#;
-        let result = normalize_usage(usage, None).unwrap();
-        let primary = result.primary.expect("usage data should emit a window");
-        assert_eq!(primary.used_percent, 50.0);
-        assert_eq!(primary.resets_at, None);
-    }
-
-    #[test]
-    fn credits_without_reset_keeps_exhausted_window() {
-        let result = normalize_usage(br#"{ "usage": 100, "quota": 100 }"#, None).unwrap();
-        let primary = result.primary.expect("usage data should emit a window");
-        assert_eq!(primary.used_percent, 100.0);
-        assert_eq!(primary.resets_at, None);
+        // An ordinary and an exhausted reading: neither is dropped for lacking
+        // a reset.
+        for (usage, percent) in [
+            (br#"{ "usage": 50, "quota": 100 }"#.as_slice(), 50.0),
+            (br#"{ "usage": 100, "quota": 100 }"#.as_slice(), 100.0),
+        ] {
+            let result = normalize_usage(usage, None).unwrap();
+            let primary = result.primary.expect("usage data should emit a window");
+            assert_eq!(primary.used_percent, percent);
+            assert_eq!(primary.resets_at, None);
+        }
     }
 
     #[test]
     fn weekly_without_real_reset_keeps_real_window() {
-        let usage = br#"{ "usage": 1, "quota": 10, "next_quota_reset": "2026-07-01T00:00:00Z" }"#;
-        let subscription = br#"{ "rateLimit": { "weeklyUsed": 5, "weeklyLimit": 100 } }"#;
-        let result = normalize_usage(usage, Some(subscription)).unwrap();
-        assert!(result.primary.is_some());
-        let secondary = result.secondary.expect("usage data should emit a window");
-        assert_eq!(secondary.used_percent, 5.0);
-        assert_eq!(secondary.resets_at, None);
-    }
-
-    #[test]
-    fn weekly_without_reset_keeps_exhausted_window() {
-        let subscription = br#"{ "rateLimit": { "weeklyUsed": 100, "weeklyLimit": 100 } }"#;
-        let result = normalize_usage(br#"{}"#, Some(subscription)).unwrap();
-        let secondary = result.secondary.expect("usage data should emit a window");
-        assert_eq!(secondary.used_percent, 100.0);
-        assert_eq!(secondary.resets_at, None);
+        // An ordinary weekly reading beside a credits window, and an exhausted
+        // one with no credits data at all.
+        for (usage, subscription, percent, beside_credits) in [
+            (
+                br#"{ "usage": 1, "quota": 10, "next_quota_reset": "2026-07-01T00:00:00Z" }"#
+                    .as_slice(),
+                br#"{ "rateLimit": { "weeklyUsed": 5, "weeklyLimit": 100 } }"#.as_slice(),
+                5.0,
+                true,
+            ),
+            (
+                br#"{}"#.as_slice(),
+                br#"{ "rateLimit": { "weeklyUsed": 100, "weeklyLimit": 100 } }"#.as_slice(),
+                100.0,
+                false,
+            ),
+        ] {
+            let result = normalize_usage(usage, Some(subscription)).unwrap();
+            if beside_credits {
+                assert!(result.primary.is_some(), "the credits window survives");
+            }
+            let secondary = result.secondary.expect("usage data should emit a window");
+            assert_eq!(secondary.used_percent, percent);
+            assert_eq!(secondary.resets_at, None);
+        }
     }
 
     #[test]
     fn garbage_usage_body_is_decode_error() {
         assert!(matches!(
             normalize_usage(b"not json", None),
-            Err(FetchError::Decode(_))
+            Err(FetchError::Decode(message)) if message.starts_with("codebuff ")
         ));
-    }
-
-    #[test]
-    fn clean_strips_quotes() {
-        assert_eq!(clean("  \"tok\" ").as_deref(), Some("tok"));
-        assert_eq!(clean("''"), None);
     }
 }

@@ -1062,27 +1062,6 @@ mod tests {
         }
     }
 
-    /// A 401 on the environment key is rejected, and nothing is reported: the
-    /// vault did not serve that key.
-    #[tokio::test]
-    async fn an_environment_401_is_rejected_and_never_reported_to_the_vault() {
-        let (base, _) = chatbox(401, "").await;
-        let (source, reports) = MockSource::serving(&[("apikey:chatbox", credential(KEY, 5))]);
-        let provider = provider(
-            Some(source),
-            Arc::new(VaultHandleLoader::default()),
-            &base,
-            &[(KEY_ENV, "env-license-key")],
-        );
-        let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
-        let error = attempt.usage.unwrap_err();
-        assert_eq!(error.error_class(), "credential_rejected", "{error:?}");
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert!(reports.lock().unwrap().is_empty());
-    }
-
     /// A key upstream would refuse is never sent, and is not quoted.
     #[tokio::test]
     async fn malformed_keys_are_unusable_and_send_nothing() {

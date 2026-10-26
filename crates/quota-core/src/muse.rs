@@ -911,10 +911,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_device_token_is_refused_without_a_request() {
-        let provider = provider(env_with(&[(TOKEN_ENV, "LLM_dashboard_key")]));
+        // A listener nobody should reach: a connection attempt would sit in its
+        // backlog, so a non-blocking accept afterwards says whether one came.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider = provider(env_with(&[(TOKEN_ENV, "LLM_dashboard_key")]));
+        provider.url = format!("http://{}/muse-code/key", listener.local_addr().unwrap());
         let attempt = provider.fetch_handle(&CredentialHandle::implicit()).await;
         let error = attempt.usage.unwrap_err();
         assert_eq!(error.error_class(), "credential_unusable");
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a token that is not a device token must not be sent anywhere"
+        );
     }
 
     #[tokio::test]
@@ -1009,6 +1018,8 @@ mod tests {
         (provider, reports)
     }
 
+    /// A deposit replaces the local lane, and without one the local lane stands:
+    /// the two sides of one branch in `handles`.
     #[test]
     fn a_vault_deposit_replaces_the_local_lane() {
         let loader = Arc::new(VaultHandleLoader::default());
@@ -1017,10 +1028,7 @@ mod tests {
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].stable_id(), "apikey:muse");
-    }
 
-    #[test]
-    fn without_a_deposit_the_local_lane_stands() {
         let (provider, _) = vault_provider(b"dca:v", Arc::new(VaultHandleLoader::default()));
         assert_eq!(
             provider.handles().unwrap(),

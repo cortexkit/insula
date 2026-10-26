@@ -252,6 +252,8 @@ mod tests {
         let raw = br#"{ "openai": { "type": "api", "key": "sk-xyz" } }"#;
         let auth = parse_provider(raw, "openai").unwrap().unwrap();
         assert!(matches!(auth, OpencodeAuth::Api { key } if key == "sk-xyz"));
+        // A provider the store does not hold is absent, not an error.
+        assert!(parse_provider(raw, "anthropic").unwrap().is_none());
     }
 
     /// An auth store that cannot be read must not report as one that is absent.
@@ -301,12 +303,6 @@ mod tests {
         assert!(matches!(read_provider_at(&without, "anthropic"), Ok(None)));
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn absent_provider_is_none() {
-        let raw = br#"{ "openai": { "type": "api", "key": "sk" } }"#;
-        assert!(parse_provider(raw, "anthropic").unwrap().is_none());
     }
 
     #[test]

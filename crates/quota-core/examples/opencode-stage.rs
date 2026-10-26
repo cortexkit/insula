@@ -64,6 +64,9 @@ async fn explain_workspaces_answer(client: &reqwest::Client, cookie: &str) {
 
 #[tokio::main]
 async fn main() {
+    // A one-shot diagnostic that makes a few requests and exits, so the
+    // refresher's pool bound (see clippy.toml) does not apply.
+    #[allow(clippy::disallowed_methods)]
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(25))
         .build()

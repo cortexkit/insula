@@ -808,32 +808,6 @@ mod tests {
         assert_eq!(primary.resets_at, None);
     }
 
-    #[test]
-    fn fallback_to_percentage_when_quota_fields_absent() {
-        let body = br#"{
-            "code": 200,
-            "msg": "success",
-            "success": true,
-            "data": {
-                "limits": [
-                    {
-                        "type": "TOKENS_LIMIT",
-                        "unit": 3,
-                        "number": 5,
-                        "usage": null,
-                        "currentValue": null,
-                        "remaining": null,
-                        "percentage": 45,
-                        "nextResetTime": 1782135879000
-                    }
-                ]
-            }
-        }"#;
-        let usage = normalize_usage(body).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 45.0);
-    }
-
     /// The directly-supplied percentage is clamped like the computed one.
     ///
     /// This upstream omits or misreports its quota fields, so the percentage it

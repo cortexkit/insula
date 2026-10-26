@@ -1548,6 +1548,9 @@ impl UsageProvider for CodexProvider {
 
 #[cfg(test)]
 mod tests {
+    // Test clients live for one test, so the pool bound in clippy.toml's
+    // client rule does not apply to them.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::codex_resets::RedemptionJournal;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1709,70 +1712,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unarmed_registry_fetches_credits_without_consume_post() {
-        let usage_body = br#"{
-            "plan_type": "pro",
-            "rate_limit": {
-                "primary_window": {"used_percent": 41.0}
-            }
-        }"#;
-        let usage_response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            usage_body.len(),
-            String::from_utf8_lossy(usage_body)
-        );
-        let usage_base = serve_one_raw_response(usage_response.into_bytes()).await;
-        let home =
-            std::env::temp_dir().join(format!("ck-quota-codex-unarmed-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            home.join("auth.json"),
-            br#"{"tokens":{"access_token":"oauth-token","account_id":"acct-unarmed"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            home.join("config.toml"),
-            context_config(&usage_base).unwrap(),
-        )
-        .unwrap();
-
-        let transport = Arc::new(CountingResetTransport {
-            gets: AtomicUsize::new(0),
-            posts: AtomicUsize::new(0),
-            fail_get: false,
-        });
-        let journal_dir = home.join("state");
-        let coordinator = Arc::new(
-            ResetCoordinator::new(RedemptionJournal::new(journal_dir.join("redemptions.json")))
-                .unwrap(),
-        );
-        let provider = CodexProvider::new_for_test(
-            CodexConfig::default(),
-            None,
-            Arc::clone(&transport) as Arc<dyn ResetTransport>,
-            coordinator,
-            VaultHandleLoader::default(),
-            home.clone(),
-        );
-        let registry = crate::Registry::new(vec![Box::new(provider)]);
-        registry
-            .refresh_tick(&tokio_util::sync::CancellationToken::new())
-            .await;
-        let usage = registry.get_usage(None).await;
-
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].account.as_deref(), Some("acct-unarmed"));
-        assert_eq!(
-            usage[0].account_info.as_ref().unwrap().plan_type.as_deref(),
-            Some("pro")
-        );
-        assert_eq!(usage[0].saved_resets.as_ref().unwrap().available_count, 1);
-        assert_eq!(transport.gets.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
     /// The workspace credit limit travels the provider's real fetch path into
     /// the published entry's `spend`, reset included, and the published entry
     /// passes the wire rules.
@@ -1931,9 +1870,15 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].account.as_deref(), Some("acct-http-unarmed"));
+        assert_eq!(
+            usage[0].account_info.as_ref().unwrap().plan_type.as_deref(),
+            Some("pro")
+        );
         assert_eq!(usage[0].saved_resets.as_ref().unwrap().available_count, 1);
         assert_eq!(usage_gets.load(Ordering::SeqCst), 1);
         assert_eq!(credits_gets.load(Ordering::SeqCst), 1);
+        // An unarmed registry reads the credits and never redeems one.
         assert_eq!(consume_posts.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(home);
     }

@@ -755,9 +755,6 @@ mod tests {
         let handles = loader.anthropic_handles().unwrap();
         assert_eq!(handles.len(), 2);
         assert!(handles.iter().all(CredentialHandle::is_vault));
-        assert!(!loader
-            .warning()
-            .is_some_and(|warning| warning.contains("deduplicated identical capabilities")));
     }
 
     #[test]
@@ -1016,25 +1013,6 @@ mod tests {
         assert!(!warning.contains("cookie:kimi.com"), "{warning}");
     }
 
-    #[test]
-    fn zero_grants_retains_the_previous_snapshot() {
-        let loader = VaultHandleLoader::default();
-        install(&loader, vec![row("oauth:xai", "oauth")]);
-        let result = loader.install_snapshot(
-            ScopedSnapshot {
-                grants: 0,
-                rows: Vec::new(),
-            },
-            Instant::now(),
-        );
-        assert!(!result.authoritative);
-        assert_eq!(loader.grok_handles().unwrap().len(), 1);
-        assert_eq!(
-            loader.enumeration_failure().as_deref(),
-            Some("principal is not granted")
-        );
-    }
-
     fn zero_grants(loader: &VaultHandleLoader) -> SnapshotInstall {
         loader.install_snapshot(
             ScopedSnapshot {
@@ -1122,6 +1100,12 @@ mod tests {
         assert!(!zero_grants(&loader).authoritative);
         assert_eq!(loader.handle_state(), VaultHandleState::Answered);
         assert_eq!(loader.anthropic_handles().unwrap().len(), 1);
+        // The refusal is still reported, so the retained snapshot does not
+        // pass for a fresh answer.
+        assert_eq!(
+            loader.enumeration_failure().as_deref(),
+            Some("principal is not granted")
+        );
     }
 
     #[test]

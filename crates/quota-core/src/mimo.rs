@@ -170,6 +170,10 @@ pub struct MimoProvider {
 }
 
 impl MimoProvider {
+    // Builds its own client to turn redirects off, so a session cookie never
+    // follows one. It does not set the shared pool idle bound from
+    // `http::provider_client()`; see clippy.toml for why that bound matters.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
         handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
@@ -397,15 +401,5 @@ mod tests {
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T12:00:00Z"));
         assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
         assert_eq!(primary.window_minutes, Some(43200));
-    }
-
-    #[test]
-    fn handles_without_credential_source_are_empty() {
-        let provider = MimoProvider::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
-        );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

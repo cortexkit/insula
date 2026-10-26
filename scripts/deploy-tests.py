@@ -156,7 +156,8 @@ class DeployPolicyTests(unittest.TestCase):
     def test_unknown_argument_refuses(self):
         result = self.deploy("--unknown")
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("usage:", result.stdout)
+        # The whole usage line, so a usage that stopped naming the flags fails.
+        self.assertIn("usage: scripts/deploy.sh [--stage] [--dry-run]", result.stdout)
 
 
 if __name__ == "__main__":

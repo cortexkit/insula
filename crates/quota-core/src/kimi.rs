@@ -793,7 +793,12 @@ mod tests {
     #[test]
     fn garbage_body_is_decode_error() {
         let err = normalize_usage(b"not json").unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        // The message names the provider, so the published error says where it
+        // came from.
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.starts_with("kimi usages not decodable")),
+            "{err}"
+        );
     }
 
     #[test]

@@ -409,6 +409,9 @@ pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// which is nothing for a poller -- for the removal of a whole failure class.
 /// Reuse WITHIN a tick is preserved, which is the reuse that matters: providers
 /// making several calls per fetch make them seconds apart.
+// The one place a client is built for providers, so the lint that sends every
+// other site here is allowed only here (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub fn provider_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
@@ -735,6 +738,9 @@ impl JsonRequest {
 
 #[cfg(test)]
 mod tests {
+    // Test clients live for one test, so the pool bound in clippy.toml's
+    // client rule does not apply to them.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1139,23 +1145,29 @@ mod tests {
         // The drain reads up to 8 KiB, so without an excerpt here the same
         // class of data would ship under two different bounds -- and the
         // later backstops would have hidden the divergence rather than
-        // preventing it.
-        let (url, server) = serve_fixed(403, vec![b'x'; ERROR_BODY_PREFIX_BYTES]).await;
-        let long = JsonRequest::get(url)
-            .send_provider_status_first(&reqwest::Client::new(), "test")
-            .await;
-        match long {
-            Err(FetchError::ProviderStatus(403, body)) => {
-                assert_eq!(
-                    body.chars().count(),
-                    200,
-                    "the excerpt must match the bound every other refusal uses"
-                );
+        // preventing it. The 429 row is longer than the drain itself, so the
+        // status mapping must also survive a body the drain cuts short.
+        for (status, length) in [
+            (403, ERROR_BODY_PREFIX_BYTES),
+            (429, ERROR_BODY_PREFIX_BYTES * 2),
+        ] {
+            let (url, server) = serve_fixed(status, vec![b'x'; length]).await;
+            let long = JsonRequest::get(url)
+                .send_provider_status_first(&reqwest::Client::new(), "test")
+                .await;
+            match long {
+                Err(FetchError::ProviderStatus(code, body)) if code == status => {
+                    assert_eq!(
+                        body.chars().count(),
+                        200,
+                        "the excerpt must match the bound every other refusal uses"
+                    );
+                }
+                Err(other) => panic!("expected ProviderStatus({status}, ..), got {other:?}"),
+                Ok(_) => panic!("a {status} must not be reported as success"),
             }
-            Err(other) => panic!("expected ProviderStatus(403, ..), got {other:?}"),
-            Ok(_) => panic!("a 403 must not be reported as success"),
+            server.await.unwrap();
         }
-        server.await.unwrap();
 
         let (url, server) = serve_fixed(403, Vec::new()).await;
         let silent = JsonRequest::get(url)
@@ -1202,23 +1214,6 @@ mod tests {
         // A body that is only whitespace is empty, so callers render it as
         // "no response body" -- the upstream said nothing of substance.
         assert!(refusal_excerpt(b"   \n\t ").is_empty());
-    }
-
-    #[tokio::test]
-    async fn provider_status_mapping_survives_bounded_error_drain() {
-        let body = vec![b'x'; ERROR_BODY_PREFIX_BYTES * 2];
-        let (url, server) = serve_fixed(429, body).await;
-
-        let result = JsonRequest::get(url)
-            .send_provider_status_first(&reqwest::Client::new(), "test")
-            .await;
-
-        match result {
-            Err(FetchError::ProviderStatus(429, _)) => {}
-            Err(other) => panic!("expected ProviderStatus(429, _), got {other:?}"),
-            Ok(_) => panic!("non-success response unexpectedly succeeded"),
-        }
-        server.await.unwrap();
     }
 
     /// A refusal keeps the response headers that say when to ask again, beside
@@ -1361,11 +1356,11 @@ mod tests {
     /// which is the exact failure this test exists to prevent one level up.
     #[test]
     fn every_send_helper_is_fenced_or_deliberately_exempt() {
-        let src = include_str!("http.rs");
-        let cut = src
-            .find("#[cfg(test)]")
-            .expect("this file has a test module");
-        let production = &src[..cut];
+        // Through the shared boundary rule rather than a cut at the first
+        // `#[cfg(test)]`, which can sit on a production item and hide every
+        // helper defined after it.
+        let production = crate::tests::production_body(include_str!("http.rs"));
+        let production = production.as_str();
 
         let mut found: Vec<String> = Vec::new();
         for (index, _) in production.match_indices("async fn send") {

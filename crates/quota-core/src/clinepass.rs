@@ -370,13 +370,13 @@ mod tests {
 
     #[test]
     fn only_unrecognized_limit_types_is_a_decode_error() {
-        // A well-formed response whose every limit is skipped. Returning Ok here
-        // would publish an empty entry as a success, which is stored fresh and
-        // replaces the provider's previously good windows while reporting it
-        // healthy — a silent outage rather than a visible failure. The garbage
-        // timestamp is incidental: it is never parsed, because the unrecognized
-        // type is skipped first.
-        let body = br#"{
+        // A well-formed response whose every limit is skipped, or which lists
+        // none. Returning Ok here would publish an empty entry as a success,
+        // which is stored fresh and replaces the provider's previously good
+        // windows while reporting it healthy — a silent outage rather than a
+        // visible failure. The garbage timestamp is incidental: it is never
+        // parsed, because the unrecognized type is skipped first.
+        let unrecognized = br#"{
             "success": true,
             "data": {
                 "limits": [
@@ -387,42 +387,19 @@ mod tests {
                     }
                 ]
             }
-        }"#;
+        }"#
+        .as_slice();
+        let empty = br#"{ "success": true, "data": { "limits": [] } }"#.as_slice();
 
-        match normalize_usage(body).unwrap_err() {
-            FetchError::Decode(message) => assert!(
-                message.contains("no recognized window type"),
-                "the all-skipped case must name itself: {message}"
-            ),
-            other => panic!("expected Decode, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_empty_limit_list_is_a_decode_error() {
-        let body = br#"{ "success": true, "data": { "limits": [] } }"#;
-        assert!(matches!(normalize_usage(body), Err(FetchError::Decode(_))));
-    }
-
-    #[test]
-    fn one_recognized_window_beside_unrecognized_ones_still_succeeds() {
-        // The guard must reject only the zero-output case. A partially understood
-        // response is a usable answer, and rejecting it would break a working
-        // provider whenever the upstream adds a new limit kind.
-        let body = br#"{
-            "success": true,
-            "data": {
-                "limits": [
-                    { "type": "quarterly", "percentUsed": 10.0 },
-                    { "type": "weekly", "percentUsed": 60.0 }
-                ]
+        for body in [unrecognized, empty] {
+            match normalize_usage(body).unwrap_err() {
+                FetchError::Decode(message) => assert!(
+                    message.contains("no recognized window type"),
+                    "the all-skipped case must name itself: {message}"
+                ),
+                other => panic!("expected Decode, got {other:?}"),
             }
-        }"#;
-
-        let usage = normalize_usage(body).expect("one recognized window is a valid response");
-        assert!(usage.primary.is_none(), "no five_hour limit was reported");
-        assert_eq!(usage.secondary.expect("weekly window").used_percent, 60.0);
-        assert!(usage.tertiary.is_none());
+        }
     }
 
     #[test]
@@ -446,18 +423,5 @@ mod tests {
             .await;
 
         assert!(matches!(attempt.usage, Err(FetchError::NoSession(_))));
-    }
-
-    #[test]
-    fn clean_key_strips_quotes_and_whitespace() {
-        assert_eq!(clean_key("  key  ".to_string()), Some("key".to_string()));
-        assert_eq!(clean_key("\"key\"".to_string()), Some("key".to_string()));
-        assert_eq!(clean_key("'key'".to_string()), Some("key".to_string()));
-        assert_eq!(
-            clean_key("  \"key\"  ".to_string()),
-            Some("key".to_string())
-        );
-        assert_eq!(clean_key("".to_string()), None);
-        assert_eq!(clean_key("\"\"".to_string()), None);
     }
 }

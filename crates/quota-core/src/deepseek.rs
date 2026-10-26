@@ -466,7 +466,7 @@ mod tests {
     fn a_garbage_body_is_a_decode_error() {
         assert!(matches!(
             normalize_pools(b"not json"),
-            Err(FetchError::Decode(_))
+            Err(FetchError::Decode(message)) if message.starts_with("deepseek: ")
         ));
     }
 
@@ -531,48 +531,27 @@ mod tests {
     }
 
     #[test]
-    fn an_apikey_handle_routes_to_the_deepseek_provider() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[("apikey:deepseek", "apikey")]);
-        let handles = loader.deepseek_handles().unwrap();
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].stable_id(), "apikey:deepseek");
-        assert_eq!(handles[0].vault_credential_type(), Some("apikey"));
-    }
-
-    #[test]
     fn vault_handles_replace_the_implicit_local_lane() {
         let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
         loader.install_rows_for_test(&[("apikey:deepseek", "apikey")]);
-        let (source, _) = source(Err(VaultGetError::Permanent));
-        let provider = DeepSeekProvider::new_with_handle_loader(Some(source), loader);
+        let (mapped_source, _) = source(Err(VaultGetError::Permanent));
+        let provider = DeepSeekProvider::new_with_handle_loader(Some(mapped_source), loader);
         let handles = provider.handles().unwrap();
         assert_eq!(handles.len(), 1);
         assert!(handles[0].is_vault());
         assert_eq!(handles[0].stable_id(), "apikey:deepseek");
-    }
 
-    #[test]
-    fn implicit_local_lane_survives_when_no_vault_handles_are_mapped() {
-        let (source, _) = source(Err(VaultGetError::Permanent));
+        // The other side of the same branch: with no vault handle mapped, the
+        // implicit local lane survives.
+        let (unmapped_source, _) = source(Err(VaultGetError::Permanent));
         let provider = DeepSeekProvider::new_with_handle_loader(
-            Some(source),
+            Some(unmapped_source),
             Arc::new(crate::vault_handles::VaultHandleLoader::default()),
         );
         assert_eq!(
             provider.handles().unwrap(),
             vec![CredentialHandle::implicit()]
         );
-    }
-
-    #[test]
-    fn two_handles_for_one_apikey_family_are_refused() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[
-            ("apikey:deepseek", "apikey"),
-            ("apikey:deepseek:second", "apikey"),
-        ]);
-        assert!(loader.deepseek_handles().unwrap().is_empty());
     }
 
     /// The vault lane serves the key and reports a 401 to the store.

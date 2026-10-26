@@ -2000,20 +2000,15 @@ mod tests {
     }
 
     #[test]
-    fn other_forbidden_exceptions_invalidate_older_quota() {
-        let error = AIR_MIGRATION_QUOTA_LINE.replace(
-            "com.intellij.ml.llm.core.AIAssistantForbiddenException",
-            "com.intellij.ml.llm.core.OtherForbiddenException",
-        );
-        assert!(
-            latest_log_entry_in(&format!("{JUNIE_QUOTA_LINE}\n{error}\n")).is_none(),
-            "only the disabled-assistant exception may be skipped"
-        );
-    }
-
-    #[test]
     fn unsupported_latest_states_do_not_resurrect_junie_quota() {
-        for exception in ["java.net.SocketTimeoutException", "Unknown"] {
+        // Only the disabled-assistant exception may be skipped: any other
+        // forbidden exception, or any other newest state, invalidates the older
+        // quota.
+        for exception in [
+            "com.intellij.ml.llm.core.OtherForbiddenException",
+            "java.net.SocketTimeoutException",
+            "Unknown",
+        ] {
             let error = AIR_MIGRATION_QUOTA_LINE.replace(
                 "com.intellij.ml.llm.core.AIAssistantForbiddenException",
                 exception,
@@ -2194,5 +2189,13 @@ mod tests {
     #[test]
     fn entity_decode_roundtrip() {
         assert_eq!(decode_html_entities("a&quot;b&#10;c"), "a\"b\nc");
+        // Every entity JetBrains writes, once each.
+        assert_eq!(
+            decode_html_entities("&#10;&quot;&lt;&gt;&apos;&amp;"),
+            "\n\"<>'&"
+        );
+        // `&amp;` is decoded last, so an escaped entity stays escaped once
+        // rather than being decoded twice.
+        assert_eq!(decode_html_entities("&amp;lt;"), "&lt;");
     }
 }

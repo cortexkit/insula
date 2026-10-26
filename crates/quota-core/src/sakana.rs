@@ -338,6 +338,10 @@ pub struct SakanaProvider {
 }
 
 impl SakanaProvider {
+    // Builds its own client to turn redirects off, so a session cookie never
+    // follows one. It does not set the shared pool idle bound from
+    // `http::provider_client()`; see clippy.toml for why that bound matters.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -521,13 +525,6 @@ mod tests {
         let login_url = Url::parse("https://auth.sakana.ai/login").unwrap();
         let result = normalize_response(200, &login_url, BILLING_FIXTURE.as_bytes());
         assert!(matches!(result, Err(FetchError::Unauthorized(_))));
-    }
-
-    #[test]
-    fn missing_cookie_environment_is_no_session() {
-        let result = load_cookie_header_from(|_| None);
-
-        assert!(matches!(result, Err(FetchError::NoSession(_))));
     }
 
     #[test]

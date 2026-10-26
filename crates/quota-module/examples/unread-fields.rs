@@ -103,6 +103,9 @@ async fn main() {
         Err(error) => refuse(&format!("payload is not a usable bearer: {error}")),
     };
 
+    // A one-shot diagnostic that makes a few requests and exits, so the
+    // refresher's pool bound (see clippy.toml) does not apply.
+    #[allow(clippy::disallowed_methods)]
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()

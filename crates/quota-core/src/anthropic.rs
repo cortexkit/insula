@@ -44,7 +44,7 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 ///
 /// Dated opt-in header. Dated values get superseded, and the supersession is
 /// invisible here until a request is refused.
-const BETA_HEADER: &str = "oauth-2025-04-20";
+pub(crate) const BETA_HEADER: &str = "oauth-2025-04-20";
 /// The Claude Code version this module identifies as. Anthropic gates the
 /// saved-reset inventory on it.
 ///
@@ -1597,14 +1597,13 @@ mod tests {
         assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
     }
 
+    /// A 400, or a 403 that is not a missing-scope refusal, retries once with
+    /// the ordinary identity and publishes the retry's windows.
     #[tokio::test]
-    async fn inventory_400_retries_once_with_ordinary_identity_and_publishes_retry_windows() {
-        assert_inventory_fallback(400).await;
-    }
-
-    #[tokio::test]
-    async fn inventory_403_without_profile_scope_retries_once() {
-        assert_inventory_fallback(403).await;
+    async fn inventory_400_or_403_without_profile_scope_retries_once() {
+        for status in [400, 403] {
+            assert_inventory_fallback(status).await;
+        }
     }
 
     #[tokio::test]
@@ -1921,6 +1920,11 @@ mod tests {
         ] {
             assert!(saved_resets(Some(block), now).unwrap().is_none());
         }
+        // The grant-count bound is inclusive: 200 grants are read, and only the
+        // 201st above refuses the block.
+        let at_bound =
+            serde_json::json!({"eligible":true,"grants":vec![serde_json::json!({});200]});
+        assert!(saved_resets(Some(at_bound), now).is_ok());
         let block =
             serde_json::json!({"eligible":true,"grants":[{"resets_left":50,"paused":false}]});
         let saved = saved_resets(Some(block), now).unwrap().unwrap();
@@ -2591,47 +2595,9 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_non_object_limits_entry_keeps_the_main_windows() {
-        let usage = normalize_usage(&limits_body("[null]"))
-            .expect("a null entry must not fail the response");
-        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(
-            usage.extra_rate_windows.is_none(),
-            "a bad limits entry must not become a row"
-        );
-    }
-
-    #[test]
-    fn a_string_percent_reads_as_absent_and_keeps_the_main_windows() {
-        let usage = normalize_usage(&limits_body(
-            r#"[{"kind": "weekly_scoped", "percent": "12",
-                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
-        ))
-        .expect("a string percent must not fail the response");
-        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(
-            usage.extra_rate_windows.is_none(),
-            "a bad limits entry must not become a row"
-        );
-    }
-
-    #[test]
-    fn a_boolean_percent_is_not_one_percent() {
-        // Everything else about the entry is valid, so reading `true` as a
-        // number would publish a 1% Fable row here.
-        let usage = normalize_usage(&limits_body(
-            r#"[{"kind": "weekly_scoped", "percent": true,
-                "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}]"#,
-        ))
-        .expect("a Boolean percent must not fail the response");
-        assert_eq!(main_windows(&usage), (Some(12.0), Some(60.0)));
-        assert!(
-            usage.extra_rate_windows.is_none(),
-            "a bad limits entry must not become a row"
-        );
-    }
-
+    /// Bad `limits` entries cost nothing but themselves: the main windows stay,
+    /// and only the valid scoped entry becomes a row. Each bad sibling carries
+    /// its own id, so one wrongly kept would show as a second row.
     #[test]
     fn a_valid_scoped_entry_survives_bad_siblings() {
         let usage = normalize_usage(&limits_body(
@@ -2642,6 +2608,10 @@ mod tests {
                     "scope": {"model": {"id": "other", "display_name": "Other"}}},
                 {"kind": "weekly_scoped", "percent": false,
                     "scope": {"model": {"id": "fable-v0", "display_name": "Fable"}}},
+                {"kind": "weekly_scoped", "percent": "12",
+                    "scope": {"model": {"id": "fable-string", "display_name": "Fable"}}},
+                {"kind": "weekly_scoped", "percent": true,
+                    "scope": {"model": {"id": "fable-boolean", "display_name": "Fable"}}},
                 {"kind": "weekly_scoped", "percent": 30.0, "scope": "fable"},
                 {"kind": "weekly_scoped", "percent": 40.0, "resets_at": 5,
                     "scope": {"model": {"id": "fable-v1", "display_name": "Fable"}}}
@@ -2652,6 +2622,7 @@ mod tests {
         let extras = usage
             .extra_rate_windows
             .expect("the valid Fable entry must be kept");
+        // A string percent reads as absent, and a Boolean `true` is not 1%.
         assert_eq!(extras.len(), 1, "a bad limits entry must not become a row");
         assert_eq!(extras[0].title.as_deref(), Some("7 Day (Fable)"));
         assert_eq!(extras[0].id.as_deref(), Some("fable-v1"));
@@ -2930,31 +2901,25 @@ mod tests {
         assert!(refusal.spend_keys.is_empty());
     }
 
+    /// When a refusal is worth a log line: the first one, a change of reason,
+    /// and a clearing are logged; the same reason again, and a readable
+    /// payload that stays readable, are silent.
     #[test]
-    fn first_refusal_is_logged() {
-        assert!(refusal_needs_log(None, Some(RefusalReason::LimitMissing)));
-    }
-
-    #[test]
-    fn the_same_refusal_again_is_silent() {
-        assert!(!refusal_needs_log(
-            Some(RefusalReason::LimitMissing),
-            Some(RefusalReason::LimitMissing)
-        ));
-    }
-
-    #[test]
-    fn a_different_refusal_is_logged() {
-        assert!(refusal_needs_log(
-            Some(RefusalReason::LimitMissing),
-            Some(RefusalReason::CurrencyMismatch)
-        ));
-    }
-
-    #[test]
-    fn a_refusal_clearing_is_logged_and_readable_stays_silent() {
-        assert!(refusal_needs_log(Some(RefusalReason::Unparseable), None));
-        assert!(!refusal_needs_log(None, None));
+    fn a_refusal_is_logged_only_when_it_starts_changes_or_clears() {
+        use RefusalReason::{CurrencyMismatch, LimitMissing, Unparseable};
+        for (previous, current, logged) in [
+            (None, Some(LimitMissing), true),
+            (Some(LimitMissing), Some(LimitMissing), false),
+            (Some(LimitMissing), Some(CurrencyMismatch), true),
+            (Some(Unparseable), None, true),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                refusal_needs_log(previous, current),
+                logged,
+                "{previous:?} -> {current:?}"
+            );
+        }
     }
 
     #[test]

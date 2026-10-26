@@ -309,19 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_data_user_is_a_decode_error() {
-        let body = br#"{ "data": { "user": null } }"#;
-        let error = normalize_usage(body).unwrap_err();
-        match error {
-            FetchError::Decode(message) => assert!(
-                message.contains("data.user"),
-                "missing-link error was opaque: {message}"
-            ),
-            other => panic!("expected Decode, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn metered_window_without_a_refresh_time_still_reports_its_percent() {
         // The percent is load-bearing and the reset is optional: a plan that
         // reports its limit but not its next refresh still has real usage. The
@@ -365,26 +352,29 @@ mod tests {
 
     #[test]
     fn every_missing_required_graphql_link_is_named() {
+        // Exact messages: every one of them contains `data`, so a substring
+        // check would pass with the links permuted.
         let cases: &[(&[u8], &str)] = &[
-            (br#"{}"#, "data"),
+            (br#"{}"#, "warp response missing data"),
+            (
+                br#"{ "data": { "user": null } }"#,
+                "warp response missing data.user",
+            ),
             (
                 br#"{ "data": { "user": { "__typename": "UserOutput", "user": null } } }"#,
-                "data.user.user",
+                "warp response missing data.user.user",
             ),
             (
                 br#"{ "data": { "user": { "user": {} } } }"#,
-                "data.user.user.requestLimitInfo",
+                "warp response missing data.user.user.requestLimitInfo",
             ),
         ];
 
-        for (body, missing_link) in cases {
+        for (body, expected) in cases {
             let error = normalize_usage(body).unwrap_err();
             match error {
-                FetchError::Decode(message) => assert!(
-                    message.contains(missing_link),
-                    "missing-link error did not name {missing_link}: {message}"
-                ),
-                other => panic!("expected Decode for {missing_link}, got {other:?}"),
+                FetchError::Decode(message) => assert_eq!(message, *expected),
+                other => panic!("expected Decode for {expected}, got {other:?}"),
             }
         }
     }

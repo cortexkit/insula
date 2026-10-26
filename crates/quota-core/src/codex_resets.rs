@@ -3081,6 +3081,23 @@ mod tests {
             state.spend_bound_allows,
             "past the bound the fence must release, or the feature never fires again"
         );
+
+        // Just before the bound it still holds, so the release above is the
+        // bound elapsing and not a fence that never held at this age.
+        let recent = now - chrono::Duration::seconds(SPEND_BOUND_SECS - 1);
+        let mut record = pending_record("acct-recent", "req-recent");
+        record.status = JournalStatus::Resolved;
+        record.outcome = Some(ConsumeOutcome::NothingToReset);
+        record.created_at = recent.to_rfc3339();
+        record.last_attempt_at = Some(recent.to_rfc3339());
+        journal.save(&[record]).expect("seed the journal");
+        let state = journal
+            .inspect_account("acct-recent", now)
+            .expect("inspect the seeded account");
+        assert!(
+            !state.spend_bound_allows,
+            "one second inside the bound the fence must still hold"
+        );
     }
 
     /// A PENDING record outlives the retention horizon; only RESOLVED ones age out.
@@ -3145,9 +3162,18 @@ mod tests {
         still_pending.created_at = ancient.to_rfc3339();
         still_pending.last_attempt_at = Some(ancient.to_rfc3339());
 
+        // A resolved record exactly at the horizon is not yet past it, so it is
+        // kept: the boundary control for the age rule.
+        let at_horizon = now - chrono::Duration::seconds(RESOLVED_RETENTION_SECS);
+        let mut boundary = pending_record("acct-boundary", "req-boundary");
+        boundary.status = JournalStatus::Resolved;
+        boundary.outcome = Some(ConsumeOutcome::NothingToReset);
+        boundary.created_at = at_horizon.to_rfc3339();
+        boundary.last_attempt_at = Some(at_horizon.to_rfc3339());
+
         journal
-            .save(&[resolved, still_pending])
-            .expect("seed both records");
+            .save(&[resolved, still_pending, boundary])
+            .expect("seed the records");
         journal
             .inspect_account("acct-pending", now)
             .expect("inspect, which prunes as a side effect");
@@ -3160,10 +3186,18 @@ mod tests {
             .collect();
         assert_eq!(
             surviving,
-            vec!["acct-pending".to_string()],
+            vec!["acct-pending".to_string(), "acct-boundary".to_string()],
             "the aged RESOLVED record must be gone and the aged PENDING one must \
              remain -- if both survive the retention rule does nothing, and if \
              both vanish the unconfirmed request id is lost"
+        );
+
+        // And the id a caller would actually reuse is still that one: the next
+        // reservation for the account answers with the surviving pending id
+        // rather than minting a fresh one.
+        assert_eq!(
+            journal.reserve("acct-pending", now),
+            Ok(Reservation::ExistingPending("req-unconfirmed".to_string()))
         );
     }
 
@@ -3189,15 +3223,31 @@ mod tests {
     /// must not consult the environment's previous answer.
     #[test]
     fn only_the_env_constructor_reaches_the_legacy_path() {
-        let source = include_str!("codex_resets.rs");
-        let probe = source
-            .split_once("fn probe_atomic_write")
-            .expect("probe_atomic_write must exist")
-            .1;
-        let body = probe
-            .split_once("\n    fn ")
-            .map(|(body, _)| body)
-            .unwrap_or(probe);
+        // Production only, through the shared boundary rule: this test's own
+        // strings name both functions and must not be read as their bodies.
+        let source = crate::tests::production_body(include_str!("codex_resets.rs"));
+        // One function's body: from its signature to the closing brace at the
+        // signature's own indentation, which rustfmt guarantees. Cutting at the
+        // next `fn` instead would read past a body that ends in a nested item
+        // or a closure, and stop early at a nested `fn`.
+        let body_of = |signature: &str| -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} must exist"));
+            let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+            let line = &source[line_start..];
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let close = format!("\n{indent}}}\n");
+            let end = source[start..]
+                .find(&close)
+                .map_or(source.len(), |at| start + at);
+            source[start..end].to_string()
+        };
+        let body = body_of("fn probe_atomic_write(");
+        assert!(
+            body.contains("fn probe_atomic_write(") && body.lines().count() > 3,
+            "the probe's body was not found: {body}"
+        );
         assert!(
             !body.contains("legacy_redemption_journal_path") && !body.contains("adopt_from"),
             "probe_atomic_write runs for EVERY journal including temporary ones, \
@@ -3207,14 +3257,7 @@ mod tests {
         // Not vacuous: the migration must still exist somewhere, and that
         // somewhere must be the constructor that asked the environment in the
         // first place.
-        let from_env = source
-            .split_once("fn from_env_source(")
-            .expect("from_env must exist")
-            .1;
-        let from_env_body = from_env
-            .split_once("\n    }")
-            .map(|(b, _)| b)
-            .unwrap_or(from_env);
+        let from_env_body = body_of("fn from_env_source(");
         assert!(
             from_env_body.contains("adopt_from"),
             "the migration has to live in from_env; if it lives nowhere, a \

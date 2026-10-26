@@ -588,7 +588,9 @@ mod tests {
     }
 
     /// A 401 on the environment key is rejected too, and nothing is reported:
-    /// the vault did not serve that key, so it has nothing to retire.
+    /// the vault did not serve that key, so it has nothing to retire. The
+    /// early return for an environment handle is shared by every API-key
+    /// provider with a vault lane, so this one copy stands for all of them.
     #[tokio::test]
     async fn an_environment_401_is_rejected_and_never_reported_to_the_vault() {
         let (base, _) = abliteration(401, "").await;

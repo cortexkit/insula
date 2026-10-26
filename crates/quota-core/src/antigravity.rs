@@ -2250,6 +2250,10 @@ impl AntigravityProvider {
         Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()))
     }
 
+    // The loopback client must accept the local editor's self-signed
+    // certificate, which the shared client never does. It does not set the
+    // shared pool idle bound; see clippy.toml for why that bound matters.
+    #[allow(clippy::disallowed_methods)]
     pub fn new_with_handle_loader(
         credential_source: Option<Arc<dyn CredentialSource>>,
         handle_loader: Arc<VaultHandleLoader>,
@@ -2275,19 +2279,23 @@ impl AntigravityProvider {
         }
     }
 
-    #[doc(hidden)]
-    pub fn set_local_endpoints(&mut self, endpoints: Vec<(LocalServer, u16)>) {
+    // Test-only substitutes for the local process scan and the sidebar store,
+    // so tests can drive both lanes without a running editor or a real file.
+    // Compiled out of release builds: no caller outside this crate's tests
+    // sets them, and in production both fields stay `None`.
+    #[cfg(test)]
+    pub(crate) fn set_local_endpoints(&mut self, endpoints: Vec<(LocalServer, u16)>) {
         self.local_endpoints = Some(endpoints);
         *self.local_cache.get_mut() = None;
     }
 
-    #[doc(hidden)]
-    pub fn set_override_accounts(&mut self, accounts: Vec<StoredAccount>) {
+    #[cfg(test)]
+    pub(crate) fn set_override_accounts(&mut self, accounts: Vec<StoredAccount>) {
         self.override_store = Some(Ok(accounts));
     }
 
-    #[doc(hidden)]
-    pub fn set_override_store_unreadable(&mut self, reason: &str) {
+    #[cfg(test)]
+    pub(crate) fn set_override_store_unreadable(&mut self, reason: &str) {
         self.override_store = Some(Err(reason.to_string()));
     }
 
@@ -2924,40 +2932,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn native_discovery_uses_one_matcher_and_owner_port_selection() {
-        for command in [
-            "/opt/Antigravity/language_server --csrf_token=editor-token",
-            "C:\\Program Files\\Antigravity\\language_server.exe --csrf_token=editor-token",
-        ] {
-            assert_eq!(classify_command(command).as_deref(), Some("editor-token"));
-        }
-        for command in [
-            "/usr/bin/agy serve",
-            "C:\\bin\\agy.exe serve",
-            "\"C:\\Program Files\\agy.exe\" serve",
-        ] {
-            assert_eq!(classify_command(command).as_deref(), Some(""));
-        }
-        assert_eq!(classify_command("/opt/Antigravity/language_server"), None);
-        assert_eq!(
-            classify_command("/opt/other/language_server --csrf_token=other"),
-            None
-        );
-        assert_eq!(
-            command_requires_csrf("C:\\OtherEditor\\language_server.exe"),
-            None
-        );
-        assert_eq!(
-            command_requires_csrf("C:\\Antigravity\\language_server.exe"),
-            Some(true)
-        );
-        assert_eq!(
-            select_ports(42, [(7, 8000), (42, 9000), (42, 9000), (42, 9001)]),
-            vec![9000, 9001]
-        );
-    }
-
-    #[test]
     fn windows_tcp_owner_fixtures_select_pid_and_network_order_ports() {
         // Literal DWORD rows from the documented layouts, independent of the decoder.
         let ipv4 = [
@@ -3278,18 +3252,6 @@ mod tests {
         }
     }
 
-    async fn assert_preflight_serves_quota(status: u16, body: Vec<u8>) {
-        let mock = cloud_preflight_mock(status, body).await;
-        let usage = mock
-            .provider
-            .fetch_remote_quota("mock-token", None)
-            .await
-            .expect("a preflight without an affirmative consumer-client refusal must serve quota");
-        assert_eq!(pool_window(&usage, "gemini-weekly").used_percent, 7.15);
-        assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
-    }
-
     #[tokio::test]
     async fn consumer_client_refusal_rejects_credentials_without_requesting_quota() {
         let mut mock =
@@ -3316,63 +3278,85 @@ mod tests {
         );
     }
 
+    /// Every preflight that is not an affirmative consumer-client refusal still
+    /// requests quota: the refusal blocks quota only when it is unambiguous, so
+    /// a degraded or different preflight answer never hides the account's
+    /// figures. Each row is one way the refusal can be absent or unreadable.
     #[tokio::test]
-    async fn consumer_client_refusal_with_a_current_tier_still_requests_quota() {
-        let mut body = consumer_client_refusal();
-        body["currentTier"] = serde_json::json!({"id": "free-tier"});
-        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
-    }
-
-    #[tokio::test]
-    async fn consumer_client_refusal_with_a_response_project_still_requests_quota() {
+    async fn a_preflight_that_is_not_an_affirmative_refusal_still_requests_quota() {
+        let refusal_with = |edit: &dyn Fn(&mut Value)| {
+            let mut body = consumer_client_refusal();
+            edit(&mut body);
+            body.to_string().into_bytes()
+        };
+        let mut cases: Vec<(String, u16, Vec<u8>)> = vec![
+            (
+                "a current tier".into(),
+                200,
+                refusal_with(&|body| body["currentTier"] = serde_json::json!({"id": "free-tier"})),
+            ),
+            (
+                "a different ineligible reason".into(),
+                200,
+                refusal_with(&|body| {
+                    body["ineligibleTiers"][0]["reasonCode"] = serde_json::json!("OTHER_REASON")
+                }),
+            ),
+            (
+                "absent ineligible tiers".into(),
+                200,
+                refusal_with(&|body| {
+                    body.as_object_mut().unwrap().remove("ineligibleTiers");
+                }),
+            ),
+            (
+                "a preflight HTTP 500".into(),
+                500,
+                consumer_client_refusal().to_string().into_bytes(),
+            ),
+            ("an unparseable preflight".into(), 200, b"not JSON".to_vec()),
+        ];
         for project in [
             serde_json::json!("existing-project"),
             serde_json::json!({"id": "existing-project"}),
             serde_json::json!({"projectId": "existing-project"}),
         ] {
-            let mut body = consumer_client_refusal();
-            body["cloudaicompanionProject"] = project;
-            assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+            cases.push((
+                format!("a response project {project}"),
+                200,
+                refusal_with(&|body| body["cloudaicompanionProject"] = project.clone()),
+            ));
         }
-    }
-
-    #[tokio::test]
-    async fn a_different_ineligible_reason_still_requests_quota() {
-        let mut body = consumer_client_refusal();
-        body["ineligibleTiers"][0]["reasonCode"] = serde_json::json!("OTHER_REASON");
-        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
-    }
-
-    #[tokio::test]
-    async fn absent_ineligible_tiers_preserve_quota_fetching() {
-        let mut body = consumer_client_refusal();
-        body.as_object_mut().unwrap().remove("ineligibleTiers");
-        assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
-    }
-
-    #[tokio::test]
-    async fn malformed_ineligible_tiers_preserve_quota_fetching() {
         for inventory in [
             Value::Null,
             serde_json::json!("not an array"),
             serde_json::json!({}),
             serde_json::json!([null, false, {"reasonCode": 123}, {}]),
         ] {
-            let mut body = consumer_client_refusal();
-            body["ineligibleTiers"] = inventory;
-            assert_preflight_serves_quota(200, body.to_string().into_bytes()).await;
+            cases.push((
+                format!("malformed ineligible tiers {inventory}"),
+                200,
+                refusal_with(&|body| body["ineligibleTiers"] = inventory.clone()),
+            ));
         }
-    }
 
-    #[tokio::test]
-    async fn a_preflight_http_500_still_requests_quota() {
-        assert_preflight_serves_quota(500, consumer_client_refusal().to_string().into_bytes())
-            .await;
-    }
-
-    #[tokio::test]
-    async fn an_unparseable_preflight_still_requests_quota() {
-        assert_preflight_serves_quota(200, b"not JSON".to_vec()).await;
+        for (case, status, body) in cases {
+            let mock = cloud_preflight_mock(status, body).await;
+            let usage = mock
+                .provider
+                .fetch_remote_quota("mock-token", None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{case}: a preflight without an affirmative refusal must serve quota: {error:?}")
+                });
+            assert_eq!(
+                pool_window(&usage, "gemini-weekly").used_percent,
+                7.15,
+                "{case}"
+            );
+            assert_eq!(mock.preflight_requests.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -4320,7 +4304,8 @@ mod tests {
         assert_eq!(pool_window(&usage, "3p-weekly").used_percent, 60.0);
     }
 
-    /// A window with usage but no reset is still published.
+    /// A window with usage but no reset is still published, an exhausted one
+    /// included.
     ///
     /// Hand-written input: the identifiers and display names here were chosen to
     /// make the case reachable, not observed on a live server. Real captures use
@@ -4328,28 +4313,17 @@ mod tests {
     /// downstream should treat `g-*` as a shape this upstream sends.
     #[test]
     fn bucket_without_reset_is_kept() {
-        let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
-            {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.5}
-        ]}]}"#;
-        let usage = parse_quota_summary(body).unwrap();
-        let primary = pool_window(&usage, "g-5h");
-        assert_eq!(primary.used_percent, 50.0);
-        assert_eq!(primary.resets_at, None);
-    }
-
-    /// An exhausted window with no reset is published rather than dropped.
-    ///
-    /// Hand-written input, like its sibling above: `g-*` identifiers are
-    /// invented to reach the case, not observed.
-    #[test]
-    fn exhausted_bucket_without_reset_is_kept() {
-        let body = r#"{"groups":[{"displayName":"Gemini","buckets":[
-            {"bucketId":"g-5h","displayName":"5-hour","remainingFraction":0.0}
-        ]}]}"#;
-        let usage = parse_quota_summary(body).unwrap();
-        let primary = pool_window(&usage, "g-5h");
-        assert_eq!(primary.used_percent, 100.0);
-        assert_eq!(primary.resets_at, None);
+        for (remaining, used) in [("0.5", 50.0), ("0.0", 100.0)] {
+            let body = format!(
+                r#"{{"groups":[{{"displayName":"Gemini","buckets":[
+                    {{"bucketId":"g-5h","displayName":"5-hour","remainingFraction":{remaining}}}
+                ]}}]}}"#
+            );
+            let usage = parse_quota_summary(&body).unwrap();
+            let primary = pool_window(&usage, "g-5h");
+            assert_eq!(primary.used_percent, used, "remaining {remaining}");
+            assert_eq!(primary.resets_at, None);
+        }
     }
 
     /// A bucket the server marks disabled contributes nothing.
@@ -4849,6 +4823,16 @@ mod plugin_lane_tests {
         assert_eq!(hub_target("windows", "aarch64"), ("windows", "arm64"));
         assert_eq!(hub_target("windows", "x86_64"), ("windows", "amd64"));
         assert_eq!(hub_target("freebsd", "riscv64"), ("darwin", "amd64"));
+
+        // The header this host sends: the spellings above, for this target,
+        // under the Hub's version.
+        let (platform, architecture) = hub_target(std::env::consts::OS, std::env::consts::ARCH);
+        let header = remote_user_agent_header();
+        assert_eq!(header.name, "User-Agent");
+        assert_eq!(
+            header.value,
+            format!("antigravity/hub/2.9.1 {platform}/{architecture}")
+        );
     }
 
     #[test]
@@ -4857,27 +4841,6 @@ mod plugin_lane_tests {
             cli_user_agent_for("macos", "aarch64"),
             "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; \
              cl=998863838; auth_method=consumer)"
-        );
-    }
-
-    #[test]
-    fn hub_identity_pins_the_host_user_agent() {
-        let platform = match std::env::consts::OS {
-            "macos" => "darwin",
-            "linux" => "linux",
-            "windows" => "windows",
-            _ => "darwin",
-        };
-        let architecture = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "amd64",
-            _ => "amd64",
-        };
-        let header = remote_user_agent_header();
-        assert_eq!(header.name, "User-Agent");
-        assert_eq!(
-            header.value,
-            format!("antigravity/hub/2.9.1 {platform}/{architecture}")
         );
     }
 
@@ -5069,103 +5032,82 @@ mod plugin_lane_tests {
             Some("beatricelau0414@gmail.com")
         );
         assert_eq!(attempt.source.as_deref(), Some("oauth"));
+        // The local-probe lane publishes the account's email as account info,
+        // like the sidebar lane, so the address does not blink when the
+        // serving lane switches.
+        assert_eq!(
+            attempt
+                .account_info
+                .as_ref()
+                .and_then(|info| info.email.as_deref()),
+            Some("beatricelau0414@gmail.com")
+        );
         assert_eq!(
             attempt.value_observed_at, None,
             "a cache response would carry the cache's earlier value-time"
         );
     }
 
-    /// A different editor email must use the handle email's sidebar quota.
+    /// When the local editor cannot vouch for the handle's account, the handle
+    /// email's sidebar quota is served instead: a local editor signed into a
+    /// different account, and a local status that omits the email (which cannot
+    /// attribute quota to this account at all).
     #[tokio::test]
     async fn identity_mismatch_falls_through_to_the_sidebar_lane() {
-        let (port, _server) = spawn_mock_server(move |path| {
-            if path == QUOTA_SUMMARY_PATH {
-                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
-            } else if path == USER_STATUS_PATH {
-                // Local editor is signed into a DIFFERENT account than the handle.
-                (
-                    200,
-                    br#"{"userStatus":{"email":"different_user@gmail.com"}}"#.to_vec(),
-                )
-            } else if path == "/cloud-quota" {
-                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
-            } else {
-                (404, b"not found".to_vec())
-            }
-        })
-        .await;
-
-        let mut provider = AntigravityProvider::new();
-        provider.set_local_endpoints(vec![(
-            LocalServer {
-                pid: 100,
-                csrf_token: String::new(),
-            },
-            port,
-        )]);
-        provider.set_override_accounts(vec![cached_paid_account(
-            "beatricelau0414@gmail.com",
-            Utc::now() - chrono::Duration::minutes(5),
-        )]);
-        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
-        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
-
-        let attempt = provider
-            .fetch_handle(&CredentialHandle::Named(
-                "plugin:beatricelau0414@gmail.com".into(),
-            ))
+        for status_body in [
+            br#"{"userStatus":{"email":"different_user@gmail.com"}}"#.as_slice(),
+            br#"{"userStatus":{}}"#.as_slice(),
+        ] {
+            let status_body = status_body.to_vec();
+            let (port, _server) = spawn_mock_server(move |path| {
+                if path == QUOTA_SUMMARY_PATH {
+                    (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
+                } else if path == USER_STATUS_PATH {
+                    (200, status_body.clone())
+                } else if path == "/cloud-quota" {
+                    (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
+                } else {
+                    (404, b"not found".to_vec())
+                }
+            })
             .await;
-        let usage = attempt.usage.expect("usage must be present");
-        let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
-        assert!((primary.used_percent - 6.1696).abs() < 1e-10);
-        assert!(attempt.value_observed_at.is_some());
-    }
+            let mut provider = AntigravityProvider::new();
+            provider.set_local_endpoints(vec![(
+                LocalServer {
+                    pid: 100,
+                    csrf_token: String::new(),
+                },
+                port,
+            )]);
+            provider.set_override_accounts(vec![cached_paid_account(
+                "beatricelau0414@gmail.com",
+                Utc::now() - chrono::Duration::minutes(5),
+            )]);
+            provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
+            provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
 
-    /// A local status response without email cannot attribute quota to this account.
-    #[tokio::test]
-    async fn local_snapshot_with_no_email_does_not_serve_a_named_handle() {
-        let (port, _server) = spawn_mock_server(move |path| {
-            if path == QUOTA_SUMMARY_PATH {
-                (200, LOCAL_MOCK_QUOTA.as_bytes().to_vec())
-            } else if path == USER_STATUS_PATH {
-                // GetUserStatus call fails or omits email.
-                (200, br#"{"userStatus":{}}"#.to_vec())
-            } else if path == "/cloud-quota" {
-                (200, CLOUD_MOCK_QUOTA.as_bytes().to_vec())
-            } else {
-                (404, b"not found".to_vec())
-            }
-        })
-        .await;
+            let attempt = provider
+                .fetch_handle(&CredentialHandle::Named(
+                    "plugin:beatricelau0414@gmail.com".into(),
+                ))
+                .await;
+            // The sidebar lane publishes the handle's email as account info,
+            // so the address does not blink when the serving lane switches.
+            assert_eq!(
+                attempt
+                    .account_info
+                    .as_ref()
+                    .and_then(|info| info.email.as_deref()),
+                Some("beatricelau0414@gmail.com")
+            );
+            let usage = attempt.usage.expect("usage must be present");
+            let primary = super::tests::pool_window(&usage, "gemini-weekly");
 
-        let mut provider = AntigravityProvider::new();
-        provider.set_local_endpoints(vec![(
-            LocalServer {
-                pid: 100,
-                csrf_token: String::new(),
-            },
-            port,
-        )]);
-        provider.set_override_accounts(vec![cached_paid_account(
-            "beatricelau0414@gmail.com",
-            Utc::now() - chrono::Duration::minutes(5),
-        )]);
-        provider.quota_summary_url = format!("http://127.0.0.1:{port}/cloud-quota");
-        provider.load_code_assist_url = format!("http://127.0.0.1:{port}/load");
-
-        let attempt = provider
-            .fetch_handle(&CredentialHandle::Named(
-                "plugin:beatricelau0414@gmail.com".into(),
-            ))
-            .await;
-        let usage = attempt.usage.expect("usage must be present");
-        let primary = super::tests::pool_window(&usage, "gemini-weekly");
-
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
-        assert!((primary.used_percent - 6.1696).abs() < 1e-10);
-        assert!(attempt.value_observed_at.is_some());
+            assert_eq!(primary.resets_at.as_deref(), Some("2026-09-17T18:41:37Z"));
+            assert!((primary.used_percent - 6.1696).abs() < 1e-10);
+            assert!(attempt.value_observed_at.is_some());
+        }
     }
 
     #[tokio::test]
@@ -5273,6 +5215,9 @@ mod plugin_lane_tests {
             .stored_accounts()
             .unwrap_err()
             .contains("unreadable"));
+        // Enumeration fails too, rather than returning an empty roster: an
+        // error keeps the existing slots, and an empty set would reap them.
+        assert!(provider.handles().is_err());
     }
 
     #[test]
@@ -5404,17 +5349,6 @@ mod plugin_lane_tests {
             std::path::Path::new(home)
                 .join(".local/state")
                 .join(SIDEBAR_STATE_RELATIVE)
-        );
-    }
-
-    /// A sidebar read error must not enumerate an empty roster and prune accounts.
-    #[test]
-    fn an_unreadable_plugin_sidebar_fails_enumeration() {
-        let mut provider = AntigravityProvider::new();
-        provider.set_override_store_unreadable("moved");
-        assert!(
-            provider.handles().is_err(),
-            "an error keeps the existing slots; an empty set would reap them"
         );
     }
 

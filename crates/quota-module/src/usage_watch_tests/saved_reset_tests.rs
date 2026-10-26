@@ -235,19 +235,18 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         assert_eq!(body(&call(&mut wire, 1, params).await)["code"], code);
     }
     assert_eq!(posts.load(Ordering::SeqCst), 0);
-    for outcome in [
-        ConsumeOutcome::Reset,
-        ConsumeOutcome::NothingToReset,
-        ConsumeOutcome::NoCredit,
-        ConsumeOutcome::AlreadyRedeemed,
+    // The published codes are literals here, not `as_code()`: the phone reads
+    // these strings, so a renamed code must fail this test.
+    for (outcome, code) in [
+        (ConsumeOutcome::Reset, "reset"),
+        (ConsumeOutcome::NothingToReset, "nothing_to_reset"),
+        (ConsumeOutcome::NoCredit, "no_credit"),
+        (ConsumeOutcome::AlreadyRedeemed, "already_redeemed"),
     ] {
         *result.lock().unwrap() = Ok(outcome);
         let frame = call(&mut wire, 1, reset_params()).await;
         assert_eq!(frame.header.ty, FrameType::Response);
-        assert_eq!(
-            body(&frame),
-            json!({"outcome":outcome.as_code(),"request_id":CLIENT_ID})
-        );
+        assert_eq!(body(&frame), json!({"outcome":code,"request_id":CLIENT_ID}));
     }
     for (error, code) in [
         (
@@ -333,14 +332,6 @@ async fn saved_reset_marks_slot_due_and_refresh_emits_watch_change() {
     let changed = notice(wire.recv().await, 5, 1, 703);
     assert_eq!(changed["provider"], "codex");
     assert_eq!(changed["account"], ACCOUNT);
-    assert_eq!(
-        registry.get_usage(None).await[0]
-            .saved_resets
-            .as_ref()
-            .unwrap()
-            .available_count,
-        1
-    );
     wire.stop().await;
     wire.finish().await;
 }

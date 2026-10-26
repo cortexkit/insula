@@ -408,7 +408,10 @@ mod tests {
     fn garbage_payload_is_decode_error() {
         let body = br#"{"error":"unauthorized","message":"session expired"}"#;
         let err = normalize_usage(body).unwrap_err();
-        assert!(matches!(err, FetchError::Decode(_)));
+        assert!(
+            matches!(&err, FetchError::Decode(m) if m.starts_with("manus")),
+            "the message names the provider: {err}"
+        );
     }
 
     #[test]

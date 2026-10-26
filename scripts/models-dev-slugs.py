@@ -9,7 +9,7 @@ nothing, routing treated the account as having neutral abundance, and it took a
 consumer tracing a tie-break to find it. A slug that joins to nothing is silent
 by construction, so the only reader is one that goes and looks.
 
-It reads the slug table straight out of `api_provider_name` in
+It reads the slug table straight out of `API_PROVIDER_SLUGS` in
 crates/quota-core/src/lib.rs rather than from a copied list, so it cannot
 disagree with what the module publishes.
 
@@ -39,12 +39,12 @@ POSITIVE_CONTROL = "anthropic"
 
 def published_slugs() -> dict[str, str]:
     source = LIB.read_text()
-    start = source.find("fn api_provider_name(")
+    start = source.find("const API_PROVIDER_SLUGS")
     if start < 0:
         return {}
-    end = source.find("\n}\n", start)
+    end = source.find("\n];", start)
     body = source[start:end]
-    return dict(re.findall(r'"([a-z0-9-]+)"\s*=>\s*Some\("([^"]+)"\)', body))
+    return dict(re.findall(r'\("([a-z0-9-]+)",\s*"([^"]+)"\)', body))
 
 
 def main() -> int:

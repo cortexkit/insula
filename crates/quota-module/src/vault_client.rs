@@ -3609,10 +3609,9 @@ mod tests {
         assert_eq!(credential.email.as_deref(), Some("person@example.test"));
         assert_eq!(credential.org_name.as_deref(), Some("Example Org"));
         assert_eq!(credential.record_version, 4);
-    }
 
-    #[test]
-    fn get_result_decodes_optional_email_and_org_name() {
+        // Without an account id, and with padded values: email and org name
+        // still decode, trimmed.
         let body = serde_json::json!({
             "result": {
                 "payload": b"vault-token",
@@ -3887,6 +3886,17 @@ mod tests {
             VaultGetError::Transient,
             "a forgotten channel says nothing about whether the module exists"
         );
+        // And through the canonical error body a daemon actually sends, an
+        // unknown channel is a failure of the route only.
+        let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(
+            "unknown_channel",
+            "unknown channel 7",
+        ))
+        .unwrap();
+        assert_eq!(
+            classify_error_frame(&body, &AtomicU64::new(0)),
+            ClientFailure::RouteGone
+        );
     }
 
     /// An absent credential module is asked about exactly once per call.
@@ -3939,19 +3949,6 @@ mod tests {
             frames_after_refusal.load(Ordering::Relaxed),
             0,
             "an absent module was asked again inside the same call"
-        );
-    }
-
-    #[test]
-    fn canonical_error_body_unknown_channel_is_route_only_failure() {
-        let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(
-            "unknown_channel",
-            "unknown channel 7",
-        ))
-        .unwrap();
-        assert_eq!(
-            classify_error_frame(&body, &AtomicU64::new(0)),
-            ClientFailure::RouteGone
         );
     }
 

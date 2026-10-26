@@ -187,8 +187,17 @@ mod tests {
         let text = "aé中\u{1f600}z";
         for index in 0..=text.len() + 2 {
             let end = floor_char_boundary(text, index);
-            // The point of the helper: the result is always safe to slice at.
+            // Safe to slice at: a non-boundary would panic here.
             let _ = &text[..end];
+            // And the GREATEST such offset: never past the index, and no
+            // boundary lies between it and the index. Returning 0 every time
+            // would pass the slice above and fail here.
+            let bound = index.min(text.len());
+            assert!(end <= bound, "index {index}: {end}");
+            assert!(
+                (end + 1..=bound).all(|later| !text.is_char_boundary(later)),
+                "index {index}: {end} is not the nearest boundary below it"
+            );
         }
     }
 
@@ -219,9 +228,18 @@ mod tests {
         let text = format!("{}中中中中", "a".repeat(30));
         for limit in 28..36 {
             let out = truncate_for_wire(&text, limit);
-            // Reaching here at all is the assertion: building `out` slices the
-            // input, so a boundary error would panic rather than fail.
-            assert!(!out.is_empty());
+            // The kept front is the longest whole-character prefix within the
+            // limit, and the suffix accounts for every byte dropped.
+            let kept = floor_char_boundary(&text, limit);
+            assert!(
+                kept <= limit && kept + 3 > limit,
+                "limit {limit}: kept {kept}"
+            );
+            assert_eq!(
+                out,
+                format!("{}… [{} more bytes]", &text[..kept], text.len() - kept),
+                "limit {limit}"
+            );
         }
     }
 }

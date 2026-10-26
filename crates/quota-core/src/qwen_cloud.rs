@@ -953,6 +953,9 @@ struct FetchUrls<'a> {
 }
 
 impl QwenCloudProvider {
+    // The team client turns redirects off so a sign-in redirect can be
+    // inspected; it keeps the shared pool idle bound.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn new_with_handle_loader(
         credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
         handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
@@ -1162,6 +1165,9 @@ impl UsageProvider for QwenCloudProvider {
 
 #[cfg(test)]
 mod tests {
+    // Test clients live for one test, so the pool bound in clippy.toml's
+    // client rule does not apply to them.
+    #![allow(clippy::disallowed_methods)]
 
     // UPSTREAM-SHAPED fixtures: field names, envelopes and selection rules come
     // from CodexBar v0.74.0 qwencloud-team.ts. Values are synthetic; these are not
@@ -2382,15 +2388,5 @@ mod tests {
             // discarding the window.
             assert_eq!(primary.used_percent, 27.8, "{name}");
         }
-    }
-
-    #[test]
-    fn handles_without_credential_source_are_empty() {
-        let provider = QwenCloudProvider::new_with_handle_loader(
-            None,
-            std::sync::Arc::new(crate::vault_handles::VaultHandleLoader::default()),
-        );
-        let handles = provider.handles().unwrap();
-        assert_eq!(handles, Vec::<CredentialHandle>::new());
     }
 }

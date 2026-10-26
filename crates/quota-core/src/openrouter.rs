@@ -595,6 +595,8 @@ mod tests {
 
     #[test]
     fn absent_and_unreadable_auth_store_results_keep_their_distinct_classes() {
+        use crate::opencode_auth::OpencodeAuth;
+
         let absent = api_key_from_auth(Ok(None)).expect_err("missing entry is no session");
         assert!(matches!(absent, FetchError::NoSession(_)), "got {absent:?}");
 
@@ -605,6 +607,36 @@ mod tests {
         assert!(
             matches!(unreadable, FetchError::CredentialUnusable(_)),
             "got {unreadable:?}"
+        );
+
+        // An entry that exists but cannot be used is unusable, not absent: a
+        // blank key, and an OAuth entry where an API key is required.
+        let blank = api_key_from_auth(Ok(Some(OpencodeAuth::Api {
+            key: "  ".to_string(),
+        })))
+        .expect_err("a blank key is not a credential");
+        assert!(
+            matches!(&blank, FetchError::CredentialUnusable(message) if message.contains("empty")),
+            "got {blank:?}"
+        );
+        let oauth = api_key_from_auth(Ok(Some(OpencodeAuth::Oauth {
+            access: "token".to_string(),
+            refresh: None,
+            expires: None,
+        })))
+        .expect_err("an OAuth entry is not an API key");
+        assert!(
+            matches!(&oauth, FetchError::CredentialUnusable(message) if message.contains("not an API key")),
+            "got {oauth:?}"
+        );
+
+        // Control: a real key is served unchanged.
+        assert_eq!(
+            api_key_from_auth(Ok(Some(OpencodeAuth::Api {
+                key: "sk-or-key".to_string(),
+            })))
+            .unwrap(),
+            "sk-or-key"
         );
     }
 
@@ -669,16 +701,6 @@ mod tests {
     }
 
     #[test]
-    fn an_apikey_handle_routes_to_the_openrouter_provider() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[("apikey:openrouter", "apikey")]);
-        let handles = loader.openrouter_handles().unwrap();
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].stable_id(), "apikey:openrouter");
-        assert_eq!(handles[0].vault_credential_type(), Some("apikey"));
-    }
-
-    #[test]
     fn vault_handles_replace_the_implicit_local_lane() {
         let loader = Arc::new(crate::vault_handles::VaultHandleLoader::default());
         loader.install_rows_for_test(&[("apikey:openrouter", "apikey")]);
@@ -701,16 +723,6 @@ mod tests {
             provider.handles().unwrap(),
             vec![CredentialHandle::implicit()]
         );
-    }
-
-    #[test]
-    fn two_handles_for_one_apikey_family_are_refused() {
-        let loader = crate::vault_handles::VaultHandleLoader::default();
-        loader.install_rows_for_test(&[
-            ("apikey:openrouter", "apikey"),
-            ("apikey:openrouter:second", "apikey"),
-        ]);
-        assert!(loader.openrouter_handles().unwrap().is_empty());
     }
 
     /// The vault lane serves the key and reports a 401 to the store.

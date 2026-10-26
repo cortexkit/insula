@@ -591,34 +591,6 @@ impl UsageProvider for DoubaoProvider {
 #[cfg(test)]
 mod tests {
 
-    /// The absent-credential message names the variables to set.
-    ///
-    /// This provider accepts two credential schemes across sixteen names, so a
-    /// message that only says credentials are missing leaves a reader with no
-    /// way to learn which spelling this build reads -- and the aliases exist
-    /// because the upstream's own tools disagree about them.
-    ///
-    /// Asserted on the rendered message rather than on the constants, because
-    /// the constants being correct says nothing about whether they reach a
-    /// reader: the interpolation is the part that can silently stop happening.
-    #[test]
-    fn the_absent_credential_message_names_the_variables() {
-        let message = format!(
-            "no Doubao credentials: set one of {API_KEY_ENV:?}, or a \
-             Volcengine signing pair from {ACCESS_KEY_ID_ENV:?} and \
-             {SECRET_ACCESS_KEY_ENV:?}"
-        );
-        for expected in [
-            "ARK_API_KEY",
-            "VOLCENGINE_ACCESS_KEY_ID",
-            "VOLCENGINE_SECRET_ACCESS_KEY",
-        ] {
-            assert!(
-                message.contains(expected),
-                "{expected} must appear in the message a reader acts on: {message}"
-            );
-        }
-    }
     use super::*;
     use chrono::TimeZone;
 
@@ -629,16 +601,13 @@ mod tests {
     /// 429 and that response states both the limit and its reset -- so treating
     /// it as an upstream error would drop the provider from the wire at exactly
     /// the moment it is most constrained, and a missing window reads as capacity
-    /// that was never measured rather than as capacity that is gone.
+    /// that was never measured rather than as capacity that is gone. 200 is
+    /// accepted for the ordinary reason.
     #[test]
     fn a_rate_limited_probe_is_accepted_so_its_headers_can_be_read() {
-        assert!(classify_probe_status(429, b"").is_ok());
-    }
-
-    /// The paired case: 200 is accepted for the ordinary reason.
-    #[test]
-    fn a_successful_probe_is_accepted() {
-        assert!(classify_probe_status(200, b"").is_ok());
+        for status in [200, 429] {
+            assert!(classify_probe_status(status, b"").is_ok(), "{status}");
+        }
     }
 
     /// Every other status is refused, and the two refusals are distinguished.
@@ -759,27 +728,23 @@ mod tests {
 
     #[test]
     fn normal_window_from_remaining_and_limit() {
-        let headers = DoubaoHeaderSnapshot {
-            remaining_requests: Some(80),
-            limit_requests: Some(100),
-            reset_requests: Some("2026-06-22T18:00:00Z".to_string()),
-        };
-        let usage = normalize_usage(&headers).unwrap();
-        let primary = usage.primary.unwrap();
-        assert_eq!(primary.used_percent, 20.0);
-        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T18:00:00Z"));
-        assert_eq!(primary.window_minutes, None);
-    }
-
-    #[test]
-    fn remaining_to_used_conversion() {
-        let headers = DoubaoHeaderSnapshot {
-            remaining_requests: Some(0),
-            limit_requests: Some(50),
-            reset_requests: Some("2026-06-22T12:00:00Z".to_string()),
-        };
-        let usage = normalize_usage(&headers).unwrap();
-        assert_eq!(usage.primary.unwrap().used_percent, 100.0);
+        // (remaining, limit, reset, expected used percent): an ordinary reading
+        // and a fully spent one, so remaining is converted to used both ways.
+        for (remaining, limit, reset, used) in [
+            (80, 100, "2026-06-22T18:00:00Z", 20.0),
+            (0, 50, "2026-06-22T12:00:00Z", 100.0),
+        ] {
+            let headers = DoubaoHeaderSnapshot {
+                remaining_requests: Some(remaining),
+                limit_requests: Some(limit),
+                reset_requests: Some(reset.to_string()),
+            };
+            let usage = normalize_usage(&headers).unwrap();
+            let primary = usage.primary.unwrap();
+            assert_eq!(primary.used_percent, used, "{remaining}/{limit}");
+            assert_eq!(primary.resets_at.as_deref(), Some(reset));
+            assert_eq!(primary.window_minutes, None);
+        }
     }
 
     #[test]
@@ -830,9 +795,11 @@ mod tests {
 
     #[test]
     fn probe_body_matches_codexbar() {
-        let body = probe_body("doubao-seed-2.0-code");
+        // A model name unlike the default, so a body that ignored its argument
+        // and hard-coded the default model would fail here.
+        let body = probe_body("probe-model-under-test");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["model"], "doubao-seed-2.0-code");
+        assert_eq!(json["model"], "probe-model-under-test");
         assert_eq!(json["max_tokens"], 1);
         assert_eq!(json["messages"][0]["content"], "hi");
     }
