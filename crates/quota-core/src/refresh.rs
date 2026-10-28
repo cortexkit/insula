@@ -521,6 +521,7 @@ fn healthy_entry(
     ProviderUsage {
         provider: provider_name.to_string(),
         api_provider: None,
+        credential_ref: None,
         account: observation.and_then(|value| value.account_id.clone()),
         source,
         account_info: account_info.filter(|info| !info.is_empty()),

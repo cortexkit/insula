@@ -1541,7 +1541,18 @@ and image generations publishes:
 | `account` | the account id this module **verified** for the fetch; absent when unverified or when the provider exposes no identity |
 | `accountInfo` | optional `email`, `orgName`, `planType`, and for Claude `subscriptionRenewsAt` / `subscriptionEndsAt`; descriptive only |
 | `source` | the lane that produced the reading ([8.2](#82-source-says-how-a-reading-was-obtained)) |
+| `credentialRef` | the vault record id the reading was fetched with (`apikey:opencode-go`, `oauth:anthropic:<label>`); absent for every non-vault lane |
 | `savedResets` | banked quota-reset credits held by this account |
+
+**`credentialRef` is not an identity either.** It names the stored credential,
+not the account behind it, so never join it to `account` or to the vault's
+account id. It exists for entries with no `account`: a bare API key carries no
+identity, so a consumer keeping per-lane history keys such an entry by
+`(provider, credentialRef)`, and a second key for the same provider shows up as
+a second lane instead of merging into the first. On an account read through two
+lanes, it names the lane whose reading won. The label was chosen when the
+credential was stored and can read like a nickname, so a redacting renderer
+hides it.
 
 **`accountInfo` is not an identity.** Nothing in this module derives behaviour
 from it, and `planType` is the upstream's own label, not comparable across
@@ -1947,6 +1958,7 @@ fields are provider-scoped:
 | `account` | account | the credential's account id |
 | `accountInfo` | account | that account's email, org, plan, optional subscription dates |
 | `source` | lane | set per credential lane, and the lane serving one account can change between polls |
+| `credentialRef` | lane | the vault record of the lane that served this entry |
 | `fetchedAt` | account | that slot's own last success |
 | `savedResets` | account | reset credits are granted to **one** account |
 | `usage` (incl. `rawUsedPercent`) | account | measured against that account's own limits |

@@ -333,6 +333,17 @@ fn staleness_disclosure(slot: &ProviderSlot) -> Option<cortexkit_provider_usage:
         })
 }
 
+/// The vault record a published entry was read with, so a consumer can key an
+/// entry that has no account (a bare API key) by `(provider, credential_ref)`.
+/// It is the record id the vault itself uses, never an account identity, and is
+/// absent for every non-vault lane (local files, environment variables, the
+/// editor probe, the plugin sidebar).
+fn credential_ref(key: &SlotKey) -> Option<String> {
+    key.handle
+        .is_vault()
+        .then(|| key.handle.stable_id().to_string())
+}
+
 fn relax_usage_for_read(entry: &mut ProviderUsage, slot: &ProviderSlot, read_now: Instant) {
     if !(slot.relax_eligible && slot.is_fresh(read_now)) {
         return;
@@ -1159,10 +1170,8 @@ impl Registry {
                         .is_some_and(|entry| entry.usage.is_some())
             });
             if ambiguous_capacity {
-                let primary = slots
-                    .iter()
-                    .filter(|(_, slot)| !slot.label_in_flux)
-                    .min_by(|(left_key, left_slot), (right_key, right_slot)| {
+                let primary = slots.iter().filter(|(_, slot)| !slot.label_in_flux).min_by(
+                    |(left_key, left_slot), (right_key, right_slot)| {
                         let rank = |slot: &ProviderSlot| {
                             let healthy = slot.entry.as_ref().is_some_and(|entry| {
                                 entry.error.is_none() && entry.usage.is_some()
@@ -1185,12 +1194,13 @@ impl Registry {
                                     .stable_id()
                                     .cmp(right_key.handle.stable_id())
                             })
-                    })
-                    .map(|(_, slot)| slot);
-                if let Some(primary) = primary {
+                    },
+                );
+                if let Some((primary_key, primary)) = primary {
                     if let Some(mut entry) = primary.entry.clone() {
                         entry.account = None;
                         entry.api_provider = api_provider_name(name).map(String::from);
+                        entry.credential_ref = credential_ref(primary_key);
                         relax_usage_for_read(&mut entry, primary, read_now);
                         out.push(entry);
                     }
@@ -1372,10 +1382,11 @@ impl Registry {
             let candidates_published: HashSet<String> = candidates.keys().cloned().collect();
             let mut selected: Vec<_> = candidates.into_iter().collect();
             selected.sort_by(|(_, (left, _)), (_, (right, _))| left.handle.sort_cmp(&right.handle));
-            for (account_id, (_, slot)) in selected {
+            for (account_id, (key, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
                     entry.api_provider = api_provider_name(name).map(String::from);
+                    entry.credential_ref = credential_ref(key);
                     relax_usage_for_read(&mut entry, slot, read_now);
                     out.push(entry);
                 }
@@ -1385,13 +1396,14 @@ impl Registry {
             // Emitting it keeps a dead handle reportable to an operator; the
             // alternative is a provider that renders perfectly while quietly
             // holding a credential that can never resolve again.
-            if let Some((_, slot)) = unidentified
+            if let Some((key, slot)) = unidentified
                 .into_iter()
                 .min_by(|(left, _), (right, _)| left.handle.sort_cmp(&right.handle))
             {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = None;
                     entry.api_provider = api_provider_name(name).map(String::from);
+                    entry.credential_ref = credential_ref(key);
                     out.push(entry);
                 }
             }

@@ -2807,6 +2807,60 @@ async fn no_provider_is_complete_before_the_first_turn() {
     );
 }
 
+/// A provider with one fixed handle whose readings carry no account identity.
+struct OneHandleProvider {
+    name: &'static str,
+    handle: CredentialHandle,
+}
+
+#[async_trait]
+impl UsageProvider for OneHandleProvider {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        Ok(vec![self.handle.clone()])
+    }
+
+    async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+        FetchAttempt::success(None, "vault", Usage::default())
+    }
+}
+
+/// An entry read from a vault record names that record in `credentialRef`, so
+/// a consumer can key an account-less entry by credential. Any other lane
+/// publishes none: a local file or env var is not a stored credential.
+#[tokio::test]
+async fn vault_entries_name_their_credential_and_local_entries_do_not() {
+    let registry = Registry::new(vec![
+        Box::new(OneHandleProvider {
+            name: "keyed",
+            handle: CredentialHandle::scoped("apikey:keyed", "apikey"),
+        }),
+        Box::new(OneHandleProvider {
+            name: "local",
+            handle: CredentialHandle::implicit(),
+        }),
+    ]);
+    tick(&registry).await;
+    let snapshot = registry.usage_snapshot(None).await;
+    let by_provider = |name: &str| {
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.provider == name)
+            .unwrap_or_else(|| panic!("{name} published no entry"))
+            .clone()
+    };
+    assert_eq!(
+        by_provider("keyed").credential_ref.as_deref(),
+        Some("apikey:keyed")
+    );
+    assert_eq!(by_provider("keyed").account, None);
+    assert_eq!(by_provider("local").credential_ref, None);
+}
+
 /// A provider whose enumeration always fails but names the handles it knows.
 struct PartlyKnownProvider {
     known: Vec<CredentialHandle>,
