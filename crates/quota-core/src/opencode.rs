@@ -1,4 +1,4 @@
-//! OpenCode subscription usage — session cookies + Next.js `_server` actions.
+//! OpenCode Zen — legacy subscription windows and migrated prepaid balance.
 //!
 //! Flow: the deposited `cookie:opencode.ai` header → workspace id via
 //! `_server` → subscription payload → parse `rollingUsage` + `weeklyUsage`.
@@ -21,12 +21,12 @@
 //! the same cookie jar was accepted by the console (`opencodego` read
 //! `/console/api/orgs` and `/console/api/go/status` through it). So a signed-out
 //! verdict from the workspaces call is checked against the console first: if
-//! the console lists a workspace, the account is published as moved (a Decode,
-//! the fix being ours), and only a console 401 -- or a console that cannot answer
-//! -- keeps the expired-session verdict. There is no console endpoint for Zen
-//! usage known here: CodexBar v0.65.0 has the same gap (no console lane for Zen
-//! usage), so a parity round should check whether
-//! upstream later reads Zen from the console, and port that instead.
+//! the console lists a workspace, its billing status can supply a prepaid PAYG
+//! balance. No balance keeps the moved-account diagnosis; no recurring console
+//! Zen usage window is inferred from money. The balance port is fixture-verified
+//! against CodexBar v0.82.0's OpenCodeGoZenBalanceFetcher/Parser and console tests,
+//! NOT live-verified: no prepaid Zen account or opencode.ai vault deposit was
+//! available on the porting host.
 
 use std::{sync::Arc, time::Duration};
 
@@ -38,7 +38,7 @@ use crate::{
     cookie_jar::CookieJar,
     env,
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{Amount, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 use crate::{
@@ -336,7 +336,7 @@ pub async fn fetch_console_workspace_id(
 /// can be driven against a loopback server in tests.
 ///
 /// `console_origin` is where to ask the console before publishing a signed-out
-/// verdict (see [`signed_out_verdict`]). `None` skips that check, for a caller
+/// verdict (see [`signed_out_workspace`]). `None` skips that check, for a caller
 /// that has already asked the console itself -- `opencodego` reads the console
 /// first and only reaches this call once the console has failed.
 pub(crate) async fn fetch_workspace_id_at(
@@ -345,6 +345,23 @@ pub(crate) async fn fetch_workspace_id_at(
     server_base: &str,
     console_origin: Option<&str>,
 ) -> Result<String, FetchError> {
+    match fetch_workspace_at(client, cookie, server_base, console_origin).await? {
+        Workspace::Legacy(id) => Ok(id),
+        Workspace::Console { no_balance, .. } => Err(no_balance),
+    }
+}
+
+enum Workspace {
+    Legacy(String),
+    Console { id: String, no_balance: FetchError },
+}
+
+async fn fetch_workspace_at(
+    client: &reqwest::Client,
+    cookie: &str,
+    server_base: &str,
+    console_origin: Option<&str>,
+) -> Result<Workspace, FetchError> {
     let get_url = server_get_url_at(server_base, WORKSPACES_SERVER_ID, None);
     let text = server_get(
         client,
@@ -354,7 +371,7 @@ pub(crate) async fn fetch_workspace_id_at(
     )
     .await?;
     if looks_signed_out(&text) {
-        return Err(signed_out_verdict(client, cookie, console_origin, "workspace fetch").await);
+        return signed_out_workspace(client, cookie, console_origin, "workspace fetch").await;
     }
     // Checked before the retry, for the same reason it is checked on the
     // subscription call: an empty result and a stated "there is nothing here"
@@ -379,7 +396,7 @@ pub(crate) async fn fetch_workspace_id_at(
             .map_err(|error| error.stage("workspaces POST"))?;
         let fallback = String::from_utf8_lossy(&body);
         if looks_signed_out(&fallback) {
-            return Err(signed_out_verdict(client, cookie, console_origin, "workspace POST").await);
+            return signed_out_workspace(client, cookie, console_origin, "workspace POST").await;
         }
         if is_explicit_null(&fallback) {
             return Err(FetchError::NoQuotaReported(
@@ -388,12 +405,15 @@ pub(crate) async fn fetch_workspace_id_at(
         }
         ids = parse_workspace_ids(&fallback);
     }
-    ids.into_iter().next().ok_or_else(|| {
-        FetchError::Decode("opencode: missing workspace id in _server response".to_string())
-    })
+    ids.into_iter()
+        .next()
+        .map(Workspace::Legacy)
+        .ok_or_else(|| {
+            FetchError::Decode("opencode: missing workspace id in _server response".to_string())
+        })
 }
 
-/// The error to publish when the workspaces call reads as signed out.
+/// Resolve a sign-in redirect without discarding an accepted console workspace.
 ///
 /// That reading is a substring match (`login` and friends), and for an account
 /// OpenCode has moved to its console the legacy call answers HTTP 200 with a
@@ -403,19 +423,19 @@ pub(crate) async fn fetch_workspace_id_at(
 /// So the console is asked first, with the same cookie:
 ///
 /// - it lists a workspace: the session is valid and the account is on the
-///   console, where this module cannot read Zen usage yet. Published as
-///   `Decode` because the missing piece is ours (a console port), and `Decode`
-///   is not counted as a stale login.
+///   console. Keep that id for the prepaid balance read, and retain the existing
+///   `Decode` diagnosis if billing supplies no balance. `Decode` is not counted
+///   as a stale login.
 /// - it answers 401: the session really is expired; the original verdict.
 /// - anything else (transport error, 5xx, unreadable body, empty list): we
 ///   cannot tell, so the original verdict stands. This check must never make a
 ///   genuinely expired session read as something else.
-async fn signed_out_verdict(
+async fn signed_out_workspace(
     client: &reqwest::Client,
     cookie: &str,
     console_origin: Option<&str>,
     stage: &str,
-) -> FetchError {
+) -> Result<Workspace, FetchError> {
     let original = FetchError::Unauthorized(format!("opencode session expired ({stage})"));
     let moved = || {
         FetchError::Decode(format!(
@@ -425,15 +445,83 @@ async fn signed_out_verdict(
         ))
     };
     let Some(origin) = console_origin else {
-        return original;
+        return Err(original);
     };
     match crate::opencodego::fetch_console_workspace_id(client, cookie, origin).await {
-        Ok(_) => moved(),
+        Ok(id) => Ok(Workspace::Console {
+            id,
+            no_balance: moved(),
+        }),
         // The console rejected the cookie too: a real expiry.
-        Err(FetchError::Unauthorized(_)) => original,
+        Err(FetchError::Unauthorized(_)) => Err(original),
         // The console could not answer, so it says nothing about the session.
-        Err(_) => original,
+        Err(_) => Err(original),
     }
+}
+
+/// The balance is a remainder, not a spend limit or a recurring allowance.
+/// Keep the console's eight decimal USD places exactly, including fractional
+/// cents; converting through a float would lose low digits on large balances.
+fn parse_console_balance(text: &str) -> Result<Option<Pool>, FetchError> {
+    let body: Value = serde_json::from_str(text)
+        .map_err(|_| FetchError::Decode("opencode: invalid console billing payload".to_string()))?;
+    if !body.is_object() {
+        return Err(FetchError::Decode(
+            "opencode: invalid console billing payload".to_string(),
+        ));
+    }
+    if body.get("billingMode").and_then(Value::as_str) != Some("prepaid")
+        || body.get("mode").and_then(Value::as_str) != Some("pay-as-you-go")
+    {
+        return Ok(None);
+    }
+    let Some(raw) = body.get("balanceMicroCents") else {
+        return Ok(None);
+    };
+    let minor = raw.as_str().and_then(|raw| {
+        let digits = raw.strip_prefix('-').unwrap_or(raw);
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| raw.parse::<i64>().ok())
+            .flatten()
+    });
+    let minor = minor.ok_or_else(|| {
+        FetchError::Decode("opencode: invalid console balanceMicroCents".to_string())
+    })?;
+    Ok(Some(Pool {
+        id: "prepaid_balance".to_string(),
+        label: "Prepaid balance".to_string(),
+        funding: PoolFunding::Purchased,
+        remaining: Some(Amount {
+            minor,
+            exponent: 8,
+            unit: "USD".to_string(),
+        }),
+        total: None,
+        basis: PoolBasis::Reported,
+        spendable: None,
+        resets_at: None,
+        expires_at: None,
+        unlimited: None,
+    }))
+}
+
+async fn fetch_console_balance(
+    client: &reqwest::Client,
+    cookie: &str,
+    origin: &str,
+    workspace_id: &str,
+) -> Result<Option<Pool>, FetchError> {
+    // Reuse Go's console status policy: only 401 proves rejection. In particular
+    // a billing outage after org discovery must never send a valid user to login.
+    let text = crate::opencodego::fetch_console_text(
+        client,
+        cookie,
+        &format!("{origin}/console/api/billing/status"),
+        Some(workspace_id),
+    )
+    .await
+    .map_err(|error| error.stage("console billing status"))?;
+    parse_console_balance(&text)
 }
 
 /// Fetch the billing payload for a workspace.
@@ -1005,15 +1093,32 @@ impl UsageProvider for OpenCodeProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let mut balance = None;
         let result: Result<ProviderUsage, FetchError> = async {
             let (cookie, source) = self.vault.cookie_for(handle).await?;
-            let workspace_id = fetch_workspace_id_at(
+            let workspace = fetch_workspace_at(
                 &self.http,
                 &cookie,
                 &self.server_base,
                 Some(&self.console_origin),
             )
             .await?;
+            let workspace_id = match workspace {
+                Workspace::Legacy(id) => id,
+                Workspace::Console { id, no_balance } => {
+                    balance = fetch_console_balance(&self.http, &cookie, &self.console_origin, &id)
+                        .await?;
+                    if balance.is_none() {
+                        return Err(no_balance);
+                    }
+                    return Ok(ProviderUsage::healthy(
+                        PROVIDER_NAME,
+                        None,
+                        source,
+                        Usage::default(),
+                    ));
+                }
+            };
             let text =
                 fetch_subscription_text_at(&self.http, &cookie, &workspace_id, &self.server_base)
                     .await?;
@@ -1022,7 +1127,11 @@ impl UsageProvider for OpenCodeProvider {
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
-        FetchAttempt::from_provider_usage(result)
+        let mut attempt = FetchAttempt::from_provider_usage(result);
+        if let Some(pool) = balance {
+            attempt.pools = Some(vec![pool]);
+        }
+        attempt
     }
 }
 
@@ -1576,9 +1685,27 @@ mod console_check_tests {
       "weeklyUsage": { "usagePercent": 10, "resetInSec": 86400 }
     }"#;
 
+    // CodexBar v0.82.0 Tests/CodexBarTests/OpenCodeGoConsoleBalanceTests.swift,
+    // billingStatus. Keep the unrelated available credit: it must never replace
+    // a missing or malformed prepaid balance. No live Zen deposit was available.
+    const BILLING_BODY: &str = concat!(
+        r#"{"billingMode":"prepaid","mode":"pay-as-you-go","balanceMicroCents":"1234567890","#,
+        r#""availableMicroCents":"9876543210","creditLimitMicroCents":null}"#,
+    );
+
     /// Serve every request with `respond(path_and_query)`, recording each one.
     async fn serve(
         respond: impl Fn(&str) -> (u16, &'static str) + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_request(move |request| {
+            let (status, body) = respond(request.split_whitespace().nth(1).unwrap_or("/"));
+            (status, body.to_string())
+        })
+        .await
+    }
+
+    async fn serve_request(
+        respond: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1594,7 +1721,7 @@ mod console_check_tests {
                 let request = crate::loopback::read_request(&mut stream).await;
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                 recorded.lock().unwrap().push(path.clone());
-                let (status, body) = respond(&path);
+                let (status, body) = respond(&request);
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -1653,6 +1780,9 @@ mod console_check_tests {
         let (base, requests) = serve(move |path| {
             if path == CONSOLE_WORKSPACES_PATH {
                 return (console_status, console_body);
+            }
+            if path == "/console/api/billing/status" {
+                return (200, r#"{"billingMode":"legacy","mode":"pay-as-you-go"}"#);
             }
             (200, MIGRATED_WORKSPACES_BODY)
         })
@@ -1727,6 +1857,184 @@ mod console_check_tests {
             seen.iter().any(|path| path == CONSOLE_WORKSPACES_PATH),
             "the console must have been asked: {seen:?}"
         );
+    }
+
+    async fn migrated_billing(status: u16, body: String) -> (FetchAttempt, Vec<String>) {
+        let (base, requests) = serve_request(move |request| {
+            let path = request.split_whitespace().nth(1).unwrap();
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains("cookie: auth=test; __host-console_session=synthetic\r\n"));
+            match path {
+                CONSOLE_WORKSPACES_PATH => {
+                    assert!(!headers.contains("x-org-id:"));
+                    // Org id fixture from v0.82.0 OpenCodeGoConsoleMigrationTests,
+                    // `console organization IDs preserve workspace scope`.
+                    (
+                        200,
+                        r#"[{"id":"org_TEST123"},{"id":"wrk_TEST456"}]"#.to_string(),
+                    )
+                }
+                "/console/api/billing/status" => {
+                    assert!(request.starts_with("GET "));
+                    assert!(headers.contains("x-org-id: org_test123\r\n"));
+                    assert!(headers.contains("accept: application/json\r\n"));
+                    (status, body.clone())
+                }
+                _ => (200, MIGRATED_WORKSPACES_BODY.to_string()),
+            }
+        })
+        .await;
+        let (provider, handle) = loopback_provider(&base);
+        let attempt = provider.fetch_handle(&handle).await;
+        let seen = requests.lock().unwrap().clone();
+        (attempt, seen)
+    }
+
+    #[tokio::test]
+    async fn migrated_prepaid_payg_serves_only_a_reported_usd_pool() {
+        let (attempt, seen) = migrated_billing(200, BILLING_BODY.to_string()).await;
+        let usage = attempt.usage.expect("balance serves the migrated entry");
+        assert_eq!(
+            usage,
+            Usage::default(),
+            "money must not invent rate windows"
+        );
+        let pools = attempt.pools.expect("prepaid balance");
+        assert_eq!(pools.len(), 1);
+        let pool = &pools[0];
+        assert_eq!(pool.funding, PoolFunding::Purchased);
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        assert_eq!(
+            pool.remaining,
+            Some(Amount {
+                minor: 1_234_567_890,
+                exponent: 8,
+                unit: "USD".to_string(),
+            })
+        );
+        assert_eq!(pool.total, None);
+        assert_eq!(pool.resets_at, None);
+        assert_eq!(pool.expires_at, None);
+        assert_eq!(pool.spendable, None);
+        assert_eq!(pool.unlimited, None);
+        assert_eq!(
+            seen.len(),
+            3,
+            "reuse the org discovery, with no legacy retry: {seen:?}"
+        );
+        assert_eq!(
+            seen[1..],
+            [CONSOLE_WORKSPACES_PATH, "/console/api/billing/status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_prepaid_payg_can_replace_the_moved_account_diagnosis() {
+        let (original, _) = signed_out_workspaces_with_console(200, WORKSPACES_BODY).await;
+        // Variants of CodexBar's billingStatus fixture, matching its unsupported
+        // modes and invoiceable tests; even an attached balance cannot fund PAYG.
+        for billing_mode in ["prepaid", "legacy", "seat", "credit", "future"] {
+            for mode in ["pay-as-you-go", "invoiceable", "future"] {
+                if billing_mode == "prepaid" && mode == "pay-as-you-go" {
+                    continue;
+                }
+                let body = BILLING_BODY
+                    .replace("prepaid", billing_mode)
+                    .replace("pay-as-you-go", mode);
+                let (attempt, _) = migrated_billing(200, body).await;
+                assert!(
+                    attempt.pools.is_none(),
+                    "{billing_mode}/{mode} is not prepaid PAYG"
+                );
+                assert_eq!(attempt.usage.unwrap_err().to_string(), original.to_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_balance_keeps_the_moved_account_diagnosis() {
+        let (original, _) = signed_out_workspaces_with_console(200, WORKSPACES_BODY).await;
+        let body = BILLING_BODY.replace(r#""balanceMicroCents":"1234567890","#, "");
+        let (attempt, _) = migrated_billing(200, body).await;
+        assert!(
+            attempt.pools.is_none(),
+            "available credit is not a prepaid balance"
+        );
+        assert_eq!(attempt.usage.unwrap_err().to_string(), original.to_string());
+    }
+
+    #[test]
+    fn console_balance_keeps_exact_micro_cent_scaling() {
+        // Zero/negative/fractional variants follow CodexBar's console balance
+        // tests. The large integer exceeds f64's exact range, guarding our exact
+        // money representation rather than repeating upstream's float arithmetic.
+        for (raw, minor) in [
+            ("0", 0),
+            ("-125000000", -125_000_000),
+            ("1234567890", 1_234_567_890),
+            ("2786781005", 2_786_781_005),
+            ("1", 1),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("-9223372036854775808", i64::MIN),
+        ] {
+            let body = BILLING_BODY.replace("1234567890", raw);
+            let amount = parse_console_balance(&body)
+                .unwrap()
+                .unwrap()
+                .remaining
+                .unwrap();
+            assert_eq!(
+                amount,
+                Amount {
+                    minor,
+                    exponent: 8,
+                    unit: "USD".to_string()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_console_balances_never_reject_an_accepted_session() {
+        for raw in [
+            "null",
+            "true",
+            "12",
+            r#""NaN""#,
+            r#""Infinity""#,
+            r#""1e999""#,
+            r#""1.5""#,
+            r#""+1""#,
+            r#"" 1""#,
+            r#""""#,
+            r#""9223372036854775808""#,
+        ] {
+            let body = BILLING_BODY.replace(r#""1234567890""#, raw);
+            let (attempt, _) = migrated_billing(200, body).await;
+            assert!(attempt.pools.is_none());
+            let error = attempt.usage.unwrap_err();
+            assert_eq!(error.error_class(), "decode_failed", "{raw}: {error}");
+        }
+        for body in ["invalid", "null", "<html>login</html>"] {
+            let (attempt, _) = migrated_billing(200, body.to_string()).await;
+            assert_eq!(attempt.usage.unwrap_err().error_class(), "decode_failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_billing_401_rejects_the_console_session() {
+        for (status, expected) in [
+            (401, "credential_rejected"),
+            (403, "upstream_failed"),
+            (500, "upstream_failed"),
+            (503, "upstream_failed"),
+        ] {
+            let (attempt, _) = migrated_billing(status, "unavailable".to_string()).await;
+            assert!(attempt.pools.is_none());
+            let error = attempt.usage.unwrap_err();
+            assert_eq!(error.error_class(), expected, "{status}: {error}");
+            assert!(error.to_string().contains("console billing status"));
+        }
     }
 
     /// A working account never pays for the console check.

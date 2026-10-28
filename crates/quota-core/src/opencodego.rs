@@ -159,7 +159,7 @@ impl Endpoints {
 /// console payload can mention login routes without saying anything about the
 /// session. Only the status line speaks, and only a 401 proves an expired
 /// session.
-async fn fetch_console_text(
+pub(crate) async fn fetch_console_text(
     client: &reqwest::Client,
     cookie: &str,
     url: &str,

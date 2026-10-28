@@ -2190,6 +2190,20 @@ match. Capture tools take the URL from this table:
   check URL above. The first API organization with readable billing is selected;
   `account` is its UUID and `accountInfo.orgName` its name. A billing 403 means
   this login lacks billing access, not that its session needs re-capturing.
+- **OpenCode Zen (`opencode`)**: shares the `cookie:opencode.ai[:<account>]`
+  deposit with Go, but publishes a different plan. Healthy legacy workspaces
+  keep their subscription windows and make no console calls. After a migrated
+  workspace redirects, the console's first workspace/org from `/console/api/orgs`
+  scopes `/console/api/billing/status` through `x-org-id`. Only
+  `billingMode: "prepaid"` and `mode: "pay-as-you-go"` with a readable string
+  `balanceMicroCents` serve a `prepaid_balance` pool: purchased USD,
+  `basis: "reported"`, exact integer money at exponent 8 (100,000,000 units per
+  USD), no total or reset, and no rate windows. This is remaining money, not a
+  recurring quota or spend limit. Other billing modes and a missing balance
+  keep the existing `decode_failed` moved-to-console diagnosis. A billing 401
+  is `credential_rejected`; billing 5xx/transport failures are transient and
+  malformed bodies or balances are `decode_failed`, never a reason to sign in
+  again. The balance port is fixture-verified only, not live-verified.
 - The login page can be any page where the user signs in; for factory it is
   `app.factory.ai` while the fetch is on `api.factory.ai`.
 - **traecn**: sign in at `https://www.trae.cn/dashboard`, then capture the
