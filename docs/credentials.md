@@ -154,12 +154,26 @@ provider's source state it.
 | `soniox` | | `SONIOX_ORG_API_KEY` (an organization key; `SONIOX_API_KEY`, a project key, is not read) |
 | `stepfun` | | `STEPFUN_TOKEN` |
 | `sub2api` | | `SUB2API_API_KEY`, `SUB2API_BASE_URL` |
-| `synthetic` | | `SYNTHETIC_API_KEY` |
+| `synthetic` | OpenCode's `synthetic` entry | `SYNTHETIC_API_KEY` |
 | `vercel` | | `AI_GATEWAY_API_KEY` |
 | `vercel-budget` | | `VERCEL_ACCESS_TOKEN` with `VERCEL_TEAM_ID`; the token alone is `credential_unusable` |
 | `warp` | | `WARP_API_KEY`, `WARP_TOKEN` |
 | `zai` | | `Z_AI_API_KEY` |
 | `zenmux` | | `ZENMUX_MANAGEMENT_API_KEY` |
+
+OpenCode entries are read from the `credential` table in OpenCode 2's
+`~/.local/share/opencode/opencode.db` and from OpenCode 1's `auth.json` beside it
+(`$XDG_DATA_HOME/opencode/` when set). The database is opened read-only, in place;
+it is never copied or written. Rows explicitly marked inactive (`active = 0`)
+are excluded; NULL is live. For each provider's integration ID, the newest
+`time_updated` row is considered. When both stores have OAuth credentials, the
+later `expires` wins. If either expiry is missing, or for API keys, the database
+row's `time_updated` is compared with `auth.json`'s modification time. An
+unavailable database is reported as a local source problem, not an absent
+credential; a valid `auth.json` entry can still be used, with a warning logged
+once. Tokens are never refreshed, because refresh-token rotation would disrupt
+OpenCode's session. An expired-looking access token is still tried: its recorded
+expiry need not match the server's actual validity window.
 
 The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `qoder`,
 `qwen-cloud` and `traecn` have no local lane: without a vault deposit they are not
