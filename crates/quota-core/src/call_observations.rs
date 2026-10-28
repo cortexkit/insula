@@ -113,6 +113,9 @@ impl Registry {
         if windows.primary.is_none() && windows.secondary.is_none() {
             return Err("no_usable_window");
         }
+        if eligible.iter().any(|(_, slot)| regresses(slot, &windows)) {
+            return Err("window_regressed");
+        }
         for (key, prev) in eligible {
             let mut next = prev.clone();
             let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();
@@ -143,6 +146,49 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+/// Whether a forwarded reading reports less use than the held reading for a
+/// window whose reset hasn't moved.
+///
+/// Use within one window period only grows, so a fall beyond rounding with the
+/// same reset time can't be real. Anthropic does send such readings: on
+/// 2026-10-22 one account's responses alternated, within seconds and within one
+/// run, between its real weekly figure (61%) and a reply with the weekly and
+/// 5-hour counters at 0 and the weekly reset unchanged, apparently from a
+/// replica that had lost the count. Applying those made the account flap
+/// between exhausted and empty. The whole observation is refused, because its
+/// other windows came from the same bad reply.
+///
+/// The 1-point allowance covers rounding: forwarded headers carry two decimals
+/// and the usage endpoint whole percents. Resets compare to the minute, because
+/// the endpoint sends sub-second resets and the headers whole seconds. A genuine
+/// early reset that keeps its reset time would be refused here too, but only
+/// until insula's own poll of the usage endpoint, which this check never blocks.
+fn regresses(slot: &refresh::ProviderSlot, update: &crate::model::Usage) -> bool {
+    let Some(held) = slot.entry.as_ref().and_then(|e| e.usage.as_ref()) else {
+        return false;
+    };
+    let same_reset = |a: &Option<String>, b: &Option<String>| {
+        let parse = |s: &Option<String>| {
+            s.as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.timestamp())
+        };
+        matches!((parse(a), parse(b)), (Some(a), Some(b)) if (a - b).abs() < 60)
+    };
+    [
+        (&held.primary, &update.primary),
+        (&held.secondary, &update.secondary),
+    ]
+    .into_iter()
+    .any(|(held, update)| match (held, update) {
+        (Some(held), Some(update)) => {
+            same_reset(&held.resets_at, &update.resets_at)
+                && update.used_percent < held.used_percent - 1.0
+        }
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -300,6 +346,42 @@ mod tests {
         assert_eq!(after["usage"]["primary"]["usedPercent"], 21.0);
         assert_eq!(registry.drop_page(None).await.drops.len(), 1);
         assert_eq!(registry.call_observation_metrics().applied, 1);
+    }
+
+    /// The reply Anthropic sent on 2026-10-22 alongside the real one: weekly and
+    /// 5-hour at 0, the weekly reset unchanged, the 5-hour reset later.
+    fn zeroed_replica(at: i64, weekly_reset: &str) -> Value {
+        let mut headers = headers();
+        for (key, value) in [
+            ("7d-utilization", "0.0"),
+            ("7d-reset", weekly_reset),
+            ("5h-utilization", "0.0"),
+            ("5h-reset", "1790396400"),
+        ] {
+            headers.insert(format!("anthropic-ratelimit-unified-{key}"), value.into());
+        }
+        json!({"provider":"claude", "account":"a", "observedAtMs":at, "headers":headers})
+    }
+
+    #[tokio::test]
+    async fn a_weekly_drop_with_an_unchanged_reset_is_refused_and_a_new_period_is_not() {
+        let registry = registry().await;
+        assert_eq!(registry.observe_calls(vec![observation(STAMP)]).accepted, 1);
+        let held = serde_json::to_value(registry.get_usage(None).await).unwrap();
+        let result = registry.observe_calls(vec![zeroed_replica(STAMP + 1000, "1790740800")]);
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.ignored[0].reason, "window_regressed");
+        assert_eq!(
+            serde_json::to_value(registry.get_usage(None).await).unwrap(),
+            held,
+            "a refused reading must change nothing"
+        );
+        // A new weekly period (the reset moved) may start at 0.
+        let result = registry.observe_calls(vec![zeroed_replica(STAMP + 2000, "1791345600")]);
+        assert_eq!(result.accepted, 1);
+        let after = registry.get_usage(None).await;
+        let weekly = after[0].usage.as_ref().unwrap().secondary.as_ref().unwrap();
+        assert_eq!(weekly.used_percent, 0.0);
     }
 
     #[tokio::test]

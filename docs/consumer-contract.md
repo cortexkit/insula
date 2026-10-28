@@ -356,6 +356,7 @@ Reply: `{"result":{"accepted":1,"ignored":[]}}`. Each ignored row names its
 | `no_poll_reading_yet` | the account has no usable successful poll inventory yet |
 | `older_than_held` | value time is older than or equal to the held reading |
 | `no_usable_window` | neither utilization header is a finite number |
+| `window_regressed` | a window reports more than 1 point less use than insula holds while its reset time is unchanged, which can't happen within one period; Anthropic has sent such zeroed replies interleaved with real ones |
 | `invalid_observation` | row shape or timestamp cannot be decoded |
 
 Only usable `5h-utilization` and `7d-utilization` update their matching windows,
