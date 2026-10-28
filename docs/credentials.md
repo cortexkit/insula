@@ -127,7 +127,7 @@ provider's source state it.
 |---|---|---|
 | `abliteration` | | `ABLITERATION_API_KEY` |
 | `alibaba` | | `ALIBABA_CODING_PLAN_API_KEY`, `ALIBABA_QWEN_API_KEY`, `DASHSCOPE_API_KEY` |
-| `antigravity` | the running editor or `agy` CLI (loopback); the opencode antigravity-auth plugin's sidebar file | `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE` |
+| `antigravity` | the running editor or `agy` CLI (loopback); the antigravity-auth plugin's sidebar file under OpenCode 1 only (OpenCode 2 hosts use the vault lane) | `ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE` |
 | `chatbox` | | `CHATBOX_LICENSE_KEY` |
 | `claude` | OpenCode's `anthropic` OAuth entry | |
 | `clinepass` | | `CLINE_API_KEY`, `CLINEPASS_API_KEY` |
@@ -161,7 +161,14 @@ provider's source state it.
 | `zai` | | `Z_AI_API_KEY` |
 | `zenmux` | | `ZENMUX_MANAGEMENT_API_KEY` |
 
-OpenCode entries are read from the `credential` table in OpenCode 2's
+The Antigravity plugin sidebar is an OpenCode 1-only source. OpenCode 2 does
+not write this file or provide equivalent sidebar state for other applications;
+OpenCode 2 hosts read Antigravity through the vault lane (`antigravity:google`). A sidebar roster
+whose newest quota `checkedAt` is over 24 hours old, or has no readable quota
+timestamp, is ignored. The 24-hour age applies to the roster; an individual
+cached quota observation is ignored once it is more than one hour old.
+
+Other OpenCode entries are read from the `credential` table in OpenCode 2's
 `~/.local/share/opencode/opencode.db` and from OpenCode 1's `auth.json` beside it
 (`$XDG_DATA_HOME/opencode/` when set). The database is opened read-only, in place;
 it is never copied or written. Rows explicitly marked inactive (`active = 0`)
