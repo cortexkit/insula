@@ -1,23 +1,25 @@
-//! Reader for opencode's unified auth store (`~/.local/share/opencode/auth.json`).
+//! Reader for OpenCode's credential stores in `~/.local/share/opencode/`.
 //!
 //! Unlike CodexBar — which reaches each provider's own native credential store
 //! (macOS Keychain for Claude, bespoke CLI files, browser cookies) — this module
 //! runs inside the CortexKit/opencode ecosystem, where opencode already holds
-//! OAuth tokens and API keys for many providers in ONE cross-platform JSON file.
+//! OAuth tokens and API keys for many providers in cross-platform stores.
 //! Preferring it (where it carries the provider) avoids the macOS-only Keychain
 //! path and collapses several providers into a single session archetype.
 //!
-//! The file shape is `{ "<provider>": { "type": "oauth"|"api", ... } }`. For an
-//! `oauth` entry we read `access` (+ `refresh`/`expires` for future refresh); for
-//! an `api` entry we read `key`.
+//! OpenCode 2 stores live credentials in `opencode.db`'s `credential` table;
+//! OpenCode 1 uses `auth.json`. Both use the same credential JSON shape. We
+//! compare freshness when both hold a provider, without ever refreshing tokens:
+//! using a rotating refresh token would invalidate OpenCode's own session.
 
 use std::path::PathBuf;
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 
 use crate::provider::FetchError;
 
-/// One provider's credential entry in opencode's auth.json.
+/// One provider's credential entry in either OpenCode store.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum OpencodeAuth {
@@ -88,9 +90,14 @@ pub(crate) fn auth_path_from(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString> + Copy,
 ) -> Option<PathBuf> {
     if let Some(xdg) = lookup("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("opencode/auth.json"));
+        return Some(PathBuf::from(xdg).join("opencode").join("auth.json"));
     }
-    crate::env::home_dir_from(lookup).map(|home| home.join(".local/share/opencode/auth.json"))
+    crate::env::home_dir_from(lookup).map(|home| {
+        home.join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json")
+    })
 }
 
 /// Classify a resolved-or-not auth path, so the refusal is testable apart from
@@ -105,35 +112,14 @@ pub(crate) fn path_or_refusal(path: Option<PathBuf>) -> Result<PathBuf, FetchErr
     })
 }
 
-/// Read one provider's credential entry from opencode's auth.json.
+/// Read one provider's freshest credential from OpenCode's local stores.
 ///
-/// `Ok(None)` means nothing is configured: no auth file, or no entry for this
-/// provider. `Err` means the file is there and could not be used -- no
-/// permission, a directory in its place, an I/O error, or contents that will not
-/// parse.
-///
-/// The error type is [`FetchError`] rather than a string because the callers
-/// were each choosing a class for it, and both chose `NoSession` -- so an
-/// unreadable auth file reached the wire as `credential_absent`, the class that
-/// tells a consumer the account was never configured and lets an operator
-/// surface leave it out of the count it watches. Classifying here means a new
-/// caller cannot make that choice again.
+/// `Ok(None)` means neither store has this provider. An unavailable database is
+/// `LocalSourceUnavailable`, not an absent credential. A usable entry in the
+/// other store can still be used if one store fails.
 pub fn read_provider(provider: &str) -> Result<Option<OpencodeAuth>, FetchError> {
-    // NOT `Ok(None)` when the path does not resolve. `auth_path` returns None
-    // when the HOME DIRECTORY cannot be resolved -- neither `XDG_DATA_HOME` nor
-    // any home variable is set -- which says nothing about whether a credential
-    // exists. The file was never looked for.
-    //
-    // This is the defect the paragraph above records, surviving on the sibling
-    // path of the same function: that fix moved classification here so a caller
-    // could not choose `NoSession` for an unreadable file, and left the
-    // unresolvable-path arm returning the value that MEANS "nothing is
-    // configured". Reported on insula#18.
-    //
-    // `LocalSourceUnavailable` rather than a credential class, because the
-    // subject is this machine's environment rather than the account: the remedy
-    // is fixing the process environment, the same shape as the macOS
-    // profile-permission denial that already uses it.
+    // An unresolved home means we could not look, not that no credential exists.
+    // The remedy is fixing the process environment, not signing in again.
     let path = path_or_refusal(auth_path())?;
     read_provider_at(&path, provider)
 }
@@ -144,6 +130,112 @@ pub fn read_provider(provider: &str) -> Result<Option<OpencodeAuth>, FetchError>
 /// can point at a deliberately unreadable file instead of altering the real auth
 /// store to reach that branch.
 fn read_provider_at(
+    path: &std::path::Path,
+    provider: &str,
+) -> Result<Option<OpencodeAuth>, FetchError> {
+    let database = read_database_provider_at(&path.with_file_name("opencode.db"), provider);
+    if let Err(error) = &database {
+        warn_database_once(error);
+    }
+    let json = read_json_provider_at(path, provider);
+    match (database, json) {
+        (Ok(Some(database)), Ok(Some(json))) => {
+            let database_is_newer = match (&database.auth, &json) {
+                (
+                    OpencodeAuth::Oauth {
+                        expires: Some(db_expires),
+                        ..
+                    },
+                    OpencodeAuth::Oauth {
+                        expires: Some(json_expires),
+                        ..
+                    },
+                ) if db_expires != json_expires => db_expires > json_expires,
+                _ => database.updated_ms >= json_modified_ms(path)?,
+            };
+            Ok(Some(if database_is_newer {
+                database.auth
+            } else {
+                json
+            }))
+        }
+        (Err(_), Ok(Some(json))) => Ok(Some(json)),
+        (Ok(Some(database)), _) => Ok(Some(database.auth)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(None), json) => json,
+    }
+}
+
+struct DatabaseCredential {
+    auth: OpencodeAuth,
+    updated_ms: i64,
+}
+
+fn read_database_provider_at(
+    path: &std::path::Path,
+    provider: &str,
+) -> Result<Option<DatabaseCredential>, FetchError> {
+    let unavailable = |error| {
+        FetchError::LocalSourceUnavailable(format!("reading OpenCode opencode.db: {error}"))
+    };
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
+    }
+
+    // Do not use SQLite's immutable mode: OpenCode keeps writing to the WAL,
+    // and ignoring it could return an older credential from the main database.
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT value, time_updated FROM credential
+             WHERE integration_id = ?1 AND (active IS NULL OR active <> 0)
+             ORDER BY time_updated DESC LIMIT 1",
+            [provider],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| unavailable(error.to_string()))?;
+    row.map(|(value, updated_ms)| {
+        let auth = serde_json::from_str(&value)
+            .map_err(|error| unavailable(format!("credential entry not decodable: {error}")))?;
+        Ok(DatabaseCredential { auth, updated_ms })
+    })
+    .transpose()
+}
+
+fn json_modified_ms(path: &std::path::Path) -> Result<i64, FetchError> {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| {
+            FetchError::CredentialUnusable(format!(
+                "reading the opencode auth store timestamp: {error}"
+            ))
+        })?;
+    let elapsed = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            FetchError::CredentialUnusable(format!(
+                "opencode auth store timestamp before epoch: {error}"
+            ))
+        })?;
+    i64::try_from(elapsed.as_millis()).map_err(|error| {
+        FetchError::CredentialUnusable(format!(
+            "opencode auth store timestamp out of range: {error}"
+        ))
+    })
+}
+
+fn warn_database_once(error: &FetchError) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("[insula] warning: {error}; trying OpenCode auth.json instead");
+    });
+}
+
+fn read_json_provider_at(
     path: &std::path::Path,
     provider: &str,
 ) -> Result<Option<OpencodeAuth>, FetchError> {
@@ -228,6 +320,326 @@ mod tests {
     }
 
     use super::*;
+
+    fn fixture(label: &str) -> crate::tests::ResetTempDir {
+        crate::tests::ResetTempDir::with_prefix("insula-opencode-auth", label)
+    }
+
+    fn create_database(dir: &std::path::Path) -> Connection {
+        let connection = Connection::open(dir.join("opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE credential (
+                    id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,
+                    value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn insert_credential(
+        connection: &Connection,
+        provider: &str,
+        active: Option<i64>,
+        updated_ms: i64,
+        value: serde_json::Value,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO credential
+                 (id, integration_id, label, value, active, time_created, time_updated)
+                 VALUES (?1, ?2, 'fixture', ?3, ?4, ?5, ?5)",
+                rusqlite::params![
+                    format!("{provider}-{updated_ms}"),
+                    provider,
+                    value.to_string(),
+                    active,
+                    updated_ms,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn oauth(access: &str, expires: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "oauth", "methodID": "fixture", "access": access,
+            "refresh": "must-not-be-used", "expires": expires,
+        })
+    }
+
+    fn write_json(dir: &std::path::Path, value: serde_json::Value) -> i64 {
+        let path = dir.join("auth.json");
+        std::fs::write(&path, serde_json::json!({"anthropic": value}).to_string()).unwrap();
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    fn token_at(dir: &std::path::Path) -> String {
+        match read_provider_at(&dir.join("auth.json"), "anthropic")
+            .unwrap()
+            .unwrap()
+        {
+            OpencodeAuth::Oauth { access, .. } => access,
+            OpencodeAuth::Api { key } => key,
+        }
+    }
+
+    #[test]
+    fn database_only_reads_live_credential() {
+        let dir = fixture("database-only");
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            10,
+            oauth("database", Some(20)),
+        );
+        drop(connection);
+
+        assert_eq!(token_at(dir.path()), "database");
+        assert!(read_provider_at(&dir.path().join("auth.json"), "openai")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn auth_json_only_keeps_opencode_one_working() {
+        let dir = fixture("json-only");
+        write_json(dir.path(), oauth("json", Some(10)));
+        assert_eq!(token_at(dir.path()), "json");
+        assert!(!dir.path().join("opencode.db").exists());
+    }
+
+    #[test]
+    fn database_newer_oauth_expiry_wins() {
+        let dir = fixture("database-newer-expiry");
+        write_json(dir.path(), oauth("stale-json", Some(10)));
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            1,
+            oauth("fresh-database", Some(20)),
+        );
+
+        // Both recorded expiries are in the past, and the JSON file's mtime is
+        // newer. Expiry still decides freshness, without suppressing the token.
+        assert_eq!(token_at(dir.path()), "fresh-database");
+    }
+
+    #[test]
+    fn auth_json_newer_oauth_expiry_wins() {
+        let dir = fixture("json-newer-expiry");
+        let mtime = write_json(dir.path(), oauth("fresh-json", Some(20)));
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            mtime + 60_000,
+            oauth("stale-database", Some(10)),
+        );
+        assert_eq!(token_at(dir.path()), "fresh-json");
+    }
+
+    #[test]
+    fn active_null_is_live_and_zero_is_excluded() {
+        let dir = fixture("active");
+        let connection = create_database(dir.path());
+        insert_credential(&connection, "anthropic", None, 10, oauth("live", Some(10)));
+        insert_credential(
+            &connection,
+            "anthropic",
+            Some(0),
+            20,
+            oauth("inactive", Some(20)),
+        );
+        insert_credential(
+            &connection,
+            "openai",
+            Some(1),
+            30,
+            oauth("other-provider", Some(30)),
+        );
+        assert_eq!(token_at(dir.path()), "live");
+
+        connection
+            .execute("DELETE FROM credential WHERE active IS NULL", [])
+            .unwrap();
+        assert!(read_provider_at(&dir.path().join("auth.json"), "anthropic")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn newest_database_row_wins_before_comparing_sources() {
+        let dir = fixture("newest-row");
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            Some(1),
+            10,
+            oauth("old-row", Some(200)),
+        );
+        insert_credential(
+            &connection,
+            "anthropic",
+            Some(1),
+            20,
+            oauth("new-row", Some(100)),
+        );
+        assert_eq!(token_at(dir.path()), "new-row");
+    }
+
+    #[test]
+    fn api_keys_are_compared_by_timestamp() {
+        let dir = fixture("api-timestamp");
+        let mtime = write_json(
+            dir.path(),
+            serde_json::json!({"type": "api", "key": "json-key"}),
+        );
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            mtime + 60_000,
+            serde_json::json!({"type": "api", "key": "database-key"}),
+        );
+        assert_eq!(token_at(dir.path()), "database-key");
+
+        connection
+            .execute("UPDATE credential SET time_updated = ?1", [mtime - 60_000])
+            .unwrap();
+        assert_eq!(token_at(dir.path()), "json-key");
+    }
+
+    #[test]
+    fn missing_oauth_expiry_falls_back_to_timestamp() {
+        let dir = fixture("missing-expiry");
+        let connection = create_database(dir.path());
+        for (db_expires, json_expires) in [(None, Some(20)), (Some(20), None), (None, None)] {
+            connection.execute("DELETE FROM credential", []).unwrap();
+            let mtime = write_json(dir.path(), oauth("json", json_expires));
+            insert_credential(
+                &connection,
+                "anthropic",
+                None,
+                mtime + 60_000,
+                oauth("database", db_expires),
+            );
+            assert_eq!(token_at(dir.path()), "database");
+            connection
+                .execute("UPDATE credential SET time_updated = ?1", [mtime - 60_000])
+                .unwrap();
+            assert_eq!(token_at(dir.path()), "json");
+        }
+    }
+
+    #[test]
+    fn unreadable_database_falls_back_without_becoming_absent() {
+        for label in ["directory", "corrupt", "missing-table"] {
+            let dir = fixture(label);
+            let db_path = dir.path().join("opencode.db");
+            match label {
+                "directory" => std::fs::create_dir(&db_path).unwrap(),
+                "corrupt" => std::fs::write(&db_path, b"not a SQLite database").unwrap(),
+                _ => drop(Connection::open(&db_path).unwrap()),
+            }
+            write_json(dir.path(), oauth("json-fallback", Some(10)));
+            assert_eq!(token_at(dir.path()), "json-fallback");
+
+            std::fs::remove_file(dir.path().join("auth.json")).unwrap();
+            let error = read_provider_at(&dir.path().join("auth.json"), "anthropic")
+                .expect_err("a broken database is unavailable, not absent");
+            assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
+            assert!(error.to_string().contains("opencode.db"));
+        }
+    }
+
+    #[test]
+    fn database_only_read_leaves_bytes_and_mtime_unchanged() {
+        let dir = fixture("read-only");
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            10,
+            oauth("database", Some(20)),
+        );
+        drop(connection);
+        let path = dir.path().join("opencode.db");
+        let bytes_before = std::fs::read(&path).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(token_at(dir.path()), "database");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+    }
+
+    #[test]
+    fn reads_current_credentials_from_live_wal() {
+        let dir = fixture("wal");
+        let connection = create_database(dir.path());
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            10,
+            oauth("before-wal", Some(10)),
+        );
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            20,
+            oauth("in-wal", Some(20)),
+        );
+        assert!(dir.path().join("opencode.db-wal").exists());
+
+        // The writer stays open so the fresh row has not been checkpointed into
+        // the main database; a reader ignoring the WAL would see the old row.
+        assert_eq!(token_at(dir.path()), "in-wal");
+    }
+
+    #[test]
+    fn injected_xdg_path_keeps_database_beside_auth_json() {
+        let dir = fixture("xdg");
+        let path = auth_path_from(|name| {
+            (name == "XDG_DATA_HOME").then(|| dir.path().as_os_str().to_owned())
+        })
+        .unwrap();
+        let data_dir = dir.path().join("opencode");
+        assert_eq!(path, data_dir.join("auth.json"));
+        std::fs::create_dir(&data_dir).unwrap();
+        let connection = create_database(&data_dir);
+        insert_credential(
+            &connection,
+            "anthropic",
+            None,
+            10,
+            oauth("xdg-database", Some(20)),
+        );
+        assert!(matches!(read_provider_at(&path, "anthropic").unwrap(),
+            Some(OpencodeAuth::Oauth { access, .. }) if access == "xdg-database"));
+    }
 
     #[test]
     fn reads_oauth_entry() {
