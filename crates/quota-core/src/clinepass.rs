@@ -1,4 +1,5 @@
-//! ClinePass usage fetcher — credential from environment variables.
+//! ClinePass usage fetcher — credential from vault `apikey:cline-pass` or
+//! `CLINE_API_KEY` / `CLINEPASS_API_KEY` environment variables.
 //!
 //! Endpoint: `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`
 //!
@@ -19,10 +20,14 @@
 //! tagged path is still openable while a bare one sends a reader hunting.
 //! Flagged by scripts/parity-citations.py.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
+use crate::credential_source::CredentialSource;
+use crate::provider::{CredentialHandle, FetchAttempt, HandlesError};
+use crate::vault_handles::VaultHandleLoader;
 use crate::{
     env,
     http::JsonRequest,
@@ -159,21 +164,96 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
 
 /// The ClinePass usage provider.
 pub struct ClinePassProvider {
+    url: String,
     http: reqwest::Client,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
 }
 
 impl ClinePassProvider {
     pub fn new() -> Self {
+        Self::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()))
+    }
+
+    pub(crate) fn new_with_handle_loader(
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
+    ) -> Self {
         Self {
+            url: "https://api.cline.bot/api/v1/users/me/plan/usage-limits".to_string(),
             http: crate::http::provider_client(),
+            credential_source,
+            handle_loader,
+        }
+    }
+
+    async fn read(&self, api_key: &str, vault: bool) -> Result<Usage, FetchError> {
+        let request = JsonRequest::get(&self.url).bearer(api_key);
+        // Keep the status on the vault lane so only a 401 retires the served key.
+        // The environment lane retains the shared transport's existing mapping.
+        let body = if vault {
+            request
+                .send_provider_status_first(&self.http, PROVIDER_NAME)
+                .await?
+                .body
+        } else {
+            request.send(&self.http).await?
+        };
+        normalize_usage(&body)
+    }
+
+    async fn fetch_vault(&self, handle: &CredentialHandle) -> FetchAttempt {
+        let Some(credential_source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(
+                crate::credential_source::VaultGetError::Permanent,
+            );
+        };
+        let mut credential = match crate::credential_source::get_vault_credential(
+            credential_source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let record_version = credential.record_version;
+        let key = match crate::credential_source::take_utf8_payload(&mut credential.payload) {
+            Ok(key) => clean_key(key),
+            Err(error) => return FetchAttempt::failure(None, Some("vault".to_string()), error),
+        };
+        let Some(key) = key else {
+            return FetchAttempt::failure(
+                None,
+                Some("vault".to_string()),
+                FetchError::CredentialUnusable(
+                    "the apikey:cline-pass deposit holds no API key".to_string(),
+                ),
+            );
+        };
+        match self.read(&key, true).await {
+            Ok(usage) => FetchAttempt::success(None, "vault", usage),
+            Err(error) => {
+                crate::credential_source::report_vault_auth_failure(
+                    Some(credential_source),
+                    handle,
+                    record_version,
+                    &error,
+                );
+                FetchAttempt::failure(None, Some("vault".to_string()), error)
+            }
         }
     }
 
     async fn fetch_handle_from(
         &self,
-        _handle: &CredentialHandle,
+        handle: &CredentialHandle,
         lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> FetchAttempt {
+        if handle.is_vault() {
+            return self.fetch_vault(handle).await;
+        }
         let result: Result<ProviderUsage, FetchError> = async {
             let raw_key = env::first_env_from(API_KEY_ENV, lookup)
                 .ok_or_else(|| FetchError::NoSession(format!("none of {API_KEY_ENV:?} is set")))?;
@@ -182,12 +262,7 @@ impl ClinePassProvider {
                 FetchError::CredentialUnusable("ClinePass API key is empty".to_string())
             })?;
 
-            let body = JsonRequest::get("https://api.cline.bot/api/v1/users/me/plan/usage-limits")
-                .bearer(&api_key)
-                .send(&self.http)
-                .await?;
-
-            let usage = normalize_usage(&body)?;
+            let usage = self.read(&api_key, false).await?;
             Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
         }
         .await;
@@ -207,6 +282,18 @@ impl UsageProvider for ClinePassProvider {
         PROVIDER_NAME
     }
 
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        if self.credential_source.is_some() {
+            let vault = self.handle_loader.clinepass_handles()?;
+            if !vault.is_empty() {
+                // The key carries no account identity, so a parallel environment
+                // lane could overwrite the vault reading as the same account.
+                return Ok(vault);
+            }
+        }
+        Ok(vec![CredentialHandle::implicit()])
+    }
+
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         self.fetch_handle_from(handle, |key| std::env::var_os(key))
             .await
@@ -216,6 +303,122 @@ impl UsageProvider for ClinePassProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vercel::testkit::{credential, routes, Log, MockSource};
+
+    const LIMITS: &str =
+        r#"{"success":true,"data":{"limits":[{"type":"weekly","percentUsed":42.0}]}}"#;
+
+    fn provider(
+        source: Option<Arc<dyn CredentialSource>>,
+        loader: Arc<VaultHandleLoader>,
+        base: &str,
+    ) -> ClinePassProvider {
+        let mut provider = ClinePassProvider::new_with_handle_loader(source, loader);
+        provider.url = format!("{base}/api/v1/users/me/plan/usage-limits");
+        provider
+    }
+
+    fn vault_handle() -> CredentialHandle {
+        CredentialHandle::scoped("apikey:cline-pass", "apikey")
+    }
+
+    async fn clinepass(status: u16, body: &str) -> (String, Log) {
+        let body = body.to_string();
+        routes(move |path, _| match path {
+            "/api/v1/users/me/plan/usage-limits" => (status, body.as_bytes().to_vec()),
+            _ => (404, Vec::new()),
+        })
+        .await
+    }
+
+    #[test]
+    fn a_vault_deposit_routes_to_clinepass_and_replaces_the_environment_lane() {
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("apikey:cline-pass", "apikey")]);
+        let (source, _) = MockSource::serving(&[]);
+        let provider = provider(Some(source), loader, "http://127.0.0.1:9");
+        assert_eq!(provider.handles().unwrap(), vec![vault_handle()]);
+    }
+
+    #[tokio::test]
+    async fn the_vault_key_is_sent_and_the_environment_key_is_not() {
+        let (base, served) = clinepass(200, LIMITS).await;
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[("apikey:cline-pass", "apikey")]);
+        let (source, reports) =
+            MockSource::serving(&[("apikey:cline-pass", credential("vault-key", 3))]);
+        let provider = provider(Some(source), loader, &base);
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, vec![vault_handle()]);
+        let attempt = provider
+            .fetch_handle_from(&handles[0], |_| Some("env-key".into()))
+            .await;
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(attempt.usage.unwrap().secondary.unwrap().used_percent, 42.0);
+        let requests = served.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer vault-key")
+        );
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_a_vault_401_is_reported_once_with_the_record_version() {
+        for (status, vault) in [(401, true), (403, true), (401, false)] {
+            let (base, served) = clinepass(status, "").await;
+            let (source, reports) =
+                MockSource::serving(&[("apikey:cline-pass", credential("vault-key", 11))]);
+            let provider = provider(Some(source), Arc::new(VaultHandleLoader::default()), &base);
+            let handle = if vault {
+                vault_handle()
+            } else {
+                CredentialHandle::implicit()
+            };
+            let attempt = provider
+                .fetch_handle_from(&handle, |_| Some("env-key".into()))
+                .await;
+            assert_eq!(
+                attempt.usage.unwrap_err().error_class(),
+                "credential_rejected"
+            );
+            assert_eq!(served.lock().unwrap().len(), 1, "no retry on HTTP {status}");
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            let expected = if vault && status == 401 {
+                vec![("apikey:cline-pass".to_string(), 401, 11)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                *reports.lock().unwrap(),
+                expected,
+                "HTTP {status}, vault={vault}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_vault_handle_keeps_both_environment_key_spellings_working() {
+        for name in API_KEY_ENV {
+            let (base, served) = clinepass(200, LIMITS).await;
+            let (source, reports) = MockSource::serving(&[]);
+            let provider = provider(Some(source), Arc::new(VaultHandleLoader::default()), &base);
+            let handles = provider.handles().unwrap();
+            assert_eq!(handles, vec![CredentialHandle::implicit()]);
+            let attempt = provider
+                .fetch_handle_from(&handles[0], |key| (key == *name).then(|| "env-key".into()))
+                .await;
+            assert_eq!(attempt.source.as_deref(), Some("api"));
+            assert_eq!(attempt.usage.unwrap().secondary.unwrap().used_percent, 42.0);
+            let requests = served.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].authorization.as_deref(), Some("Bearer env-key"));
+            assert!(reports.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn normalizes_happy_path_with_all_windows() {

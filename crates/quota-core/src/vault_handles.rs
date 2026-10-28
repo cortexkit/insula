@@ -65,6 +65,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:soniox", "soniox"),
     // An abliteration.ai API key, which reads the account's USD credits.
     ("apikey:abliteration", "abliteration"),
+    ("apikey:cline-pass", "clinepass"),
     // A Chatbox AI license key. Chatbox sends it as the whole Authorization
     // header, and it also authorizes AI requests, not only quota reads.
     ("apikey:chatbox", "chatbox"),
@@ -112,6 +113,7 @@ enum ProviderKind {
     VercelBudget,
     Soniox,
     Abliteration,
+    ClinePass,
     Chatbox,
 }
 
@@ -502,6 +504,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Abliteration)
     }
 
+    pub fn clinepass_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::ClinePass)
+    }
+
     pub fn chatbox_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Chatbox)
     }
@@ -609,6 +615,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "vercel-budget" => Some(ProviderKind::VercelBudget),
         "soniox" => Some(ProviderKind::Soniox),
         "abliteration" => Some(ProviderKind::Abliteration),
+        "clinepass" => Some(ProviderKind::ClinePass),
         "chatbox" => Some(ProviderKind::Chatbox),
         _ => None,
     }
@@ -789,6 +796,32 @@ mod tests {
         );
         assert!(loader.deepseek_handles().unwrap().is_empty());
         assert_eq!(loader.anthropic_handles().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_cline_pass_family_routes_only_to_clinepass_without_an_alias() {
+        let families: Vec<_> = CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(_, provider)| *provider == "clinepass")
+            .copied()
+            .collect();
+        assert_eq!(families, vec![("apikey:cline-pass", "clinepass")]);
+        for id in ["apikey:cline-pass", "apikey:cline-pass:main"] {
+            assert_eq!(providers_for_id(id), vec![ProviderKind::ClinePass]);
+            let loader = VaultHandleLoader::default();
+            install(&loader, vec![row(id, "apikey")]);
+            assert_eq!(
+                loader.clinepass_handles().unwrap(),
+                vec![CredentialHandle::scoped(id, "apikey")]
+            );
+        }
+        for id in [
+            "apikey:clinepass",
+            "apikey:clinepass:main",
+            "apikey:cline-passx",
+        ] {
+            assert!(providers_for_id(id).is_empty(), "{id} must stay unclaimed");
+        }
     }
 
     #[test]
