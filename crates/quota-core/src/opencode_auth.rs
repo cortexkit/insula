@@ -32,7 +32,10 @@ pub enum OpencodeAuth {
         #[serde(default)]
         expires: Option<i64>,
     },
-    /// A static API key.
+    /// A static API key. OpenCode 1's auth.json tags it `api`; OpenCode 2's
+    /// `credential` table tags the same shape `key` (measured 2026-10-28 on a
+    /// live store: every API-key row read `"type":"key"`).
+    #[serde(alias = "key")]
     Api { key: String },
 }
 
@@ -514,7 +517,8 @@ mod tests {
             "anthropic",
             None,
             mtime + 60_000,
-            serde_json::json!({"type": "api", "key": "database-key"}),
+            // OpenCode 2 tags API keys `key`, unlike auth.json's `api`.
+            serde_json::json!({"type": "key", "key": "database-key"}),
         );
         assert_eq!(token_at(dir.path()), "database-key");
 
