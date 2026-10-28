@@ -59,6 +59,29 @@ struct ClinePassLimit {
     resets_at: Option<String>,
 }
 
+/// Cline answers a key whose account has no Cline Pass plan with HTTP 404 and
+/// `{"data":null,"error":"no plan history found for user","success":false}`
+/// (measured on a live key, 2026-10-28). The key works and there's simply no
+/// plan to report, so that is `no_quota_reported`, not a transient upstream
+/// failure retried forever. Any other 404, such as a moved endpoint, keeps its
+/// class, so it stays visible as a failure.
+fn no_plan_or(error: FetchError) -> FetchError {
+    const NO_PLAN: &str = "no plan history found";
+    let no_plan = match &error {
+        FetchError::ProviderStatus(404, body) => body.contains(NO_PLAN),
+        FetchError::Upstream(message) => message.contains("404") && message.contains(NO_PLAN),
+        _ => false,
+    };
+    if no_plan {
+        FetchError::NoQuotaReported(
+            "Cline reports no Cline Pass plan on this account (\"no plan history found for user\")"
+                .to_string(),
+        )
+    } else {
+        error
+    }
+}
+
 fn clean_key(key: String) -> Option<String> {
     crate::text::strip_wrapping_quotes(&key)
 }
@@ -191,14 +214,15 @@ impl ClinePassProvider {
         let request = JsonRequest::get(&self.url).bearer(api_key);
         // Keep the status on the vault lane so only a 401 retires the served key.
         // The environment lane retains the shared transport's existing mapping.
-        let body = if vault {
+        let sent = if vault {
             request
                 .send_provider_status_first(&self.http, PROVIDER_NAME)
-                .await?
-                .body
+                .await
+                .map(|response| response.body)
         } else {
-            request.send(&self.http).await?
+            request.send(&self.http).await
         };
+        let body = sent.map_err(no_plan_or)?;
         normalize_usage(&body)
     }
 
@@ -362,6 +386,41 @@ mod tests {
             Some("Bearer vault-key")
         );
         assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// A key on an account with no Cline Pass plan gets Cline's 404 "no plan
+    /// history" body: no quota on both lanes, never reported to the vault. Any
+    /// other 404 stays an upstream failure.
+    #[tokio::test]
+    async fn no_plan_history_is_no_quota_and_other_404s_are_not() {
+        const NO_PLAN: &str =
+            r#"{"data":null,"error":"no plan history found for user","success":false}"#;
+        for (body, class) in [
+            (NO_PLAN, "no_quota_reported"),
+            ("Not Found", "upstream_failed"),
+        ] {
+            for vault in [true, false] {
+                let (base, _) = clinepass(404, body).await;
+                let (source, reports) =
+                    MockSource::serving(&[("apikey:cline-pass", credential("vault-key", 2))]);
+                let provider =
+                    provider(Some(source), Arc::new(VaultHandleLoader::default()), &base);
+                let handle = if vault {
+                    vault_handle()
+                } else {
+                    CredentialHandle::implicit()
+                };
+                let attempt = provider
+                    .fetch_handle_from(&handle, |_| Some("env-key".into()))
+                    .await;
+                assert_eq!(
+                    attempt.usage.unwrap_err().error_class(),
+                    class,
+                    "body {body:?}, vault={vault}"
+                );
+                assert!(reports.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test]
