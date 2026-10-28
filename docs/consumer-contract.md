@@ -259,13 +259,22 @@ not its email or a vault credential id:
 {"method":"usage.use_saved_reset","params":{"provider":"codex","account":"synthetic-codex-id","request_id":"phone-request-0001"}}
 ```
 
-Only a route with **both** daemon-attested principal `reserved:callosum` and
-`route.bind` identity `harness` beginning with the literal `fed-phone:` may call
-this operation. A phone identity without that principal grants nothing. Simulator,
-Mac, unknown, missing-harness and all other principals receive `forbidden` before
-parameters are decoded or any reservation is made. Scope ownership is not caller
-attestation. Bind permission is scoped to the route channel and epoch and is
-revoked on rebind or route goodbye.
+Two kinds of route may call this operation:
+
+- **The phone:** daemon-attested principal `reserved:callosum` **and** a
+  `route.bind` identity `harness` beginning with the literal `fed-phone:`. A phone
+  identity without that principal grants nothing.
+- **The local desktop app, during development:** principal `direct` with no scope
+  stamp, a harness not beginning with `fed-`, and not the OpenCode plugin's
+  shared channel (harness `alfonso` with session `prefrontal-core`). This mirrors
+  core's development admission, and will be replaced by subc's `operator_app`
+  stamp before release.
+
+Every other route (simulator, Mac, unknown or missing harness, any scoped route,
+any other principal) receives `forbidden` before parameters are decoded or any
+reservation is made. Scope ownership is not caller attestation. Bind permission
+is scoped to the route channel and epoch and is revoked on rebind or route
+goodbye.
 
 Generate one `request_id` per deliberate press: 8–128 ASCII letters, digits or
 hyphens (`[A-Za-z0-9-]`). Persist it on the phone until the reply is known. **Resend

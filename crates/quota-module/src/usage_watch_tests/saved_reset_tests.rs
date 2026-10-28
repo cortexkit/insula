@@ -122,6 +122,78 @@ pub(super) async fn bind(wire: &mut Wire, epoch: u32, principal: Value, harness:
     }
 }
 
+/// A bind with no scope stamp, the shape the desktop app's plain local route
+/// has. `bind` always sends a stamp, so it can't build this one.
+async fn bind_unscoped(
+    wire: &mut Wire,
+    epoch: u32,
+    principal: Value,
+    harness: &str,
+    session: &str,
+) {
+    let identity =
+        json!({"project_root":"/synthetic/desktop", "session":session, "harness":harness});
+    let body = json!({"op":"route.bind", "route_channel":5, "epoch":epoch,
+        "target":{"kind":"management_surface","module_id":"insula"}, "identity":identity,
+        "principal":principal});
+    wire.send(
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            700,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(wire.recv().await.header.ty, FrameType::Response);
+}
+
+/// The desktop app may use a saved reset during development: an unscoped
+/// direct route that isn't federated and isn't the OpenCode plugin's channel.
+/// Each of those three conditions, and the principal, refuses on its own.
+#[tokio::test]
+async fn the_desktop_app_may_use_a_saved_reset_on_an_unscoped_direct_route() {
+    let (registry, posts, _) = fixture().await;
+    let mut wire = Wire::with_registry(false, 65536, registry).await;
+    let direct = || json!({"kind":"direct"});
+    for (i, (principal, harness, session)) in [
+        (direct(), "fed-mac:fp", "s"),
+        (direct(), "alfonso", "prefrontal-core"),
+        (json!({"kind":"unverified"}), "alfonso-desktop", "s"),
+        (
+            json!({"kind":"reserved","module_id":"other"}),
+            "alfonso-desktop",
+            "s",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let epoch = i as u32 + 1;
+        bind_unscoped(&mut wire, epoch, principal, harness, session).await;
+        assert_eq!(
+            body(&call(&mut wire, epoch, Value::Null).await)["code"],
+            "forbidden",
+            "{harness}/{session} must not spend"
+        );
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    // A direct route WITH a scope stamp is refused too: `bind` always sends one,
+    // and `saved_reset_caller_requires_callosum_principal` covers it.
+    bind_unscoped(&mut wire, 20, direct(), "alfonso-desktop", "desktop-1").await;
+    assert_eq!(
+        body(&call(&mut wire, 20, reset_params()).await)["outcome"],
+        "reset",
+        "the desktop app's own route may spend"
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    wire.stop().await;
+    wire.finish().await;
+}
+
 pub(super) fn callosum() -> Value {
     json!({"kind":"reserved","module_id":"callosum"})
 }

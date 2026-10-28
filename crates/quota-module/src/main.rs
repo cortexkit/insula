@@ -773,10 +773,17 @@ async fn handle_control_request(
             epoch,
             principal,
             identity,
+            scope,
             ..
         } => {
             let phone_allowed =
-                saved_reset_caller_allowed(principal.as_ref(), Some(identity.harness.as_str()));
+                saved_reset_caller_allowed(principal.as_ref(), Some(identity.harness.as_str()))
+                    || dev_operator_app_admission(
+                        principal.as_ref(),
+                        scope.is_some(),
+                        &identity.harness,
+                        &identity.session,
+                    );
             let mut phones = serve
                 .phone_reset_writers
                 .lock()
@@ -1209,9 +1216,10 @@ async fn handle_usage_request(
         corr,
     };
 
-    // The route.bind harness is trustworthy only with the daemon-attested
-    // reserved:callosum principal and a fed-phone: harness. Check permission for
-    // this bound channel and epoch before decoding mutation parameters.
+    // Only the phone (daemon-attested reserved:callosum with a fed-phone:
+    // harness) or the local desktop app (see `dev_operator_app_admission`) may
+    // spend. Check permission for this bound channel and epoch before decoding
+    // mutation parameters.
     let is_reset = serde_json::from_slice::<serde_json::Value>(&frame.body)
         .is_ok_and(|v| v.get("method").and_then(|m| m.as_str()) == Some(USE_SAVED_RESET_OP));
     if is_reset
@@ -1226,6 +1234,8 @@ async fn handle_usage_request(
             serve,
             reply,
             "forbidden",
+            // Wording pinned by the published phone vectors (quota-phone-v2.1,
+            // error-forbidden.json); the desktop admission is in the contract.
             "usage.use_saved_reset requires reserved:callosum with fed-phone: harness",
         )
         .await;
@@ -1506,6 +1516,30 @@ fn saved_reset_caller_allowed(
 ) -> bool {
     matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "callosum")
         && harness.is_some_and(|harness| harness.starts_with("fed-phone:"))
+}
+
+/// Whether a route is the desktop app during development, mirroring core's
+/// `dev_operator_app_admission`: a `direct` carrier with no scope stamp,
+/// whose harness doesn't start with `fed-`, and whose bind identity isn't the
+/// OpenCode plugin's shared channel (harness `alfonso`, session
+/// `prefrontal-core`). Any `reserved` principal is refused here; the phone has
+/// its own check above.
+///
+/// It admits only `usage.use_saved_reset`, which spends real credit. Ufuk
+/// allowed the desktop app this on 2026-10-28; the 30-minute per-account spend
+/// bound in the redemption journal still applies to every caller. Release
+/// plan: replace this body with a check of subc's `operator_app` stamp
+/// (capability `operator-app/v1`), as core and Basal will.
+fn dev_operator_app_admission(
+    principal: Option<&subc_protocol::Principal>,
+    scoped: bool,
+    harness: &str,
+    session: &str,
+) -> bool {
+    matches!(principal, Some(subc_protocol::Principal::Direct))
+        && !scoped
+        && !harness.starts_with("fed-")
+        && !(harness == "alfonso" && session == "prefrontal-core")
 }
 
 fn valid_reset_request_id(id: &str) -> bool {
