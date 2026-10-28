@@ -67,6 +67,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 | `apikey:soniox` | `soniox` (an organization API key) |
 | `apikey:abliteration` | `abliteration` (an abliteration.ai API key) |
+| `apikey:cline-pass` | `clinepass` (a Cline plan API key) |
 | `apikey:chatbox` | `chatbox` (a Chatbox AI license key) |
 
 The authoritative list is `CREDENTIAL_FAMILIES` in
