@@ -192,6 +192,10 @@ const MIGRATED_STORE_POINTER: &str =
 const SIDEBAR_STATE_ENV: &str = "ANTIGRAVITY_AUTH_SIDEBAR_STATE_FILE";
 const SIDEBAR_STATE_RELATIVE: &str = "cortexkit/antigravity-auth/sidebar-state.json";
 
+/// Only OpenCode 1 writes the plugin sidebar. A day exceeds an ordinary break
+/// from OpenCode 1, so an older roster no longer identifies accounts in use.
+const SIDEBAR_ROSTER_MAX_AGE: chrono::Duration = chrono::Duration::hours(24);
+
 /// A cached pool older than this is more than 20% of the five-hour window's
 /// period old, so it has stopped describing the window it claims to describe.
 /// The weekly window would tolerate longer, but one cache entry carries both
@@ -375,9 +379,14 @@ fn sidebar_path(lookup: &EnvLookup) -> Result<std::path::PathBuf, String> {
     Ok(home.join(".local/state").join(SIDEBAR_STATE_RELATIVE))
 }
 
-/// Failure means keep the last roster, not remove its accounts. Only absence
-/// without installation evidence proves there is no plugin roster to enumerate.
-fn read_sidebar(lookup: &EnvLookup) -> Result<Vec<StoredAccount>, String> {
+enum SidebarRoster {
+    Current(Vec<StoredAccount>),
+    Stale(Option<DateTime<Utc>>),
+}
+
+/// Failure means keep the last roster, not remove its accounts. Absence without
+/// installation evidence or a stale snapshot means no plugin roster to enumerate.
+fn read_sidebar(lookup: &EnvLookup, now: DateTime<Utc>) -> Result<SidebarRoster, String> {
     let path = sidebar_path(lookup)?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -388,7 +397,7 @@ fn read_sidebar(lookup: &EnvLookup) -> Result<Vec<StoredAccount>, String> {
             for evidence in [ACCOUNTS_FILE, MIGRATED_STORE_POINTER] {
                 match home.join(evidence).try_exists() {
                     Ok(true) => {
-                        return Err("Antigravity plugin is installed but its sidebar state is absent; update the plugin and let it publish quota".to_string());
+                        return Err("Antigravity plugin is installed but its sidebar state is absent; the sidebar is written only by the plugin under OpenCode 1; OpenCode 2 hosts use the vault lane".to_string());
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -396,7 +405,7 @@ fn read_sidebar(lookup: &EnvLookup) -> Result<Vec<StoredAccount>, String> {
                     }
                 }
             }
-            return Ok(Vec::new());
+            return Ok(SidebarRoster::Current(Vec::new()));
         }
         Err(error) => return Err(format!("plugin sidebar state unreadable: {error}")),
     };
@@ -412,11 +421,27 @@ fn read_sidebar(lookup: &EnvLookup) -> Result<Vec<StoredAccount>, String> {
     // interpreting account fields so schema errors cannot mask the update remedy.
     let accounts: Vec<StoredAccount> = serde_json::from_value(file.accounts)
         .map_err(|error| format!("plugin sidebar accounts did not parse: {error}"))?;
-    Ok(accounts
-        .into_iter()
-        .filter(|account| account.enabled != Some(false))
-        .filter(|account| account_handle_name(account).is_some())
-        .collect())
+    // Use quota observations across all accounts, not file publication time:
+    // rewriting a frozen snapshot must not keep its roster alive.
+    let newest_checked_at = accounts
+        .iter()
+        .flat_map(|account| [&account.quota.gemini, &account.quota.non_gemini])
+        .flatten()
+        .filter_map(|pool| pool.checked_at)
+        .filter_map(DateTime::<Utc>::from_timestamp_millis)
+        .max();
+    if newest_checked_at
+        .is_none_or(|checked_at| now.signed_duration_since(checked_at) > SIDEBAR_ROSTER_MAX_AGE)
+    {
+        return Ok(SidebarRoster::Stale(newest_checked_at));
+    }
+    Ok(SidebarRoster::Current(
+        accounts
+            .into_iter()
+            .filter(|account| account.enabled != Some(false))
+            .filter(|account| account_handle_name(account).is_some())
+            .collect(),
+    ))
 }
 
 /// Positional ids and labels can move when the roster is reordered, so only a
@@ -2240,9 +2265,13 @@ pub struct AntigravityProvider {
     /// watching its output, however carefully. THE INSTRUMENT HAS TO NAME THE
     /// PRODUCER.
     served_lane: std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    /// Suppress repeated stale-roster diagnostics until its newest date changes
+    /// or an active roster is seen again.
+    stale_sidebar_note: std::sync::Mutex<Option<String>>,
     local_endpoints: Option<Vec<(LocalServer, u16)>>,
     override_store: Option<Result<Vec<StoredAccount>, String>>,
     env_lookup: EnvLookup,
+    now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 impl AntigravityProvider {
@@ -2273,9 +2302,11 @@ impl AntigravityProvider {
             local_cache: tokio::sync::Mutex::new(None),
             process_scan: process_scan(),
             served_lane: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stale_sidebar_note: std::sync::Mutex::new(None),
             local_endpoints: None,
             override_store: None,
             env_lookup: default_sidebar_env(),
+            now: Arc::new(Utc::now),
         }
     }
 
@@ -2303,7 +2334,30 @@ impl AntigravityProvider {
         if let Some(accounts) = &self.override_store {
             return accounts.clone();
         }
-        read_sidebar(&self.env_lookup)
+        let roster = read_sidebar(&self.env_lookup, (self.now)())?;
+        let (accounts, note) = match roster {
+            SidebarRoster::Current(accounts) => (accounts, None),
+            SidebarRoster::Stale(newest) => (
+                Vec::new(),
+                Some(newest.map_or_else(
+                    || "unavailable (no readable checkedAt)".to_string(),
+                    |date| date.to_rfc3339(),
+                )),
+            ),
+        };
+        if let Ok(mut previous) = self.stale_sidebar_note.lock() {
+            if let Some(date) = &note {
+                if previous.as_ref() != Some(date) {
+                    eprintln!(
+                        "{} antigravity sidebar roster ignored as stale; newest checkedAt: {date} \
+                         (only the plugin under OpenCode 1 writes the sidebar)",
+                        crate::LOG_TAG
+                    );
+                }
+            }
+            *previous = note;
+        }
+        Ok(accounts)
     }
 
     /// Log source switches, not every poll. Different sources use the same
@@ -2402,7 +2456,7 @@ impl AntigravityProvider {
 
         // The plugin owns quota polling. This lane reads only the sidebar's cached
         // quota data and never tries a token exchange or cloud fallback.
-        if let Some((usage, checked_at)) = parse_cached_quota(&account.quota, Utc::now()) {
+        if let Some((usage, checked_at)) = parse_cached_quota(&account.quota, (self.now)()) {
             self.note_lane(handle_name, "plugin-cache");
             return FetchAttempt::success(observed, PLUGIN_SOURCE, usage)
                 .with_value_observed_at(checked_at)
@@ -3561,6 +3615,52 @@ mod tests {
             .map(CredentialHandle::stable_id)
             .collect();
         assert_eq!(known, vec!["antigravity:google"]);
+    }
+
+    #[tokio::test]
+    async fn a_sidebar_roster_just_over_24_hours_old_leaves_the_vault_complete() {
+        let now = DateTime::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let checked_at = now - chrono::Duration::hours(24) - chrono::Duration::milliseconds(1);
+        let account = super::plugin_lane_tests::sidebar_account_json(
+            "removed@example.test",
+            checked_at.timestamp_millis(),
+        );
+        let (sidebar, _home) =
+            super::plugin_lane_tests::sidebar_fixture("frozen-vault", serde_json::json!([account]));
+        let mut mock = cloud_preflight_mock(200, b"{}".to_vec()).await;
+        mock.provider.override_store = None;
+        mock.provider.env_lookup = sidebar.env_lookup;
+        mock.provider.now = Arc::new(move || now);
+        mock.provider
+            .handle_loader
+            .install_rows_for_test(&[("antigravity:google", "oauth")]);
+        mock.provider.credential_source = Some(Arc::new(PreflightVaultSource {
+            project: Some("p".to_string()),
+            email: Some("vault@example.test".to_string()),
+            reports: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert_eq!(
+            mock.provider.handles().unwrap(),
+            vec![CredentialHandle::scoped("antigravity:google", "oauth")],
+            "a frozen sidebar must not enumerate plugin handles"
+        );
+        let provider = std::mem::take(&mut mock.provider);
+        let registry = crate::Registry::new(vec![Box::new(provider)]);
+        registry
+            .refresh_tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let snapshot = registry.usage_snapshot(None).await;
+        assert_eq!(snapshot.complete_providers, ["antigravity"]);
+        assert_eq!(snapshot.entries.len(), 1);
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.account.as_deref(), Some("vault@example.test"));
+        assert_eq!(entry.source.as_deref(), Some("vault"));
+        assert!(entry.error.is_none());
+        assert_eq!(
+            pool_window(entry.usage.as_ref().unwrap(), "gemini-weekly").used_percent,
+            7.15
+        );
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5201,6 +5301,11 @@ mod plugin_lane_tests {
                 .stored_accounts()
                 .expect_err("installed plugin is not an empty roster");
             assert!(error.contains("sidebar state is absent"), "{error}");
+            assert!(
+                error.contains("only by the plugin under OpenCode 1"),
+                "{error}"
+            );
+            assert!(!error.contains("update the plugin"), "{error}");
             assert!(provider.handles().is_err());
         }
     }
@@ -5269,7 +5374,7 @@ mod plugin_lane_tests {
         let (provider, home) = sidebar_fixture(
             "v2",
             serde_json::json!([
-                { "id": "vault-acct-0", "label": "Account 1", "email": "a@example.test", "enabled": true, "quota": {} },
+                { "id": "vault-acct-0", "label": "Account 1", "email": "a@example.test", "enabled": true, "quota": {"gemini": {"checkedAt": Utc::now().timestamp_millis()}} },
                 { "id": "vault-acct-1", "label": "Account 2", "email": " b@example.test ", "quota": {} }
             ]),
         );
@@ -5287,12 +5392,80 @@ mod plugin_lane_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_sidebar_roster_just_under_24_hours_old_keeps_its_handles_but_not_readings() {
+        let now = DateTime::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let newest = now - chrono::Duration::hours(24) + chrono::Duration::milliseconds(1);
+        let older = now - chrono::Duration::hours(48);
+        let mut account = sidebar_account_json("a@example.test", older.timestamp_millis());
+        account["quota"]["non-gemini"]["checkedAt"] = serde_json::json!(newest.timestamp_millis());
+        let (mut provider, _home) = sidebar_fixture(
+            "roster-under-day",
+            serde_json::json!([
+                sidebar_account_json("b@example.test", older.timestamp_millis()),
+                account
+            ]),
+        );
+        provider.now = Arc::new(move || now);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![
+                CredentialHandle::new("plugin:b@example.test"),
+                CredentialHandle::new("plugin:a@example.test"),
+            ]
+        );
+        for handle in provider.handles().unwrap() {
+            let attempt = provider.fetch_handle(&handle).await;
+            assert!(matches!(
+                attempt.usage,
+                Err(FetchError::LocalSourceUnavailable(_))
+            ));
+            assert_eq!(attempt.value_observed_at, None);
+        }
+    }
+
+    #[test]
+    fn a_sidebar_roster_exactly_24_hours_old_keeps_its_handle() {
+        let now = DateTime::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let checked_at = now - chrono::Duration::hours(24);
+        let (mut provider, _home) = sidebar_fixture(
+            "roster-at-day",
+            serde_json::json!([sidebar_account_json(
+                "a@example.test",
+                checked_at.timestamp_millis()
+            )]),
+        );
+        provider.now = Arc::new(move || now);
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::new("plugin:a@example.test")]
+        );
+    }
+
+    #[test]
+    fn a_sidebar_roster_without_readable_checked_at_has_no_plugin_handles() {
+        for checked_at in [None, Some(i64::MAX)] {
+            let (provider, _home) = sidebar_fixture(
+                "roster-undated",
+                serde_json::json!([{
+                    "email": "a@example.test",
+                    "quota": {"gemini": {"checkedAt": checked_at}}
+                }]),
+            );
+            assert!(provider.stored_accounts().unwrap().is_empty());
+            assert_eq!(
+                provider.handles().unwrap(),
+                vec![CredentialHandle::implicit()]
+            );
+        }
+    }
+
     #[test]
     fn sidebar_accounts_without_nonempty_email_are_skipped() {
         let (provider, _home) = sidebar_fixture(
             "no-email",
             serde_json::json!([
-                { "id": "acct-0", "label": "not-an-identity", "enabled": true, "quota": {} },
+                { "id": "acct-0", "label": "not-an-identity", "enabled": true, "quota": {"gemini": {"checkedAt": Utc::now().timestamp_millis()}} },
                 { "id": "acct-1", "email": "   ", "enabled": true, "quota": {} }
             ]),
         );
@@ -5308,7 +5481,7 @@ mod plugin_lane_tests {
         let (provider, _home) = sidebar_fixture(
             "disabled",
             serde_json::json!([
-                { "id": "acct-0", "email": "off@example.test", "enabled": false, "quota": {} },
+                { "id": "acct-0", "email": "off@example.test", "enabled": false, "quota": {"gemini": {"checkedAt": Utc::now().timestamp_millis()}} },
                 { "id": "acct-1", "email": "on@example.test", "enabled": true, "quota": {} }
             ]),
         );
@@ -5540,14 +5713,17 @@ mod plugin_lane_tests {
                 .remove("checkedAt");
         }
         let (provider, _home) = sidebar_fixture("undated", serde_json::json!([account]));
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
         let attempt = provider
             .fetch_handle(&CredentialHandle::new("plugin:a@example.test"))
             .await;
         let error = attempt
             .usage
             .expect_err("publication and window clocks cannot date a group");
-        assert!(matches!(error, FetchError::LocalSourceUnavailable(_)));
-        assert_eq!(classify(&error), FetchClass::Transient);
+        assert!(matches!(error, FetchError::NoSession(_)));
         assert_eq!(attempt.value_observed_at, None);
     }
 
