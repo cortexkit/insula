@@ -14,6 +14,11 @@
 //! on 2026-10-01: HTTP 403 with `error.type == "EntitlementError"` maps to
 //! `no_quota_reported`, not a rejected key.
 //!
+//! With no key or deposited cookie, the active OpenCode CLI login can supply
+//! the same bearer API (CodexBar v0.82.0 `OpenCodeGoLocalUsageReader`). This
+//! fallback is fixture-verified, not live-verified: the development Mac has a
+//! vault key, which deliberately suppresses discovery of the CLI credential.
+//!
 //! What the API lane does NOT do, deliberately:
 //! - A success body without `usage.rolling` remains `decode_failed`; only a
 //!   parsed HTTP 403 `EntitlementError` establishes no Go subscription.
@@ -69,6 +74,7 @@ use crate::{
 };
 
 pub const PROVIDER_NAME: &str = "opencodego";
+const CLI_HANDLE: &str = "opencode-cli";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Usage endpoint for the API-key lane. Answers 401 or 403 for a key it
@@ -785,6 +791,7 @@ pub struct OpenCodeGoProvider {
     /// Reads the environment's API key. A field so tests can supply a key
     /// without mutating the process environment other tests share.
     env_api_key: fn() -> Option<String>,
+    cli_credential: Arc<dyn Fn() -> Result<Option<String>, FetchError> + Send + Sync>,
     endpoints: Endpoints,
 }
 
@@ -822,6 +829,7 @@ impl OpenCodeGoProvider {
             credential_source,
             handle_loader,
             env_api_key,
+            cli_credential: Arc::new(crate::opencode_auth::read_go_credential),
             endpoints: Endpoints::production(),
         }
     }
@@ -841,9 +849,9 @@ impl OpenCodeGoProvider {
             .collect())
     }
 
-    /// The environment-key lane: a parsed 403 EntitlementError means no Go
+    /// The bearer lane: a parsed 403 EntitlementError means no Go
     /// subscription; other 401/403 responses retain the Unauthorized key verdict.
-    async fn fetch_env_api(&self, key: &str) -> Result<ProviderUsage, FetchError> {
+    async fn fetch_bearer(&self, key: &str, source: &str) -> Result<ProviderUsage, FetchError> {
         let response = api_usage_request(&self.endpoints.api_usage_url, key)
             .send_provider_status_first(&self.http, PROVIDER_NAME)
             .await
@@ -867,12 +875,7 @@ impl OpenCodeGoProvider {
             &String::from_utf8_lossy(&response.body),
             chrono::Utc::now().timestamp(),
         )?;
-        Ok(ProviderUsage::healthy(
-            PROVIDER_NAME,
-            None,
-            API_SOURCE,
-            usage,
-        ))
+        Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
     }
 
     /// The vault-key lane. The status-first helper keeps the HTTP status, so a
@@ -949,7 +952,8 @@ impl UsageProvider for OpenCodeGoProvider {
     /// nobody can see. An explicitly configured key beats a deposited cookie
     /// session, which may belong to any account that shares the deposit. A
     /// vault key comes before the environment's, as in `deepseek`. With no key,
-    /// the cookie lanes are `CookieVault`'s: a deposit or nothing.
+    /// a deposited cookie remains scoped to its own account. Only when neither
+    /// is configured do we discover the ambient CLI login.
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         let vault_keys = self.vault_api_key_handles()?;
         if !vault_keys.is_empty() {
@@ -960,16 +964,37 @@ impl UsageProvider for OpenCodeGoProvider {
             // while the environment still holds a key.
             return Ok(vec![CredentialHandle::implicit()]);
         }
-        self.vault.handles()
+        let cookies = self.vault.handles()?;
+        if !cookies.is_empty() {
+            return Ok(cookies);
+        }
+        match (self.cli_credential)() {
+            Ok(None) => Ok(Vec::new()),
+            // An unusable or unreadable local store needs a lane so its fetch
+            // can publish the actual error instead of silently hiding it.
+            Ok(Some(_)) | Err(_) => Ok(vec![CredentialHandle::new(CLI_HANDLE)]),
+        }
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         if is_api_key_handle(handle) {
             return self.fetch_vault_api(handle).await;
         }
+        if handle == &CredentialHandle::new(CLI_HANDLE) {
+            let result = async {
+                let token = (self.cli_credential)()?.ok_or_else(|| {
+                    FetchError::NoSession("OpenCode CLI login is no longer present".into())
+                })?;
+                self.fetch_bearer(&token, "cli").await
+            }
+            .await;
+            return FetchAttempt::from_provider_usage(result);
+        }
         if !handle.is_vault() {
             if let Some(key) = (self.env_api_key)() {
-                return FetchAttempt::from_provider_usage(self.fetch_env_api(key.trim()).await);
+                return FetchAttempt::from_provider_usage(
+                    self.fetch_bearer(key.trim(), API_SOURCE).await,
+                );
             }
         }
         let result: Result<ProviderUsage, FetchError> = async {
@@ -1264,6 +1289,7 @@ mod tests {
             loader,
         );
         provider.env_api_key = || None;
+        provider.cli_credential = Arc::new(|| Ok(None));
         (provider, reports)
     }
 
@@ -1958,6 +1984,116 @@ mod tests {
         // No key and no deposit: no lane at all.
         let provider = provider_with_rows(&[], "");
         assert_eq!(ids(provider.handles().unwrap()), Vec::<String>::new());
+    }
+
+    fn install_cli_store(provider: &mut OpenCodeGoProvider, value: &str) {
+        let store = crate::opencode_auth::go_tests::Store::new();
+        let db = store.create_at(&store.database());
+        crate::opencode_auth::go_tests::Store::row(&db, "opencode-go", Some(1), value);
+        drop(db);
+        provider.cli_credential = Arc::new(move || store.read());
+    }
+
+    #[test]
+    fn a_vault_key_suppresses_the_cli_lane() {
+        let mut provider = provider_with_rows(&[("apikey:opencode-go", "apikey")], "vault-key");
+        install_cli_store(&mut provider, r#"{"type":"key","key":"cli-key"}"#);
+        let read = Arc::clone(&provider.cli_credential);
+        assert_eq!(read().unwrap().as_deref(), Some("cli-key"));
+        provider.cli_credential =
+            Arc::new(move || panic!("an authoritative vault key must prevent CLI discovery"));
+        assert_eq!(ids(provider.handles().unwrap()), vec!["apikey:opencode-go"]);
+    }
+
+    #[test]
+    fn env_keys_and_deposited_cookies_do_not_discover_the_cli_account() {
+        let mut provider = provider_with_rows(&[], "");
+        provider.env_api_key = || Some("env-key".into());
+        provider.cli_credential = Arc::new(|| panic!("the env key must suppress the CLI login"));
+        assert_eq!(
+            provider.handles().unwrap(),
+            vec![CredentialHandle::implicit()]
+        );
+
+        for cookie in ["cookie:opencode.ai", "cookie:opencode.ai:chosen-account"] {
+            let mut provider = provider_with_rows(&[(cookie, "cookie")], "");
+            provider.cli_credential = Arc::new(|| panic!("a cookie account must stay scoped"));
+            assert_eq!(ids(provider.handles().unwrap()), vec![cookie]);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_login_fetches_the_bearer_api_without_borrowing_cookie_handles() {
+        let body: &'static str =
+            Box::leak(api_payload(12.0, Some(8.0), Some(35.0)).into_boxed_str());
+        let (base, requests) = serve(move |_, _| Reply::Body(200, body)).await;
+        let mut provider = provider_with_rows(&[], "");
+        install_cli_store(
+            &mut provider,
+            r#"{"type":"oauth","access":"cli-token","expires":4000000000000}"#,
+        );
+        point_at(&mut provider, &base);
+        let handles = provider.handles().unwrap();
+        assert_eq!(ids(handles.clone()), vec![super::CLI_HANDLE]);
+        let attempt = provider.fetch_handle(&handles[0]).await;
+        assert_eq!(attempt.source.as_deref(), Some("cli"));
+        assert!(attempt.observed.unwrap().account_id.is_none());
+        let usage = attempt.usage.unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 12.0);
+        assert_eq!(usage.secondary.unwrap().used_percent, 8.0);
+        assert_eq!(usage.tertiary.unwrap().used_percent, 35.0);
+        assert_eq!(paths(&requests), vec![API_USAGE_PATH]);
+        assert!(requests.lock().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cli-token"));
+
+        let cookie = CredentialHandle::scoped("cookie:opencode.ai:chosen-account", "cookie");
+        assert!(provider.fetch_handle(&cookie).await.usage.is_err());
+        assert_eq!(
+            paths(&requests),
+            vec![API_USAGE_PATH, CONSOLE_WORKSPACES_PATH],
+            "a cookie fetch must not borrow the ambient login"
+        );
+        assert!(!requests.lock().unwrap()[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer"));
+    }
+
+    #[tokio::test]
+    async fn cli_store_errors_enumerate_and_publish_their_actual_classification() {
+        let mut provider = provider_with_rows(&[], "");
+        install_cli_store(
+            &mut provider,
+            r#"{"type":"oauth","access":"expired","expires":1}"#,
+        );
+        let handles = provider.handles().unwrap();
+        assert_eq!(ids(handles.clone()), vec![super::CLI_HANDLE]);
+        let error = provider.fetch_handle(&handles[0]).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "credential_unusable");
+        assert!(error.to_string().contains("expired"));
+
+        provider.cli_credential = Arc::new(|| {
+            Err(FetchError::LocalSourceUnavailable(
+                "unreadable database".into(),
+            ))
+        });
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        let error = provider.fetch_handle(&handles[0]).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "local_source_unavailable");
+    }
+
+    #[tokio::test]
+    async fn cli_api_entitlement_is_no_quota_and_401_is_rejected() {
+        for (status, expected) in [(403, "no_quota_reported"), (401, "credential_rejected")] {
+            let (base, _) = serve(move |_, _| Reply::Body(status, ENTITLEMENT_BODY)).await;
+            let mut provider = provider_with_rows(&[], "");
+            install_cli_store(&mut provider, r#"{"type":"key","key":"cli-key"}"#);
+            point_at(&mut provider, &base);
+            let handle = provider.handles().unwrap().remove(0);
+            let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+            assert_eq!(error.error_class(), expected);
+        }
     }
 
     /// An env-key fetch sends the bearer key to the usage path and publishes

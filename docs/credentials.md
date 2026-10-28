@@ -149,7 +149,7 @@ provider's source state it.
 | `minimax` | | `MINIMAX_CODING_API_KEY`, `MINIMAX_API_KEY` |
 | `muse` | `MUSE_AUTH_PATH` or `~/.config/muse/auth.json` | `MUSE_DEVICE_TOKEN` |
 | `neuralwatt` | | `NEURALWATT_API_KEY` |
-| `opencodego` | | `OPENCODE_API_KEY` |
+| `opencodego` | active OpenCode CLI Go key or OAuth login (fallback only) | `OPENCODE_API_KEY`; `OPENCODE_DB` overrides the CLI database |
 | `openrouter` | OpenCode's `openrouter` entry | |
 | `sakana` | | `SAKANA_COOKIE` |
 | `soniox` | | `SONIOX_ORG_API_KEY` (an organization key; `SONIOX_API_KEY`, a project key, is not read) |
@@ -169,7 +169,8 @@ whose newest quota `checkedAt` is over 24 hours old, or has no readable quota
 timestamp, is ignored. The 24-hour age applies to the roster; an individual
 cached quota observation is ignored once it is more than one hour old.
 
-Other OpenCode entries are read from the `credential` table in OpenCode 2's
+Except for OpenCode Go's active-login rule below, OpenCode entries are read from
+the `credential` table in OpenCode 2's
 `~/.local/share/opencode/opencode.db` and from OpenCode 1's `auth.json` beside it
 (`$XDG_DATA_HOME/opencode/` when set). The database is opened read-only, in place;
 it is never copied or written. Rows explicitly marked inactive (`active = 0`)
@@ -182,6 +183,29 @@ credential; a valid `auth.json` entry can still be used, with a warning logged
 once. Tokens are never refreshed, because refresh-token rotation would disrupt
 OpenCode's session. An expired-looking access token is still tried: its recorded
 expiry need not match the server's actual validity window.
+
+**OpenCode Go's CLI fallback** follows CodexBar v0.82.0. A vault
+`apikey:opencode-go` key, then `OPENCODE_API_KEY`, remains authoritative and
+prevents CLI discovery. A deposited `cookie:opencode.ai` session also stays in
+its own lane; it never borrows the ambient CLI account. With neither key nor
+cookie deposit, insula reads the CLI's active login read-only, without refresh.
+The database is `~/.local/share/opencode/opencode.db`; an absolute
+`XDG_DATA_HOME` changes the data root (a relative value is ignored).
+`OPENCODE_DB` overrides the database path, relative to that `opencode` directory
+or absolute; `:memory:` disables the CLI lookup, including `auth.json`.
+
+Only `credential` rows with `active = 1` qualify. `opencode-go` takes precedence
+over `opencode`; duplicate active rows for the chosen integration are refused.
+A dedicated Go row can hold a `key` or OAuth `access` token. A generic
+`opencode` row must be OAuth. OAuth requires a future millisecond `expires`.
+Only an absent database or absent `credential` table permits fallback to
+`auth.json` in the data directory, and only its `opencode-go` entry with
+`type: "api"` qualifies. An existing table with no usable row does not revive
+the legacy login. Expired OAuth, ambiguous rows and malformed credentials are
+`credential_unusable`; an unreadable database is `local_source_unavailable`.
+With neither store present, no CLI lane is enumerated. This fallback is
+fixture-verified, not live-verified: the development Mac has a vault key, which
+suppresses the CLI lane.
 
 The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `qoder`,
 `qwen-cloud` and `traecn` have no local lane: without a vault deposit they are not

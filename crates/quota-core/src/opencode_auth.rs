@@ -9,8 +9,10 @@
 //!
 //! OpenCode 2 stores live credentials in `opencode.db`'s `credential` table;
 //! OpenCode 1 uses `auth.json`. Both use the same credential JSON shape. We
-//! compare freshness when both hold a provider, without ever refreshing tokens:
-//! using a rotating refresh token would invalidate OpenCode's own session.
+//! compare freshness when both hold a provider, except Go, which follows the
+//! CLI's active account and only falls back when the database or table is absent.
+//! We never refresh tokens: using a rotating refresh token would invalidate
+//! OpenCode's own session.
 
 use std::path::PathBuf;
 
@@ -181,16 +183,9 @@ fn read_database_provider_at(
     let unavailable = |error| {
         FetchError::LocalSourceUnavailable(format!("reading OpenCode opencode.db: {error}"))
     };
-    match std::fs::metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(unavailable(error.to_string())),
-    }
-
-    // Do not use SQLite's immutable mode: OpenCode keeps writing to the WAL,
-    // and ignoring it could return an older credential from the main database.
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| unavailable(error.to_string()))?;
+    let Some(connection) = open_database_at(path)? else {
+        return Ok(None);
+    };
     let row: Option<(String, i64)> = connection
         .query_row(
             "SELECT value, time_updated FROM credential
@@ -207,6 +202,181 @@ fn read_database_provider_at(
         Ok(DatabaseCredential { auth, updated_ms })
     })
     .transpose()
+}
+
+fn open_database_at(path: &std::path::Path) -> Result<Option<Connection>, FetchError> {
+    let unavailable = |error| {
+        FetchError::LocalSourceUnavailable(format!("reading OpenCode opencode.db: {error}"))
+    };
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
+    }
+
+    // Do not use SQLite's immutable mode: OpenCode keeps writing to the WAL,
+    // and ignoring it could return an older credential from the main database.
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| unavailable(error.to_string()))?;
+    Ok(Some(connection))
+}
+
+/// Go can reuse the CLI's active Go key or OpenCode OAuth login, but must not
+/// resurrect an old auth.json account after the CLI has migrated to SQLite.
+pub(crate) fn read_go_credential() -> Result<Option<String>, FetchError> {
+    read_go_credential_from(|name| std::env::var_os(name), now_ms())
+}
+
+pub(crate) fn read_go_credential_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString> + Copy,
+    now_ms: i64,
+) -> Result<Option<String>, FetchError> {
+    let filename = lookup("OPENCODE_DB").unwrap_or_else(|| "opencode.db".into());
+    if filename == ":memory:" {
+        return Ok(None);
+    }
+    // XDG requires an absolute data directory; a relative value must not make
+    // credential discovery depend on the application's working directory.
+    let auth = path_or_refusal(auth_path_from(|name| {
+        lookup(name)
+            .filter(|value| name != "XDG_DATA_HOME" || std::path::Path::new(value).is_absolute())
+    }))?;
+    let database = auth
+        .parent()
+        .expect("auth path has a parent")
+        .join(filename);
+    read_go_credential_at(&database, &auth, now_ms)
+}
+
+fn go_unusable(reason: &str) -> FetchError {
+    FetchError::CredentialUnusable(format!("OpenCode CLI credential {reason}"))
+}
+
+fn go_database_unavailable() -> FetchError {
+    // SQLite diagnostics can contain row contents. Keep tokens out of errors.
+    FetchError::LocalSourceUnavailable("cannot read OpenCode CLI credential database".into())
+}
+
+fn read_go_credential_at(
+    database: &std::path::Path,
+    auth: &std::path::Path,
+    now_ms: i64,
+) -> Result<Option<String>, FetchError> {
+    let Some(connection) = open_database_at(database).map_err(|_| go_database_unavailable())?
+    else {
+        return read_go_legacy_at(auth);
+    };
+    let has_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'credential')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| go_database_unavailable())?;
+    if !has_table {
+        return read_go_legacy_at(auth);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT integration_id, value FROM credential
+             WHERE active = 1 AND integration_id IN ('opencode-go', 'opencode')
+             ORDER BY CASE integration_id WHEN 'opencode-go' THEN 0 ELSE 1 END LIMIT 2",
+        )
+        .map_err(|_| go_database_unavailable())?;
+    let mut rows = statement.query([]).map_err(|_| go_database_unavailable())?;
+    let Some(first) = rows.next().map_err(|_| go_database_unavailable())? else {
+        return Ok(None);
+    };
+    let integration: String = first
+        .get(0)
+        .map_err(|_| go_unusable("value is malformed"))?;
+    let value: String = first
+        .get(1)
+        .map_err(|_| go_unusable("value is malformed"))?;
+    if let Some(next) = rows.next().map_err(|_| go_database_unavailable())? {
+        let next_integration: String =
+            next.get(0).map_err(|_| go_unusable("value is malformed"))?;
+        if next_integration == integration {
+            return Err(go_unusable("has ambiguous duplicate active rows"));
+        }
+    }
+    let credential: GoCredential =
+        serde_json::from_str(&value).map_err(|_| go_unusable("value is malformed"))?;
+    // A generic Zen key does not establish a Go login; only its OAuth account
+    // can supply Go quotas. A dedicated Go row still takes precedence.
+    if integration == "opencode" && credential.kind != "oauth" {
+        return Ok(None);
+    }
+    match credential.kind.as_str() {
+        "key" => go_token(credential.key),
+        "oauth" => {
+            let expiry = credential
+                .expires
+                .ok_or_else(|| go_unusable("OAuth expiry is missing"))?;
+            if !expiry.is_finite() || expiry < 0.0 || expiry.fract() != 0.0 {
+                return Err(go_unusable("OAuth expiry is malformed"));
+            }
+            if expiry <= now_ms as f64 {
+                return Err(go_unusable("OAuth token is expired"));
+            }
+            go_token(credential.access)
+        }
+        _ => Err(go_unusable("value has an unsupported type")),
+    }
+    .map(Some)
+}
+
+#[derive(Deserialize)]
+struct GoCredential {
+    #[serde(rename = "type")]
+    kind: String,
+    key: Option<String>,
+    access: Option<String>,
+    expires: Option<f64>,
+}
+
+#[cfg(test)]
+pub(crate) mod go_tests;
+
+fn go_token(token: Option<String>) -> Result<String, FetchError> {
+    token
+        .filter(|token| {
+            !token.is_empty() && !token.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+        .ok_or_else(|| go_unusable("value has a missing or malformed bearer token"))
+}
+
+fn read_go_legacy_at(path: &std::path::Path) -> Result<Option<String>, FetchError> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(FetchError::LocalSourceUnavailable(
+                "cannot read OpenCode auth.json".into(),
+            ))
+        }
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&data).map_err(|_| go_unusable("auth.json value is malformed"))?;
+    let entries = value
+        .as_object()
+        .ok_or_else(|| go_unusable("auth.json value is malformed"))?;
+    let Some(entry) = entries.get("opencode-go") else {
+        return Ok(None);
+    };
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| go_unusable("auth.json value is malformed"))?;
+    if entry.get("type").and_then(|value| value.as_str()) != Some("api") {
+        return Ok(None);
+    }
+    go_token(
+        entry
+            .get("key")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+    )
+    .map(Some)
 }
 
 fn json_modified_ms(path: &std::path::Path) -> Result<i64, FetchError> {

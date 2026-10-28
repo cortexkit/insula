@@ -1596,6 +1596,7 @@ from the usage fetch and may fail without degrading the entry.
 | `vault` | served by the credential vault | re-authenticate that vault record |
 | `oauth` | an OAuth token or session found on this machine | log in with the tool that owns it |
 | `api` | an API key from the environment or a config file | supply or replace the key |
+| `cli` | OpenCode Go's active OpenCode CLI key or OAuth login | log in with OpenCode CLI |
 
 The set is open. `source` is observability only: one account read through two
 lanes (a local file and a vault credential) can publish `vault` on one poll and
@@ -2219,6 +2220,31 @@ against the provider's source, and every cookie family against the table),
 Some facts a consumer needs are not stated by any upstream, so they are recorded
 here as observations rather than published as wire fields. A wire field would
 assert an upstream claim indefinitely; an observation here carries its method.
+
+### OpenCode Go: active CLI login
+
+Without a vault `apikey:opencode-go` key, `OPENCODE_API_KEY`, or a deposited
+`cookie:opencode.ai` session, `opencodego` can use the active OpenCode CLI login
+as the bearer for `GET https://opencode.ai/zen/go/v1/usage`. A key suppresses
+CLI discovery entirely, and a cookie handle never falls back to the CLI's
+potentially different account. The CLI lane publishes `source: "cli"` and no
+account identity; the same rolling 5-hour, weekly and monthly windows and HTTP
+classification apply. A typed 403 `EntitlementError` is `no_quota_reported`.
+
+The CLI's read-only SQLite `credential` table selects active `opencode-go`
+before generic `opencode` OAuth. Duplicate active rows, malformed values and
+expired OAuth are `credential_unusable`, not missing credentials. An unreadable
+database is `local_source_unavailable`. Only an absent database or absent
+`credential` table permits an `opencode-go` API key from `auth.json`; no usable
+row in an existing table does not resurrect the legacy login. With both stores
+absent, the CLI lane is not enumerated. Path overrides and the `:memory:` opt-out
+are documented in [credentials.md](credentials.md).
+
+This is fixture-verified against CodexBar v0.82.0 with real SQLite databases and
+loopback HTTP, not live-verified: the development Mac has a vault key, so the
+CLI lane cannot serve there. Key precedence is defended by
+`a_vault_key_suppresses_the_cli_lane` and a `scripts/probe.py` run removing the
+vault-key guard that makes that test fail.
 
 ### Muse: idle subscription windows
 
