@@ -16,9 +16,10 @@ fixtures, comments or commit messages.
 
 ## Gate before you deliver
 
-- Run `scripts/prepush.sh` once it exists; until then, `bash scripts/gates.sh --quick` plus, on
-  Linux, the library and integration tests of every crate you touched. Filtered tests alone are
-  not a gate.
+- Run `scripts/prepush.sh`: fast local checks, then the Linux and Windows CI legs in parallel
+  on the build servers. `--fast` alone is not a delivery gate; `--linux-only` omits Windows.
+  The optional `--e2e --sibling ../subconscious` uses a built sibling daemon, never the installed
+  daemon. Filtered tests alone are not a gate.
 - A bug fix adds a test and shows it failing once without the fix (`scripts/probe.py`).
 - `cargo test -p quota-core --lib -- --list`: the total must equal the unique count. A doc comment
   inserted between a neighbour's doc comment and its `#[test]` silently unregisters that test.

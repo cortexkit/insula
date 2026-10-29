@@ -1,6 +1,71 @@
 # Verifying a change
 
-## The gates
+## The pre-push gate
+
+```sh
+scripts/prepush.sh                       # local checks, then Linux + Windows in parallel
+scripts/prepush.sh --fast                # local checks only; not a full delivery gate
+scripts/prepush.sh --linux-only          # explicitly omit Windows
+scripts/prepush.sh --e2e --sibling ../subconscious  # also CI's real-daemon proof on Linux
+```
+
+Phase 1 does not compile Rust. It uses installed stable Rust/rustfmt, Cargo,
+Python 3.11+ (with PyYAML available to `python3`), Git, Bash and `shasum`.
+It runs `gates.sh --repo-only` for path dependencies, scanner controls,
+deploy-policy dry runs, Python syntax, `bash -n`, endpoint hosts, train
+preconditions, public layout and orphan modules. The existing lock-write
+announcement remains active; `cargo metadata --locked` checks resolution first.
+It also verifies every `test-vectors/*/SHA256SUMS` from its own directory.
+`models-dev-slugs.py` is a separate network-backed audit, not an existing gate
+or CI step; it is not added to this seconds-long offline-source phase.
+
+Phase 2 requires `ck motor run`. It sends the working checkout snapshot to a
+16-vCPU Linux job and a native Windows job at the same time, streams both, and
+waits for both even if one fails. Each job installs current stable with clippy
+and rustfmt (like CI), uses `CARGO_TERM_COLOR=always`, allows dependency/toolchain
+downloads (`--net`), and has CI's 20-minute timeout. Timings are printed for
+phase 1 and each remote job. Motor must be configured and both platforms available;
+there is no host compilation fallback or silent platform skip.
+
+Exit 0 means every **requested** check passed; `--fast` and `--linux-only`
+explicitly print their reduced coverage. Exit 1 names a failing gate. Exit 2
+means a check could not run, including a missing command, motor refusal,
+lost/unknown outcome, cancellation or timeout. Neither partial option claims
+a full prepush pass. `train.sh` runs `prepush.sh --fast` before its first push;
+run the full gate before starting the train.
+
+### CI parity
+
+Source of truth: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+CI runs on master/train pushes, pull requests, daily schedules, manual dispatch
+and reusable-workflow calls. It does not fail-fast across the two OS legs.
+
+| CI step / condition | Prepush equivalent |
+|---|---|
+| Checkout insula (both) | Motor snapshots the current checkout; GitHub checkout is CI-only infrastructure. |
+| Train preconditions (Ubuntu only) | Phase 1, same checker, before any remote job. |
+| Public `.cortexkit` layout (Ubuntu only) | Phase 1, same checker and ignore controls. |
+| Checkout subconscious (Ubuntu only) | Opt-in `--e2e --sibling ../subconscious` sends the sibling snapshot to Linux. No sibling is needed by the default suites. |
+| Stable toolchain with clippy + rustfmt (both) | Phase 2 installs/updates stable on both native runners; phase 1 uses installed stable. |
+| Defender exclusions / disabling real-time monitoring (Windows only) | CI-only disposable-VM optimization. Prepush does not change build-server security settings. |
+| Rust cache for insula and subconscious (both) | CI-only cache action; motor manages its own build caches. No assertion is skipped. |
+| `cargo fmt --all -- --check` (both) | Phase 1; repeated in phase 2 on each CI toolchain/platform. |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` (both) | Phase 2, identical arguments on Linux and Windows. Phase 1 additionally checks the lock without compiling. |
+| `cargo test --workspace --all-targets` (both) | Phase 2, identical arguments on Linux and Windows, including vector drift tests. |
+| `cargo test --workspace --doc` (both) | Phase 2, separate from all-targets on both platforms. |
+| Real daemon supervision (Ubuntu only) | Phase 2 Linux **only with `--e2e`**: `cargo test -p quota-module --test it -- --ignored real_daemon_e2e::`; preserves Cargo/Rustup homes and uses isolated HOME, XDG config and state directories like CI. Never the installed daemon. |
+| `cargo run -p quota-core --example completeness-envelopes` (both) | Phase 2, identical arguments on Linux and Windows. |
+
+CI's ref-keyed concurrency cancellation and trigger scheduling stay CI-only:
+a local invocation is an explicit check of one snapshot, not a branch event.
+The real-daemon step is the only CI assertion omitted by default, because it
+requires the sibling checkout. Live provider/session tests remain ignored in
+both places; they need credentials and are not CI assertions.
+
+## Legacy host gates
+
+`gates.sh` remains available for existing host/deploy workflows. The modes and
+coverage below describe that script, not the prepush matrix above.
 
 ```sh
 scripts/gates.sh --quick  # before deploy: host lint, units, launch/wire smoke

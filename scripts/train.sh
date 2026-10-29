@@ -88,6 +88,9 @@ if git log -1 --format=%B | grep -qE '[a-z,)]  [a-z(]' &&
   exit 2
 fi
 
+# Stop before any push, including deletion of an old train branch.
+bash "$(dirname "$0")/prepush.sh" --fast || exit $?
+
 # A re-push to an existing train branch leaves TWO runs on one sha, and the
 # cancelled one can be the newer. Delete first so the sha gets exactly one.
 git push -q --delete "origin" "$branch" 2>/dev/null
