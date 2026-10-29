@@ -59,7 +59,13 @@ with (root / "cargo.jsonl").open("a") as output:
                              "state": os.environ.get("CK_QUOTA_STATE_DIR")}) + "\\n")
 sys.exit(int(os.environ.get("FMT_RC", "0")) if sys.argv[1] == "fmt" else 0)
 ''')
-        self.stub("rustup", 'print("fake stable toolchain")\n')
+        self.stub("rustup", '''
+import os, sys
+from pathlib import Path
+Path(os.environ["PREPUSH_TEST_ROOT"], "rustup-called").touch()
+print("fake stable toolchain")
+''')
+        self.stub("rustc", 'print("fake installed rustc")\n')
         self.stub("ck", '''
 import json, os, sys, time
 from pathlib import Path
@@ -119,8 +125,10 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
             self.assertIn(platform + " job finished in", result.stdout)
             self.assertTrue((self.root / (platform + ".finished")).exists())
         linux = json.loads((self.root / "linux.json").read_text())
+        windows = json.loads((self.root / "windows.json").read_text())
         self.assertEqual(linux[linux.index("--vcpus") + 1], "16")
         self.assertIn("--net", linux)
+        self.assertNotIn("--net", windows)
         self.assertEqual(linux[linux.index("--timeout") + 1], "1200")
 
     def test_linux_only_does_not_claim_full_coverage(self):
@@ -202,6 +210,8 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
                 (self.root / "cargo.jsonl").unlink(missing_ok=True)
                 result = self.run_gate("--worker-" + platform, "0")
                 self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn("fake installed rustc", result.stdout)
+                self.assertFalse((self.root / "rustup-called").exists())
                 self.assertEqual([call["args"] for call in self.cargo_calls()], [
                     ["--version"], ["fmt", "--all", "--", "--check"],
                     ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],

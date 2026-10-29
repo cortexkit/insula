@@ -21,9 +21,11 @@ or CI step; it is not added to this seconds-long offline-source phase.
 
 Phase 2 requires `ck motor run`. It sends the working checkout snapshot to a
 16-vCPU Linux job and a native Windows job at the same time, streams both, and
-waits for both even if one fails. Each job installs current stable with clippy
-and rustfmt (like CI), uses `CARGO_TERM_COLOR=always`, allows dependency/toolchain
-downloads (`--net`), and has CI's 20-minute timeout. Timings are printed for
+waits for both even if one fails. Each job uses the runner's installed toolchain
+with clippy and rustfmt, prints `rustc --version` and `cargo --version`, uses
+`CARGO_TERM_COLOR=always`, and has CI's 20-minute timeout. Only Linux requests
+network access (`--net`); Windows motor jobs do not support that flag and use
+their pre-provisioned dependencies. Timings are printed for
 phase 1 and each remote job. Motor must be configured and both platforms available;
 there is no host compilation fallback or silent platform skip.
 
@@ -46,7 +48,7 @@ and reusable-workflow calls. It does not fail-fast across the two OS legs.
 | Train preconditions (Ubuntu only) | Phase 1, same checker, before any remote job. |
 | Public `.cortexkit` layout (Ubuntu only) | Phase 1, same checker and ignore controls. |
 | Checkout subconscious (Ubuntu only) | Opt-in `--e2e --sibling ../subconscious` sends the sibling snapshot to Linux. No sibling is needed by the default suites. |
-| Stable toolchain with clippy + rustfmt (both) | Phase 2 installs/updates stable on both native runners; phase 1 uses installed stable. |
+| Stable toolchain with clippy + rustfmt (both) | Phase 2 uses each runner's installed, pinned toolchain and prints rustc/Cargo versions. CI tracks latest stable; the read-only runner may lag, so prepush cannot catch newly introduced toolchain lints. The legacy `gates.sh` newest-stable check remains available. Phase 1 uses installed stable. |
 | Defender exclusions / disabling real-time monitoring (Windows only) | CI-only disposable-VM optimization. Prepush does not change build-server security settings. |
 | Rust cache for insula and subconscious (both) | CI-only cache action; motor manages its own build caches. No assertion is skipped. |
 | `cargo fmt --all -- --check` (both) | Phase 1; repeated in phase 2 on each CI toolchain/platform. |

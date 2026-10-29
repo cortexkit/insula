@@ -25,16 +25,16 @@ gate() {
     esac
 }
 
-# Internal entry point for the snapshot sent by ck motor. Each native runner
-# updates stable just as dtolnay/rust-toolchain@stable does in GitHub Actions.
+# Internal entry point for the snapshot sent by ck motor. Build-server toolchains
+# are read-only, so record their versions rather than trying to update rustup.
 worker() {
     local platform="$1" e2e="$2" rig
     require cargo
-    require rustup
-    rustup toolchain install stable --profile minimal --component clippy --component rustfmt \
-        || cannot_check "$platform stable toolchain setup"
-    export RUSTUP_TOOLCHAIN=stable CARGO_TERM_COLOR=always
-    gate "$platform toolchain" cargo --version
+    require rustc
+    unset RUSTUP_TOOLCHAIN
+    export CARGO_TERM_COLOR=always
+    gate "$platform rustc version" rustc --version
+    gate "$platform cargo version" cargo --version
     gate "$platform format" cargo fmt --all -- --check
     gate "$platform clippy (committed lock)" cargo clippy --locked --workspace --all-targets -- -D warnings
     gate "$platform tests" cargo test --workspace --all-targets
@@ -121,9 +121,9 @@ fi
 
 remote() {
     local platform="$1" start=$SECONDS rc
-    local args=(--platform "$platform" --net --timeout 1200)
+    local args=(--platform "$platform" --timeout 1200)
     if [ "$platform" = linux ]; then
-        args+=(--vcpus 16)
+        args+=(--vcpus 16 --net)
         [ "$E2E" -eq 0 ] || args+=(--sibling "$SIBLING")
     fi
     echo "  starting $platform CI leg"
