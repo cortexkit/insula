@@ -29,6 +29,15 @@ their pre-provisioned dependencies. Timings are printed for
 phase 1 and each remote job. Motor must be configured and both platforms available;
 there is no host compilation fallback or silent platform skip.
 
+Motor can omit Git metadata from a snapshot (currently the Windows runner does).
+The caller sends its NUL-delimited tracked Markdown list as a base64 motor
+environment value. When `.git` is absent, the worker builds a temporary Git index
+from only those paths still present in the snapshot and scopes it to the
+all-targets test command. This lets the document-reference test use real
+`git ls-files` without allowing an untracked document to legitimize a link.
+No synthetic `.git` is placed in the workspace or exposed to other commands;
+module build provenance continues to report the snapshot's missing metadata.
+
 Exit 0 means every **requested** check passed; `--fast` and `--linux-only`
 explicitly print their reduced coverage. Exit 1 names a failing gate. Exit 2
 means a check could not run, including a missing command, motor refusal,
@@ -44,7 +53,7 @@ and reusable-workflow calls. It does not fail-fast across the two OS legs.
 
 | CI step / condition | Prepush equivalent |
 |---|---|
-| Checkout insula (both) | Motor snapshots the current checkout; GitHub checkout is CI-only infrastructure. |
+| Checkout insula (both) | Motor snapshots the current checkout; GitHub checkout is CI-only infrastructure. When motor omits `.git`, the caller's tracked Markdown list supplies a test-scoped temporary Git index for the document-reference resolver. |
 | Train preconditions (Ubuntu only) | Phase 1, same checker, before any remote job. |
 | Public `.cortexkit` layout (Ubuntu only) | Phase 1, same checker and ignore controls. |
 | Checkout subconscious (Ubuntu only) | Opt-in `--e2e --sibling ../subconscious` sends the sibling snapshot to Linux. No sibling is needed by the default suites. |

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check gate orchestration with fake tools, never starting a remote job."""
 
+import base64
 import hashlib
 import json
 import os
@@ -25,11 +26,22 @@ class PrepushTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="prepush-test-", dir=scratch)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.env = os.environ.copy()
+        for key in list(self.env):
+            if key.startswith("GIT_"):
+                self.env.pop(key)
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
         (self.root / "scripts").mkdir()
         shutil.copyfile(SOURCE, self.root / "scripts/prepush.sh")
         (self.root / "scripts/gates.sh").write_text(
             '#!/bin/bash\nprintf "repo checks %s\\n" "$*"\nexit "${REPO_RC:-0}"\n'
         )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/tracked.md").write_text("tracked snapshot content\n")
+        (self.root / "docs/space name.md").write_text("another tracked document\n")
+        subprocess.run(["git", "init", "--quiet", str(self.root)], env=self.env, check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "--",
+                        "docs/tracked.md", "docs/space name.md"], env=self.env, check=True)
         for version in ("v1", "v2"):
             folder = self.root / "test-vectors" / version
             folder.mkdir(parents=True)
@@ -41,22 +53,26 @@ class PrepushTests(unittest.TestCase):
         # A closed PATH proves the missing-ck case even on a configured host.
         for tool in ("bash", "python3", "git", "shasum", "cut", "find", "sort",
                      "wc", "tr", "basename", "mktemp", "mkdir", "rm", "grep",
-                     "sed", "env", "dirname"):
+                     "sed", "env", "dirname", "base64"):
             location = shutil.which(tool)
             assert location is not None, f"{tool} is required"
             (self.bin / tool).symlink_to(location)
-        self.env = os.environ.copy()
         self.env.update(PATH=str(self.bin), PREPUSH_TEST_ROOT=str(self.root))
         for key in ("FMT_RC", "REPO_RC", "LINUX_RC", "WINDOWS_RC", "PARALLEL"):
             self.env.pop(key, None)
         self.stub("cargo", '''
-import json, os, sys
+import json, os, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["PREPUSH_TEST_ROOT"])
+tracked = None
+if os.environ.get("VERIFY_DOC_INDEX") and sys.argv[1:] == ["test", "--workspace", "--all-targets"]:
+    tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
 with (root / "cargo.jsonl").open("a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "home": os.environ.get("HOME"),
                              "cargo_home": os.environ.get("CARGO_HOME"),
-                             "state": os.environ.get("CK_QUOTA_STATE_DIR")}) + "\\n")
+                             "state": os.environ.get("CK_QUOTA_STATE_DIR"),
+                             "tracked": tracked,
+                             "git_dir": os.environ.get("GIT_DIR")}) + "\\n")
 sys.exit(int(os.environ.get("FMT_RC", "0")) if sys.argv[1] == "fmt" else 0)
 ''')
         self.stub("rustup", '''
@@ -130,6 +146,9 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
         self.assertIn("--net", linux)
         self.assertNotIn("--net", windows)
         self.assertEqual(linux[linux.index("--timeout") + 1], "1200")
+        manifest = next(arg for arg in windows if arg.startswith("CK_PREPUSH_TRACKED_DOCS="))
+        self.assertEqual(base64.b64decode(manifest.split("=", 1)[1]),
+                         b"docs/space name.md\0docs/tracked.md\0")
 
     def test_linux_only_does_not_claim_full_coverage(self):
         result = self.run_gate("--linux-only")
@@ -231,6 +250,32 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
         self.assertNotEqual(daemon["home"], original_home)
         self.assertEqual(daemon["state"], daemon["home"] + "/state")
         self.assertEqual(daemon["cargo_home"], original_home + "/.cargo")
+
+    def test_snapshot_without_git_gets_only_present_tracked_docs_during_tests(self):
+        shutil.rmtree(self.root / ".git")
+        (self.root / "docs/untracked.md").write_text("must not become a valid target\n")
+        paths = b"docs/tracked.md\0docs/space name.md\0docs/deleted.md\0"
+        self.env["CK_PREPUSH_TRACKED_DOCS"] = base64.b64encode(paths).decode("ascii")
+        self.env["VERIFY_DOC_INDEX"] = "1"
+        result = self.run_gate("--worker-windows", "0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        calls = self.cargo_calls()
+        test = next(call for call in calls if call["args"] == ["test", "--workspace", "--all-targets"])
+        self.assertEqual(test["tracked"], ["docs/space name.md", "docs/tracked.md"])
+        self.assertIsNotNone(test["git_dir"])
+        self.assertTrue(all(call["git_dir"] is None for call in calls if call is not test))
+        self.assertFalse((self.root / ".git").exists(), "build provenance must not see a synthetic .git")
+
+    def test_snapshot_without_git_refuses_missing_or_empty_tracked_manifest(self):
+        shutil.rmtree(self.root / ".git")
+        for manifest in ("", base64.b64encode(b"docs/deleted.md\0").decode("ascii")):
+            with self.subTest(manifest=manifest):
+                self.env["CK_PREPUSH_TRACKED_DOCS"] = manifest
+                result = self.run_gate("--worker-windows", "0")
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("COULD NOT CHECK: windows", result.stdout)
+                self.assertFalse(any(call["args"] == ["test", "--workspace", "--all-targets"]
+                                     for call in self.cargo_calls()))
 
     def test_train_stops_before_any_push_when_fast_gate_cannot_pass(self):
         shutil.copyfile(SOURCE.with_name("train.sh"), self.root / "scripts/train.sh")

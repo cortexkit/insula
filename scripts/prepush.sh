@@ -25,6 +25,37 @@ gate() {
     esac
 }
 
+workspace_tests() {
+    local platform="$1" index_dir path
+    local docs=()
+    if [ -e .git ]; then
+        gate "$platform tests" cargo test --workspace --all-targets
+        return
+    fi
+
+    # Some motor snapshots omit .git. The documentation resolver deliberately
+    # requires tracked targets, so give only the test command a real Git index
+    # populated from the caller's tracked Markdown, never from untracked files.
+    # Keep .git out of the workspace so build provenance still reports no_git_dir.
+    for tool in git base64 mktemp mkdir env; do require "$tool"; done
+    [ -n "${CK_PREPUSH_TRACKED_DOCS:-}" ] || cannot_check "$platform tracked Markdown manifest missing"
+    mkdir -p target/scratch || cannot_check "$platform index scratch directory"
+    index_dir="$(mktemp -d "$ROOT/target/scratch/prepush-index.XXXXXX")" \
+        || cannot_check "$platform index scratch directory"
+    printf '%s' "$CK_PREPUSH_TRACKED_DOCS" | base64 --decode >"$index_dir/paths" \
+        || cannot_check "$platform tracked Markdown manifest decoding"
+    while IFS= read -r -d '' path; do
+        [ -f "$path" ] && docs+=("$path")
+    done <"$index_dir/paths"
+    [ "${#docs[@]}" -gt 0 ] || cannot_check "$platform no tracked Markdown present in snapshot"
+    git init --bare --quiet "$index_dir/git" || cannot_check "$platform temporary Git repository"
+    git --git-dir="$index_dir/git" --work-tree="$ROOT" --literal-pathspecs \
+        add --force -- "${docs[@]}" || cannot_check "$platform tracked Markdown index"
+    printf '  %s tracked Markdown index: %s files\n' "$platform" "${#docs[@]}"
+    gate "$platform tests" env GIT_DIR="$index_dir/git" GIT_WORK_TREE="$ROOT" \
+        GIT_INDEX_FILE="$index_dir/git/index" cargo test --workspace --all-targets
+}
+
 # Internal entry point for the snapshot sent by ck motor. Build-server toolchains
 # are read-only, so record their versions rather than trying to update rustup.
 worker() {
@@ -37,7 +68,7 @@ worker() {
     gate "$platform cargo version" cargo --version
     gate "$platform format" cargo fmt --all -- --check
     gate "$platform clippy (committed lock)" cargo clippy --locked --workspace --all-targets -- -D warnings
-    gate "$platform tests" cargo test --workspace --all-targets
+    workspace_tests "$platform"
     gate "$platform doctests" cargo test --workspace --doc
     if [ "$e2e" -eq 1 ]; then
         # Keep toolchain paths before hiding HOME, exactly as CI's daemon step
@@ -119,9 +150,15 @@ if [ "$FAST" -eq 1 ]; then
     exit 0
 fi
 
+require base64
+TRACKED_DOCS="$(git ls-files -z -- '*.md' | base64 | tr -d '\r\n')" \
+    || cannot_check "capture tracked Markdown for snapshot tests"
+[ -n "$TRACKED_DOCS" ] || cannot_check "no tracked Markdown to send to snapshot tests"
+
 remote() {
     local platform="$1" start=$SECONDS rc
     local args=(--platform "$platform" --timeout 1200)
+    args+=(--env "CK_PREPUSH_TRACKED_DOCS=$TRACKED_DOCS")
     if [ "$platform" = linux ]; then
         args+=(--vcpus 16 --net)
         [ "$E2E" -eq 0 ] || args+=(--sibling "$SIBLING")
