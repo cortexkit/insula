@@ -14,8 +14,8 @@ import unittest
 
 SOURCE = Path(__file__).resolve().with_name("prepush.sh")
 ROOT = SOURCE.parent.parent
-BASH = shutil.which("bash")
-assert BASH is not None, "bash is required"
+BASH = shutil.which("bash") or ""
+assert BASH, "bash is required"
 
 
 class PrepushTests(unittest.TestCase):
