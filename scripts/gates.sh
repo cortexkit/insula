@@ -7,6 +7,7 @@
 #   scripts/gates.sh          fmt, clippy, unit tests
 #   scripts/gates.sh --quick  host clippy, unit tests, launch/wire smoke, repo checks
 #   scripts/gates.sh --e2e    also the integration suites (adds ~80s)
+#   scripts/gates.sh --repo-only  non-compiling repository checks only
 #
 # Exit codes match every other checker here: 0 clean, 1 a gate failed, 2 could
 # not check.
@@ -17,20 +18,33 @@ cd "$(dirname "$0")/.." || { echo "  cannot reach the workspace root" >&2; exit 
 
 WITH_E2E=0
 QUICK=0
+REPO_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --e2e) WITH_E2E=1 ;;
         --quick) QUICK=1 ;;
+        --repo-only) REPO_ONLY=1 ;;
         *) echo "  unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
-if [ "$QUICK" -eq 1 ] && [ "$WITH_E2E" -eq 1 ]; then
-    echo "  --quick and --e2e are separate modes" >&2
+if [ "$((QUICK + WITH_E2E + REPO_ONLY))" -gt 1 ]; then
+    echo "  --quick, --e2e and --repo-only are separate modes" >&2
     exit 2
 fi
 
 step() { printf '\n  == %s\n' "$1"; }
 fail() { printf '\n  GATE FAILED: %s\n' "$1" >&2; exit 1; }
+repo_check() {
+    local label="$1" rc
+    shift
+    "$@"
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2|126|127) echo "  COULD NOT CHECK: $label (exit $rc)" >&2; exit 2 ;;
+        *) fail "$label" ;;
+    esac
+}
 
 step "repository path dependencies"
 # Python 3.11's standard TOML parser also sees unused Cargo patches, which
@@ -42,15 +56,18 @@ for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
         break
     fi
 done
-[ -n "$TOML_PYTHON" ] || fail "path dependency check requires Python 3.11 or newer"
+[ -n "$TOML_PYTHON" ] || { echo "  COULD NOT CHECK: path dependencies require Python 3.11 or newer" >&2; exit 2; }
 "$TOML_PYTHON" --version
-"$TOML_PYTHON" scripts/path-dependencies.py || fail "repository path dependencies"
+repo_check "repository path dependencies" "$TOML_PYTHON" scripts/path-dependencies.py
 
 step "mutation scan controls"
-bash scripts/mutation-scans.sh || fail "planted scanner violations"
+repo_check "planted scanner violations" bash scripts/mutation-scans.sh
 
 step "deploy policy dry-run tests"
-python3 scripts/deploy-tests.py || fail "deploy policy"
+repo_check "deploy policy" python3 scripts/deploy-tests.py
+
+step "prepush orchestration tests"
+repo_check "prepush orchestration" python3 scripts/prepush-tests.py
 
 # Cargo commands without --locked can rewrite Cargo.lock after a local manifest
 # edit. Announce any write so it is reviewed as a dependency change rather than
@@ -125,7 +142,7 @@ step "endpoint host manifest"
 # and compares against a recorded host per module. No network, no build, sub-second.
 # It matches a CONSTRUCT rather than a name, so a comment mentioning a host cannot
 # manufacture an entry -- the failure mode that broke a fleet census the same day.
-python3 scripts/endpoint-hosts.py || fail "endpoint host manifest is out of date"
+repo_check "endpoint host manifest" python3 scripts/endpoint-hosts.py
 
 step "train preconditions"
 # Same reasoning as the endpoint manifest above: RUN rather than trusted. These
@@ -136,11 +153,12 @@ step "train preconditions"
 #
 # Here as well as in CI because a workflow edit should fail before the push that
 # carries it, not on the run it breaks.
-./scripts/check-train-preconditions.sh || fail "train preconditions drifted"
+repo_check "train preconditions" bash scripts/check-train-preconditions.sh
 
 step "public .cortexkit layout"
-./scripts/check-cortexkit-layout.sh || fail "disallowed .cortexkit tracking or missing ignore controls"
+repo_check "public .cortexkit layout" bash scripts/check-cortexkit-layout.sh
 
+if [ "$REPO_ONLY" -eq 0 ]; then
 step "cargo fmt --check"
 cargo fmt --check || fail "formatting"
 
@@ -236,6 +254,7 @@ if [ "$WITH_E2E" -eq 1 ]; then
 
     step "cargo test -p quota-module --test it skeleton_e2e::"
     cargo test -p quota-module --test it skeleton_e2e:: || fail "skeleton_e2e"
+fi
 fi
 
 # A .rs file that no `mod` declaration reaches is compiled by NOTHING: cargo never

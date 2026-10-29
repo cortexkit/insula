@@ -128,8 +128,8 @@ fn main() {
     println!(
         "cargo:rustc-env=CK_QUOTA_PROVENANCE_SHA={}",
         // head_commit takes the GIT DIR (which for a worktree is not under the
-        // worktree root at all); tree_clean and lock_digest take the WORKTREE
-        // ROOT. Two different paths, and passing one to the other compiles fine
+        // worktree root at all); tree_clean takes the WORKTREE ROOT.
+        // Two different paths, and passing one to the other compiles fine
         // and yields None on every worktree build.
         match (clean, locate_git_dir().as_deref().and_then(head_commit)) {
             // The ONLY case that may state a commit: we looked, and it was clean.
@@ -147,9 +147,10 @@ fn main() {
     );
     println!(
         "cargo:rustc-env=CK_QUOTA_LOCK_DIGEST={}",
-        worktree
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
             .as_deref()
-            .and_then(lock_digest)
+            .and_then(lock_digest_from_manifest)
             .unwrap_or_default()
     );
 }
@@ -225,10 +226,16 @@ fn tree_clean(worktree_root: &Path) -> Option<bool> {
 /// The width matters too: subc-protocol validates this as exactly 64 hex, and a
 /// 16-hex value false-drifts a fleet census against modules publishing full
 /// digests.
-fn lock_digest(worktree_root: &Path) -> Option<String> {
+fn lock_digest(workspace_root: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let text = std::fs::read(worktree_root.join("Cargo.lock")).ok()?;
+    let text = std::fs::read(workspace_root.join("Cargo.lock")).ok()?;
     Some(format!("{:x}", Sha256::digest(&text)))
+}
+
+/// A source archive still has the workspace lockfile even when it has no Git
+/// metadata. Locate the lock from the package, independently of Git provenance.
+fn lock_digest_from_manifest(manifest_dir: &Path) -> Option<String> {
+    lock_digest(manifest_dir.parent()?.parent()?)
 }
 
 fn is_stamp(raw: &str) -> bool {
@@ -343,4 +350,41 @@ fn read_sha(path: &Path) -> Option<String> {
 
 fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Workspace(PathBuf);
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn lock_digest_survives_a_gitless_workspace() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = Workspace(
+            std::env::temp_dir().join(format!("insula-build-lock-{}-{nonce}", std::process::id())),
+        );
+        let manifest_dir = workspace.0.join("crates/quota-module");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        assert!(manifest_dir
+            .ancestors()
+            .all(|dir| !dir.join(".git").exists()));
+        // The standard SHA-256 test vector makes the expected digest independent
+        // of the build script's hash implementation and lockfile path selection.
+        std::fs::write(workspace.0.join("Cargo.lock"), b"abc").unwrap();
+
+        assert_eq!(
+            lock_digest_from_manifest(&manifest_dir).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
 }
