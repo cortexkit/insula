@@ -30,8 +30,11 @@ phase 1 and each remote job. Motor must be configured and both platforms availab
 there is no host compilation fallback or silent platform skip.
 
 Motor can omit Git metadata from a snapshot (currently the Windows runner does).
-The caller sends its NUL-delimited tracked Markdown list as a base64 motor
-environment value. When `.git` is absent, the worker builds a temporary Git index
+The caller writes its NUL-delimited tracked Markdown list to a unique, untracked, non-ignored
+`.prepush-tracked-docs.*` file at the workspace root so motor includes it in the
+snapshot. The caller removes it after both jobs finish. The worker moves its copy
+under ignored scratch before Cargo runs so it cannot dirty module provenance.
+When `.git` is absent, the worker builds a temporary Git index
 from only those paths still present in the snapshot and scopes it to the
 all-targets test command. This lets the document-reference test use real
 `git ls-files` without allowing an untracked document to legitimize a link.

@@ -37,16 +37,15 @@ workspace_tests() {
     # requires tracked targets, so give only the test command a real Git index
     # populated from the caller's tracked Markdown, never from untracked files.
     # Keep .git out of the workspace so build provenance still reports no_git_dir.
-    for tool in git base64 mktemp mkdir env; do require "$tool"; done
-    [ -n "${CK_PREPUSH_TRACKED_DOCS:-}" ] || cannot_check "$platform tracked Markdown manifest missing"
+    for tool in git mktemp mkdir env; do require "$tool"; done
+    [ -n "${DOC_MANIFEST:-}" ] && [ -s "$DOC_MANIFEST" ] \
+        || cannot_check "$platform tracked Markdown manifest missing"
     mkdir -p target/scratch || cannot_check "$platform index scratch directory"
     index_dir="$(mktemp -d "$ROOT/target/scratch/prepush-index.XXXXXX")" \
         || cannot_check "$platform index scratch directory"
-    printf '%s' "$CK_PREPUSH_TRACKED_DOCS" | base64 --decode >"$index_dir/paths" \
-        || cannot_check "$platform tracked Markdown manifest decoding"
     while IFS= read -r -d '' path; do
         [ -f "$path" ] && docs+=("$path")
-    done <"$index_dir/paths"
+    done <"$DOC_MANIFEST"
     [ "${#docs[@]}" -gt 0 ] || cannot_check "$platform no tracked Markdown present in snapshot"
     git init --bare --quiet "$index_dir/git" || cannot_check "$platform temporary Git repository"
     git --git-dir="$index_dir/git" --work-tree="$ROOT" --literal-pathspecs \
@@ -59,7 +58,15 @@ workspace_tests() {
 # Internal entry point for the snapshot sent by ck motor. Build-server toolchains
 # are read-only, so record their versions rather than trying to update rustup.
 worker() {
-    local platform="$1" e2e="$2" rig
+    local platform="$1" e2e="$2" manifest="$3" rig
+    for tool in mkdir mktemp mv; do require "$tool"; done
+    [ -f "$manifest" ] || cannot_check "$platform tracked Markdown manifest missing"
+    mkdir -p target/scratch || cannot_check "$platform manifest scratch directory"
+    DOC_MANIFEST="$(mktemp "$ROOT/target/scratch/prepush-docs.XXXXXX")" \
+        || cannot_check "$platform manifest scratch file"
+    # The untracked file must travel in the snapshot, but must not make module
+    # provenance dirty. Move it under ignored scratch before any Cargo command.
+    mv -- "$manifest" "$DOC_MANIFEST" || cannot_check "$platform tracked Markdown manifest staging"
     require cargo
     require rustc
     unset RUSTUP_TOOLCHAIN
@@ -87,11 +94,11 @@ worker() {
 
 case "${1:-}" in
     --worker-linux|--worker-windows)
-        [ "$#" -eq 2 ] || cannot_check "invalid worker arguments"
+        [ "$#" -eq 3 ] || cannot_check "invalid worker arguments"
         case "$2" in 0|1) ;; *) cannot_check "invalid worker e2e flag" ;; esac
         platform="${1#--worker-}"
         [ "$platform" = linux ] || [ "$2" -eq 0 ] || cannot_check "e2e is Linux-only"
-        worker "$platform" "$2"
+        worker "$platform" "$2" "$3"
         exit 0 ;;
 esac
 
@@ -132,7 +139,8 @@ export RUSTUP_TOOLCHAIN=stable PYTHONDONTWRITEBYTECODE=1
 rustup run stable rustfmt --version || cannot_check "install stable with rustfmt for phase 1"
 mkdir -p "$ROOT/target/scratch" || cannot_check "local scratch directory"
 scratch="$(mktemp -d "$ROOT/target/scratch/prepush.XXXXXX")" || cannot_check "local scratch directory"
-trap 'rm -rf "$scratch"' EXIT
+manifest=""
+trap 'rm -rf "$scratch"; [ -z "$manifest" ] || rm -f -- "$manifest"' EXIT
 export TMPDIR="$scratch"
 
 metadata() { cargo metadata --locked --format-version 1 >"$scratch/metadata.json"; }
@@ -150,21 +158,21 @@ if [ "$FAST" -eq 1 ]; then
     exit 0
 fi
 
-require base64
-TRACKED_DOCS="$(git ls-files -z -- '*.md' | base64 | tr -d '\r\n')" \
-    || cannot_check "capture tracked Markdown for snapshot tests"
-[ -n "$TRACKED_DOCS" ] || cannot_check "no tracked Markdown to send to snapshot tests"
+# Ignored paths are not transported by every runner. This unique root file is
+# intentionally untracked and non-ignored until both snapshot jobs have finished.
+manifest="$(mktemp .prepush-tracked-docs.XXXXXX)" || cannot_check "tracked Markdown manifest file"
+git ls-files -z -- '*.md' >"$manifest" || cannot_check "capture tracked Markdown for snapshot tests"
+[ -s "$manifest" ] || cannot_check "no tracked Markdown to send to snapshot tests"
 
 remote() {
     local platform="$1" start=$SECONDS rc
     local args=(--platform "$platform" --timeout 1200)
-    args+=(--env "CK_PREPUSH_TRACKED_DOCS=$TRACKED_DOCS")
     if [ "$platform" = linux ]; then
         args+=(--vcpus 16 --net)
         [ "$E2E" -eq 0 ] || args+=(--sibling "$SIBLING")
     fi
     echo "  starting $platform CI leg"
-    ck motor run "${args[@]}" -- bash scripts/prepush.sh "--worker-$platform" "$([ "$platform" = linux ] && echo "$E2E" || echo 0)"
+    ck motor run "${args[@]}" -- bash scripts/prepush.sh "--worker-$platform" "$([ "$platform" = linux ] && echo "$E2E" || echo 0)" "$manifest"
     rc=$?
     printf '\n  %s job finished in %ss (exit %s)\n' "$platform" "$((SECONDS - start))" "$rc"
     case "$rc" in
