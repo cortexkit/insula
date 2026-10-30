@@ -7,7 +7,7 @@ fixtures, comments or commit messages.
 
 ## Build and test remotely
 
-- Run builds, tests and lint on the build server: `runon: "linux,8c"`, or `linux,16c` for
+- Run builds, tests and lint on the build server: `runon: "linux,4c"` for tests and lint, `linux,8c` for
   whole-workspace jobs. Use `runon: "windows"` when you touch paths, file I/O, process spawning
   or `cfg(windows)` code; Windows has been insula's most common CI-only failure.
 - On this Mac, run only what needs macOS, at `nice -n 10`.

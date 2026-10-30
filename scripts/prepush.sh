@@ -168,7 +168,9 @@ remote() {
     local platform="$1" start=$SECONDS rc
     local args=(--platform "$platform" --timeout 1200)
     if [ "$platform" = linux ]; then
-        args+=(--vcpus 16 --net)
+        # A job holds every slot it asks for, so ask for what a full workspace
+        # build keeps busy (the build servers' guidance: 8 for that).
+        args+=(--vcpus 8 --net)
         [ "$E2E" -eq 0 ] || args+=(--sibling "$SIBLING")
     fi
     echo "  starting $platform CI leg"

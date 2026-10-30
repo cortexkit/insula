@@ -20,7 +20,7 @@ It also verifies every `test-vectors/*/SHA256SUMS` from its own directory.
 or CI step; it is not added to this seconds-long offline-source phase.
 
 Phase 2 requires `ck motor run`. It sends the working checkout snapshot to a
-16-vCPU Linux job and a native Windows job at the same time, streams both, and
+8-vCPU Linux job and a native Windows job at the same time, streams both, and
 waits for both even if one fails. Each job uses the runner's installed toolchain
 with clippy and rustfmt, prints `rustc --version` and `cargo --version`, uses
 `CARGO_TERM_COLOR=always`, and has CI's 20-minute timeout. Only Linux requests
