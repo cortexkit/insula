@@ -523,9 +523,7 @@ async fn read_installed_snapshot(stream: &mut TcpStream) -> Result<SnapshotReadb
 }
 
 async fn open_usage_route(stream: &mut TcpStream) -> Result<common::Route, String> {
-    let project_root = std::env::current_dir()
-        .map_err(|error| format!("could not resolve checker working directory: {error}"))?;
-    let identity = BindIdentity::new(project_root, "vault-lanes", "readback-check");
+    let identity = BindIdentity::new("vault-lanes", "readback-check");
     let target = RouteTarget::ManagementSurface {
         module_id: common::MODULE_ID.to_string(),
     };

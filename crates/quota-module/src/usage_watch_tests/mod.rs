@@ -532,7 +532,7 @@ async fn bind_writer(wire: &mut Wire, principal: Value, epoch: u32) {
     // attests the scope owner, not the module sending requests on this route.
     let body = json!({"op":"route.bind","route_channel":5,"epoch":epoch,
         "target":{"kind":"management_surface","module_id":"insula"},
-        "identity":{"project_root":"/tmp/x","harness":"prefrontal-routing","session":"s"},
+        "identity":{"harness":"prefrontal-routing","session":"s"},
         "principal":principal,
         "scope":{"owner":{"kind":"reserved","module_id":"prefrontal-routing"},
             "ref":"head","scope_epoch":1,"kind":"worker","owner_authorized":true}});

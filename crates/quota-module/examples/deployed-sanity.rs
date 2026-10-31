@@ -40,7 +40,7 @@ async fn main() {
 
     let mut stream = common::connect_consumer(&path).await;
     common::wait_for_catalog(&mut stream, common::MODULE_ID, Duration::from_secs(10)).await;
-    let route = common::route_open(&mut stream, &std::env::temp_dir(), 1).await;
+    let route = common::route_open(&mut stream, 1).await;
     // Called BEFORE usage.get so a broken drops op cannot hide behind a clean
     // usage report. Shipping an operation and verifying only the neighbouring one
     // is how a fix looked complete for a week in August: the tests drove a path

@@ -804,8 +804,9 @@ impl ClientState {
                 "kind": "management_surface",
                 "module_id": self.target_module,
             },
+            // No project: since subc-protocol 0.34 a route's project comes only
+            // from a session scope, and this route is a module's own, unscoped.
             "identity": {
-                "project_root": "/",
                 "harness": "ck-quota",
                 "session": "vault-consumer",
             },

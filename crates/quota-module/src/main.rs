@@ -11,7 +11,8 @@
 //!
 //! The module is machine-global: it reads each provider's own on-disk session
 //! (`~/.codex/auth.json`, ...) regardless of the relayed bind identity, so it
-//! declares an empty identity scope and ignores `project_root`.
+//! declares an empty identity scope and `bind-no-project/v1`: it reads no
+//! project from the bind.
 
 // From the library target rather than `mod`, so the binary and any example use
 // ONE compiled copy. Declaring `mod` here as well would build the same source
@@ -42,9 +43,9 @@ use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
-        Concurrency, ConsumerRole, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
-        SignalCadence, TrustTier,
+        CapabilityDeclarations, Concurrency, ConsumerRole, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, SelfSignalDeclaration,
+        SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, TrustTier,
     },
     session::{
         HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -2021,23 +2022,22 @@ fn manifest(
     .provenance(build_provenance().ok().map(|provenance| {
         provenance.with_launch_nonce_source(launch_nonce_source.map(launch_nonce_source_wire))
     }))
-    .capabilities(
-        // No versioned capability grammar declared. `None` and an empty block are
-        // NOT the same statement: the protocol makes this optional precisely so a
-        // module can say nothing, and the daemon VALIDATES a present block before
-        // accepting a HELLO -- so an inaccurate declaration is a module that does
-        // not come up, which is worse than one that stays silent.
+    .capabilities(Some(CapabilityDeclarations {
+        // `bind-no-project/v1`: insula reads no project field from `route.bind`.
+        // Every op answers machine-wide quota keyed on accounts, and admission
+        // reads the attested principal and the scope's agent, never a folder.
+        // Declaring it tells the daemon to stop filling a project in for us.
         //
-        // Saying nothing is currently the accurate answer. The tempting entry is a
-        // `requires` on the credential vault, since vault lanes go dark without
-        // claustrum -- but that would be wrong twice over: this module degrades
+        // The daemon VALIDATES this block before accepting a HELLO, so an
+        // inaccurate entry is a module that does not come up. The tempting
+        // `requires` on the credential vault stays out: this module degrades
         // rather than fails without it (local lanes keep fetching, and the vault
-        // client retries a refused route indefinitely by design), and I have not
-        // established what the daemon's validation does with an unsatisfied
-        // requirement. Declaring a dependency I have not verified the semantics of
-        // trades a working module for a tidier manifest.
-        None,
-    )
+        // client retries a refused route indefinitely by design), and an
+        // unsatisfied requirement's effect on admission is unverified.
+        provides: vec![subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string()],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    }))
     .build()
 }
 
@@ -2349,6 +2349,23 @@ mod tests {
             "the manifest advertises what catalog.list shows a consumer; an \
              operation listed here and not dispatched answers `unknown method` \
              to a caller who read the catalog and did nothing wrong"
+        );
+    }
+
+    /// insula reads no project from `route.bind`, and says so. Without the
+    /// declaration, openers that move to protocol 0.34 wait on insula before
+    /// sending project-free routes, and the daemon keeps filling a placeholder.
+    /// The block is validated at HELLO, so it must hold exactly this one entry.
+    #[test]
+    fn the_manifest_declares_it_reads_no_bind_project() {
+        let m = manifest("insula", None);
+        assert_eq!(
+            m.capabilities,
+            Some(CapabilityDeclarations {
+                provides: vec!["bind-no-project/v1".to_string()],
+                requires: Vec::new(),
+                must_never_reach: Vec::new(),
+            })
         );
     }
 
@@ -3521,7 +3538,7 @@ mod tests {
             "route_channel": 7,
             "epoch": 1,
             "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
-            "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
+            "identity": { "harness": "test", "session": "s1" }
         });
         let frame = Frame::build_with_version(
             PROTOCOL_VERSION,
@@ -3578,7 +3595,7 @@ mod tests {
             "route_channel": 7,
             "epoch": 1,
             "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
-            "identity": { "project_root": "/tmp/x", "harness": "test", "session": "s1" }
+            "identity": { "harness": "test", "session": "s1" }
         });
         bind["scope"] = serde_json::to_value(&stamp).unwrap();
         assert_eq!(

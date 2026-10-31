@@ -154,9 +154,7 @@ async fn real_subc_daemon_supervises_quota_module_and_routes_usage_get() {
     // The daemon spawns the module asynchronously; poll the catalog until it lands.
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("quota-real-daemon-project");
-    std::fs::create_dir_all(&project_root).unwrap();
-    let route = route_open(&mut consumer, &project_root, 1).await;
+    let route = route_open(&mut consumer, 1).await;
 
     // Serving is cache-only: the module returns whatever its background
     // refresher has resolved so far, so poll until the first sweep warms the
@@ -186,8 +184,6 @@ async fn real_subc_daemon_supervises_quota_module_and_routes_usage_get() {
         !result.is_empty(),
         "expected the provider registry to return entries (healthy or degraded)"
     );
-
-    let _ = std::fs::remove_dir_all(&project_root);
 }
 
 /// The module-level error contract holds through a REAL daemon too: an unknown
@@ -199,9 +195,7 @@ async fn real_daemon_unknown_method_returns_error_frame() {
     let mut consumer = connect_consumer(&daemon.connection_file).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("quota-real-daemon-err");
-    std::fs::create_dir_all(&project_root).unwrap();
-    let route = route_open(&mut consumer, &project_root, 1).await;
+    let route = route_open(&mut consumer, 1).await;
 
     let frame = raw_route_frame(
         &mut consumer,
@@ -217,6 +211,4 @@ async fn real_daemon_unknown_method_returns_error_frame() {
     );
     let body: subc_protocol::ErrorBody = serde_json::from_slice(&frame.body).unwrap();
     assert_eq!(body.code, "unknown_method");
-
-    let _ = std::fs::remove_dir_all(&project_root);
 }

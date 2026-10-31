@@ -232,22 +232,16 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
     }
 }
 
-fn json_route_open(project_root: &Path) -> Value {
+fn json_route_open() -> Value {
     let target = RouteTarget::ManagementSurface {
         module_id: MODULE_ID.to_string(),
     };
     // Constructed rather than written as a literal: upstream made this
     // `#[non_exhaustive]` so an added identity field does not force every
-    // construction site in the fleet to migrate.
-    //
-    // `project_id` is deliberately left absent by the constructor, and that is the
-    // honest value here rather than a gap to fill in later. Absent means "no stable
-    // id, key on the triple" rather than "unknown", and the upstream contract is
-    // that a producer answers for a session consistently -- a driver that sometimes
-    // sent an id and sometimes did not would fork the consumer's lineage into
-    // separate stores with no error at either end. A test harness has no registered
-    // project, so consistently absent is both true and stable.
-    let identity = BindIdentity::new(project_root.to_path_buf(), "quota-e2e", "session-1");
+    // construction site in the fleet to migrate. Since subc-protocol 0.34 a
+    // route carries no project of its own (a route's project comes only from a
+    // session scope), and insula reads none, so the test route opens unscoped.
+    let identity = BindIdentity::new("quota-e2e", "session-1");
     serde_json::json!({
         "op": "route.open",
         "target": target,
@@ -256,8 +250,8 @@ fn json_route_open(project_root: &Path) -> Value {
 }
 
 /// `route.open` the management surface; returns the route `(channel, epoch)`.
-pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> Route {
-    let frame = control_rpc(stream, corr, json_route_open(project_root)).await;
+pub async fn route_open(stream: &mut TcpStream, corr: u64) -> Route {
+    let frame = control_rpc(stream, corr, json_route_open()).await;
     assert_eq!(
         frame.header.ty,
         FrameType::Response,

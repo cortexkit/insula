@@ -96,7 +96,7 @@ pub(super) async fn call(wire: &mut Wire, epoch: u32, params: Value) -> Frame {
 }
 
 pub(super) async fn bind(wire: &mut Wire, epoch: u32, principal: Value, harness: Option<&str>) {
-    let mut identity = json!({"project_root":"/synthetic/phone", "session":"synthetic-session"});
+    let mut identity = json!({"session":"synthetic-session"});
     if let Some(harness) = harness {
         identity["harness"] = json!(harness);
     }
@@ -131,8 +131,7 @@ async fn bind_unscoped(
     harness: &str,
     session: &str,
 ) {
-    let identity =
-        json!({"project_root":"/synthetic/desktop", "session":session, "harness":harness});
+    let identity = json!({"session":session, "harness":harness});
     let body = json!({"op":"route.bind", "route_channel":5, "epoch":epoch,
         "target":{"kind":"management_surface","module_id":"insula"}, "identity":identity,
         "principal":principal});

@@ -921,9 +921,6 @@ async fn open_quota_route(
     let module = spawn_quota_module(&daemon.connection_file_path, &daemon.temp_dir, sessions);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("quota-e2e-project");
-    std::fs::create_dir_all(&project_root).unwrap();
-
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
 
     // catalog.list — confirm the module is discoverable as a management surface.
@@ -933,8 +930,7 @@ async fn open_quota_route(
         "quota module should be in the catalog: {modules:?}"
     );
 
-    let route = route_open(&mut consumer, &project_root, 2).await;
-    let _ = std::fs::remove_dir_all(&project_root);
+    let route = route_open(&mut consumer, 2).await;
     (daemon, module, consumer, route)
 }
 
@@ -1027,10 +1023,8 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
     let _module = ModuleProcess::new(child);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = daemon.temp_dir.join("project");
-    std::fs::create_dir_all(&project_root).unwrap();
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
-    let route = route_open(&mut consumer, &project_root, 20).await;
+    let route = route_open(&mut consumer, 20).await;
 
     let deadline = Instant::now() + Duration::from_secs(80);
     let mut corr = 21;
@@ -1181,10 +1175,8 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
     let _module = ModuleProcess::new(child);
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = daemon.temp_dir.join("project");
-    std::fs::create_dir_all(&project_root).unwrap();
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
-    let route = route_open(&mut consumer, &project_root, 10).await;
+    let route = route_open(&mut consumer, 10).await;
     // DERIVED FROM THE SCHEDULER, NOT CHOSEN. This test drives the REAL registry,
     // so the second of codex's two handles is not fetched until codex's second
     // round: the refresher selects round-robin ACROSS providers under a
