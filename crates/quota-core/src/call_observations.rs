@@ -120,18 +120,19 @@ impl Registry {
             let mut next = prev.clone();
             let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();
             // Preserve breakdowns and all poll-only windows and metadata. A
-            // partial call response cannot describe the complete account inventory.
+            // partial call response cannot describe the complete account
+            // inventory, so it only updates windows the poll already holds and
+            // never adds one. Anthropic removed the 5-hour limit from verified
+            // Ultra accounts (October 2026): their usage endpoint answers
+            // `five_hour: null`, and a 5-hour header on a model call must not
+            // bring back a window that limit no longer has.
             for (held, update) in [
                 (&mut usage.primary, &windows.primary),
                 (&mut usage.secondary, &windows.secondary),
             ] {
-                if let Some(update) = update {
-                    if let Some(held) = held {
-                        held.used_percent = update.used_percent;
-                        held.resets_at = update.resets_at.clone();
-                    } else {
-                        *held = Some(update.clone());
-                    }
+                if let (Some(held), Some(update)) = (held.as_mut(), update) {
+                    held.used_percent = update.used_percent;
+                    held.resets_at = update.resets_at.clone();
                 }
             }
             next.last_success_wall = Some(incoming);
@@ -346,6 +347,50 @@ mod tests {
         assert_eq!(after["usage"]["primary"]["usedPercent"], 21.0);
         assert_eq!(registry.drop_page(None).await.drops.len(), 1);
         assert_eq!(registry.call_observation_metrics().applied, 1);
+    }
+
+    /// An account whose poll reports no 5-hour window (Anthropic removed that
+    /// limit for verified Ultra accounts) keeps none when a model call's headers
+    /// carry 5-hour figures; the call still updates the weekly window.
+    #[tokio::test]
+    async fn a_call_reading_never_adds_a_window_the_poll_did_not_report() {
+        let registry = registry().await;
+        let key = SlotKey::new("claude", CredentialHandle::implicit());
+        {
+            let mut store = registry.store.lock().unwrap();
+            let prev = store.get(&key).unwrap().clone();
+            let mut no_five_hour = prev.clone();
+            no_five_hour
+                .entry
+                .as_mut()
+                .unwrap()
+                .usage
+                .as_mut()
+                .unwrap()
+                .primary = None;
+            store.publish_if_current(&key, prev.incarnation, prev.attempt_sequence, no_five_hour);
+        }
+        assert!(registry.get_usage(None).await[0]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .is_none());
+        let result = registry.observe_calls(vec![observation(STAMP)]);
+        assert_eq!(result.accepted, 1);
+        let after = registry.get_usage(None).await;
+        let usage = after[0].usage.as_ref().unwrap();
+        assert!(
+            usage.primary.is_none(),
+            "a call reading added a 5-hour window the poll did not report"
+        );
+        assert_eq!(usage.secondary.as_ref().unwrap().used_percent, 100.0);
+        assert_eq!(
+            after[0].fetched_at,
+            Some(crate::rfc3339_canonical(
+                DateTime::from_timestamp_millis(STAMP).unwrap()
+            ))
+        );
     }
 
     /// The reply Anthropic sent on 2026-10-22 alongside the real one: weekly and
