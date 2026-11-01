@@ -58,6 +58,7 @@ pub mod ollama;
 pub mod opencode;
 pub mod opencode_auth;
 pub mod opencodego;
+pub mod opendesign;
 pub mod openrouter;
 pub mod provider;
 pub mod qoder;
@@ -749,6 +750,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(langdock::LangdockProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(opendesign::OpenDesignProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
