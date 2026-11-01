@@ -134,7 +134,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     # read by `vercel-budget` (vercel_budget.rs holds no origin of its own).
     "vercel": {"GATEWAY_BASE": "ai-gateway.vercel.sh", "API_BASE": "api.vercel.com"},
     "warp": {"API_URL": "app.warp.dev"},
-    "zai": {"DEFAULT_BASE": "api.z.ai"},
+    "zai": {"DEFAULT_BASE": "api.z.ai", "BALANCE_URL": "www.bigmodel.cn"},
     "zenmux": {"SUBSCRIPTION_DETAIL_URL": "zenmux.ai"},
 }
 

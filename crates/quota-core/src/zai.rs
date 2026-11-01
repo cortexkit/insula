@@ -28,12 +28,13 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::{future::Future, time::Duration};
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::{Header, JsonRequest},
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
     provider::{FetchError, UsageProvider},
 };
 
@@ -42,6 +43,7 @@ const API_KEY_ENV: &[&str] = &["Z_AI_API_KEY"];
 const BIGMODEL_ORGANIZATION_ENV: &str = "Z_AI_BIGMODEL_ORGANIZATION";
 const BIGMODEL_PROJECT_ENV: &str = "Z_AI_BIGMODEL_PROJECT";
 const DEFAULT_BASE: &str = "https://api.z.ai";
+const BALANCE_URL: &str = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report";
 
 #[derive(Debug, Deserialize)]
 struct ZaiQuotaLimitResponse {
@@ -100,15 +102,21 @@ struct ZaiTeamContext {
 struct ZaiRequestSpec {
     url: String,
     headers: Vec<Header>,
+    timeout: Option<Duration>,
 }
 
 impl ZaiRequestSpec {
     fn into_json_request(self) -> JsonRequest {
-        self.headers
+        let request = self
+            .headers
             .into_iter()
             .fold(JsonRequest::get(self.url), |request, header| {
                 request.header(header)
-            })
+            });
+        match self.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     #[cfg(test)]
@@ -385,7 +393,121 @@ fn build_quota_request(
         url
     };
 
-    Ok(ZaiRequestSpec { url, headers })
+    Ok(ZaiRequestSpec {
+        url,
+        headers,
+        timeout: None,
+    })
+}
+
+fn is_china_personal_request(request: &ZaiRequestSpec) -> bool {
+    let Ok(url) = reqwest::Url::parse(&request.url) else {
+        return false;
+    };
+    // Host overrides also permit proxies. Only a direct CN quota request authorizes
+    // sending the same key to the fixed CN balance endpoint.
+    url.scheme() == "https"
+        && url.host_str() == Some("open.bigmodel.cn")
+        && !url
+            .query_pairs()
+            .any(|(name, value)| name == "type" && value != "1")
+        && !request.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Bigmodel-Organization")
+                || header.name.eq_ignore_ascii_case("Bigmodel-Project")
+        })
+}
+
+fn is_no_coding_plan(body: &[u8]) -> bool {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    root["success"] == false
+        && root["code"].as_f64() == Some(500.0)
+        && root["msg"] == "当前用户不存在coding plan"
+}
+
+#[derive(Deserialize)]
+struct ZaiBalanceResponse {
+    success: bool,
+    data: Option<ZaiBalanceData>,
+}
+
+#[derive(Deserialize)]
+struct ZaiBalanceData {
+    // Keep decimal lexemes intact: a plain JSON number rounds through binary floats.
+    #[serde(rename = "availableBalance")]
+    available_balance: Option<Box<serde_json::value::RawValue>>,
+    balance: Option<Box<serde_json::value::RawValue>>,
+}
+
+fn normalize_balance(body: &[u8]) -> Option<Pool> {
+    let response: ZaiBalanceResponse = serde_json::from_slice(body).ok()?;
+    if !response.success {
+        return None;
+    }
+    let data = response.data?;
+    let amount = |raw: &serde_json::value::RawValue| {
+        let text = raw.get();
+        let decimal = if text.starts_with('"') {
+            serde_json::from_str::<String>(text).ok()?
+        } else {
+            text.to_owned()
+        };
+        crate::money::parse_amount(&decimal, "CNY")
+    };
+    let remaining = data
+        .available_balance
+        .as_deref()
+        .and_then(amount)
+        .or_else(|| data.balance.as_deref().and_then(amount))?;
+    Some(Pool {
+        id: "account_balance".to_owned(),
+        label: "Account balance".to_owned(),
+        // The report aggregates purchased and granted credit, without a live split.
+        funding: PoolFunding::Unknown,
+        remaining: Some(remaining),
+        total: None,
+        basis: PoolBasis::Reported,
+        spendable: None,
+        resets_at: None,
+        expires_at: None,
+        unlimited: None,
+    })
+}
+
+async fn fetch_usage_with<F, Fut>(
+    api_key: &str,
+    request: ZaiRequestSpec,
+    mut send: F,
+) -> Result<ProviderUsage, FetchError>
+where
+    F: FnMut(ZaiRequestSpec) -> Fut,
+    Fut: Future<Output = Result<(u16, Vec<u8>), FetchError>>,
+{
+    let china_personal = is_china_personal_request(&request);
+    let (status, body) = send(request).await?;
+    let quota_error = match normalize_usage(&body) {
+        Ok(usage) => return Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage)),
+        Err(error) => error,
+    };
+    if status == 200 && china_personal && is_no_coding_plan(&body) {
+        let request = ZaiRequestSpec {
+            url: BALANCE_URL.to_owned(),
+            headers: vec![Header::bearer(api_key)],
+            // Match the optional upstream lookup's bound, below the fetch deadline.
+            timeout: Some(Duration::from_secs(5)),
+        };
+        if let Ok((200, balance)) = send(request).await {
+            if let Some(pool) = normalize_balance(&balance) {
+                let mut usage =
+                    ProviderUsage::healthy(PROVIDER_NAME, None, "api", Usage::default());
+                usage.spend = Some(vec![pool]);
+                return Ok(usage);
+            }
+        }
+    }
+    // An unreadable balance must not replace or reclassify the quota failure.
+    Err(quota_error)
 }
 
 /// The Zai usage provider.
@@ -420,10 +542,11 @@ impl UsageProvider for ZaiProvider {
             let request =
                 build_quota_request(&api_key, resolve_quota_url(), team_context_from_env())?;
 
-            let body = request.into_json_request().send(&self.http).await?;
-
-            let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            fetch_usage_with(&api_key, request, |request| async move {
+                let response = request.into_json_request().send_full(&self.http).await?;
+                Ok((response.status, response.body))
+            })
+            .await
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -433,6 +556,246 @@ impl UsageProvider for ZaiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Fixture bodies from CodexBar v0.83.0, TestsPlugin/ZaiPluginBalanceTests.swift
+    // (null fallback, prepaid-only success, and unavailable balance).
+    const NO_CODING_PLAN: &str =
+        r#"{"code":500,"msg":"当前用户不存在coding plan","success":false}"#;
+    const PREPAID_BALANCE: &str =
+        r#"{"code":200,"success":true,"data":{"availableBalance":8.663060440}}"#;
+    const CN_QUOTA_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+
+    async fn fetch_fixture(
+        url: &str,
+        team: Option<ZaiTeamContext>,
+        quota: (u16, &str),
+        balance: Result<(u16, &str), FetchError>,
+    ) -> (Result<ProviderUsage, FetchError>, Vec<ZaiRequestSpec>) {
+        let response = |(status, body): (u16, &str)| {
+            if (200..300).contains(&status) {
+                Ok((status, body.as_bytes().to_vec()))
+            } else {
+                Err(crate::http::status_error(status, body.as_bytes()))
+            }
+        };
+        let mut responses =
+            std::collections::VecDeque::from([response(quota), balance.and_then(response)]);
+        let mut requests = Vec::new();
+        let request = build_quota_request("fixture-key", url.to_owned(), team).unwrap();
+        let result = fetch_usage_with("fixture-key", request, |request| {
+            requests.push(request);
+            std::future::ready(responses.pop_front().expect("unexpected request"))
+        })
+        .await;
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn cn_prepaid_only_reports_exact_balance_without_windows() {
+        let (result, requests) = fetch_fixture(
+            CN_QUOTA_URL,
+            None,
+            (200, NO_CODING_PLAN),
+            Ok((200, PREPAID_BALANCE)),
+        )
+        .await;
+        let usage = result.unwrap();
+        assert_eq!(
+            serde_json::to_value(usage.usage).unwrap(),
+            serde_json::json!({})
+        );
+        let pools = usage.spend.unwrap();
+        assert_eq!(pools.len(), 1);
+        let pool = &pools[0];
+        let amount = pool.remaining.as_ref().unwrap();
+        assert_eq!(amount.unit, "CNY");
+        assert_eq!(amount.minor, 8_663_060_440);
+        assert_eq!(amount.exponent, 9);
+        assert_eq!(pool.basis, PoolBasis::Reported);
+        assert_eq!(pool.funding, PoolFunding::Unknown);
+        assert!(pool.resets_at.is_none());
+        assert!(pool.spendable.is_none());
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, CN_QUOTA_URL);
+        assert_eq!(requests[1].url, BALANCE_URL);
+        assert_eq!(
+            requests[1].header("Authorization"),
+            Some("Bearer fixture-key")
+        );
+        assert_eq!(requests[1].headers.len(), 1);
+        assert_eq!(requests[1].timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn cn_null_available_balance_falls_back_to_balance() {
+        let balance = r#"{
+          "code": 200,
+          "success": true,
+          "data": {
+            "balance": 42.5,
+            "availableBalance": null,
+            "rechargeAmount": null,
+            "giveAmount": 5.0,
+            "totalSpendAmount": null
+          }
+        }"#;
+        let (result, requests) = fetch_fixture(
+            CN_QUOTA_URL,
+            None,
+            (200, NO_CODING_PLAN),
+            Ok((200, balance)),
+        )
+        .await;
+        let pools = result.unwrap().spend.unwrap();
+        assert_eq!(
+            pools.len(),
+            1,
+            "provenance totals are not separate balances"
+        );
+        let amount = pools[0].remaining.as_ref().unwrap();
+        assert_eq!(amount.minor, 425);
+        assert_eq!(amount.exponent, 1);
+        assert_eq!(amount.unit, "CNY");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn a_balance_prefers_available_and_never_turns_absence_into_zero() {
+        for (data, minor, exponent) in [
+            (r#"{"availableBalance":40.0,"balance":42.5}"#, 400, 1),
+            (r#"{"balance":42.5}"#, 425, 1),
+            (r#"{"availableBalance":"NaN","balance":42.5}"#, 425, 1),
+            (r#"{"availableBalance":0,"balance":42.5}"#, 0, 0),
+            (r#"{"availableBalance":"0.000000001"}"#, 1, 9),
+            (
+                r#"{"availableBalance":9007199254740993}"#,
+                9_007_199_254_740_993,
+                0,
+            ),
+        ] {
+            let body = format!(r#"{{"success":true,"data":{data}}}"#);
+            let amount = normalize_balance(body.as_bytes())
+                .unwrap()
+                .remaining
+                .unwrap();
+            assert_eq!((amount.minor, amount.exponent), (minor, exponent), "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_healthy_china_quota_does_not_request_balance() {
+        let quota = r#"{
+          "code": 200,
+          "success": true,
+          "data": {
+            "limits": [
+              { "type": "TOKENS_LIMIT", "unit": 5, "number": 300, "percentage": 42,
+                "usage": 1000, "remaining": 580, "nextResetTime": 1756000000 }
+            ]
+          }
+        }"#;
+        let (result, requests) =
+            fetch_fixture(CN_QUOTA_URL, None, (200, quota), Ok((200, PREPAID_BALANCE))).await;
+        let usage = result.unwrap();
+        assert_eq!(usage.usage.unwrap().primary.unwrap().used_percent, 42.0);
+        assert!(usage.spend.is_none());
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cn_unreadable_balance_keeps_the_original_quota_failure() {
+        for balance in [
+            Ok((200, "{}")),
+            Ok((200, "not json")),
+            Ok((200, r#"{"success":false,"data":{"availableBalance":10}}"#)),
+            Ok((
+                200,
+                r#"{"success":true,"data":{"availableBalance":null,"balance":null}}"#,
+            )),
+            Ok((200, r#"{"success":true,"data":{}}"#)),
+            Ok((
+                200,
+                r#"{"success":true,"data":{"availableBalance":"NaN","balance":"Infinity"}}"#,
+            )),
+            Ok((500, PREPAID_BALANCE)),
+            Err(FetchError::Upstream(
+                "balance transport unavailable".to_owned(),
+            )),
+        ] {
+            let (result, requests) =
+                fetch_fixture(CN_QUOTA_URL, None, (200, NO_CODING_PLAN), balance).await;
+            let error = result.unwrap_err();
+            assert!(matches!(error, FetchError::Upstream(_)));
+            assert_eq!(
+                error.to_string(),
+                normalize_usage(NO_CODING_PLAN.as_bytes())
+                    .unwrap_err()
+                    .to_string()
+            );
+            assert_eq!(requests.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_different_quota_error_never_requests_balance() {
+        for quota in [
+            r#"{"code":500,"msg":"another error","success":false}"#,
+            r#"{"code":501,"msg":"当前用户不存在coding plan","success":false}"#,
+            r#"{"code":"500","msg":"当前用户不存在coding plan","success":false}"#,
+            r#"{"code":500,"msg":"当前用户不存在coding plan ","success":false}"#,
+            r#"{"code":500,"msg":"当前用户不存在coding plan","success":true}"#,
+        ] {
+            let (result, requests) =
+                fetch_fixture(CN_QUOTA_URL, None, (200, quota), Ok((200, PREPAID_BALANCE))).await;
+            assert!(result.is_err(), "{quota}");
+            assert_eq!(requests.len(), 1, "{quota}");
+        }
+    }
+
+    #[tokio::test]
+    async fn global_team_and_untrusted_endpoints_never_request_balance() {
+        for url in [
+            "https://api.z.ai/api/monitor/usage/quota/limit",
+            "https://quota-proxy.test/api/monitor/usage/quota/limit",
+            "https://open.bigmodel.cn.example/api/monitor/usage/quota/limit",
+            "http://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit?type=2",
+        ] {
+            let (result, requests) =
+                fetch_fixture(url, None, (200, NO_CODING_PLAN), Ok((200, PREPAID_BALANCE))).await;
+            assert!(result.is_err(), "{url}");
+            assert_eq!(requests.len(), 1, "{url}");
+        }
+        let team = ZaiTeamContext {
+            organization: "fixture-organization".to_owned(),
+            project: "fixture-project".to_owned(),
+        };
+        let (result, requests) = fetch_fixture(
+            CN_QUOTA_URL,
+            Some(team),
+            (200, NO_CODING_PLAN),
+            Ok((200, PREPAID_BALANCE)),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_http_500_never_requests_balance() {
+        let (result, requests) = fetch_fixture(
+            CN_QUOTA_URL,
+            None,
+            (500, NO_CODING_PLAN),
+            Ok((200, PREPAID_BALANCE)),
+        )
+        .await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::http::status_error(500, NO_CODING_PLAN.as_bytes()).to_string()
+        );
+    }
 
     #[test]
     fn normalizes_quota_limit_payload() {
