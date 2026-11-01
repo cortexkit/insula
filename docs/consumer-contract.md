@@ -2204,8 +2204,9 @@ match. Capture tools take the URL from this table:
   18,000-second (`five_hour`) and 604,800-second (`weekly`) used/limit credit
   windows, selected by duration, with positive limits and optional resets. Zero
   or missing resets stay absent. Ineligible plans and responses with no supported
-  window are `no_quota_reported`. The account label is the workspace name when
-  provided, otherwise absent; a vault suffix is never used as identity. One
+  window are `no_quota_reported`. The row carries no `account`: a workspace
+  name is a shared, renamable display string, not an account identity, and a
+  vault suffix is never used as identity either. One
   deposit is supported, with no domain aliases. This port is fixture-verified
   against CodexBar v0.83.0 only; no live OpenDesign account is available.
 - **OpenCode Zen (`opencode`)**: shares the `cookie:opencode.ai[:<account>]`

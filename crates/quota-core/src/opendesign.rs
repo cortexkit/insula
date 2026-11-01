@@ -32,6 +32,9 @@ const MAX_SAFE_CREDITS: f64 = 9_007_199_254_740_991.0;
 #[serde(rename_all = "camelCase")]
 struct Workspace {
     workspace_id: String,
+    // Declared so the unread-field log doesn't report it, and deliberately not
+    // published: a workspace name isn't an account identity (see fetch_handle).
+    #[allow(dead_code)]
     workspace_name: Option<Value>,
 }
 
@@ -266,8 +269,11 @@ impl UsageProvider for OpenDesignProvider {
                 )
                 .await?;
             let usage = normalize(&body, &workspace.workspace_id)?;
-            let account = workspace.workspace_name.as_ref().and_then(text).map(str::to_string);
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, account, source, usage))
+            // No account label. `account` is the identity consumers join on, and
+            // a workspace name is a shared, renamable display string: several
+            // users can see the same workspace, so naming the row after it would
+            // let two people's readings collapse into one account.
+            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, source, usage))
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -552,9 +558,9 @@ mod tests {
             (USAGE_PATH, 200, usage(&[WEEKLY, FIVE_HOUR])),
         ])
         .await;
-        assert_eq!(
-            attempt.observed.unwrap().account_id.as_deref(),
-            Some("Synthetic workspace")
+        assert!(
+            attempt.observed.unwrap().account_id.is_none(),
+            "a workspace name is not an account identity"
         );
         assert_eq!(attempt.source.as_deref(), Some("vault"));
         assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 1.0);
