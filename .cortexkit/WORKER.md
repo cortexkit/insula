@@ -16,15 +16,25 @@ fixtures, comments or commit messages.
 
 ## Gate before you deliver
 
-- Run `scripts/prepush.sh`: fast local checks, then the Linux and Windows CI legs in parallel
-  on the build servers. `--fast` alone is not a delivery gate; `--linux-only` omits Windows.
-  The optional `--e2e --sibling ../subconscious` uses a built sibling daemon, never the installed
-  daemon. Filtered tests alone are not a gate.
-- A bug fix adds a test and shows it failing once without the fix (`scripts/probe.py`).
+Keep it to minutes. The integrating agent runs the full suite and `scripts/prepush.sh` once per
+merged batch, so a worker never does.
+
+- Run only the tests for the files and behaviour you changed, by filter (for example
+  `cargo test -p quota-core --lib synthetic::`), plus `cargo fmt --check` and
+  `cargo clippy -p <crate> --all-targets -- -D warnings`. Add `runon: "windows"` for the same
+  filtered tests when you touch paths, file I/O, process spawning or `cfg(windows)` code.
+- Never run a whole crate or workspace test suite, `scripts/prepush.sh` or `scripts/gates.sh`.
+- A bug fix adds a test and shows it failing once without the fix (`scripts/probe.py`, filtered
+  to that test).
 - `cargo test -p quota-core --lib -- --list`: the total must equal the unique count. A doc comment
   inserted between a neighbour's doc comment and its `#[test]` silently unregisters that test.
-- Report each command, its pass and fail counts, and every failing test name. If a failure isn't
-  yours, show it fails the same way on your base commit.
+  This only lists tests; it doesn't run them.
+- A failure that looks unrelated: rerun that one test by name on your base commit, never the
+  suite.
+- No `bash_watch` loops up to their cap. A filtered run that takes longer than about 15 minutes
+  means the filter is too broad.
+- Keep the normal build directory; a separate `CARGO_TARGET_DIR` forces a cold build.
+- Report each command, its pass and fail counts, and every failing test name.
 - Commit only after `git config user.email` prints `94532+ualtinok@users.noreply.github.com`, with
   `git commit -F - <<'MSG'`. Backticks in `-m` are eaten by the shell.
 
