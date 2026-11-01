@@ -88,10 +88,10 @@ const RESET_KEYS: &[&str] = &[
     "renew_at",
     "renewsAt",
     "renews_at",
-    "nextTickAt",
-    "next_tick_at",
-    "nextRegenAt",
-    "next_regen_at",
+    // Not `nextTickAt` / `nextRegenAt`. Those date the next regeneration step,
+    // when part of the pool comes back, and `resetsAt` promises the whole window
+    // is restored by then. On the weekly credit pool that would overstate
+    // headroom at the step instant, so a step time never becomes a reset.
     "periodEnd",
     "period_end",
     "expiresAt",
@@ -375,9 +375,16 @@ fn prioritized_quota_slots(
         .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
         .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::FIVE_HOUR));
 
-    let weekly = root
-        .get("weeklyTokenLimit")
-        .or_else(|| data_dict.and_then(|d| d.get("weeklyTokenLimit")))
+    // `planWeeklyLimit` is the weekly credit pool on Synthetic's current plans
+    // (measured 2026-10-26 and 2026-11-01): it carries only `percentRemaining`
+    // and the next regeneration step, no reset. `weeklyTokenLimit` is the older
+    // name; a response carrying both is taken by the current one.
+    let weekly = ["planWeeklyLimit", "weeklyTokenLimit"]
+        .iter()
+        .find_map(|key| {
+            root.get(*key)
+                .or_else(|| data_dict.and_then(|d| d.get(*key)))
+        })
         .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::WEEKLY));
 
     let search_hourly = root
@@ -877,6 +884,49 @@ mod tests {
         assert_eq!(tertiary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
         assert_eq!(tertiary.window_kind.as_deref(), Some("hourly"));
         assert_eq!(tertiary.window_minutes, Some(60));
+    }
+
+    /// The current plan's response: `planWeeklyLimit` is the weekly credit pool,
+    /// beside the legacy `subscription` counter and the hourly search window.
+    /// The weekly window is published in the weekly slot, and its next
+    /// regeneration step is not published as a reset: only part of the pool
+    /// returns then.
+    #[test]
+    fn plan_weekly_limit_is_the_weekly_window_without_a_reset() {
+        let body = br#"{
+            "subscription": {"limit": 1350, "requests": 0, "renewsAt": "2026-11-01T21:00:00Z"},
+            "search": {"hourly": {"limit": 250, "requests": 25, "renewsAt": "2026-11-01T17:00:00Z"}},
+            "planWeeklyLimit": {
+                "nextRegenAt": "2026-11-01T18:00:00Z",
+                "percentRemaining": 62.5,
+                "nextRegenPercent": 2.0
+            }
+        }"#;
+        let usage = normalize_usage(body).unwrap();
+        assert!(usage.primary.is_none());
+        let weekly = usage
+            .secondary
+            .expect("planWeeklyLimit is the weekly window");
+        assert_eq!(weekly.used_percent, 37.5);
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
+        assert_eq!(
+            weekly.resets_at, None,
+            "a regeneration step must not read as the weekly reset"
+        );
+        let hourly = usage.tertiary.expect("the search window stays");
+        assert_eq!(hourly.used_percent, 10.0);
+        assert_eq!(hourly.resets_at.as_deref(), Some("2026-11-01T17:00:00Z"));
+    }
+
+    /// A response carrying both weekly blocks is read from the current one.
+    #[test]
+    fn plan_weekly_limit_wins_over_weekly_token_limit() {
+        let body = br#"{
+            "weeklyTokenLimit": {"usedPercent": 90.0},
+            "planWeeklyLimit": {"percentRemaining": 70.0}
+        }"#;
+        let weekly = normalize_usage(body).unwrap().secondary.unwrap();
+        assert_eq!(weekly.used_percent, 30.0);
     }
 
     #[test]
