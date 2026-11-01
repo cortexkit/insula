@@ -27,7 +27,7 @@ The library. Its public entry point is `Registry` in
 | `codex_resets.rs` | the banked-reset policy and the redemption journal |
 | `model.rs`, `money.rs` | wire types re-exported from `cortexkit-provider-usage`, and exact money amounts |
 | `http.rs`, `env.rs`, `text.rs`, `json_scan.rs`, `subprocess.rs` | shared request, error-excerpt, environment, file and parsing helpers |
-| `config.rs` | `QuotaConfig` (today only `codex.auto_use_resets`), the `LiveQuotaConfig` handle every consumer reads at the moment it decides, and the `ConfigReloader` that keeps it in step with the file |
+| `config.rs` | `QuotaConfig` (`codex.auto_use_resets`, `muse.team_id`, `litellm.base_url`), the `LiveQuotaConfig` handle every consumer reads at the moment it decides, and the `ConfigReloader` that keeps it in step with the file |
 | `wire_sanity.rs`, `unread_keys.rs` | internal-consistency rules for published windows, and logging of response fields no adapter reads |
 
 ### `quota-module`

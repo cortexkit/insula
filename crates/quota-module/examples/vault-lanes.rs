@@ -1063,6 +1063,28 @@ mod tests {
     }
 
     #[test]
+    fn litellm_virtual_keys_route_and_a_dark_lane_is_not_excused() {
+        let report = evaluate(
+            granted(&["apikey:litellm:fixture"]),
+            usage(vec![healthy("litellm", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        let counts = report.counts.expect("a checked report has counts");
+        assert_eq!((counts.routed, counts.expected, counts.checked), (1, 1, 1));
+        assert_eq!(report.exit_code, 0, "{report:?}");
+        let dark = evaluate(
+            granted(&["apikey:litellm"]),
+            usage(vec![]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(dark.exit_code, 1, "{dark:?}");
+    }
+
+    #[test]
     fn removing_a_required_family_mapping_is_not_excused_as_unsupported() {
         let families_without_anthropic: Vec<_> = quota_core::vault_handles::CREDENTIAL_FAMILIES
             .iter()

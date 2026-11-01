@@ -31,6 +31,14 @@ pub const MAX_AUTO_USE_RESETS_SECS: u64 = 30 * 24 * 60 * 60;
 pub struct QuotaConfig {
     pub codex: CodexConfig,
     pub muse: MuseConfig,
+    pub litellm: LiteLLMConfig,
+}
+
+/// All LiteLLM keys on this host belong to this explicitly chosen proxy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LiteLLMConfig {
+    pub base_url: Option<String>,
 }
 
 /// The team is an explicit choice: a web session can see several subscriptions.
@@ -128,6 +136,10 @@ impl LiveQuotaConfig {
 
     pub fn muse(&self) -> MuseConfig {
         self.read().config.muse.clone()
+    }
+
+    pub fn litellm(&self) -> LiteLLMConfig {
+        self.read().config.litellm.clone()
     }
 
     /// The config in force, when it was loaded, and any pending load error.
