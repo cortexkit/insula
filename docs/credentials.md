@@ -196,8 +196,8 @@ or absolute; `:memory:` disables the CLI lookup, including `auth.json`.
 
 Only `credential` rows with `active = 1` qualify. `opencode-go` takes precedence
 over `opencode`; duplicate active rows for the chosen integration are refused.
-A dedicated Go row can hold a `key` or OAuth `access` token. A generic
-`opencode` row must be OAuth. OAuth requires a future millisecond `expires`.
+Either row can hold a `key` or an OAuth `access` token. OAuth requires a future
+millisecond `expires`.
 Only an absent database or absent `credential` table permits fallback to
 `auth.json` in the data directory, and only its `opencode-go` entry with
 `type: "api"` qualifies. An existing table with no usable row does not revive

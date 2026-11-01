@@ -2246,7 +2246,7 @@ account identity; the same rolling 5-hour, weekly and monthly windows and HTTP
 classification apply. A typed 403 `EntitlementError` is `no_quota_reported`.
 
 The CLI's read-only SQLite `credential` table selects active `opencode-go`
-before generic `opencode` OAuth. Duplicate active rows, malformed values and
+before generic `opencode`, which may hold an API key or OAuth. Duplicate active rows, malformed values and
 expired OAuth are `credential_unusable`, not missing credentials. An unreadable
 database is `local_source_unavailable`. Only an absent database or absent
 `credential` table permits an `opencode-go` API key from `auth.json`; no usable
