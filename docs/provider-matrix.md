@@ -1,6 +1,6 @@
 # Provider matrix
 
-45 providers registered.
+46 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -83,6 +83,7 @@ on every operating system. The public wire semantics are in
 | `ollama` | Vault `apikey:ollama-cloud` (takes precedence) or `cookie:ollama.com` | Key: `GET https://ollama.com/api/balance`; cookie: `GET https://ollama.com/settings` | Key balance; page included-credit / session (5h) / weekly windows and wallet pools |
 | `opencode` | Vault `cookie:opencode.ai` (shared with Go) | Legacy workspace/subscription actions at `https://opencode.ai/_server`; migrated accounts: `/console/api/orgs`, `/console/api/billing/status` with `x-org-id` | Legacy rolling 5h / weekly windows; migrated prepaid PAYG: reported purchased USD balance pool, no total, reset or rate windows. Other modes or missing balance keep the moved-account diagnosis. Balance fixture-verified against CodexBar v0.82.0 only; no prepaid Zen account or opencode.ai deposit available for live verification |
 | `opencodego` | Vault `apikey:opencode-go`, then `OPENCODE_API_KEY` (key is exclusive); otherwise `cookie:opencode.ai`; with neither, active OpenCode CLI login (fixture-verified only; `OPENCODE_DB` override) | Key or CLI bearer: `GET https://opencode.ai/zen/go/v1/usage`; cookie: `/console/api/orgs`, `/console/api/go/status`, legacy `/workspace/<id>/go` fallback | Rolling 5h / weekly / monthly |
+| `opendesign` | Vault `cookie:amr-api.open-design.ai` | `GET https://amr-api.open-design.ai/api/v1/workspaces/current`, then `/api/v1/workspaces/{id}/billing/coding-plan-usage` with `X-Vela-Workspace-Id` | 5h / weekly used and limit credits, optional resets; workspace name as account label. Fixture-verified against CodexBar v0.83.0 only; no OpenDesign account available for live verification |
 | `qoder` | Vault `cookie:qoder.com` | `GET https://qoder.com/api/v2/me/usages/big_model_credits` | Combined base/shared primary quota; duration unstated |
 | `qwen-cloud` | Vault `cookie:qwencloud.com` | Personal plan gateway at `https://cs-data.qwencloud.com/data/api.json`; Team inventory/seat calls at `https://home.qwencloud.com` | Personal 5h / weekly / monthly; Team seat quota |
 | `sakana` | `SAKANA_COOKIE` environment request header | `GET https://console.sakana.ai/billing` | 5h / weekly subscription cards |

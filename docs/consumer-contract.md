@@ -2171,6 +2171,7 @@ match. Capture tools take the URL from this table:
 | `cookie:cursor.com:<account>` | cursor | `https://cursor.com/api/usage-summary` |
 | `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
 | `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
+| `cookie:amr-api.open-design.ai:<account>` | opendesign | `https://amr-api.open-design.ai/api/v1/workspaces/current` |
 | `cookie:trae.cn:<account>` | traecn | `https://api.trae.cn/cloudide/api/v3/common/GetUserToken` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 
@@ -2191,6 +2192,22 @@ match. Capture tools take the URL from this table:
   check URL above. The first API organization with readable billing is selected;
   `account` is its UUID and `accountInfo.orgName` its name. A billing 403 means
   this login lacks billing access, not that its session needs re-capturing.
+- **opendesign**: sign in at `https://open-design.ai/cloud/login`, then capture
+  the request header for the API fetch URL above, including
+  `__Secure-better-auth.session_token`. The whole header is sent to
+  `amr-api.open-design.ai`; a deposit without the session cookie is a missing
+  login (`credential_absent`), and HTTP 401 is an expired login
+  (`credential_rejected`, sign in again). HTTP 403 means the login lacks billing
+  access (`credential_unusable`), not that signing in again will help. HTTP 429,
+  408 and 5xx are temporary (`upstream_failed`). The current workspace id must
+  match the billing response. Eligible plans publish only the explicitly stated
+  18,000-second (`five_hour`) and 604,800-second (`weekly`) used/limit credit
+  windows, selected by duration, with positive limits and optional resets. Zero
+  or missing resets stay absent. Ineligible plans and responses with no supported
+  window are `no_quota_reported`. The account label is the workspace name when
+  provided, otherwise absent; a vault suffix is never used as identity. One
+  deposit is supported, with no domain aliases. This port is fixture-verified
+  against CodexBar v0.83.0 only; no live OpenDesign account is available.
 - **OpenCode Zen (`opencode`)**: shares the `cookie:opencode.ai[:<account>]`
   deposit with Go, but publishes a different plan. Healthy legacy workspaces
   keep their subscription windows and make no console calls. After a migrated

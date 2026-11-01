@@ -52,6 +52,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:qoder.com` | `qoder` |
 | `cookie:factory.ai` | `factory` |
 | `cookie:langdock.com` | `langdock` |
+| `cookie:amr-api.open-design.ai` | `opendesign` |
 | `cookie:trae.cn` | `traecn` |
 | `cookie:xiaomimimo.com` | `mimo` |
 | `cookie:ollama.com`, `apikey:ollama-cloud` | `ollama` |
@@ -207,7 +208,7 @@ With neither store present, no CLI lane is enumerated. This fallback is
 fixture-verified, not live-verified: the development Mac has a vault key, which
 suppresses the CLI lane.
 
-The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `qoder`,
+The cookie providers `amp`, `factory`, `langdock`, `mimo`, `opencode`, `opendesign`, `qoder`,
 `qwen-cloud` and `traecn` have no local lane: without a vault deposit they are not
 configured. Endpoint and region overrides are listed in
 [`provider-matrix.md`](provider-matrix.md).

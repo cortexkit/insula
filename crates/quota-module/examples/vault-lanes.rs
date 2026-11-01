@@ -713,6 +713,31 @@ mod tests {
     }
 
     #[test]
+    fn opendesign_deposit_is_routed_and_must_serve_from_the_vault() {
+        for id in [
+            "cookie:amr-api.open-design.ai",
+            "cookie:amr-api.open-design.ai:fixture",
+        ] {
+            let report = evaluate(
+                granted(&[id]),
+                usage(vec![healthy("opendesign", "vault")]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                DUAL_LANE,
+                ENUMERATED_UNSUPPORTED,
+            );
+            assert_eq!(report.exit_code, 0, "{report:?}");
+            let missing = evaluate(
+                granted(&[id]),
+                usage(vec![]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                DUAL_LANE,
+                ENUMERATED_UNSUPPORTED,
+            );
+            assert_eq!(missing.exit_code, 1, "{missing:?}");
+        }
+    }
+
+    #[test]
     fn all_four_populations_are_counted_separately() {
         let report = evaluate(
             granted(&[

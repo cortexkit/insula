@@ -1674,6 +1674,28 @@ async fn langdock_is_registered_as_cookie_based_without_a_guessed_catalog_slug()
     assert_eq!(entries[0].api_provider, None);
 }
 
+#[tokio::test]
+async fn opendesign_is_cookie_based_with_one_exact_vault_family_and_no_catalog_slug() {
+    let defaults = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    assert!(defaults.provider_names().contains(&"opendesign"));
+    assert!(defaults
+        .cookie_based_provider_names()
+        .contains(&"opendesign"));
+    assert_eq!(
+        crate::vault_handles::CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(_, provider)| *provider == "opendesign")
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![("cookie:amr-api.open-design.ai", "opendesign")]
+    );
+    let registry = registry(&[("opendesign", true, true)]);
+    tick(&registry).await;
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].api_provider, None);
+}
+
 /// models.dev has no Trae provider, so no catalog slug is published for it.
 #[tokio::test]
 async fn traecn_is_registered_as_cookie_based_without_a_guessed_catalog_slug() {
@@ -1724,6 +1746,59 @@ fn langdock_replacement_changes_the_single_deposit_and_two_deposits_are_refused(
     );
     assert!(provider.fetcher.handles().unwrap().is_empty());
     assert!(loader.warning().unwrap().contains("cookie:langdock.com"));
+}
+
+#[test]
+fn opendesign_routes_one_deposit_and_refuses_duplicates_without_domain_aliases() {
+    let registry = Registry::with_defaults(
+        crate::config::QuotaConfig::default(),
+        Some(Arc::new(DefaultListSource)),
+    );
+    let loader = registry.vault_handle_loader.as_ref().unwrap();
+    let provider = registry
+        .providers
+        .iter()
+        .find(|provider| provider.name == "opendesign")
+        .unwrap();
+    for id in [
+        "cookie:amr-api.open-design.ai",
+        "cookie:amr-api.open-design.ai:fixture",
+    ] {
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(id, "cookie", 1, "active")]),
+            Instant::now(),
+        );
+        let handles = provider.fetcher.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].vault_credential_id(), Some(id));
+    }
+    loader.install_snapshot(
+        scoped_snapshot(
+            1,
+            vec![
+                scoped_row("cookie:amr-api.open-design.ai:first", "cookie", 1, "active"),
+                scoped_row(
+                    "cookie:amr-api.open-design.ai:second",
+                    "cookie",
+                    1,
+                    "active",
+                ),
+            ],
+        ),
+        Instant::now(),
+    );
+    assert!(provider.fetcher.handles().unwrap().is_empty());
+    assert!(loader
+        .warning()
+        .unwrap()
+        .contains("cookie:amr-api.open-design.ai"));
+    for id in ["cookie:open-design.ai", "cookie:www.open-design.ai"] {
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(id, "cookie", 1, "active")]),
+            Instant::now(),
+        );
+        assert!(provider.fetcher.handles().unwrap().is_empty());
+    }
 }
 
 /// Every provider with a vault credential family is BUILT to read the vault.
@@ -11018,6 +11093,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("cursor", include_str!("cursor.rs")),
         ("factory", include_str!("factory.rs")),
         ("langdock", include_str!("langdock.rs")),
+        ("opendesign", include_str!("opendesign.rs")),
         ("mimo", include_str!("mimo.rs")),
         ("ollama", include_str!("ollama.rs")),
         ("opencode", include_str!("opencode.rs")),
