@@ -421,11 +421,19 @@ impl UsageProvider for LiteLLMProvider {
         if handle.is_vault() {
             return self.fetch_vault(handle).await;
         }
-        match (self.env)(KEY_ENV) {
+        // `LITELLM_API_KEY` is also what LiteLLM's own SDK and proxy read, so it
+        // is often set on hosts that never asked insula to watch a proxy. Without
+        // a configured `litellm.base_url` the environment key is not a setup for
+        // this provider, so it reads as unconfigured rather than as a broken
+        // credential. A deliberate vault deposit with no URL still reports the
+        // missing URL (fetch_vault).
+        let configured = self.config.litellm().base_url.is_some();
+        match (self.env)(KEY_ENV).filter(|_| configured) {
             Some(key) => attempt_from(self.read(&key).await, "api"),
             None => attempt_from(
                 Err(FetchError::NoSession(
-                    "no LITELLM_API_KEY and no apikey:litellm vault deposit".into(),
+                    "no apikey:litellm vault deposit, and no LITELLM_API_KEY with litellm.base_url set"
+                        .into(),
                 )),
                 "api",
             ),
@@ -948,6 +956,24 @@ mod tests {
         );
     }
 
+    /// LiteLLM's own SDK and proxy read `LITELLM_API_KEY` too, so the key alone
+    /// is not a setup for this provider. Without `litellm.base_url` it reads as
+    /// unconfigured, never as a broken credential, and sends nothing.
+    #[tokio::test]
+    async fn an_environment_key_without_a_base_url_is_unconfigured() {
+        let (base, log) = routes(|_, _| (200, b"{}".to_vec())).await;
+        let mut p = provider(&base);
+        p.config = QuotaConfig::default().into();
+        p.env = Arc::new(|_| Some("sdk-key".into()));
+        let error = p
+            .fetch_handle(&CredentialHandle::implicit())
+            .await
+            .usage
+            .unwrap_err();
+        assert_eq!(error.error_class(), "credential_absent");
+        assert!(log.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn live_config_is_read_again_on_the_next_fetch() {
         let (base, log) = routes(|_, _| (401, b"{}".to_vec())).await;
@@ -966,7 +992,8 @@ mod tests {
                 .usage
                 .unwrap_err()
                 .error_class(),
-            "credential_unusable"
+            "credential_unusable",
+            "a configured public HTTP URL is refused, not silently unconfigured"
         );
         std::fs::write(&path, json!({"litellm":{"base_url":base}}).to_string()).unwrap();
         reloader.check();

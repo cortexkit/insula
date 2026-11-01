@@ -1,6 +1,6 @@
 # Provider matrix
 
-46 providers registered.
+47 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.

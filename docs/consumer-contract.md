@@ -1534,7 +1534,9 @@ and image generations publishes:
 ### 7.16 `litellm`: self-hosted personal, member and team budgets
 
 `litellm` reads a virtual key from `apikey:litellm[:<account>]`, or
-`LITELLM_API_KEY` only when no vault deposit exists. The proxy is chosen separately
+`LITELLM_API_KEY` only when no vault deposit exists and `litellm.base_url` is set.
+LiteLLM's own tools read that variable too, so on its own it leaves the provider
+unconfigured (`credential_absent`). The proxy is chosen separately
 in the live-reloaded quota config, shared by all LiteLLM keys on the host:
 
 ```json
