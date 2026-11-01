@@ -2060,6 +2060,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_cli_key_sends_its_bearer_to_the_usage_api() {
+        let (base, requests) =
+            serve(|_, _| Reply::Body(200, r#"{"usage":{"rolling":{"percent":12}}}"#)).await;
+        let mut provider = provider_with_rows(&[], "");
+        let store = crate::opencode_auth::go_tests::Store::new();
+        let db = store.create_at(&store.database());
+        crate::opencode_auth::go_tests::Store::row(
+            &db,
+            "opencode",
+            Some(1),
+            r#"{"type":"key","key":"generic-cli-key"}"#,
+        );
+        drop(db);
+        provider.cli_credential = Arc::new(move || store.read());
+        point_at(&mut provider, &base);
+
+        let handles = provider.handles().unwrap();
+        assert_eq!(ids(handles.clone()), vec![super::CLI_HANDLE]);
+        let attempt = provider.fetch_handle(&handles[0]).await;
+        assert_eq!(attempt.source.as_deref(), Some("cli"));
+        assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 12.0);
+        assert_eq!(paths(&requests), vec![API_USAGE_PATH]);
+        let request = requests.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(request.starts_with(&format!("get {API_USAGE_PATH} http/1.1\r\n")));
+        assert!(request.contains("\r\nauthorization: bearer generic-cli-key\r\n"));
+    }
+
+    #[tokio::test]
     async fn cli_store_errors_enumerate_and_publish_their_actual_classification() {
         let mut provider = provider_with_rows(&[], "");
         install_cli_store(

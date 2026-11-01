@@ -302,11 +302,6 @@ fn read_go_credential_at(
     }
     let credential: GoCredential =
         serde_json::from_str(&value).map_err(|_| go_unusable("value is malformed"))?;
-    // A generic Zen key does not establish a Go login; only its OAuth account
-    // can supply Go quotas. A dedicated Go row still takes precedence.
-    if integration == "opencode" && credential.kind != "oauth" {
-        return Ok(None);
-    }
     match credential.kind.as_str() {
         "key" => go_token(credential.key),
         "oauth" => {

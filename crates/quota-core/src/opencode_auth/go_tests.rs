@@ -102,6 +102,42 @@ fn duplicate_active_rows_for_the_selected_integration_are_unusable() {
 }
 
 #[test]
+fn active_go_row_beats_generic_keys_even_when_generic_rows_are_ambiguous() {
+    for dedicated in [GO_KEY, OAUTH] {
+        let store = Store::new();
+        let db = store.create_at(&store.database());
+        Store::row(
+            &db,
+            "opencode",
+            Some(1),
+            r#"{"type":"key","key":"generic-key"}"#,
+        );
+        Store::row(&db, "opencode-go", Some(1), dedicated);
+        let expected = if dedicated == GO_KEY {
+            "go-key"
+        } else {
+            "oauth-token"
+        };
+        assert_eq!(store.read().unwrap().as_deref(), Some(expected));
+        Store::row(&db, "opencode", Some(1), GO_KEY);
+        assert_eq!(store.read().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn duplicate_active_key_rows_for_the_selected_integration_are_unusable() {
+    for integration in ["opencode-go", "opencode"] {
+        let store = Store::new();
+        let db = store.create_at(&store.database());
+        Store::row(&db, integration, Some(1), GO_KEY);
+        Store::row(&db, integration, Some(1), GO_KEY);
+        let error = store.read().unwrap_err();
+        assert_eq!(error.error_class(), "credential_unusable");
+        assert!(error.to_string().contains("duplicate active rows"));
+    }
+}
+
+#[test]
 fn oauth_requires_a_future_integral_expiry_and_never_refreshes() {
     for integration in ["opencode", "opencode-go"] {
         for (expiry, reason) in [
@@ -198,10 +234,9 @@ fn legacy_is_used_only_when_the_database_or_table_is_absent() {
         "an empty credential table retires auth.json"
     );
     Store::row(&db, "opencode", Some(1), GO_KEY);
-    assert!(
-        store.read().unwrap().is_none(),
-        "a generic API key cannot authorize Go"
-    );
+    // The modern CLI's generic key login also authorizes Go. The legacy
+    // auth.json fallback remains restricted to dedicated Go API keys.
+    assert_eq!(store.read().unwrap().as_deref(), Some("go-key"));
     Store::row(&db, "opencode-go", Some(1), "malformed");
     assert_eq!(
         store.read().unwrap_err().error_class(),
