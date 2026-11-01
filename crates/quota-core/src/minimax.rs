@@ -9,10 +9,10 @@
 //!
 //! Window mapping: the `general` Token Plan model supplies the primary interval
 //! and secondary weekly percent windows; the first available non-text model is
-//! tertiary. Percent windows use `100 - remaining_percent`. Legacy count windows
-//! keep their existing remaining-count semantics and epoch-derived durations.
+//! tertiary. Explicit remaining percentages win over used/total percentages.
+//! Legacy count windows keep their remaining-count semantics and epoch-derived durations.
 //! `resets_at` comes from the reported end epoch, or the remaining-time offset.
-//! Unlimited weekly windows intentionally omit `resets_at`.
+//! Unlimited percent windows intentionally omit `resets_at` and absolute counts.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
 //! MiniMax API key was available. Endpoint, auth headers, env key order, and
@@ -98,6 +98,8 @@ struct BaseResp {
 
 #[derive(Debug, Deserialize, Clone)]
 struct ModelRemains {
+    // Boost permill/permille fields only feed upstream's synthetic counts. Ignore
+    // them here: used/total percentages already account for boosted allowances.
     #[serde(rename = "model_name")]
     model_name: Option<String>,
     #[serde(rename = "current_interval_total_count")]
@@ -108,6 +110,10 @@ struct ModelRemains {
     current_interval_status: Option<serde_json::Value>,
     #[serde(rename = "current_interval_remaining_percent")]
     current_interval_remaining_percent: Option<serde_json::Value>,
+    #[serde(rename = "current_interval_used_percent")]
+    current_interval_used_percent: Option<serde_json::Value>,
+    #[serde(rename = "current_interval_total_percent")]
+    current_interval_total_percent: Option<serde_json::Value>,
     #[serde(rename = "start_time")]
     start_time: Option<serde_json::Value>,
     #[serde(rename = "end_time")]
@@ -122,6 +128,10 @@ struct ModelRemains {
     current_weekly_status: Option<serde_json::Value>,
     #[serde(rename = "current_weekly_remaining_percent")]
     current_weekly_remaining_percent: Option<serde_json::Value>,
+    #[serde(rename = "current_weekly_used_percent")]
+    current_weekly_used_percent: Option<serde_json::Value>,
+    #[serde(rename = "current_weekly_total_percent")]
+    current_weekly_total_percent: Option<serde_json::Value>,
     #[serde(rename = "weekly_start_time")]
     weekly_start_time: Option<serde_json::Value>,
     #[serde(rename = "weekly_end_time")]
@@ -170,6 +180,30 @@ fn decode_float(value: &serde_json::Value) -> Option<f64> {
 
 fn opt_float(field: &Option<serde_json::Value>) -> Option<f64> {
     field.as_ref().and_then(decode_float)
+}
+
+fn percent_value(field: &Option<serde_json::Value>) -> Option<f64> {
+    opt_float(field).or_else(|| {
+        let text = field.as_ref()?.as_str()?.strip_suffix('%')?;
+        let value: f64 = text.parse().ok()?;
+        value.is_finite().then_some(value)
+    })
+}
+
+fn quota_remaining_percent(
+    explicit: &Option<serde_json::Value>,
+    used: &Option<serde_json::Value>,
+    total: &Option<serde_json::Value>,
+) -> Option<f64> {
+    opt_float(explicit).or_else(|| {
+        let used = percent_value(used).filter(|value| *value >= 0.0)?;
+        let total = percent_value(total).unwrap_or(100.0);
+        if total < 0.0 {
+            return None;
+        }
+        let limit = if total == 0.0 { 100.0 } else { total };
+        Some((100.0 - used / limit * 100.0).clamp(0.0, 100.0))
+    })
 }
 
 fn epoch_to_secs(raw: i64) -> Option<i64> {
@@ -280,8 +314,28 @@ fn representative_window(
 }
 
 fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
-    if let Some(remaining_percent) = opt_float(&m.current_interval_remaining_percent) {
-        let unavailable_placeholder = opt_int(&m.current_interval_status) == Some(3)
+    let has_used_percent = percent_value(&m.current_interval_used_percent).is_some();
+    let is_unlimited = has_used_percent
+        && opt_int(&m.current_interval_status) == Some(3)
+        && is_text_quota_model(m.model_name.as_deref().unwrap_or(""));
+    let minutes = if has_used_percent && opt_int(&m.start_time).is_none() {
+        Some(5 * 60)
+    } else {
+        window_minutes(opt_int(&m.start_time), opt_int(&m.end_time))
+    };
+    let remaining_percent = if is_unlimited {
+        // Match the existing unlimited-weekly and Warp convention: no cap or reset.
+        Some(100.0)
+    } else {
+        quota_remaining_percent(
+            &m.current_interval_remaining_percent,
+            &m.current_interval_used_percent,
+            &m.current_interval_total_percent,
+        )
+    };
+    if let Some(remaining_percent) = remaining_percent {
+        let unavailable_placeholder = !is_unlimited
+            && opt_int(&m.current_interval_status) == Some(3)
             && interval_total(m) == 0
             && opt_int(&m.current_interval_usage_count).unwrap_or(0) == 0
             && remaining_percent >= 100.0;
@@ -293,8 +347,12 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             window_kind: None,
             used_percent: remaining_percent_to_used(remaining_percent),
             raw_used_percent: None,
-            resets_at: resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs),
-            window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
+            resets_at: if is_unlimited {
+                None
+            } else {
+                resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs)
+            },
+            window_minutes: minutes,
             used_count: None,
             total_count: None,
             regeneration: None,
@@ -313,7 +371,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         used_percent: used_percent(total, remaining),
         raw_used_percent: None,
         resets_at,
-        window_minutes: window_minutes(opt_int(&m.start_time), opt_int(&m.end_time)),
+        window_minutes: minutes,
         used_count: None,
         total_count: None,
         regeneration: None,
@@ -327,9 +385,20 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         return None;
     }
 
-    if let Some(remaining_percent) = opt_float(&m.current_weekly_remaining_percent) {
+    let is_new_unlimited = percent_value(&m.current_weekly_used_percent).is_some()
+        && opt_int(&m.current_weekly_status) == Some(3);
+    let remaining_percent = if is_new_unlimited {
+        Some(100.0)
+    } else {
+        quota_remaining_percent(
+            &m.current_weekly_remaining_percent,
+            &m.current_weekly_used_percent,
+            &m.current_weekly_total_percent,
+        )
+    };
+    if let Some(remaining_percent) = remaining_percent {
         if opt_int(&m.current_weekly_status) == Some(3) && remaining_percent >= 100.0 {
-            if is_general_model(m) {
+            if is_new_unlimited || is_general_model(m) {
                 return Some(RateWindow {
                     window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
                     used_percent: 0.0,
@@ -824,6 +893,205 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000;
+
+    // Fixtures ported from CodexBar v0.83.0:
+    // Tests/CodexBarTests/MiniMaxCurrentTokenPlanResponseTests.swift (8–58).
+    // These verify parser compatibility, not the live API-key response schema.
+    const PERCENT_SCHEMA: &[u8] = br#"{
+      "base_resp":{"status_code":0},"model_remains":[{
+        "model_name":"general", "current_interval_used_percent":"8%",
+        "current_interval_total_percent":"100%", "remains_time":3600000,
+        "current_weekly_used_percent":"45%", "current_weekly_total_percent":"150%",
+        "weekly_remains_time":7200000
+      }]}
+    "#;
+    const UNLIMITED_PERCENT_SCHEMA: &[u8] = br#"{
+      "base_resp":{"status_code":0},"model_remains":[{"model_name":"general",
+        "current_interval_used_percent":"0%", "current_interval_total_percent":"0%",
+        "current_interval_status":3, "current_weekly_used_percent":"0%",
+        "current_weekly_total_percent":"100%", "current_weekly_status":3}]}
+    "#;
+
+    #[test]
+    fn percent_schema_strings_normalize_boosted_allowances_without_counts() {
+        let usage = normalize_usage_at(PERCENT_SCHEMA, NOW).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 8.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at, env::epoch_to_iso8601(NOW + 3600));
+        assert_eq!(primary.used_count, None);
+        assert_eq!(primary.total_count, None);
+
+        let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 30.0);
+        assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
+        assert_eq!(secondary.window_minutes, Some(10_080));
+        assert_eq!(secondary.resets_at, env::epoch_to_iso8601(NOW + 7200));
+        assert_eq!(secondary.used_count, None);
+        assert_eq!(secondary.total_count, None);
+        assert!(usage.tertiary.is_none());
+    }
+
+    #[test]
+    fn percent_schema_explicit_boost_spellings_do_not_change_percent_ratios() {
+        for spelling in ["permill", "permille"] {
+            let mut body: serde_json::Value = serde_json::from_slice(PERCENT_SCHEMA).unwrap();
+            let model = &mut body["model_remains"][0];
+            model[format!("interval_boost_{spelling}")] = serde_json::json!(2000);
+            model[format!("weekly_boost_{spelling}")] = serde_json::json!(3000);
+            let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+            let primary = usage.primary.unwrap();
+            let secondary = usage.secondary.unwrap();
+            assert_eq!(primary.used_percent, 8.0, "{spelling}");
+            assert_eq!(secondary.used_percent, 30.0, "{spelling}");
+            assert_eq!(primary.total_count, None);
+            assert_eq!(secondary.total_count, None);
+        }
+    }
+
+    #[test]
+    fn percent_schema_unlimited_windows_have_no_cap_or_reset() {
+        for add_finite_fields in [false, true] {
+            let mut body: serde_json::Value =
+                serde_json::from_slice(UNLIMITED_PERCENT_SCHEMA).unwrap();
+            if add_finite_fields {
+                let model = &mut body["model_remains"][0];
+                for prefix in ["current_interval", "current_weekly"] {
+                    model[format!("{prefix}_used_percent")] = serde_json::json!(45);
+                    model[format!("{prefix}_remaining_percent")] = serde_json::json!(55);
+                    model[format!("{prefix}_total_count")] = serde_json::json!(100);
+                    model[format!("{prefix}_usage_count")] = serde_json::json!(55);
+                }
+                model["end_time"] = serde_json::json!(1_700_003_600_000_i64);
+                model["remains_time"] = serde_json::json!(3600000);
+                model["weekly_end_time"] = serde_json::json!(1_700_007_200_000_i64);
+                model["weekly_remains_time"] = serde_json::json!(7200000);
+            }
+            let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+            for window in [usage.primary.unwrap(), usage.secondary.unwrap()] {
+                assert_eq!(window.used_percent, 0.0);
+                assert_eq!(window.resets_at, None);
+                assert_eq!(window.used_count, None);
+                assert_eq!(window.total_count, None);
+            }
+        }
+    }
+
+    #[test]
+    fn percent_schema_detection_is_per_cadence() {
+        for new_interval in [false, true] {
+            let mut model = serde_json::json!({
+                "model_name": "MiniMax-M2.7",
+                "current_interval_status": 3,
+                "current_interval_remaining_percent": 50,
+                "remains_time": 3600000,
+                "current_weekly_status": 3,
+                "current_weekly_remaining_percent": 50,
+                "weekly_remains_time": 7200000
+            });
+            let field = if new_interval {
+                "current_interval_used_percent"
+            } else {
+                "current_weekly_used_percent"
+            };
+            model[field] = serde_json::json!(45);
+            let body = serde_json::json!({"model_remains": [model]});
+            let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+            let primary = usage.primary.unwrap();
+            let secondary = usage.secondary.unwrap();
+            let (unlimited, metered) = if new_interval {
+                (primary, secondary)
+            } else {
+                (secondary, primary)
+            };
+            assert_eq!(unlimited.used_percent, 0.0);
+            assert_eq!(unlimited.resets_at, None);
+            assert_eq!(metered.used_percent, 50.0);
+            assert_eq!(
+                metered.resets_at,
+                env::epoch_to_iso8601(NOW + if new_interval { 7200 } else { 3600 })
+            );
+        }
+    }
+
+    #[test]
+    fn percent_schema_explicit_remaining_wins_over_used_and_total() {
+        for remaining in [serde_json::json!(67), serde_json::json!("67")] {
+            let mut body: serde_json::Value = serde_json::from_slice(PERCENT_SCHEMA).unwrap();
+            let model = &mut body["model_remains"][0];
+            model["current_interval_remaining_percent"] = remaining.clone();
+            model["current_weekly_remaining_percent"] = remaining;
+            let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+            assert_eq!(usage.primary.unwrap().used_percent, 33.0);
+            assert_eq!(usage.secondary.unwrap().used_percent, 33.0);
+        }
+    }
+
+    #[test]
+    fn percent_schema_numeric_values_defaults_and_validation() {
+        use serde_json::json;
+        let cases = [
+            (json!(8), json!(100), Some(8.0)),
+            (json!("8"), json!("100"), Some(8.0)),
+            (json!(45), json!(150), Some(30.0)),
+            (json!(8), json!(null), Some(8.0)),
+            (json!(8), json!(0), Some(8.0)),
+            (json!("8%"), json!("0%"), Some(8.0)),
+            (json!(200), json!(100), Some(100.0)),
+            (json!(0), json!(100), Some(0.0)),
+            (json!(-1), json!(100), None),
+            (json!(8), json!(-1), None),
+            (json!("NaN%"), json!(100), None),
+            (json!("inf%"), json!(100), None),
+            (json!("-inf%"), json!(100), None),
+            (json!("1e309%"), json!(100), None),
+            (json!("NaN"), json!(100), None),
+            (json!(true), json!(100), None),
+            (json!("invalid%"), json!(100), None),
+            (json!(null), json!(100), None),
+            // An undecodable total is missing, as in the upstream decoder.
+            (json!(8), json!("NaN%"), Some(8.0)),
+        ];
+        for (used, total, expected) in cases {
+            let body = json!({"model_remains": [{
+                "model_name": "general",
+                "current_interval_used_percent": used,
+                "current_interval_total_percent": total,
+                "current_weekly_used_percent": used,
+                "current_weekly_total_percent": total
+            }]});
+            let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+            for window in [usage.primary, usage.secondary] {
+                assert_eq!(window.map(|w| w.used_percent), expected, "{used} / {total}");
+            }
+        }
+        for invalid in ["NaN%", "inf%", "-inf%", "1e309%"] {
+            assert_eq!(percent_value(&Some(json!(invalid))), None);
+        }
+    }
+
+    #[test]
+    fn old_percent_schema_keeps_its_windows_and_unavailable_placeholders() {
+        let body = br#"{"model_remains":[{
+          "model_name":"general", "current_interval_remaining_percent":92,
+          "remains_time":3600000, "current_weekly_remaining_percent":70,
+          "weekly_remains_time":7200000
+        },{
+          "model_name":"video", "current_interval_status":3,
+          "current_interval_total_count":0, "current_interval_usage_count":0,
+          "current_interval_remaining_percent":100
+        }]}"#;
+        let usage = normalize_usage_at(body, NOW).unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 8.0);
+        assert_eq!(primary.window_minutes, None);
+        assert_eq!(primary.resets_at, env::epoch_to_iso8601(NOW + 3600));
+        let secondary = usage.secondary.unwrap();
+        assert_eq!(secondary.used_percent, 30.0);
+        assert_eq!(secondary.window_minutes, Some(10_080));
+        assert_eq!(secondary.resets_at, env::epoch_to_iso8601(NOW + 7200));
+        assert!(usage.tertiary.is_none());
+    }
 
     /// A general bucket that yields no window must not hide a model that does.
     ///
