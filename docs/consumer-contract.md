@@ -264,11 +264,11 @@ Two kinds of route may call this operation:
 - **The phone:** daemon-attested principal `reserved:callosum` **and** a
   `route.bind` identity `harness` beginning with the literal `fed-phone:`. A phone
   identity without that principal grants nothing.
-- **The local desktop app, during development:** principal `direct` with no scope
-  stamp, a harness not beginning with `fed-`, and not the OpenCode plugin's
-  shared channel (harness `alfonso` with session `prefrontal-core`). This mirrors
-  core's development admission, and will be replaced by subc's `operator_app`
-  stamp before release.
+- **The local desktop app:** a route with no scope stamp that the daemon has
+  stamped `operator_app` (insula declares `operator-app/v1`). Nothing the caller
+  chooses stands in for the stamp: a `direct` principal, a harness or a session
+  naming the desktop app grants nothing. Daemons that don't stamp operator apps
+  yet send no stamp, so until one does, the desktop app cannot use a saved reset.
 
 Every other route (simulator, Mac, unknown or missing harness, any scoped route,
 any other principal) receives `forbidden` before parameters are decoded or any

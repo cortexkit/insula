@@ -777,14 +777,15 @@ async fn handle_control_request(
             scope,
             ..
         } => {
+            // The daemon's operator-app stamp rides beside the bind's own keys, so
+            // it is read from the same body. An unreadable stamp grants nothing.
+            let operator_app =
+                serde_json::from_slice::<subc_protocol::peer::RouteBindPeer>(&frame.body)
+                    .ok()
+                    .and_then(|peer| peer.operator_app);
             let phone_allowed =
                 saved_reset_caller_allowed(principal.as_ref(), Some(identity.harness.as_str()))
-                    || dev_operator_app_admission(
-                        principal.as_ref(),
-                        scope.is_some(),
-                        &identity.harness,
-                        &identity.session,
-                    );
+                    || operator_app_admission(operator_app.as_ref(), scope.is_some());
             let mut phones = serve
                 .phone_reset_writers
                 .lock()
@@ -1218,8 +1219,8 @@ async fn handle_usage_request(
     };
 
     // Only the phone (daemon-attested reserved:callosum with a fed-phone:
-    // harness) or the local desktop app (see `dev_operator_app_admission`) may
-    // spend. Check permission for this bound channel and epoch before decoding
+    // harness) or a daemon-attested operator app (see `operator_app_admission`)
+    // may spend. Check permission for this bound channel and epoch before decoding
     // mutation parameters.
     let is_reset = serde_json::from_slice::<serde_json::Value>(&frame.body)
         .is_ok_and(|v| v.get("method").and_then(|m| m.as_str()) == Some(USE_SAVED_RESET_OP));
@@ -1519,28 +1520,24 @@ fn saved_reset_caller_allowed(
         && harness.is_some_and(|harness| harness.starts_with("fed-phone:"))
 }
 
-/// Whether a route is the desktop app during development, mirroring core's
-/// `dev_operator_app_admission`: a `direct` carrier with no scope stamp,
-/// whose harness doesn't start with `fed-`, and whose bind identity isn't the
-/// OpenCode plugin's shared channel (harness `alfonso`, session
-/// `prefrontal-core`). Any `reserved` principal is refused here; the phone has
-/// its own check above.
+/// Whether a route is an operator app (the desktop app) the daemon itself
+/// recognised: an `operator_app` stamp on the bind, with no scope stamp.
 ///
-/// It admits only `usage.use_saved_reset`, which spends real credit. Ufuk
-/// allowed the desktop app this on 2026-10-28; the 30-minute per-account spend
-/// bound in the redemption journal still applies to every caller. Release
-/// plan: replace this body with a check of subc's `operator_app` stamp
-/// (capability `operator-app/v1`), as core and Basal will.
-fn dev_operator_app_admission(
-    principal: Option<&subc_protocol::Principal>,
+/// It admits only `usage.use_saved_reset`, which spends real credit. Nothing a
+/// caller sends can stand in for the stamp: a `direct` principal and a
+/// harness name are both chosen by whatever process opened the route, so any
+/// program running as the user could claim to be the desktop app.
+/// The daemon sends the stamp only to a module declaring `operator-app/v1`,
+/// and only for a connection it recognised from its compiled app table. Until
+/// a daemon release turns that on, no route carries it and the desktop app
+/// cannot spend: refusing is the safe direction for an operation that spends
+/// money, so there is deliberately no fallback to the old rule. The 30-minute
+/// per-account spend bound in the redemption journal applies to every caller.
+fn operator_app_admission(
+    operator_app: Option<&subc_protocol::peer::OperatorApp>,
     scoped: bool,
-    harness: &str,
-    session: &str,
 ) -> bool {
-    matches!(principal, Some(subc_protocol::Principal::Direct))
-        && !scoped
-        && !harness.starts_with("fed-")
-        && !(harness == "alfonso" && session == "prefrontal-core")
+    operator_app.is_some() && !scoped
 }
 
 fn valid_reset_request_id(id: &str) -> bool {
@@ -2034,7 +2031,14 @@ fn manifest(
         // rather than fails without it (local lanes keep fetching, and the vault
         // client retries a refused route indefinitely by design), and an
         // unsatisfied requirement's effect on admission is unverified.
-        provides: vec![subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string()],
+        //
+        // `operator-app/v1` asks the daemon to stamp a route opened by a
+        // recognised operator app; it's the only proof `usage.use_saved_reset`
+        // accepts from the desktop app (see `operator_app_admission`).
+        provides: vec![
+            subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
+            subc_protocol::peer::OPERATOR_APP_CAPABILITY.to_string(),
+        ],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
@@ -2355,14 +2359,19 @@ mod tests {
     /// insula reads no project from `route.bind`, and says so. Without the
     /// declaration, openers that move to protocol 0.34 wait on insula before
     /// sending project-free routes, and the daemon keeps filling a placeholder.
-    /// The block is validated at HELLO, so it must hold exactly this one entry.
+    /// `operator-app/v1` is the only way the desktop app can prove itself to
+    /// `usage.use_saved_reset`. The block is validated at HELLO, so it must hold
+    /// exactly these entries.
     #[test]
     fn the_manifest_declares_it_reads_no_bind_project() {
         let m = manifest("insula", None);
         assert_eq!(
             m.capabilities,
             Some(CapabilityDeclarations {
-                provides: vec!["bind-no-project/v1".to_string()],
+                provides: vec![
+                    "bind-no-project/v1".to_string(),
+                    "operator-app/v1".to_string()
+                ],
                 requires: Vec::new(),
                 must_never_reach: Vec::new(),
             })

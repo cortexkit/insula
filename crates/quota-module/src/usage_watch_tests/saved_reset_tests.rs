@@ -123,18 +123,24 @@ pub(super) async fn bind(wire: &mut Wire, epoch: u32, principal: Value, harness:
 }
 
 /// A bind with no scope stamp, the shape the desktop app's plain local route
-/// has. `bind` always sends a stamp, so it can't build this one.
+/// has. `bind` always sends a stamp, so it can't build this one. `operator_app`
+/// is the daemon's stamp for a recognised operator app, carried beside the
+/// bind's own keys.
 async fn bind_unscoped(
     wire: &mut Wire,
     epoch: u32,
     principal: Value,
     harness: &str,
     session: &str,
+    operator_app: Option<Value>,
 ) {
     let identity = json!({"session":session, "harness":harness});
-    let body = json!({"op":"route.bind", "route_channel":5, "epoch":epoch,
+    let mut body = json!({"op":"route.bind", "route_channel":5, "epoch":epoch,
         "target":{"kind":"management_surface","module_id":"insula"}, "identity":identity,
         "principal":principal});
+    if let Some(stamp) = operator_app {
+        body["operator_app"] = stamp;
+    }
     wire.send(
         Frame::build(
             FrameType::Request,
@@ -150,15 +156,19 @@ async fn bind_unscoped(
     assert_eq!(wire.recv().await.header.ty, FrameType::Response);
 }
 
-/// The desktop app may use a saved reset during development: an unscoped
-/// direct route that isn't federated and isn't the OpenCode plugin's channel.
-/// Each of those three conditions, and the principal, refuses on its own.
+/// A local route spends a saved reset only with the daemon's `operator_app`
+/// stamp. Everything a caller chooses itself is refused: a plain
+/// `direct` route, a harness or session naming the desktop app, empty identity
+/// strings, and the other principals. A stamped route spends.
 #[tokio::test]
-async fn the_desktop_app_may_use_a_saved_reset_on_an_unscoped_direct_route() {
+async fn only_a_daemon_attested_operator_app_may_use_a_saved_reset() {
     let (registry, posts, _) = fixture().await;
     let mut wire = Wire::with_registry(false, 65536, registry).await;
     let direct = || json!({"kind":"direct"});
     for (i, (principal, harness, session)) in [
+        (direct(), "reader", "session"),
+        (direct(), "alfonso-desktop", "desktop"),
+        (direct(), "", ""),
         (direct(), "fed-mac:fp", "s"),
         (direct(), "alfonso", "prefrontal-core"),
         (json!({"kind":"unverified"}), "alfonso-desktop", "s"),
@@ -172,21 +182,30 @@ async fn the_desktop_app_may_use_a_saved_reset_on_an_unscoped_direct_route() {
     .enumerate()
     {
         let epoch = i as u32 + 1;
-        bind_unscoped(&mut wire, epoch, principal, harness, session).await;
+        bind_unscoped(&mut wire, epoch, principal, harness, session, None).await;
         assert_eq!(
             body(&call(&mut wire, epoch, Value::Null).await)["code"],
             "forbidden",
-            "{harness}/{session} must not spend"
+            "{harness:?}/{session:?} without the daemon's stamp must not spend"
         );
     }
     assert_eq!(posts.load(Ordering::SeqCst), 0);
-    // A direct route WITH a scope stamp is refused too: `bind` always sends one,
-    // and `saved_reset_caller_requires_callosum_principal` covers it.
-    bind_unscoped(&mut wire, 20, direct(), "alfonso-desktop", "desktop-1").await;
+    // A stamped route WITH a scope stamp is refused too: `bind` always sends
+    // one, and `saved_reset_caller_requires_callosum_principal` covers it.
+    let stamp = json!({"app":"alfonso-desktop","pid":4242});
+    bind_unscoped(
+        &mut wire,
+        20,
+        direct(),
+        "alfonso-desktop",
+        "desktop-1",
+        Some(stamp),
+    )
+    .await;
     assert_eq!(
         body(&call(&mut wire, 20, reset_params()).await)["outcome"],
         "reset",
-        "the desktop app's own route may spend"
+        "a route the daemon attests as an operator app may spend"
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     wire.stop().await;
