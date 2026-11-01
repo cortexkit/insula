@@ -88,6 +88,10 @@ EXPECTED: dict[str, dict[str, str]] = {
     "kimi": {"USAGE_URL": "www.kimi.com", "SUBSCRIPTION_STATS_URL": "www.kimi.com"},
     "kimi_for_coding": {"USAGE_URL": "api.kimi.com", "SUBSCRIPTION_STATS_URL": "www.kimi.com"},
     "langdock": {"USAGE_URL": "app.langdock.com", "REFERER_URL": "app.langdock.com"},
+    # LiteLLM is self-hosted: litellm.base_url is validated at each fetch, with
+    # redirects disabled. No fixed origin is exempted: adding any URL constant
+    # to this module still fails the normal unrecorded-constant check below.
+    "litellm": {},
     "manus": {"CREDITS_URL": "api.manus.im"},
     "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
     "minimax": {"CHINA_API_BASE": "api.minimaxi.com", "GLOBAL_API_BASE": "api.minimax.io"},

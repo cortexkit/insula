@@ -450,6 +450,18 @@ pub fn provider_client() -> reqwest::Client {
         })
 }
 
+/// Configured proxy origins must never redirect a credential to another origin.
+/// Fail closed if this policy cannot be installed, rather than using a default client.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn provider_client_without_redirects() -> Result<reqwest::Client, FetchError> {
+    reqwest::Client::builder()
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(POOL_IDLE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(transport_error)
+}
+
 /// A small request spec the helper executes and maps to [`FetchError`].
 pub struct JsonRequest {
     method: Method,

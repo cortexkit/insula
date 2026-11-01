@@ -44,6 +44,7 @@ pub mod kilo;
 pub mod kimi;
 pub mod kimi_for_coding;
 pub mod langdock;
+pub mod litellm;
 pub mod llmproxy;
 #[cfg(test)]
 pub mod loopback;
@@ -823,6 +824,11 @@ impl Registry {
             Box::new(abliteration::AbliterationProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(litellm::LiteLLMProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+                config.clone(),
             )),
             Box::new(traecn::TraeCnProvider::new_with_handle_loader(
                 credential_source.clone(),

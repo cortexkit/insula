@@ -1531,6 +1531,55 @@ and image generations publishes:
 `each_status_maps_to_its_class_and_only_a_vault_401_is_reported`,
 `a_vault_deposit_replaces_the_environment_lane`.
 
+### 7.16 `litellm`: self-hosted personal, member and team budgets
+
+`litellm` reads a virtual key from `apikey:litellm[:<account>]`, or
+`LITELLM_API_KEY` only when no vault deposit exists. The proxy is chosen separately
+in the live-reloaded quota config, shared by all LiteLLM keys on the host:
+
+```json
+{"litellm":{"base_url":"https://proxy.example.com"}}
+```
+
+There is no URL environment fallback or default public proxy. A trailing `/v1`
+is stripped before requesting `/key/info`, then `/user/info` and/or `/team/info`.
+The URL must use HTTPS, except HTTP is allowed on localhost, loopback, RFC 1918,
+IPv6 unique-local, link-local addresses and `.local` names. Userinfo, query and
+fragment are refused as `credential_unusable` without sending the key. All
+redirects are disabled, including redirects to another host. Config edits take
+effect on the next fetch, not halfway through a sequence of budget requests.
+
+Each positive cap publishes a separate USD money pool with `basis: "derived"`,
+`funding: "unknown"`, `total` equal to `max_budget` and `remaining` equal to
+`max(0, max_budget − max(0, spend))`. Personal capacity uses `id: "personal"`.
+If no positive personal cap exists, a matching member's override, then the team's
+default member budget can supply `id: "member"` instead. Only that user's spend
+in that team may be compared with a member cap; user-wide spend is never used.
+An override from `/user/info` wins over `/team/info` overrides and defaults.
+The matching team's own budget is a separate `id: "team"` pool, also used alone
+for team-only keys. These are overlapping constraints, not additive balances.
+Each pool carries only its own stated `budget_reset_at`; no reset cadence,
+expiration, spendable flag or rate window is invented.
+
+Optional membership discovery failures preserve budgets already read. With no
+positive cap there is no capacity to publish: the result is `no_quota_reported`,
+not spend alone or a zero-cap pool. The provider does not request a separate
+spend report when budget information is unavailable. Key-info 401/403 means
+`credential_rejected`; transport/429/5xx means `upstream_failed`. Fixtures from
+CodexBar v0.83.0 cover this behavior; no live LiteLLM proxy was available.
+Like other identity-less API-key lanes, LiteLLM does not invent an account id
+from a credential suffix. At most one unlabelled entry is published for the
+provider, even when several such credentials exist (section 9.1).
+
+**Proven by:** `team_default_member_budget_becomes_personal_capacity`,
+`own_member_override_needs_no_team_request`,
+`fallback_overrides_precede_defaults_but_not_user_overrides`,
+`user_wide_spend_is_never_used_for_a_member_budget`,
+`optional_team_info_failures_preserve_known_budgets`,
+`configured_url_allows_https_and_private_http_only`,
+`redirects_are_never_followed_to_another_host`,
+`live_config_is_read_again_on_the_next_fetch`.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys
