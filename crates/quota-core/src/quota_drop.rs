@@ -117,13 +117,16 @@ const NOISE_FLOOR_PERCENT: f64 = 1.0;
 /// series" without either side being a close call.
 const CONTINUOUS_MULTIPLIER: u32 = 2;
 
-/// The mechanic string that makes a decrease meaningless as a drop.
+/// The mechanic strings that make a decrease meaningless as a drop.
 ///
 /// A continuously replenishing pool goes down and up as a matter of course, so a
 /// lower reading says "Tuesday" rather than "quota returned". This is the
 /// dependency that blocked the whole feature: without a stated mechanic, a
 /// detector keyed on a decrease fires every tick for a drip provider.
 const DRIP: &str = "drip";
+/// A pool that returns in partial steps goes down at every step in the same
+/// ordinary way, so each step would otherwise be recorded as a reset.
+const STEP: &str = "step";
 
 /// What one paired reading concluded.
 ///
@@ -328,14 +331,14 @@ fn consider(before: Option<&RateWindow>, after: Option<&RateWindow>, largest: &m
         return;
     };
 
-    // A stated drip mechanic makes a lower reading ordinary rather than
+    // A stated drip or step mechanic makes a lower reading ordinary rather than
     // informative. Checked on the NEW window: it describes the account as it is
     // now, and a provider that started stating a mechanic between the two
     // readings should be believed immediately rather than after one more tick.
     if after
         .regeneration
         .as_ref()
-        .is_some_and(|regeneration| regeneration.mechanic == DRIP)
+        .is_some_and(|regeneration| matches!(regeneration.mechanic.as_str(), DRIP | STEP))
     {
         return;
     }
@@ -610,6 +613,7 @@ mod tests {
         after.regeneration = Some(Regeneration {
             mechanic: "drip".to_string(),
             rate: None,
+            next_step: None,
         });
         let prev = slot_at(now, usage(Some(window(90.0))), BASE);
 
@@ -627,6 +631,33 @@ mod tests {
         );
     }
 
+    /// A stated step mechanic suppresses it too: each partial step lowers the
+    /// reading, and recording those as resets would flood the drop history.
+    #[test]
+    fn a_stated_step_mechanic_suppresses_the_decrease() {
+        let now = Instant::now();
+        let mut after = window(60.0);
+        after.regeneration = Some(Regeneration {
+            mechanic: "step".to_string(),
+            rate: None,
+            next_step: None,
+        });
+        let prev = slot_at(now, usage(Some(window(90.0))), BASE);
+
+        assert_eq!(
+            detect(
+                &prev,
+                &usage(Some(after)),
+                Some(chrono::Utc::now()),
+                false,
+                now,
+                BASE
+            ),
+            DropObservation::NoDrop,
+            "a pool that returns in steps reads lower at every step"
+        );
+    }
+
     /// A stated CLIFF mechanic does not suppress it.
     ///
     /// The control for the test above. Without this, suppressing every window
@@ -639,6 +670,7 @@ mod tests {
         after.regeneration = Some(Regeneration {
             mechanic: "cliff".to_string(),
             rate: None,
+            next_step: None,
         });
         let prev = slot_at(now, usage(Some(window(90.0))), BASE);
 

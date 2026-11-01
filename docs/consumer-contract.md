@@ -1901,7 +1901,9 @@ a goodwill grant, a plan change and an upstream correction look the same.
 These do not count as drops:
 
 - a decrease across an account change (two accounts are not one series);
-- a decrease on a window that states a continuous `drip` regeneration;
+- a decrease on a window that states a continuous `drip` or a stepped `step`
+  regeneration (Synthetic's weekly credit pool returns in steps, and each step
+  lowers the reading);
 - a decrease under one percentage point;
 - a reading whose `fetchedAt` is earlier than the previous one.
 

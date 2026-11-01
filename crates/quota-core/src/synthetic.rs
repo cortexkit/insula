@@ -23,7 +23,7 @@ use crate::LOG_TAG;
 use crate::{
     env,
     http::JsonRequest,
-    model::{ProviderUsage, RateWindow, Usage},
+    model::{ProviderUsage, RateWindow, Regeneration, RegenerationStep, Usage},
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
 };
@@ -98,6 +98,15 @@ const RESET_KEYS: &[&str] = &[
     "expires_at",
     "endAt",
     "end_at",
+];
+const STEP_AT_KEYS: &[&str] = &["nextRegenAt", "next_regen_at", "nextTickAt", "next_tick_at"];
+const STEP_PERCENT_KEYS: &[&str] = &[
+    "nextRegenPercent",
+    "next_regen_percent",
+    "nextTickPercent",
+    "next_tick_percent",
+    "tickPercent",
+    "tick_percent",
 ];
 const WINDOW_MINUTES_KEYS: &[&str] = &[
     "windowMinutes",
@@ -348,8 +357,26 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
         window_minutes,
         used_count: None,
         total_count: None,
-        regeneration: None,
+        regeneration: regeneration_step(map),
         breakdown: None,
+    })
+}
+
+/// The next regeneration step a quota block states, published as a `step`.
+///
+/// Synthetic's weekly credit pool returns in steps: `nextRegenAt` dates the next
+/// one and `nextRegenPercent` says how much of the pool it returns. Neither is a
+/// reset (see `RESET_KEYS`). Published only when the block states a time; a size
+/// that isn't a finite share of the window (0 < p <= 100) is left unstated rather
+/// than passed on.
+fn regeneration_step(map: &serde_json::Map<String, serde_json::Value>) -> Option<Regeneration> {
+    let at = first_date(map, STEP_AT_KEYS)?;
+    let percent = crate::json_scan::first_finite_f64(map, STEP_PERCENT_KEYS)
+        .filter(|p| *p > 0.0 && *p <= 100.0);
+    Some(Regeneration {
+        mechanic: "step".to_string(),
+        rate: None,
+        next_step: Some(RegenerationStep { at, percent }),
     })
 }
 
@@ -913,9 +940,46 @@ mod tests {
             weekly.resets_at, None,
             "a regeneration step must not read as the weekly reset"
         );
+        assert_eq!(
+            weekly.regeneration,
+            Some(Regeneration {
+                mechanic: "step".to_string(),
+                rate: None,
+                next_step: Some(RegenerationStep {
+                    at: "2026-11-01T18:00:00Z".to_string(),
+                    percent: Some(2.0),
+                }),
+            }),
+            "the next step is published as a step, with its size"
+        );
         let hourly = usage.tertiary.expect("the search window stays");
         assert_eq!(hourly.used_percent, 10.0);
         assert_eq!(hourly.resets_at.as_deref(), Some("2026-11-01T17:00:00Z"));
+    }
+
+    /// A step time with an implausible size keeps the time and leaves the size
+    /// unstated; a block with no step time states no regeneration at all.
+    #[test]
+    fn a_step_size_outside_the_window_is_left_unstated() {
+        let body = br#"{"planWeeklyLimit": {"percentRemaining": 50.0,
+            "nextRegenAt": "2026-11-01T18:00:00Z", "nextRegenPercent": 150.0}}"#;
+        let step = normalize_usage(body)
+            .unwrap()
+            .secondary
+            .unwrap()
+            .regeneration
+            .unwrap();
+        assert_eq!(step.next_step.unwrap().percent, None);
+
+        let body = br#"{"planWeeklyLimit": {"percentRemaining": 50.0, "nextRegenPercent": 2.0}}"#;
+        assert_eq!(
+            normalize_usage(body)
+                .unwrap()
+                .secondary
+                .unwrap()
+                .regeneration,
+            None
+        );
     }
 
     /// A response carrying both weekly blocks is read from the current one.

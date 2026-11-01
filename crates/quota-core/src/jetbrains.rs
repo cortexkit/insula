@@ -706,6 +706,7 @@ fn regeneration_from(refill: &NextRefill) -> Option<Regeneration> {
     Some(Regeneration {
         mechanic: "cliff".to_string(),
         rate,
+        next_step: None,
     })
 }
 
