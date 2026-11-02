@@ -141,10 +141,12 @@ its credential (reading a vault credential through `CredentialSource`, which
 returns it already refreshed), calls the provider, and normalizes the answer
 into rate windows and `spend` pools, or returns a `FetchError`.
 
-Routing also forwards account-keyed model-response headers through `usage.observe`.
+Broca and Claustrum forward credential-keyed model-response headers through
+`usage.observe`.
 The module remembers the daemon-attested `principal` on each `route.bind`, keyed
-by channel and binding epoch, and permits only `reserved:prefrontal-routing` to
-write. Neither the client-supplied bind identity nor the scope owner's principal
+by channel and binding epoch, and permits only `reserved:broca` and
+`reserved:claustrum` (with a vouch) to write. Neither the client-supplied bind
+identity nor the scope owner's principal
 identifies the calling module. The pure parser in `anthropic.rs` extracts the
 five-hour and weekly fractions and their reset instants; unrelated headers do
 not affect the inventory.

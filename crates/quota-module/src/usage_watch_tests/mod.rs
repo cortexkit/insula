@@ -512,6 +512,15 @@ impl quota_core::provider::UsageProvider for ClaudePoll {
     fn name(&self) -> &str {
         "claude"
     }
+    fn handles(
+        &self,
+    ) -> Result<Vec<quota_core::provider::CredentialHandle>, quota_core::provider::HandlesError>
+    {
+        Ok(vec![quota_core::provider::CredentialHandle::scoped(
+            "oauth:claude:synthetic",
+            "oauth",
+        )])
+    }
     async fn fetch_handle(
         &self,
         _: &quota_core::provider::CredentialHandle,
@@ -553,8 +562,8 @@ async fn bind_writer(wire: &mut Wire, principal: Value, epoch: u32) {
 
 async fn observe_wire(wire: &mut Wire, epoch: u32, corr: u64, at: i64) -> Frame {
     let body = json!({"method":"usage.observe", "params":{"observations":[
-        {"provider":"claude","account":"missing","observedAtMs":at,"headers":{}},
-        {"provider":"claude","account":"work","observedAtMs":at,
+        {"provider":"claude","credentialId":"oauth:claude:missing","observedAtMs":at,"headers":{}},
+        {"provider":"claude","credentialId":"oauth:claude:synthetic","account":"work","observedAtMs":at,
             "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21", "anthropic-ratelimit-unified-5h-reset":"1790394000",
                 "anthropic-ratelimit-unified-7d-utilization":"1.0","anthropic-ratelimit-unified-7d-reset":"1790740800"}}
     ]}});
@@ -574,7 +583,7 @@ async fn observe_wire(wire: &mut Wire, epoch: u32, corr: u64, at: i64) -> Frame 
 }
 
 #[tokio::test]
-async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_watch() {
+async fn usage_observe_requires_attested_writer_and_changes_get_samples_and_watch() {
     let registry = Arc::new(Registry::new(vec![Box::new(ClaudePoll)]));
     registry.refresh_tick(&CancellationToken::new()).await;
     let before = serde_json::to_value(registry.get_usage(None).await).unwrap();
@@ -593,6 +602,10 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
         (2, json!({"kind":"direct"})),
         (3, json!({"kind":"unverified"})),
         (4, json!({"kind":"reserved","module_id":"prefrontal-core"})),
+        (
+            5,
+            json!({"kind":"reserved","module_id":"prefrontal-routing"}),
+        ),
     ] {
         bind_writer(&mut wire, principal, epoch).await;
         let response = observe_wire(&mut wire, epoch, 401, at).await;
@@ -612,22 +625,17 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
             epoch as u64
         );
     }
-    bind_writer(
-        &mut wire,
-        json!({"kind":"reserved","module_id":"prefrontal-routing"}),
-        5,
-    )
-    .await;
-    wire.subscribe(5, 5, 91).await;
+    bind_writer(&mut wire, json!({"kind":"reserved","module_id":"broca"}), 6).await;
+    wire.subscribe(5, 6, 91).await;
     wire.recv().await;
-    let response = observe_wire(&mut wire, 5, 402, at).await;
+    let response = observe_wire(&mut wire, 6, 402, at).await;
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["result"]["accepted"], 1);
     assert_eq!(body["result"]["ignored"][0]["reason"], "unknown_credential");
-    let changed = notice(wire.recv().await, 5, 5, 91);
+    let changed = notice(wire.recv().await, 5, 6, 91);
     assert_eq!(changed["provider"], "claude");
     assert_eq!(changed["account"], "work");
-    wire.send(request(5, 5, 403, USAGE_GET_OP, false)).await;
+    wire.send(request(5, 6, 403, USAGE_GET_OP, false)).await;
     let served: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
     assert_eq!(served["result"][0]["usage"]["primary"]["usedPercent"], 21.0);
     assert_eq!(
@@ -639,8 +647,8 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
     assert_eq!(metrics["callObservationsApplied"], 1);
     assert_eq!(metrics["callObservationsIgnored"]["unknown_credential"], 1);
 
-    bind_writer(&mut wire, json!({"kind":"direct"}), 6).await;
-    let stale_epoch = observe_wire(&mut wire, 5, 404, at + 1).await;
+    bind_writer(&mut wire, json!({"kind":"direct"}), 7).await;
+    let stale_epoch = observe_wire(&mut wire, 6, 404, at + 1).await;
     let body: Value = serde_json::from_slice(&stale_epoch.body).unwrap();
     assert_eq!(body["code"], "forbidden");
     wire.stop().await;
@@ -649,7 +657,7 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
 
 #[tokio::test]
 async fn usage_observe_admits_broca_and_claustrum_before_decoding_rows() {
-    for module in ["broca", "claustrum", "prefrontal-routing"] {
+    for module in ["broca", "claustrum"] {
         let registry = Arc::new(Registry::new(vec![]));
         let mut wire = Wire::with_registry(false, 64 * 1024, registry.clone()).await;
         bind_writer(&mut wire, json!({"kind":"reserved","module_id":module}), 1).await;
@@ -695,6 +703,7 @@ async fn usage_observe_forbids_untrusted_scoped_writers_before_row_decoding() {
         json!({"kind":"direct"}),
         json!({"kind":"unverified"}),
         json!({"kind":"reserved","module_id":"another-module"}),
+        json!({"kind":"reserved","module_id":"prefrontal-routing"}),
     ]
     .into_iter()
     .enumerate()

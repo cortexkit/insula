@@ -803,9 +803,6 @@ async fn handle_control_request(
                         "claustrum" => {
                             Some(quota_core::call_observations::ObservationWriter::Claustrum)
                         }
-                        "prefrontal-routing" => {
-                            Some(quota_core::call_observations::ObservationWriter::Routing)
-                        }
                         _ => None,
                     }
                 }
@@ -1287,7 +1284,7 @@ async fn handle_usage_request(
             serve,
             reply,
             "forbidden",
-            "usage.observe requires reserved:broca, reserved:claustrum or reserved:prefrontal-routing",
+            "usage.observe requires reserved:broca or reserved:claustrum (vouched)",
         )
         .await;
     }
@@ -1841,7 +1838,7 @@ fn manifest(
                 ManagementOperation {
                     name: "usage.observe".to_string(),
                     kind: ManagementOperationKind::Mutate,
-                    description: Some("Accept Claude and Codex reply readings from reserved:broca, reserved:claustrum (vouched), and transitional reserved:prefrontal-routing.".to_string()),
+                    description: Some("Accept Claude and Codex reply readings from reserved:broca and reserved:claustrum (vouched).".to_string()),
                 },
                 ManagementOperation {
                     name: USE_SAVED_RESET_OP.to_string(),

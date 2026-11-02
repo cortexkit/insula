@@ -105,12 +105,36 @@ async fn claustrum_requires_matching_vouch() {
 #[tokio::test]
 async fn only_claustrum_may_vouch() {
     let registry = registry("claude").await;
-    for writer in [ObservationWriter::Broca, ObservationWriter::Routing] {
+    let mut bad = row("claude");
+    bad["vouched"] = json!({"principal":"enrolled:synthetic","credentialId":CREDENTIAL});
+    ignored(
+        &registry,
+        ObservationWriter::Broca,
+        bad.clone(),
+        "vouch_mismatch",
+    );
+    bad["vouched"] = Value::Null;
+    ignored(&registry, ObservationWriter::Broca, bad, "vouch_mismatch");
+}
+
+#[tokio::test]
+async fn credential_id_is_required_even_with_a_matching_account() {
+    let registry = registry("claude").await;
+    let before = registry.usage_snapshot(None).await.to_envelope();
+    for writer in [ObservationWriter::Broca, ObservationWriter::Claustrum] {
         let mut bad = row("claude");
-        bad["vouched"] = json!({"principal":"enrolled:synthetic","credentialId":CREDENTIAL});
-        ignored(&registry, writer, bad.clone(), "vouch_mismatch");
-        bad["vouched"] = Value::Null;
-        ignored(&registry, writer, bad, "vouch_mismatch");
+        bad.as_object_mut().unwrap().remove("credentialId");
+        bad["account"] = json!("synthetic-account");
+        if writer == ObservationWriter::Claustrum {
+            bad["vouched"] = json!({"principal":"enrolled:synthetic","credentialId":CREDENTIAL});
+        }
+        let result = registry.observe_calls(writer, vec![bad]);
+        assert_eq!(result.accepted, 0);
+        assert_eq!(
+            serde_json::to_value(&result.ignored).unwrap(),
+            json!([{"reason":"invalid_observation"}])
+        );
+        assert_eq!(before, registry.usage_snapshot(None).await.to_envelope());
     }
 }
 
