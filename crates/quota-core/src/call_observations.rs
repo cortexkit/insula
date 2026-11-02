@@ -126,10 +126,17 @@ impl Registry {
                     .map_err(|_| "invalid_observation")?;
                 if let Some(vouch) = observation.vouched.as_ref() {
                     let mut metrics = self.call_metrics.lock().unwrap_or_else(|p| p.into_inner());
-                    *metrics
+                    let count = metrics
                         .vouched_principals
                         .entry(vouch.principal.clone())
-                        .or_default() += 1;
+                        .or_default();
+                    if *count == 0 {
+                        eprintln!(
+                            "[insula] vouched call observation principal={:?}",
+                            vouch.principal
+                        );
+                    }
+                    *count += 1;
                 }
                 if observation.credential_id.is_none()
                     && (writer != ObservationWriter::Routing || observation.account.is_none())
