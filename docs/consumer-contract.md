@@ -329,8 +329,8 @@ SHA256SUMS and a drift test. v1 is unchanged.
 
 ### `usage.observe`: reply-reading writer contract
 
-The daemon-attested writers are `reserved:broca` (direct), `reserved:claustrum`
-(enrolled-plugin relay), and transitional `reserved:prefrontal-routing`. Every
+The daemon-attested writers are `reserved:broca` (direct) and `reserved:claustrum`
+(enrolled-plugin relay, vouched). Every
 other caller receives a route error `forbidden` **before row decoding**. A
 client-supplied identity or scope owner cannot grant admission; scope attribution
 does not change the attested caller. Binding epochs prevent stale writers.
@@ -345,7 +345,8 @@ does not change the attested caller. Binding epochs prevent stale writers.
 }]}}
 ```
 
-`credentialId` is the vault record id that served the call, **not** an account id.
+`credentialId` is required for every row: it is the vault record id that served the
+call, **not** an account id. A missing key is `invalid_observation`.
 It selects only a `CredentialHandle::Vault` slot for the stated provider. Optional
 `account` must equal that slot's resolved account id. `observedAtMs` is the reply's
 Unix-millisecond value time, not delivery time. `headers` is an optional lowercase
@@ -355,18 +356,17 @@ capped at 16 KiB when serialized. Bad rows do not refuse siblings.
 Claustrum must supply `vouched: {"principal":"enrolled:synthetic",
 "credentialId":"chatgpt:openai:synthetic"}`. The vouched credential must equal
 the row's key. No other writer may carry `vouched`. The vouched principal is
-counted for diagnostics, never used for admission or slot selection. Only routing
-may still send its legacy account-only shape without `credentialId`.
+counted for diagnostics, never used for admission or slot selection.
 
-Reply: `{"result":{"accepted":1,"ignored":[]}}`. Ignored modern rows carry
-`credentialId` and `reason`; ignored legacy rows retain `account` and `reason`.
+Reply: `{"result":{"accepted":1,"ignored":[]}}`. Ignored rows carry `reason` and
+`credentialId` when the row supplied a string key.
 
 | Reason | Meaning |
 |---|---|
 | `forbidden` | caller is not an admitted attested writer (route error, before rows) |
 | `invalid_observation` | malformed row, timestamp, frame, missing key, or row over 16 KiB |
 | `unsupported_provider` | no parser; only `claude` and `codex` are supported |
-| `unknown_credential` | no matching vault slot for this provider/key (or no matching legacy account) |
+| `unknown_credential` | no matching vault slot for this provider/key |
 | `account_mismatch` | supplied account differs from the slot's resolved account |
 | `no_poll_reading_yet` | no successful usable poll with resolved identity |
 | `future_reading` | value time is more than 60 seconds ahead of insula's clock |
@@ -416,6 +416,7 @@ reloads change this decision without a restart.
 
 **Proven by:** `usage_observe_admits_broca_and_claustrum_before_decoding_rows`,
 `usage_observe_forbids_untrusted_scoped_writers_before_row_decoding`,
+`credential_id_is_required_even_with_a_matching_account`,
 `claustrum_requires_matching_vouch`, `only_claustrum_may_vouch`,
 `early_new_period_refuses_whole_row_for_both_providers`,
 `codex_matches_length_not_primary_slot_and_never_adds_periods`,

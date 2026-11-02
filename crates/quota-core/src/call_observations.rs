@@ -10,7 +10,7 @@ use crate::{anthropic, refresh, scheduler_now, Registry};
 #[serde(rename_all = "camelCase")]
 pub struct CallObservation {
     pub provider: String,
-    pub credential_id: Option<String>,
+    pub credential_id: String,
     pub account: Option<String>,
     pub observed_at_ms: i64,
     #[serde(default)]
@@ -31,7 +31,6 @@ pub struct VouchedObservation {
 pub enum ObservationWriter {
     Broca,
     Claustrum,
-    Routing,
 }
 
 impl ObservationWriter {
@@ -39,7 +38,6 @@ impl ObservationWriter {
         match self {
             Self::Broca => "reserved:broca",
             Self::Claustrum => "reserved:claustrum",
-            Self::Routing => "reserved:prefrontal-routing",
         }
     }
 }
@@ -55,8 +53,6 @@ pub struct ObserveResult {
 pub struct IgnoredObservation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
     pub reason: &'static str,
 }
 
@@ -94,20 +90,15 @@ impl Registry {
                 .get("credentialId")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
-            let account = if credential_id.is_none() {
-                value
-                    .get("account")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            } else {
-                None
-            };
             let applied = (|| {
                 if serde_json::to_vec(&value)
                     .map_err(|_| "invalid_observation")?
                     .len()
                     > 16 * 1024
                 {
+                    return Err("invalid_observation");
+                }
+                if credential_id.is_none() {
                     return Err("invalid_observation");
                 }
                 if writer != ObservationWriter::Claustrum && value.get("vouched").is_some() {
@@ -138,11 +129,6 @@ impl Registry {
                     }
                     *count += 1;
                 }
-                if observation.credential_id.is_none()
-                    && (writer != ObservationWriter::Routing || observation.account.is_none())
-                {
-                    return Err("invalid_observation");
-                }
                 self.apply_call_observation(observation)
             })();
             let mut metrics = self.call_metrics.lock().unwrap_or_else(|p| p.into_inner());
@@ -159,7 +145,6 @@ impl Registry {
                     *metrics.ignored.entry(reason.to_owned()).or_default() += 1;
                     result.ignored.push(IgnoredObservation {
                         credential_id,
-                        account,
                         reason,
                     });
                 }
@@ -182,15 +167,9 @@ impl Registry {
         let slots: Vec<_> = store
             .snapshot()
             .into_iter()
-            .filter(|(key, slot)| {
+            .filter(|(key, _)| {
                 key.provider == observation.provider
-                    && match observation.credential_id.as_deref() {
-                        Some(id) => key.handle.vault_credential_id() == Some(id),
-                        None => {
-                            !slot.label_in_flux
-                                && slot.account_id() == observation.account.as_deref()
-                        }
-                    }
+                    && key.handle.vault_credential_id() == Some(observation.credential_id.as_str())
             })
             .collect();
         if slots.is_empty() {
@@ -399,7 +378,7 @@ mod tests {
         .collect()
     }
     fn observation(at: i64) -> Value {
-        json!({"provider":"claude", "account":"a", "observedAtMs":at, "headers":headers()})
+        json!({"provider":"claude", "credentialId":"oauth:claude:synthetic", "account":"a", "observedAtMs":at, "headers":headers()})
     }
     fn poll_entry() -> ProviderUsage {
         serde_json::from_value(json!({"provider":"claude", "account":"a", "source":"oauth",
@@ -418,6 +397,12 @@ mod tests {
     impl UsageProvider for Poll {
         fn name(&self) -> &str {
             "claude"
+        }
+        fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
+            Ok(vec![CredentialHandle::scoped(
+                "oauth:claude:synthetic",
+                "oauth",
+            )])
         }
         async fn fetch_handle(&self, _: &CredentialHandle) -> FetchAttempt {
             FetchAttempt::from_provider_usage(Ok(poll_entry()))
@@ -474,7 +459,10 @@ mod tests {
     async fn call_observation_preserves_poll_inventory_and_publishes_drop_and_value_time() {
         let registry = registry().await;
         let before = registry.get_usage(None).await;
-        let key = SlotKey::new("claude", CredentialHandle::implicit());
+        let key = SlotKey::new(
+            "claude",
+            CredentialHandle::scoped("oauth:claude:synthetic", "oauth"),
+        );
         {
             let mut store = registry.store.lock().unwrap();
             let prev = store.get(&key).unwrap().clone();
@@ -492,7 +480,7 @@ mod tests {
             store.publish_if_current(&key, prev.incarnation, prev.attempt_sequence, failed);
         }
         assert!(registry.get_usage(None).await[0].stale.is_some());
-        let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(STAMP)]);
+        let result = registry.observe_calls(ObservationWriter::Broca, vec![observation(STAMP)]);
         assert_eq!(result.accepted, 1);
         let after = registry.get_usage(None).await;
         assert!(after[0].stale.is_none());
@@ -524,7 +512,10 @@ mod tests {
     #[tokio::test]
     async fn a_call_reading_never_adds_a_window_the_poll_did_not_report() {
         let registry = registry().await;
-        let key = SlotKey::new("claude", CredentialHandle::implicit());
+        let key = SlotKey::new(
+            "claude",
+            CredentialHandle::scoped("oauth:claude:synthetic", "oauth"),
+        );
         {
             let mut store = registry.store.lock().unwrap();
             let prev = store.get(&key).unwrap().clone();
@@ -545,7 +536,7 @@ mod tests {
             .unwrap()
             .primary
             .is_none());
-        let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(STAMP)]);
+        let result = registry.observe_calls(ObservationWriter::Broca, vec![observation(STAMP)]);
         assert_eq!(result.accepted, 1);
         let after = registry.get_usage(None).await;
         let usage = after[0].usage.as_ref().unwrap();
@@ -574,7 +565,7 @@ mod tests {
         ] {
             headers.insert(format!("anthropic-ratelimit-unified-{key}"), value.into());
         }
-        json!({"provider":"claude", "account":"a", "observedAtMs":at, "headers":headers})
+        json!({"provider":"claude", "credentialId":"oauth:claude:synthetic", "account":"a", "observedAtMs":at, "headers":headers})
     }
 
     #[tokio::test]
@@ -582,13 +573,13 @@ mod tests {
         let registry = registry().await;
         assert_eq!(
             registry
-                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .observe_calls(ObservationWriter::Broca, vec![observation(STAMP)])
                 .accepted,
             1
         );
         let held = serde_json::to_value(registry.get_usage(None).await).unwrap();
         let result = registry.observe_calls(
-            ObservationWriter::Routing,
+            ObservationWriter::Broca,
             vec![zeroed_replica(STAMP + 1000, "1790740800")],
         );
         assert_eq!(result.accepted, 0);
@@ -600,7 +591,7 @@ mod tests {
         );
         // A new weekly period may start at 0 only after the held reset has passed.
         let result = registry.observe_calls(
-            ObservationWriter::Routing,
+            ObservationWriter::Broca,
             vec![zeroed_replica(1790740800000, "1791345600")],
         );
         assert_eq!(result.accepted, 1);
@@ -614,13 +605,13 @@ mod tests {
         let registry = registry().await;
         assert_eq!(
             registry
-                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .observe_calls(ObservationWriter::Broca, vec![observation(STAMP)])
                 .accepted,
             1
         );
         let before = serde_json::to_value(registry.get_usage(None).await).unwrap();
         for at in [STAMP - 1, STAMP] {
-            let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(at)]);
+            let result = registry.observe_calls(ObservationWriter::Broca, vec![observation(at)]);
             assert_eq!(
                 result.accepted, 0,
                 "an older or equal observation must not be accepted"
@@ -638,9 +629,10 @@ mod tests {
         let registry = registry().await;
         let mut cold = observation(STAMP);
         cold["account"] = json!("cold");
+        cold["credentialId"] = json!("oauth:claude:cold");
         {
             let mut store = registry.store.lock().unwrap();
-            let handle = CredentialHandle::new("cold");
+            let handle = CredentialHandle::scoped("oauth:claude:cold", "oauth");
             store.insert_known("claude", std::slice::from_ref(&handle), scheduler_now());
             let key = SlotKey::new("claude", handle);
             let mut slot = store.get(&key).unwrap().clone();
@@ -648,13 +640,13 @@ mod tests {
             store.publish_if_current(&key, slot.incarnation, slot.attempt_sequence, slot);
         }
         let mut unknown = observation(STAMP);
-        unknown["account"] = json!("unknown");
+        unknown["credentialId"] = json!("oauth:claude:unknown");
         let mut unsupported = observation(STAMP);
         unsupported["provider"] = json!("unsupported");
         let mut unusable = observation(STAMP);
         unusable["headers"] = json!({});
         let result = registry.observe_calls(
-            ObservationWriter::Routing,
+            ObservationWriter::Broca,
             vec![
                 cold,
                 unknown,
@@ -688,7 +680,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn claude_call_cadence_defers_only_recent_observations_and_keeps_backoff() {
         let registry = registry().await;
-        let key = SlotKey::new("claude", CredentialHandle::implicit());
+        let key = SlotKey::new(
+            "claude",
+            CredentialHandle::scoped("oauth:claude:synthetic", "oauth"),
+        );
         let mut slot = registry.store.lock().unwrap().get(&key).unwrap().clone();
         let last = slot.last_poll_completed_at.unwrap();
         assert_eq!(slot.next_due_at, last + Duration::from_secs(180));
@@ -703,7 +698,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(179)).await;
         assert_eq!(
             registry
-                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .observe_calls(ObservationWriter::Broca, vec![observation(STAMP)])
                 .accepted,
             1
         );
