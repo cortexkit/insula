@@ -327,54 +327,102 @@ SHA256SUMS and a drift test. v1 is unchanged.
 
 ## 4. Freshness
 
-### `usage.observe`: routing's writer contract
+### `usage.observe`: reply-reading writer contract
 
-Only the daemon-attested principal `reserved:prefrontal-routing` may call
-`usage.observe`. Every other principal (including an absent attestation) receives
-a route error with code `forbidden`, without applying or counting any rows.
-Client-supplied identities and scope owners cannot grant this permission.
+The daemon-attested writers are `reserved:broca` (direct), `reserved:claustrum`
+(enrolled-plugin relay), and transitional `reserved:prefrontal-routing`. Every
+other caller receives a route error `forbidden` **before row decoding**. A
+client-supplied identity or scope owner cannot grant admission; scope attribution
+does not change the attested caller. Binding epochs prevent stale writers.
 
 ```json
-{"method":"usage.observe","params":{"observations":[
-  {"provider":"claude","account":"vault-account-id","observedAtMs":1790394000123,
-   "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21",
-              "anthropic-ratelimit-unified-5h-reset":"1790394000"}}
-]}}
+{"method":"usage.observe","params":{"observations":[{
+  "provider":"codex","credentialId":"chatgpt:openai:synthetic",
+  "account":"synthetic-account","observedAtMs":1793600000000,
+  "headers":{"x-codex-primary-used-percent":"41",
+             "x-codex-primary-window-minutes":"10080",
+             "x-codex-primary-reset-at":"1793774164"}
+}]}}
 ```
 
-Routing forwards the newest reading per account, with every
-`anthropic-ratelimit-unified-*` header verbatim as a string; insula owns parsing.
-The account is the id published as `account` by `usage.get`, not a credential id.
-`observedAtMs` is the reading's Unix-millisecond value time, not its delivery time.
-Reply: `{"result":{"accepted":1,"ignored":[]}}`. Each ignored row names its
-`account` and `reason`; a bad row never refuses the rest of the batch:
+`credentialId` is the vault record id that served the call, **not** an account id.
+It selects only a `CredentialHandle::Vault` slot for the stated provider. Optional
+`account` must equal that slot's resolved account id. `observedAtMs` is the reply's
+Unix-millisecond value time, not delivery time. `headers` is an optional lowercase
+string map; `frame` is an optional JSON object. Rows are decoded independently and
+capped at 16 KiB when serialized. Bad rows do not refuse siblings.
+
+Claustrum must supply `vouched: {"principal":"enrolled:synthetic",
+"credentialId":"chatgpt:openai:synthetic"}`. The vouched credential must equal
+the row's key. No other writer may carry `vouched`. The vouched principal is
+counted for diagnostics, never used for admission or slot selection. Only routing
+may still send its legacy account-only shape without `credentialId`.
+
+Reply: `{"result":{"accepted":1,"ignored":[]}}`. Ignored modern rows carry
+`credentialId` and `reason`; ignored legacy rows retain `account` and `reason`.
 
 | Reason | Meaning |
 |---|---|
-| `unsupported_provider` | provider is not `claude` |
-| `unknown_account` | no current verified Claude slot names that account |
-| `no_poll_reading_yet` | the account has no usable successful poll inventory yet |
+| `forbidden` | caller is not an admitted attested writer (route error, before rows) |
+| `invalid_observation` | malformed row, timestamp, frame, missing key, or row over 16 KiB |
+| `unsupported_provider` | no parser; only `claude` and `codex` are supported |
+| `unknown_credential` | no matching vault slot for this provider/key (or no matching legacy account) |
+| `account_mismatch` | supplied account differs from the slot's resolved account |
+| `no_poll_reading_yet` | no successful usable poll with resolved identity |
+| `future_reading` | value time is more than 60 seconds ahead of insula's clock |
 | `older_than_held` | value time is older than or equal to the held reading |
-| `no_usable_window` | neither utilization header is a finite number |
-| `window_regressed` | a window reports more than 1 point less use than insula holds while its reset time is unchanged, which can't happen within one period; Anthropic has sent such zeroed replies interleaved with real ones |
-| `invalid_observation` | row shape or timestamp cannot be decoded |
+| `no_usable_window` | no usable reading matches a window held by the poll |
+| `window_regressed` | use falls by more than 1 point with reset unchanged to the minute, or with no reset stated (a reply without a reset keeps the poll's reset time) |
+| `early_new_period` | reset moved later and use fell before the held reset passed at the reading's own time |
+| `vouch_mismatch` | missing/wrong Claustrum vouch, or any vouch from another writer |
 
-Only usable `5h-utilization` and `7d-utilization` update their matching windows,
-as fractions converted to percent and clamped to 0–100. Missing or malformed
-utilization leaves that window unchanged. Matching reset headers are Unix
-seconds, rendered as RFC 3339 Z; missing or malformed resets are absent. Overall
-status, representative claim and overage headers are ignored. Applied readings
-advance canonical `fetchedAt` to `observedAtMs` and clear `stale`. They preserve
-`source`, account metadata, tertiary and Fable windows, saved resets, breakdowns
-and the Extra-usage pool from the poll. They use the same drop comparison,
-quota-sample detector and `usage.watch` invalidations as polled readings.
+Claude parses `anthropic-ratelimit-unified-5h-*` and `7d-*`: finite utilization
+fractions become clamped percentages, and epoch-second resets become RFC 3339 Z.
+Codex parses only default `x-codex-primary-*` / `x-codex-secondary-*` headers
+(`used-percent`, `window-minutes`, `reset-at`), or a `codex.rate_limits` frame's
+`rate_limits.primary/secondary` (`used_percent`, `window_minutes`, `reset_at`).
+A used-percent header takes precedence over the frame for that slot, without
+mixing periods. Codex percentages must be finite and within 0–100. Reset values
+accept epoch seconds, milliseconds or ISO dates. A zero-use slot without positive
+minutes or a reset (including `window-minutes: 0`, `reset-at: ""`) is absent.
+Missing or malformed resets stay absent; relative reset-after values are ignored.
+HTTP 429 readings use the same parser as HTTP 200 readings.
 
-**Proven by:** `usage_observe_requires_attested_routing_and_changes_get_samples_and_watch`,
-`captured_call_headers_parse_and_missing_values_do_not_invent_windows`,
-`call_observation_preserves_poll_inventory_and_publishes_drop_and_value_time`,
-`older_call_observations_are_ignored_without_changing_the_held_reading`,
-`ignored_calls_name_unknown_cold_unsupported_and_unusable_rows_independently`,
-`an_applied_call_reading_enters_the_existing_quota_sample_queue`.
+The Codex writer header allowlist is every `x-codex-*` header except
+`x-codex-turn-state`, plus `x-*-primary-*`, `x-*-secondary-*` and `x-*-limit-name`.
+Non-default families never override default windows. Credits, promo, allowed,
+limit_reached, code-review limits and additional model limits are ignored.
+
+Readings only refresh windows the poll holds; they never add or remove inventory.
+**Codex matches by window length**, not primary/secondary position. A later reset
+can lower use only after the held reset has passed at `observedAtMs`; same-period
+falls greater than 1 point refuse the whole row. Applied readings advance
+`fetchedAt` and clear stale-serving, preserving source, account metadata,
+errorClass, completeness, breakdowns, tertiary/extra windows, saved resets,
+spend pools and vault-auth reporting. They reuse poll drop accounting, quota
+samples and `usage.watch` invalidations.
+
+**Reports never spend money:** only Codex's own poll constructs reset-policy
+facts. A report's 100% or `limit_reached: true` never reaches the reset coordinator
+or authorizes a consume POST. A Codex report with any held window at 99% or
+higher revokes existing saved-reset output relaxation; reports never grant that
+eligibility. Lower readings leave the poll's latch unchanged. While accepted
+readings arrived within the last
+15 minutes, healthy polls back off to a 15-minute backstop after the last poll.
+Call silence restores normal cadence; endpoint failure/429 backoff is never
+shortened. **Codex exception:** live `codex.auto_use_resets` being armed keeps the
+normal Codex poll cadence, so every sibling is read within 600 seconds. Config
+reloads change this decision without a restart.
+
+**Proven by:** `usage_observe_admits_broca_and_claustrum_before_decoding_rows`,
+`usage_observe_forbids_untrusted_scoped_writers_before_row_decoding`,
+`claustrum_requires_matching_vouch`, `only_claustrum_may_vouch`,
+`early_new_period_refuses_whole_row_for_both_providers`,
+`codex_matches_length_not_primary_slot_and_never_adds_periods`,
+`reported_codex_wall_never_reaches_armed_coordinator_or_consume`,
+`observation_sources_cannot_call_reset_policy`,
+`codex_cadence_exception_tracks_live_config`,
+`committed_usage_observe_vectors_match`.
 
 ### 4.1 `fetchedAt` dates the reading
 
@@ -460,10 +508,11 @@ threshold must clear that sum, not the interval alone; below it, every healthy
 provider reads stale for part of every cycle, all at once, which looks like a
 producer-wide outage. This module itself counts an entry as fresh for 120 s
 (`FRESH_HORIZON`). Claude polls every 180 s instead, with a health freshness
-horizon of 215 s. A Claude account with a call reading applied in the last three
+horizon of 215 s. An account with a call reading applied in the last fifteen
 minutes defers polling until fifteen minutes after its last completed poll.
-Once calls stop, the ordinary three-minute schedule resumes; cold accounts are
-never deferred. Failure backoff and vault-repair acceleration take precedence
+Once calls stop, its ordinary schedule resumes; cold accounts are
+never deferred. Codex keeps its normal cadence while live `auto_use_resets`
+is armed. Failure backoff and vault-repair acceleration take precedence
 over this deferral: an account backing off after a 429 polls on the backoff
 schedule even while call readings arrive.
 
@@ -2067,7 +2116,9 @@ not happened, never zero.
 | `quotaDropsObservedContinuously` | object | of those, the ones observed across a continuous interval |
 | `quotaComparisonsNoDrop` | number | paired readings that were compared and showed no drop |
 | `callObservationsApplied` | number | applied model-call observations since process start |
-| `callObservationsIgnored` | object | ignored observations counted by the `usage.observe` reasons above; forbidden callers do not enter these counters |
+| `callObservationsIgnored` | object | ignored observations by reason; `forbidden` counts refused requests before decoding, other reasons count rows |
+| `callObservationsByWriter` | object | decoded-batch rows attempted per attested writer, including ignored/invalid rows |
+| `callObservationsVouchedPrincipals` | object | rows with matching Claustrum vouches by vouched principal, diagnostic only |
 | `quotaNotComparable` | object | readings that could not be compared, by reason |
 | `cookieCohortTotal` | number | providers whose credential is a web session cookie |
 | `cookieLoginsStale` | array | cookie providers whose deposited login stopped working |

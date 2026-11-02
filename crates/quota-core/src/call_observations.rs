@@ -1,4 +1,4 @@
-//! Forwarded model-call readings update only windows whose headers are present.
+//! Reply readings update only quota windows already established by a poll.
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -10,9 +10,38 @@ use crate::{anthropic, refresh, scheduler_now, Registry};
 #[serde(rename_all = "camelCase")]
 pub struct CallObservation {
     pub provider: String,
-    pub account: String,
+    pub credential_id: Option<String>,
+    pub account: Option<String>,
     pub observed_at_ms: i64,
+    #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    pub frame: Option<serde_json::Map<String, serde_json::Value>>,
+    pub vouched: Option<VouchedObservation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VouchedObservation {
+    pub principal: String,
+    pub credential_id: String,
+}
+
+/// Selected only from the transport's daemon-attested caller, never row data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationWriter {
+    Broca,
+    Claustrum,
+    Routing,
+}
+
+impl ObservationWriter {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Broca => "reserved:broca",
+            Self::Claustrum => "reserved:claustrum",
+            Self::Routing => "reserved:prefrontal-routing",
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -22,8 +51,12 @@ pub struct ObserveResult {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IgnoredObservation {
-    pub account: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub reason: &'static str,
 }
 
@@ -31,9 +64,16 @@ pub struct IgnoredObservation {
 pub struct CallObservationMetrics {
     pub applied: u64,
     pub ignored: BTreeMap<String, u64>,
+    pub by_writer: BTreeMap<String, u64>,
+    pub vouched_principals: BTreeMap<String, u64>,
 }
 
 impl Registry {
+    pub fn record_forbidden_observation(&self) {
+        let mut metrics = self.call_metrics.lock().unwrap_or_else(|p| p.into_inner());
+        *metrics.ignored.entry("forbidden".to_owned()).or_default() += 1;
+    }
+
     pub fn call_observation_metrics(&self) -> CallObservationMetrics {
         self.call_metrics
             .lock()
@@ -43,18 +83,73 @@ impl Registry {
 
     /// The transport must authenticate the writer before calling this method.
     /// Decode rows independently so a malformed row cannot refuse its siblings.
-    pub fn observe_calls(&self, observations: Vec<serde_json::Value>) -> ObserveResult {
+    pub fn observe_calls(
+        &self,
+        writer: ObservationWriter,
+        observations: Vec<serde_json::Value>,
+    ) -> ObserveResult {
         let mut result = ObserveResult::default();
         for value in observations {
-            let account = value
-                .get("account")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let applied = serde_json::from_value::<CallObservation>(value)
-                .map_err(|_| "invalid_observation")
-                .and_then(|observation| self.apply_call_observation(observation));
+            let credential_id = value
+                .get("credentialId")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let account = if credential_id.is_none() {
+                value
+                    .get("account")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            let applied = (|| {
+                if serde_json::to_vec(&value)
+                    .map_err(|_| "invalid_observation")?
+                    .len()
+                    > 16 * 1024
+                {
+                    return Err("invalid_observation");
+                }
+                if writer != ObservationWriter::Claustrum && value.get("vouched").is_some() {
+                    return Err("vouch_mismatch");
+                }
+                if writer == ObservationWriter::Claustrum
+                    && (value
+                        .pointer("/vouched/credentialId")
+                        .and_then(|v| v.as_str())
+                        .is_none()
+                        || value.pointer("/vouched/credentialId") != value.get("credentialId"))
+                {
+                    return Err("vouch_mismatch");
+                }
+                let observation = serde_json::from_value::<CallObservation>(value)
+                    .map_err(|_| "invalid_observation")?;
+                if let Some(vouch) = observation.vouched.as_ref() {
+                    let mut metrics = self.call_metrics.lock().unwrap_or_else(|p| p.into_inner());
+                    let count = metrics
+                        .vouched_principals
+                        .entry(vouch.principal.clone())
+                        .or_default();
+                    if *count == 0 {
+                        eprintln!(
+                            "[insula] vouched call observation principal={:?}",
+                            vouch.principal
+                        );
+                    }
+                    *count += 1;
+                }
+                if observation.credential_id.is_none()
+                    && (writer != ObservationWriter::Routing || observation.account.is_none())
+                {
+                    return Err("invalid_observation");
+                }
+                self.apply_call_observation(observation)
+            })();
             let mut metrics = self.call_metrics.lock().unwrap_or_else(|p| p.into_inner());
+            *metrics
+                .by_writer
+                .entry(writer.name().to_owned())
+                .or_default() += 1;
             match applied {
                 Ok(()) => {
                     result.accepted += 1;
@@ -62,7 +157,11 @@ impl Registry {
                 }
                 Err(reason) => {
                     *metrics.ignored.entry(reason.to_owned()).or_default() += 1;
-                    result.ignored.push(IgnoredObservation { account, reason });
+                    result.ignored.push(IgnoredObservation {
+                        credential_id,
+                        account,
+                        reason,
+                    });
                 }
             }
         }
@@ -70,8 +169,13 @@ impl Registry {
     }
 
     fn apply_call_observation(&self, observation: CallObservation) -> Result<(), &'static str> {
-        if observation.provider != "claude" {
+        if !matches!(observation.provider.as_str(), "claude" | "codex") {
             return Err("unsupported_provider");
+        }
+        let incoming = DateTime::<Utc>::from_timestamp_millis(observation.observed_at_ms)
+            .ok_or("invalid_observation")?;
+        if incoming > Utc::now() + chrono::Duration::seconds(60) {
+            return Err("future_reading");
         }
         let now = scheduler_now();
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -79,18 +183,32 @@ impl Registry {
             .snapshot()
             .into_iter()
             .filter(|(key, slot)| {
-                key.provider == "claude"
-                    && !slot.label_in_flux
-                    && slot.account_id() == Some(observation.account.as_str())
+                key.provider == observation.provider
+                    && match observation.credential_id.as_deref() {
+                        Some(id) => key.handle.vault_credential_id() == Some(id),
+                        None => {
+                            !slot.label_in_flux
+                                && slot.account_id() == observation.account.as_deref()
+                        }
+                    }
             })
             .collect();
         if slots.is_empty() {
-            return Err("unknown_account");
+            return Err("unknown_credential");
+        }
+        if observation.account.as_deref().is_some_and(|account| {
+            slots
+                .iter()
+                .any(|(_, slot)| slot.account_id().is_some_and(|held| held != account))
+        }) {
+            return Err("account_mismatch");
         }
         let eligible: Vec<_> = slots
             .into_iter()
             .filter(|(_, slot)| {
-                slot.last_poll_completed_at.is_some()
+                !slot.label_in_flux
+                    && slot.account_id().is_some()
+                    && slot.last_poll_completed_at.is_some()
                     && slot
                         .entry
                         .as_ref()
@@ -100,8 +218,6 @@ impl Registry {
         if eligible.is_empty() {
             return Err("no_poll_reading_yet");
         }
-        let incoming = DateTime::<Utc>::from_timestamp_millis(observation.observed_at_ms)
-            .ok_or("invalid_observation")?;
         let held = eligible
             .iter()
             .filter_map(|(_, slot)| slot.last_success_wall)
@@ -109,13 +225,30 @@ impl Registry {
         if !refresh::value_time_supersedes(Some(incoming), held, true) {
             return Err("older_than_held");
         }
-        let windows = anthropic::call_windows(&observation.headers);
+        let windows = if observation.provider == "codex" {
+            crate::codex::call_windows(&observation.headers, observation.frame.as_ref())
+        } else {
+            anthropic::call_windows(&observation.headers)
+        };
         if windows.primary.is_none() && windows.secondary.is_none() {
             return Err("no_usable_window");
         }
-        if eligible.iter().any(|(_, slot)| regresses(slot, &windows)) {
-            return Err("window_regressed");
+        for (_, slot) in &eligible {
+            let usage = slot.entry.as_ref().unwrap().usage.as_ref().unwrap();
+            for (index, held) in [usage.primary.as_ref(), usage.secondary.as_ref()]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(held) = held {
+                    if let Some(update) =
+                        matching_window(&windows, held, index, &observation.provider)
+                    {
+                        guard_window(held, update, incoming)?;
+                    }
+                }
+            }
         }
+        let mut updated = false;
         for (key, prev) in eligible {
             let mut next = prev.clone();
             let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();
@@ -126,15 +259,37 @@ impl Registry {
             // Ultra accounts (October 2026): their usage endpoint answers
             // `five_hour: null`, and a 5-hour header on a model call must not
             // bring back a window that limit no longer has.
-            for (held, update) in [
-                (&mut usage.primary, &windows.primary),
-                (&mut usage.secondary, &windows.secondary),
-            ] {
-                if let (Some(held), Some(update)) = (held.as_mut(), update) {
-                    held.used_percent = update.used_percent;
-                    held.resets_at = update.resets_at.clone();
+            let mut matched = false;
+            for (index, held) in [&mut usage.primary, &mut usage.secondary]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(held) = held.as_mut() {
+                    if let Some(update) =
+                        matching_window(&windows, held, index, &observation.provider)
+                    {
+                        held.used_percent = update.used_percent;
+                        // A reply that states no reset says nothing about the
+                        // period, so it keeps the poll's reset time.
+                        if update.resets_at.is_some() {
+                            held.resets_at = update.resets_at.clone();
+                        }
+                        matched = true;
+                    }
                 }
             }
+            if !matched {
+                continue;
+            }
+            // A full reply revokes the poll's promise of spare capacity. Only
+            // a poll may decide a saved reset will lift the wall; a report can
+            // withdraw relaxation but must never grant it.
+            if observation.provider == "codex"
+                && crate::model::windows(usage).any(|window| window.used_percent >= 99.0)
+            {
+                next.relax_eligible = false;
+            }
+            updated = true;
             next.last_success_wall = Some(incoming);
             next.last_success_at = Some(now);
             next.last_call_observation_at = Some(now);
@@ -145,52 +300,66 @@ impl Registry {
             // not erase the endpoint's rate-limit backoff or vault repair state.
             self.publish_reading(&mut store, &key, &prev, next, now);
         }
-        Ok(())
+        if updated {
+            Ok(())
+        } else {
+            Err("no_usable_window")
+        }
     }
 }
 
-/// Whether a forwarded reading reports less use than the held reading for a
-/// window whose reset hasn't moved.
-///
-/// Use within one window period only grows, so a fall beyond rounding with the
-/// same reset time can't be real. Anthropic does send such readings: on
-/// 2026-10-22 one account's responses alternated, within seconds and within one
-/// run, between its real weekly figure (61%) and a reply with the weekly and
-/// 5-hour counters at 0 and the weekly reset unchanged, apparently from a
-/// replica that had lost the count. Applying those made the account flap
-/// between exhausted and empty. The whole observation is refused, because its
-/// other windows came from the same bad reply.
-///
-/// The 1-point allowance covers rounding: forwarded headers carry two decimals
-/// and the usage endpoint whole percents. Resets compare to the minute, because
-/// the endpoint sends sub-second resets and the headers whole seconds. A genuine
-/// early reset that keeps its reset time would be refused here too, but only
-/// until insula's own poll of the usage endpoint, which this check never blocks.
-fn regresses(slot: &refresh::ProviderSlot, update: &crate::model::Usage) -> bool {
-    let Some(held) = slot.entry.as_ref().and_then(|e| e.usage.as_ref()) else {
-        return false;
-    };
-    let same_reset = |a: &Option<String>, b: &Option<String>| {
-        let parse = |s: &Option<String>| {
-            s.as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.timestamp())
-        };
-        matches!((parse(a), parse(b)), (Some(a), Some(b)) if (a - b).abs() < 60)
-    };
-    [
-        (&held.primary, &update.primary),
-        (&held.secondary, &update.secondary),
-    ]
-    .into_iter()
-    .any(|(held, update)| match (held, update) {
-        (Some(held), Some(update)) => {
-            same_reset(&held.resets_at, &update.resets_at)
-                && update.used_percent < held.used_percent - 1.0
-        }
-        _ => false,
-    })
+/// Match Codex periods by duration: primary and secondary can swap between
+/// the poll and a reply. Claude's two named periods retain their fixed slots.
+fn matching_window<'a>(
+    windows: &'a crate::model::Usage,
+    held: &crate::model::RateWindow,
+    index: usize,
+    provider: &str,
+) -> Option<&'a crate::model::RateWindow> {
+    if provider == "codex" {
+        [windows.primary.as_ref(), windows.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|update| {
+                held.window_minutes.is_some() && update.window_minutes == held.window_minutes
+            })
+    } else {
+        [windows.primary.as_ref(), windows.secondary.as_ref()][index]
+    }
 }
+
+/// A reply cannot roll a counter back before the held period has ended.
+fn guard_window(
+    held: &crate::model::RateWindow,
+    update: &crate::model::RateWindow,
+    incoming: DateTime<Utc>,
+) -> Result<(), &'static str> {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    // A reply with no reset can't show a new period began, so it is held to
+    // the current period: no fall beyond rounding.
+    if update.resets_at.is_none() && update.used_percent < held.used_percent - 1.0 {
+        return Err("window_regressed");
+    }
+    if let (Some(old), Some(new)) = (parse(&held.resets_at), parse(&update.resets_at)) {
+        if (old.timestamp() - new.timestamp()).abs() < 60
+            && update.used_percent < held.used_percent - 1.0
+        {
+            return Err("window_regressed");
+        }
+        if new > old && update.used_percent < held.used_percent && incoming < old {
+            return Err("early_new_period");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "call_observations_v2_tests.rs"]
+mod v2_tests;
 
 #[cfg(test)]
 mod tests {
@@ -323,7 +492,7 @@ mod tests {
             store.publish_if_current(&key, prev.incarnation, prev.attempt_sequence, failed);
         }
         assert!(registry.get_usage(None).await[0].stale.is_some());
-        let result = registry.observe_calls(vec![observation(STAMP)]);
+        let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(STAMP)]);
         assert_eq!(result.accepted, 1);
         let after = registry.get_usage(None).await;
         assert!(after[0].stale.is_none());
@@ -376,7 +545,7 @@ mod tests {
             .unwrap()
             .primary
             .is_none());
-        let result = registry.observe_calls(vec![observation(STAMP)]);
+        let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(STAMP)]);
         assert_eq!(result.accepted, 1);
         let after = registry.get_usage(None).await;
         let usage = after[0].usage.as_ref().unwrap();
@@ -411,9 +580,17 @@ mod tests {
     #[tokio::test]
     async fn a_weekly_drop_with_an_unchanged_reset_is_refused_and_a_new_period_is_not() {
         let registry = registry().await;
-        assert_eq!(registry.observe_calls(vec![observation(STAMP)]).accepted, 1);
+        assert_eq!(
+            registry
+                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .accepted,
+            1
+        );
         let held = serde_json::to_value(registry.get_usage(None).await).unwrap();
-        let result = registry.observe_calls(vec![zeroed_replica(STAMP + 1000, "1790740800")]);
+        let result = registry.observe_calls(
+            ObservationWriter::Routing,
+            vec![zeroed_replica(STAMP + 1000, "1790740800")],
+        );
         assert_eq!(result.accepted, 0);
         assert_eq!(result.ignored[0].reason, "window_regressed");
         assert_eq!(
@@ -421,8 +598,11 @@ mod tests {
             held,
             "a refused reading must change nothing"
         );
-        // A new weekly period (the reset moved) may start at 0.
-        let result = registry.observe_calls(vec![zeroed_replica(STAMP + 2000, "1791345600")]);
+        // A new weekly period may start at 0 only after the held reset has passed.
+        let result = registry.observe_calls(
+            ObservationWriter::Routing,
+            vec![zeroed_replica(1790740800000, "1791345600")],
+        );
         assert_eq!(result.accepted, 1);
         let after = registry.get_usage(None).await;
         let weekly = after[0].usage.as_ref().unwrap().secondary.as_ref().unwrap();
@@ -432,10 +612,15 @@ mod tests {
     #[tokio::test]
     async fn older_call_observations_are_ignored_without_changing_the_held_reading() {
         let registry = registry().await;
-        assert_eq!(registry.observe_calls(vec![observation(STAMP)]).accepted, 1);
+        assert_eq!(
+            registry
+                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .accepted,
+            1
+        );
         let before = serde_json::to_value(registry.get_usage(None).await).unwrap();
         for at in [STAMP - 1, STAMP] {
-            let result = registry.observe_calls(vec![observation(at)]);
+            let result = registry.observe_calls(ObservationWriter::Routing, vec![observation(at)]);
             assert_eq!(
                 result.accepted, 0,
                 "an older or equal observation must not be accepted"
@@ -465,23 +650,26 @@ mod tests {
         let mut unknown = observation(STAMP);
         unknown["account"] = json!("unknown");
         let mut unsupported = observation(STAMP);
-        unsupported["provider"] = json!("codex");
+        unsupported["provider"] = json!("unsupported");
         let mut unusable = observation(STAMP);
         unusable["headers"] = json!({});
-        let result = registry.observe_calls(vec![
-            cold,
-            unknown,
-            unsupported,
-            unusable,
-            json!({"account":"bad"}),
-            observation(STAMP),
-        ]);
+        let result = registry.observe_calls(
+            ObservationWriter::Routing,
+            vec![
+                cold,
+                unknown,
+                unsupported,
+                unusable,
+                json!({"account":"bad"}),
+                observation(STAMP),
+            ],
+        );
         assert_eq!(result.accepted, 1);
         assert_eq!(
             result.ignored.iter().map(|i| i.reason).collect::<Vec<_>>(),
             [
                 "no_poll_reading_yet",
-                "unknown_account",
+                "unknown_credential",
                 "unsupported_provider",
                 "no_usable_window",
                 "invalid_observation"
@@ -505,44 +693,51 @@ mod tests {
         let last = slot.last_poll_completed_at.unwrap();
         assert_eq!(slot.next_due_at, last + Duration::from_secs(180));
         assert!(
-            slot.poll_due_at("claude", last + Duration::from_secs(179))
+            slot.poll_due_at("claude", last + Duration::from_secs(179), false)
                 > last + Duration::from_secs(179)
         );
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(180)),
+            slot.poll_due_at("claude", last + Duration::from_secs(180), false),
             last + Duration::from_secs(180)
         );
         tokio::time::advance(Duration::from_secs(179)).await;
-        assert_eq!(registry.observe_calls(vec![observation(STAMP)]).accepted, 1);
+        assert_eq!(
+            registry
+                .observe_calls(ObservationWriter::Routing, vec![observation(STAMP)])
+                .accepted,
+            1
+        );
         slot = registry.store.lock().unwrap().get(&key).unwrap().clone();
         let (due, _) = crate::select_due_round_robin(
             &registry.providers,
             vec![(key.clone(), slot.clone())],
             last + Duration::from_secs(180),
             None,
+            false,
         );
         assert!(
             due.is_empty(),
             "recent calls must defer real scheduler admission"
         );
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(180)),
+            slot.poll_due_at("claude", last + Duration::from_secs(180), false),
             last + Duration::from_secs(900),
             "recent call readings must defer the poll to its fifteen-minute backstop"
         );
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(900)),
+            slot.poll_due_at("claude", last + Duration::from_secs(1079), false),
             last + Duration::from_secs(180)
         );
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(359)),
+            slot.poll_due_at("claude", last + Duration::from_secs(1079), false),
             last + Duration::from_secs(180)
         );
         let (due, _) = crate::select_due_round_robin(
             &registry.providers,
             vec![(key.clone(), slot.clone())],
-            last + Duration::from_secs(359),
+            last + Duration::from_secs(1079),
             None,
+            false,
         );
         assert_eq!(
             due.len(),
@@ -550,8 +745,8 @@ mod tests {
             "call silence must resume real scheduler admission"
         );
         assert_eq!(
-            slot.poll_due_at("codex", last + Duration::from_secs(180)),
-            slot.next_due_at
+            slot.poll_due_at("codex", last + Duration::from_secs(180), false),
+            last + Duration::from_secs(900)
         );
         let other = refresh::next_slot_after_attempt(
             &refresh::ProviderSlot::due_now(last, slot.incarnation),
@@ -564,15 +759,15 @@ mod tests {
         slot.last_failure_class = Some(refresh::FetchClass::Transient);
         slot.next_due_at = last + Duration::from_secs(600);
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(180)),
+            slot.poll_due_at("claude", last + Duration::from_secs(180), false),
             slot.next_due_at
         );
         slot.next_due_at = last;
         assert_eq!(
-            slot.poll_due_at("claude", last + Duration::from_secs(180)),
+            slot.poll_due_at("claude", last + Duration::from_secs(180), false),
             last
         );
         let cold = refresh::ProviderSlot::due_now(Instant::now(), slot.incarnation);
-        assert_eq!(cold.poll_due_at("claude", last), cold.next_due_at);
+        assert_eq!(cold.poll_due_at("claude", last, false), cold.next_due_at);
     }
 }

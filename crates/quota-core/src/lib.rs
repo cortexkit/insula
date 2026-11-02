@@ -180,6 +180,7 @@ fn select_due_round_robin(
     snapshot: Vec<(SlotKey, ProviderSlot)>,
     now: Instant,
     last_admitted_provider: Option<usize>,
+    codex_resets_armed: bool,
 ) -> (Vec<DueCandidate>, Option<usize>) {
     let provider_index: HashMap<&str, usize> = providers
         .iter()
@@ -190,7 +191,7 @@ fn select_due_round_robin(
         (0..providers.len()).map(|_| VecDeque::new()).collect();
 
     for (key, slot) in snapshot {
-        if slot.poll_due_at(&key.provider, now) > now {
+        if slot.poll_due_at(&key.provider, now, codex_resets_armed) > now {
             continue;
         }
         if let Some(&index) = provider_index.get(key.provider.as_str()) {
@@ -854,6 +855,12 @@ impl Registry {
         registry.vault_handle_loader = Some(vault_handle_loader);
         registry.live_config = Some(config);
         registry
+    }
+
+    pub(crate) fn codex_resets_armed(&self) -> bool {
+        self.live_config
+            .as_ref()
+            .is_some_and(|config| config.codex().is_enabled())
     }
 
     /// The live config this registry's providers read, if it was built with one.
@@ -1698,8 +1705,13 @@ impl Registry {
                 .last_admitted_provider
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (mut candidates, last_admitted) =
-                select_due_round_robin(&self.providers, snapshot, turn_start, *cursor);
+            let (mut candidates, last_admitted) = select_due_round_robin(
+                &self.providers,
+                snapshot,
+                turn_start,
+                *cursor,
+                self.codex_resets_armed(),
+            );
             candidates.retain(|candidate| {
                 !candidate
                     .key
@@ -1946,7 +1958,7 @@ impl Registry {
                     .vault_credential_id()
                     .is_some_and(|id| latched_ids.contains(id))
             })
-            .map(|(key, slot)| slot.poll_due_at(&key.provider, now))
+            .map(|(key, slot)| slot.poll_due_at(&key.provider, now, self.codex_resets_armed()))
             .min()
             .map(|due| {
                 due.saturating_duration_since(now)

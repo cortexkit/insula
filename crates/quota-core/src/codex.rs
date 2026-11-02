@@ -441,6 +441,18 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
     })
 }
 
+#[path = "codex_call_windows.rs"]
+mod call_readings;
+pub use call_readings::call_windows;
+
+#[cfg(test)]
+#[path = "codex_call_tests.rs"]
+pub(crate) mod call_window_tests;
+
+#[cfg(test)]
+#[path = "codex_observation_money_tests.rs"]
+mod observation_money_tests;
+
 /// Build the credit pool this account holds, when it holds one.
 ///
 /// Returns an EMPTY vector rather than a zero-balance pool when the account has
