@@ -266,7 +266,8 @@ fi
 #
 # Cheap, and it fails closed: a src/*.rs with no matching `mod` in the crate root
 # is either work someone forgot to wire or a leftover that should have been
-# deleted. Both want a human, and neither announces itself.
+# deleted. Both want a human, and neither announces itself. A file another module
+# includes with `#[path = "<file>.rs"]` is reached too, so that counts as declared.
 printf '\n  == orphan module check\n'
 orphans=0
 for crate_src in crates/*/src; do
@@ -277,7 +278,8 @@ for crate_src in crates/*/src; do
     [ -e "$f" ] || continue
     m="$(basename "$f" .rs)"
     case "$m" in lib|main) continue;; esac
-    if ! grep -q "mod $m;" "$root"; then
+    if ! grep -q "mod $m;" "$root" \
+      && ! grep -qF "#[path = \"$m.rs\"]" "$crate_src"/*.rs; then
       printf '    ORPHAN: %s is declared by no mod in %s\n' "$f" "$root"
       orphans=$((orphans + 1))
     fi
