@@ -613,13 +613,13 @@ mod tests {
         samples.observe(registry.get_usage(None).await).await;
         assert!(samples.pop().is_some());
         let result = registry.observe_calls(quota_core::call_observations::ObservationWriter::Routing, vec![serde_json::json!({"provider":"claude", "account":"work", "observedAtMs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 1000,
-            "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21"}})]);
+            "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.95"}})]);
         assert_eq!(result.accepted, 1);
         samples.observe(registry.get_usage(None).await).await;
         let sample = samples
             .pop()
             .expect("call reading must queue a quota sample");
-        assert_eq!(sample.body["usage"]["primary"]["usedPercent"], 21.0);
+        assert_eq!(sample.body["usage"]["primary"]["usedPercent"], 95.0);
         assert_eq!(sample.body["account"], "work");
         assert!(samples.pop().is_none());
     }
