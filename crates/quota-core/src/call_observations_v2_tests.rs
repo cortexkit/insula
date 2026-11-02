@@ -180,6 +180,41 @@ async fn early_new_period_refuses_whole_row_for_both_providers() {
     }
 }
 
+/// A reply with no reset can't show a new period began: it may not lower the
+/// held usage, and when it raises it the poll's reset time stays.
+#[tokio::test]
+async fn a_reply_without_a_reset_keeps_the_period_and_cannot_lower_usage() {
+    let registry = registry("codex").await;
+    let mut lower = row("codex");
+    lower["headers"] = json!({"x-codex-primary-used-percent":"10",
+        "x-codex-primary-window-minutes":"10080","x-codex-primary-reset-at":""});
+    ignored(
+        &registry,
+        ObservationWriter::Broca,
+        lower,
+        "window_regressed",
+    );
+    let mut higher = row("codex");
+    higher["headers"] = json!({"x-codex-primary-used-percent":"90",
+        "x-codex-primary-window-minutes":"10080"});
+    assert_eq!(
+        registry
+            .observe_calls(ObservationWriter::Broca, vec![higher])
+            .accepted,
+        1
+    );
+    let entries = registry.get_usage(None).await;
+    let weekly = entries[0]
+        .usage
+        .as_ref()
+        .unwrap()
+        .secondary
+        .as_ref()
+        .unwrap();
+    assert_eq!(weekly.used_percent, 90.0);
+    assert_eq!(weekly.resets_at.as_deref(), Some("2026-09-30T04:00:00Z"));
+}
+
 #[tokio::test]
 async fn codex_matches_length_not_primary_slot_and_never_adds_periods() {
     let registry = registry("codex").await;

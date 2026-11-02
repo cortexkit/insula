@@ -372,7 +372,7 @@ Reply: `{"result":{"accepted":1,"ignored":[]}}`. Ignored modern rows carry
 | `future_reading` | value time is more than 60 seconds ahead of insula's clock |
 | `older_than_held` | value time is older than or equal to the held reading |
 | `no_usable_window` | no usable reading matches a window held by the poll |
-| `window_regressed` | use falls by more than 1 point with reset unchanged to the minute |
+| `window_regressed` | use falls by more than 1 point with reset unchanged to the minute, or with no reset stated (a reply without a reset keeps the poll's reset time) |
 | `early_new_period` | reset moved later and use fell before the held reset passed at the reading's own time |
 | `vouch_mismatch` | missing/wrong Claustrum vouch, or any vouch from another writer |
 

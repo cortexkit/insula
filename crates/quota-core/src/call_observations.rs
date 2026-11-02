@@ -269,7 +269,11 @@ impl Registry {
                         matching_window(&windows, held, index, &observation.provider)
                     {
                         held.used_percent = update.used_percent;
-                        held.resets_at = update.resets_at.clone();
+                        // A reply that states no reset says nothing about the
+                        // period, so it keeps the poll's reset time.
+                        if update.resets_at.is_some() {
+                            held.resets_at = update.resets_at.clone();
+                        }
                         matched = true;
                     }
                 }
@@ -335,6 +339,11 @@ fn guard_window(
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&Utc))
     };
+    // A reply with no reset can't show a new period began, so it is held to
+    // the current period: no fall beyond rounding.
+    if update.resets_at.is_none() && update.used_percent < held.used_percent - 1.0 {
+        return Err("window_regressed");
+    }
     if let (Some(old), Some(new)) = (parse(&held.resets_at), parse(&update.resets_at)) {
         if (old.timestamp() - new.timestamp()).abs() < 60
             && update.used_percent < held.used_percent - 1.0
