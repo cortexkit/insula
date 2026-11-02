@@ -29,7 +29,7 @@ workspace_tests() {
     local platform="$1" index_dir path
     local docs=()
     if [ -e .git ]; then
-        gate "$platform tests" cargo test --workspace --all-targets
+        gate "$platform tests" cargo test --locked --workspace --all-targets
         return
     fi
 
@@ -52,7 +52,7 @@ workspace_tests() {
         add --force -- "${docs[@]}" || cannot_check "$platform tracked Markdown index"
     printf '  %s tracked Markdown index: %s files\n' "$platform" "${#docs[@]}"
     gate "$platform tests" env GIT_DIR="$index_dir/git" GIT_WORK_TREE="$ROOT" \
-        GIT_INDEX_FILE="$index_dir/git/index" cargo test --workspace --all-targets
+        GIT_INDEX_FILE="$index_dir/git/index" cargo test --locked --workspace --all-targets
 }
 
 # Internal entry point for the snapshot sent by ck motor. Build-server toolchains
@@ -76,7 +76,7 @@ worker() {
     gate "$platform format" cargo fmt --all -- --check
     gate "$platform clippy (committed lock)" cargo clippy --locked --workspace --all-targets -- -D warnings
     workspace_tests "$platform"
-    gate "$platform doctests" cargo test --workspace --doc
+    gate "$platform doctests" cargo test --locked --workspace --doc
     if [ "$e2e" -eq 1 ]; then
         # Keep toolchain paths before hiding HOME, exactly as CI's daemon step
         # does. The sibling builds its own ck-subc; no installed daemon is used.
@@ -87,7 +87,7 @@ worker() {
             || cannot_check "daemon scratch directory"
         gate "$platform real daemon supervision" env HOME="$rig" XDG_CONFIG_HOME="$rig/config" \
             CK_QUOTA_STATE_DIR="$rig/state" \
-            cargo test -p quota-module --test it -- --ignored real_daemon_e2e::
+            cargo test --locked -p quota-module --test it -- --ignored real_daemon_e2e::
     fi
     gate "$platform completeness envelopes" cargo run -p quota-core --example completeness-envelopes
 }

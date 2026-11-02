@@ -65,7 +65,7 @@ import json, os, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["PREPUSH_TEST_ROOT"])
 tracked = None
-if os.environ.get("VERIFY_DOC_INDEX") and sys.argv[1:] == ["test", "--workspace", "--all-targets"]:
+if os.environ.get("VERIFY_DOC_INDEX") and sys.argv[1:] == ["test", "--locked", "--workspace", "--all-targets"]:
     tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
 with (root / "cargo.jsonl").open("a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "home": os.environ.get("HOME"),
@@ -242,8 +242,8 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
                 self.assertEqual([call["args"] for call in self.cargo_calls()], [
                     ["--version"], ["fmt", "--all", "--", "--check"],
                     ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
-                    ["test", "--workspace", "--all-targets"],
-                    ["test", "--workspace", "--doc"],
+                    ["test", "--locked", "--workspace", "--all-targets"],
+                    ["test", "--locked", "--workspace", "--doc"],
                     ["run", "-p", "quota-core", "--example", "completeness-envelopes"],
                 ])
 
@@ -253,7 +253,7 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
         result = self.run_gate("--worker-linux", "1")
         self.assertEqual(result.returncode, 0, result.stdout)
         daemon = next(call for call in self.cargo_calls() if "--ignored" in call["args"])
-        self.assertEqual(daemon["args"], ["test", "-p", "quota-module", "--test", "it",
+        self.assertEqual(daemon["args"], ["test", "--locked", "-p", "quota-module", "--test", "it",
                                          "--", "--ignored", "real_daemon_e2e::"])
         self.assertNotEqual(daemon["home"], original_home)
         self.assertEqual(daemon["state"], daemon["home"] + "/state")
@@ -267,7 +267,7 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
         result = self.run_gate("--worker-windows", "0")
         self.assertEqual(result.returncode, 0, result.stdout)
         calls = self.cargo_calls()
-        test = next(call for call in calls if call["args"] == ["test", "--workspace", "--all-targets"])
+        test = next(call for call in calls if call["args"] == ["test", "--locked", "--workspace", "--all-targets"])
         self.assertEqual(test["tracked"], ["docs/space name.md", "docs/tracked.md"])
         self.assertIsNotNone(test["git_dir"])
         self.assertTrue(all(call["git_dir"] is None for call in calls if call is not test))
@@ -282,7 +282,7 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
                 result = self.run_gate("--worker-windows", "0")
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("COULD NOT CHECK: windows", result.stdout)
-                self.assertFalse(any(call["args"] == ["test", "--workspace", "--all-targets"]
+                self.assertFalse(any(call["args"] == ["test", "--locked", "--workspace", "--all-targets"]
                                      for call in self.cargo_calls()))
 
     def test_train_stops_before_any_push_when_fast_gate_cannot_pass(self):
