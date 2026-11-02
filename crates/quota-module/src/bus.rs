@@ -612,7 +612,7 @@ mod tests {
         let samples = super::QuotaSamples::new(registry.drop_page(None).await.epoch);
         samples.observe(registry.get_usage(None).await).await;
         assert!(samples.pop().is_some());
-        let result = registry.observe_calls(vec![serde_json::json!({"provider":"claude", "account":"work", "observedAtMs":1890394000123_i64,
+        let result = registry.observe_calls(quota_core::call_observations::ObservationWriter::Routing, vec![serde_json::json!({"provider":"claude", "account":"work", "observedAtMs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 1000,
             "headers":{"anthropic-ratelimit-unified-5h-utilization":"0.21"}})]);
         assert_eq!(result.accepted, 1);
         samples.observe(registry.get_usage(None).await).await;

@@ -51,7 +51,7 @@ pub const STALE_MESSAGE_CHARS: usize = 160;
 /// Anthropic rate-limits the OAuth usage endpoint per account; model calls
 /// refresh its two routing windows without spending another endpoint request.
 pub const CLAUDE_INTERVAL: Duration = Duration::from_secs(180);
-pub const CLAUDE_OBSERVED_INTERVAL: Duration = Duration::from_secs(900);
+pub const CALL_OBSERVED_INTERVAL: Duration = Duration::from_secs(900);
 
 /// The Claude Console credit balance is a billing page read with the user's own
 /// browser session. API spend moves it slowly and grants arrive monthly, so a
@@ -278,7 +278,7 @@ pub struct ProviderSlot {
     pub failing_since_wall: Option<DateTime<Utc>>,
     pub last_attempt_at: Option<Instant>,
     /// Keep poll completion separate from call readings, so frequent calls
-    /// cannot defer the next Claude poll indefinitely.
+    /// cannot defer the next poll indefinitely.
     pub last_poll_completed_at: Option<Instant>,
     pub last_call_observation_at: Option<Instant>,
     pub status: SlotStatus,
@@ -392,15 +392,15 @@ impl ProviderSlot {
     /// Recompute the call-based delay whenever deciding whether to schedule a
     /// poll, so call silence restores the normal polling cadence. Failed polls
     /// and vault-repair deadlines keep priority.
-    pub fn poll_due_at(&self, provider: &str, now: Instant) -> Instant {
-        if provider == "claude"
+    pub fn poll_due_at(&self, provider: &str, now: Instant, codex_resets_armed: bool) -> Instant {
+        if !(provider == "codex" && codex_resets_armed)
             && self.last_failure_class.is_none()
             && self
                 .last_call_observation_at
-                .is_some_and(|at| now.saturating_duration_since(at) < CLAUDE_INTERVAL)
+                .is_some_and(|at| now.saturating_duration_since(at) < CALL_OBSERVED_INTERVAL)
         {
             if let Some(last_poll) = self.last_poll_completed_at {
-                return self.next_due_at.max(last_poll + CLAUDE_OBSERVED_INTERVAL);
+                return self.next_due_at.max(last_poll + CALL_OBSERVED_INTERVAL);
             }
         }
         self.next_due_at

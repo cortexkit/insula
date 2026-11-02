@@ -578,7 +578,11 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
     let registry = Arc::new(Registry::new(vec![Box::new(ClaudePoll)]));
     registry.refresh_tick(&CancellationToken::new()).await;
     let before = serde_json::to_value(registry.get_usage(None).await).unwrap();
-    let at = 1890394000123;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 1000;
     let mut wire = Wire::with_registry(false, 64 * 1024, registry.clone()).await;
     wire.serve
         .samples
@@ -595,7 +599,7 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(
             body["code"], "forbidden",
-            "only attested routing may observe"
+            "only attested writers may observe"
         );
         assert_eq!(
             serde_json::to_value(registry.get_usage(None).await).unwrap(),
@@ -603,7 +607,10 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
             "a forbidden writer must change nothing"
         );
         assert_eq!(registry.call_observation_metrics().applied, 0);
-        assert!(registry.call_observation_metrics().ignored.is_empty());
+        assert_eq!(
+            registry.call_observation_metrics().ignored["forbidden"],
+            epoch as u64
+        );
     }
     bind_writer(
         &mut wire,
@@ -616,7 +623,7 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
     let response = observe_wire(&mut wire, 5, 402, at).await;
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["result"]["accepted"], 1);
-    assert_eq!(body["result"]["ignored"][0]["reason"], "unknown_account");
+    assert_eq!(body["result"]["ignored"][0]["reason"], "unknown_credential");
     let changed = notice(wire.recv().await, 5, 5, 91);
     assert_eq!(changed["provider"], "claude");
     assert_eq!(changed["account"], "work");
@@ -630,7 +637,7 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
     assert_eq!(registry.drop_page(None).await.drops.len(), 1);
     let metrics = wire.health_metrics().await;
     assert_eq!(metrics["callObservationsApplied"], 1);
-    assert_eq!(metrics["callObservationsIgnored"]["unknown_account"], 1);
+    assert_eq!(metrics["callObservationsIgnored"]["unknown_credential"], 1);
 
     bind_writer(&mut wire, json!({"kind":"direct"}), 6).await;
     let stale_epoch = observe_wire(&mut wire, 5, 404, at + 1).await;
@@ -639,3 +646,82 @@ async fn usage_observe_requires_attested_routing_and_changes_get_samples_and_wat
     wire.stop().await;
     wire.finish().await;
 }
+
+#[tokio::test]
+async fn usage_observe_admits_broca_and_claustrum_before_decoding_rows() {
+    for module in ["broca", "claustrum", "prefrontal-routing"] {
+        let registry = Arc::new(Registry::new(vec![]));
+        let mut wire = Wire::with_registry(false, 64 * 1024, registry.clone()).await;
+        bind_writer(&mut wire, json!({"kind":"reserved","module_id":module}), 1).await;
+        let mut row = json!({"provider":"claude","credentialId":"oauth:claude:synthetic","observedAtMs":1790394000123_i64,"headers":{}});
+        if module == "claustrum" {
+            row["vouched"] =
+                json!({"principal":"enrolled:synthetic","credentialId":"oauth:claude:synthetic"});
+        }
+        wire.send(
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                5,
+                1,
+                401,
+                serde_json::to_vec(
+                    &json!({"method":"usage.observe","params":{"observations":[row]}}),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+        assert_eq!(
+            body["result"]["ignored"][0]["reason"], "unknown_credential",
+            "{module}: {body}"
+        );
+        assert_eq!(
+            registry.call_observation_metrics().by_writer[&format!("reserved:{module}")],
+            1
+        );
+        wire.stop().await;
+        wire.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn usage_observe_forbids_untrusted_scoped_writers_before_row_decoding() {
+    let registry = Arc::new(Registry::new(vec![]));
+    let mut wire = Wire::with_registry(false, 64 * 1024, registry.clone()).await;
+    for (index, principal) in [
+        json!({"kind":"direct"}),
+        json!({"kind":"unverified"}),
+        json!({"kind":"reserved","module_id":"another-module"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let epoch = index as u32 + 1;
+        bind_writer(&mut wire, principal, epoch).await;
+        wire.send(
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                5,
+                epoch,
+                401,
+                serde_json::to_vec(
+                    &json!({"method":"usage.observe","params":{"observations":"not-an-array"}}),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+        assert_eq!(body["code"], "forbidden");
+        assert!(registry.call_observation_metrics().by_writer.is_empty());
+    }
+    wire.stop().await;
+    wire.finish().await;
+}
+
+mod usage_observe_vectors;

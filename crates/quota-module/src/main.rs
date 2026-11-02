@@ -634,7 +634,9 @@ struct RouteReply {
 struct ServeCounters {
     /// Only daemon-attested route principals grant write access. Scope owners
     /// and client-supplied bind identities are not the calling module.
-    observation_writers: Mutex<std::collections::HashSet<(u16, u32)>>,
+    observation_writers: Mutex<
+        std::collections::HashMap<(u16, u32), quota_core::call_observations::ObservationWriter>,
+    >,
     phone_reset_writers: Mutex<std::collections::HashSet<(u16, u32)>>,
     samples: Arc<bus::QuotaSamples>,
     served: AtomicU64,
@@ -794,14 +796,28 @@ async fn handle_control_request(
             if phone_allowed {
                 phones.insert((route_channel, epoch));
             }
-            let allowed = matches!(principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "prefrontal-routing");
+            let observation_writer = match principal.as_ref() {
+                Some(subc_protocol::Principal::Reserved { module_id }) => {
+                    match module_id.as_str() {
+                        "broca" => Some(quota_core::call_observations::ObservationWriter::Broca),
+                        "claustrum" => {
+                            Some(quota_core::call_observations::ObservationWriter::Claustrum)
+                        }
+                        "prefrontal-routing" => {
+                            Some(quota_core::call_observations::ObservationWriter::Routing)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
             let mut writers = serve
                 .observation_writers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            writers.retain(|(channel, _)| *channel != route_channel);
-            if allowed {
-                writers.insert((route_channel, epoch));
+            writers.retain(|(channel, _), _| *channel != route_channel);
+            if let Some(observation_writer) = observation_writer {
+                writers.insert((route_channel, epoch), observation_writer);
             }
             ModuleControlResponse::RouteBindAck {}
         }
@@ -1140,6 +1156,15 @@ fn health_report(
         "lastFetchSuccessAgeSecs": snapshot.last_fetch_success_age.map(|d| d.as_secs()),
         "fetchBlackout": snapshot.fetch_blackout,
     });
+    metrics.as_object_mut().unwrap().extend(
+        json!({
+            "callObservationsByWriter": call_metrics.by_writer,
+            "callObservationsVouchedPrincipals": call_metrics.vouched_principals,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
     // The quota config in force NOW, which with live reload can differ from
     // what the file said when this process started. `loadedAt` is when it was
     // last taken from the file (or from the file's absence), and `lastError`
@@ -1244,23 +1269,25 @@ async fn handle_usage_request(
     }
 
     // Refuse writers before decoding their rows, so even malformed observations
-    // from an untrusted route cannot enter the write path or its counters.
-    let allowed = serve
+    // from an untrusted route cannot enter the row decoder.
+    let observation_writer = serve
         .observation_writers
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .contains(&(channel, epoch));
-    if !allowed
+        .get(&(channel, epoch))
+        .copied();
+    if observation_writer.is_none()
         && serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|value| {
             value.get("method").and_then(|m| m.as_str()) == Some("usage.observe")
         })
     {
+        registry.record_forbidden_observation();
         return send_route_error(
             writer,
             serve,
             reply,
             "forbidden",
-            "usage.observe requires reserved:prefrontal-routing",
+            "usage.observe requires reserved:broca, reserved:claustrum or reserved:prefrontal-routing",
         )
         .await;
     }
@@ -1327,7 +1354,10 @@ async fn handle_usage_request(
     }
 
     if request.method == "usage.observe" {
-        let result = registry.observe_calls(request.params.observations);
+        let result = registry.observe_calls(
+            observation_writer.expect("writer admitted before decoding"),
+            request.params.observations,
+        );
         // Reuse the poll observer: it owns both quota samples and watch notices.
         if result.accepted > 0 {
             serve.samples.observe(registry.get_usage(None).await).await;
@@ -1811,7 +1841,7 @@ fn manifest(
                 ManagementOperation {
                     name: "usage.observe".to_string(),
                     kind: ManagementOperationKind::Mutate,
-                    description: Some("Accept Claude model-call headers from reserved:prefrontal-routing only.".to_string()),
+                    description: Some("Accept Claude and Codex reply readings from reserved:broca, reserved:claustrum (vouched), and transitional reserved:prefrontal-routing.".to_string()),
                 },
                 ManagementOperation {
                     name: USE_SAVED_RESET_OP.to_string(),
@@ -3425,6 +3455,8 @@ mod tests {
         let expected = [
             "callObservationsApplied",
             "callObservationsIgnored",
+            "callObservationsByWriter",
+            "callObservationsVouchedPrincipals",
             "buildCommit",
             "quotaConfig",
             "providersTotal",
