@@ -131,6 +131,32 @@ done
 echo "  $(echo "$shell_scripts" | wc -l | tr -d ' ') shell instrument(s), $broken_shell broken"
 [ "$broken_shell" -eq 0 ] || fail "a shell instrument does not parse"
 
+step "shell instruments fail closed"
+# macOS /bin/bash is 3.2. Under `set -eu` with an EXIT trap, an unbound variable
+# (a plain scalar, or "${a[@]}" on an empty array) aborts the script with exit
+# status 0, so a gate reports success having run nothing. Measured here: the same
+# script exits 1 without the trap, and 127 with `set -u` but no `-e`. Linux CI
+# runs bash 5, so only a local run on the Mac shows it. A script may combine
+# errexit with an EXIT trap only if the trap fails closed: it sets `finished=1`
+# just before each intended success and turns an exit 0 without it into a failure.
+unsafe_trap() { # prints the file when it combines errexit and an EXIT trap with no finished flag
+  grep -qE '^[[:space:]]*set -[a-zA-Z]*e|set -o errexit' "$1" &&
+    grep -qE '^[[:space:]]*trap .*EXIT' "$1" &&
+    ! grep -q 'finished=1' "$1" && echo "$1"
+}
+trap_probe=$(mktemp -d)
+printf '#!/usr/bin/env bash\nset -euo pipefail\ntrap true EXIT\n' >"$trap_probe/planted.sh"
+printf '#!/usr/bin/env bash\nset -euo pipefail\ntrap f EXIT\nfinished=1\n' >"$trap_probe/guarded.sh"
+self_test=$( { unsafe_trap "$trap_probe/planted.sh"; unsafe_trap "$trap_probe/guarded.sh"; } | wc -l | tr -d ' ')
+rm -rf "$trap_probe"
+# The planted file must be flagged and the guarded one must not; otherwise the
+# check itself is broken and a clean result below would mean nothing.
+[ "$self_test" = 1 ] || fail "fail-closed check self-test flagged $self_test of 2 planted files (want 1)"
+unsafe_scripts=$(for script in $shell_scripts; do unsafe_trap "$script"; done)
+for script in $unsafe_scripts; do echo "  $script: errexit + EXIT trap without a finished flag"; done
+echo "  $(echo "$shell_scripts" | wc -l | tr -d ' ') shell instrument(s) checked, $(echo "$unsafe_scripts" | grep -c . ) unsafe"
+[ -z "$unsafe_scripts" ] || fail "a shell instrument can exit 0 on an unbound variable under bash 3.2"
+
 step "endpoint host manifest"
 # RUN, not merely compiled. This checker existed for two weeks reporting a real
 # finding that nobody saw, because the gate only py_compile'd it: the openrouter
