@@ -59,10 +59,14 @@ pub const CALL_OBSERVED_INTERVAL: Duration = Duration::from_secs(900);
 /// session the user is also signed in to.
 pub const CLAUDE_CONSOLE_INTERVAL: Duration = Duration::from_secs(900);
 
+/// Prepaid Platform balances do not need per-minute polling, even after a poll failure.
+pub const OPENAI_PLATFORM_INTERVAL: Duration = Duration::from_secs(900);
+
 pub fn poll_interval(provider: &str) -> Duration {
     match provider {
         "claude" => CLAUDE_INTERVAL,
         "claude-console" => CLAUDE_CONSOLE_INTERVAL,
+        "openai-platform" => OPENAI_PLATFORM_INTERVAL,
         _ => BASE_INTERVAL,
     }
 }
@@ -393,6 +397,13 @@ impl ProviderSlot {
     /// poll, so call silence restores the normal polling cadence. Failed polls
     /// and vault-repair deadlines keep priority.
     pub fn poll_due_at(&self, provider: &str, now: Instant, codex_resets_armed: bool) -> Instant {
+        // Billing reads stay slow even after failures or a vault replacement
+        // makes next_due_at immediate. Neither event replenishes API credits.
+        if provider == "openai-platform" {
+            if let Some(last_poll) = self.last_poll_completed_at {
+                return self.next_due_at.max(last_poll + poll_interval(provider));
+            }
+        }
         if !(provider == "codex" && codex_resets_armed)
             && self.last_failure_class.is_none()
             && self
@@ -1155,6 +1166,32 @@ fn credential_was_replaced(slot: &ProviderSlot, status: &CredentialStatus) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn openai_platform_poll_floor_survives_failures_and_reactivation() {
+        use super::*;
+        let now = Instant::now();
+        assert_eq!(poll_interval("openai-platform"), Duration::from_secs(900));
+        let mut slot = ProviderSlot::due_now(now, Incarnation::from_counter(1));
+        assert_eq!(slot.poll_due_at("openai-platform", now, false), now);
+        slot.last_poll_completed_at = Some(now);
+        for failure in [
+            None,
+            Some(FetchClass::Transient),
+            Some(FetchClass::NonTransient),
+        ] {
+            slot.last_failure_class = failure;
+            slot.next_due_at = now;
+            assert_eq!(
+                slot.poll_due_at("openai-platform", now, false),
+                now + Duration::from_secs(900)
+            );
+        }
+        slot.next_due_at = now + Duration::from_secs(1200);
+        assert_eq!(
+            slot.poll_due_at("openai-platform", now, false),
+            slot.next_due_at
+        );
+    }
 
     /// A fetch describing an EARLIER moment than the reading already held is
     /// discarded, so a slot's value time never walks backwards.

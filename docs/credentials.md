@@ -61,6 +61,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:deepseek` | `deepseek` |
 | `apikey:synthetic` | `synthetic` |
 | `apikey:openrouter` | `openrouter` |
+| `apikey:openai` | `openai-platform` (Platform API credits, never Codex) |
 | `apikey:minimax-coding-plan` | `minimax` |
 | `apikey:muse` | `muse` |
 | `cookie:dev.meta.ai` | `muse` (idle-window enrichment only; `llama_dev_sess`) |
@@ -75,6 +76,13 @@ next. Records are matched to providers by their id prefix (the "family"):
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
 suffix after the family (`oauth:anthropic:<account>`).
+
+OpenAI Platform keys are vault-only, with no environment or local-file fallback.
+Several `apikey:openai:<account>` deposits may be polled independently to diagnose
+billing access. Without vault-supplied account identities they still publish at
+most one unlabelled balance row, since two keys may read the same organization.
+A 403 requiring a browser session key means `credential_unusable`, not that the
+API key has stopped working for inference.
 
 ### Web sessions captured by Cerebellum
 

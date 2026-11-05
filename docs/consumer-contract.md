@@ -1086,9 +1086,42 @@ API credit uses `funding: subscription`, purchased tranches use `purchased`, and
 other promotional tranches use `granted`. Exhausted remainders stay at zero; a
 negative remainder is clamped to zero. The aggregate balance appears only when
 the response lists no grants, never beside its constituent grants. `usage` has
-no rate windows. Grant expiry is not a reset and the current pool type has no
-expiry field, so expiry is used for filtering but not published. Monthly spend
+no rate windows. Grant expiry is not a reset: it is published as `expiresAt`,
+never `resetsAt`. Monthly spend
 is not fetched because the wire has no field for cumulative spending this month.
+
+### OpenAI Platform API credits
+
+`openai-platform` reads only `GET /v1/dashboard/billing/credit_grants` at
+`api.openai.com`, with a Bearer key from vault `apikey:openai` or
+`apikey:openai:<account>`. There is no environment or local-file lane. These
+keys never route to `codex`, which reads ChatGPT subscription credentials.
+The polling interval is fifteen minutes per credential.
+
+Each successful reading publishes one reported `spend` pool, `id: credits`,
+`label: API credits`, with exact USD decimal amounts: `remaining` is
+`total_available` and `total` is `total_granted` only when positive. The
+aggregate does not identify its funding, so `funding` is `unknown`.
+`expiresAt` is the earliest strictly future grant expiry, when present;
+expired grants do not contribute an expiry. There are no rate windows or
+`resetsAt`. Organization costs are not fetched.
+
+Only an account identity supplied by the vault is used; a bare key does not
+identify an organization. Otherwise the row is unlabelled and carries its
+vault `credentialRef`. No `apiProvider` inference-provider slug is assigned.
+Several platform keys may be polled and diagnosed, but keys with no account
+identity still publish at most one unlabelled row under the ordinary identity
+rules: separate keys may read the same organization's balance. Do not sum them.
+
+HTTP 401 means `credential_rejected` and only a 401 on the served bearer is
+reported to the vault. HTTP 403 means `credential_unusable`, not a dead key:
+the endpoint may require a browser session key. Its upstream message is
+preserved in `error`, with key material redacted. HTTP 429, 5xx and transport
+failures mean `upstream_failed`; an unparseable successful body means
+`decode_failed`. Per-credential outcome changes log the vault id, HTTP status
+(absent when no response arrived), and non-2xx `message`, `type`, `code` fields,
+never the bearer or balance amounts. Ordinary API-key access remains
+unverified until a deployed read succeeds or reports its refusal.
 
 <a id="amounts-are-integer-minor-units"></a>
 

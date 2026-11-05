@@ -57,15 +57,6 @@ const DUAL_LANE: &[(&str, &str)] = &[(
 /// adding an id to one without the other is the defect this note exists for.
 const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[
     (
-        "apikey:openai",
-        "a platform API key is a different plane from a ChatGPT subscription; codex \
-         reads the subscription OAuth credential and must never be handed this",
-    ),
-    (
-        "apikey:openai:astro",
-        "another seat's platform key, same reason",
-    ),
-    (
         "apikey:cerebras",
         "declined: the endpoint is Cloudflare-blocked and exposes no usage API",
     ),
@@ -257,7 +248,9 @@ fn evaluate(
         .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:ollama-cloud"));
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
-        if prefix.starts_with("cookie:") || prefix.starts_with("apikey:") {
+        if (prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
+            && *prefix != "apikey:openai"
+        {
             identityless_families.entry(prefix).or_default();
         }
     }
@@ -642,6 +635,24 @@ mod tests {
     use super::*;
     use quota_core::model::Usage;
 
+    #[test]
+    fn openai_platform_keys_are_routed_not_unsupported_or_duplicate_refusals() {
+        let report = evaluate(
+            granted(&["apikey:openai", "apikey:openai:fixture"]),
+            usage(vec![
+                healthy("openai-platform", "vault"),
+                healthy("openai-platform", "vault"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(report.exit_code, 0, "{report:?}");
+        let counts = report.counts.unwrap();
+        assert_eq!(counts.routed, 2);
+        assert_eq!(counts.checked, 1);
+    }
+
     fn healthy(provider: &str, source: &str) -> ProviderUsage {
         ProviderUsage::healthy(provider, None, source, Usage::default())
     }
@@ -838,9 +849,9 @@ mod tests {
 
         let unsupported = evaluate(
             Ok(SnapshotReadback::Granted(InstalledSnapshot {
-                credential_ids: vec!["oauth:anthropic".into(), "apikey:openai".into()],
+                credential_ids: vec!["oauth:anthropic".into(), "apikey:cerebras".into()],
                 mapping_warning: Some(
-                    "ignored ids outside supported vault mapping [apikey:openai]".into(),
+                    "ignored ids outside supported vault mapping [apikey:cerebras]".into(),
                 ),
             })),
             usage(vec![healthy("claude", "vault")]),
@@ -850,28 +861,17 @@ mod tests {
         );
         assert_eq!(unsupported.exit_code, 0, "{unsupported:?}");
 
-        // THE EXEMPTION IS BY EXACT ID, AND THIS IS WHAT PROVES IT.
-        //
-        // A SECOND unmapped id in the SAME vendor family as the exempted one. Widen
-        // the match from equality to a `apikey:` prefix and this row is silently
-        // excused with the first, so a genuine routing gap exits 0 under a confident
-        // coverage count. Verified against the live vault before writing it: this
-        // host holds `apikey:amazon-bedrock` and `apikey:apns-alfonso` beside
-        // `apikey:openai`, so the widened match would hide real rows rather than a
-        // hypothetical one.
-        //
-        // Without this case the fixture holds exactly one `apikey:` id -- the
-        // exempted one -- so exact and prefix matching are indistinguishable and the
-        // constant's own doc comment ("Exact ids only") has no defender.
+        // A second API-key id is not covered by the exact-id exemption. A broad
+        // `apikey:` exemption would silently hide this genuine routing gap.
         let sibling_in_the_same_family = evaluate(
             Ok(SnapshotReadback::Granted(InstalledSnapshot {
                 credential_ids: vec![
                     "oauth:anthropic".into(),
-                    "apikey:openai".into(),
+                    "apikey:cerebras".into(),
                     "apikey:amazon-bedrock".into(),
                 ],
                 mapping_warning: Some(
-                    "ignored ids outside supported vault mapping [apikey:amazon-bedrock, apikey:openai]"
+                    "ignored ids outside supported vault mapping [apikey:amazon-bedrock, apikey:cerebras]"
                         .into(),
                 ),
             })),
@@ -888,7 +888,7 @@ mod tests {
         assert!(unsupported
             .lines
             .join("\n")
-            .contains("unsupported: apikey:openai"));
+            .contains("unsupported: apikey:cerebras"));
     }
 
     #[test]

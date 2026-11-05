@@ -9811,6 +9811,8 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "oauth:xai",
         "apikey:deepseek",
         "apikey:openrouter",
+        "apikey:openai",
+        "apikey:openai:fixture",
         "apikey:opencode-go",
         "apikey:ollama-cloud",
         "apikey:minimax-coding-plan",
@@ -9831,12 +9833,16 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         );
     }
 
-    // THE CONTROL, and it carries the weight: a platform API key must NOT be
-    // claimed by the ChatGPT subscription family. Codex reads a subscription
-    // OAuth credential, and a table widened until everything matches has stopped
-    // discriminating -- which is the failure mode of fixing the case above
-    // carelessly.
-    for id in ["apikey:openai", "apikey:openai:astro", "apikey:cerebras"] {
+    // Platform keys read billing credits, never ChatGPT subscription usage.
+    for id in ["apikey:openai", "apikey:openai:fixture"] {
+        let providers: Vec<_> = crate::vault_handles::CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(prefix, _)| crate::vault_handles::handle_id_names_family(id, prefix))
+            .map(|(_, provider)| *provider)
+            .collect();
+        assert_eq!(providers, ["openai-platform"], "{id}");
+    }
+    for id in ["apikey:cerebras", "apikey:fireworks-ai"] {
         assert!(
             !crate::vault_handles::CREDENTIAL_FAMILIES
                 .iter()

@@ -56,6 +56,7 @@ pub mod money;
 pub mod muse;
 pub mod neuralwatt;
 pub mod ollama;
+pub mod openai_platform;
 pub mod opencode;
 pub mod opencode_auth;
 pub mod opencodego;
@@ -787,6 +788,12 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
+            Box::new(
+                openai_platform::OpenAIPlatformProvider::new_with_handle_loader(
+                    credential_source.clone(),
+                    Arc::clone(&vault_handle_loader),
+                ),
+            ),
             Box::new(openrouter::OpenRouterProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
