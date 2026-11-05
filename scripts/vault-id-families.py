@@ -56,10 +56,7 @@ DAEMON_CLI_CANDIDATES = (
 # there), so the Rust checker reported three findings on a healthy host. Keep the
 # ids and reasons identical in both.
 DELIBERATELY_UNCLAIMED = {
-    "apikey:openai": "a platform API key is a different plane from a ChatGPT "
-    "subscription; codex reads the subscription OAuth credential and must never "
-    "be handed this",
-    "apikey:openai:astro": "another seat's platform key, same reason",
+
     "apikey:cerebras": "declined: the endpoint is Cloudflare-blocked and exposes "
     "no usage API",
     "apikey:fireworks-ai": "declined: no structured usage endpoint",

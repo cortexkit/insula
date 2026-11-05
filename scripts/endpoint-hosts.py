@@ -68,6 +68,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "chatbox": {"API_BASE": "api.chatboxai.app"},
     "codebuff": {"BASE_URL": "www.codebuff.com"},
     "codex": {"DEFAULT_BASE": "chatgpt.com"},
+    "openai_platform": {"CREDIT_GRANTS_URL": "api.openai.com"},
     "copilot": {"USAGE_URL": "api.github.com"},
     # The Sand (Grok Bot) usage-status endpoint is served from cursor.com, like
     # the other two; it carries an X Subscription account's shared weekly pool.

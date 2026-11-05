@@ -43,6 +43,8 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
+    // Platform billing keys are not ChatGPT subscription credentials.
+    ("apikey:openai", "openai-platform"),
     // Named after OpenCode's `minimax-coding-plan` provider id, as
     // `apikey:kimi-for-coding` is: the record is the Coding Plan key OpenCode
     // sends, and the vault cannot rename it (insula#29). There is deliberately
@@ -110,6 +112,7 @@ enum ProviderKind {
     DeepSeek,
     Synthetic,
     OpenRouter,
+    OpenAIPlatform,
     MiniMax,
     Muse,
     Vercel,
@@ -480,6 +483,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Synthetic)
     }
 
+    pub fn openai_platform_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::OpenAIPlatform)
+    }
+
     pub fn openrouter_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::OpenRouter)
     }
@@ -618,6 +625,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "deepseek" => Some(ProviderKind::DeepSeek),
         "synthetic" => Some(ProviderKind::Synthetic),
         "openrouter" => Some(ProviderKind::OpenRouter),
+        "openai-platform" => Some(ProviderKind::OpenAIPlatform),
         "minimax" => Some(ProviderKind::MiniMax),
         "muse" => Some(ProviderKind::Muse),
         "vercel" => Some(ProviderKind::Vercel),
@@ -653,6 +661,10 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         // Console sessions resolve an organization UUID before publishing. Other
         // cookie/key lanes cannot distinguish two deposits from the same owner.
         .filter(|(prefix, _)| *prefix != "cookie:platform.claude.com")
+        // Platform billing keys are polled independently so each key's access
+        // outcome can be diagnosed. The registry still collapses unknown owners
+        // to one unlabelled row; duplicate keys must not imply distinct balances.
+        .filter(|(prefix, _)| *prefix != "apikey:openai")
         .filter(|(prefix, _)| {
             !ENRICHMENT_FAMILIES
                 .iter()
@@ -743,6 +755,25 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn openai_platform_keys_route_only_to_billing_and_allow_multiple_deposits() {
+        use super::*;
+        let loader = VaultHandleLoader::default();
+        loader.install_rows_for_test(&[
+            ("apikey:openai", "apikey"),
+            ("apikey:openai:fixture", "apikey"),
+            ("apikey:openai:second", "apikey"),
+            ("apikey:openai:third", "apikey"),
+            ("apikey:deepseek", "apikey"),
+            ("apikey:deepseek:fixture", "apikey"),
+        ]);
+        assert_eq!(loader.openai_platform_handles().unwrap().len(), 4);
+        assert!(loader.codex_handles().unwrap().is_empty());
+        assert!(loader.deepseek_handles().unwrap().is_empty());
+        assert_eq!(providers_for_id("chatgpt:openai"), [ProviderKind::Codex]);
+        assert!(providers_for_id("apikey:openaix").is_empty());
+    }
+
     use super::*;
 
     fn row(id: &str, credential_type: &str) -> ScopedRowState {
