@@ -1132,12 +1132,18 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
         "each fake codex credential must resolve its handle before failing: {codex:?}"
     );
 
-    let unrouted_ids = [
-        "apikey:openai",
-        "apikey:openai:astro",
-        "apikey:cerebras",
-        "apikey:fireworks-ai",
-    ];
+    // Platform API keys bill a Platform organization, not a ChatGPT plan: they
+    // reach only the credit-balance provider (the exact codex list above
+    // already proves codex never got them).
+    let mut platform_accounts = result
+        .iter()
+        .filter(|entry| entry["provider"] == "openai-platform")
+        .filter_map(|entry| entry["account"].as_str())
+        .collect::<Vec<_>>();
+    platform_accounts.sort_unstable();
+    assert_eq!(platform_accounts, ["apikey:openai", "apikey:openai:astro"]);
+
+    let unrouted_ids = ["apikey:cerebras", "apikey:fireworks-ai"];
     let unrouted_entries = result
         .iter()
         .filter(|entry| {
