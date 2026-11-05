@@ -45,6 +45,10 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:openrouter", "openrouter"),
     // Platform billing keys are not ChatGPT subscription credentials.
     ("apikey:openai", "openai-platform"),
+    // Organization Admin keys (`sk-admin-`). Kept under their own name so a
+    // key that can manage the whole organization is granted to insula alone
+    // by an exact grant, never through a shared category.
+    ("apikey:openai-admin", "openai-platform"),
     // Named after OpenCode's `minimax-coding-plan` provider id, as
     // `apikey:kimi-for-coding` is: the record is the Coding Plan key OpenCode
     // sends, and the vault cannot rename it (insula#29). There is deliberately
@@ -664,7 +668,7 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         // Platform billing keys are polled independently so each key's access
         // outcome can be diagnosed. The registry still collapses unknown owners
         // to one unlabelled row; duplicate keys must not imply distinct balances.
-        .filter(|(prefix, _)| *prefix != "apikey:openai")
+        .filter(|(prefix, _)| *prefix != "apikey:openai" && *prefix != "apikey:openai-admin")
         .filter(|(prefix, _)| {
             !ENRICHMENT_FAMILIES
                 .iter()
@@ -761,7 +765,7 @@ mod tests {
         let loader = VaultHandleLoader::default();
         loader.install_rows_for_test(&[
             ("apikey:openai", "apikey"),
-            ("apikey:openai:fixture", "apikey"),
+            ("apikey:openai-admin:fixture", "apikey"),
             ("apikey:openai:second", "apikey"),
             ("apikey:openai:third", "apikey"),
             ("apikey:deepseek", "apikey"),
