@@ -111,17 +111,35 @@ fn safe_field(value: &str, key: &str) -> String {
 }
 
 fn error_fields(body: &[u8], key: &str) -> ErrorFields {
-    let body = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
-    let field = |name| match &body["error"][name] {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let field = |name| match &parsed["error"][name] {
         serde_json::Value::String(value) => Some(safe_field(value, key)),
         serde_json::Value::Number(value) => Some(value.to_string()),
         _ => None,
     };
     ErrorFields {
-        message: field("message"),
+        // A refusal outside OpenAI's `{"error":{...}}` shape (an edge-proxy page,
+        // or an empty body) would otherwise log and publish nothing, leaving
+        // "why was this key refused" unanswerable. Fall back to the start of the
+        // body itself, as other providers publish refusal bodies.
+        message: field("message").or_else(|| body_excerpt(body, key)),
         kind: field("type"),
         code: field("code"),
     }
+}
+
+/// The first 200 printable characters of a refusal body, with key material
+/// removed, or `"empty body"` when there is nothing to show.
+fn body_excerpt(body: &[u8], key: &str) -> Option<String> {
+    let text: String = String::from_utf8_lossy(body)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Some("empty body".to_string());
+    }
+    Some(safe_field(&text, key).chars().take(200).collect())
 }
 
 fn status_error(status: u16, fields: &ErrorFields) -> FetchError {
@@ -506,6 +524,24 @@ mod tests {
         assert_eq!(error.error_class(), "credential_unusable");
         assert!(error.to_string().contains(message));
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_outside_the_error_shape_still_says_what_came_back() {
+        let page = b"<html>\n<title>403 Forbidden</title> served-secret sk-abc\n</html>";
+        assert_eq!(
+            error_fields(page, "served-secret").message.as_deref(),
+            Some("<html> <title>403 Forbidden</title> [redacted] [redacted] </html>")
+        );
+        assert_eq!(
+            error_fields(b"", "served-secret").message.as_deref(),
+            Some("empty body")
+        );
+        let long = "x".repeat(500);
+        assert_eq!(
+            error_fields(long.as_bytes(), "k").message.unwrap().len(),
+            200
+        );
     }
 
     #[tokio::test]
