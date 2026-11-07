@@ -998,9 +998,11 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
         scoped_stub_credential("apikey:deepseek", "apikey", "deepseek", 12),
         scoped_stub_credential("apikey:openrouter", "apikey", "openrouter", 13),
         scoped_stub_credential("apikey:openai", "apikey", "openai", 14),
-        scoped_stub_credential("apikey:openai:astro", "apikey", "openai", 15),
+        scoped_stub_credential("apikey:openai:fixture", "apikey", "openai", 15),
         scoped_stub_credential("apikey:cerebras", "apikey", "cerebras", 16),
         scoped_stub_credential("apikey:fireworks-ai", "apikey", "fireworks-ai", 17),
+        scoped_stub_credential("apikey:openai-session:fixture", "apikey", "openai", 18),
+        scoped_stub_credential("apikey:openai-admin:fixture", "apikey", "openai", 19),
     ];
     let _vault_stub =
         start_vault_stub_with_credentials(&daemon.connection_file_path, &stub_credentials).await;
@@ -1132,18 +1134,23 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
         "each fake codex credential must resolve its handle before failing: {codex:?}"
     );
 
-    // Platform API keys bill a Platform organization, not a ChatGPT plan: they
-    // reach only the credit-balance provider (the exact codex list above
-    // already proves codex never got them).
+    // Only browser session keys reach Platform billing. Ordinary and Admin API
+    // keys cannot read its credit endpoint or a ChatGPT subscription.
     let mut platform_accounts = result
         .iter()
         .filter(|entry| entry["provider"] == "openai-platform")
         .filter_map(|entry| entry["account"].as_str())
         .collect::<Vec<_>>();
     platform_accounts.sort_unstable();
-    assert_eq!(platform_accounts, ["apikey:openai", "apikey:openai:astro"]);
+    assert_eq!(platform_accounts, ["apikey:openai-session:fixture"]);
 
-    let unrouted_ids = ["apikey:cerebras", "apikey:fireworks-ai"];
+    let unrouted_ids = [
+        "apikey:openai",
+        "apikey:openai:fixture",
+        "apikey:openai-admin:fixture",
+        "apikey:cerebras",
+        "apikey:fireworks-ai",
+    ];
     let unrouted_entries = result
         .iter()
         .filter(|entry| {

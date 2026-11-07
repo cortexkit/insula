@@ -43,12 +43,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:deepseek", "deepseek"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
-    // Platform billing keys are not ChatGPT subscription credentials.
-    ("apikey:openai", "openai-platform"),
-    // Organization Admin keys (`sk-admin-`). Kept under their own name so a
-    // key that can manage the whole organization is granted to insula alone
-    // by an exact grant, never through a shared category.
-    ("apikey:openai-admin", "openai-platform"),
+    // Browser session keys can act on the whole organization: exact grants only,
+    // never a shared category. Ordinary and Admin API keys cannot read billing.
+    ("apikey:openai-session", "openai-platform"),
     // Named after OpenCode's `minimax-coding-plan` provider id, as
     // `apikey:kimi-for-coding` is: the record is the Coding Plan key OpenCode
     // sends, and the vault cannot rename it (insula#29). There is deliberately
@@ -665,10 +662,10 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         // Console sessions resolve an organization UUID before publishing. Other
         // cookie/key lanes cannot distinguish two deposits from the same owner.
         .filter(|(prefix, _)| *prefix != "cookie:platform.claude.com")
-        // Platform billing keys are polled independently so each key's access
+        // Platform browser sessions are polled independently so each session's access
         // outcome can be diagnosed. The registry still collapses unknown owners
         // to one unlabelled row; duplicate keys must not imply distinct balances.
-        .filter(|(prefix, _)| *prefix != "apikey:openai" && *prefix != "apikey:openai-admin")
+        .filter(|(prefix, _)| *prefix != "apikey:openai-session")
         .filter(|(prefix, _)| {
             !ENRICHMENT_FAMILIES
                 .iter()
@@ -760,22 +757,38 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
 #[cfg(test)]
 mod tests {
     #[test]
-    fn openai_platform_keys_route_only_to_billing_and_allow_multiple_deposits() {
+    fn openai_platform_sessions_route_only_to_billing_and_allow_multiple_deposits() {
         use super::*;
         let loader = VaultHandleLoader::default();
         loader.install_rows_for_test(&[
-            ("apikey:openai", "apikey"),
-            ("apikey:openai-admin:fixture", "apikey"),
-            ("apikey:openai:second", "apikey"),
-            ("apikey:openai:third", "apikey"),
+            ("apikey:openai-session", "apikey"),
+            ("apikey:openai-session:fixture", "apikey"),
+            ("apikey:openai-session:second", "apikey"),
             ("apikey:deepseek", "apikey"),
             ("apikey:deepseek:fixture", "apikey"),
         ]);
-        assert_eq!(loader.openai_platform_handles().unwrap().len(), 4);
+        assert_eq!(
+            loader.openai_platform_handles().unwrap(),
+            [
+                "apikey:openai-session",
+                "apikey:openai-session:fixture",
+                "apikey:openai-session:second",
+            ]
+            .map(|id| CredentialHandle::scoped(id, "apikey"))
+        );
         assert!(loader.codex_handles().unwrap().is_empty());
         assert!(loader.deepseek_handles().unwrap().is_empty());
         assert_eq!(providers_for_id("chatgpt:openai"), [ProviderKind::Codex]);
         assert!(providers_for_id("apikey:openaix").is_empty());
+        for id in [
+            "apikey:openai",
+            "apikey:openai:fixture",
+            "apikey:openai-admin",
+            "apikey:openai-admin:fixture",
+            "apikey:openai-sessionx",
+        ] {
+            assert!(providers_for_id(id).is_empty(), "{id} must stay unrouted");
+        }
     }
 
     use super::*;
@@ -957,8 +970,8 @@ mod tests {
         }
     }
 
-    /// Like every `apikey:` family, a second minimax deposit darkens the family
-    /// rather than racing the first.
+    /// Unlike browser sessions, a second minimax deposit causes the family's
+    /// handles to be refused rather than racing the first.
     #[test]
     fn a_second_minimax_api_key_is_refused() {
         let loader = VaultHandleLoader::default();

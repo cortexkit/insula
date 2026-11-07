@@ -61,7 +61,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:deepseek` | `deepseek` |
 | `apikey:synthetic` | `synthetic` |
 | `apikey:openrouter` | `openrouter` |
-| `apikey:openai` | `openai-platform` (Platform API credits, never Codex) |
+| `apikey:openai-session` | `openai-platform` (Platform browser session key, never Codex) |
 | `apikey:minimax-coding-plan` | `minimax` |
 | `apikey:muse` | `muse` |
 | `cookie:dev.meta.ai` | `muse` (idle-window enrichment only; `llama_dev_sess`) |
@@ -77,12 +77,45 @@ The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
 suffix after the family (`oauth:anthropic:<account>`).
 
-OpenAI Platform keys are vault-only, with no environment or local-file fallback.
-Several `apikey:openai:<account>` deposits may be polled independently to diagnose
-billing access. Without vault-supplied account identities they still publish at
-most one unlabelled balance row, since two keys may read the same organization.
-A 403 requiring a browser session key means `credential_unusable`, not that the
-API key has stopped working for inference.
+### OpenAI Platform browser session keys
+
+OpenAI Platform billing is live-verified with a browser session key (`sess-…`),
+sent as an Authorization Bearer token, not a Cookie header. Ordinary API keys
+and organization Admin keys are refused by this endpoint; `apikey:openai` and
+`apikey:openai-admin` are deliberately unrouted. The only family is
+`apikey:openai-session` (bare or with an account suffix), with no environment or
+local-file fallback.
+
+To deposit a session key on any platform:
+
+1. Sign in at `https://platform.openai.com`. In the browser's network developer
+   tools, find the `/v1/dashboard/onboarding/login` response. Take the session
+   key from `user.session.sensitive_id`, the OpenAI user id (`user-…`) from
+   `user.id`, and the account email. Do not use an inference or Admin API key.
+2. Save only the session key in a private, owner-readable file. Replace the
+   placeholders below with your account label, file path, OpenAI user id and
+   email, then run:
+
+   ```sh
+   ck auth put --id apikey:openai-session:<account> --payload-file <file>
+   ck auth grant --principal reserved:insula --selector-kind exact --selector apikey:openai-session:<account> --operation read
+   ck auth grant --principal reserved:insula --selector-kind exact --selector apikey:openai-session:<account> --operation list
+   ck auth set-identity apikey:openai-session:<account> --account-id <openai-user-id> --email <email>
+   ```
+
+   `--payload-file` keeps the secret out of command-line arguments and strips
+   trailing whitespace. Delete the file after depositing it. Each operation
+   needs its own exact grant: `read` does not imply `list`. Never grant this key
+   through a category: it can act on the whole organization, so access must be
+   limited to the exact credential and `reserved:insula` principal.
+
+Several session deposits may be polled independently. Rows split by the
+vault-supplied account id, with email as a label, not by the deposit's suffix. Without
+an account identity they still publish at most one unlabelled balance row,
+since separate sessions may read the same organization. Do not sum them.
+HTTP 401 publishes `credential_rejected` without reporting auth failure to the
+vault, which cannot refresh a browser session; sign in again and replace the
+deposit. HTTP 403 remains `credential_unusable`.
 
 ### Web sessions captured by Cerebellum
 
