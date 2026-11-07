@@ -9811,8 +9811,8 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         "oauth:xai",
         "apikey:deepseek",
         "apikey:openrouter",
-        "apikey:openai",
-        "apikey:openai:fixture",
+        "apikey:openai-session",
+        "apikey:openai-session:fixture",
         "apikey:opencode-go",
         "apikey:ollama-cloud",
         "apikey:minimax-coding-plan",
@@ -9833,8 +9833,8 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
         );
     }
 
-    // Platform keys read billing credits, never ChatGPT subscription usage.
-    for id in ["apikey:openai", "apikey:openai:fixture"] {
+    // Browser session keys read billing credits, never ChatGPT subscription usage.
+    for id in ["apikey:openai-session", "apikey:openai-session:fixture"] {
         let providers: Vec<_> = crate::vault_handles::CREDENTIAL_FAMILIES
             .iter()
             .filter(|(prefix, _)| crate::vault_handles::handle_id_names_family(id, prefix))
@@ -9842,7 +9842,14 @@ fn the_vaults_canonical_credential_ids_route_to_a_provider() {
             .collect();
         assert_eq!(providers, ["openai-platform"], "{id}");
     }
-    for id in ["apikey:cerebras", "apikey:fireworks-ai"] {
+    for id in [
+        "apikey:openai",
+        "apikey:openai:fixture",
+        "apikey:openai-admin",
+        "apikey:openai-admin:fixture",
+        "apikey:cerebras",
+        "apikey:fireworks-ai",
+    ] {
         assert!(
             !crate::vault_handles::CREDENTIAL_FAMILIES
                 .iter()

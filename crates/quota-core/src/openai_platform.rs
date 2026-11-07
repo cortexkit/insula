@@ -1,7 +1,7 @@
-//! OpenAI Platform prepaid API credits, read with a vault API key.
+//! OpenAI Platform prepaid API credits, read with a vault browser session key.
 //!
-//! This billing read is separate from ChatGPT subscription usage. Some keys
-//! cannot access it; a permission denial does not mean the API key is dead.
+//! This billing read is separate from ChatGPT subscription usage. Ordinary and
+//! organization Admin API keys cannot access it.
 
 use std::{
     collections::HashMap,
@@ -16,8 +16,7 @@ use serde_json::value::RawValue;
 
 use crate::{
     credential_source::{
-        get_vault_credential, report_vault_auth_failure, take_utf8_payload, CredentialSource,
-        VAULT_READ_MIN_TTL_MS,
+        get_vault_credential, take_utf8_payload, CredentialSource, VAULT_READ_MIN_TTL_MS,
     },
     http::JsonRequest,
     model::{Amount, Pool, PoolBasis, PoolFunding, Usage},
@@ -45,7 +44,7 @@ struct Grants {
 
 #[derive(Deserialize)]
 struct Grant {
-    expires_at: Option<i64>,
+    expires_at: Option<f64>,
 }
 
 fn decode_error() -> FetchError {
@@ -68,9 +67,12 @@ fn normalize_pool(body: &[u8], now: DateTime<Utc>) -> Result<Pool, FetchError> {
         .into_iter()
         .flat_map(|grants| grants.data)
         .filter_map(|grant| {
-            grant
-                .expires_at
-                .and_then(|at| DateTime::from_timestamp(at, 0))
+            grant.expires_at.and_then(|at| {
+                DateTime::from_timestamp(
+                    at.floor() as i64,
+                    ((at - at.floor()) * 1_000_000_000.0) as u32,
+                )
+            })
         })
         .filter(|at| *at > now)
         .min();
@@ -269,7 +271,7 @@ impl UsageProvider for OpenAIPlatformProvider {
             let key = key.trim();
             if key.is_empty() {
                 return Err(FetchError::CredentialUnusable(
-                    "openai-platform vault deposit holds no API key".to_string(),
+                    "openai-platform vault deposit holds no browser session key".to_string(),
                 ));
             }
             let response = JsonRequest::get(&self.credits_url)
@@ -281,7 +283,8 @@ impl UsageProvider for OpenAIPlatformProvider {
             if !(200..300).contains(&response.status) {
                 fields = error_fields(&response.body, key);
                 let error = status_error(response.status, &fields);
-                report_vault_auth_failure(Some(source), handle, credential.record_version, &error);
+                // The vault cannot refresh browser sessions. Reject the reading
+                // without latching a vault auth failure that needs manual clearing.
                 return Err(error);
             }
             normalize_pool(&response.body, Utc::now())
@@ -328,6 +331,57 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn decodes_browser_session_credit_summary_with_float_expiry() {
+        let body = br#"{
+            "object":"credit_summary","total_granted":220.0,"total_used":20.0,
+            "total_available":200.0,"total_paid_available":0.0,
+            "grants":{"object":"list","data":[
+                {"object":"credit_summary","id":"grant-fixture-active",
+                 "grant_amount":200.0,"used_amount":0.0,
+                 "effective_at":1793540529.0,"expires_at":1796132529.0,
+                 "is_scheduled":false,"is_held_for_prepaid_transition":false},
+                {"object":"credit_summary","id":"grant-fixture-spent",
+                 "grant_amount":20.0,"used_amount":20.0,
+                 "effective_at":1793276868.602,"expires_at":null}
+            ]}
+        }"#;
+        let pool = normalize_pool(body, now()).unwrap();
+        assert_eq!(
+            pool.remaining,
+            Some(Amount {
+                minor: 2000,
+                exponent: 1,
+                unit: "USD".into(),
+            })
+        );
+        assert_eq!(
+            pool.total,
+            Some(Amount {
+                minor: 2200,
+                exponent: 1,
+                unit: "USD".into(),
+            })
+        );
+        assert_eq!(
+            pool.expires_at.as_deref(),
+            Some("2026-12-01T13:42:09+00:00")
+        );
+        assert!(pool.resets_at.is_none());
+    }
+
+    #[test]
+    fn fractional_epoch_expiry_preserves_subsecond_ordering() {
+        let body = br#"{"total_granted":1,"total_used":0,"total_available":1,
+            "grants":{"data":[{"expires_at":1800000000.75},{"expires_at":1800000000.25}]}}"#;
+        let pool =
+            normalize_pool(body, DateTime::from_timestamp(1_800_000_000, 0).unwrap()).unwrap();
+        assert_eq!(
+            pool.expires_at.as_deref(),
+            Some("2027-01-15T08:00:00.250+00:00")
+        );
     }
 
     #[test]
@@ -428,17 +482,17 @@ mod tests {
             class: "credential_rejected",
             fields,
         };
-        assert!(outcomes.changed("apikey:openai", failed.clone()));
-        assert!(!outcomes.changed("apikey:openai", failed.clone()));
-        assert!(outcomes.changed("apikey:openai:fixture", failed.clone()));
+        assert!(outcomes.changed("apikey:openai-session", failed.clone()));
+        assert!(!outcomes.changed("apikey:openai-session", failed.clone()));
+        assert!(outcomes.changed("apikey:openai-session:fixture", failed.clone()));
         let ok = Outcome {
             status: Some(200),
             class: "ok",
             fields: ErrorFields::default(),
         };
-        assert!(outcomes.changed("apikey:openai", ok.clone()));
-        assert!(!outcomes.changed("apikey:openai", ok));
-        assert!(outcomes.changed("apikey:openai", failed));
+        assert!(outcomes.changed("apikey:openai-session", ok.clone()));
+        assert!(!outcomes.changed("apikey:openai-session", ok));
+        assert!(outcomes.changed("apikey:openai-session", failed));
     }
 
     struct Source {
@@ -449,15 +503,18 @@ mod tests {
     #[async_trait]
     impl CredentialSource for Source {
         async fn get_scoped(&self, id: &str, ttl: u64) -> Result<VaultCredential, VaultGetError> {
-            assert_eq!(id, "apikey:openai:fixture");
+            assert_eq!(id, "apikey:openai-session:fixture");
             assert_eq!(ttl, VAULT_READ_MIN_TTL_MS);
             Ok(VaultCredential {
-                payload: b"synthetic-key".to_vec(),
+                payload: b"sess-synthetic".to_vec(),
                 expires_at_ms: None,
                 record_version: 7,
                 account_id: self.account.clone(),
                 project_id: None,
-                email: None,
+                email: self
+                    .account
+                    .as_ref()
+                    .map(|_| "fixture@example.invalid".into()),
                 org_name: None,
             })
         }
@@ -492,7 +549,7 @@ mod tests {
             assert!(request.starts_with("GET /v1/dashboard/billing/credit_grants HTTP/1.1\r\n"));
             assert!(request
                 .to_ascii_lowercase()
-                .contains("authorization: bearer synthetic-key\r\n"));
+                .contains("authorization: bearer sess-synthetic\r\n"));
             socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let reports = Arc::new(Mutex::new(Vec::new()));
@@ -506,7 +563,10 @@ mod tests {
         );
         provider.credits_url = url;
         let attempt = provider
-            .fetch_handle(&CredentialHandle::scoped("apikey:openai:fixture", "apikey"))
+            .fetch_handle(&CredentialHandle::scoped(
+                "apikey:openai-session:fixture",
+                "apikey",
+            ))
             .await;
         server.await.unwrap();
         // Await a task turn for the shared fire-and-forget vault report.
@@ -545,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_served_bearer_401_reports_auth_failure_and_other_statuses_are_transient() {
+    async fn browser_session_401_never_reports_auth_failure_and_other_statuses_are_transient() {
         for (status, class) in [
             (401, "credential_rejected"),
             (429, "upstream_failed"),
@@ -563,23 +623,20 @@ mod tests {
                 crate::refresh::classify(&error) == crate::refresh::FetchClass::Transient,
                 status != 401
             );
-            assert_eq!(
-                reports,
-                if status == 401 {
-                    vec![("apikey:openai:fixture".into(), 401, 7)]
-                } else {
-                    vec![]
-                }
-            );
+            assert!(reports.is_empty(), "HTTP {status}: {reports:?}");
         }
     }
 
     #[tokio::test]
     async fn success_uses_only_vault_identity_and_publishes_one_pool() {
-        for account in [None, Some("synthetic-org")] {
+        for account in [None, Some("user-first"), Some("user-second")] {
             let (attempt, reports) = fetch(200, CREDITS, account).await;
             assert_eq!(attempt.observed.unwrap().account_id.as_deref(), account);
             assert_eq!(attempt.source.as_deref(), Some("vault"));
+            assert_eq!(
+                attempt.account_info.and_then(|info| info.email),
+                account.map(|_| "fixture@example.invalid".to_string())
+            );
             assert_eq!(
                 serde_json::to_value(attempt.usage.unwrap()).unwrap(),
                 serde_json::json!({})

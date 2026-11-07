@@ -1093,35 +1093,41 @@ is not fetched because the wire has no field for cumulative spending this month.
 ### OpenAI Platform API credits
 
 `openai-platform` reads only `GET /v1/dashboard/billing/credit_grants` at
-`api.openai.com`, with a Bearer key from vault `apikey:openai` or
-`apikey:openai:<account>`. There is no environment or local-file lane. These
-keys never route to `codex`, which reads ChatGPT subscription credentials.
+`api.openai.com`, with a browser session key (`sess-…`) sent as a Bearer token
+from vault `apikey:openai-session` or `apikey:openai-session:<account>`. This
+lane is live-verified. Ordinary API keys and organization Admin keys are
+refused by the endpoint; `apikey:openai` and `apikey:openai-admin` deliberately
+route nowhere. There is no environment or local-file lane. Session keys never
+route to `codex`, which reads ChatGPT subscription credentials.
 The polling interval is fifteen minutes per credential.
 
 Each successful reading publishes one reported `spend` pool, `id: credits`,
 `label: API credits`, with exact USD decimal amounts: `remaining` is
 `total_available` and `total` is `total_granted` only when positive. The
 aggregate does not identify its funding, so `funding` is `unknown`.
-`expiresAt` is the earliest strictly future grant expiry, when present;
+`expiresAt` is the earliest strictly future grant expiry, when present (integer
+and fractional epoch seconds are accepted);
 expired grants do not contribute an expiry. There are no rate windows or
 `resetsAt`. Organization costs are not fetched.
 
-Only an account identity supplied by the vault is used; a bare key does not
-identify an organization. Otherwise the row is unlabelled and carries its
+Only an account identity supplied by the vault is used; the deposit's account
+suffix is not an identity. Set the OpenAI user id and email on the vault record
+to split and label accounts. Otherwise the row is unlabelled and carries its
 vault `credentialRef`. No `apiProvider` inference-provider slug is assigned.
-Several platform keys may be polled and diagnosed, but keys with no account
+Several browser sessions may be polled and diagnosed, but sessions with no account
 identity still publish at most one unlabelled row under the ordinary identity
-rules: separate keys may read the same organization's balance. Do not sum them.
+rules: separate sessions may read the same organization's balance. Do not sum them.
 
-HTTP 401 means `credential_rejected` and only a 401 on the served bearer is
-reported to the vault. HTTP 403 means `credential_unusable`, not a dead key:
-the endpoint may require a browser session key. Its upstream message is
+HTTP 401 means `credential_rejected`, but is not reported as an auth failure to
+the vault: browser sessions cannot be refreshed there. HTTP 403 remains
+`credential_unusable`. The upstream message is
 preserved in `error`, with key material redacted. HTTP 429, 5xx and transport
 failures mean `upstream_failed`; an unparseable successful body means
 `decode_failed`. Per-credential outcome changes log the vault id, HTTP status
 (absent when no response arrived), and non-2xx `message`, `type`, `code` fields,
-never the bearer or balance amounts. Ordinary API-key access remains
-unverified until a deployed read succeeds or reports its refusal.
+never the bearer or balance amounts. Session keys can act on the whole
+organization: grant exact `read` and `list` operations to `reserved:insula`,
+never through a category. See [deposit instructions](credentials.md#openai-platform-browser-session-keys).
 
 <a id="amounts-are-integer-minor-units"></a>
 

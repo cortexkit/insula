@@ -57,6 +57,22 @@ const DUAL_LANE: &[(&str, &str)] = &[(
 /// adding an id to one without the other is the defect this note exists for.
 const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[
     (
+        "apikey:openai",
+        "ordinary API keys cannot read Platform billing; use a browser session key",
+    ),
+    (
+        "apikey:openai:fixture",
+        "ordinary API keys cannot read Platform billing; use a browser session key",
+    ),
+    (
+        "apikey:openai-admin",
+        "Admin API keys cannot read Platform billing; use a browser session key",
+    ),
+    (
+        "apikey:openai-admin:fixture",
+        "Admin API keys cannot read Platform billing; use a browser session key",
+    ),
+    (
         "apikey:cerebras",
         "declined: the endpoint is Cloudflare-blocked and exposes no usage API",
     ),
@@ -249,7 +265,7 @@ fn evaluate(
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
         if (prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
-            && *prefix != "apikey:openai"
+            && *prefix != "apikey:openai-session"
         {
             identityless_families.entry(prefix).or_default();
         }
@@ -636,9 +652,16 @@ mod tests {
     use quota_core::model::Usage;
 
     #[test]
-    fn openai_platform_keys_are_routed_not_unsupported_or_duplicate_refusals() {
+    fn openai_platform_sessions_route_and_api_keys_stay_unsupported() {
         let report = evaluate(
-            granted(&["apikey:openai", "apikey:openai:fixture"]),
+            granted(&[
+                "apikey:openai-session",
+                "apikey:openai-session:fixture",
+                "apikey:openai",
+                "apikey:openai:fixture",
+                "apikey:openai-admin",
+                "apikey:openai-admin:fixture",
+            ]),
             usage(vec![
                 healthy("openai-platform", "vault"),
                 healthy("openai-platform", "vault"),
