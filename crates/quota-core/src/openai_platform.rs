@@ -28,6 +28,8 @@ use crate::{
 
 const PROVIDER_NAME: &str = "openai-platform";
 const CREDIT_GRANTS_URL: &str = "https://api.openai.com/v1/dashboard/billing/credit_grants";
+/// Identifies insula honestly; OpenAI needs some User-Agent, not a browser one.
+const USER_AGENT: &str = concat!("insula/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Deserialize)]
 struct Credits {
@@ -276,6 +278,12 @@ impl UsageProvider for OpenAIPlatformProvider {
             }
             let response = JsonRequest::get(&self.credits_url)
                 .bearer(key)
+                // OpenAI answers a request with no User-Agent with 403 "This
+                // endpoint is only available through a browser" before it
+                // looks at the key at all (measured 2026-11-07: an empty
+                // User-Agent got that 403, any non-empty one reached key
+                // validation). reqwest sends none by default.
+                .header(crate::http::Header::new("User-Agent", USER_AGENT))
                 .timeout(Duration::from_secs(15))
                 .send_raw(&self.http)
                 .await?;
@@ -550,6 +558,13 @@ mod tests {
             assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer sess-synthetic\r\n"));
+            assert!(
+                request.to_ascii_lowercase().contains(&format!(
+                    "user-agent: {}\r\n",
+                    USER_AGENT.to_ascii_lowercase()
+                )),
+                "a request without a User-Agent is refused before the key is read"
+            );
             socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let reports = Arc::new(Mutex::new(Vec::new()));
