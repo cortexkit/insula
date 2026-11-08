@@ -336,7 +336,10 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         *result.lock().unwrap() = Ok(outcome);
         let frame = call(&mut wire, 1, reset_params()).await;
         assert_eq!(frame.header.ty, FrameType::Response);
-        assert_eq!(body(&frame), json!({"result":{"outcome":code,"request_id":CLIENT_ID}}));
+        assert_eq!(
+            body(&frame),
+            json!({"result":{"outcome":code,"request_id":CLIENT_ID}})
+        );
     }
     for (error, code) in [
         (
