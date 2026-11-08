@@ -121,10 +121,10 @@ retrying cannot fix, or an exponential backoff capped at
 back at a higher `record_version`, or is reactivated, makes its slot due
 immediately; a row in `needs_reauth` is not fetched at all.
 
-An open watch also replaces the per-minute status poll for a slot whose last
-failure passed the shared 401 report gate. Its latched `needs_reauth` repair changes
-the inventory view. Unreported failures (including 403s and cookie rejections)
-still poll status: replacing a still-active credential need not change that view.
+A vault-backed slot in non-transient backoff polls credential status once per
+minute, even with an open watch and a reported 401. The vault may refresh a
+reported credential instead of latching `needs_reauth`; refreshing or replacing
+a still-active record need not change the inventory view watched by enumeration.
 
 `select_due_round_robin` picks due slots starting after the provider admitted
 last, so no provider starves, and at most `CONCURRENCY_CAP` (8) fetches run at

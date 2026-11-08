@@ -151,7 +151,7 @@ fn before_fetched_at_format() {
 }
 
 enum FetchOutcome {
-    Attempt(Box<FetchAttempt>, bool),
+    Attempt(Box<FetchAttempt>),
     TimedOut,
     Panicked,
     Cancelled,
@@ -1493,7 +1493,6 @@ impl Registry {
                 .into_iter()
                 .filter(|(key, slot)| {
                     refresh::should_poll_credential_status(slot, &key.handle, now)
-                        && !(source.scoped_watch_open() && slot.last_failure_reported)
                 })
                 .collect()
         };
@@ -1764,10 +1763,7 @@ impl Registry {
                 let attempt_start = scheduler_now();
                 let handle = unit.key.handle.clone();
                 // Broader blocking-I/O isolation is deferred until providers use the future credential store.
-                let mut task = tokio::spawn(async move {
-                    credential_source::track_auth_failure_report(provider.fetch_handle(&handle))
-                        .await
-                });
+                let mut task = tokio::spawn(async move { provider.fetch_handle(&handle).await });
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -1776,13 +1772,7 @@ impl Registry {
                         FetchOutcome::Cancelled
                     },
                     result = tokio::time::timeout(fetch_deadline, &mut task) => match result {
-                        Ok(Ok((attempt, reported))) => {
-                            // A secondary endpoint can report a 401 while quota succeeds.
-                            // Only suppress polls for the failure this slot actually publishes.
-                            let reported = reported && matches!(attempt.usage,
-                                Err(provider::FetchError::ProviderStatus(401, _)));
-                            FetchOutcome::Attempt(Box::new(attempt), reported)
-                        },
+                        Ok(Ok(attempt)) => FetchOutcome::Attempt(Box::new(attempt)),
                         Ok(Err(_join_error)) => FetchOutcome::Panicked,
                         Err(_elapsed) => {
                             task.abort();
@@ -1810,9 +1800,8 @@ impl Registry {
             else {
                 continue;
             };
-            let reported = matches!(&outcome, FetchOutcome::Attempt(_, true));
-            let mut next = match outcome {
-                FetchOutcome::Attempt(attempt, _) => next_slot_after_attempt(
+            let next = match outcome {
+                FetchOutcome::Attempt(attempt) => next_slot_after_attempt(
                     &prev,
                     &unit.key.provider,
                     *attempt,
@@ -1842,7 +1831,6 @@ impl Registry {
                 ),
                 FetchOutcome::Cancelled => continue,
             };
-            next.last_failure_reported = reported;
             self.note_cookie_lifetime(&unit.key.handle, &next);
             self.publish_reading(&mut store, &unit.key, &prev, next, completed_at);
         }
