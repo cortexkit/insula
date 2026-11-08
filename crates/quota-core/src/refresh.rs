@@ -322,9 +322,6 @@ pub struct ProviderSlot {
     /// degraded slot can also be a transient failure with nothing to stale-serve,
     /// and those retry on their own ladder -- they must not pick up this poll.
     pub last_failure_class: Option<FetchClass>,
-    /// Set by the shared 401 report gate, not inferred from an HTTP status.
-    /// Reporting does not replace status polling: a refresh need not change the inventory view.
-    pub last_failure_reported: bool,
     /// When this slot last asked the vault for `credential.status`.
     ///
     /// Cadence bookkeeping for the poll, not serving state. A failed poll still
@@ -355,7 +352,6 @@ impl ProviderSlot {
             next_due_at: now,
             retry_count: 0,
             last_failure_class: None,
-            last_failure_reported: false,
             last_status_poll_at: None,
         }
     }
@@ -713,7 +709,6 @@ fn next_slot_after_attempt_inner(
             retry_count: prev.retry_count,
             last_failure_class: prev.last_failure_class,
             last_status_poll_at: None,
-            last_failure_reported: false,
         };
     }
 
@@ -852,7 +847,6 @@ fn next_slot_after_attempt_inner(
             retry_count: 0,
             last_failure_class: None,
             last_status_poll_at: None,
-            last_failure_reported: false,
         },
         Err(error) => {
             let retry_base = if account_changed {
@@ -981,7 +975,6 @@ fn next_slot_after_attempt_inner(
                 retry_count,
                 last_failure_class: Some(class),
                 last_status_poll_at: None,
-                last_failure_reported: false,
             }
         }
     }

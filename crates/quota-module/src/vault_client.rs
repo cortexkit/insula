@@ -2167,10 +2167,6 @@ impl CredentialSource for VaultClient {
             .map(|result| result.map(snapshot_from_wire))
     }
 
-    fn scoped_watch_open(&self) -> bool {
-        self.vault_list_watch() == "watching"
-    }
-
     async fn scoped_changed(&self) {
         self.state.watch_changed.notified().await;
     }

@@ -12343,16 +12343,12 @@ async fn real_codex_account_spends_its_reset_only_once_its_limit_is_reported() {
 }
 
 struct WatchStatusSource {
-    watching: std::sync::atomic::AtomicBool,
     calls: Mutex<Vec<String>>,
     version: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
 impl CredentialSource for WatchStatusSource {
-    fn scoped_watch_open(&self) -> bool {
-        self.watching.load(std::sync::atomic::Ordering::Relaxed)
-    }
     async fn status_scoped(&self, id: &str) -> Result<CredentialStatus, VaultGetError> {
         self.calls.lock().unwrap().push(id.to_string());
         Ok(CredentialStatus {
@@ -12398,7 +12394,6 @@ async fn watch_status_fixture(
     report: bool,
 ) -> (Registry, Arc<WatchStatusSource>, CredentialHandle) {
     let source = Arc::new(WatchStatusSource {
-        watching: std::sync::atomic::AtomicBool::new(true),
         calls: Mutex::new(Vec::new()),
         version: std::sync::atomic::AtomicU64::new(7),
     });
@@ -12418,11 +12413,6 @@ async fn watch_status_fixture(
 #[tokio::test]
 async fn watch_reported_401_polls_status_and_replaced_record_clears_backoff() {
     let (registry, source, handle) = watch_status_fixture(401, true).await;
-    assert!(
-        slot_for(&registry, &handle).last_failure_reported,
-        "the shared report gate marked this fetch"
-    );
-    assert!(source.scoped_watch_open());
     let due_before = slot_for(&registry, &handle).next_due_at;
     registry.poll_replaced_credentials(Instant::now()).await;
     assert_eq!(
@@ -12440,17 +12430,12 @@ async fn watch_reported_401_polls_status_and_replaced_record_clears_backoff() {
         &["oauth:codex:watch-status", "oauth:codex:watch-status"]
     );
     assert_eq!(slot_for(&registry, &handle).next_due_at, now);
-    assert!(source.scoped_watch_open());
 }
 
 #[tokio::test]
 async fn watch_unreported_failures_keep_status_poll() {
     for (status, report) in [(403, true), (401, false)] {
-        let (registry, source, handle) = watch_status_fixture(status, report).await;
-        assert!(
-            !slot_for(&registry, &handle).last_failure_reported,
-            "only an actually reported 401 is marked"
-        );
+        let (registry, source, _) = watch_status_fixture(status, report).await;
         registry.poll_replaced_credentials(Instant::now()).await;
         assert_eq!(
             source.calls.lock().unwrap().as_slice(),
@@ -12486,10 +12471,6 @@ impl ReplacedCodexSource {
 
 #[async_trait]
 impl CredentialSource for ReplacedCodexSource {
-    fn scoped_watch_open(&self) -> bool {
-        true
-    }
-
     async fn refresh_scoped(&self) -> Option<Result<ScopedSnapshot, VaultGetError>> {
         // A token replacement leaves the set unchanged, so the open inventory
         // watch never asks for another listing after the initial installation.
@@ -12653,7 +12634,6 @@ async fn real_codex_reported_401_recovers_via_status_with_open_watch_and_local_d
         failed.last_failure_class,
         Some(refresh::FetchClass::NonTransient)
     );
-    assert!(failed.last_failure_reported);
     assert_eq!(failed.observation.as_ref().unwrap().record_version, Some(7));
     assert_eq!(
         failed.observation.as_ref().unwrap().account_id,

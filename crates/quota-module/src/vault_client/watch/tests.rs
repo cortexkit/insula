@@ -225,7 +225,7 @@ async fn watch_first_notice_reads_once_and_installs_changed_accounts() {
         1,
         "connect and seq 1 share one read"
     );
-    assert!(stub.client.scoped_watch_open());
+    assert_eq!(stub.client.vault_list_watch(), "watching");
     stub.send(FrameType::StreamData, notice(2, "v2", "epoch", "keys"))
         .await;
     loader.install_snapshot(
@@ -425,10 +425,10 @@ async fn watch_ended_after_notice_resubscribes_once_on_the_next_turn() {
     stub.turn().await.unwrap().unwrap();
     stub.send(FrameType::StreamEnd, Value::Null).await;
     stub.turn().await.unwrap().unwrap();
-    assert!(!stub.client.scoped_watch_open());
+    assert_ne!(stub.client.vault_list_watch(), "watching");
     stub.minute().await;
     stub.turn().await.unwrap().unwrap();
-    assert!(stub.client.scoped_watch_open());
+    assert_eq!(stub.client.vault_list_watch(), "watching");
     for _ in 0..3 {
         assert!(stub.turn().await.is_none());
     }
@@ -441,9 +441,9 @@ async fn watch_reconnect_coalesces_the_new_first_notice_and_connection_read() {
     let stub = Stub::new(Opening::Notice).await;
     stub.turn().await.unwrap().unwrap();
     stub.send(FrameType::Goodbye, Value::Null).await;
-    assert!(!stub.client.scoped_watch_open());
+    assert_ne!(stub.client.vault_list_watch(), "watching");
     stub.turn().await.unwrap().unwrap();
-    assert!(stub.client.scoped_watch_open());
+    assert_eq!(stub.client.vault_list_watch(), "watching");
     assert_eq!(stub.opens.load(Ordering::Relaxed), 2);
     assert_eq!(stub.reads.load(Ordering::Relaxed), 2);
     assert_eq!(stub.client.connections_established(), 2);
@@ -456,10 +456,10 @@ async fn watch_route_closed_reopens_the_route_before_fallback_and_resubscribe() 
     stub.send(FrameType::Error, serde_json::json!({"code":"route_closed"}))
         .await;
     stub.turn().await.unwrap().unwrap();
-    assert!(!stub.client.scoped_watch_open());
+    assert_ne!(stub.client.vault_list_watch(), "watching");
     stub.minute().await;
     stub.turn().await.unwrap().unwrap();
-    assert!(stub.client.scoped_watch_open());
+    assert_eq!(stub.client.vault_list_watch(), "watching");
     assert_eq!(stub.opens.load(Ordering::Relaxed), 2);
     assert_eq!(stub.client.connections_established(), 1);
 }

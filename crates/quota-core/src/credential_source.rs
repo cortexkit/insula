@@ -211,11 +211,6 @@ pub trait CredentialSource: Send + Sync {
         Some(self.list_scoped().await)
     }
 
-    /// Whether the scoped inventory subscription is currently open.
-    fn scoped_watch_open(&self) -> bool {
-        false
-    }
-
     /// Wake the scheduler when the held inventory subscription receives a frame.
     async fn scoped_changed(&self) {
         std::future::pending::<()>().await;
@@ -287,25 +282,6 @@ pub async fn get_vault_credential(
 /// anything", which is the distinction that decides where to look next.
 static AUTH_FAILURES_REPORTED: AtomicU64 = AtomicU64::new(0);
 
-tokio::task_local! {
-    // Each provider fetch has its own scope; parallel accounts cannot mark one another.
-    static FETCH_REPORTED_AUTH_FAILURE: std::cell::Cell<bool>;
-}
-
-pub(crate) async fn track_auth_failure_report<F: std::future::Future>(
-    fetch: F,
-) -> (F::Output, bool) {
-    FETCH_REPORTED_AUTH_FAILURE
-        .scope(std::cell::Cell::new(false), async {
-            let result = fetch.await;
-            (
-                result,
-                FETCH_REPORTED_AUTH_FAILURE.with(|reported| reported.get()),
-            )
-        })
-        .await
-}
-
 /// How many auth failures this process has reported to the vault.
 pub fn auth_failures_reported() -> u64 {
     AUTH_FAILURES_REPORTED.load(Ordering::Relaxed)
@@ -354,7 +330,6 @@ pub fn report_vault_auth_failure(
     let credential_id = credential_id.to_owned();
     let status = *status;
     count_auth_failure_reported();
-    let _ = FETCH_REPORTED_AUTH_FAILURE.try_with(|reported| reported.set(true));
     tokio::spawn(async move {
         source
             .report_auth_failure_scoped(&credential_id, status, record_version)
