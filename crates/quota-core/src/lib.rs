@@ -1493,7 +1493,6 @@ impl Registry {
                 .into_iter()
                 .filter(|(key, slot)| {
                     refresh::should_poll_credential_status(slot, &key.handle, now)
-                        && !(source.scoped_watch_open() && slot.last_failure_reported)
                 })
                 .collect()
         };
@@ -1778,7 +1777,7 @@ impl Registry {
                     result = tokio::time::timeout(fetch_deadline, &mut task) => match result {
                         Ok(Ok((attempt, reported))) => {
                             // A secondary endpoint can report a 401 while quota succeeds.
-                            // Only suppress polls for the failure this slot actually publishes.
+                            // Track only the failure this slot actually publishes.
                             let reported = reported && matches!(attempt.usage,
                                 Err(provider::FetchError::ProviderStatus(401, _)));
                             FetchOutcome::Attempt(Box::new(attempt), reported)

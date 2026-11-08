@@ -211,7 +211,7 @@ pub trait CredentialSource: Send + Sync {
         Some(self.list_scoped().await)
     }
 
-    /// Whether inventory notifications currently cover reported auth-failure repairs.
+    /// Whether the scoped inventory subscription is currently open.
     fn scoped_watch_open(&self) -> bool {
         false
     }

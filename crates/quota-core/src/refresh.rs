@@ -323,7 +323,7 @@ pub struct ProviderSlot {
     /// and those retry on their own ladder -- they must not pick up this poll.
     pub last_failure_class: Option<FetchClass>,
     /// Set by the shared 401 report gate, not inferred from an HTTP status.
-    /// Unreported failures still need status polls: a bare re-seal need not change the view.
+    /// Reporting does not replace status polling: a refresh need not change the inventory view.
     pub last_failure_reported: bool,
     /// When this slot last asked the vault for `credential.status`.
     ///

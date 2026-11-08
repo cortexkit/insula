@@ -12345,6 +12345,7 @@ async fn real_codex_account_spends_its_reset_only_once_its_limit_is_reported() {
 struct WatchStatusSource {
     watching: std::sync::atomic::AtomicBool,
     calls: Mutex<Vec<String>>,
+    version: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -12356,7 +12357,7 @@ impl CredentialSource for WatchStatusSource {
         self.calls.lock().unwrap().push(id.to_string());
         Ok(CredentialStatus {
             ready: true,
-            record_version: Some(7),
+            record_version: Some(self.version.load(Ordering::SeqCst)),
             stale_pending: None,
         })
     }
@@ -12399,6 +12400,7 @@ async fn watch_status_fixture(
     let source = Arc::new(WatchStatusSource {
         watching: std::sync::atomic::AtomicBool::new(true),
         calls: Mutex::new(Vec::new()),
+        version: std::sync::atomic::AtomicU64::new(7),
     });
     let provider = WatchStatusProvider {
         source: Arc::clone(&source) as Arc<dyn CredentialSource>,
@@ -12414,25 +12416,31 @@ async fn watch_status_fixture(
 }
 
 #[tokio::test]
-async fn watch_reported_401_skips_status_until_watch_closes() {
+async fn watch_reported_401_polls_status_and_replaced_record_clears_backoff() {
     let (registry, source, handle) = watch_status_fixture(401, true).await;
     assert!(
         slot_for(&registry, &handle).last_failure_reported,
         "the shared report gate marked this fetch"
     );
-    registry.poll_replaced_credentials(Instant::now()).await;
-    assert!(
-        source.calls.lock().unwrap().is_empty(),
-        "the open watch covers the latched credential's repair"
-    );
-    source
-        .watching
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(source.scoped_watch_open());
+    let due_before = slot_for(&registry, &handle).next_due_at;
     registry.poll_replaced_credentials(Instant::now()).await;
     assert_eq!(
         source.calls.lock().unwrap().as_slice(),
         &["oauth:codex:watch-status"]
     );
+    assert_eq!(slot_for(&registry, &handle).next_due_at, due_before);
+
+    source.version.store(8, Ordering::SeqCst);
+    age_slot_into_status_poll(&registry, &handle);
+    let now = Instant::now();
+    registry.poll_replaced_credentials(now).await;
+    assert_eq!(
+        source.calls.lock().unwrap().as_slice(),
+        &["oauth:codex:watch-status", "oauth:codex:watch-status"]
+    );
+    assert_eq!(slot_for(&registry, &handle).next_due_at, now);
+    assert!(source.scoped_watch_open());
 }
 
 #[tokio::test]
@@ -12441,7 +12449,7 @@ async fn watch_unreported_failures_keep_status_poll() {
         let (registry, source, handle) = watch_status_fixture(status, report).await;
         assert!(
             !slot_for(&registry, &handle).last_failure_reported,
-            "only an actually reported 401 is covered"
+            "only an actually reported 401 is marked"
         );
         registry.poll_replaced_credentials(Instant::now()).await;
         assert_eq!(
@@ -12450,6 +12458,260 @@ async fn watch_unreported_failures_keep_status_poll() {
             "unreported failures still need status even with an open watch"
         );
     }
+}
+
+struct ReplacedCodexSource {
+    version: std::sync::atomic::AtomicU64,
+    list_reads: AtomicUsize,
+    gets: AtomicUsize,
+    status_calls: Mutex<Vec<String>>,
+    reports: Mutex<Vec<(String, u16, u64)>>,
+    reported: Semaphore,
+}
+
+impl ReplacedCodexSource {
+    const ID: &'static str = "chatgpt:openai:repair-test";
+    const ACCOUNT: &'static str = "synthetic-codex-account";
+
+    fn snapshot() -> ScopedSnapshot {
+        scoped_snapshot(
+            1,
+            vec![ScopedRowState {
+                account_id: Some(Self::ACCOUNT.to_string()),
+                ..scoped_row(Self::ID, "oauth", 7, "active")
+            }],
+        )
+    }
+}
+
+#[async_trait]
+impl CredentialSource for ReplacedCodexSource {
+    fn scoped_watch_open(&self) -> bool {
+        true
+    }
+
+    async fn refresh_scoped(&self) -> Option<Result<ScopedSnapshot, VaultGetError>> {
+        // A token replacement leaves the set unchanged, so the open inventory
+        // watch never asks for another listing after the initial installation.
+        self.list_reads
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Ok(Self::snapshot()))
+    }
+
+    async fn get_scoped(
+        &self,
+        credential_id: &str,
+        _min_ttl_ms: u64,
+    ) -> Result<VaultCredential, VaultGetError> {
+        assert_eq!(credential_id, Self::ID);
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let version = self.version.load(Ordering::SeqCst);
+        Ok(VaultCredential {
+            payload: if version == 7 {
+                b"expired-vault-token".to_vec()
+            } else {
+                b"repaired-vault-token".to_vec()
+            },
+            expires_at_ms: None,
+            record_version: version,
+            account_id: Some(Self::ACCOUNT.to_string()),
+            email: None,
+            org_name: None,
+            project_id: None,
+        })
+    }
+
+    async fn status_scoped(&self, credential_id: &str) -> Result<CredentialStatus, VaultGetError> {
+        assert_eq!(credential_id, Self::ID);
+        self.status_calls.lock().unwrap().push(credential_id.into());
+        Ok(CredentialStatus {
+            ready: true,
+            record_version: Some(self.version.load(Ordering::SeqCst)),
+            stale_pending: None,
+        })
+    }
+
+    async fn report_auth_failure_scoped(&self, id: &str, status: u16, version: u64) {
+        self.reports
+            .lock()
+            .unwrap()
+            .push((id.into(), status, version));
+        self.reported.add_permits(1);
+    }
+}
+
+#[tokio::test]
+async fn real_codex_reported_401_recovers_via_status_with_open_watch_and_local_duplicate() {
+    let temp = ResetTempDir::new("codex-status-repair");
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let local_requests = Arc::new(AtomicUsize::new(0));
+    let server_local_requests = Arc::clone(&local_requests);
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            let repaired = request.lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer repaired-vault-token")
+            });
+            if request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer expired-local-token"))
+            {
+                server_local_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            let (status, body) = if repaired {
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "plan_type": "pro",
+                        "rate_limit": {"primary_window": {
+                            "used_percent": 0.0,
+                            "reset_at": 1_900_000_000_i64,
+                            "limit_window_seconds": 604_800
+                        }}
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    "401 Unauthorized",
+                    "authentication token has expired".to_string(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let codex_home = temp.dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    write_owner_only_test_file(
+        &codex_home.join("auth.json"),
+        serde_json::json!({"tokens": {
+            "access_token": "expired-local-token",
+            "account_id": ReplacedCodexSource::ACCOUNT
+        }})
+        .to_string()
+        .as_bytes(),
+    );
+    write_owner_only_test_file(
+        &codex_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url = {:?}\n",
+            format!("http://{address}/backend-api")
+        )
+        .as_bytes(),
+    );
+    let source = Arc::new(ReplacedCodexSource {
+        version: std::sync::atomic::AtomicU64::new(7),
+        list_reads: AtomicUsize::new(0),
+        gets: AtomicUsize::new(0),
+        status_calls: Mutex::new(Vec::new()),
+        reports: Mutex::new(Vec::new()),
+        reported: Semaphore::new(0),
+    });
+    let transport = Arc::new(MockResetTransport::new(MockConsumeBehavior::Error).no_credits());
+    let provider_loader = VaultHandleLoader::default();
+    provider_loader.install_snapshot(ReplacedCodexSource::snapshot(), Instant::now());
+    let provider = crate::codex::CodexProvider::new_for_test(
+        crate::config::CodexConfig::default(),
+        Some(source.clone()),
+        transport.clone(),
+        Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
+        provider_loader,
+        codex_home,
+    );
+    let registry = scoped_registry(
+        vec![Box::new(provider)],
+        Arc::new(VaultHandleLoader::default()),
+        source.clone(),
+    );
+    let vault = CredentialHandle::scoped(ReplacedCodexSource::ID, "oauth");
+    let local = CredentialHandle::implicit();
+    tick(&registry).await;
+    tokio::time::timeout(Duration::from_secs(5), source.reported.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        source.reports.lock().unwrap().as_slice(),
+        &[(ReplacedCodexSource::ID.to_string(), 401, 7)]
+    );
+    let failed = slot_for(&registry, &vault);
+    assert_eq!(failed.error_class, Some("credential_rejected"));
+    assert_eq!(
+        failed.last_failure_class,
+        Some(refresh::FetchClass::NonTransient)
+    );
+    assert!(failed.last_failure_reported);
+    assert_eq!(failed.observation.as_ref().unwrap().record_version, Some(7));
+    assert_eq!(
+        failed.observation.as_ref().unwrap().account_id,
+        slot_for(&registry, &local).observation.unwrap().account_id,
+        "both slots resolve the same account before serving deduplicates them"
+    );
+    assert_eq!(local_requests.load(Ordering::SeqCst), 1);
+    tick(&registry).await;
+    assert!(source.status_calls.lock().unwrap().is_empty());
+    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
+
+    age_slot_into_status_poll(&registry, &vault);
+    let backoff_due = slot_for(&registry, &vault).next_due_at;
+    tick(&registry).await;
+    assert_eq!(source.status_calls.lock().unwrap().len(), 1);
+    assert_eq!(slot_for(&registry, &vault).next_due_at, backoff_due);
+    assert_eq!(source.gets.load(Ordering::SeqCst), 1);
+    tick(&registry).await;
+    assert_eq!(
+        source.status_calls.lock().unwrap().len(),
+        1,
+        "an intervening turn must not reset the status-poll cadence"
+    );
+
+    source.version.store(9, Ordering::SeqCst);
+    age_slot_into_status_poll(&registry, &vault);
+    let backoff_due = slot_for(&registry, &vault).next_due_at;
+    tick(&registry).await;
+    assert!(
+        Instant::now() < backoff_due,
+        "recovery precedes the normal retry"
+    );
+    assert_eq!(
+        source.status_calls.lock().unwrap().as_slice(),
+        &[ReplacedCodexSource::ID, ReplacedCodexSource::ID]
+    );
+    assert_eq!(source.list_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(source.gets.load(Ordering::SeqCst), 2);
+    assert_eq!(slot_for(&registry, &vault).status, SlotStatus::Fresh);
+    assert_eq!(
+        slot_for(&registry, &vault)
+            .observation
+            .unwrap()
+            .record_version,
+        Some(9)
+    );
+    assert_eq!(slot_for(&registry, &local).status, SlotStatus::Degraded);
+    assert_eq!(local_requests.load(Ordering::SeqCst), 1);
+    let entries = registry.get_usage(Some("codex")).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].account.as_deref(),
+        Some(ReplacedCodexSource::ACCOUNT)
+    );
+    assert_eq!(entries[0].source.as_deref(), Some("vault"));
+    assert_eq!(primary_percent(&entries[0]), 0.0);
+    assert_eq!(transport.posts.load(Ordering::SeqCst), 0);
+    server.await.unwrap();
 }
 
 // ---- live config reload, through the real Codex provider ----
