@@ -1575,7 +1575,10 @@ fn saved_reset_reply(
     outcome: quota_core::codex_resets::ConsumeOutcome,
     request_id: &str,
 ) -> serde_json::Value {
-    json!({"outcome": outcome.as_code(), "request_id": request_id})
+    // Wrapped in `result` like every other route reply (`usage.get`,
+    // `usage.observe`): clients unwrap `result` before decoding, and a bare
+    // body reads as a lost reply even though the reset was spent.
+    json!({"result": {"outcome": outcome.as_code(), "request_id": request_id}})
 }
 
 fn saved_reset_error_body(error: quota_core::codex_resets::SavedResetError) -> serde_json::Value {

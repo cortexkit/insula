@@ -203,7 +203,7 @@ async fn only_a_daemon_attested_operator_app_may_use_a_saved_reset() {
     )
     .await;
     assert_eq!(
-        body(&call(&mut wire, 20, reset_params()).await)["outcome"],
+        body(&call(&mut wire, 20, reset_params()).await)["result"]["outcome"],
         "reset",
         "a route the daemon attests as an operator app may spend"
     );
@@ -246,7 +246,7 @@ async fn saved_reset_caller_requires_callosum_principal() {
     assert_eq!(posts.load(Ordering::SeqCst), 0);
     bind(&mut wire, 20, callosum(), Some("fed-phone:synthetic-fp")).await;
     assert_eq!(
-        body(&call(&mut wire, 20, reset_params()).await)["outcome"],
+        body(&call(&mut wire, 20, reset_params()).await)["result"]["outcome"],
         "reset"
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1);
@@ -280,7 +280,7 @@ async fn saved_reset_caller_requires_phone_harness() {
     assert_eq!(posts.load(Ordering::SeqCst), 0);
     bind(&mut wire, 20, callosum(), Some("fed-phone:synthetic-fp")).await;
     assert_eq!(
-        body(&call(&mut wire, 20, reset_params()).await)["outcome"],
+        body(&call(&mut wire, 20, reset_params()).await)["result"]["outcome"],
         "reset"
     );
     bind(&mut wire, 21, callosum(), Some("fed-mac:fp")).await;
@@ -336,7 +336,7 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         *result.lock().unwrap() = Ok(outcome);
         let frame = call(&mut wire, 1, reset_params()).await;
         assert_eq!(frame.header.ty, FrameType::Response);
-        assert_eq!(body(&frame), json!({"outcome":code,"request_id":CLIENT_ID}));
+        assert_eq!(body(&frame), json!({"result":{"outcome":code,"request_id":CLIENT_ID}}));
     }
     for (error, code) in [
         (
@@ -400,7 +400,7 @@ async fn saved_reset_marks_slot_due_and_refresh_emits_watch_change() {
         .next_due_at;
     assert!(before > Instant::now());
     assert_eq!(
-        body(&call(&mut wire, 1, reset_params()).await)["outcome"],
+        body(&call(&mut wire, 1, reset_params()).await)["result"]["outcome"],
         "reset"
     );
     assert!(
