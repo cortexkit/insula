@@ -1,0 +1,5 @@
+# Required checks on master, one CI job name per line. Keep in step with branch
+# protection. Release tokens cannot normally read protection, so the release
+# gate enforces this fallback; when readable, it enforces both sets of names.
+Test (ubuntu)
+Test (windows)
