@@ -209,17 +209,48 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+        with:
+          path: insula
+
+      # The release body is the curated notes file for this tag, never text
+      # generated from commit titles, and the manifest carries the core floor
+      # the release index publishes as `requires_core`, so `ck setup insula`
+      # refuses a daemon this build cannot register with. Both are committed
+      # at the tagged commit; a release without them is refused here rather
+      # than published half-described.
+      - name: Check release notes and manifest
+        working-directory: insula
+        run: |
+          set -euo pipefail
+          notes=".cortexkit/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::missing or empty $notes; write the release notes before tagging"
+            exit 1
+          fi
+          python3 - <<'EOF'
+          import json, re
+          manifest = json.load(open("release-manifest.json"))
+          floor = manifest.get("requires_core")
+          if not isinstance(floor, str) or not re.fullmatch(r"\d+\.\d+\.\d+", floor):
+              raise SystemExit(f"::error::release-manifest.json requires_core must be MAJOR.MINOR.PATCH, got {floor!r}")
+          print(f"requires_core: {floor}")
+          EOF
+
       - uses: actions/download-artifact@v4
         with:
           path: assets
           merge-multiple: true
 
       - name: List what is being published
-        run: ls -l assets
+        run: |
+          cp insula/release-manifest.json assets/
+          ls -l assets
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             assets/*.zip
             assets/*.zip.sha256
-          generate_release_notes: true
+            assets/release-manifest.json
+          body_path: insula/.cortexkit/release-notes/${{ github.ref_name }}.md
