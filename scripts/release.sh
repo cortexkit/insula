@@ -159,8 +159,20 @@ for attempt in 1 2 3 4 5 6; do
 done
 [ -n "$run" ] || refuse "no release.yml push run appeared for $tag at $release_sha after 60 seconds"
 workflow="run $run in progress"
-gh run watch "$run" -R "$repo" --exit-status --interval 30 || echo 'release: watch failed; reading authoritative run conclusion' >&2
-conclusion=$(gh run view "$run" -R "$repo" --json status,conclusion --jq '.status + "/" + .conclusion') || refuse "cannot read release workflow conclusion"
+# `gh run watch` can return early while the run is still going (a dropped or
+# rate-limited request ends it with rc 1). Watch again until GitHub reports the
+# run completed, so a slow macOS leg isn't read as a failed release.
+conclusion=""
+watch_deadline=$((SECONDS + 5400))
+while [ "$SECONDS" -lt "$watch_deadline" ]; do
+    gh run watch "$run" -R "$repo" --exit-status --interval 30 >/dev/null 2>&1 || true
+    conclusion=$(gh run view "$run" -R "$repo" --json status,conclusion --jq '.status + "/" + .conclusion' 2>/dev/null) || conclusion=""
+    case "$conclusion" in
+        completed/*) break ;;
+    esac
+    sleep 30
+done
+[ -n "$conclusion" ] || refuse "cannot read release workflow conclusion"
 workflow="run $run $conclusion"
 [ "$conclusion" = completed/success ] || refuse "release workflow did not succeed ($workflow); tag is already pushed"
 
