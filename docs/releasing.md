@@ -11,8 +11,8 @@ ZIPs with SHA256 sidecars, and `release-manifest.json`. The release index at
 1. Choose a version greater than every previous release: patches for fixes,
    minors for new providers, new wire fields or behaviour changes. Before 1.0,
    call out a breaking wire change in a minor release's upgrade notes.
-2. Review the commits since the last tag. Write and commit
-   `.cortexkit/release-notes/vX.Y.Z.md` following the
+2. Review the commits since the last tag. Write and commit the notes for the
+   tag in `.cortexkit/release-notes/`, named after the tag, following the
    [format](../.cortexkit/release-notes/FORMAT.md). The
    [0.2.0 notes](../.cortexkit/release-notes/v0.2.0.md) are a worked example.
    Review the prose before tagging; commit titles are not release notes.

@@ -61,6 +61,7 @@ reads a browser or an API key. See the [capture instructions](docs/consumer-cont
 | [`docs/credentials.md`](docs/credentials.md) | how to make an account show up |
 | [`docs/installing.md`](docs/installing.md) | installing, upgrading and removing the module |
 | [`docs/verifying.md`](docs/verifying.md) | the gates, the ignored tests, and the checkers to run after a deploy |
+| [`docs/releasing.md`](docs/releasing.md) | cutting a public release: notes, the core floor, and `scripts/release.sh` |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to make and land a change, and where code goes |
 | [`SECURITY.md`](SECURITY.md) | reporting a vulnerability, and what the module does with credentials |
 | [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) | licenses of code adapted from other projects |
