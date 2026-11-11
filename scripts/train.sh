@@ -136,20 +136,30 @@ fi
 # GitHub rate limit, which tripped GitHub's per-minute abuse limit on
 # 2026-10-08. A CI run takes minutes, so a minute of extra latency costs nothing.
 echo "  watching run $run"
-gh run watch "$run" --exit-status --interval 60 >/dev/null 2>&1
-watch_rc=$?
-
 # Read the conclusion back rather than trusting the exit code, for the same
-# reason: one code, several meanings.
-# Retry the readback: a rate-limited GitHub answers with an error body, which
-# is not a conclusion. Only a known word counts.
+# reason: one code, several meanings. `gh run watch` can also return early while
+# the run is still going (a rate-limited or dropped request ends it with rc 1),
+# and a run that hasn't finished has no conclusion yet. So keep watching until
+# GitHub reports the run completed, within the deadline; only then is an empty
+# or unknown conclusion a real answer. Seen: a Windows leg still running read
+# as a failed train and stranded a release.
+# A rate-limited GitHub answers with an error body, which is not a conclusion.
+# Only a known word counts.
 conclusion=""
-for _ in $(seq 1 5); do
-  conclusion=$(gh api "repos/$REPO/actions/runs/$run" --jq '.conclusion' 2>/dev/null)
-  case "$conclusion" in
-    success|failure|cancelled|timed_out|skipped|neutral|action_required|startup_failure|stale) break ;;
-    *) conclusion=""; sleep 30 ;;
-  esac
+watch_rc=""
+watch_deadline=$((SECONDS + 5400))
+while [ "$SECONDS" -lt "$watch_deadline" ]; do
+  gh run watch "$run" --exit-status --interval 60 >/dev/null 2>&1
+  watch_rc=$?
+  status=$(gh api "repos/$REPO/actions/runs/$run" --jq '.status' 2>/dev/null)
+  if [ "$status" = "completed" ]; then
+    conclusion=$(gh api "repos/$REPO/actions/runs/$run" --jq '.conclusion' 2>/dev/null)
+    case "$conclusion" in
+      success|failure|cancelled|timed_out|skipped|neutral|action_required|startup_failure|stale) break ;;
+      *) conclusion="" ;;
+    esac
+  fi
+  sleep 30
 done
 echo "  run $run: ${conclusion:-unknown} (watch rc=$watch_rc)"
 
