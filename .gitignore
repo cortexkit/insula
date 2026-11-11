@@ -49,3 +49,6 @@ _bmad-output
 # Internal engineering notes stay in .cortexkit/internal-docs/.
 /ARCHITECTURE.md
 /STRUCTURE.md
+
+# Python bytecode from running the release and gate helpers.
+__pycache__/
