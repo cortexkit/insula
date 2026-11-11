@@ -19,8 +19,27 @@ permissions:
   contents: write
 
 jobs:
+  gate:
+    name: CI gate (ci.yml green on this commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fetch landed master
+        run: git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+      - name: Require exact-commit push CI and all required checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release-ci-gate.sh "$GITHUB_SHA"
+
   verify:
     name: Verify tag matches crate version
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -50,7 +69,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.asset }}
-    needs: verify
+    needs: [gate, verify]
     runs-on: ${{ matrix.runner }}
     strategy:
       # Every target builds to completion. A Windows packaging failure and a
@@ -61,15 +80,35 @@ jobs:
         include:
           - asset: ck-insula-darwin-arm64
             runner: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+            runnable: true
+          - asset: ck-insula-darwin-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            cross: false
+            runnable: true
           - asset: ck-insula-linux-x64
             runner: ubuntu-latest
-          # Shipped deliberately with a stated limitation rather than omitted:
-          # the nine browser-cookie providers cannot read Chrome's store on
-          # Windows (App-Bound Encryption hands the key only to chrome.exe), and
-          # every file- and API-backed provider works. Nine providers dark with a
-          # published reason beats an absent platform.
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            runnable: true
+          - asset: ck-insula-linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            # An x64 Linux runner cannot execute this ARM64 binary natively.
+            runnable: false
           - asset: ck-insula-windows-x64
             runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            runnable: true
+          - asset: ck-insula-windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            cross: false
+            runnable: true
     timeout-minutes: 30
     defaults:
       run:
@@ -80,9 +119,22 @@ jobs:
           path: insula
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross for Linux ARM64
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       - name: Build release binary
-        run: cargo build --release -p quota-module
+        if: '!matrix.cross'
+        run: cargo build --locked --release -p quota-module --target ${{ matrix.target }}
+
+      - name: Cross-build release binary
+        if: matrix.cross
+        run: cross build --locked --release -p quota-module --target ${{ matrix.target }}
 
       # RUN THE BINARY, DO NOT ASSUME IT RUNS. An asset that cannot execute on
       # the platform it is named for is indistinguishable from a good one until a
@@ -94,11 +146,12 @@ jobs:
       # 81fee3d, because it is normally spawned by the daemon and nobody had run
       # it by hand.
       - name: Verify the binary self-reports its version
+        if: matrix.runnable
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/release/ck-insula"
-          [ "${{ runner.os }}" = "Windows" ] && bin="target/release/ck-insula.exe"
+          bin="target/${{ matrix.target }}/release/ck-insula"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
           reported=$("$bin" --version)
           echo "reported: ${reported}"
           expected="ck-insula ${GITHUB_REF_NAME#v}"
@@ -167,7 +220,7 @@ jobs:
           APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
-        run: bash scripts/release/macos-sign-notarize.sh target/release "${{ matrix.asset }}.zip"
+        run: bash scripts/release/macos-sign-notarize.sh "target/${{ matrix.target }}/release" "${{ matrix.asset }}.zip"
 
       # Binary at the archive ROOT, per the installer contract -- no directory
       # prefix, so extraction yields the executable directly. Darwin is already
@@ -177,11 +230,11 @@ jobs:
         if: runner.os != 'macOS' || vars.ALPHA_DARWIN_UNSIGNED == 'true'
         run: |
           set -euo pipefail
-          cd target/release
+          cd "target/${{ matrix.target }}/release"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a -tzip "../../${{ matrix.asset }}.zip" ck-insula.exe
+            7z a -tzip "../../../${{ matrix.asset }}.zip" ck-insula.exe
           else
-            zip -j "../../${{ matrix.asset }}.zip" ck-insula
+            zip -j "../../../${{ matrix.asset }}.zip" ck-insula
           fi
 
       # shasum format (`<hex>  <filename>`), over the ZIP bytes, so a consumer can
@@ -206,7 +259,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs: [gate, verify, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
