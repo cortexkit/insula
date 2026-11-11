@@ -393,6 +393,13 @@ impl SlotStore {
 
     /// Refresh every lane for the redeemed identity, not only the chosen handle:
     /// a duplicate lane must not keep serving its pre-reset credit count.
+    ///
+    /// Clearing the call-observation stamp is what makes "now" stick. While
+    /// reply readings arrive, `poll_due_at` defers the poll to 15 minutes after
+    /// the last one, whatever `next_due_at` says. And those reply readings can't
+    /// show the reset themselves: a reading whose period starts before the held
+    /// reset time is refused as `early_new_period`. So without this, a redeemed
+    /// account kept its pre-reset reading for up to 15 minutes.
     pub(crate) fn mark_account_due(&mut self, provider: &str, account_id: &str, now: Instant) {
         for (key, slot) in &mut self.slots {
             if key.provider == provider
@@ -403,6 +410,7 @@ impl SlotStore {
                     == Some(account_id)
             {
                 slot.next_due_at = now;
+                slot.last_call_observation_at = None;
             }
         }
     }
@@ -1147,6 +1155,51 @@ mod tests {
         assert!(
             !store.publish_if_current(&key, old_incarnation, current_sequence, in_flight),
             "an attempt from a previous incarnation published into the re-added slot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redeem_due_tests {
+    use super::*;
+    use crate::provider::AccountObservation;
+    use crate::refresh::CALL_OBSERVED_INTERVAL;
+    use std::time::Duration;
+
+    /// A redeemed account is polled on the next tick even while reply readings
+    /// are deferring its poll. Seen live: a phone redeem at 17:19:38Z left the
+    /// account at its pre-reset 96% until the deferred poll 15 minutes later.
+    #[test]
+    fn a_redeem_polls_now_even_while_reply_readings_defer_the_poll() {
+        let start = Instant::now();
+        let mut store = SlotStore::new(start);
+        let key = SlotKey::new("codex", CredentialHandle::ImplicitLocal);
+        let mut slot = ProviderSlot::due_now(start, Incarnation::from_counter(1));
+        slot.observation = Some(AccountObservation::new(Some("acct-1".into()), None));
+        slot.last_poll_completed_at = Some(start);
+        slot.next_due_at = start + Duration::from_secs(60);
+        slot.last_call_observation_at = Some(start + Duration::from_secs(5));
+        store.slots.insert(key.clone(), slot);
+
+        let redeemed = start + Duration::from_secs(10);
+        let deferred = store
+            .get(&key)
+            .unwrap()
+            .poll_due_at("codex", redeemed, false);
+        assert_eq!(
+            deferred,
+            start + CALL_OBSERVED_INTERVAL,
+            "fixture must start inside the reply-reading deferral"
+        );
+
+        store.mark_account_due("codex", "acct-1", redeemed);
+        assert_eq!(
+            store
+                .get(&key)
+                .unwrap()
+                .poll_due_at("codex", redeemed, false),
+            redeemed,
+            "a redeemed account kept the 15-minute deferral and served its pre-reset reading"
         );
     }
 }
