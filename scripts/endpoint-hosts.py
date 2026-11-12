@@ -108,6 +108,7 @@ EXPECTED: dict[str, dict[str, str]] = {
     "opencode": {"SERVER_BASE": "opencode.ai"},
     "opencodego": {"API_USAGE_URL": "opencode.ai"},
     "opendesign": {"CURRENT_URL": "amr-api.open-design.ai"},
+    "typesafe": {"OVERVIEW_URL": "console.typesafe.ai"},
     "qoder": {"USAGE_URL": "qoder.com"},
     "qwen_cloud": {
         "QUOTA_CONFIG_URL": "cs-data.qwencloud.com",

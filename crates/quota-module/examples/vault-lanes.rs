@@ -57,6 +57,10 @@ const DUAL_LANE: &[(&str, &str)] = &[(
 /// adding an id to one without the other is the defect this note exists for.
 const ENUMERATED_UNSUPPORTED: &[(&str, &str)] = &[
     (
+        "apikey:typesafe",
+        "inference API keys cannot read billing; use a console.typesafe.ai session cookie",
+    ),
+    (
         "apikey:openai",
         "ordinary API keys cannot read Platform billing; use a browser session key",
     ),
@@ -650,6 +654,21 @@ async fn main() {
 mod tests {
     use super::*;
     use quota_core::model::Usage;
+
+    #[test]
+    fn typesafe_cookie_routes_and_its_inference_key_stays_unsupported() {
+        let report = evaluate(
+            granted(&["cookie:console.typesafe.ai:fixture", "apikey:typesafe"]),
+            usage(vec![healthy("typesafe", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            &[],
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(report.exit_code, 0, "{report:?}");
+        let counts = report.counts.unwrap();
+        assert_eq!(counts.routed, 1);
+        assert_eq!(counts.checked, 1);
+    }
 
     #[test]
     fn openai_platform_sessions_route_and_api_keys_stay_unsupported() {

@@ -1,6 +1,6 @@
 # Provider matrix
 
-48 providers registered.
+49 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -90,3 +90,4 @@ on every operating system. The public wire semantics are in
 | `qwen-cloud` | Vault `cookie:qwencloud.com` | Personal plan gateway at `https://cs-data.qwencloud.com/data/api.json`; Team inventory/seat calls at `https://home.qwencloud.com` | Personal 5h / weekly / monthly; Team seat quota |
 | `sakana` | `SAKANA_COOKIE` environment request header | `GET https://console.sakana.ai/billing` | 5h / weekly subscription cards |
 | `traecn` | Vault `cookie:trae.cn` (parent-domain session or a header captured on `api.trae.cn`) | `POST https://api.trae.cn/cloudide/api/v3/common/GetUserToken`, then `/trae/api/v2/pay/user_current_entitlement_list` with the exchanged token | Derived credit pool (total and remaining across all packs); plan label; no rate window, reset or renewal. Tested against upstream fixtures only |
+| `typesafe` | Vault `cookie:console.typesafe.ai` only; inference API keys cannot read billing | `GET https://console.typesafe.ai/api/billing/overview` with a browser-style user agent; no redirects | Reported USD balance pool; optional single-grant expiry and plan label, no rate windows. Fixture-verified against CodexBar v0.84.0 only; no deposited session available for live verification |

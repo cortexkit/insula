@@ -1675,6 +1675,82 @@ async fn langdock_is_registered_as_cookie_based_without_a_guessed_catalog_slug()
 }
 
 #[tokio::test]
+async fn typesafe_is_cookie_based_with_one_host_family_and_no_catalog_slug() {
+    let defaults = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
+    assert!(defaults.provider_names().contains(&"typesafe"));
+    assert!(defaults.cookie_based_provider_names().contains(&"typesafe"));
+    assert_eq!(
+        crate::vault_handles::CREDENTIAL_FAMILIES
+            .iter()
+            .filter(|(_, provider)| *provider == "typesafe")
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![("cookie:console.typesafe.ai", "typesafe")]
+    );
+    let registry = registry(&[("typesafe", true, true)]);
+    tick(&registry).await;
+    let entries = registry.get_usage(None).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].api_provider, None);
+}
+
+#[test]
+fn typesafe_routes_one_deposit_refuses_duplicates_and_ignores_keys_and_aliases() {
+    let registry = Registry::with_defaults(
+        crate::config::QuotaConfig::default(),
+        Some(Arc::new(DefaultListSource)),
+    );
+    let loader = registry.vault_handle_loader.as_ref().unwrap();
+    let provider = registry
+        .providers
+        .iter()
+        .find(|p| p.name == "typesafe")
+        .unwrap();
+    assert!(provider.fetcher.handles().is_err());
+    loader.install_snapshot(scoped_snapshot(1, vec![]), Instant::now());
+    assert!(provider.fetcher.handles().unwrap().is_empty());
+    for id in [
+        "cookie:console.typesafe.ai",
+        "cookie:console.typesafe.ai:fixture",
+    ] {
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(id, "cookie", 1, "active")]),
+            Instant::now(),
+        );
+        let handles = provider.fetcher.handles().unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].vault_credential_id(), Some(id));
+    }
+    loader.install_snapshot(
+        scoped_snapshot(
+            1,
+            vec![
+                scoped_row("cookie:console.typesafe.ai:first", "cookie", 1, "active"),
+                scoped_row("cookie:console.typesafe.ai:second", "cookie", 1, "active"),
+            ],
+        ),
+        Instant::now(),
+    );
+    assert!(provider.fetcher.handles().unwrap().is_empty());
+    assert!(loader
+        .warning()
+        .unwrap()
+        .contains("cookie:console.typesafe.ai"));
+    for (id, kind) in [
+        ("apikey:typesafe", "api_key"),
+        ("apikey:typesafe:fixture", "api_key"),
+        ("cookie:typesafe.ai", "cookie"),
+        ("cookie:console.typesafe.ai.example.com", "cookie"),
+    ] {
+        loader.install_snapshot(
+            scoped_snapshot(1, vec![scoped_row(id, kind, 1, "active")]),
+            Instant::now(),
+        );
+        assert!(provider.fetcher.handles().unwrap().is_empty(), "{id}");
+    }
+}
+
+#[tokio::test]
 async fn opendesign_is_cookie_based_with_one_exact_vault_family_and_no_catalog_slug() {
     let defaults = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
     assert!(defaults.provider_names().contains(&"opendesign"));
@@ -11109,6 +11185,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("factory", include_str!("factory.rs")),
         ("langdock", include_str!("langdock.rs")),
         ("opendesign", include_str!("opendesign.rs")),
+        ("typesafe", include_str!("typesafe.rs")),
         ("mimo", include_str!("mimo.rs")),
         ("ollama", include_str!("ollama.rs")),
         ("opencode", include_str!("opencode.rs")),
