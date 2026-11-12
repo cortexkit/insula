@@ -886,6 +886,15 @@ limit the provider named without a readable figure. A consumer that ignores
   resets, breakdowns and Extra usage. Those poll-only fields are at most about
   fifteen minutes old during healthy operation; failed polls can leave them
   older. `fetchedAt` dates the newest applied reading, not every retained field.
+- **`synthetic`** publishes the weekly credit pool as `secondary` and hourly
+  search as `tertiary`, without moving either into an empty `primary`. A
+  readable `planWeeklyLimit` at the root or under `data` suppresses the retired
+  rolling five-hour `primary`, even when the server still sends it. An absent
+  or unreadable new-plan block does not suppress rolling; legacy
+  `weeklyTokenLimit` plus rolling responses retain both windows. Named percent
+  fields stay on a 0–100 scale, including values below 1. The weekly pool's
+  `nextRegenAt` and valid `nextRegenPercent` describe the next regeneration
+  step, never `resetsAt`. These mappings are fixture-verified only.
 - **`qwen-cloud`** tries the Team Token Plan before the personal plan. An active
   Team plan publishes exactly one named extra, `id: "team"`, `title: "Team"`,
   with all three slots empty. It is the shared subscription's `credit_value`
@@ -943,6 +952,9 @@ limit the provider named without a readable figure. A consumer that ignores
 
 **Proven by:** `a_monthly_usage_block_publishes_its_percent_without_a_fabricated_cadence`,
 `a_page_with_monthly_and_session_blocks_publishes_both`,
+`readable_plan_weekly_suppresses_rolling_and_preserves_other_lanes`,
+`unreadable_plan_weekly_keeps_rolling`,
+`legacy_weekly_and_search_do_not_suppress_rolling`,
 `active_team_plan_publishes_one_distinct_credit_window`,
 `a_monthly_window_beside_the_rolling_windows_is_an_extra`,
 `an_x_subscription_account_publishes_the_weekly_pool_as_primary`,
