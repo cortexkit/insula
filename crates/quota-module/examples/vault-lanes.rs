@@ -1108,6 +1108,41 @@ mod tests {
     }
 
     #[test]
+    fn siliconflow_regions_are_distinct_expected_vault_lanes() {
+        let ids = [
+            "apikey:siliconflow:fixture",
+            "apikey:siliconflow-cn:fixture",
+        ];
+        for (id, expected) in ids.iter().zip(["siliconflow", "siliconflow-cn"]) {
+            assert_eq!(
+                providers_for_id(id, quota_core::vault_handles::CREDENTIAL_FAMILIES),
+                vec![expected]
+            );
+        }
+        let report = evaluate(
+            granted(&ids),
+            usage(vec![
+                healthy("siliconflow", "vault"),
+                healthy("siliconflow-cn", "vault"),
+            ]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        let counts = report.counts.unwrap();
+        assert_eq!((counts.routed, counts.expected, counts.checked), (2, 2, 2));
+        assert_eq!(report.exit_code, 0);
+        let dark = evaluate(
+            granted(&ids),
+            usage(vec![healthy("siliconflow", "vault")]),
+            quota_core::vault_handles::CREDENTIAL_FAMILIES,
+            DUAL_LANE,
+            ENUMERATED_UNSUPPORTED,
+        );
+        assert_eq!(dark.exit_code, 1);
+    }
+
+    #[test]
     fn removing_a_required_family_mapping_is_not_excused_as_unsupported() {
         let families_without_anthropic: Vec<_> = quota_core::vault_handles::CREDENTIAL_FAMILIES
             .iter()

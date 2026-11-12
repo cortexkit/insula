@@ -41,6 +41,9 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // (the Zen balance) has no API-key lane.
     ("apikey:opencode-go", "opencodego"),
     ("apikey:deepseek", "deepseek"),
+    // Regional models.dev names bind each key to one official origin.
+    ("apikey:siliconflow", "siliconflow"),
+    ("apikey:siliconflow-cn", "siliconflow-cn"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
     // Browser session keys can act on the whole organization: exact grants only,
@@ -112,6 +115,8 @@ enum ProviderKind {
     OpenCode,
     OpenCodeGo,
     DeepSeek,
+    SiliconFlow,
+    SiliconFlowCn,
     Synthetic,
     OpenRouter,
     OpenAIPlatform,
@@ -482,6 +487,14 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::DeepSeek)
     }
 
+    pub fn siliconflow_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::SiliconFlow)
+    }
+
+    pub fn siliconflow_cn_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::SiliconFlowCn)
+    }
+
     pub fn synthetic_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::Synthetic)
     }
@@ -630,6 +643,8 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "opencode" => Some(ProviderKind::OpenCode),
         "opencodego" => Some(ProviderKind::OpenCodeGo),
         "deepseek" => Some(ProviderKind::DeepSeek),
+        "siliconflow" => Some(ProviderKind::SiliconFlow),
+        "siliconflow-cn" => Some(ProviderKind::SiliconFlowCn),
         "synthetic" => Some(ProviderKind::Synthetic),
         "openrouter" => Some(ProviderKind::OpenRouter),
         "openai-platform" => Some(ProviderKind::OpenAIPlatform),
@@ -763,6 +778,32 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn siliconflow_regions_route_only_at_the_family_boundary() {
+        let loader = super::VaultHandleLoader::default();
+        loader.install_rows_for_test(&[
+            ("apikey:siliconflow:fixture", "apikey"),
+            ("apikey:siliconflow-cn:fixture", "apikey"),
+            ("apikey:siliconflow-other", "apikey"),
+        ]);
+        let global = loader.siliconflow_handles().unwrap();
+        let china = loader.siliconflow_cn_handles().unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(china.len(), 1);
+        assert_eq!(
+            global[0].vault_credential_id(),
+            Some("apikey:siliconflow:fixture")
+        );
+        assert_eq!(
+            china[0].vault_credential_id(),
+            Some("apikey:siliconflow-cn:fixture")
+        );
+        assert!(!super::handle_id_names_family(
+            "apikey:siliconflow-cn",
+            "apikey:siliconflow"
+        ));
+    }
+
     #[test]
     fn openai_platform_sessions_route_only_to_billing_and_allow_multiple_deposits() {
         use super::*;

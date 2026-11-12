@@ -69,6 +69,7 @@ pub mod quota_drop;
 pub mod qwen_cloud;
 pub mod refresh;
 pub mod sakana;
+pub mod siliconflow;
 pub mod soniox;
 pub mod stepfun;
 pub mod store;
@@ -434,6 +435,8 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
 /// a counterpart; see [`api_provider_name`]. Data rather than a `match`, so a
 /// test can check every row against the registry without parsing source.
 const API_PROVIDER_SLUGS: &[(&str, &str)] = &[
+    ("siliconflow", "siliconflow"),
+    ("siliconflow-cn", "siliconflow-cn"),
     ("codex", "openai"),
     ("claude", "anthropic"),
     ("grok", "xai"),
@@ -833,6 +836,16 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(soniox::SonioxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(siliconflow::SiliconFlowProvider::new_with_handle_loader(
+                siliconflow::Region::International,
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(siliconflow::SiliconFlowProvider::new_with_handle_loader(
+                siliconflow::Region::China,
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

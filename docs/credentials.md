@@ -59,6 +59,8 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:opencode.ai` | `opencode` and `opencodego` |
 | `apikey:opencode-go` | `opencodego` |
 | `apikey:deepseek` | `deepseek` |
+| `apikey:siliconflow` | `siliconflow` (International API key, `.com`, USD) |
+| `apikey:siliconflow-cn` | `siliconflow-cn` (China API key, `.cn`, CNY) |
 | `apikey:synthetic` | `synthetic` |
 | `apikey:openrouter` | `openrouter` |
 | `apikey:openai-session` | `openai-platform` (Platform browser session key, never Codex) |
@@ -88,6 +90,12 @@ account identity; deposit only one Tripo key, because multiple identity-less
 deposits in this family are refused by the handle loader. Available credits and
 frozen reservations are separate pools;
 see the [consumer contract](consumer-contract.md#717-tripo-available-credits-and-frozen-reservations).
+
+SiliconFlow's regional families use their models.dev names. An account suffix
+does not select a region: `apikey:siliconflow:china` still goes only to the
+International `.com` API. There is no origin override, region probing or local
+credential fallback. Each region follows the API-key routing guard that refuses
+multiple deposits in one family; a suffix labels a deposit, not a verified owner.
 
 ### OpenAI Platform browser session keys
 
