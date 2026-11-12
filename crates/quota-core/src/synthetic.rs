@@ -397,22 +397,31 @@ fn prioritized_quota_slots(
 ) -> Option<Vec<Option<RateWindow>>> {
     let data_dict = root.get("data").and_then(|v| v.as_object());
 
-    let rolling = root
-        .get("rollingFiveHourLimit")
-        .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
-        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::FIVE_HOUR));
-
     // `planWeeklyLimit` is the weekly credit pool on Synthetic's current plans
     // (measured 2026-10-26 and 2026-11-01): it carries only `percentRemaining`
     // and the next regeneration step, no reset. `weeklyTokenLimit` is the older
     // name; a response carrying both is taken by the current one.
-    let weekly = ["planWeeklyLimit", "weeklyTokenLimit"]
-        .iter()
-        .find_map(|key| {
-            root.get(*key)
-                .or_else(|| data_dict.and_then(|d| d.get(*key)))
+    let plan_weekly = root
+        .get("planWeeklyLimit")
+        .or_else(|| data_dict.and_then(|d| d.get("planWeeklyLimit")));
+    let weekly = plan_weekly
+        .or_else(|| {
+            root.get("weeklyTokenLimit")
+                .or_else(|| data_dict.and_then(|d| d.get("weeklyTokenLimit")))
         })
         .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::WEEKLY));
+
+    // A readable new-plan weekly pool retires the five-hour allowance.
+    // CodexBar v0.84.0's synthetic.js accepts any finite quota field as its
+    // marker. Insula deliberately requires a parsed weekly window instead:
+    // an incomplete block must not hide the only readable allowance.
+    let rolling = if plan_weekly.is_some() && weekly.is_some() {
+        None
+    } else {
+        root.get("rollingFiveHourLimit")
+            .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
+            .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::FIVE_HOUR))
+    };
 
     let search_hourly = root
         .get("search")
@@ -991,6 +1000,111 @@ mod tests {
         }"#;
         let weekly = normalize_usage(body).unwrap().secondary.unwrap();
         assert_eq!(weekly.used_percent, 30.0);
+    }
+
+    /// Based on CodexBar v0.84.0 `Tests/CodexBarTests/SyntheticProviderTests.swift`
+    /// ("plan weekly quota ignores retired subscription and preserves search"),
+    /// with the retired rolling allowance also present.
+    #[test]
+    fn readable_plan_weekly_suppresses_rolling_and_preserves_other_lanes() {
+        let body = serde_json::json!({
+            "subscription": {"limit": 500, "requests": 0, "renewsAt": "2026-10-31T15:15:05.743Z"},
+            "rollingFiveHourLimit": {"percentRemaining": 75.0},
+            "weeklyTokenLimit": {"percentRemaining": 98.0},
+            "search": {
+                "hourly": {"limit": 250, "requests": 0, "renewsAt": "2026-10-31T11:15:05.743Z"}
+            },
+            "planWeeklyLimit": {
+                "nextRegenAt": "2026-10-31T12:14:13.000Z",
+                "percentRemaining": 99.47981765714286,
+                "nextRegenPercent": 2
+            }
+        });
+        for wrapped in [false, true] {
+            let payload = if wrapped {
+                serde_json::json!({"data": body})
+            } else {
+                body.clone()
+            };
+            let usage = normalize_usage(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert!(
+                usage.primary.is_none(),
+                "retired rolling allowance: {wrapped}"
+            );
+            let weekly = usage.secondary.expect("the weekly slot stays");
+            assert!((weekly.used_percent - 0.52018234285714).abs() < 0.000001);
+            assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
+            assert!(weekly.resets_at.is_none());
+            assert_eq!(
+                weekly.regeneration,
+                Some(Regeneration {
+                    mechanic: "step".to_string(),
+                    rate: None,
+                    next_step: Some(RegenerationStep {
+                        at: "2026-10-31T12:14:13Z".to_string(),
+                        percent: Some(2.0),
+                    }),
+                })
+            );
+            let hourly = usage.tertiary.expect("the search slot stays");
+            assert_eq!(hourly.used_percent, 0.0);
+            assert_eq!(hourly.window_kind.as_deref(), Some("hourly"));
+            assert_eq!(hourly.resets_at.as_deref(), Some("2026-10-31T11:15:05Z"));
+        }
+    }
+
+    #[test]
+    fn unreadable_plan_weekly_keeps_rolling() {
+        for marker in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"limit": 100}),
+            serde_json::json!({"percentRemaining": "unknown"}),
+            serde_json::json!({"percentRemaining": "NaN"}),
+            serde_json::json!({"nextRegenAt": "2026-10-31T12:14:13Z"}),
+        ] {
+            for wrapped in [false, true] {
+                let body = serde_json::json!({
+                    "rollingFiveHourLimit": {"percentRemaining": 75.0},
+                    "planWeeklyLimit": marker,
+                    "search": {"hourly": {"limit": 250, "requests": 5}}
+                });
+                let payload = if wrapped {
+                    serde_json::json!({"data": body})
+                } else {
+                    body
+                };
+                let usage = normalize_usage(&serde_json::to_vec(&payload).unwrap()).unwrap();
+                let rolling = usage.primary.expect("a readable rolling allowance stays");
+                assert_eq!(rolling.used_percent, 25.0);
+                assert_eq!(rolling.window_kind.as_deref(), Some("five_hour"));
+                assert!(usage.secondary.is_none());
+                assert_eq!(usage.tertiary.unwrap().used_percent, 2.0);
+            }
+        }
+    }
+
+    /// CodexBar v0.84.0 `Tests/CodexBarTests/SyntheticProviderTests.swift`,
+    /// "legacy rolling and weekly quotas retain fractional percentages".
+    /// Insula deliberately reads all named percent fields as percentage points.
+    #[test]
+    fn legacy_weekly_and_search_do_not_suppress_rolling() {
+        let body = serde_json::json!({
+            "rollingFiveHourLimit": {"percentRemaining": 0.75, "tickPercent": 0.02},
+            "weeklyTokenLimit": {"percentRemaining": 0.98},
+            "search": {"hourly": {"limit": 250, "requests": 5}}
+        });
+        for wrapped in [false, true] {
+            let payload = if wrapped {
+                serde_json::json!({"data": body})
+            } else {
+                body.clone()
+            };
+            let usage = normalize_usage(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(usage.primary.unwrap().used_percent, 99.25);
+            assert_eq!(usage.secondary.unwrap().used_percent, 99.02);
+            assert_eq!(usage.tertiary.unwrap().used_percent, 2.0);
+        }
     }
 
     #[test]
