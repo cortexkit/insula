@@ -1,11 +1,13 @@
 //! NeuralWatt usage provider.
 //!
-//! The prepaid balance (`credits_remaining_usd`) is parsed and not published.
-//! Balances have a home now -- `Pool`s on `ProviderUsage::spend` -- so what is
-//! missing is a credential to verify against, not somewhere to put it.
+//! The reported prepaid USD balance is a resetless pool, separate from the
+//! subscription's kWh window and the key's allowance window. Missing balances
+//! are not derived from total credits or consumption.
 //!
 //! VERIFICATION:
 //! This port is fixture-verified against CodexBar source.
+//! Balance mapping: CodexBar v0.84.0
+//! `Sources/CodexBarCore/Resources/Plugins/neuralwatt.js`.
 //! Ported from CodexBar:
 //! - `Sources/CodexBarCore/Providers/NeuralWatt/NeuralWattUsageFetcher.swift`
 //! - `Sources/CodexBarCore/Providers/NeuralWatt/NeuralWattSettingsReader.swift`
@@ -19,13 +21,15 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::time::Duration;
 
 use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
     env,
     http::JsonRequest,
-    model::{ExtraWindow, ProviderUsage, RateWindow, Usage},
+    model::{Amount, ExtraWindow, Pool, PoolBasis, PoolFunding, ProviderUsage, RateWindow, Usage},
+    money::parse_amount,
     provider::{FetchError, UsageProvider},
 };
 
@@ -34,13 +38,14 @@ const DEFAULT_BASE: &str = "https://api.neuralwatt.com";
 const API_KEY_ENV: &[&str] = &["NEURALWATT_API_KEY"];
 const BASE_URL_ENV: &[&str] = &["NEURALWATT_API_URL"];
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct NeuralWattBalance {
-    credits_remaining_usd: Option<f64>,
+    credits_remaining_usd: Option<Box<RawValue>>,
     total_credits_usd: Option<f64>,
     credits_used_usd: Option<f64>,
-    accounting_method: Option<String>,
+    #[serde(rename = "accounting_method")]
+    _accounting_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -98,13 +103,16 @@ struct NeuralWattKey {
     allowance: Option<NeuralWattKeyAllowance>,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct NeuralWattQuotaResponse {
-    snapshot_at: Option<String>,
+    #[serde(rename = "snapshot_at")]
+    _snapshot_at: Option<String>,
     balance: Option<NeuralWattBalance>,
-    usage: Option<NeuralWattUsage>,
-    limits: Option<NeuralWattLimits>,
+    #[serde(rename = "usage")]
+    _usage: Option<NeuralWattUsage>,
+    #[serde(rename = "limits")]
+    _limits: Option<NeuralWattLimits>,
     subscription: Option<NeuralWattSubscription>,
     key: Option<NeuralWattKey>,
 }
@@ -195,6 +203,27 @@ fn quota_url(mut base_url: url::Url) -> url::Url {
 
 /// Normalize the NeuralWatt quota response to [`Usage`]. Pure — unit-testable.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
+    normalize_reading(body).map(|(usage, _)| usage)
+}
+
+fn reported_balance(balance: &NeuralWattBalance) -> Result<Option<Amount>, FetchError> {
+    balance
+        .credits_remaining_usd
+        .as_deref()
+        .map(|raw| {
+            // Preserve the JSON decimal text, including sub-cent precision and
+            // amounts beyond f64's exact range. Quoted numbers are not numbers.
+            parse_amount(raw.get(), "USD").ok_or_else(|| {
+                FetchError::Decode(
+                    "Neuralwatt credits_remaining_usd is not an exact USD amount".to_string(),
+                )
+            })
+        })
+        .transpose()
+        .map(|amount| amount.filter(|amount| amount.minor >= 0))
+}
+
+fn normalize_reading(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> {
     let decoded: NeuralWattQuotaResponse = serde_json::from_slice(body)
         .map_err(|e| FetchError::Decode(format!("failed to parse Neuralwatt response: {e}")))?;
 
@@ -203,7 +232,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         .as_ref()
         .ok_or_else(|| FetchError::Decode("Missing Neuralwatt balance object".to_string()))?;
 
-    if valid_non_negative(balance.credits_remaining_usd).is_none()
+    let remaining = reported_balance(balance)?;
+    if remaining.is_none()
         && valid_non_negative(balance.credits_used_usd).is_none()
         && valid_positive(balance.total_credits_usd).is_none()
     {
@@ -355,12 +385,34 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         }])
     }();
 
-    Ok(Usage {
+    let usage = Usage {
         primary,
         secondary: None,
         tertiary: None,
         extra_rate_windows,
-    })
+    };
+    let pool = remaining.map(|remaining| Pool {
+        id: "prepaid_balance".to_string(),
+        label: "NeuralWatt prepaid balance".to_string(),
+        // Neither the prepaid label nor accounting_method states whether this
+        // credit was bought or granted, or whether the key may spend it.
+        funding: PoolFunding::Unknown,
+        remaining: Some(remaining),
+        total: None,
+        basis: PoolBasis::Reported,
+        spendable: None,
+        resets_at: None,
+        expires_at: None,
+        unlimited: None,
+    });
+    Ok((usage, pool))
+}
+
+fn normalize_response(body: &[u8]) -> Result<ProviderUsage, FetchError> {
+    let (usage, pool) = normalize_reading(body)?;
+    let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage);
+    entry.spend = pool.map(|pool| vec![pool]);
+    Ok(entry)
 }
 
 /// The NeuralWatt usage provider.
@@ -412,8 +464,7 @@ impl NeuralWattProvider {
                 .send(&self.http)
                 .await?;
 
-            let usage = normalize_usage(&body)?;
-            Ok(ProviderUsage::healthy(PROVIDER_NAME, None, "api", usage))
+            normalize_response(&body)
         }
         .await;
         FetchAttempt::from_provider_usage(result)
@@ -441,6 +492,160 @@ impl UsageProvider for NeuralWattProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CodexBar v0.84.0, TestsPlugin/NeuralWattPluginTests.swift, first fixture.
+    const PREPAID_WITH_WINDOWS: &[u8] = br#"{
+      "snapshot_at": "2026-04-16T18:30:00Z",
+      "balance": {
+        "credits_remaining_usd": 32.6774,
+        "total_credits_usd": 52.34,
+        "credits_used_usd": 19.6626,
+        "accounting_method": "energy"
+      },
+      "usage": {
+        "lifetime": {"cost_usd": 243.9145, "requests": 37801, "tokens": 1235477176, "energy_kwh": 15.6009},
+        "current_month": {"cost_usd": 160.1463, "requests": 23902, "tokens": 1116658995, "energy_kwh": 9.7278}
+      },
+      "limits": {"overage_limit_usd": null, "rate_limit_tier": "standard"},
+      "subscription": {
+        "plan": "standard",
+        "status": "active",
+        "billing_interval": "month",
+        "current_period_start": "2026-04-11T05:05:25Z",
+        "current_period_end": "2026-05-11T05:05:25Z",
+        "auto_renew": true,
+        "kwh_included": 20.0,
+        "kwh_used": 13.9023,
+        "kwh_remaining": 6.0977,
+        "in_overage": false
+      },
+      "key": {
+        "name": "my-production-key",
+        "allowance": {"limit_usd": 50.0, "period": "monthly", "spent_usd": 12.5, "remaining_usd": 37.5, "blocked": false}
+      }
+    }"#;
+
+    #[test]
+    fn reported_balance_is_separate_from_subscription_and_key_windows() {
+        let attempt = FetchAttempt::from_provider_usage(normalize_response(PREPAID_WITH_WINDOWS));
+        let usage = attempt.usage.unwrap();
+        let primary = usage.primary.unwrap();
+        assert!((primary.used_percent - 69.5115).abs() < 1e-10);
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-05-11T05:05:25Z"));
+        assert_eq!(primary.window_minutes, Some(43200));
+        assert_eq!(primary.window_kind.as_deref(), Some("monthly"));
+        let extras = usage.extra_rate_windows.unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].id.as_deref(), Some("key-allowance"));
+        assert_eq!(extras[0].window.as_ref().unwrap().used_percent, 25.0);
+        assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+
+        let pools = attempt.pools.unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id, "prepaid_balance");
+        assert_eq!(pools[0].label, "NeuralWatt prepaid balance");
+        assert_eq!(
+            pools[0].remaining,
+            Some(Amount {
+                minor: 326774,
+                exponent: 4,
+                unit: "USD".to_string(),
+            })
+        );
+        assert_eq!(pools[0].basis, PoolBasis::Reported);
+        assert_eq!(pools[0].funding, PoolFunding::Unknown);
+        assert_eq!(pools[0].total, None);
+        assert_eq!(pools[0].spendable, None);
+        assert_eq!(pools[0].resets_at, None);
+        assert_eq!(pools[0].expires_at, None);
+        assert_eq!(pools[0].unlimited, None);
+    }
+
+    #[test]
+    fn reported_balances_keep_exact_decimals_and_zero() {
+        for (number, minor, exponent) in [
+            ("0.0", 0, 1),
+            ("0.000000001", 1, 9),
+            ("4.5000", 45000, 4),
+            ("900719925474099.13", 90_071_992_547_409_913, 2),
+        ] {
+            let body = format!(r#"{{"balance":{{"credits_remaining_usd":{number}}}}}"#);
+            let entry = normalize_response(body.as_bytes()).unwrap();
+            let pool = &entry.spend.as_ref().unwrap()[0];
+            assert_eq!(
+                pool.remaining,
+                Some(Amount {
+                    minor,
+                    exponent,
+                    unit: "USD".to_string(),
+                }),
+                "{number}"
+            );
+            let wire = serde_json::to_value(&entry).unwrap();
+            assert_eq!(wire["spend"][0]["remaining"]["minor"], minor);
+        }
+    }
+
+    #[test]
+    fn absent_remaining_is_not_derived_or_zero() {
+        // The 10-minus-3 case is from CodexBar v0.84.0,
+        // TestsPlugin/NeuralWattPluginTests.swift. Only a stated remainder is
+        // reported here; total minus used would have different provenance.
+        for balance in [
+            r#"{"total_credits_usd":10,"credits_used_usd":3}"#,
+            r#"{"credits_remaining_usd":null,"total_credits_usd":10,"credits_used_usd":3}"#,
+            r#"{"credits_remaining_usd":-1,"total_credits_usd":10,"credits_used_usd":3}"#,
+        ] {
+            let body = format!(
+                r#"{{"balance":{balance},"subscription":{{"kwh_included":10,"kwh_used":2.5}}}}"#
+            );
+            let entry = normalize_response(body.as_bytes()).unwrap();
+            assert_eq!(entry.usage.unwrap().primary.unwrap().used_percent, 25.0);
+            assert_eq!(entry.spend, None);
+        }
+    }
+
+    #[test]
+    fn balance_only_accounts_publish_pools_without_windows() {
+        // Balance-only and zero-balance inputs from CodexBar v0.84.0,
+        // TestsPlugin/NeuralWattPluginTests.swift, with unused fields omitted.
+        for number in ["4.5", "0.0"] {
+            let body = format!(
+                r#"{{"balance":{{"credits_remaining_usd":{number}}},"subscription":null,"key":{{"allowance":null}}}}"#
+            );
+            let attempt = FetchAttempt::from_provider_usage(normalize_response(body.as_bytes()));
+            let usage = attempt.usage.unwrap();
+            assert!(
+                usage.primary.is_none() && usage.secondary.is_none() && usage.tertiary.is_none()
+            );
+            assert!(usage.extra_rate_windows.is_none());
+            assert_eq!(attempt.pools.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn malformed_reported_balances_are_decode_failed_without_echoing_payloads() {
+        for raw in [
+            r#""secret_fixture""#,
+            r#""32.6774""#,
+            "true",
+            "{}",
+            "[]",
+            "1e1",
+            "0.0000000001",
+            "9223372036854775808",
+        ] {
+            let body = format!(
+                r#"{{"balance":{{"credits_remaining_usd":{raw},"total_credits_usd":10}}}}"#
+            );
+            let error = normalize_response(body.as_bytes()).unwrap_err();
+            assert!(matches!(error, FetchError::Decode(_)), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "decode error: Neuralwatt credits_remaining_usd is not an exact USD amount"
+            );
+        }
+    }
 
     #[test]
     fn test_capitalize() {
