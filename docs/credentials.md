@@ -69,6 +69,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:vercel-budget` | `vercel-budget` (an access token and team id) |
 | `apikey:soniox` | `soniox` (an organization API key) |
 | `apikey:abliteration` | `abliteration` (an abliteration.ai API key) |
+| `apikey:tripo` | `tripo` (a Tripo API key; vault-only) |
 | `apikey:litellm` | `litellm` (a virtual key for the configured LiteLLM proxy) |
 | `apikey:cline-pass` | `clinepass` (a Cline plan API key) |
 | `apikey:chatbox` | `chatbox` (a Chatbox AI license key) |
@@ -76,6 +77,17 @@ next. Records are matched to providers by their id prefix (the "family"):
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
 suffix after the family (`oauth:anthropic:<account>`).
+
+### Tripo API keys
+
+Deposit the plain API key as `apikey:tripo` or `apikey:tripo:<account>`. It is
+sent as a Bearer token only to `openapi.tripo3d.ai` for the read-only account
+balance endpoint. No browser session is needed, and insula does not read
+`TRIPO_API_KEY` from the environment. The suffix labels a credential, not an
+account identity; deposit only one Tripo key, because multiple identity-less
+deposits in this family are refused by the handle loader. Available credits and
+frozen reservations are separate pools;
+see the [consumer contract](consumer-contract.md#717-tripo-available-credits-and-frozen-reservations).
 
 ### OpenAI Platform browser session keys
 

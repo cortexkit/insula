@@ -52,6 +52,7 @@ SRC = REPO / "crates/quota-core/src"
 # provider module -> constant -> expected host.
 EXPECTED: dict[str, dict[str, str]] = {
     "abliteration": {"API_BASE": "api.abliteration.ai"},
+    "tripo": {"API_BASE": "openapi.tripo3d.ai"},
     "amp": {"SETTINGS_URL": "ampcode.com"},
     "anthropic": {"USAGE_URL": "api.anthropic.com"},
     "claude_console": {"ORGANIZATIONS_URL": "platform.claude.com"},
