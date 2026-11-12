@@ -1754,6 +1754,46 @@ fixtures and local loopback transport, not a live Tripo account.
 `only_a_401_rejects_and_reports_the_served_vault_key`,
 `missing_or_unusable_keys_send_nothing_and_vault_absence_is_not_inferred`.
 
+### 7.18 `neuralwatt`: reported prepaid USD beside kWh and key allowances
+
+`neuralwatt` reads `GET https://api.neuralwatt.com/v1/quota` once with
+`NEURALWATT_API_KEY`. Alongside the existing subscription kWh window and
+key-allowance extra window, a reported `balance.credits_remaining_usd`
+publishes:
+
+```json
+"spend": [
+  { "id": "prepaid_balance", "label": "NeuralWatt prepaid balance",
+    "funding": "unknown", "basis": "reported",
+    "remaining": { "minor": 326774, "exponent": 4, "unit": "USD" } }
+]
+```
+
+- The remainder is an exact nonnegative decimal JSON number, including zero
+  and sub-cent precision, preserved as integer minor units without passing
+  through a binary float. Quoted numbers, exponent notation, unsupported
+  precision (more than nine decimal places), and amounts outside the minor-unit
+  range are `decode_failed`, not rounded or replaced with zero.
+- Missing or `null` remaining credit leaves `spend` absent, not `[]` or zero.
+  No remainder is derived from `total_credits_usd - credits_used_usd`.
+  Negative remaining credit is not published, matching upstream's
+  nonnegative-balance rule; other valid balance fields can still accompany
+  the existing windows.
+- The pool has no `total`, `spendable`, `unlimited`, `resetsAt` or `expiresAt`.
+  Upstream's display-only `limit: 0` is not a cap, and neither its prepaid
+  label nor `accounting_method` proves whether credit was bought or granted.
+  The key allowance and subscription are not the pool's total or reset.
+- A balance-only response publishes `usage: {}` and the pool. No extra
+  request, credential source, identity or HTTP error classification is added.
+- Verified only against CodexBar v0.84.0 fixtures in
+  `TestsPlugin/NeuralWattPluginTests.swift`, not a live NeuralWatt account.
+
+**Proven by:** `reported_balance_is_separate_from_subscription_and_key_windows`,
+`reported_balances_keep_exact_decimals_and_zero`,
+`absent_remaining_is_not_derived_or_zero`,
+`balance_only_accounts_publish_pools_without_windows`,
+`malformed_reported_balances_are_decode_failed_without_echoing_payloads`.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys
