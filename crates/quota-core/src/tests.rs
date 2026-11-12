@@ -700,7 +700,9 @@ fn production_sources_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             parent.join(stem)
         };
         for (index, line) in lines.iter().enumerate() {
-            if *line != "#[cfg(test)]" {
+            // `test-hooks` is enabled only by quota-module's dev-dependency, so a
+            // module gated on it is test code that the module's own tests reuse.
+            if *line != "#[cfg(test)]" && *line != "#[cfg(any(test, feature = \"test-hooks\"))]" {
                 continue;
             }
             let mut explicit = None;
