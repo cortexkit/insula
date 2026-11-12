@@ -328,6 +328,9 @@ mod tests {
 
     // CodexBar v0.43.0, Tests/CodexBarTests/OpenAIAPICreditBalanceTests.swift
     // (MIT), `parses credit grants balance`.
+    // Verified at v0.43.0; this historical test file is absent at v0.84.0.
+    // Recorded for scripts/parity-citations.py so the fixture's pinned source
+    // remains followable without implying the file exists in current upstream.
     const CREDITS: &str = r#"{
         "object":"credit_summary", "total_granted":25.5,
         "total_used":7.25, "total_available":18.25,
