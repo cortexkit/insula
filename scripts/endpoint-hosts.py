@@ -123,6 +123,10 @@ EXPECTED: dict[str, dict[str, str]] = {
         "TEAM_REFERER_URL": "home.qwencloud.com",
     },
     "sakana": {"BILLING_URL": "console.sakana.ai"},
+    "siliconflow": {
+        "INTERNATIONAL_URL": "api.siliconflow.com",
+        "CHINA_URL": "api.siliconflow.cn",
+    },
     "soniox": {"API_BASE": "api.soniox.com"},
     "stepfun": {"API_URL": "platform.stepfun.com"},
     "synthetic": {"DEFAULT_BASE": "api.synthetic.new"},

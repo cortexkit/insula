@@ -162,6 +162,16 @@ def claims(cid, fams):
 
     A family ends at a colon boundary: `apikey:opencode` must not claim
     the models.dev-slug family `apikey:opencode-go`.
+
+    Regional SiliconFlow names are separate families, not account suffixes:
+
+    >>> fams = families()
+    >>> claims("apikey:siliconflow:fixture", fams)
+    ['siliconflow']
+    >>> claims("apikey:siliconflow-cn:fixture", fams)
+    ['siliconflow-cn']
+    >>> claims("apikey:siliconflow-other", fams)
+    []
     """
     return [n for p, n in fams if cid == p or cid.startswith(p + ":")]
 

@@ -59,6 +59,8 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:opencode.ai` | `opencode` and `opencodego` |
 | `apikey:opencode-go` | `opencodego` |
 | `apikey:deepseek` | `deepseek` |
+| `apikey:siliconflow` | `siliconflow` (International API key, `.com`, USD) |
+| `apikey:siliconflow-cn` | `siliconflow-cn` (China API key, `.cn`, CNY) |
 | `apikey:synthetic` | `synthetic` |
 | `apikey:openrouter` | `openrouter` |
 | `apikey:openai-session` | `openai-platform` (Platform browser session key, never Codex) |
@@ -76,6 +78,12 @@ next. Records are matched to providers by their id prefix (the "family"):
 The authoritative list is `CREDENTIAL_FAMILIES` in
 `crates/quota-core/src/vault_handles.rs`. A record id may carry an account
 suffix after the family (`oauth:anthropic:<account>`).
+
+SiliconFlow's regional families use their models.dev names. An account suffix
+does not select a region: `apikey:siliconflow:china` still goes only to the
+International `.com` API. There is no origin override, region probing or local
+credential fallback. Each region follows the API-key routing guard that refuses
+multiple deposits in one family; a suffix labels a deposit, not a verified owner.
 
 ### OpenAI Platform browser session keys
 

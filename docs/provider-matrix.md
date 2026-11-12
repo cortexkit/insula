@@ -1,6 +1,6 @@
 # Provider matrix
 
-48 providers registered.
+50 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -63,6 +63,8 @@ on every operating system. The public wire semantics are in
 | `openrouter` | OpenCode `openrouter` API key; vault `apikey:openrouter` | `GET https://openrouter.ai/api/v1/credits`; `/api/v1/key` for owner | Derived USD balance; no rate window |
 | `openai-platform` | Vault only: `apikey:openai-session[:<account>]` (browser session key) | `GET https://api.openai.com/v1/dashboard/billing/credit_grants` | Reported aggregate USD API credits, positive granted total and earliest future grant expiry; no rate windows. Live-verified via browser session key; ordinary and organization Admin API keys are refused |
 | `soniox` | `SONIOX_ORG_API_KEY`; vault `apikey:soniox` | `GET https://api.soniox.com/v1/organization/balance`; `/v1/organization/usage/monthly` | Monthly budget window resetting on the 1st (UTC), only when a budget is set; reported USD prepaid balance unless invoice-billed. Tested against upstream fixtures only |
+| `siliconflow` | Vault only: `apikey:siliconflow[:<account>]` | `GET https://api.siliconflow.com/v1/user/info` | International: reported aggregate USD balance, including debt; no rate windows. CodexBar v0.84.0 fixtures only |
+| `siliconflow-cn` | Vault only: `apikey:siliconflow-cn[:<account>]` | `GET https://api.siliconflow.cn/v1/user/info` | China: reported aggregate CNY balance, including debt; no rate windows. Shares `siliconflow.rs`; CodexBar v0.84.0 fixtures only |
 | `stepfun` | `STEPFUN_TOKEN` | `POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit` | 5h / weekly quota |
 | `sub2api` | `SUB2API_API_KEY`, configured `SUB2API_BASE_URL` | `GET {base}/v1/usage` | Named rate-limit windows (5h / 1d / 7d recognized); money fields omitted |
 | `vercel` | `AI_GATEWAY_API_KEY`; vault `apikey:vercel` | `GET https://ai-gateway.vercel.sh/v1/credits` | Reported USD team credit balance; no rate window. Tested against upstream fixtures only |

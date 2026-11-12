@@ -1671,6 +1671,64 @@ provider, even when several such credentials exist (section 9.1).
 `redirects_are_never_followed_to_another_host`,
 `live_config_is_read_again_on_the_next_fetch`.
 
+### 7.17 `siliconflow` and `siliconflow-cn`: regional prepaid balances
+
+These are separate providers with the same parser, named after their models.dev
+slugs. Both read `GET /v1/user/info` with a vault API key as a Bearer token:
+
+| Provider / `apiProvider` | Vault family | Only upstream origin | Pool currency |
+|---|---|---|---|
+| `siliconflow` | `apikey:siliconflow[:<account>]` | `https://api.siliconflow.com` | `USD` |
+| `siliconflow-cn` | `apikey:siliconflow-cn[:<account>]` | `https://api.siliconflow.cn` | `CNY` |
+
+No region is inferred from an account suffix, key or payload. There is no origin
+override and no retry against the other region. The China contract fixture
+publishes:
+
+```json
+"usage": {},
+"spend": [
+  { "id": "balance", "label": "Account balance",
+    "funding": "unknown", "basis": "reported",
+    "remaining": { "minor": 8888, "exponent": 2, "unit": "CNY" } }
+]
+```
+
+- `remaining` is the required `totalBalance`, at the stated decimal precision,
+  including zero and negative debt. Strings and JSON numbers are read without
+  binary floating-point arithmetic; more than nine fractional places or a
+  magnitude that cannot fit integer minor units is `decode_failed`.
+- The optional `chargeBalance` (purchased) and `balance` (bonus) fields are
+  validated but not published as extra pools: they overlap the aggregate, and
+  summing all three would double-count money. Missing components stay absent,
+  never zero. The aggregate's funding is therefore `unknown`.
+- No rate window, `total`, reset, expiry or `spendable` is invented. Account
+  `status`, including `overdue`, is not a per-pool enable flag.
+- `account` is the nonblank `data.id` only when the response states it. Vault
+  labels and credential metadata never supply an identity. No descriptive
+  account information is published.
+- Only vault deposits are read. A vault that has not answered enumeration is
+  unfinished, not empty. A blank deposit is `credential_unusable` and sends
+  nothing. Each region retains the shared API-key family's single-deposit guard.
+- HTTP 401 and API code 30014 mean `credential_rejected`; only an actual HTTP
+  401 is reported to the vault, with the served record version. HTTP 403 is
+  `upstream_failed`, not evidence of a dead key. HTTP 410 and API code 20092 mean
+  the balance query was refused or retired: `upstream_failed`, never
+  `no_quota_reported` or a healthy zero. HTTP 429, 5xx and other unsuccessful
+  statuses are also `upstream_failed`. Refusal bodies are bounded and never
+  quoted. A nonempty unreadable payload, a missing required balance or an
+  unsuccessful/malformed envelope is `decode_failed`.
+- Verified with CodexBar v0.84.0 fixtures in
+  `TestsPlugin/SiliconFlowPluginTests.swift`, not with a live SiliconFlow account.
+
+**Proven by:** `regional_vault_reads_publish_only_the_reported_total_and_verified_identity`,
+`negative_overdue_balances_and_unstated_identity_are_preserved`,
+`decimal_strings_and_json_numbers_keep_exact_precision_without_floats`,
+`malformed_or_missing_balances_never_turn_into_zero_or_absence`,
+`refusals_keep_their_classes_and_only_http_401_reports_a_dead_key`,
+`unusable_or_cross_region_deposits_send_nothing`,
+`siliconflow_regions_route_only_at_the_family_boundary`.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys
