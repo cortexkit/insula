@@ -159,6 +159,8 @@ impl CreditsSnapshot {
                     expires_at: crate::rfc3339_canonical(*expires_at),
                 })
                 .collect(),
+            // Codex states no kind for its credits.
+            kinds: Vec::new(),
         }
     }
 }
@@ -462,6 +464,35 @@ pub struct RedemptionRecord {
     /// Client ids must remain replayable after the automatic retention horizon.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manual: bool,
+    /// The provider whose saved reset this redemption spends. Records written
+    /// before Claude redemptions existed carry none and are Codex's, and a
+    /// Codex record still omits it, so a journal holding only Codex records
+    /// keeps its bytes and an older module reads it as before.
+    #[serde(default = "codex_provider", skip_serializing_if = "is_codex_provider")]
+    pub provider: String,
+}
+
+const CODEX_PROVIDER: &str = "codex";
+
+fn codex_provider() -> String {
+    CODEX_PROVIDER.to_string()
+}
+
+fn is_codex_provider(provider: &str) -> bool {
+    provider == CODEX_PROVIDER
+}
+
+impl RedemptionRecord {
+    /// The automatic Codex policy (pending ids, the cross-account fence and the
+    /// provider-wide floor) reads Codex records only: another provider's
+    /// redemption says nothing about Codex accounts.
+    fn is_codex(&self) -> bool {
+        is_codex_provider(&self.provider)
+    }
+
+    fn is_for(&self, provider: &str, account_id: &str) -> bool {
+        self.provider == provider && self.account_id == account_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +509,18 @@ pub enum SavedResetError {
     RecentlyReset(DateTime<Utc>),
     ProviderRefused(String),
     ProviderUnavailable(String),
+    /// The request named something this provider cannot spend, such as a
+    /// missing or unknown saved-reset kind.
+    InvalidRequest(String),
+    /// The provider refused because the account redeemed recently, and said
+    /// until when if it said so.
+    ProviderCooldown(Option<DateTime<Utc>>),
+    /// The provider answered with a decided refusal: its result word and, if
+    /// it gave one, its reason code. Both are bounded vocabulary words.
+    ProviderDeclined {
+        result: String,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -747,7 +790,7 @@ impl RedemptionJournal {
             self.save(&records)?;
         }
         let pending = records.iter().find(|record| {
-            record.account_id == account_id && record.status == JournalStatus::Pending
+            record.is_for(CODEX_PROVIDER, account_id) && record.status == JournalStatus::Pending
         });
         if let Some(record) = pending {
             let latest = parse_record_latest_time(record)?;
@@ -775,7 +818,7 @@ impl RedemptionJournal {
         // becomes genuinely walled inside the next half hour waits at most that
         // long. The cost of the tidy version is unbounded.
         let spend_bound_allows = !records.iter().any(|record| {
-            record.account_id == account_id
+            record.is_for(CODEX_PROVIDER, account_id)
                 && record.status == JournalStatus::Resolved
                 && parse_record_latest_time(record).is_ok_and(|latest| {
                     now.signed_duration_since(latest).num_seconds() < SPEND_BOUND_SECS
@@ -788,7 +831,7 @@ impl RedemptionJournal {
         let mut recent_elsewhere = Vec::new();
         for record in records
             .iter()
-            .filter(|record| record.account_id != account_id)
+            .filter(|record| record.is_codex() && record.account_id != account_id)
         {
             let at = parse_record_latest_time(record)?;
             if now.signed_duration_since(at).num_seconds() < CROSS_ACCOUNT_BOUND_SECS {
@@ -837,7 +880,7 @@ impl RedemptionJournal {
         // record unresolved. Refused before anything is written, so a refusal
         // leaves no pending record behind.
         let mut last_redemption: Option<RecentRedemption> = None;
-        for record in &records {
+        for record in records.iter().filter(|record| record.is_codex()) {
             let at = parse_record_latest_time(record)?;
             let inside_floor =
                 now.signed_duration_since(at).num_seconds() < PROVIDER_REDEMPTION_FLOOR_SECS;
@@ -863,6 +906,7 @@ impl RedemptionJournal {
             status: JournalStatus::Pending,
             outcome: None,
             manual: false,
+            provider: codex_provider(),
         });
         self.save(&records)?;
         eprintln!(
@@ -880,9 +924,22 @@ impl RedemptionJournal {
         request_id: &str,
         now: DateTime<Utc>,
     ) -> Result<ManualReservation, JournalError> {
+        self.reserve_manual_for(CODEX_PROVIDER, account_id, request_id, now)
+    }
+
+    /// [`Self::reserve_manual`] for `provider`'s account. The spend bound and
+    /// the request-id replay are per provider and account: a Claude account and
+    /// a Codex account never share either.
+    pub fn reserve_manual_for(
+        &self,
+        provider: &str,
+        account_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ManualReservation, JournalError> {
         let mut records = self.load()?;
         if let Some(record) = records.iter_mut().find(|record| {
-            record.account_id == account_id && record.redeem_request_id == request_id
+            record.is_for(provider, account_id) && record.redeem_request_id == request_id
         }) {
             let reservation = match record.status {
                 JournalStatus::Pending => ManualReservation::Pending,
@@ -901,7 +958,7 @@ impl RedemptionJournal {
         let mut latest = None;
         for record in records
             .iter()
-            .filter(|record| record.account_id == account_id)
+            .filter(|record| record.is_for(provider, account_id))
         {
             let at = parse_record_latest_time(record)?;
             if now.signed_duration_since(at).num_seconds() < SPEND_BOUND_SECS {
@@ -920,6 +977,7 @@ impl RedemptionJournal {
             status: JournalStatus::Pending,
             outcome: None,
             manual: true,
+            provider: provider.to_owned(),
         });
         self.save(&records)?;
         Ok(ManualReservation::Pending)
@@ -932,11 +990,22 @@ impl RedemptionJournal {
         redeem_request_id: &str,
         attempted_at: DateTime<Utc>,
     ) -> Result<(), JournalError> {
+        self.record_attempt_for(CODEX_PROVIDER, account_id, redeem_request_id, attempted_at)
+    }
+
+    /// [`Self::record_attempt`] for `provider`'s account.
+    pub fn record_attempt_for(
+        &self,
+        provider: &str,
+        account_id: &str,
+        redeem_request_id: &str,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<(), JournalError> {
         let mut records = self.load()?;
         let record = records
             .iter_mut()
             .find(|record| {
-                record.account_id == account_id
+                record.is_for(provider, account_id)
                     && record.redeem_request_id == redeem_request_id
                     && record.status == JournalStatus::Pending
             })
@@ -950,7 +1019,7 @@ impl RedemptionJournal {
         let attempt_count = record.attempt_count;
         self.save(&records)?;
         eprintln!(
-            "{LOG_TAG} codex reset journal attempt account_id={account_id} redeem_request_id={redeem_request_id} attempt_count={attempt_count}"
+            "{LOG_TAG} {provider} reset journal attempt account_id={account_id} redeem_request_id={redeem_request_id} attempt_count={attempt_count}"
         );
         Ok(())
     }
@@ -961,11 +1030,22 @@ impl RedemptionJournal {
         redeem_request_id: &str,
         outcome: ConsumeOutcome,
     ) -> Result<(), JournalError> {
+        self.resolve_for(CODEX_PROVIDER, account_id, redeem_request_id, outcome)
+    }
+
+    /// [`Self::resolve`] for `provider`'s account.
+    pub fn resolve_for(
+        &self,
+        provider: &str,
+        account_id: &str,
+        redeem_request_id: &str,
+        outcome: ConsumeOutcome,
+    ) -> Result<(), JournalError> {
         let mut records = self.load()?;
         let record = records
             .iter_mut()
             .find(|record| {
-                record.account_id == account_id
+                record.is_for(provider, account_id)
                     && record.redeem_request_id == redeem_request_id
                     && record.status == JournalStatus::Pending
             })
@@ -978,7 +1058,7 @@ impl RedemptionJournal {
         record.outcome = Some(outcome);
         self.save(&records)?;
         eprintln!(
-            "{LOG_TAG} codex reset journal resolve account_id={account_id} redeem_request_id={redeem_request_id} outcome={}",
+            "{LOG_TAG} {provider} reset journal resolve account_id={account_id} redeem_request_id={redeem_request_id} outcome={}",
             outcome.as_code()
         );
         Ok(())
@@ -1657,10 +1737,31 @@ impl Drop for InFlightReset {
     }
 }
 
+/// The one in-process lock for the journal at `path`.
+///
+/// Each provider that spends saved resets builds its own coordinator over the
+/// same file, and every write is a whole-file load-modify-save. A lock per
+/// coordinator would let two providers interleave those cycles and drop each
+/// other's records, so the lock belongs to the path instead.
+fn journal_io_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 /// In-process mutation fence layered over the durable journal.
 pub struct ResetCoordinator {
     journal: RedemptionJournal,
-    journal_io: Mutex<()>,
+    /// Shared by every coordinator over the same journal file (see
+    /// [`journal_io_lock`]): the Codex and Claude providers each hold one, and
+    /// two unsynchronised load-modify-save cycles would lose a record.
+    journal_io: Arc<Mutex<()>>,
     accounts: Mutex<HashMap<String, Arc<AccountMutation>>>,
     /// Latest reading per account, with when it was observed. Fed from EVERY
     /// codex fetch, including accounts that hold no credit and so never reach
@@ -1676,10 +1777,16 @@ pub struct ResetCoordinator {
 
 impl ResetCoordinator {
     pub fn new(journal: RedemptionJournal) -> Result<Self, JournalError> {
-        journal.probe_atomic_write()?;
+        let journal_io = journal_io_lock(&journal.path);
+        {
+            // The probe rewrites the file, so it must not interleave with
+            // another coordinator's write to the same journal.
+            let _guard = journal_io.lock().unwrap_or_else(|p| p.into_inner());
+            journal.probe_atomic_write()?;
+        }
         Ok(Self {
             journal,
-            journal_io: Mutex::new(()),
+            journal_io,
             accounts: Mutex::new(HashMap::new()),
             headroom: Mutex::new(HashMap::new()),
             handles: Mutex::new(HashMap::new()),
@@ -1981,20 +2088,30 @@ impl ResetCoordinator {
         account_id: &str,
         request_id: &str,
     ) -> Result<Option<ConsumeOutcome>, JournalError> {
+        self.saved_reset_outcome_for(CODEX_PROVIDER, account_id, request_id)
+    }
+
+    /// [`Self::saved_reset_outcome`] for `provider`'s account.
+    pub fn saved_reset_outcome_for(
+        &self,
+        provider: &str,
+        account_id: &str,
+        request_id: &str,
+    ) -> Result<Option<ConsumeOutcome>, JournalError> {
         let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = self
             .journal
             .records()?
             .iter()
             .find(|record| {
-                record.account_id == account_id
+                record.is_for(provider, account_id)
                     && record.redeem_request_id == request_id
                     && record.status == JournalStatus::Resolved
             })
             .and_then(|record| record.outcome);
         if outcome.is_some() {
             self.journal
-                .reserve_manual(account_id, request_id, Utc::now())?;
+                .reserve_manual_for(provider, account_id, request_id, Utc::now())?;
         }
         Ok(outcome)
     }
@@ -2010,15 +2127,70 @@ impl ResetCoordinator {
         request: &ResetRequest,
         timeout: Duration,
     ) -> SavedResetResult {
+        self.manual_redeem(
+            CODEX_PROVIDER,
+            account_id,
+            request_id,
+            now,
+            move || async move {
+                match tokio::time::timeout(timeout, transport.consume_manual(request, request_id))
+                    .await
+                {
+                    Ok(Ok(body)) => normalize_consume_response(&body).map_err(|_| {
+                        SavedResetError::ProviderRefused(crate::http::refusal_excerpt(&body))
+                    }),
+                    Ok(Err(error)) => {
+                        request.report_auth_failure(&error);
+                        match error {
+                            FetchError::ProviderStatus(status, excerpt) if status < 500 => {
+                                Err(SavedResetError::ProviderRefused(excerpt))
+                            }
+                            FetchError::Unauthorized(excerpt) => {
+                                Err(SavedResetError::ProviderRefused(excerpt))
+                            }
+                            error => Err(SavedResetError::ProviderUnavailable(error.to_string())),
+                        }
+                    }
+                    Err(_) => Err(SavedResetError::ProviderUnavailable(
+                        "consume timed out".into(),
+                    )),
+                }
+            },
+        )
+        .await
+    }
+
+    /// Spend one of `provider`'s saved resets for `account_id` by running
+    /// `post`, fenced by the journal whatever the provider.
+    ///
+    /// A request id already resolved replays its stored outcome without running
+    /// `post`. A new id for an account with any record inside the 30-minute
+    /// spend bound is refused. Otherwise the id is written as pending, with the
+    /// attempt recorded, before `post` runs, so a reply lost in transit leaves a
+    /// pending record that a retry of the same id resumes. Only a decided
+    /// outcome resolves the record; an error leaves it pending.
+    pub async fn manual_redeem<F, Fut>(
+        &self,
+        provider: &str,
+        account_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+        post: F,
+    ) -> SavedResetResult
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<ConsumeOutcome, SavedResetError>>,
+    {
         let unavailable =
             |error: JournalError| SavedResetError::ProviderUnavailable(error.to_string());
         let reserved = {
             let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
             self.journal
-                .reserve_manual(account_id, request_id, now)
+                .reserve_manual_for(provider, account_id, request_id, now)
                 .and_then(|reservation| {
                     if reservation == ManualReservation::Pending {
-                        self.journal.record_attempt(account_id, request_id, now)?;
+                        self.journal
+                            .record_attempt_for(provider, account_id, request_id, now)?;
                     }
                     Ok(reservation)
                 })
@@ -2036,43 +2208,19 @@ impl ResetCoordinator {
             Err(error) => return SavedResetResult::before_post(unavailable(error)),
             Ok(ManualReservation::Pending) => {}
         }
-        let result = match tokio::time::timeout(
-            timeout,
-            transport.consume_manual(request, request_id),
-        )
-        .await
-        {
-            Ok(Ok(body)) => normalize_consume_response(&body)
-                .map_err(|_| SavedResetError::ProviderRefused(crate::http::refusal_excerpt(&body))),
-            Ok(Err(error)) => {
-                request.report_auth_failure(&error);
-                match error {
-                    FetchError::ProviderStatus(status, excerpt) if status < 500 => {
-                        Err(SavedResetError::ProviderRefused(excerpt))
-                    }
-                    FetchError::Unauthorized(excerpt) => {
-                        Err(SavedResetError::ProviderRefused(excerpt))
-                    }
-                    error => Err(SavedResetError::ProviderUnavailable(error.to_string())),
-                }
-            }
-            Err(_) => Err(SavedResetError::ProviderUnavailable(
-                "consume timed out".into(),
-            )),
-        };
-        let result = result.and_then(|outcome| {
+        let result = post().await.and_then(|outcome| {
             let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
             // Concurrent retries use the same upstream id. The first resolution
             // wins locally too, so a late already_redeemed cannot replace reset.
             match self
                 .journal
-                .reserve_manual(account_id, request_id, now)
+                .reserve_manual_for(provider, account_id, request_id, now)
                 .map_err(unavailable)?
             {
                 ManualReservation::Resolved(stored) => Ok(stored),
                 ManualReservation::Pending => {
                     self.journal
-                        .resolve(account_id, request_id, outcome)
+                        .resolve_for(provider, account_id, request_id, outcome)
                         .map_err(unavailable)?;
                     Ok(outcome)
                 }
@@ -3005,6 +3153,7 @@ mod tests {
     fn pending_record(account: &str, request: &str) -> RedemptionRecord {
         RedemptionRecord {
             manual: false,
+            provider: codex_provider(),
             account_id: account.to_string(),
             redeem_request_id: request.to_string(),
             created_at: "2026-08-20T12:00:00+00:00".to_string(),

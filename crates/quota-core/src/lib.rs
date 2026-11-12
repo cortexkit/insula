@@ -18,6 +18,7 @@ pub mod antigravity;
 pub mod call_observations;
 pub mod chatbox;
 pub mod claude_console;
+pub mod claude_resets;
 mod claude_subscription;
 pub mod clinepass;
 pub mod codebuff;
@@ -46,7 +47,7 @@ pub mod kimi_for_coding;
 pub mod langdock;
 pub mod litellm;
 pub mod llmproxy;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod loopback;
 pub mod manus;
 pub mod mimo;
@@ -998,14 +999,20 @@ impl Registry {
         self.usage_snapshot(provider_filter).await.entries
     }
 
+    /// Spend one saved reset for `provider`'s `account` on a caller's request.
+    ///
+    /// Codex and Claude spend saved resets. `kind` names which kind of Claude
+    /// reset to spend (one of [`claude_resets::KINDS`]); Codex has one kind and
+    /// ignores it.
     pub async fn use_saved_reset(
         &self,
         provider: &str,
         account: &str,
         request_id: &str,
+        kind: Option<&str>,
     ) -> Result<codex_resets::ConsumeOutcome, codex_resets::SavedResetError> {
         use codex_resets::SavedResetError;
-        if provider != "codex" {
+        if provider != codex::PROVIDER_NAME && provider != anthropic::PROVIDER_NAME {
             return Err(SavedResetError::UnsupportedProvider);
         }
         let fetcher = self
@@ -1029,7 +1036,7 @@ impl Registry {
         let (key, id) = selected.ok_or(SavedResetError::UnknownAccount)?;
         let result = fetcher
             .fetcher
-            .use_saved_reset(&key.handle, &id, request_id)
+            .use_saved_reset(&key.handle, &id, request_id, kind)
             .await;
         if result.consume_attempted {
             self.store

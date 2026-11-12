@@ -1,0 +1,1 @@
+{"code":"invalid_request","message":"kind is required for claude and must be one of session, weekly, full, model_weekly"}

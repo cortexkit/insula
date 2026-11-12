@@ -208,6 +208,19 @@ impl SubscriptionCache {
         })
     }
 
+    /// A cache reading the OAuth profile from `profile_url`, for tests that
+    /// serve Anthropic from a local mock.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_profile_url(profile_url: String) -> Arc<Self> {
+        Arc::new(Self {
+            http: crate::http::provider_client(),
+            profile_url,
+            account_url: ACCOUNT_URL.into(),
+            organizations_url: ORGANIZATIONS_URL.into(),
+            state: Mutex::new(HashMap::new()),
+        })
+    }
+
     fn binding(
         loader: &VaultHandleLoader,
         handle: &CredentialHandle,
@@ -382,6 +395,19 @@ impl SubscriptionCache {
             return Err("unverifiable OAuth owner");
         }
         Owner::profile(&body.body).ok_or("unverifiable OAuth owner")
+    }
+
+    /// The organization the OAuth profile names for `bearer`'s owner, the one
+    /// Claude spends that account's saved resets under. It must be a UUID: it
+    /// becomes a path segment of the redemption URL.
+    pub(crate) async fn oauth_organization(&self, bearer: &str) -> Result<String, &'static str> {
+        let owner = self.oauth_owner(bearer).await?;
+        // Only the 36-character hyphenated form: `parse_str` also accepts
+        // braced and `urn:uuid:` spellings, which have no place in a URL path.
+        if owner.organization.len() != 36 || uuid::Uuid::parse_str(&owner.organization).is_err() {
+            return Err("unverifiable OAuth owner");
+        }
+        Ok(owner.organization)
     }
 
     async fn web_get(&self, url: &str, cookie: &str) -> Result<Vec<u8>, &'static str> {

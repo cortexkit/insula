@@ -17,9 +17,9 @@
 //! `docs/consumer-contract.md` defines the public pool fields and safe defaults.
 
 pub use cortexkit_provider_usage::{
-    AccountInfo, Amount, BreakdownRow, CreditExpiry, ExtraWindow, Pool, PoolBasis, PoolFunding,
-    ProviderUsage, RateWindow, Regeneration, RegenerationRate, RegenerationStep, SavedResets,
-    Usage, UsageBreakdown,
+    saved_reset_kind, AccountInfo, Amount, BreakdownRow, CreditExpiry, ExtraWindow, Pool,
+    PoolBasis, PoolFunding, ProviderUsage, RateWindow, Regeneration, RegenerationRate,
+    RegenerationStep, SavedResetKind, SavedResets, Usage, UsageBreakdown,
 };
 
 /// Every rate window a `Usage` carries, in slot order then extras.

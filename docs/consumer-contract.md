@@ -251,13 +251,28 @@ sheddable). An insula predating this method replies `unknown_method` with an
 
 ### `usage.use_saved_reset`: explicit phone redemption
 
-This **Mutate** operation spends one Codex saved reset. OpenAI chooses the credit;
-there is no credit selector. Send the `account` from the Codex `usage.get` row,
-not its email or a vault credential id:
+This **Mutate** operation spends one Codex or Claude saved reset. For Codex,
+OpenAI chooses the credit; there is no credit selector. Send the `account` from
+the provider's `usage.get` row, not its email or a vault credential id:
 
 ```json
 {"method":"usage.use_saved_reset","params":{"provider":"codex","account":"synthetic-codex-id","request_id":"phone-request-0001"}}
 ```
+
+A Claude spend also names `kind`, one of the `savedResets.kinds` values
+(`session`, `weekly`, `full`, `model_weekly`); a missing or unknown `kind` is
+`invalid_request`. Codex ignores `kind`:
+
+```json
+{"method":"usage.use_saved_reset","params":{"provider":"claude","account":"synthetic-claude-account","request_id":"phone-claude-0001","kind":"session"}}
+```
+
+Of that account's grants of that kind that Claude's latest poll stated as usable
+now, the module spends Claude's next grant when it is one of them (Claude
+refuses any other), otherwise the one expiring soonest. With none, the reply is
+`nothing_to_reset` and nothing is sent. The grants are held in memory from the
+latest poll, so right after a restart a Claude spend answers `nothing_to_reset`
+until that account has been polled once.
 
 Two kinds of route may call this operation:
 
@@ -277,13 +292,15 @@ is scoped to the route channel and epoch and is revoked on rebind or route
 goodbye.
 
 Generate one `request_id` per deliberate press: 8–128 ASCII letters, digits or
-hyphens (`[A-Za-z0-9-]`). Persist it on the phone until the reply is known. **Resend
+hyphens (`[A-Za-z0-9-]`), and at most 64 for Claude. Persist it on the phone until the reply is known. **Resend
 the same id after a lost reply**, including after either side restarts. The durable
 journal returns a resolved id's stored outcome without another consume POST; a
-pending id resumes OpenAI's consume with that exact `redeem_request_id`. Manual
+pending id resumes the provider's redemption with that exact request id. Manual
 results remain in the journal beyond automatic record retention. A fresh id is
 refused if this account has any reservation within the 30-minute spend bound,
 regardless of outcome. A retry does not become a new intent when the bound expires.
+The journal and the bound are kept per provider and account, so a Claude spend
+never blocks a Codex account or the automatic Codex policy.
 
 The operation works even with `codex.auto_use_resets = 0`. Manual intent bypasses
 automation's sibling-headroom policy and provider-wide ten-minute floor, **not**
@@ -301,18 +318,21 @@ Success Response frame bodies are:
 ```
 
 `outcome` is one of `reset`, `nothing_to_reset`, `no_credit`, `already_redeemed`.
-All four are completed outcomes and are replayed as stored. Failures use the normal
+All four are completed outcomes and are replayed as stored. Claude's answers map
+onto them: `reset` is `reset`, `already_used` is `already_redeemed`, and
+`not_limited` is `nothing_to_reset` (a grant that needs its limit hit was spent
+while it was not). Failures use the normal
 Error frame body (`code`, `message`, optional `detail`, the `subc_protocol::ErrorBody` field); branch on `code`, not prose:
 
 | Code | Meaning |
 |---|---|
-| `invalid_request` | malformed request, missing fields, or invalid `request_id` |
+| `invalid_request` | malformed request, missing fields, invalid `request_id`, or a Claude spend without a known `kind` |
 | `forbidden` | route is not an attested callosum phone route |
-| `unsupported_provider` | provider is not `codex` |
-| `unknown_account` | no current Codex slot/credential matches that row's account |
-| `recently_reset` | a different reservation is inside the 30-minute bound; `detail.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted) |
-| `provider_refused` | OpenAI refused the consume or returned an unrecognized outcome; `detail.excerpt` contains its existing bounded excerpt, at most 200 characters |
-| `provider_unavailable` | timeout, transport failure, 5xx, or unavailable journal/credential; retry the same id |
+| `unsupported_provider` | provider is not `codex` or `claude` |
+| `unknown_account` | no current slot/credential of that provider matches that row's account |
+| `recently_reset` | a different reservation is inside the 30-minute bound; `detail.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted). For Claude also Anthropic's own `cooldown` answer, with `detail.cooldown_until` when Anthropic gave it |
+| `provider_refused` | the provider refused the redemption or returned an unrecognized outcome; `detail.excerpt` contains its existing bounded excerpt, at most 200 characters. Claude's `ineligible` and `unavailable` answers instead carry `detail.result` and `detail.reason` (Claude's reason code, such as `tier` or `paused`, or `unrecognized`) |
+| `provider_unavailable` | timeout, transport failure, 429, 5xx, or unavailable journal/credential/organization; retry the same id |
 
 An unsuccessful provider attempt leaves the record pending rather than guessing
 whether a credit was spent. For example:
@@ -323,7 +343,8 @@ whether a credit was spent. For example:
 
 Generated synthetic request, every outcome/error and before/after rows (saved-reset
 `availableCount` 2 → 1) are pinned in `test-vectors/quota-wire-v2/`, with in-process
-SHA256SUMS and a drift test. v1 is unchanged.
+SHA256SUMS and a drift test. v1 is unchanged. The Claude request, a `kinds` sample
+and Claude's replies are pinned the same way in `test-vectors/quota-wire-v3/`.
 
 ## 4. Freshness
 
@@ -1032,8 +1053,9 @@ relaxation is applied at read time and only to a fresh, healthy entry.
 - An account can jump from 0% to a high number in one poll when its credits run
   out or the conditions stop holding. That is a correct reading.
 
-Claude also publishes a `savedResets` inventory, but it is display-only: no
-redemption path is known, and Claude windows are never relaxed.
+Claude also publishes a `savedResets` inventory. This module spends a Claude
+saved reset only when a caller asks through `usage.use_saved_reset`, never
+automatically, and Claude windows are never relaxed.
 
 **Proven by:** `relaxation_is_read_time_only_and_expires_at_the_freshness_horizon`,
 `degraded_slots_and_other_providers_never_relax`,
@@ -1719,15 +1741,38 @@ last good answer for the same credential, and never changes windows or
 fixture-verified only.
 
 **`savedResets`** carries `availableCount` (credits held), `soonestExpiresAt`
-(the next expiry) and `credits` (each with its own `expiresAt`). Credits are
-granted to one account, never to a provider. Codex credits can be redeemed by
-this module ([6.6](#usedpercent-can-be-lower-than-what-the-provider-reported));
-Claude's inventory is display-only and counts only grants usable now (paused,
-future, expired and ineligible grants are excluded). A credit without a stated
-expiry counts toward `availableCount` with no expiry row. **Absent
-`savedResets` does not mean zero credits**: the inventory lookup is separate
-from the usage fetch and may fail without degrading the entry.
+(the next expiry), `credits` (each with its own `expiresAt`) and, where the
+provider says what each credit restores, `kinds`. Credits are granted to one
+account, never to a provider. Codex credits can be redeemed by this module
+automatically ([6.6](#usedpercent-can-be-lower-than-what-the-provider-reported))
+and on request; Claude credits only on request, through
+[`usage.use_saved_reset`](#usageuse_saved_reset-explicit-phone-redemption).
+Claude's inventory counts unpaused, started, unexpired grants with resets left
+on an eligible account (paused, future, expired and ineligible grants are
+excluded); a grant Claude marks not usable right now still counts. A credit
+without a stated expiry counts toward `availableCount` with no expiry row.
+**Absent `savedResets` does not mean zero credits**: the inventory lookup is
+separate from the usage fetch and may fail without degrading the entry.
 `soonestExpiresAt` absent means no credit has a stated expiry.
+
+**`kinds`** groups the same credits by what a reset restores: one entry per kind
+with `kind`, `availableCount` and, when any of them states one,
+`soonestExpiresAt`. The entries' counts add up to `availableCount`. `kinds` is
+omitted when the provider states no kind (Codex today); that means the kinds are
+unknown, not that there is one. `kind` is an open vocabulary, render an unknown
+value rather than dropping it:
+
+| `kind` | Restores |
+|---|---|
+| `session` | the five-hour window |
+| `weekly` | the weekly window(s) |
+| `full` | both the five-hour and the weekly windows |
+| `model_weekly` | the weekly limit of one model (Claude's "fable" grants) |
+
+Claude's kind follows Claude Code's own rule: a grant that gives back a model's
+weekly limit is `model_weekly`; otherwise its stated type; otherwise the windows it
+clears (only the five-hour window is `session`, weekly windows without it are
+`weekly`, anything else is `full`). Grant ids and labels never reach the wire.
 
 ### 8.2 `source` says how a reading was obtained
 

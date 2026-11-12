@@ -30,8 +30,8 @@ use crate::LOG_TAG;
 use crate::{
     http::{Header, JsonRequest, Refusal},
     model::{
-        Amount, BreakdownRow, CreditExpiry, Pool, PoolBasis, PoolFunding, RateWindow, SavedResets,
-        Usage, UsageBreakdown,
+        Amount, BreakdownRow, CreditExpiry, Pool, PoolBasis, PoolFunding, RateWindow,
+        SavedResetKind, SavedResets, Usage, UsageBreakdown,
     },
     opencode_auth::{self, OpencodeAuth},
     provider::{FetchError, UsageProvider},
@@ -60,6 +60,20 @@ pub(crate) const BETA_HEADER: &str = "oauth-2025-04-20";
 /// the signal; raise this to the current Claude Code release.
 const CLAUDE_CODE_UA: &str = "claude-code/2.1.282";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Where a saved reset is spent:
+/// `{RESET_ORGANIZATIONS_URL}/{organization}/reset_rate_limits`.
+const RESET_ORGANIZATIONS_URL: &str = "https://api.anthropic.com/api/organizations";
+/// Claude Code's own timeout for the redemption request.
+const REDEEM_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The identity the saved-reset inventory is requested under, and the one a
+/// reset is spent under.
+fn cli_user_agent() -> String {
+    format!(
+        "{} (external, cli)",
+        CLAUDE_CODE_UA.replace("claude-code/", "claude-cli/")
+    )
+}
 
 const FIVE_HOUR_MINUTES: i64 = 5 * 60;
 const SEVEN_DAY_MINUTES: i64 = 7 * 24 * 60;
@@ -624,16 +638,18 @@ fn normalize_response(body: &[u8]) -> Result<(Usage, Option<Pool>), FetchError> 
 fn normalize_with_overage(
     body: &[u8],
 ) -> Result<(Usage, Result<Option<Pool>, OverageRefusal>), FetchError> {
-    normalize_inventory(body).map(|(usage, pool, _, _)| (usage, pool))
+    normalize_inventory(body).map(|(usage, pool, _, _, _)| (usage, pool))
 }
 
-/// Windows, overage pool, saved resets, and -- when a saved-reset block was
-/// present but counted nothing -- a description of why (see [`inventory_shape`]).
+/// Windows, overage pool, saved resets, a description of why a present
+/// saved-reset block counted nothing (see [`inventory_shape`]), and the grants
+/// held in memory for redemption (see [`crate::claude_resets::held_resets`]).
 type NormalizedInventory = (
     Usage,
     Result<Option<Pool>, OverageRefusal>,
     Result<Option<SavedResets>, &'static str>,
     Option<String>,
+    Option<crate::claude_resets::HeldResets>,
 );
 
 fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
@@ -642,6 +658,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
             .map_err(|e| FetchError::Decode(format!("anthropic usage not decodable: {e}")))?;
     let now = chrono::Utc::now();
     let shape = inventory_shape(response.cedar_ember.as_ref(), now);
+    let held = crate::claude_resets::held_resets(response.cedar_ember.as_ref());
     let resets = saved_resets(response.cedar_ember, now);
     let pool = overage_pool(response.spend, response.extra_usage);
     let usage = Usage {
@@ -671,7 +688,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
         ),
         extra_rate_windows: scoped_weekly_extras(&limit_entries(response.limits.as_ref())),
     };
-    Ok((usage, pool, resets, shape))
+    Ok((usage, pool, resets, shape, held))
 }
 
 /// A successful attempt carrying the windows and, when there is one, the pool.
@@ -714,6 +731,12 @@ fn saved_resets(
     }
     let mut count = 0u32;
     let mut expiries = Vec::new();
+    // Per kind, in publication order: how many resets and their expiries.
+    let mut kinds: Vec<(&'static str, u32, Vec<chrono::DateTime<chrono::Utc>>)> =
+        crate::claude_resets::KINDS
+            .iter()
+            .map(|kind| (*kind, 0, Vec::new()))
+            .collect();
     for raw in grants {
         let Ok((resets_left, ends)) = grant_outcome(raw, now) else {
             continue;
@@ -722,8 +745,15 @@ fn saved_resets(
             return Err("resets_left");
         }
         count += resets_left as u32;
+        let kind = crate::claude_resets::grant_kind(raw);
+        let group = kinds
+            .iter_mut()
+            .find(|(known, _, _)| *known == kind)
+            .expect("grant_kind returns one of KINDS");
+        group.1 += resets_left as u32;
         if let Some(end) = ends {
             expiries.extend(std::iter::repeat_n(end, resets_left as usize));
+            group.2.push(end);
         }
     }
     // CodexBar omits empty usable inventories. Keep that absence on the wire
@@ -739,6 +769,17 @@ fn saved_resets(
             .into_iter()
             .map(|date| CreditExpiry {
                 expires_at: crate::rfc3339_canonical(date),
+            })
+            .collect(),
+        // Every counted reset lands in exactly one kind, so the kinds' counts
+        // add up to `available_count`.
+        kinds: kinds
+            .into_iter()
+            .filter(|(_, count, _)| *count > 0)
+            .map(|(kind, count, ends)| SavedResetKind {
+                kind: kind.to_string(),
+                available_count: count,
+                soonest_expires_at: ends.into_iter().min().map(crate::rfc3339_canonical),
             })
             .collect(),
     }))
@@ -1004,9 +1045,50 @@ pub struct AnthropicProvider {
     /// [`AnthropicProvider::settle_rate_limit`].
     rate_limits: Mutex<HashMap<String, String>>,
     subscription: Arc<crate::claude_subscription::SubscriptionCache>,
+    /// Per handle stable id, the account and the grants its latest successful
+    /// poll stated; see [`AnthropicProvider::hold_grants`]. Memory only: a
+    /// restart drops them until the next poll.
+    held_grants: Mutex<HashMap<String, (String, crate::claude_resets::HeldResets)>>,
+    /// Per handle stable id and account, the organization the OAuth profile
+    /// named, read when a reset is first spent. Memory only.
+    organizations: Mutex<HashMap<(String, String), String>>,
+    /// Per account and request id, the grant a request was sent for, so that a
+    /// retry of the same request id names the same grant even after the next
+    /// poll changed which grant would be chosen. Memory only.
+    sent_grants: Mutex<HashMap<(String, String), String>>,
+    reset_organizations_url: String,
+    /// The redemption journal shared with Codex, opened on the first spend.
+    reset_coordinator:
+        std::sync::OnceLock<Result<Arc<crate::codex_resets::ResetCoordinator>, String>>,
 }
 
 impl AnthropicProvider {
+    /// A provider whose every Anthropic endpoint is under `base_url` (a local
+    /// mock), with its redemption journal at `journal_path` instead of the
+    /// environment's. For tests only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn redemption_fixture(
+        source: Arc<dyn CredentialSource>,
+        base_url: &str,
+        journal_path: std::path::PathBuf,
+    ) -> Self {
+        let mut provider =
+            Self::new_with_handle_loader(Some(source), Arc::new(VaultHandleLoader::default()));
+        provider.usage_url = format!("{base_url}/api/oauth/usage");
+        provider.reset_organizations_url = format!("{base_url}/api/organizations");
+        provider.subscription = crate::claude_subscription::SubscriptionCache::with_profile_url(
+            format!("{base_url}/api/oauth/profile"),
+        );
+        let coordinator = crate::codex_resets::ResetCoordinator::new(
+            crate::codex_resets::RedemptionJournal::new(journal_path),
+        )
+        .map(Arc::new)
+        .map_err(|error| error.to_string());
+        let _ = provider.reset_coordinator.set(coordinator);
+        provider
+    }
+
     #[cfg(test)]
     pub(crate) fn subscription_fixture(
         source: Arc<dyn CredentialSource>,
@@ -1035,6 +1117,11 @@ impl AnthropicProvider {
             inventory_shapes: Mutex::new(HashMap::new()),
             rate_limits: Mutex::new(HashMap::new()),
             subscription: crate::claude_subscription::SubscriptionCache::new(),
+            held_grants: Mutex::new(HashMap::new()),
+            organizations: Mutex::new(HashMap::new()),
+            sent_grants: Mutex::new(HashMap::new()),
+            reset_organizations_url: RESET_ORGANIZATIONS_URL.to_string(),
+            reset_coordinator: std::sync::OnceLock::new(),
         }
     }
 
@@ -1185,10 +1272,7 @@ impl AnthropicProvider {
         vault: bool,
     ) -> (Result<Vec<u8>, FetchError>, Option<RateLimited>) {
         let url = format!("{}?cedar_ember=1", self.usage_url);
-        let cli_ua = format!(
-            "{} (external, cli)",
-            CLAUDE_CODE_UA.replace("claude-code/", "claude-cli/")
-        );
+        let cli_ua = cli_user_agent();
         let mut result = usage_request(&url, bearer, &cli_ua)
             .send_provider_status_first_keeping_headers(&self.http, PROVIDER_NAME)
             .await;
@@ -1255,11 +1339,254 @@ impl AnthropicProvider {
         );
     }
 
+    /// Keep the grants this handle's poll just read, for a later spend, or
+    /// forget them when the poll stated none or named no account. A failed
+    /// poll never reaches here, so the last readable grants stay held.
+    fn hold_grants(
+        &self,
+        handle_id: &str,
+        observed: Option<&AccountObservation>,
+        held: Option<crate::claude_resets::HeldResets>,
+    ) {
+        let account = observed.and_then(|observed| observed.account_id.clone());
+        let mut table = self
+            .held_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (account, held) {
+            (Some(account), Some(held)) => {
+                table.insert(handle_id.to_string(), (account, held));
+            }
+            _ => {
+                table.remove(handle_id);
+            }
+        }
+    }
+
+    /// The id of the grant to spend for `account_id`'s `kind`, from the grants
+    /// its last poll stated, or the grant an earlier send of this request id
+    /// named.
+    fn grant_to_spend(
+        &self,
+        handle_id: &str,
+        account_id: &str,
+        request_id: &str,
+        kind: &str,
+    ) -> Option<String> {
+        let sent = self
+            .sent_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(account_id.to_string(), request_id.to_string()))
+            .cloned();
+        if sent.is_some() {
+            return sent;
+        }
+        let table = self
+            .held_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (held_for, held) = table.get(handle_id)?;
+        if held_for != account_id {
+            return None;
+        }
+        crate::claude_resets::choose_grant(held, kind, chrono::Utc::now())
+            .map(|grant| grant.id.clone())
+    }
+
+    /// The organization `account_id` belongs to, read once per handle and
+    /// account from the same OAuth profile endpoint the subscription-dates
+    /// check reads.
+    async fn organization(
+        &self,
+        handle_id: &str,
+        account_id: &str,
+        bearer: &str,
+    ) -> Result<String, &'static str> {
+        let key = (handle_id.to_string(), account_id.to_string());
+        if let Some(organization) = self
+            .organizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+        {
+            return Ok(organization);
+        }
+        let organization = self.subscription.oauth_organization(bearer).await?;
+        self.organizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, organization.clone());
+        Ok(organization)
+    }
+
+    /// Send one redemption request and hand back the 2xx body.
+    async fn post_redeem(
+        &self,
+        bearer: &str,
+        organization: &str,
+        grant_id: &str,
+        request_id: &str,
+    ) -> Result<Vec<u8>, FetchError> {
+        let url = format!(
+            "{}/{organization}/reset_rate_limits",
+            self.reset_organizations_url
+        );
+        JsonRequest::post_json(url, crate::claude_resets::redeem_body(grant_id, request_id))
+            .timeout(REDEEM_TIMEOUT)
+            .bearer(bearer)
+            .header(Header::new("anthropic-beta", BETA_HEADER))
+            .header(Header::new("User-Agent", cli_user_agent()))
+            .send_provider_status_first(&self.http, PROVIDER_NAME)
+            .await
+            .map(|response| response.body)
+    }
+
+    fn reset_coordinator(
+        &self,
+    ) -> Result<&Arc<crate::codex_resets::ResetCoordinator>, crate::codex_resets::SavedResetError>
+    {
+        self.reset_coordinator
+            .get_or_init(|| {
+                crate::codex_resets::ResetCoordinator::from_env()
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| {
+                crate::codex_resets::SavedResetError::ProviderUnavailable(error.clone())
+            })
+    }
+
+    /// Spend one of `account_id`'s saved resets of `kind`, on a caller's
+    /// request. Never called by any automatic policy.
+    async fn spend_saved_reset(
+        &self,
+        handle: &CredentialHandle,
+        account_id: &str,
+        request_id: &str,
+        kind: Option<&str>,
+    ) -> crate::codex_resets::SavedResetResult {
+        use crate::codex_resets::{ConsumeOutcome, SavedResetError, SavedResetResult};
+        let Some(kind) = kind.and_then(crate::claude_resets::known_kind) else {
+            return SavedResetResult::before_post(SavedResetError::InvalidRequest(format!(
+                "kind must be one of {}",
+                crate::claude_resets::KINDS.join(", ")
+            )));
+        };
+        if !crate::claude_resets::valid_request_id(request_id) {
+            return SavedResetResult::before_post(SavedResetError::InvalidRequest(
+                "request_id must be at most 64 ASCII letters, digits, hyphens or underscores"
+                    .to_string(),
+            ));
+        }
+        let coordinator = match self.reset_coordinator() {
+            Ok(coordinator) => coordinator,
+            Err(error) => return SavedResetResult::before_post(error),
+        };
+        // A request id already answered replays its outcome before anything
+        // else is read, so a retry needs no credential and sends nothing.
+        match coordinator.saved_reset_outcome_for(PROVIDER_NAME, account_id, request_id) {
+            Ok(Some(outcome)) => {
+                return SavedResetResult {
+                    result: Ok(outcome),
+                    consume_attempted: false,
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                    error.to_string(),
+                ))
+            }
+        }
+        let handle_id = handle.stable_id();
+        let Some(grant_id) = self.grant_to_spend(handle_id, account_id, request_id, kind) else {
+            return SavedResetResult {
+                result: Ok(ConsumeOutcome::NothingToReset),
+                consume_attempted: false,
+            };
+        };
+        let (Some(source), true) = (self.credential_source.as_ref(), handle.is_vault()) else {
+            return SavedResetResult::before_post(SavedResetError::UnknownAccount);
+        };
+        let mut credential = match crate::credential_source::get_vault_credential(
+            source,
+            handle,
+            crate::credential_source::VAULT_READ_MIN_TTL_MS,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(_) => {
+                return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                    "credential unavailable".into(),
+                ))
+            }
+        };
+        // A credential can rotate after the poll that held these grants. Never
+        // spend through a replacement identity using the old account's grant.
+        if canonical_account_id(credential.account_id.clone()).as_deref() != Some(account_id) {
+            return SavedResetResult::before_post(SavedResetError::UnknownAccount);
+        }
+        let record_version = credential.record_version;
+        let Ok(bearer) = crate::credential_source::take_utf8_payload(&mut credential.payload)
+        else {
+            return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                "credential unreadable".into(),
+            ));
+        };
+        let organization = match self.organization(handle_id, account_id, &bearer).await {
+            Ok(organization) => organization,
+            Err(reason) => {
+                return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                    format!("organization unavailable: {reason}"),
+                ))
+            }
+        };
+        let sent_key = (account_id.to_string(), request_id.to_string());
+        self.sent_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(sent_key.clone(), grant_id.clone());
+        let (bearer, organization, grant) = (&bearer, &organization, &grant_id);
+        let result = coordinator
+            .manual_redeem(
+                PROVIDER_NAME,
+                account_id,
+                request_id,
+                chrono::Utc::now(),
+                move || async move {
+                    match self
+                        .post_redeem(bearer, organization, grant, request_id)
+                        .await
+                    {
+                        Ok(body) => crate::claude_resets::map_reply(&body),
+                        Err(error) => {
+                            self.report_auth_failure(handle, record_version, &error);
+                            Err(crate::claude_resets::map_failure(error))
+                        }
+                    }
+                },
+            )
+            .await;
+        // Once nothing was sent, or the outcome is in the journal, a retry of
+        // this request id no longer needs the grant it named.
+        if !result.consume_attempted || result.result.is_ok() {
+            self.sent_grants
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&sent_key);
+        }
+        result
+    }
+
     async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {
         let (body, rate_limited) = self.inventory_body(handle_id, bearer, false).await;
         let result = body.and_then(|body| normalize_inventory(&body));
         match result {
-            Ok((usage, overage, resets, shape)) => {
+            Ok((usage, overage, resets, shape, _)) => {
                 self.settle_shape(handle_id, shape);
                 success_attempt(
                     Some(AccountObservation::new(None, None)),
@@ -1325,8 +1652,9 @@ impl AnthropicProvider {
             self.report_auth_failure(handle, record_version, error);
         }
         match result {
-            Ok((usage, overage, resets, shape)) => {
+            Ok((usage, overage, resets, shape, held)) => {
                 self.settle_shape(handle_id, shape);
+                self.hold_grants(handle_id, observed.as_ref(), held);
                 let pool = self.settle_overage(handle_id, overage);
                 let mut attempt = success_attempt(observed, "vault", usage, pool)
                     .with_account_info(account_info)
@@ -1382,6 +1710,17 @@ impl UsageProvider for AnthropicProvider {
             Err(error) => return FetchAttempt::failure(None, None, error),
         };
         self.fetch_local_bearer(handle.stable_id(), &access).await
+    }
+
+    async fn use_saved_reset(
+        &self,
+        handle: &CredentialHandle,
+        account_id: &str,
+        request_id: &str,
+        kind: Option<&str>,
+    ) -> crate::codex_resets::SavedResetResult {
+        self.spend_saved_reset(handle, account_id, request_id, kind)
+            .await
     }
 }
 
@@ -1976,6 +2315,54 @@ mod tests {
         assert_eq!(inventory_shape(None, now), None);
     }
 
+    /// Counted resets are grouped by what they restore, by Claude Code's rule,
+    /// and the groups add up to the total. Uncounted grants (paused here)
+    /// join no group, while `usable_now` changes neither count.
+    #[test]
+    fn counted_resets_are_grouped_by_kind_and_the_kinds_add_up() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let block = serde_json::json!({"eligible":true,"next_grant_id":"g1","grants":[
+            {"id":"g1","label":"private grant","resets_left":2,"paused":false,"type":"session",
+             "ends_at":"2026-12-01T00:00:00Z"},
+            {"id":"g2","resets_left":1,"paused":false,"clears":["five_hour"],
+             "ends_at":"2026-11-01T00:00:00Z"},
+            {"id":"g3","resets_left":1,"paused":false,"clears":["seven_day","seven_day_opus"]},
+            {"id":"g4","resets_left":1,"paused":false,"gives_back_weekly":true,"type":"weekly",
+             "ends_at":"2026-10-20T00:00:00Z"},
+            {"id":"g5","resets_left":1,"paused":false,"clears":["five_hour","seven_day"],
+             "usable_now":false},
+            {"id":"g6","resets_left":1,"paused":true,"type":"weekly"}
+        ]});
+        let saved = saved_resets(Some(block), now).unwrap().unwrap();
+        assert_eq!(saved.available_count, 6);
+        let kinds = serde_json::to_value(&saved.kinds).unwrap();
+        assert_eq!(
+            kinds,
+            serde_json::json!([
+                {"kind":"session","availableCount":3,
+                 "soonestExpiresAt":"2026-11-01T00:00:00.000000000+00:00"},
+                {"kind":"weekly","availableCount":1},
+                {"kind":"full","availableCount":1},
+                {"kind":"model_weekly","availableCount":1,
+                 "soonestExpiresAt":"2026-10-20T00:00:00.000000000+00:00"}
+            ])
+        );
+        assert_eq!(
+            saved
+                .kinds
+                .iter()
+                .map(|kind| kind.available_count)
+                .sum::<u32>(),
+            saved.available_count
+        );
+        let wire = serde_json::to_string(&saved).unwrap();
+        for secret in ["g1", "g2", "g4", "private grant", "next_grant"] {
+            assert!(!wire.contains(secret), "{secret} reached the wire: {wire}");
+        }
+    }
+
     #[tokio::test]
     async fn grant_ids_never_appear_in_serialized_account_entry() {
         let (url, _) = serve_once(
@@ -1994,6 +2381,12 @@ mod tests {
         let entries = registry.get_usage(Some(PROVIDER_NAME)).await;
         let wire = serde_json::to_value(&entries[0]).unwrap();
         assert_eq!(wire["savedResets"]["availableCount"], 2);
+        // A grant stating neither a type nor what it clears is a full reset.
+        assert_eq!(
+            wire["savedResets"]["kinds"],
+            serde_json::json!([{"kind": "full", "availableCount": 2,
+                "soonestExpiresAt": "2099-01-01T00:00:00.000000000+00:00"}])
+        );
         let json = wire.to_string();
         assert!(!json.contains("redemption-handle"));
         assert!(!json.contains("private grant"));
