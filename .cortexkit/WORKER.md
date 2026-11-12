@@ -25,7 +25,10 @@ merged batch, so a worker never does.
   filtered tests when you touch paths, file I/O, process spawning or `cfg(windows)` code.
 - Never run a whole crate or workspace test suite, `scripts/prepush.sh` or `scripts/gates.sh`.
 - A bug fix adds a test and shows it failing once without the fix (`scripts/probe.py`, filtered
-  to that test).
+  to that test). On the build server the checkout's source and `.git` are read-only, so copy the
+  checkout into `target/scratch/probe-worktree`, give that copy its own git metadata, and run
+  `scripts/probe.py` unchanged there, reusing the build server's target directory. You don't
+  need to ask first.
 - `cargo test -p quota-core --lib -- --list`: the total must equal the unique count. A doc comment
   inserted between a neighbour's doc comment and its `#[test]` silently unregisters that test.
   This only lists tests; it doesn't run them.
