@@ -5334,7 +5334,7 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
     );
     assert_eq!(
         registry
-            .use_saved_reset("codex", "shared-account", "phone-request-0001")
+            .use_saved_reset("codex", "shared-account", "phone-request-0001", None)
             .await,
         Ok(ConsumeOutcome::Reset)
     );
@@ -5365,7 +5365,7 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
     );
     assert_eq!(
         registry
-            .use_saved_reset("codex", "shared-account", "phone-request-0002")
+            .use_saved_reset("codex", "shared-account", "phone-request-0002", None)
             .await,
         Err(SavedResetError::UnknownAccount),
         "a stale row must not authorize a replacement identity"
@@ -5374,7 +5374,7 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
     // A completed retry is a journal read, even when the credential has rotated.
     assert_eq!(
         registry
-            .use_saved_reset("codex", "shared-account", "phone-request-0001")
+            .use_saved_reset("codex", "shared-account", "phone-request-0001", None)
             .await,
         Ok(ConsumeOutcome::Reset)
     );

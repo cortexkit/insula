@@ -1247,6 +1247,7 @@ mod tests {
                 available_count: 1,
                 soonest_expires_at: None,
                 credits: Vec::new(),
+                kinds: Vec::new(),
             });
         }
         entry

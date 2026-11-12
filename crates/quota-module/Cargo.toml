@@ -46,6 +46,7 @@ async-nats = { version = "0.50", default-features = false, features = ["jetstrea
 sha2 = { workspace = true }
 
 [dev-dependencies]
+quota-core = { path = "../quota-core", features = ["test-hooks"] }
 # The quota-wire vector test hashes its generated files for SHA256SUMS
 # in-process, so it also runs where no `shasum` command exists (Windows).
 sha2 = { workspace = true }

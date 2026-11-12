@@ -110,6 +110,7 @@ impl UsageProvider for VectorProvider {
                 credits: vec![CreditExpiry {
                     expires_at: "2026-02-01T00:00:00Z".into(),
                 }],
+                kinds: vec![],
             });
         } else if self.name == "deepseek" {
             attempt.pools = Some(vec![pool(
@@ -327,7 +328,7 @@ async fn generated_v2_files() -> Vec<(String, Vec<u8>)> {
     ));
     for (field, value, code) in [
         ("request_id", "short", "invalid_request"),
-        ("provider", "claude", "unsupported_provider"),
+        ("provider", "deepseek", "unsupported_provider"),
         ("account", "missing", "unknown_account"),
     ] {
         let mut params = reset_params();
@@ -422,3 +423,96 @@ const VECTOR_README: &str = "# Quota wire v1\n\n\
 `usage-watch-row-change.json` is the next body from the same watch, after the real sample observer sees fresh@example.com's primary usage change. Sequence 2 names that row; notices carry invalidations, not quota snapshots.\n\n\
 `README.md` is generated alongside the bodies. String fields are open vocabularies, not closed enums; consumers must tolerate unfamiliar values. See [the consumer contract](../../docs/consumer-contract.md) for semantics and reconciliation rules.\n\n\
 `SHA256SUMS` covers every other file in this directory in `shasum -a 256` format. JSON files contain the frame body bytes without a trailing newline. Verify with `shasum -a 256 -c SHA256SUMS` from this directory. Regenerate all files with `INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_vectors_match`. The named drift test checks every file and the checksums byte-for-byte.\n";
+
+const V3_README: &str = "# Quota wire v3: Claude saved resets by kind\n\nSynthetic identities only: account `synthetic-claude-account`, principal\n`reserved:callosum`, harness `fed-phone:synthetic-fp`. No credentials. Anthropic is a\nlocal stand-in serving three grants: a session reset, a weekly reset and a weekly-model\n(`model_weekly`) grant holding two resets.\n\n`usage-get-row-saved-resets.json` is the `savedResets` member of the Claude row from\n`usage.get`: `kinds` groups the counted resets by what they restore, and the kinds'\n`availableCount` values add up to the row's. Grant ids and labels never appear.\n\n`use-saved-reset-request.json` is the routed request envelope; its `params` is the\noperation request body. A Claude spend names `kind` (one of session, weekly, full,\nmodel_weekly); `error-invalid_request.json` is the reply to the same request without\nit. The remaining files answer the same request id in turn while Anthropic answers\n`cooldown` (`recently_reset` with `detail.cooldown_until`), then `ineligible` with\nreason `tier` (`provider_refused` with `detail.result` and `detail.reason`), then\n`reset`. A refused attempt leaves the request id pending, so its retry is sent again;\nonce resolved, a repeated request_id replays the stored outcome.\n\nGenerated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:\n`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v3_vectors_match`\n\nv1 and v2 remain as they are. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.\n";
+
+async fn generated_v3_files() -> Vec<(String, Vec<u8>)> {
+    use super::claude_saved_reset_tests::{claude_fixture, claude_params};
+    use super::saved_reset_tests::{bind, call, callosum};
+    let fixture = claude_fixture().await;
+    let mut wire = Wire::with_registry(false, 65536, fixture.registry.clone()).await;
+    bind(&mut wire, 1, callosum(), Some("fed-phone:synthetic-fp")).await;
+    let mut files = vec![
+        ("README.md".to_owned(), V3_README.as_bytes().to_vec()),
+        (
+            "use-saved-reset-request.json".into(),
+            serde_json::to_vec(&json!({"method":USE_SAVED_RESET_OP,"params":claude_params()}))
+                .unwrap(),
+        ),
+    ];
+    wire.send(request(5, 1, 702, USAGE_GET_OP, false)).await;
+    let rows: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
+    files.push((
+        "usage-get-row-saved-resets.json".into(),
+        serde_json::to_vec(&rows["result"][0]["savedResets"]).unwrap(),
+    ));
+    let mut no_kind = claude_params();
+    no_kind.as_object_mut().unwrap().remove("kind");
+    let frame = call(&mut wire, 1, no_kind).await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    files.push(("error-invalid_request.json".into(), frame.body));
+    for (reply, name, ty) in [
+        (
+            r#"{"result":"cooldown","cooldown_until":"2099-01-01T05:00:00Z"}"#,
+            "error-recently_reset.json",
+            FrameType::Error,
+        ),
+        (
+            r#"{"result":"ineligible","reason":"tier"}"#,
+            "error-provider_refused.json",
+            FrameType::Error,
+        ),
+        (
+            r#"{"result":"reset"}"#,
+            "success-reset.json",
+            FrameType::Response,
+        ),
+    ] {
+        fixture.server.set_reply(200, reply);
+        let frame = call(&mut wire, 1, claude_params()).await;
+        assert_eq!(frame.header.ty, ty, "{name}");
+        files.push((name.into(), frame.body));
+    }
+    assert_eq!(fixture.server.redeems().len(), 3);
+    wire.stop().await;
+    wire.finish().await;
+    let mut sums = String::new();
+    for (name, bytes) in &files {
+        use sha2::Digest as _;
+        let digest: String = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sums.push_str(&format!("{digest}  {name}\n"));
+    }
+    files.push(("SHA256SUMS".into(), sums.into_bytes()));
+    files
+}
+
+#[tokio::test]
+async fn committed_quota_wire_v3_vectors_match() {
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/quota-wire-v3");
+    let files = generated_v3_files().await;
+    if std::env::var_os("INSULA_WRITE_VECTORS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, bytes) in &files {
+            std::fs::write(directory.join(name), bytes).unwrap();
+        }
+    }
+    let mut differences = Vec::new();
+    for (name, bytes) in &files {
+        if std::fs::read(directory.join(name)).ok().as_ref() != Some(bytes) {
+            differences.push(name.clone());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if !files.iter().any(|(expected, _)| *expected == name) {
+                differences.push(name);
+            }
+        }
+    }
+    assert!(differences.is_empty(), "committed quota wire v3 vectors differ: {}. Regenerate with INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v3_vectors_match", differences.join(", "));
+}

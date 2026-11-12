@@ -446,11 +446,14 @@ pub trait UsageProvider: Send + Sync {
 
     /// Redeem only through the selected account's credential lane. Providers
     /// without saved resets never perform a mutation through this hook.
+    /// `kind` is the caller's requested saved-reset kind, for a provider that
+    /// has more than one.
     async fn use_saved_reset(
         &self,
         _handle: &CredentialHandle,
         _account_id: &str,
         _request_id: &str,
+        _kind: Option<&str>,
     ) -> crate::codex_resets::SavedResetResult {
         crate::codex_resets::SavedResetResult::before_post(
             crate::codex_resets::SavedResetError::UnsupportedProvider,

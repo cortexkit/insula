@@ -53,7 +53,10 @@ SRC = REPO / "crates/quota-core/src"
 EXPECTED: dict[str, dict[str, str]] = {
     "abliteration": {"API_BASE": "api.abliteration.ai"},
     "amp": {"SETTINGS_URL": "ampcode.com"},
-    "anthropic": {"USAGE_URL": "api.anthropic.com"},
+    "anthropic": {
+        "USAGE_URL": "api.anthropic.com",
+        "RESET_ORGANIZATIONS_URL": "api.anthropic.com",
+    },
     "claude_console": {"ORGANIZATIONS_URL": "platform.claude.com"},
     "claude_subscription": {
         "PROFILE_URL": "api.anthropic.com",

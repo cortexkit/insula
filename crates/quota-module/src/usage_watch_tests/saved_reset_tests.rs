@@ -30,6 +30,7 @@ impl UsageProvider for PhoneProvider {
             },
             soonest_expires_at: Some("2026-08-01T00:00:00Z".into()),
             credits: vec![],
+            kinds: vec![],
         });
         let mut attempt = FetchAttempt::from_provider_usage(Ok(entry));
         attempt.observed = Some(AccountObservation::new(
@@ -48,6 +49,7 @@ impl UsageProvider for PhoneProvider {
         handle: &CredentialHandle,
         account_id: &str,
         request_id: &str,
+        _kind: Option<&str>,
     ) -> SavedResetResult {
         assert_eq!(handle, &CredentialHandle::implicit());
         assert_eq!(account_id, "synthetic-codex-id");
@@ -126,7 +128,7 @@ pub(super) async fn bind(wire: &mut Wire, epoch: u32, principal: Value, harness:
 /// has. `bind` always sends a stamp, so it can't build this one. `operator_app`
 /// is the daemon's stamp for a recognised operator app, carried beside the
 /// bind's own keys.
-async fn bind_unscoped(
+pub(super) async fn bind_unscoped(
     wire: &mut Wire,
     epoch: u32,
     principal: Value,
@@ -317,7 +319,7 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         assert!(valid_reset_request_id(&id));
     }
     for (field, value, code) in [
-        ("provider", "claude", "unsupported_provider"),
+        ("provider", "deepseek", "unsupported_provider"),
         ("account", "missing", "unknown_account"),
     ] {
         let mut params = reset_params();

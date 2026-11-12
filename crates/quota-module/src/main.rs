@@ -1216,6 +1216,9 @@ struct UsageParams {
     event_name: Option<String>,
     #[serde(default)]
     provider: Option<String>,
+    /// For `usage.use_saved_reset` on claude: which kind of saved reset to spend.
+    #[serde(default)]
+    kind: Option<String>,
     /// A sequence from a previous drop page. Absent means "everything retained".
     #[serde(default)]
     since: Option<u64>,
@@ -1325,8 +1328,40 @@ async fn handle_usage_request(
             )
             .await;
         };
+        // Claude has several kinds of saved reset, so a Claude spend must name
+        // one, and its request ids are shorter than the general rule allows.
+        // Codex has one kind and ignores `kind`.
+        let kind = params.kind;
+        if provider == quota_core::anthropic::PROVIDER_NAME {
+            if !kind
+                .as_deref()
+                .is_some_and(|kind| quota_core::claude_resets::known_kind(kind).is_some())
+            {
+                return send_route_error(
+                    writer,
+                    serve,
+                    reply,
+                    "invalid_request",
+                    &format!(
+                        "kind is required for claude and must be one of {}",
+                        quota_core::claude_resets::KINDS.join(", ")
+                    ),
+                )
+                .await;
+            }
+            if !quota_core::claude_resets::valid_request_id(&request_id) {
+                return send_route_error(
+                    writer,
+                    serve,
+                    reply,
+                    "invalid_request",
+                    "a claude request_id must be at most 64 characters",
+                )
+                .await;
+            }
+        }
         return match registry
-            .use_saved_reset(&provider, &account, &request_id)
+            .use_saved_reset(&provider, &account, &request_id, kind.as_deref())
             .await
         {
             Ok(outcome) => {
@@ -1345,7 +1380,13 @@ async fn handle_usage_request(
                 send(writer, response).await
             }
             Err(error) => {
-                send_route_error_body(writer, serve, reply, saved_reset_error_body(error)).await
+                send_route_error_body(
+                    writer,
+                    serve,
+                    reply,
+                    saved_reset_error_body(error, &provider),
+                )
+                .await
             }
         };
     }
@@ -1581,36 +1622,59 @@ fn saved_reset_reply(
     json!({"result": {"outcome": outcome.as_code(), "request_id": request_id}})
 }
 
-fn saved_reset_error_body(error: quota_core::codex_resets::SavedResetError) -> serde_json::Value {
+fn saved_reset_error_body(
+    error: quota_core::codex_resets::SavedResetError,
+    provider: &str,
+) -> serde_json::Value {
     use quota_core::codex_resets::SavedResetError::*;
+    let claude = provider == quota_core::anthropic::PROVIDER_NAME;
+    let refused = if claude {
+        "Anthropic refused the saved reset"
+    } else {
+        "OpenAI refused the saved reset"
+    };
     let (code, message) = match &error {
         UnsupportedProvider => (
             "unsupported_provider",
-            "saved resets are supported only for codex",
+            "saved resets are supported only for codex and claude".to_string(),
         ),
         UnknownAccount => (
             "unknown_account",
-            "no Codex credential matches this account",
+            if claude {
+                "no Claude credential matches this account"
+            } else {
+                "no Codex credential matches this account"
+            }
+            .to_string(),
         ),
         RecentlyReset(_) => (
             "recently_reset",
-            "account has a reservation within 30 minutes",
+            "account has a reservation within 30 minutes".to_string(),
         ),
-        ProviderRefused(_) => ("provider_refused", "OpenAI refused the saved reset"),
+        ProviderCooldown(_) => (
+            "recently_reset",
+            "Anthropic reports this account's saved resets are cooling down".to_string(),
+        ),
+        ProviderRefused(_) | ProviderDeclined { .. } => ("provider_refused", refused.to_string()),
         ProviderUnavailable(_) => (
             "provider_unavailable",
-            "saved reset is temporarily unavailable; retry the same request_id",
+            "saved reset is temporarily unavailable; retry the same request_id".to_string(),
         ),
+        InvalidRequest(message) => ("invalid_request", message.clone()),
     };
     // Structured details ride in subc's own `ErrorBody.detail` field, so any
     // reader decoding the fleet's error type (callosum's relay to the phone)
     // keeps them. A hand-added member of another name would be dropped.
     let detail = match error {
         RecentlyReset(at) => Some(json!({"last_reset_at": quota_core::rfc3339_canonical(at)})),
+        ProviderCooldown(Some(until)) => {
+            Some(json!({"cooldown_until": quota_core::rfc3339_canonical(until)}))
+        }
         ProviderRefused(excerpt) => Some(json!({"excerpt": excerpt})),
+        ProviderDeclined { result, reason } => Some(json!({"result": result, "reason": reason})),
         _ => None,
     };
-    let mut body = ErrorBody::new(code, message);
+    let mut body = ErrorBody::new(code, &message);
     if let Some(detail) = detail {
         body = body.with_detail(detail);
     }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use subc_protocol::{AdmissionClass, FLAG_SUBSCRIPTION};
 use tokio::{io::DuplexStream, sync::oneshot, task::JoinHandle};
 
+mod claude_saved_reset_tests;
 mod quota_wire_vectors;
 mod saved_reset_tests;
 

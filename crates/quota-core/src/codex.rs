@@ -1473,6 +1473,8 @@ impl UsageProvider for CodexProvider {
         handle: &CredentialHandle,
         account_id: &str,
         request_id: &str,
+        // Codex states one kind of saved reset, so a requested kind is ignored.
+        _kind: Option<&str>,
     ) -> crate::codex_resets::SavedResetResult {
         use crate::codex_resets::{SavedResetError, SavedResetResult, CONSUME_TIMEOUT};
         // Manual intent is independent of auto_use_resets, but both paths must
