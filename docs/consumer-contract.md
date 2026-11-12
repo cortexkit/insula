@@ -1124,6 +1124,46 @@ no rate windows. Grant expiry is not a reset: it is published as `expiresAt`,
 never `resetsAt`. Monthly spend
 is not fetched because the wire has no field for cumulative spending this month.
 
+### TypeSafe billing balance
+
+`typesafe` reads `GET https://console.typesafe.ai/api/billing/overview` using
+only a vault `cookie:console.typesafe.ai[:<account>]` request-header deposit.
+There is no browser extraction, environment or API-key lane: `apikey:typesafe`
+cannot read billing and remains unrouted. Capture against the API URL in the
+cookie table, not the older `/settings/billing` page. A browser-style user agent
+avoids the console's rejection of command-line user agents. Redirects are never
+followed, even to another route on the same host, so the flattened cookie header
+is sent only to the billing endpoint.
+
+The reading publishes exactly one reported USD pool, `id: balance`, with
+`funding: unknown` and exact `billing.balance` as `remaining`, including zero.
+The aggregate and its grants overlap; grants are never added as separate pools.
+`expiresAt` is set only when exactly one grant has positive remaining credit and
+a readable expiry; otherwise it stays absent because one grant's expiry does
+not date the whole aggregate. There is no total, spendability flag, reset or rate
+window. `spent` and `cycleLabel` describe consumption, not remaining capacity,
+and are not published. Optional upstream `plan` is `accountInfo.planType`.
+The response supplies no account identity, and a deposit suffix is not one.
+
+HTTP 401, an explicit login redirect/final URL, or a login HTML response means
+`credential_rejected`. A 403 means `upstream_failed`, not a dead session;
+429 and server failures are also transient. A non-login route redirect, non-login
+HTML or unreadable billing payload means `decode_failed`, never absent credit
+or a fabricated zero. Refusal bodies are not echoed and cookie lanes never
+report authentication failures to the vault.
+
+Verification is limited to CodexBar v0.84.0 fixture data and local transport
+fixtures, not a live TypeSafe session.
+
+**Proven by:** `billing_is_one_exact_reported_balance_not_spent_or_summed_grants`,
+`zero_negative_and_high_precision_balances_remain_exact`,
+`only_one_positive_grant_with_readable_expiry_dates_the_aggregate`,
+`missing_or_unreadable_payloads_are_decode_failures_not_absence_or_zero`,
+`login_evidence_is_rejected_but_permission_and_integration_failures_are_not`,
+`billing_get_uses_the_deposit_and_browser_ua_without_inventing_identity`,
+`cookie_header_is_never_forwarded_to_any_redirect_destination`,
+`refused_bodies_never_echo_secrets_or_report_cookie_auth_to_the_vault`.
+
 ### OpenAI Platform API credits
 
 `openai-platform` reads only `GET /v1/dashboard/billing/credit_grants` at
@@ -2520,6 +2560,7 @@ match. Capture tools take the URL from this table:
 | `cookie:factory.ai:<account>` | factory | `https://api.factory.ai/api/billing/limits` |
 | `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
 | `cookie:amr-api.open-design.ai:<account>` | opendesign | `https://amr-api.open-design.ai/api/v1/workspaces/current` |
+| `cookie:console.typesafe.ai:<account>` | typesafe | `https://console.typesafe.ai/api/billing/overview` |
 | `cookie:trae.cn:<account>` | traecn | `https://api.trae.cn/cloudide/api/v3/common/GetUserToken` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 

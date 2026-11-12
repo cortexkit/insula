@@ -56,6 +56,7 @@ DAEMON_CLI_CANDIDATES = (
 # there), so the Rust checker reported three findings on a healthy host. Keep the
 # ids and reasons identical in both.
 DELIBERATELY_UNCLAIMED = {
+    "apikey:typesafe": "inference API keys cannot read billing; use a console.typesafe.ai session cookie",
     "apikey:openai": "ordinary API keys cannot read Platform billing; use a browser session key",
     "apikey:openai:fixture": "ordinary API keys cannot read Platform billing; use a browser session key",
     "apikey:openai-admin": "Admin API keys cannot read Platform billing; use a browser session key",
