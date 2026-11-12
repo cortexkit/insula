@@ -1,6 +1,6 @@
 [package]
 name = "quota-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "Provider usage fetchers and rate-window normalization for the insula subc module. Pure logic, wire-agnostic."
