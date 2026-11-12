@@ -69,6 +69,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("apikey:soniox", "soniox"),
     // An abliteration.ai API key, which reads the account's USD credits.
     ("apikey:abliteration", "abliteration"),
+    ("apikey:tripo", "tripo"),
     ("apikey:litellm", "litellm"),
     ("apikey:cline-pass", "clinepass"),
     // A Chatbox AI license key. Chatbox sends it as the whole Authorization
@@ -120,6 +121,7 @@ enum ProviderKind {
     VercelBudget,
     Soniox,
     Abliteration,
+    Tripo,
     LiteLLM,
     ClinePass,
     Chatbox,
@@ -516,6 +518,10 @@ impl VaultHandleLoader {
         self.provider_handles(ProviderKind::Abliteration)
     }
 
+    pub fn tripo_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        self.provider_handles(ProviderKind::Tripo)
+    }
+
     pub fn litellm_handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
         self.provider_handles(ProviderKind::LiteLLM)
     }
@@ -633,6 +639,7 @@ fn provider_kind(name: &str) -> Option<ProviderKind> {
         "vercel-budget" => Some(ProviderKind::VercelBudget),
         "soniox" => Some(ProviderKind::Soniox),
         "abliteration" => Some(ProviderKind::Abliteration),
+        "tripo" => Some(ProviderKind::Tripo),
         "litellm" => Some(ProviderKind::LiteLLM),
         "clinepass" => Some(ProviderKind::ClinePass),
         "chatbox" => Some(ProviderKind::Chatbox),

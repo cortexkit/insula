@@ -77,6 +77,7 @@ mod subprocess;
 pub mod synthetic;
 pub mod text;
 pub mod traecn;
+pub mod tripo;
 pub mod unread_keys;
 pub mod vault_handles;
 pub mod vercel;
@@ -849,6 +850,10 @@ impl Registry {
                 Arc::clone(&vault_handle_loader),
             )),
             Box::new(chatbox::ChatboxProvider::new_with_handle_loader(
+                credential_source.clone(),
+                Arc::clone(&vault_handle_loader),
+            )),
+            Box::new(tripo::TripoProvider::new_with_handle_loader(
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),

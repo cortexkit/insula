@@ -1705,6 +1705,55 @@ provider, even when several such credentials exist (section 9.1).
 `redirects_are_never_followed_to_another_host`,
 `live_config_is_read_again_on_the_next_fetch`.
 
+### 7.17 `tripo`: available credits and frozen reservations
+
+`tripo` reads `GET https://openapi.tripo3d.ai/v3/account/balance` with a
+Bearer API key from `apikey:tripo` or `apikey:tripo:<account>`. This lane is
+vault-only: no environment, local-file or browser-session fallback. The response
+names no account, so the credential suffix cannot identify one. A single deposit
+publishes an unlabelled entry; multiple deposits in this identity-less family
+are refused by the vault handle loader rather than selecting an arbitrary key.
+The entry carries no `apiProvider` pricing-join slug: this 3D-generation service
+has no models.dev counterpart.
+
+The response's `data.balance` publishes a `balance` pool (Available credits),
+and `data.frozen` a separate `frozen` pool (Reserved credits), both with
+`basis: reported`, `funding: unknown` and unit `tripo-credit`. **Balance already
+means available credits:** frozen is never subtracted from it a second time,
+and the pools must not be added together as spendable capacity. The frozen
+pool has `spendable: false`; the available pool's flag is absent because no
+enable switch is stated. Neither carries a `total`, reset or expiry. `usage`
+is empty: the API states no rate window or cadence.
+
+Both amounts are required finite, non-negative JSON numbers. Exact decimal
+text, including scientific notation, is converted to integer minor units without
+float rounding, up to nine decimal places and the signed 64-bit minor-unit
+range. Unsupported precision or magnitude, missing/null amounts, strings,
+Booleans, negative values or malformed envelopes mean `decode_failed`, never
+zero. Stated zero amounts remain healthy, present pools. A nonzero integer API
+`code` means `upstream_failed`, not `no_quota_reported` or a rejected key.
+
+Only HTTP 200 is a successful reading. HTTP 401 means `credential_rejected`
+and is reported to the vault with the served record version. HTTP 403 means
+`upstream_failed`, with no auth-failure report: permission refusal does not prove
+the key is dead. Other HTTP failures, transport errors and empty successful
+bodies also mean `upstream_failed`. Refusal bodies are bounded by the shared
+transport and never quoted in diagnostics. No deposit means `credential_absent`;
+an unreadable vault is not treated as absence. An empty or malformed key deposit
+means `credential_unusable` and sends no request.
+
+Verified only against CodexBar v0.84.0's `TestsPlugin/TripoPluginTests.swift`
+fixtures and local loopback transport, not a live Tripo account.
+
+**Proven by:**
+`available_credits_and_frozen_reservations_are_separate_pools_without_windows`,
+`decimal_credits_keep_exact_minor_units_without_float_rounding`,
+`stated_zero_credits_remain_present_and_healthy`,
+`malformed_balances_are_decode_failed_without_echoing_the_payload`,
+`nonzero_api_codes_are_upstream_failed_not_missing_quota_or_dead_keys`,
+`only_a_401_rejects_and_reports_the_served_vault_key`,
+`missing_or_unusable_keys_send_nothing_and_vault_absence_is_not_inferred`.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys
