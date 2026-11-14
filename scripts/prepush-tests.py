@@ -53,7 +53,7 @@ class PrepushTests(unittest.TestCase):
         # A closed PATH proves the missing-ck case even on a configured host.
         for tool in ("bash", "python3", "git", "shasum", "cut", "find", "sort",
                      "wc", "tr", "basename", "mktemp", "mkdir", "rm", "grep",
-                     "sed", "env", "dirname", "mv"):
+                     "sed", "env", "dirname", "mv", "cp"):
             location = shutil.which(tool)
             assert location is not None, f"{tool} is required"
             (self.bin / tool).symlink_to(location)

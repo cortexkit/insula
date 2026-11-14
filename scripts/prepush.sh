@@ -59,14 +59,18 @@ workspace_tests() {
 # are read-only, so record their versions rather than trying to update rustup.
 worker() {
     local platform="$1" e2e="$2" manifest="$3" rig
-    for tool in mkdir mktemp mv; do require "$tool"; done
+    for tool in mkdir mktemp mv cp; do require "$tool"; done
     [ -f "$manifest" ] || cannot_check "$platform tracked Markdown manifest missing"
     mkdir -p target/scratch || cannot_check "$platform manifest scratch directory"
     DOC_MANIFEST="$(mktemp "$ROOT/target/scratch/prepush-docs.XXXXXX")" \
         || cannot_check "$platform manifest scratch file"
-    # The untracked file must travel in the snapshot, but must not make module
-    # provenance dirty. Move it under ignored scratch before any Cargo command.
-    mv -- "$manifest" "$DOC_MANIFEST" || cannot_check "$platform tracked Markdown manifest staging"
+    # The untracked file must travel in the snapshot, but should not make module
+    # provenance dirty, so move it under ignored scratch before any Cargo
+    # command. Build servers mount the snapshot's source read-only; there the
+    # move fails and a copy is the best available, leaving the original behind.
+    mv -- "$manifest" "$DOC_MANIFEST" 2>/dev/null \
+        || cp -- "$manifest" "$DOC_MANIFEST" \
+        || cannot_check "$platform tracked Markdown manifest staging"
     require cargo
     require rustc
     unset RUSTUP_TOOLCHAIN
