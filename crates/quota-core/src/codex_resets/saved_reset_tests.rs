@@ -82,20 +82,71 @@ async fn redeem(coordinator: &ResetCoordinator, server: &Server, id: &str) -> Sa
         .await
 }
 
+const LEGACY_JOURNAL: &str = r#"[
+  {
+    "account_id": "synthetic-account",
+    "redeem_request_id": "phone-request-0001",
+    "created_at": "2026-07-01T11:59:00Z",
+    "last_attempt_at": "2026-07-01T12:00:00Z",
+    "attempt_count": 1,
+    "status": "resolved",
+    "outcome": "reset",
+    "manual": true
+  },
+  {
+    "account_id": "synthetic-pending",
+    "redeem_request_id": "phone-pending-0001",
+    "created_at": "2026-07-01T11:59:00Z",
+    "last_attempt_at": null,
+    "attempt_count": 0,
+    "status": "pending",
+    "outcome": null
+  }
+]"#;
+
+#[tokio::test]
+async fn saved_reset_legacy_replay_uses_last_attempt_at() {
+    let (_temp, journal) = journal();
+    fs::write(journal.path(), LEGACY_JOURNAL).unwrap();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let result = coordinator
+        .manual_redeem(CODEX_PROVIDER, ACCOUNT, ID, now(), || async {
+            panic!("a resolved legacy request must not contact the provider")
+        })
+        .await;
+    assert_eq!(
+        result.result,
+        Ok((
+            ConsumeOutcome::Reset,
+            "2026-07-01T12:00:00Z".parse().unwrap()
+        ))
+    );
+    assert!(!result.consume_attempted);
+    assert_eq!(fs::read(journal.path()).unwrap(), LEGACY_JOURNAL.as_bytes());
+}
+
+#[test]
+fn saved_reset_legacy_journal_round_trip_preserves_bytes() {
+    let (_temp, journal) = journal();
+    fs::write(journal.path(), LEGACY_JOURNAL).unwrap();
+    let records = journal.records().unwrap();
+    assert!(records.iter().all(|record| record.resolved_at.is_none()));
+    journal.save(&records).unwrap();
+    assert_eq!(fs::read(journal.path()).unwrap(), LEGACY_JOURNAL.as_bytes());
+}
+
 #[tokio::test]
 async fn saved_reset_resend_after_restart_returns_stored_outcome_without_second_post() {
     let (_temp, journal) = journal();
     let server = Server::new(200, r#"{"code":"reset"}"#).await;
     let first = ResetCoordinator::new(journal.clone()).unwrap();
-    assert_eq!(
-        redeem(&first, &server, ID).await.result,
-        Ok(ConsumeOutcome::Reset)
-    );
+    let decided = redeem(&first, &server, ID).await.result.unwrap();
+    assert_eq!(decided.0, ConsumeOutcome::Reset);
     drop(first);
     let restarted =
         ResetCoordinator::new(RedemptionJournal::new(journal.path().to_path_buf())).unwrap();
     let replay = redeem(&restarted, &server, ID).await;
-    assert_eq!(replay.result, Ok(ConsumeOutcome::Reset));
+    assert_eq!(replay.result, Ok(decided));
     assert!(!replay.consume_attempted);
     assert_eq!(
         server.count(),
@@ -111,10 +162,7 @@ async fn saved_reset_resend_after_restart_returns_stored_outcome_without_second_
         .journal
         .inspect_account(ACCOUNT, now() + chrono::Duration::days(30))
         .unwrap();
-    assert_eq!(
-        redeem(&restarted, &server, ID).await.result,
-        Ok(ConsumeOutcome::Reset)
-    );
+    assert_eq!(redeem(&restarted, &server, ID).await.result, Ok(decided));
     assert_eq!(
         server.count(),
         1,
@@ -130,7 +178,10 @@ async fn saved_reset_pending_resumes_with_same_redeem_request_id() {
         ResetCoordinator::new(RedemptionJournal::new(journal.path().to_path_buf())).unwrap();
     let server = Server::new(200, r#"{"code":"already_redeemed"}"#).await;
     assert_eq!(
-        redeem(&coordinator, &server, ID).await.result,
+        redeem(&coordinator, &server, ID)
+            .await
+            .result
+            .map(|(outcome, _)| outcome),
         Ok(ConsumeOutcome::AlreadyRedeemed)
     );
     assert_eq!(server.count(), 1);
@@ -206,7 +257,10 @@ async fn saved_reset_ignores_sibling_headroom_and_provider_floor() {
         .sibling_with_headroom(ACCOUNT, Instant::now())
         .is_some());
     assert_eq!(
-        redeem(&coordinator, &server, ID).await.result,
+        redeem(&coordinator, &server, ID)
+            .await
+            .result
+            .map(|(outcome, _)| outcome),
         Ok(ConsumeOutcome::Reset)
     );
     assert_eq!(server.count(), 1);
@@ -247,7 +301,7 @@ async fn saved_reset_all_provider_outcomes_and_refusals_are_mapped() {
         let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
         let server = Server::new(200, &format!(r#"{{"code":"{}"}}"#, outcome.as_code())).await;
         let result = redeem(&coordinator, &server, ID).await;
-        assert_eq!(result.result, Ok(outcome));
+        assert_eq!(result.result.map(|(outcome, _)| outcome), Ok(outcome));
         assert!(result.consume_attempted);
         assert_eq!(
             journal.records().unwrap()[0].status,

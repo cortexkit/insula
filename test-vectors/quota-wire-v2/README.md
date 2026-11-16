@@ -13,7 +13,9 @@ changing from 2 to 1 after the due slot is refreshed. The operation reply does n
 wait for that refresh. A repeated request_id replays its durable outcome; a new id
 is not a retry. Only callosum's attested fed-phone: routes may spend a credit.
 
-Generated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:
-`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v2_vectors_match`
+These historical bodies record the success reply before `redeemed_at` was added.
+They are frozen, not regenerated from the current handler. The Rust drift test
+checks their committed bytes against SHA256SUMS; current success replies are
+represented in v3 and always include `redeemed_at`.
 
 v1 remains unchanged. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.

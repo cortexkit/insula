@@ -461,6 +461,9 @@ pub struct RedemptionRecord {
     pub attempt_count: u32,
     pub status: JournalStatus,
     pub outcome: Option<ConsumeOutcome>,
+    /// The first decision time; absent in older journals and pending records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
     /// Client ids must remain replayable after the automatic retention horizon.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manual: bool,
@@ -498,7 +501,7 @@ impl RedemptionRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualReservation {
     Pending,
-    Resolved(ConsumeOutcome),
+    Resolved(ConsumeOutcome, DateTime<Utc>),
     RecentlyReset(DateTime<Utc>),
 }
 
@@ -525,7 +528,8 @@ pub enum SavedResetError {
 
 #[derive(Debug)]
 pub struct SavedResetResult {
-    pub result: Result<ConsumeOutcome, SavedResetError>,
+    /// Success carries the outcome and its original decision time.
+    pub result: Result<(ConsumeOutcome, DateTime<Utc>), SavedResetError>,
     pub consume_attempted: bool,
 }
 
@@ -589,11 +593,25 @@ pub enum Reservation {
 #[derive(Debug, Clone)]
 pub struct RedemptionJournal {
     path: PathBuf,
+    #[cfg(any(test, feature = "test-hooks"))]
+    resolution_time: Option<DateTime<Utc>>,
 }
 
 impl RedemptionJournal {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            #[cfg(any(test, feature = "test-hooks"))]
+            resolution_time: None,
+        }
+    }
+
+    /// Pin the resolution clock for deterministic journal and served-byte tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn with_resolution_time(mut self, at: DateTime<Utc>) -> Self {
+        self.resolution_time = Some(at);
+        self
     }
 
     /// The journal at its environment-resolved location, migrating if needed.
@@ -905,6 +923,7 @@ impl RedemptionJournal {
             attempt_count: 0,
             status: JournalStatus::Pending,
             outcome: None,
+            resolved_at: None,
             manual: false,
             provider: codex_provider(),
         });
@@ -947,6 +966,7 @@ impl RedemptionJournal {
                     record
                         .outcome
                         .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?,
+                    parse_record_resolved_time(record)?,
                 ),
             };
             // A phone can resume an automatic pending redemption too. Preserve
@@ -976,6 +996,7 @@ impl RedemptionJournal {
             attempt_count: 0,
             status: JournalStatus::Pending,
             outcome: None,
+            resolved_at: None,
             manual: true,
             provider: provider.to_owned(),
         });
@@ -1031,6 +1052,7 @@ impl RedemptionJournal {
         outcome: ConsumeOutcome,
     ) -> Result<(), JournalError> {
         self.resolve_for(CODEX_PROVIDER, account_id, redeem_request_id, outcome)
+            .map(|_| ())
     }
 
     /// [`Self::resolve`] for `provider`'s account.
@@ -1040,7 +1062,7 @@ impl RedemptionJournal {
         account_id: &str,
         redeem_request_id: &str,
         outcome: ConsumeOutcome,
-    ) -> Result<(), JournalError> {
+    ) -> Result<DateTime<Utc>, JournalError> {
         let mut records = self.load()?;
         let record = records
             .iter_mut()
@@ -1056,12 +1078,16 @@ impl RedemptionJournal {
             })?;
         record.status = JournalStatus::Resolved;
         record.outcome = Some(outcome);
+        let resolved_at = Utc::now();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let resolved_at = self.resolution_time.unwrap_or(resolved_at);
+        record.resolved_at = Some(resolved_at.to_rfc3339());
         self.save(&records)?;
         eprintln!(
             "{LOG_TAG} {provider} reset journal resolve account_id={account_id} redeem_request_id={redeem_request_id} outcome={}",
             outcome.as_code()
         );
-        Ok(())
+        Ok(resolved_at)
     }
 
     fn load(&self) -> Result<Vec<RedemptionRecord>, JournalError> {
@@ -1170,6 +1196,20 @@ fn parse_record_latest_time(record: &RedemptionRecord) -> Result<DateTime<Utc>, 
         .map(|value| parse_record_timestamp(record, "last_attempt_at", value))
         .transpose()?;
     Ok(last_attempt_at.map_or(created_at, |attempted_at| attempted_at.max(created_at)))
+}
+
+fn parse_record_resolved_time(record: &RedemptionRecord) -> Result<DateTime<Utc>, JournalError> {
+    if let Some(value) = record.resolved_at.as_deref() {
+        return parse_record_timestamp(record, "resolved_at", value);
+    }
+    // A manual (caller-requested) redemption resolves within one request of
+    // its last attempt, so last_attempt_at is the closest recorded time in
+    // older journals.
+    let value = record
+        .last_attempt_at
+        .as_deref()
+        .ok_or_else(|| JournalError::new("resolved redemption has no last_attempt_at"))?;
+    parse_record_timestamp(record, "last_attempt_at", value)
 }
 
 fn prune_records(
@@ -2087,7 +2127,7 @@ impl ResetCoordinator {
         &self,
         account_id: &str,
         request_id: &str,
-    ) -> Result<Option<ConsumeOutcome>, JournalError> {
+    ) -> Result<Option<(ConsumeOutcome, DateTime<Utc>)>, JournalError> {
         self.saved_reset_outcome_for(CODEX_PROVIDER, account_id, request_id)
     }
 
@@ -2097,7 +2137,7 @@ impl ResetCoordinator {
         provider: &str,
         account_id: &str,
         request_id: &str,
-    ) -> Result<Option<ConsumeOutcome>, JournalError> {
+    ) -> Result<Option<(ConsumeOutcome, DateTime<Utc>)>, JournalError> {
         let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = self
             .journal
@@ -2108,7 +2148,13 @@ impl ResetCoordinator {
                     && record.redeem_request_id == request_id
                     && record.status == JournalStatus::Resolved
             })
-            .and_then(|record| record.outcome);
+            .map(|record| {
+                let outcome = record
+                    .outcome
+                    .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?;
+                Ok((outcome, parse_record_resolved_time(record)?))
+            })
+            .transpose()?;
         if outcome.is_some() {
             self.journal
                 .reserve_manual_for(provider, account_id, request_id, Utc::now())?;
@@ -2196,9 +2242,9 @@ impl ResetCoordinator {
                 })
         };
         match reserved {
-            Ok(ManualReservation::Resolved(outcome)) => {
+            Ok(ManualReservation::Resolved(outcome, resolved_at)) => {
                 return SavedResetResult {
-                    result: Ok(outcome),
+                    result: Ok((outcome, resolved_at)),
                     consume_attempted: false,
                 }
             }
@@ -2217,12 +2263,13 @@ impl ResetCoordinator {
                 .reserve_manual_for(provider, account_id, request_id, now)
                 .map_err(unavailable)?
             {
-                ManualReservation::Resolved(stored) => Ok(stored),
+                ManualReservation::Resolved(stored, resolved_at) => Ok((stored, resolved_at)),
                 ManualReservation::Pending => {
-                    self.journal
+                    let resolved_at = self
+                        .journal
                         .resolve_for(provider, account_id, request_id, outcome)
                         .map_err(unavailable)?;
-                    Ok(outcome)
+                    Ok((outcome, resolved_at))
                 }
                 ManualReservation::RecentlyReset(_) => {
                     unreachable!("the reserved id remains in the journal")
@@ -3161,6 +3208,7 @@ mod tests {
             attempt_count: 0,
             status: JournalStatus::Pending,
             outcome: None,
+            resolved_at: None,
         }
     }
 

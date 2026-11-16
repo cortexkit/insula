@@ -301,120 +301,29 @@ async fn committed_quota_wire_vectors_match() {
     );
 }
 
-const V2_README: &str = "# Quota wire v2: explicit Codex saved reset\n\nSynthetic identities only: account `synthetic-codex-id`, email `phone@example.com`,\nprincipal `reserved:callosum`, harness `fed-phone:synthetic-fp`. No credentials.\nThe fixed clock is 2026-07-14T12:00:00Z; the blocking reservation is 12 minutes older.\n\n`use-saved-reset-request.json` is the routed request envelope; its `params` is the\noperation request body. Success files are Response frame bodies, error files are\nError frame bodies. `recently_reset` includes RFC 3339 `detail.last_reset_at`.\n`provider_refused` includes the bounded (200-character) provider excerpt in `detail.excerpt`.\nThe before/after files are individual rows from `usage.get`, with availableCount\nchanging from 2 to 1 after the due slot is refreshed. The operation reply does not\nwait for that refresh. A repeated request_id replays its durable outcome; a new id\nis not a retry. Only callosum's attested fed-phone: routes may spend a credit.\n\nGenerated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:\n`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v2_vectors_match`\n\nv1 remains unchanged. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.\n";
-
-async fn generated_v2_files() -> Vec<(String, Vec<u8>)> {
-    use super::saved_reset_tests::{self as phone, *};
-    use quota_core::codex_resets::{ConsumeOutcome, SavedResetError};
-    let (registry, _, result) = fixture().await;
-    let mut wire = Wire::with_registry(false, 65536, registry.clone()).await;
-    let mut files = vec![
-        ("README.md".to_owned(), V2_README.as_bytes().to_vec()),
-        (
-            "use-saved-reset-request.json".into(),
-            serde_json::to_vec(&json!({"method":USE_SAVED_RESET_OP,"params":reset_params()}))
-                .unwrap(),
-        ),
-    ];
-    let forbidden = call(&mut wire, 1, reset_params()).await;
-    assert_eq!(forbidden.header.ty, FrameType::Error);
-    files.push(("error-forbidden.json".into(), forbidden.body));
-    bind(&mut wire, 1, callosum(), Some("fed-phone:synthetic-fp")).await;
-    wire.send(request(5, 1, 702, USAGE_GET_OP, false)).await;
-    let before: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
-    files.push((
-        "usage-get-row-before.json".into(),
-        serde_json::to_vec(&before["result"][0]).unwrap(),
-    ));
-    for (field, value, code) in [
-        ("request_id", "short", "invalid_request"),
-        ("provider", "deepseek", "unsupported_provider"),
-        ("account", "missing", "unknown_account"),
-    ] {
-        let mut params = reset_params();
-        params[field] = json!(value);
-        let frame = call(&mut wire, 1, params).await;
-        assert_eq!(frame.header.ty, FrameType::Error);
-        files.push((format!("error-{code}.json"), frame.body));
-    }
-    for (error, code) in [
-        (
-            SavedResetError::RecentlyReset(phone::AT.parse().unwrap()),
-            "recently_reset",
-        ),
-        (
-            SavedResetError::ProviderRefused("synthetic provider refusal".into()),
-            "provider_refused",
-        ),
-        (
-            SavedResetError::ProviderUnavailable("synthetic timeout".into()),
-            "provider_unavailable",
-        ),
-    ] {
-        *result.lock().unwrap() = Err(error);
-        let frame = call(&mut wire, 1, reset_params()).await;
-        assert_eq!(frame.header.ty, FrameType::Error);
-        files.push((format!("error-{code}.json"), frame.body));
-    }
-    for outcome in [
-        ConsumeOutcome::Reset,
-        ConsumeOutcome::NothingToReset,
-        ConsumeOutcome::NoCredit,
-        ConsumeOutcome::AlreadyRedeemed,
-    ] {
-        *result.lock().unwrap() = Ok(outcome);
-        let frame = call(&mut wire, 1, reset_params()).await;
-        assert_eq!(frame.header.ty, FrameType::Response);
-        files.push((format!("success-{}.json", outcome.as_code()), frame.body));
-    }
-    registry.refresh_tick(&CancellationToken::new()).await;
-    wire.send(request(5, 1, 702, USAGE_GET_OP, false)).await;
-    let after: Value = serde_json::from_slice(&wire.recv().await.body).unwrap();
-    files.push((
-        "usage-get-row-after.json".into(),
-        serde_json::to_vec(&after["result"][0]).unwrap(),
-    ));
-    wire.stop().await;
-    wire.finish().await;
-    let mut sums = String::new();
-    for (name, bytes) in &files {
-        use sha2::Digest as _;
-        let digest: String = sha2::Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        sums.push_str(&format!("{digest}  {name}\n"));
-    }
-    files.push(("SHA256SUMS".into(), sums.into_bytes()));
-    files
-}
-
-#[tokio::test(start_paused = true)]
-async fn committed_quota_wire_v2_vectors_match() {
+#[test]
+fn committed_quota_wire_v2_vectors_match() {
+    use sha2::Digest as _;
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/quota-wire-v2");
-    let files = generated_v2_files().await;
-    if std::env::var_os("INSULA_WRITE_VECTORS").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        std::fs::create_dir_all(&directory).unwrap();
-        for (name, bytes) in &files {
-            std::fs::write(directory.join(name), bytes).unwrap();
-        }
+    // v2 records the historical success reply before redeemed_at was added.
+    // Keep those published bodies pinned instead of regenerating a newer wire shape.
+    let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
+    let mut names = vec!["SHA256SUMS"];
+    for line in sums.lines() {
+        let (expected, name) = line.split_once("  ").unwrap();
+        let bytes = std::fs::read(directory.join(name)).unwrap();
+        let actual = format!("{:x}", sha2::Sha256::digest(bytes));
+        assert_eq!(actual, expected, "historical v2 vector changed: {name}");
+        names.push(name);
     }
-    let mut differences = Vec::new();
-    for (name, bytes) in &files {
-        if std::fs::read(directory.join(name)).ok().as_ref() != Some(bytes) {
-            differences.push(name.clone());
-        }
+    for entry in std::fs::read_dir(&directory).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            names.contains(&name.to_str().unwrap()),
+            "unlisted v2 vector: {name:?}"
+        );
     }
-    if let Ok(entries) = std::fs::read_dir(&directory) {
-        for entry in entries {
-            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            if !files.iter().any(|(expected, _)| *expected == name) {
-                differences.push(name);
-            }
-        }
-    }
-    assert!(differences.is_empty(), "committed quota wire v2 vectors differ: {}. Regenerate with INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v2_vectors_match", differences.join(", "));
 }
 
 const VECTOR_README: &str = "# Quota wire v1\n\n\
@@ -424,7 +333,7 @@ const VECTOR_README: &str = "# Quota wire v1\n\n\
 `README.md` is generated alongside the bodies. String fields are open vocabularies, not closed enums; consumers must tolerate unfamiliar values. See [the consumer contract](../../docs/consumer-contract.md) for semantics and reconciliation rules.\n\n\
 `SHA256SUMS` covers every other file in this directory in `shasum -a 256` format. JSON files contain the frame body bytes without a trailing newline. Verify with `shasum -a 256 -c SHA256SUMS` from this directory. Regenerate all files with `INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_vectors_match`. The named drift test checks every file and the checksums byte-for-byte.\n";
 
-const V3_README: &str = "# Quota wire v3: Claude saved resets by kind\n\nSynthetic identities only: account `synthetic-claude-account`, principal\n`reserved:callosum`, harness `fed-phone:synthetic-fp`. No credentials. Anthropic is a\nlocal stand-in serving three grants: a session reset, a weekly reset and a weekly-model\n(`model_weekly`) grant holding two resets.\n\n`usage-get-row-saved-resets.json` is the `savedResets` member of the Claude row from\n`usage.get`: `kinds` groups the counted resets by what they restore, and the kinds'\n`availableCount` values add up to the row's. Grant ids and labels never appear.\n\n`use-saved-reset-request.json` is the routed request envelope; its `params` is the\noperation request body. A Claude spend names `kind` (one of session, weekly, full,\nmodel_weekly); `error-invalid_request.json` is the reply to the same request without\nit. The remaining files answer the same request id in turn while Anthropic answers\n`cooldown` (`recently_reset` with `detail.cooldown_until`), then `ineligible` with\nreason `tier` (`provider_refused` with `detail.result` and `detail.reason`), then\n`reset`. A refused attempt leaves the request id pending, so its retry is sent again;\nonce resolved, a repeated request_id replays the stored outcome.\n\nGenerated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:\n`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v3_vectors_match`\n\nv1 and v2 remain as they are. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.\n";
+const V3_README: &str = "# Quota wire v3: Claude saved resets by kind\n\nSynthetic identities only: account `synthetic-claude-account`, principal\n`reserved:callosum`, harness `fed-phone:synthetic-fp`. No credentials. Anthropic is a\nlocal stand-in serving three grants: a session reset, a weekly reset and a weekly-model\n(`model_weekly`) grant holding two resets.\n\n`usage-get-row-saved-resets.json` is the `savedResets` member of the Claude row from\n`usage.get`: `kinds` groups the counted resets by what they restore, and the kinds'\n`availableCount` values add up to the row's. Grant ids and labels never appear.\n\n`use-saved-reset-request.json` is the routed request envelope; its `params` is the\noperation request body. A Claude spend names `kind` (one of session, weekly, full,\nmodel_weekly); `error-invalid_request.json` is the reply to the same request without\nit. The remaining files answer the same request id in turn while Anthropic answers\n`cooldown` (`recently_reset` with `detail.cooldown_until`), then `ineligible` with\nreason `tier` (`provider_refused` with `detail.result` and `detail.reason`), then\n`reset`. A refused attempt leaves the request id pending, so its retry is sent again;\nonce resolved, a repeated request_id replays the stored outcome. Every success\noutcome (reset, already_redeemed, nothing_to_reset, no_credit) includes redeemed_at:\nthe original decision time in canonical RFC 3339 UTC (nanoseconds and +00:00),\nmatching last_reset_at and cooldown_until. The resolution clock for success-reset.json\nis fixed at 2026-07-14T12:00:00Z. success-replay.json replays an id resolved on\n2026-07-01T12:00:05Z, almost two weeks before the fresh result, without contacting\nAnthropic. Requests use the test process's current UTC clock; their send time is\nnot a request-body field.\nClients compare redeemed_at with their send time to distinguish an earlier result\nfrom a reset decided for the current press. Old resolved records without resolved_at\nuse their last_attempt_at as the closest recorded decision time.\n\nGenerated in process by the Rust wire tests, including SHA256SUMS. Regenerate with:\n`INSULA_WRITE_VECTORS=1 cargo test -p quota-module --bin ck-insula committed_quota_wire_v3_vectors_match`\n\nv1 and v2 remain as they are. Consumers may verify SHA256SUMS with `shasum -a 256 -c SHA256SUMS`.\n";
 
 async fn generated_v3_files() -> Vec<(String, Vec<u8>)> {
     use super::claude_saved_reset_tests::{claude_fixture, claude_params};
@@ -473,6 +382,12 @@ async fn generated_v3_files() -> Vec<(String, Vec<u8>)> {
         assert_eq!(frame.header.ty, ty, "{name}");
         files.push((name.into(), frame.body));
     }
+    assert_eq!(fixture.server.redeems().len(), 3);
+    // Replay an older resolved id through the handler, with no provider call.
+    fixture.seed_past_resolution();
+    let frame = call(&mut wire, 1, claude_params()).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    files.push(("success-replay.json".into(), frame.body));
     assert_eq!(fixture.server.redeems().len(), 3);
     wire.stop().await;
     wire.finish().await;

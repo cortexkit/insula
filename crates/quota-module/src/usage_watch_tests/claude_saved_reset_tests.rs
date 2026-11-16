@@ -66,6 +66,23 @@ pub(super) struct ClaudeFixture {
     _journal: JournalDir,
 }
 
+impl ClaudeFixture {
+    pub(super) fn seed_past_resolution(&self) {
+        let path = self._journal.0.join("redemptions.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!([{
+                "account_id": ACCOUNT, "redeem_request_id": CLAUDE_REQUEST,
+                "created_at": "2026-07-01T11:59:00Z", "last_attempt_at": "2026-07-01T12:00:00Z",
+                "attempt_count": 1, "status": "resolved", "outcome": "reset",
+                "resolved_at": "2026-07-01T12:00:05Z", "manual": true, "provider": "claude"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 pub(super) fn grants() -> Value {
     mock::eligible(
         vec![
@@ -96,6 +113,7 @@ pub(super) async fn claude_fixture() -> ClaudeFixture {
         Arc::new(MockSource::default()),
         &server.base,
         journal.0.join("redemptions.json"),
+        Some(RESOLVED_AT.parse().unwrap()),
     );
     let registry = Arc::new(Registry::new(vec![Box::new(ClaudeLane(provider))]));
     registry.refresh_tick(&CancellationToken::new()).await;
@@ -107,6 +125,44 @@ pub(super) async fn claude_fixture() -> ClaudeFixture {
 }
 
 pub(super) const CLAUDE_REQUEST: &str = "phone-claude-0001";
+pub(super) const RESOLVED_AT: &str = "2026-07-14T12:00:00.000000000+00:00";
+
+#[tokio::test]
+async fn saved_reset_fresh_reply_carries_resolution_time() {
+    let fixture = claude_fixture().await;
+    let mut wire = Wire::with_registry(false, 65536, fixture.registry.clone()).await;
+    bind(&mut wire, 1, callosum(), Some("fed-phone:synthetic-fp")).await;
+    let reply = body(&call(&mut wire, 1, claude_params()).await);
+    assert_eq!(reply["result"]["redeemed_at"], RESOLVED_AT);
+    let records = quota_core::codex_resets::RedemptionJournal::new(
+        fixture._journal.0.join("redemptions.json"),
+    )
+    .records()
+    .unwrap();
+    assert_eq!(
+        records[0].resolved_at.as_deref(),
+        Some("2026-07-14T12:00:00+00:00")
+    );
+    assert_eq!(fixture.server.redeems().len(), 1);
+    wire.stop().await;
+    wire.finish().await;
+}
+
+#[tokio::test]
+async fn saved_reset_replay_reply_keeps_original_resolution_time() {
+    let fixture = claude_fixture().await;
+    fixture.seed_past_resolution();
+    let mut wire = Wire::with_registry(false, 65536, fixture.registry.clone()).await;
+    bind(&mut wire, 1, callosum(), Some("fed-phone:synthetic-fp")).await;
+    let reply = body(&call(&mut wire, 1, claude_params()).await);
+    assert_eq!(
+        reply["result"]["redeemed_at"],
+        "2026-07-01T12:00:05.000000000+00:00"
+    );
+    assert_eq!(fixture.server.redeems().len(), 0);
+    wire.stop().await;
+    wire.finish().await;
+}
 
 pub(super) fn claude_params() -> Value {
     json!({"provider": "claude", "account": ACCOUNT, "request_id": CLAUDE_REQUEST,
@@ -126,7 +182,8 @@ async fn a_phone_spends_a_claude_saved_reset_once_per_request_id() {
     assert_eq!(frame.header.ty, FrameType::Response);
     assert_eq!(
         body(&frame),
-        json!({"result": {"outcome": "reset", "request_id": CLAUDE_REQUEST}})
+        json!({"result": {"outcome": "reset", "request_id": CLAUDE_REQUEST,
+            "redeemed_at": RESOLVED_AT}})
     );
     let redeems = fixture.server.redeems();
     assert_eq!(redeems.len(), 1);
@@ -135,8 +192,8 @@ async fn a_phone_spends_a_claude_saved_reset_once_per_request_id() {
 
     // The same request id replays; a new one meets the 30-minute bound.
     assert_eq!(
-        body(&call(&mut wire, 1, claude_params()).await)["result"]["outcome"],
-        "reset"
+        body(&call(&mut wire, 1, claude_params()).await),
+        body(&frame)
     );
     let mut second = claude_params();
     second["request_id"] = json!("phone-claude-0002");

@@ -1364,7 +1364,7 @@ async fn handle_usage_request(
             .use_saved_reset(&provider, &account, &request_id, kind.as_deref())
             .await
         {
-            Ok(outcome) => {
+            Ok((outcome, redeemed_at)) => {
                 let response = Frame::build_with_version(
                     ver,
                     FrameType::Response,
@@ -1372,8 +1372,12 @@ async fn handle_usage_request(
                     channel,
                     epoch,
                     corr,
-                    serde_json::to_vec(&saved_reset_reply(outcome, &request_id))
-                        .map_err(ModuleError::Json)?,
+                    serde_json::to_vec(&saved_reset_reply(
+                        outcome,
+                        &request_id,
+                        &quota_core::rfc3339_canonical(redeemed_at),
+                    ))
+                    .map_err(ModuleError::Json)?,
                 )
                 .map_err(|e| ModuleError::Message(e.to_string()))?;
                 serve.record_served();
@@ -1615,11 +1619,13 @@ fn valid_reset_request_id(id: &str) -> bool {
 fn saved_reset_reply(
     outcome: quota_core::codex_resets::ConsumeOutcome,
     request_id: &str,
+    redeemed_at: &str,
 ) -> serde_json::Value {
     // Wrapped in `result` like every other route reply (`usage.get`,
     // `usage.observe`): clients unwrap `result` before decoding, and a bare
     // body reads as a lost reply even though the reset was spent.
-    json!({"result": {"outcome": outcome.as_code(), "request_id": request_id}})
+    json!({"result": {"outcome": outcome.as_code(), "request_id": request_id,
+        "redeemed_at": redeemed_at}})
 }
 
 fn saved_reset_error_body(

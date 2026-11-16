@@ -5410,12 +5410,11 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
         0,
         "automatic spending is disabled"
     );
-    assert_eq!(
-        registry
-            .use_saved_reset("codex", "shared-account", "phone-request-0001", None)
-            .await,
-        Ok(ConsumeOutcome::Reset)
-    );
+    let first = registry
+        .use_saved_reset("codex", "shared-account", "phone-request-0001", None)
+        .await
+        .unwrap();
+    assert_eq!(first.0, ConsumeOutcome::Reset);
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
     assert_eq!(
         *transport.consume_accounts.lock().unwrap(),
@@ -5454,7 +5453,7 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
         registry
             .use_saved_reset("codex", "shared-account", "phone-request-0001", None)
             .await,
-        Ok(ConsumeOutcome::Reset)
+        Ok(first)
     );
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
 }
