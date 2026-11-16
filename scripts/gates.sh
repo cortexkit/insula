@@ -157,6 +157,11 @@ for script in $unsafe_scripts; do echo "  $script: errexit + EXIT trap without a
 echo "  $(echo "$shell_scripts" | wc -l | tr -d ' ') shell instrument(s) checked, $(echo "$unsafe_scripts" | grep -c . ) unsafe"
 [ -z "$unsafe_scripts" ] || fail "a shell instrument can exit 0 on an unbound variable under bash 3.2"
 
+step "hand-written source size"
+# A hand-written source file stays under 5,000 lines (tests exempt), so a
+# one-line edit rebuilds quickly. The checker runs its own self-test first.
+repo_check "hand-written source size" python3 scripts/source-size.py
+
 step "endpoint host manifest"
 # RUN, not merely compiled. This checker existed for two weeks reporting a real
 # finding that nobody saw, because the gate only py_compile'd it: the openrouter
