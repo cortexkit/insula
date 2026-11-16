@@ -1033,7 +1033,10 @@ impl Registry {
         account: &str,
         request_id: &str,
         kind: Option<&str>,
-    ) -> Result<codex_resets::ConsumeOutcome, codex_resets::SavedResetError> {
+    ) -> Result<
+        (codex_resets::ConsumeOutcome, chrono::DateTime<chrono::Utc>),
+        codex_resets::SavedResetError,
+    > {
         use codex_resets::SavedResetError;
         if provider != codex::PROVIDER_NAME && provider != anthropic::PROVIDER_NAME {
             return Err(SavedResetError::UnsupportedProvider);

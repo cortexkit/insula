@@ -1072,6 +1072,7 @@ impl AnthropicProvider {
         source: Arc<dyn CredentialSource>,
         base_url: &str,
         journal_path: std::path::PathBuf,
+        resolution_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Self {
         let mut provider =
             Self::new_with_handle_loader(Some(source), Arc::new(VaultHandleLoader::default()));
@@ -1080,11 +1081,14 @@ impl AnthropicProvider {
         provider.subscription = crate::claude_subscription::SubscriptionCache::with_profile_url(
             format!("{base_url}/api/oauth/profile"),
         );
-        let coordinator = crate::codex_resets::ResetCoordinator::new(
-            crate::codex_resets::RedemptionJournal::new(journal_path),
-        )
-        .map(Arc::new)
-        .map_err(|error| error.to_string());
+        let journal = crate::codex_resets::RedemptionJournal::new(journal_path);
+        let journal = match resolution_time {
+            Some(at) => journal.with_resolution_time(at),
+            None => journal,
+        };
+        let coordinator = crate::codex_resets::ResetCoordinator::new(journal)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
         let _ = provider.reset_coordinator.set(coordinator);
         provider
     }
@@ -1503,8 +1507,10 @@ impl AnthropicProvider {
         }
         let handle_id = handle.stable_id();
         let Some(grant_id) = self.grant_to_spend(handle_id, account_id, request_id, kind) else {
+            // No journal decision is stored when there is no grant: each call
+            // decides this local outcome afresh.
             return SavedResetResult {
-                result: Ok(ConsumeOutcome::NothingToReset),
+                result: Ok((ConsumeOutcome::NothingToReset, chrono::Utc::now())),
                 consume_attempted: false,
             };
         };

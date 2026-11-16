@@ -314,14 +314,32 @@ operation reply does not wait for that refreshed reading.
 Success Response frame bodies are:
 
 ```json
-{"outcome":"reset","request_id":"phone-request-0001"}
+{"result":{"outcome":"reset","request_id":"phone-request-0001","redeemed_at":"2026-07-14T12:00:00.000000000+00:00"}}
 ```
 
 `outcome` is one of `reset`, `nothing_to_reset`, `no_credit`, `already_redeemed`.
 All four are completed outcomes and are replayed as stored. Claude's answers map
 onto them: `reset` is `reset`, `already_used` is `already_redeemed`, and
 `not_limited` is `nothing_to_reset` (a grant that needs its limit hit was spent
-while it was not). Failures use the normal
+while it was not).
+
+Every success includes `redeemed_at`, the time the outcome was first decided,
+in canonical RFC 3339 UTC with nanosecond precision and `+00:00`, like
+`detail.last_reset_at` and `detail.cooldown_until`. A fresh redemption carries its
+resolution time; a resolved `request_id` replays the original resolution time,
+not the retry's time. For older journal records without a resolution timestamp,
+`last_attempt_at` is the closest recorded decision time. Claude's local
+`nothing_to_reset` answer when no grant is available is not journaled and is
+decided afresh on each call.
+
+Persist the send time alongside the request id. A `redeemed_at` earlier than that
+send time identifies a result decided before this request, so show that an earlier
+redemption finished rather than claiming a reset happened now. Account for clock
+skew between the client and the module when comparing timestamps. The timestamp
+does not replace the request-id retry rule: never mint a new id merely because
+a reply was lost or replayed.
+
+Failures use the normal
 Error frame body (`code`, `message`, optional `detail`, the `subc_protocol::ErrorBody` field); branch on `code`, not prose:
 
 | Code | Meaning |
@@ -344,7 +362,9 @@ whether a credit was spent. For example:
 Generated synthetic request, every outcome/error and before/after rows (saved-reset
 `availableCount` 2 → 1) are pinned in `test-vectors/quota-wire-v2/`, with in-process
 SHA256SUMS and a drift test. v1 is unchanged. The Claude request, a `kinds` sample
-and Claude's replies are pinned the same way in `test-vectors/quota-wire-v3/`.
+and Claude's replies are pinned the same way in `test-vectors/quota-wire-v3/`,
+including fresh and older replay `redeemed_at` examples. v2 retains its historical
+success shape before `redeemed_at`; current success replies always carry the field.
 
 ## 4. Freshness
 

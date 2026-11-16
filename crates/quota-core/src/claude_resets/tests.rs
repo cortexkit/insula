@@ -236,6 +236,7 @@ impl Fixture {
             source.clone(),
             &server.base,
             journal.to_path_buf(),
+            None,
         );
         let attempt = provider.fetch_handle(&handle()).await;
         assert!(attempt.usage.is_ok(), "the fixture poll must succeed");
@@ -280,7 +281,10 @@ fn two_session_grants() -> Value {
 async fn a_spend_posts_the_chosen_grant_under_the_profiles_organization() {
     let fixture = Fixture::new(two_session_grants()).await;
     let result = fixture.spend("phone-request-0001", "session").await;
-    assert_eq!(result.result, Ok(ConsumeOutcome::Reset));
+    assert_eq!(
+        result.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
+    );
     assert!(result.consume_attempted);
     let redeems = fixture.server.redeems();
     assert_eq!(redeems.len(), 1);
@@ -317,18 +321,28 @@ async fn the_next_grant_is_preferred_over_the_soonest_expiring_one() {
 async fn a_retried_request_id_replays_its_outcome_without_a_second_post() {
     let fixture = Fixture::new(two_session_grants()).await;
     assert_eq!(
-        fixture.spend("phone-request-0001", "session").await.result,
+        fixture
+            .spend("phone-request-0001", "session")
+            .await
+            .result
+            .map(|(outcome, _)| outcome),
         Ok(ConsumeOutcome::Reset)
     );
     let retry = fixture.spend("phone-request-0001", "session").await;
-    assert_eq!(retry.result, Ok(ConsumeOutcome::Reset));
+    assert_eq!(
+        retry.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
+    );
     assert!(!retry.consume_attempted);
     // After a restart the journal alone still answers the retry.
     let restarted = Fixture::provider(&fixture.server, &fixture.source, &fixture.journal).await;
     let replay = restarted
         .use_saved_reset(&handle(), ACCOUNT, "phone-request-0001", Some("session"))
         .await;
-    assert_eq!(replay.result, Ok(ConsumeOutcome::Reset));
+    assert_eq!(
+        replay.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
+    );
     assert!(!replay.consume_attempted);
     assert_eq!(fixture.server.redeems().len(), 1);
 }
@@ -351,7 +365,10 @@ async fn the_spend_bound_blocks_a_second_claude_redeem_for_the_same_account() {
 async fn no_available_grant_of_the_kind_is_nothing_to_reset_without_a_post() {
     let fixture = Fixture::new(two_session_grants()).await;
     let result = fixture.spend("phone-request-0001", "model_weekly").await;
-    assert_eq!(result.result, Ok(ConsumeOutcome::NothingToReset));
+    assert_eq!(
+        result.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::NothingToReset)
+    );
     assert!(!result.consume_attempted);
     assert!(fixture.server.redeems().is_empty());
     assert!(
@@ -417,7 +434,11 @@ async fn a_rate_limited_or_failing_redeem_is_retryable_with_the_same_grant() {
     ));
     fixture.server.set_reply(200, r#"{"result":"reset"}"#);
     assert_eq!(
-        fixture.spend("phone-request-0001", "session").await.result,
+        fixture
+            .spend("phone-request-0001", "session")
+            .await
+            .result
+            .map(|(outcome, _)| outcome),
         Ok(ConsumeOutcome::Reset)
     );
     let redeems = fixture.server.redeems();

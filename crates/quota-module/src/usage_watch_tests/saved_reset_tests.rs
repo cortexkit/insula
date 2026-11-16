@@ -56,7 +56,12 @@ impl UsageProvider for PhoneProvider {
         assert_eq!(request_id, CLIENT_ID);
         self.posts.fetch_add(1, Ordering::SeqCst);
         SavedResetResult {
-            result: self.result.lock().unwrap().clone(),
+            result: self
+                .result
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|outcome| (outcome, AT.parse().unwrap())),
             consume_attempted: true,
         }
     }
@@ -340,7 +345,8 @@ async fn saved_reset_request_id_validation_and_all_wire_mappings() {
         assert_eq!(frame.header.ty, FrameType::Response);
         assert_eq!(
             body(&frame),
-            json!({"result":{"outcome":code,"request_id":CLIENT_ID}})
+            json!({"result":{"outcome":code,"request_id":CLIENT_ID,
+                "redeemed_at":"2026-07-14T11:48:00.000000000+00:00"}})
         );
     }
     for (error, code) in [
