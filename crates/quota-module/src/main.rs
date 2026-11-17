@@ -308,6 +308,8 @@ fn load_quota_config_file(path: &std::path::Path) -> (LiveQuotaConfig, ConfigRel
 }
 
 fn load_quota_config() -> (LiveQuotaConfig, Option<ConfigReloader>) {
+    // Read here so the bypass's warning appears at startup, not at first bind.
+    dev_local_saved_resets();
     let Some(path) = quota_config_path() else {
         eprintln!(
             "{LOG_TAG} warning: cannot resolve the quota config path; codex banked resets default OFF"
@@ -787,7 +789,13 @@ async fn handle_control_request(
                     .and_then(|peer| peer.operator_app);
             let phone_allowed =
                 saved_reset_caller_allowed(principal.as_ref(), Some(identity.harness.as_str()))
-                    || operator_app_admission(operator_app.as_ref(), scope.is_some());
+                    || operator_app_admission(operator_app.as_ref(), scope.is_some())
+                    || dev_local_admission(
+                        dev_local_saved_resets(),
+                        principal.as_ref(),
+                        identity.harness.as_str(),
+                        scope.is_some(),
+                    );
             let mut phones = serve
                 .phone_reset_writers
                 .lock()
@@ -1610,6 +1618,47 @@ fn operator_app_admission(
     scoped: bool,
 ) -> bool {
     operator_app.is_some() && !scoped
+}
+
+/// Set to `1` in insula's module environment to let any local route that
+/// carries no agent scope use saved resets, as the desktop app's development
+/// build does today.
+pub(crate) const DEV_LOCAL_SAVED_RESETS_ENV: &str = "CK_INSULA_DEV_LOCAL_SAVED_RESETS";
+
+/// Whether the development bypass is on, read once per process.
+fn dev_local_saved_resets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var(DEV_LOCAL_SAVED_RESETS_ENV).is_ok_and(|value| value == "1");
+        if on {
+            eprintln!(
+                "{LOG_TAG} warning: {DEV_LOCAL_SAVED_RESETS_ENV}=1, so any local program \
+                 running as this user may spend saved resets (development only)"
+            );
+        }
+        on
+    })
+}
+
+/// A development bypass for the desktop app before the daemon can confirm
+/// it: a `direct` route with no agent scope may use saved resets.
+///
+/// It is off unless the environment variable is set, because a `direct` route
+/// can be opened by any program running as the user. The agent-scope refusal
+/// still keeps a scoped agent call out. Harnesses beginning with `fed-` are
+/// calls from other computers and are never admitted here; the phone is
+/// admitted only by `saved_reset_caller_allowed`. The 30-minute per-account spend bound applies as for
+/// every caller.
+fn dev_local_admission(
+    enabled: bool,
+    principal: Option<&subc_protocol::Principal>,
+    harness: &str,
+    scoped: bool,
+) -> bool {
+    enabled
+        && matches!(principal, Some(subc_protocol::Principal::Direct))
+        && !scoped
+        && !harness.starts_with("fed-")
 }
 
 fn valid_reset_request_id(id: &str) -> bool {
@@ -3676,6 +3725,49 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
         assert!(matches!(body, ModuleControlResponse::RouteBindAck {}));
+    }
+
+    /// The development bypass admits only an unscoped `direct` route, and only
+    /// when it is switched on.
+    #[test]
+    fn the_dev_saved_reset_bypass_admits_only_unscoped_direct_routes_when_on() {
+        use subc_protocol::Principal;
+        let direct = Principal::Direct;
+        assert!(dev_local_admission(
+            true,
+            Some(&direct),
+            "alfonso-desktop",
+            false
+        ));
+        assert!(!dev_local_admission(
+            false,
+            Some(&direct),
+            "alfonso-desktop",
+            false
+        ));
+        assert!(!dev_local_admission(
+            true,
+            Some(&direct),
+            "alfonso-desktop",
+            true
+        ));
+        assert!(!dev_local_admission(
+            true,
+            Some(&direct),
+            "fed-mac:fp",
+            false
+        ));
+        assert!(!dev_local_admission(
+            true,
+            Some(&Principal::Unverified),
+            "x",
+            false
+        ));
+        assert!(!dev_local_admission(true, None, "x", false));
+        let other = Principal::Reserved {
+            module_id: "other".to_string(),
+        };
+        assert!(!dev_local_admission(true, Some(&other), "x", false));
     }
 
     /// A bind whose scope stamp carries a `flow_id` is acked, not refused.

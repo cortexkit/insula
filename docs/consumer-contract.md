@@ -284,6 +284,11 @@ Two kinds of route may call this operation:
   chooses stands in for the stamp: a `direct` principal, a harness or a session
   naming the desktop app grants nothing. Daemons that don't stamp operator apps
   yet send no stamp, so until one does, the desktop app cannot use a saved reset.
+- **Development bypass:** with `CK_INSULA_DEV_LOCAL_SAVED_RESETS=1` in insula's
+  module environment, a `direct` route with no scope stamp and a harness not
+  beginning with `fed-` may also use saved resets. That admits the desktop app's
+  development build, and also any other program running as the user. It is off
+  unless set, and insula logs a warning at startup while it is on.
 
 Every other route (simulator, Mac, unknown or missing harness, any scoped route,
 any other principal) receives `forbidden` before parameters are decoded or any
