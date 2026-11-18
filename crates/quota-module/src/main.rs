@@ -3785,7 +3785,7 @@ mod tests {
 
         let mut stamp = ScopeStamp::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".to_string(),
+                module_id: "prefrontal".to_string(),
             },
             "head-1",
             3,
@@ -3805,7 +3805,66 @@ mod tests {
             bind["scope"]["attributes"]["flow_id"], "flow:7",
             "the fixture must actually carry the field under test"
         );
+        assert_route_bind_ack(bind).await;
+    }
 
+    // An older decoder rejects unknown fields in the federated scope, which
+    // prevents the peer from opening a route even for a read-only quota query.
+    #[tokio::test]
+    async fn a_bind_with_federated_scope_metadata_is_acked() {
+        use subc_protocol::scope::{
+            FederatedAttributes, FederatedPeerClass, FederatedProject, RemoteClaim, RootKey,
+            RootKeyKind, ScopeAttributes, ScopeKind, ScopeStamp,
+        };
+        use subc_protocol::{BindIdentity, Principal, RouteTarget};
+
+        let carrier = Principal::Reserved {
+            module_id: "carrier".into(),
+        };
+        let mut federated = FederatedAttributes::new(
+            FederatedPeerClass::App,
+            "a".repeat(32),
+            "pairing-1".into(),
+            "Paired desktop".into(),
+        )
+        .with_origin_principal(Some(Principal::Reserved {
+            module_id: "caller".into(),
+        }))
+        .with_project(Some(FederatedProject::new(
+            "project-1",
+            RootKey::new(RootKeyKind::Label, "repo"),
+        )))
+        .with_remote_claim(Some(RemoteClaim::run("agent-1").with_run_id("run-1")));
+        let peer_box_id = "b".repeat(32);
+        federated.peer_box_id = Some(peer_box_id.clone());
+        federated.validate().unwrap();
+
+        let stamp = ScopeStamp::new(carrier.clone(), "scope-1", 3, ScopeKind::Federated)
+            .with_attributes(ScopeAttributes::new().with_federated(Some(federated)));
+        let bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: DEFAULT_MODULE_ID.into(),
+            },
+            identity: BindIdentity::new("fed-app:test", "s1"),
+            principal: Some(carrier),
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope: Some(stamp),
+            call_mode: None,
+        })
+        .unwrap();
+        let attrs = &bind["scope"]["attributes"]["federated"];
+        assert_eq!(attrs["peer_box_id"], peer_box_id);
+        assert_eq!(attrs["origin_principal"]["module_id"], "caller");
+        assert_eq!(attrs["project"]["project_id"], "project-1");
+        assert_eq!(attrs["remote_claim"]["run_id"], "run-1");
+        assert_route_bind_ack(bind).await;
+    }
+
+    async fn assert_route_bind_ack(bind: serde_json::Value) {
         let registry = Arc::new(Registry::with_defaults(QuotaConfig::default(), None));
         let (tx, mut rx) = mpsc::channel::<Frame>(4);
         let frame = Frame::build_with_version(
@@ -3829,10 +3888,16 @@ mod tests {
         .unwrap();
 
         let response = rx.try_recv().expect("a response frame was sent");
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "route.bind was refused: {}",
+            String::from_utf8_lossy(&response.body)
+        );
         let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
         assert!(
             matches!(body, ModuleControlResponse::RouteBindAck {}),
-            "a scope carrying flow_id must bind, got {body:?}"
+            "expected route.bind ack, got {body:?}"
         );
     }
 }
