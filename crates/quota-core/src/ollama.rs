@@ -1,6 +1,8 @@
-//! Ollama usage — settings-page cookie scrape or API-key credit balance.
+//! Ollama usage — settings-page cookie scrape or API-key balance and limits.
 //!
-//! A vault `apikey:ollama-cloud` reads `GET /api/balance` with a bearer key.
+//! A vault `apikey:ollama-cloud` reads `GET /api/balance` with a bearer key:
+//! included credits and the purchased balance, or on a legacy plan the session
+//! and weekly limits (`included.session` / `included.weekly`).
 //! When present it is the only lane: neither credential identifies an account,
 //! so emitting the key beside a cookie would create competing unlabelled rows.
 //! Without a key, `cookie:ollama.com` serves through [`crate::cookie_vault`].
@@ -33,6 +35,8 @@
 //! fixture-verified, not live-verified.
 //! The Usage credits section and `/api/balance` shape are ported from CodexBar
 //! v0.74.0 (`OllamaUsageParser.parseCreditDetails`, `ollama-api.ts`), fixture-only.
+//! The legacy `included.session` / `included.weekly` limits follow Ollama's
+//! published schema (docs.ollama.com/api/balance, read 2026-11-18), not a capture.
 
 use std::time::Duration;
 
@@ -740,6 +744,53 @@ fn api_amount(value: Option<&serde_json::Value>) -> Result<Option<Amount>, Fetch
         .ok_or_else(balance_decode_error)
 }
 
+/// An RFC 3339 instant normalized to UTC seconds; absent or unparseable is no
+/// reset, never an invented one.
+fn api_reset(value: Option<&serde_json::Value>) -> Option<String> {
+    let date = chrono::DateTime::parse_from_rfc3339(value?.as_str()?).ok()?;
+    Some(
+        date.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+/// One legacy-plan limit (`included.session` / `included.weekly`):
+/// `{"remaining_percent": 75, "resets_at": "..."}`, where 75 means 75% remains.
+/// A missing or null percent publishes no window; a percent of the wrong type is
+/// a decode error. The cadence comes from Ollama's stated plan limits (5 hours,
+/// 7 days), the same constants the page lane stamps.
+fn api_legacy_limit(
+    value: Option<&serde_json::Value>,
+    kind: &str,
+    window_minutes: i64,
+) -> Result<Option<RateWindow>, FetchError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let limit = value.as_object().ok_or_else(balance_decode_error)?;
+    let Some(remaining) = limit
+        .get("remaining_percent")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let remaining = remaining
+        .as_f64()
+        .filter(|percent| percent.is_finite())
+        .ok_or_else(balance_decode_error)?;
+    Ok(Some(RateWindow {
+        used_percent: 100.0 - remaining.clamp(0.0, 100.0),
+        resets_at: api_reset(limit.get("resets_at")),
+        window_kind: Some(kind.to_string()),
+        window_minutes: Some(window_minutes),
+        raw_used_percent: None,
+        used_count: None,
+        total_count: None,
+        regeneration: None,
+        breakdown: None,
+    }))
+}
+
 fn balance_decode_error() -> FetchError {
     FetchError::Decode("ollama: unrecognized credit balance response".to_string())
 }
@@ -773,23 +824,33 @@ fn parse_api_balance(text: &str) -> Result<ProviderUsage, FetchError> {
         let mut reset = None;
         if let Some(period) = included.get("period").filter(|value| !value.is_null()) {
             let period = period.as_object().ok_or_else(balance_decode_error)?;
-            if let Some(until) = period.get("until").filter(|value| !value.is_null()) {
-                reset = until
-                    .as_str()
-                    .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                    .map(|date| {
-                        date.with_timezone(&chrono::Utc)
-                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                    });
-            }
+            reset = api_reset(period.get("until"));
         }
+        // Legacy plans state `session` and `weekly` instead of dollars. They take
+        // the page lane's legacy slots and kinds: session in `primary`, weekly in
+        // `secondary`, so adding a key does not rename a legacy account's windows.
+        let usage = entry.usage.as_mut().unwrap();
+        usage.primary = api_legacy_limit(
+            included.get("session"),
+            cortexkit_provider_usage::window_kind::FIVE_HOUR,
+            SESSION_WINDOW_MINUTES,
+        )?;
+        usage.secondary = api_legacy_limit(
+            included.get("weekly"),
+            cortexkit_provider_usage::window_kind::WEEKLY,
+            WEEKLY_WINDOW_MINUTES,
+        )?;
         if let (Some(allowance), Some(balance)) = (allowance, balance) {
             if allowance.minor > 0 {
                 let dollars =
                     |amount: &Amount| amount.minor as f64 / 10_f64.powi(i32::from(amount.exponent));
                 let allowance = dollars(&allowance);
                 let used = (allowance - dollars(&balance)).max(0.0);
-                entry.usage.as_mut().unwrap().primary = Some(RateWindow {
+                // The schema states dollars or legacy limits, never both. If a
+                // body carries both, slot them as the page does: allowance in
+                // `primary`, session in `tertiary`.
+                usage.tertiary = usage.primary.take();
+                usage.primary = Some(RateWindow {
                     used_percent: (used / allowance * 100.0).min(100.0),
                     resets_at: reset,
                     window_kind: None,
@@ -1253,6 +1314,83 @@ mod tests {
             .unwrap()
             .resets_at
             .is_none());
+    }
+
+    // The documented legacy-plan body (docs.ollama.com/api/balance, 2026-11-18).
+    const API_LEGACY: &str = r#"{"included":{
+        "session":{"remaining_percent":75,"resets_at":"2026-10-01T07:00:00Z"},
+        "weekly":{"remaining_percent":40,"resets_at":"2026-10-05T00:00:00Z"}},
+        "purchased":{"balance_usd":25}}"#;
+
+    #[test]
+    fn api_legacy_limits_publish_in_the_page_lanes_legacy_slots() {
+        let entry = parse_api_balance(API_LEGACY).unwrap();
+        assert_eq!(entry.spend.unwrap()[0].remaining.as_ref().unwrap().minor, 25);
+        let usage = entry.usage.unwrap();
+        let session = usage.primary.unwrap();
+        assert_eq!(session.used_percent, 25.0);
+        assert_eq!(session.resets_at.as_deref(), Some("2026-10-01T07:00:00Z"));
+        assert_eq!(session.window_kind.as_deref(), Some("five_hour"));
+        assert_eq!(session.window_minutes, Some(SESSION_WINDOW_MINUTES));
+        let weekly = usage.secondary.unwrap();
+        assert_eq!(weekly.used_percent, 60.0);
+        assert_eq!(weekly.resets_at.as_deref(), Some("2026-10-05T00:00:00Z"));
+        assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
+        assert_eq!(weekly.window_minutes, Some(WEEKLY_WINDOW_MINUTES));
+        assert!(usage.tertiary.is_none() && usage.extra_rate_windows.is_none());
+
+        // Same slots and kinds as a legacy settings page.
+        let page = normalize_usage(SETTINGS_FIXTURE).unwrap();
+        assert_eq!(page.primary.unwrap().window_kind, session.window_kind);
+        assert_eq!(page.secondary.unwrap().window_kind, weekly.window_kind);
+    }
+
+    #[test]
+    fn api_legacy_limits_never_fabricate_a_percent_or_reset() {
+        let no_percent = API_LEGACY.replace("\"remaining_percent\":75,", "");
+        let usage = parse_api_balance(&no_percent).unwrap().usage.unwrap();
+        assert!(usage.primary.is_none() && usage.secondary.is_some());
+
+        let bad_reset = API_LEGACY.replace("2026-10-01T07:00:00Z", "soon");
+        let session = parse_api_balance(&bad_reset)
+            .unwrap()
+            .usage
+            .unwrap()
+            .primary
+            .unwrap();
+        assert_eq!(session.used_percent, 25.0);
+        assert!(session.resets_at.is_none());
+
+        let over = API_LEGACY.replace("\"remaining_percent\":75", "\"remaining_percent\":140");
+        let usage = parse_api_balance(&over).unwrap().usage.unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 0.0);
+
+        for body in [
+            API_LEGACY.replace("\"remaining_percent\":75", "\"remaining_percent\":\"75\""),
+            r#"{"included":{"session":75,"weekly":null}}"#.to_string(),
+        ] {
+            assert_eq!(
+                parse_api_balance(&body).unwrap_err().error_class(),
+                "decode_failed",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowance_beside_legacy_limits_takes_primary_like_the_page() {
+        let body = r#"{"included":{"allowance_usd":60,"balance_usd":45,
+            "session":{"remaining_percent":75,"resets_at":"2026-10-01T07:00:00Z"},
+            "weekly":{"remaining_percent":40,"resets_at":"2026-10-05T00:00:00Z"}}}"#;
+        let usage = parse_api_balance(body).unwrap().usage.unwrap();
+        let primary = usage.primary.unwrap();
+        assert_eq!(primary.used_percent, 25.0);
+        assert!(primary.window_kind.is_none());
+        assert_eq!(
+            usage.tertiary.unwrap().window_kind.as_deref(),
+            Some("five_hour")
+        );
+        assert_eq!(usage.secondary.unwrap().used_percent, 60.0);
     }
 
     type AuthReports = std::sync::Arc<std::sync::Mutex<Vec<(u16, u64)>>>;

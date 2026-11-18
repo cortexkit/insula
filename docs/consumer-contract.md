@@ -962,7 +962,12 @@ limit the provider named without a readable figure. A consumer that ignores
   allowance in `primary` with
   `usedPercent = min(100, max(0, allowance_usd - balance_usd) / allowance_usd * 100)`
   only when both amounts are stated and the allowance is positive, and takes
-  `resetsAt` from `included.period.until` when parseable. A key replaces the
+  `resetsAt` from `included.period.until` when parseable. On a legacy plan the
+  API states `included.session` and `included.weekly` instead of dollars; they
+  publish as on a legacy page, session in `primary` (`windowKind: "five_hour"`,
+  `windowMinutes: 300`) and weekly in `secondary` (`windowKind: "weekly"`,
+  `windowMinutes: 10080`), with `usedPercent = 100 - remaining_percent` and
+  `resetsAt` from `resets_at` when parseable. A key replaces the
   cookie lane for that account. `Monthly credits used` and relative
   `Next refill` prose have no denominator or absolute time and are not
   published as a window or reset.
