@@ -1325,7 +1325,10 @@ mod tests {
     #[test]
     fn api_legacy_limits_publish_in_the_page_lanes_legacy_slots() {
         let entry = parse_api_balance(API_LEGACY).unwrap();
-        assert_eq!(entry.spend.unwrap()[0].remaining.as_ref().unwrap().minor, 25);
+        assert_eq!(
+            entry.spend.unwrap()[0].remaining.as_ref().unwrap().minor,
+            25
+        );
         let usage = entry.usage.unwrap();
         let session = usage.primary.unwrap();
         assert_eq!(session.used_percent, 25.0);
