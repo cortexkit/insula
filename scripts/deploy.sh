@@ -146,7 +146,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  dry-run: nothing built, signed, installed or restarted"
   exit 0
 fi
-cargo build --release -q
+# This script deploys to the developer's own computer, which during development
+# may use the desktop app's saved-reset bypass. The feature only lets the
+# binary read CK_INSULA_DEV_LOCAL_SAVED_RESETS; nothing changes unless that is
+# set to 1 in insula's environment. Published releases (release.yml) build
+# without it.
+cargo build --release -q --features quota-module/dev-local-saved-resets
 
 if [ "$MODE" = "stage" ]; then
   full_sha="$(git rev-parse HEAD)"

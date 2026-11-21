@@ -18,6 +18,12 @@ repository = "https://github.com/cortexkit/insula"
 name = "ck-insula"
 path = "src/main.rs"
 
+[features]
+# Lets `CK_INSULA_DEV_LOCAL_SAVED_RESETS=1` admit any unscoped local route to
+# spend saved resets. Development only: published release builds leave it off,
+# so they never read the variable.
+dev-local-saved-resets = []
+
 [dependencies]
 quota-core = { path = "../quota-core" }
 subc-protocol = { workspace = true }

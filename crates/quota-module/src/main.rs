@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// The health metrics object is one `json!` literal with more members than the
+// macro's default expansion depth allows.
+#![recursion_limit = "256"]
 
 //! The ai-provider-quota subc module.
 //!
@@ -1146,6 +1149,10 @@ fn health_report(
         "vaultHandleState": snapshot
             .vault_handle_state
             .map(quota_core::vault_handles::VaultHandleState::as_str),
+        // Whether any local program running as this user may spend saved
+        // resets (the development bypass). Always false in release builds,
+        // which don't compile it; published so an operator can confirm it's off.
+        "devLocalSavedResets": dev_local_saved_resets(),
         "lastTickAgeSecs": snapshot.last_tick_age.map(|d| d.as_secs()),
         "refresherStalled": snapshot.refresher_stalled,
         // How long since ANY fetch last succeeded, and whether that has gone on
@@ -1622,22 +1629,33 @@ fn operator_app_admission(
 
 /// Set to `1` in insula's module environment to let any local route that
 /// carries no agent scope use saved resets, as the desktop app's development
-/// build does today.
+/// build does today. Read only by builds with the `dev-local-saved-resets`
+/// cargo feature, which is off by default, so published release builds never
+/// look at it.
+#[cfg_attr(not(feature = "dev-local-saved-resets"), allow(dead_code))]
 pub(crate) const DEV_LOCAL_SAVED_RESETS_ENV: &str = "CK_INSULA_DEV_LOCAL_SAVED_RESETS";
 
-/// Whether the development bypass is on, read once per process.
+/// Whether the development bypass is on, read once per process. Always false
+/// in a build without the `dev-local-saved-resets` feature.
 fn dev_local_saved_resets() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var(DEV_LOCAL_SAVED_RESETS_ENV).is_ok_and(|value| value == "1");
-        if on {
-            eprintln!(
-                "{LOG_TAG} warning: {DEV_LOCAL_SAVED_RESETS_ENV}=1, so any local program \
-                 running as this user may spend saved resets (development only)"
-            );
-        }
-        on
-    })
+    #[cfg(feature = "dev-local-saved-resets")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var(DEV_LOCAL_SAVED_RESETS_ENV).is_ok_and(|value| value == "1");
+            if on {
+                eprintln!(
+                    "{LOG_TAG} warning: {DEV_LOCAL_SAVED_RESETS_ENV}=1, so any local program \
+                     running as this user may spend saved resets (development only)"
+                );
+            }
+            on
+        })
+    }
+    #[cfg(not(feature = "dev-local-saved-resets"))]
+    {
+        false
+    }
 }
 
 /// A development bypass for the desktop app before the daemon can confirm
@@ -3601,6 +3619,7 @@ mod tests {
             "retainedVaultSnapshotAgeSecs",
             "vaultMappingWarning",
             "vaultHandleState",
+            "devLocalSavedResets",
             "lastTickAgeSecs",
             "fetchBlackout",
             "lastFetchSuccessAgeSecs",
@@ -3725,6 +3744,17 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: ModuleControlResponse = serde_json::from_slice(&response.body).unwrap();
         assert!(matches!(body, ModuleControlResponse::RouteBindAck {}));
+    }
+
+    /// A build without `dev-local-saved-resets` (every published release) must
+    /// not read the variable, even when it is set to 1.
+    #[cfg(not(feature = "dev-local-saved-resets"))]
+    #[test]
+    fn the_dev_saved_reset_bypass_is_never_on_in_a_build_without_its_feature() {
+        std::env::set_var(DEV_LOCAL_SAVED_RESETS_ENV, "1");
+        let on = dev_local_saved_resets();
+        std::env::remove_var(DEV_LOCAL_SAVED_RESETS_ENV);
+        assert!(!on);
     }
 
     /// The development bypass admits only an unscoped `direct` route, and only
