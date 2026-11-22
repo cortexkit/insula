@@ -211,6 +211,14 @@ impl UsageProvider for TypeSafeProvider {
                 .timeout(Duration::from_secs(10))
                 .header(Header::new("Cookie", jar.header()))
                 .header(Header::new("Accept", "application/json"))
+                .header(Header::new("Origin", "https://console.typesafe.ai"))
+                .header(Header::new(
+                    "Referer",
+                    "https://console.typesafe.ai/billing",
+                ))
+                .header(Header::new("Sec-Fetch-Site", "same-origin"))
+                .header(Header::new("Sec-Fetch-Mode", "cors"))
+                .header(Header::new("Sec-Fetch-Dest", "empty"))
                 .header(Header::new("User-Agent", USER_AGENT))
                 .send_raw(&http)
                 .await?;
@@ -447,6 +455,17 @@ mod tests {
             assert!(request
                 .to_ascii_lowercase()
                 .contains("accept: application/json\r\n"));
+            // Header expectations match CodexBar v0.85.0,
+            // TestsPlugin/TypeSafePluginTests.swift:38-49.
+            for header in [
+                "origin: https://console.typesafe.ai\r\n",
+                "referer: https://console.typesafe.ai/billing\r\n",
+                "sec-fetch-site: same-origin\r\n",
+                "sec-fetch-mode: cors\r\n",
+                "sec-fetch-dest: empty\r\n",
+            ] {
+                assert!(request.contains(header), "missing {header:?} in {request}");
+            }
             assert!(
                 request.contains(&format!("user-agent: {USER_AGENT}\r\n")),
                 "{request}"
@@ -512,5 +531,9 @@ mod tests {
             assert!(!error.to_string().contains("private-response"));
             assert!(error.to_string().len() < 200);
         }
+        // The cross-origin refusal body comes from CodexBar v0.85.0,
+        // TestsPlugin/TypeSafePluginTests.swift:137-145.
+        let refusal = fetch(403, r#"{"detail":"Cross-origin request refused"}"#, None).await;
+        assert_eq!(refusal.usage.unwrap_err().error_class(), "upstream_failed");
     }
 }
