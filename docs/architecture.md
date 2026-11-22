@@ -39,6 +39,7 @@ The `ck-insula` binary.
 | `src/main.rs` | startup, the module manifest, the subc frame loop, the `usage.get` / `usage.drops` / `events_get` handlers and the `health.check` report |
 | `src/bus.rs` | bounded quota sample queue and body cache, change detection, authenticated ck-bus connection, renewal and reconnect drain |
 | `src/vault_client.rs` | the client for the credential vault module; implements `CredentialSource` |
+| `src/registration.rs` | claim mint requests on the module connection and claim presentation on new consumer connections |
 | `src/ids.rs` | the module ids this module answers as and dials |
 | `src/lib.rs` | publishes `vault_client`, `bus` and `ids` so callers use the same transport and publisher as the module |
 
@@ -53,13 +54,19 @@ environment ───┘                    ^                                   
 
 ### 1. Start
 
-`main.rs` reads the subc connection file the daemon passes as `--subc`, loads
-the quota config from `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc` (default
+Before spawning children, `main.rs` takes the daemon's private registration
+stream (a Unix socketpair or a Windows named pipe), if present, and reads the
+launch nonce. It uses the `--subc` connection file to authenticate the stream,
+sends `HELLO` with its manifest but no launch nonce, and waits for `HELLO_ACK`.
+If the daemon did not supply a stream, the module dials the connection file
+and sends the nonce in `HELLO` as before.
+
+The module loads the quota config from `$XDG_CONFIG_HOME/cortexkit/ck-quota.jsonc` (default
 `~/.config/cortexkit/ck-quota.jsonc`; a missing or malformed file means the
 defaults, with banked resets off) into a live handle, builds
 `Registry::with_defaults` with that handle and the vault client as its
-credential source, sends `HELLO` with the manifest, and spawns
-`Registry::refresh_loop_observed` and a reload task. The reload task reads the
+credential source, and spawns `Registry::refresh_loop_observed` and a reload
+task after registration. The reload task reads the
 file every 5 seconds and parses it only when its bytes changed: an edit applies on the provider's next decision, a deleted file
 applies the defaults, and a file that cannot be read or parsed keeps the last
 good config. The manifest declares one management
@@ -67,10 +74,16 @@ surface with the queries `usage.get`, `usage.watch`, `usage.drops` and `events_g
 and the writer operation `usage.observe`, and declares that the module consumes
 the credential vault and ckbus.
 
+When registered on the private stream, the vault and bus clients each mint a
+fresh, single-use claim on the module connection for every new connection,
+including reconnects. They present the claim immediately after authenticating
+and before opening a route. A refused claim fails that connection attempt; it
+never falls back to Direct. With a legacy daemon, `route.open` still carries
+the supervisor-issued launch identity when available.
+
 After each turn the observer enqueues changed serving entries without waiting
-for the bus. A separate task obtains ck-bus credentials over the existing subc
-client plumbing, presenting insula's supervisor-issued launch identity (never
-falling back to Direct), signs nonce challenges through ckbus, and publishes
+for the bus. A separate task obtains ck-bus credentials over its subc route
+(which never falls back to Direct), signs nonce challenges through ckbus, and publishes
 `ck.{acct}.event.insula.quota_sampled.v1` with the naming SDK. The bus carries
 only an event id, digest and small hints; `events_get` serves the redacted JSON
 body from a bounded in-memory cache. The queue drops its oldest sample on

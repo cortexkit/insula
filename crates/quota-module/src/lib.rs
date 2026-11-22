@@ -14,8 +14,8 @@
 //!   ring and every process-lifetime counter.
 //! * use the client the module uses. This.
 //!
-//! `main.rs` stays the binary and keeps its frame loop; only the two modules an
-//! outside caller could legitimately need are published here.
+//! `main.rs` stays the binary and keeps its frame loop; the library shares the
+//! clients and their transport support with it.
 //!
 //! One copy, not two: `main.rs` imports these from the library rather than
 //! declaring `mod` again, which would compile the same source twice and let the
@@ -23,5 +23,6 @@
 
 pub mod bus;
 pub mod ids;
+pub mod registration;
 pub mod usage_watch;
 pub mod vault_client;
