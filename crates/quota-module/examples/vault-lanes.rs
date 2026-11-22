@@ -1131,26 +1131,32 @@ mod tests {
         let ids = [
             "apikey:siliconflow:fixture",
             "apikey:siliconflow-cn:fixture",
+            "cookie:cloud.siliconflow.cn:fixture",
         ];
-        for (id, expected) in ids.iter().zip(["siliconflow", "siliconflow-cn"]) {
+        for (id, expected) in ids
+            .iter()
+            .zip(["siliconflow", "siliconflow-cn", "siliconflow-cn"])
+        {
             assert_eq!(
                 providers_for_id(id, quota_core::vault_handles::CREDENTIAL_FAMILIES),
                 vec![expected]
             );
         }
-        let report = evaluate(
-            granted(&ids),
-            usage(vec![
-                healthy("siliconflow", "vault"),
-                healthy("siliconflow-cn", "vault"),
-            ]),
-            quota_core::vault_handles::CREDENTIAL_FAMILIES,
-            DUAL_LANE,
-            ENUMERATED_UNSUPPORTED,
-        );
-        let counts = report.counts.unwrap();
-        assert_eq!((counts.routed, counts.expected, counts.checked), (2, 2, 2));
-        assert_eq!(report.exit_code, 0);
+        for china_id in &ids[1..] {
+            let report = evaluate(
+                granted(&[ids[0], china_id]),
+                usage(vec![
+                    healthy("siliconflow", "vault"),
+                    healthy("siliconflow-cn", "vault"),
+                ]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                DUAL_LANE,
+                ENUMERATED_UNSUPPORTED,
+            );
+            let counts = report.counts.unwrap();
+            assert_eq!((counts.routed, counts.expected, counts.checked), (2, 2, 2));
+            assert_eq!(report.exit_code, 0);
+        }
         let dark = evaluate(
             granted(&ids),
             usage(vec![healthy("siliconflow", "vault")]),

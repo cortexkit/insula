@@ -1868,16 +1868,18 @@ publishes:
 
 ### 7.19 `siliconflow` and `siliconflow-cn`: regional prepaid balances
 
-These are separate providers with the same parser, named after their models.dev
-slugs. Both read `GET /v1/user/info` with a vault API key as a Bearer token:
+These are separate providers, named after their models.dev slugs. Both can read
+`GET /v1/user/info` with a vault API key as a Bearer token. Only `siliconflow-cn`
+also reads a deposited console session:
 
 | Provider / `apiProvider` | Vault family | Only upstream origin | Pool currency |
 |---|---|---|---|
 | `siliconflow` | `apikey:siliconflow[:<account>]` | `https://api.siliconflow.com` | `USD` |
 | `siliconflow-cn` | `apikey:siliconflow-cn[:<account>]` | `https://api.siliconflow.cn` | `CNY` |
+| `siliconflow-cn` | `cookie:cloud.siliconflow.cn[:<account>]` | `https://cloud.siliconflow.cn` | `CNY` |
 
 No region is inferred from an account suffix, key or payload. There is no origin
-override and no retry against the other region. The China contract fixture
+override and no retry against the other region. The China API contract fixture
 publishes:
 
 ```json
@@ -1913,8 +1915,36 @@ publishes:
   statuses are also `upstream_failed`. Refusal bodies are bounded and never
   quoted. A nonempty unreadable payload, a missing required balance or an
   unsuccessful/malformed envelope is `decode_failed`.
-- Verified with CodexBar v0.84.0 fixtures in
+- API reads are verified with CodexBar v0.84.0 fixtures in
   `TestsPlugin/SiliconFlowPluginTests.swift`, not with a live SiliconFlow account.
+
+**China console session.** If a China API key is present, it is the only lane,
+even if it fails. To use the console after retirement of the China key balance
+API, remove the `apikey:siliconflow-cn` deposit and deposit the console cookie
+using [the capture URL below](#depositing-a-session-cookie-which-url-to-capture-against).
+The International provider never uses the cookie. There is no browser-store
+access or automatic fallback between credentials.
+
+- The China console reads `GET /me/expensebill` for the response `x-subject-id`,
+  then reads `GET /walletd-server/api/v1/subject/profile/peek` with that subject
+  and the same deposited `Cookie` header. Neither request follows redirects;
+  both go only to `cloud.siliconflow.cn`. The subject scopes the wallet request
+  and is not published as `account`.
+- The single reported `balance` pool comes from the wallet's signed integer
+  string `data.financialInfo.balance`, in picoyuan (10⁻¹² CNY). Zero and debt
+  are preserved.
+  Trailing zeros are removed; amounts finer than nine decimal places are
+  floored at nine places so remaining credit never increases and debt never
+  shrinks. Other wallet fields do not create pools or windows. A missing or
+  malformed subject or amount is `decode_failed`, not zero.
+- Console HTTP 401 or a redirect to `https://account.siliconflow.cn/login`
+  means `credential_rejected`; re-capture the session. HTTP 403 means
+  `upstream_failed`; check billing permissions. Other unsuccessful statuses are
+  also `upstream_failed`. Console errors never quote the redirect or refusal
+  body and never report cookie authentication failures to the vault.
+- Console reads are verified with CodexBar v0.85.0
+  `TestsPlugin/SiliconFlowWebPluginTests.swift` and insula fixtures only, not a
+  live China account.
 
 **Proven by:** `regional_vault_reads_publish_only_the_reported_total_and_verified_identity`,
 `negative_overdue_balances_and_unstated_identity_are_preserved`,
@@ -1922,7 +1952,12 @@ publishes:
 `malformed_or_missing_balances_never_turn_into_zero_or_absence`,
 `refusals_keep_their_classes_and_only_http_401_reports_a_dead_key`,
 `unusable_or_cross_region_deposits_send_nothing`,
-`siliconflow_regions_route_only_at_the_family_boundary`.
+`siliconflow_regions_route_only_at_the_family_boundary`,
+`console_binds_wallet_to_the_billing_page_subject_and_same_cookie`,
+`console_picoyuan_preserves_exact_values_and_floors_credit_and_debt`,
+`console_login_and_permission_refusals_stay_distinct_and_redacted`,
+`console_never_follows_redirects_even_on_the_same_host`,
+`console_never_takes_over_for_a_retired_china_key`.
 
 <a id="fields-on-the-account-not-the-window"></a>
 
@@ -2594,6 +2629,7 @@ match. Capture tools take the URL from this table:
 | `cookie:langdock.com:<account>` | langdock | `https://app.langdock.com/api/trpc/usageSettings.getPersonalUsage` |
 | `cookie:amr-api.open-design.ai:<account>` | opendesign | `https://amr-api.open-design.ai/api/v1/workspaces/current` |
 | `cookie:console.typesafe.ai:<account>` | typesafe | `https://console.typesafe.ai/api/billing/overview` |
+| `cookie:cloud.siliconflow.cn:<account>` | siliconflow-cn | `https://cloud.siliconflow.cn/me/expensebill` |
 | `cookie:trae.cn:<account>` | traecn | `https://api.trae.cn/cloudide/api/v3/common/GetUserToken` |
 | `cookie:kimi.com:<account>` | kimi-for-coding | `https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` |
 
@@ -2645,6 +2681,11 @@ match. Capture tools take the URL from this table:
   is `credential_rejected`; billing 5xx/transport failures are transient and
   malformed bodies or balances are `decode_failed`, never a reason to sign in
   again. The balance port is fixture-verified only, not live-verified.
+- **siliconflow-cn**: sign in to the China console, then capture the request
+  header for `/me/expensebill`. The console session cookie
+  `__SF_auth.session-token` is scoped to `.siliconflow.cn`; the deposited
+  header is sent only to the two console URLs documented in §7.19, never to
+  the login host. The cookie serves only after removing any China API key.
 - The login page can be any page where the user signs in; for factory it is
   `app.factory.ai` while the fetch is on `api.factory.ai`.
 - **traecn**: sign in at `https://www.trae.cn/dashboard`, then capture the

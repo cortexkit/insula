@@ -1,4 +1,5 @@
-//! SiliconFlow regional API-key balances, translated from CodexBar v0.84.0.
+//! SiliconFlow regional balances: API keys in both regions, and a deposited
+//! China console session when no China key is configured.
 //!
 //! The models.dev provider name fixes the origin and currency. A key is never
 //! probed against the other region. Only the aggregate balance is published:
@@ -9,17 +10,23 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::sync::Arc;
 
+use crate::cookie_vault::{CookieVault, SOURCE};
 use crate::credential_source::CredentialSource;
-use crate::http::JsonRequest;
+use crate::http::{Header, HttpResponse, JsonRequest};
 use crate::model::{Amount, Pool, PoolBasis, PoolFunding, Usage};
 use crate::money::parse_amount;
 use crate::provider::{
     AccountObservation, CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider,
 };
-use crate::vault_handles::VaultHandleLoader;
+use crate::vault_handles::{handle_id_names_family, VaultHandleLoader, SILICONFLOW_CN_COOKIE};
 
 const INTERNATIONAL_URL: &str = "https://api.siliconflow.com/v1/user/info";
 const CHINA_URL: &str = "https://api.siliconflow.cn/v1/user/info";
+const BILLING_PAGE_URL: &str = "https://cloud.siliconflow.cn/me/expensebill";
+const WALLET_URL: &str = "https://cloud.siliconflow.cn/walletd-server/api/v1/subject/profile/peek";
+// Recognize this Location without ever requesting it.
+const LOGIN_REDIRECT: &str = "https://account.siliconflow.cn/login";
+const SUBJECT_HEADER: &str = "x-subject-id";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Region {
@@ -179,21 +186,92 @@ fn normalize(body: &[u8], region: Region) -> Result<(Option<String>, Pool), Fetc
         return Err(decode());
     }
     let account = data.id.filter(|id| !id.trim().is_empty());
-    Ok((
-        account,
-        Pool {
-            id: "balance".to_string(),
-            label: "Account balance".to_string(),
-            funding: PoolFunding::Unknown,
-            remaining: Some(remaining),
-            total: None,
-            basis: PoolBasis::Reported,
-            spendable: None,
-            resets_at: None,
-            expires_at: None,
-            unlimited: None,
-        },
-    ))
+    Ok((account, balance_pool(remaining)))
+}
+
+fn balance_pool(remaining: Amount) -> Pool {
+    Pool {
+        id: "balance".to_string(),
+        label: "Account balance".to_string(),
+        funding: PoolFunding::Unknown,
+        remaining: Some(remaining),
+        total: None,
+        basis: PoolBasis::Reported,
+        spendable: None,
+        resets_at: None,
+        expires_at: None,
+        unlimited: None,
+    }
+}
+
+fn normalize_wallet(body: &[u8]) -> Result<Pool, FetchError> {
+    let wallet: serde_json::Value = serde_json::from_slice(body).map_err(|_| decode())?;
+    if wallet["code"].as_i64() != Some(20000) {
+        return Err(decode());
+    }
+    let value = wallet["data"]["financialInfo"]["balance"]
+        .as_str()
+        .ok_or_else(decode)?;
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if !(1..=30).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(decode());
+    }
+    let picoyuan = value.parse::<i128>().map_err(|_| decode())?;
+    // The wire supports at most nine places. Floor the excess digits so we
+    // never overstate credit or understate debt. Exact multiples are unchanged.
+    let mut minor = picoyuan.div_euclid(1000);
+    let mut exponent = 9;
+    while exponent > 0 && minor % 10 == 0 {
+        minor /= 10;
+        exponent -= 1;
+    }
+    Ok(balance_pool(Amount {
+        minor: i64::try_from(minor).map_err(|_| decode())?,
+        exponent,
+        unit: Region::China.currency().to_string(),
+    }))
+}
+
+fn is_login_redirect(location: &str) -> bool {
+    location
+        .get(..LOGIN_REDIRECT.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LOGIN_REDIRECT))
+        && matches!(
+            location.as_bytes().get(LOGIN_REDIRECT.len()),
+            None | Some(b'/' | b'?' | b'#')
+        )
+}
+
+fn check_console_status(response: &HttpResponse) -> Result<(), FetchError> {
+    let status = response.status;
+    if status == 401
+        || ((300..400).contains(&status)
+            && response.header("location").is_some_and(is_login_redirect))
+    {
+        return Err(FetchError::Unauthorized(
+            "siliconflow: sign in to the China console and re-capture the cookie".into(),
+        ));
+    }
+    match status {
+        200 => Ok(()),
+        403 => Err(FetchError::Upstream(
+            "siliconflow: console balance forbidden; check the account's billing access".into(),
+        )),
+        _ => Err(FetchError::Upstream(format!(
+            "siliconflow: console balance query returned HTTP {status}"
+        ))),
+    }
+}
+
+fn console_subject(page: &HttpResponse) -> Result<&str, FetchError> {
+    page.header(SUBJECT_HEADER)
+        .filter(|subject| {
+            (1..=128).contains(&subject.len())
+                && subject
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+        .ok_or_else(decode)
 }
 
 pub struct SiliconFlowProvider {
@@ -201,8 +279,11 @@ pub struct SiliconFlowProvider {
     http: reqwest::Client,
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
+    console: CookieVault,
     #[cfg(test)]
     url: Option<String>,
+    #[cfg(test)]
+    console_urls: Option<(String, String)>,
 }
 
 impl SiliconFlowProvider {
@@ -214,10 +295,17 @@ impl SiliconFlowProvider {
         Self {
             region,
             http: crate::http::provider_client(),
+            console: CookieVault::new(
+                credential_source.clone(),
+                handle_loader.clone(),
+                SILICONFLOW_CN_COOKIE,
+            ),
             credential_source,
             handle_loader,
             #[cfg(test)]
             url: None,
+            #[cfg(test)]
+            console_urls: None,
         }
     }
 
@@ -232,12 +320,52 @@ impl SiliconFlowProvider {
         check_status(response.status)?;
         normalize(response.body_for_parsing()?, self.region)
     }
+
+    async fn read_console(&self, handle: &CredentialHandle) -> Result<Pool, FetchError> {
+        let (jar, _) = self.console.jar_for(handle).await?;
+        let cookie = jar.header();
+        if cookie.is_empty() {
+            return Err(FetchError::CredentialUnusable(
+                "siliconflow: console deposit contains no usable cookies".into(),
+            ));
+        }
+        let (page_url, wallet_url) = (BILLING_PAGE_URL, WALLET_URL);
+        #[cfg(test)]
+        let (page_url, wallet_url) = self
+            .console_urls
+            .as_ref()
+            .map_or((page_url, wallet_url), |(page, wallet)| {
+                (page.as_str(), wallet.as_str())
+            });
+
+        // A captured Cookie header lacks path metadata. Never resend it to a
+        // redirect destination, even another route on the console host.
+        let http = crate::http::provider_client_without_redirects()?;
+        let page = JsonRequest::get_accepting(page_url, "text/html")
+            .header(Header::new("Cookie", &cookie))
+            .send_raw_selecting_body(&http, |_| false)
+            .await?;
+        check_console_status(&page)?;
+        let subject = console_subject(&page)?;
+        let wallet = JsonRequest::get(wallet_url)
+            .header(Header::new("Referer", page_url))
+            .header(Header::new("Cookie", &cookie))
+            .header(Header::new(SUBJECT_HEADER, subject))
+            .send_raw_selecting_body(&http, |status| status == 200)
+            .await?;
+        check_console_status(&wallet)?;
+        normalize_wallet(wallet.body_for_parsing()?)
+    }
 }
 
 #[async_trait]
 impl UsageProvider for SiliconFlowProvider {
     fn name(&self) -> &str {
         self.region.name()
+    }
+
+    fn is_cookie_based(&self) -> bool {
+        matches!(self.region, Region::China)
     }
 
     fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
@@ -251,9 +379,29 @@ impl UsageProvider for SiliconFlowProvider {
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
-        if !handle.vault_credential_id().is_some_and(|id| {
-            crate::vault_handles::handle_id_names_family(id, &format!("apikey:{}", self.name()))
-        }) {
+        if self.is_cookie_based()
+            && handle
+                .vault_credential_id()
+                .is_some_and(|id| handle_id_names_family(id, SILICONFLOW_CN_COOKIE))
+        {
+            return match self.read_console(handle).await {
+                Ok(pool) => {
+                    // The subject scopes the wallet request; it is not a stated account identity.
+                    let mut attempt = FetchAttempt::success(
+                        Some(AccountObservation::new(None, None)),
+                        SOURCE,
+                        Usage::default(),
+                    );
+                    attempt.pools = Some(vec![pool]);
+                    attempt
+                }
+                Err(error) => FetchAttempt::failure(None, Some(SOURCE.to_string()), error),
+            };
+        }
+        if !handle
+            .vault_credential_id()
+            .is_some_and(|id| handle_id_names_family(id, &format!("apikey:{}", self.name())))
+        {
             return FetchAttempt::failure(
                 None,
                 Some("vault".to_string()),
@@ -320,6 +468,330 @@ mod tests {
     const CONTRACT: &str = r#"{"code":20000,"message":"OK","status":true,"data":{"id":"user","name":"hidden","email":"hidden@example.com","balance":"0.88","status":"normal","chargeBalance":"88.00","totalBalance":"88.88"}}"#;
     const OVERDUE: &str = r#"{"code":20000,"status":true,"data":{"balance":"0.00","chargeBalance":"0.00","totalBalance":"-1.50","status":"overdue"}}"#;
     const KEY: &str = "sk-fixture";
+
+    // CodexBar v0.85.0, TestsPlugin/SiliconFlowWebPluginTests.swift:12–47,
+    // 109–165, and 310–345: wallet shape, session headers, and refusal fixtures.
+    const CONSOLE_ID: &str = "cookie:cloud.siliconflow.cn:fixture";
+    const CONSOLE_COOKIE: &str = "__SF_auth.session-token=sf-session-1";
+    const PAGE_PATH: &str = "/me/expensebill";
+    const WALLET_PATH: &str = "/walletd-server/api/v1/subject/profile/peek";
+    const SUBJECT: &str = "X-Subject-Id: subject-fixture\r\n";
+    const CHUNKED: &str = "Transfer-Encoding: chunked\r\n";
+
+    fn wallet(balance: &str) -> String {
+        format!(
+            r#"{{"code":20000,"data":{{"financialInfo":{{"balance":{balance},"available":"1","recharged":"400000000000000","used":"387500000000000"}}}}}}"#
+        )
+    }
+
+    async fn console_fixture(
+        answer: impl Fn(&str) -> (u16, String, String) + Send + 'static,
+        key: Option<&str>,
+        cookie: &str,
+    ) -> (
+        SiliconFlowProvider,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        crate::vercel::testkit::Reports,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let request = crate::loopback::read_request(&mut stream).await;
+                let path = request.split_whitespace().nth(1).unwrap();
+                let (status, headers, body) = answer(path);
+                requests.lock().unwrap().push(request);
+                let length = if headers.contains(CHUNKED) {
+                    String::new()
+                } else {
+                    format!("Content-Length: {}\r\n", body.len())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\n{headers}{length}Connection: close\r\n\r\n{body}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut rows = vec![(CONSOLE_ID, "cookie")];
+        let mut payloads = vec![(CONSOLE_ID, credential(cookie, 17))];
+        if let Some(key) = key {
+            rows.push(("apikey:siliconflow-cn:fixture", "apikey"));
+            payloads.push(("apikey:siliconflow-cn:fixture", credential(key, 18)));
+        }
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&rows);
+        let (source, reports) = MockSource::serving(&payloads);
+        let mut provider =
+            SiliconFlowProvider::new_with_handle_loader(Region::China, Some(source), loader);
+        provider.url = Some(format!("{base}/v1/user/info"));
+        provider.console_urls =
+            Some((format!("{base}{PAGE_PATH}"), format!("{base}{WALLET_PATH}")));
+        (provider, log, reports)
+    }
+
+    #[tokio::test]
+    async fn console_binds_wallet_to_the_billing_page_subject_and_same_cookie() {
+        let (provider, requests, reports) = console_fixture(
+            |path| match path {
+                // The billing response body is irrelevant even if it ends mid-stream.
+                PAGE_PATH => (200, format!("{SUBJECT}{CHUNKED}"), String::new()),
+                WALLET_PATH => (200, String::new(), wallet(r#""12500000000000""#)),
+                _ => panic!("unexpected route {path}"),
+            },
+            None,
+            CONSOLE_COOKIE,
+        )
+        .await;
+        let handles = provider.handles().unwrap();
+        assert_eq!(handles, [CredentialHandle::scoped(CONSOLE_ID, "cookie")]);
+        let attempt = provider.fetch_handle(&handles[0]).await;
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(attempt.observed.unwrap().account_id, None);
+        assert_eq!(attempt.usage.unwrap(), Usage::default());
+        let pools = attempt.pools.unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id, "balance");
+        assert_eq!(pools[0].remaining, Some(expected(125, 1, "CNY")));
+        assert_eq!(pools[0].funding, PoolFunding::Unknown);
+        assert_eq!(pools[0].basis, PoolBasis::Reported);
+        assert!(
+            pools[0].total.is_none()
+                && pools[0].spendable.is_none()
+                && pools[0].resets_at.is_none()
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (raw, path) in requests.iter().zip([PAGE_PATH, WALLET_PATH]) {
+            assert!(raw.starts_with(&format!("GET {path} ")));
+            let raw = raw.to_ascii_lowercase();
+            assert!(raw.contains(&format!(
+                "\r\ncookie: {}\r\n",
+                CONSOLE_COOKIE.to_ascii_lowercase()
+            )));
+            assert!(!raw.contains("\r\nauthorization:"));
+            assert_eq!(raw.matches("\r\naccept:").count(), 1);
+        }
+        let page = requests[0].to_ascii_lowercase();
+        assert!(!page.contains("x-subject-id:"));
+        assert!(page.contains("\r\naccept: text/html\r\n"));
+        let wallet = requests[1].to_ascii_lowercase();
+        assert!(wallet.contains("\r\nx-subject-id: subject-fixture\r\n"));
+        assert!(wallet.contains("\r\naccept: application/json\r\n"));
+        assert!(wallet.contains(&format!(
+            "\r\nreferer: {}\r\n",
+            provider.console_urls.unwrap().0
+        )));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn console_picoyuan_preserves_exact_values_and_floors_credit_and_debt() {
+        for (value, minor, exponent) in [
+            ("0", 0, 0),
+            ("-1500000000000", -15, 1),
+            ("98765432100000000000000", 98_765_432_100, 0),
+            ("1234567891987", 1_234_567_891, 9),
+            ("-1234567891987", -1_234_567_892, 9),
+            ("-1", -1, 9),
+            ("9007199254740991000", 9_007_199_254_740_991, 9),
+        ] {
+            assert_eq!(
+                normalize_wallet(wallet(&format!("\"{value}\"")).as_bytes())
+                    .unwrap()
+                    .remaining,
+                Some(expected(minor, exponent, "CNY")),
+                "{value}",
+            );
+        }
+    }
+
+    #[test]
+    fn console_invalid_or_missing_wallet_amounts_do_not_publish_a_balance() {
+        for body in [
+            "private-response-sentinel".into(),
+            r#"{"code":20000,"data":{"financialInfo":{}}}"#.into(),
+            r#"{"code":1,"data":{"financialInfo":{"balance":"1"}}}"#.into(),
+            r#"[20000,[["1"]]]"#.into(),
+            wallet(r#""""#),
+            wallet(r#""1.5""#),
+            wallet("12"),
+            wallet("null"),
+            wallet(r#""+1""#),
+            wallet(r#""9223372036854775808000000000000""#),
+            wallet(r#""922337203685477580812345678901""#),
+        ] {
+            let error = normalize_wallet(body.as_bytes()).unwrap_err();
+            assert_eq!(error.error_class(), "decode_failed", "{body}");
+            assert!(!error.to_string().contains("private-response-sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn console_missing_or_malformed_subject_stops_before_wallet() {
+        for subject in [None, Some(""), Some("bad subject"), Some("bad/subject")] {
+            let (provider, requests, _) = console_fixture(
+                move |_| {
+                    (
+                        200,
+                        subject.map_or_else(String::new, |s| format!("X-Subject-Id: {s}\r\n")),
+                        String::new(),
+                    )
+                },
+                None,
+                CONSOLE_COOKIE,
+            )
+            .await;
+            let attempt = provider.fetch_handle(&provider.handles().unwrap()[0]).await;
+            assert_eq!(attempt.usage.unwrap_err().error_class(), "decode_failed");
+            assert!(attempt.pools.is_none());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn console_login_and_permission_refusals_stay_distinct_and_redacted() {
+        for (status, location, class) in [
+            (
+                307,
+                "https://account.siliconflow.cn/login?state=state-sentinel",
+                "credential_rejected",
+            ),
+            (401, "", "credential_rejected"),
+            (
+                403,
+                "https://account.siliconflow.cn/login",
+                "upstream_failed",
+            ),
+            (429, "", "upstream_failed"),
+            (503, "", "upstream_failed"),
+            (
+                307,
+                "https://account.siliconflow.cn.evil/login",
+                "upstream_failed",
+            ),
+            (
+                307,
+                "https://account.siliconflow.cn/login-elsewhere",
+                "upstream_failed",
+            ),
+        ] {
+            for refuse_path in [PAGE_PATH, WALLET_PATH] {
+                let (provider, requests, reports) = console_fixture(
+                    move |path| {
+                        if path == refuse_path {
+                            (
+                                status,
+                                format!("Location: {location}\r\n{CHUNKED}"),
+                                // An incomplete refusal body must not override its status.
+                                format!("800\r\nprivate-response-sentinel: {CONSOLE_COOKIE}"),
+                            )
+                        } else {
+                            (200, SUBJECT.into(), String::new())
+                        }
+                    },
+                    None,
+                    CONSOLE_COOKIE,
+                )
+                .await;
+                let error = provider
+                    .fetch_handle(&provider.handles().unwrap()[0])
+                    .await
+                    .usage
+                    .unwrap_err();
+                assert_eq!(error.error_class(), class, "HTTP {status} {location}");
+                for secret in [
+                    "state-sentinel",
+                    "private-response-sentinel",
+                    CONSOLE_COOKIE,
+                ] {
+                    assert!(!error.to_string().contains(secret));
+                }
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    if refuse_path == PAGE_PATH { 1 } else { 2 }
+                );
+                tokio::task::yield_now().await;
+                assert!(reports.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn console_never_follows_redirects_even_on_the_same_host() {
+        let (provider, requests, _) = console_fixture(
+            |path| match path {
+                PAGE_PATH => (302, "Location: /other\r\n".into(), String::new()),
+                _ => (200, SUBJECT.into(), wallet(r#""1""#)),
+            },
+            None,
+            CONSOLE_COOKIE,
+        )
+        .await;
+        let error = provider
+            .fetch_handle(&provider.handles().unwrap()[0])
+            .await
+            .usage
+            .unwrap_err();
+        assert_eq!(error.error_class(), "upstream_failed");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn console_never_takes_over_for_a_retired_china_key() {
+        let (provider, requests, reports) = console_fixture(
+            |_| (410, String::new(), String::new()),
+            Some(KEY),
+            CONSOLE_COOKIE,
+        )
+        .await;
+        let handles = provider.handles().unwrap();
+        assert_eq!(
+            handles,
+            [CredentialHandle::scoped(
+                "apikey:siliconflow-cn:fixture",
+                "apikey"
+            )]
+        );
+        let error = provider.fetch_handle(&handles[0]).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "upstream_failed");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/user/info "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer sk-fixture\r\n"));
+        assert!(!requests[0].to_ascii_lowercase().contains("\r\ncookie:"));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_unusable_deposit_and_international_cookie_handle_send_nothing() {
+        let (provider, requests, _) =
+            console_fixture(|_| (200, SUBJECT.into(), String::new()), None, " ").await;
+        let handle = provider.handles().unwrap().remove(0);
+        let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "credential_unusable");
+        assert!(requests.lock().unwrap().is_empty());
+
+        let (mut provider, requests, _) = console_fixture(
+            |_| (200, SUBJECT.into(), wallet(r#""1""#)),
+            None,
+            CONSOLE_COOKIE,
+        )
+        .await;
+        provider.region = Region::International;
+        assert!(!provider.is_cookie_based());
+        assert!(provider.handles().unwrap().is_empty());
+        let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "credential_unusable");
+        assert!(requests.lock().unwrap().is_empty());
+    }
 
     fn expected(minor: i64, exponent: u8, currency: &str) -> Amount {
         Amount {

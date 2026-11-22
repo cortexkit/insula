@@ -171,6 +171,10 @@ def claims(cid, fams):
     ['siliconflow']
     >>> claims("apikey:siliconflow-cn:fixture", fams)
     ['siliconflow-cn']
+    >>> claims("cookie:cloud.siliconflow.cn:fixture", fams)
+    ['siliconflow-cn']
+    >>> claims("cookie:cloud.siliconflow.cn.other:fixture", fams)
+    []
     >>> claims("apikey:siliconflow-other", fams)
     []
     """
