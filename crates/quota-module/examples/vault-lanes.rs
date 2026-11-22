@@ -1127,6 +1127,30 @@ mod tests {
     }
 
     #[test]
+    fn trustedrouter_expects_the_key_budget_to_be_served_from_the_vault() {
+        for id in ["apikey:trustedrouter", "apikey:trustedrouter:fixture"] {
+            let report = evaluate(
+                granted(&[id]),
+                usage(vec![healthy("trustedrouter", "vault")]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                DUAL_LANE,
+                ENUMERATED_UNSUPPORTED,
+            );
+            let counts = report.counts.unwrap();
+            assert_eq!((counts.routed, counts.expected, counts.checked), (1, 1, 1));
+            assert_eq!(report.exit_code, 0);
+            let dark = evaluate(
+                granted(&[id]),
+                usage(vec![]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                DUAL_LANE,
+                ENUMERATED_UNSUPPORTED,
+            );
+            assert_eq!(dark.exit_code, 1, "{dark:?}");
+        }
+    }
+
+    #[test]
     fn siliconflow_regions_are_distinct_expected_vault_lanes() {
         let ids = [
             "apikey:siliconflow:fixture",

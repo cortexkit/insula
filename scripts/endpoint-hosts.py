@@ -53,6 +53,7 @@ SRC = REPO / "crates/quota-core/src"
 EXPECTED: dict[str, dict[str, str]] = {
     "abliteration": {"API_BASE": "api.abliteration.ai"},
     "tripo": {"API_BASE": "openapi.tripo3d.ai"},
+    "trustedrouter": {"KEY_URL": "api.trustedrouter.com"},
     "amp": {"SETTINGS_URL": "ampcode.com"},
     "anthropic": {
         "USAGE_URL": "api.anthropic.com",

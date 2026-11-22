@@ -1,6 +1,6 @@
 # Provider matrix
 
-52 providers registered.
+53 providers registered.
 
 This is the public inventory of `Registry::with_defaults` in
 `crates/quota-core/src/lib.rs`, not a porting plan or a parity-review ledger.
@@ -48,6 +48,7 @@ on every operating system. The public wire semantics are in
 |---|---|---|---|
 | `abliteration` | `ABLITERATION_API_KEY`; vault `apikey:abliteration` | `GET https://api.abliteration.ai/v1/credits` | Derived USD credit balance (`max(0, total − usage)`) beside the stated total; no rate window or reset. Tested against upstream fixtures only |
 | `tripo` | Vault `apikey:tripo[:<account>]` only | `GET https://openapi.tripo3d.ai/v3/account/balance` | Exact available credit balance and separate frozen reservations (`spendable: false`); no windows, reset or inferred funding. CodexBar v0.84.0 fixtures only |
+| `trustedrouter` | Vault `apikey:trustedrouter[:<account>]` only | `GET https://api.trustedrouter.com/v1/key` | Reported per-key remaining USD budget and cap in exact microdollars, or an unlimited pool with no amounts; no window or reset. Verified with [CodexBar v0.85.0](https://github.com/steipete/CodexBar/blob/v0.85.0/TestsPlugin/TrustedRouterPluginTests.swift) and insula fixtures, not a live account |
 | `litellm` | `LITELLM_API_KEY`; vault `apikey:litellm[:<account>]`; live config `litellm.base_url` | Configured proxy: `GET /key/info`, `/user/info`, `/team/info` | Separate personal/member and team USD budget pools; scoped member spend only, optional membership failures preserve known budgets. No cap means no capacity. CodexBar v0.83.0 fixtures only |
 | `alibaba` | `ALIBABA_CODING_PLAN_API_KEY`, `ALIBABA_QWEN_API_KEY`, `DASHSCOPE_API_KEY`; region/URL overrides | `POST https://modelstudio.console.alibabacloud.com/data/api.json` or `https://bailian.console.aliyun.com/data/api.json`, `queryCodingPlanInstanceInfoV2` | 5h / weekly / monthly |
 | `chatbox` | `CHATBOX_LICENSE_KEY`; vault `apikey:chatbox` | `GET https://api.chatboxai.app/api/license/detail/realtime` (the bare license key as `Authorization`) | Usable plan's compute-point window with the stated next refresh as reset, no stated cadence; reward, top-up, image and legacy combined allowances as resetless pools; license end as `subscriptionEndsAt`. Tested against upstream fixtures only |

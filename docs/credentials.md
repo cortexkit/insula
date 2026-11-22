@@ -72,6 +72,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:soniox` | `soniox` (an organization API key) |
 | `apikey:abliteration` | `abliteration` (an abliteration.ai API key) |
 | `apikey:tripo` | `tripo` (a Tripo API key; vault-only) |
+| `apikey:trustedrouter` | `trustedrouter` (a TrustedRouter inference API key; vault-only) |
 | `apikey:litellm` | `litellm` (a virtual key for the configured LiteLLM proxy) |
 | `apikey:cline-pass` | `clinepass` (a Cline plan API key) |
 | `apikey:chatbox` | `chatbox` (a Chatbox AI license key) |
@@ -96,6 +97,14 @@ does not select a region: `apikey:siliconflow:china` still goes only to the
 International `.com` API. There is no origin override, region probing or local
 credential fallback. Each region follows the API-key routing guard that refuses
 multiple deposits in one family; a suffix labels a deposit, not a verified owner.
+
+### TrustedRouter API keys
+
+Deposit one plain inference API key per host as `apikey:trustedrouter` or
+`apikey:trustedrouter:<account>`. The suffix labels the deposit, not an account
+identity. There is no environment or local-file fallback. insula sends the key
+as a bearer only to `api.trustedrouter.com` to read that key's budget. See the
+[consumer contract](consumer-contract.md#720-trustedrouter-per-key-budget).
 
 ### OpenAI Platform browser session keys
 

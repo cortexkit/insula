@@ -79,6 +79,7 @@ pub mod synthetic;
 pub mod text;
 pub mod traecn;
 pub mod tripo;
+pub mod trustedrouter;
 pub mod typesafe;
 pub mod unread_keys;
 pub mod vault_handles;
@@ -471,6 +472,7 @@ const API_PROVIDER_SLUGS: &[(&str, &str)] = &[
     ("opencode", "opencode"),
     ("opencodego", "opencode-go"),
     ("openrouter", "openrouter"),
+    ("trustedrouter", "trustedrouter"),
     ("ollama", "ollama-cloud"),
     ("sakana", "sakana"),
     ("neuralwatt", "neuralwatt"),
@@ -875,6 +877,12 @@ impl Registry {
                 credential_source.clone(),
                 Arc::clone(&vault_handle_loader),
             )),
+            Box::new(
+                trustedrouter::TrustedRouterProvider::new_with_handle_loader(
+                    credential_source.clone(),
+                    Arc::clone(&vault_handle_loader),
+                ),
+            ),
         ]);
         // A real source means the empty mapping is "not answered yet" until the
         // first enumeration returns, not "this host holds no vault credentials".
