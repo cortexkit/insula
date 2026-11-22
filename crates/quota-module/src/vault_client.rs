@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
 
 use crate::ids::CREDENTIALS_MODULE_ID;
+use crate::registration::{present_claim, ClaimMinter};
 mod watch;
 /// Bounds both the TCP connect and the HMAC handshake that follows it.
 ///
@@ -251,6 +252,7 @@ struct Pending {
 
 struct ClientState {
     connection_file_path: PathBuf,
+    claims: Option<ClaimMinter>,
     target_module: &'static str,
     require_identity: bool,
     connection: AsyncMutex<ConnectionState>,
@@ -293,6 +295,7 @@ impl ClientState {
     fn with_timeout(connection_file_path: PathBuf, request_timeout: Duration) -> Self {
         Self {
             connection_file_path,
+            claims: None,
             target_module: CREDENTIALS_MODULE_ID,
             require_identity: false,
             connection: AsyncMutex::new(ConnectionState::Empty { retry_after: None }),
@@ -406,6 +409,16 @@ impl ClientState {
         self: &Arc<Self>,
         generation: u64,
     ) -> Result<Arc<LiveConnection>, ClientFailure> {
+        let claim = if let Some(claims) = &self.claims {
+            Some(
+                claims
+                    .mint(CONNECT_TIMEOUT)
+                    .await
+                    .ok_or(ClientFailure::Transport)?,
+            )
+        } else {
+            None
+        };
         let metadata = connection_file::read(&self.connection_file_path)
             .map_err(|_| ClientFailure::Transport)?;
         let endpoint = metadata.endpoints.first().ok_or(ClientFailure::Transport)?;
@@ -417,6 +430,11 @@ impl ClientState {
         authenticate_client(&mut stream, &metadata, CONNECT_TIMEOUT)
             .await
             .map_err(|_| ClientFailure::Transport)?;
+        if let Some(claim) = claim {
+            present_claim(&mut stream, self.next_corr(), claim, CONNECT_TIMEOUT)
+                .await
+                .ok_or(ClientFailure::Transport)?;
+        }
 
         let (reader, writer) = tokio::io::split(stream);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_BUFFER);
@@ -732,47 +750,30 @@ impl ClientState {
         attempt.wait().await
     }
 
-    /// Open the route, retrying once WITHOUT the identity claim if it is refused.
-    ///
-    /// A refused claim is answered with an error frame and NO ROUTE -- it is not
-    /// downgraded to `Direct` (measured by the vault's maintainer against the live
-    /// daemon). That is the right behaviour on their side and it creates a failure
-    /// mode here that did not exist before the claim did: a nonce that has gone
-    /// stale, say because the daemon restarted without respawning this process,
-    /// refuses every `route.open` and takes EVERY vault lane dark at once.
-    ///
-    /// Without this arm that lands in the unknown-code default, which is transient,
-    /// so it would retry forever while the lanes serve stale and nothing names the
-    /// cause -- and an operator would go looking at credentials and grants, both of
-    /// which would be fine.
-    ///
-    /// SO THE RETRY IS A STRICT DE-ESCALATION, never a widening: presenting no
-    /// identity yields `Direct`, which is exactly what this client had before the
-    /// claim existed. It cannot grant more than the claim would have. Scoped ops
-    /// stop working; handle-addressed ops keep working, which today is all of them.
-    ///
-    /// AND IT IS LOUD, because a silent downgrade is precisely what the vault side
-    /// refused to do and it would be perverse to reintroduce it one layer down.
-    ///
-    /// RETIRE THIS ARM WHEN ENUMERATION MOVES TO `list_scoped`. At that point
-    /// `Direct` serves nothing, so degrading to it buys nothing and hides
-    /// everything; the honest behaviour then is to fail the open and let the lanes
-    /// go dark with a named cause.
+    /// Only the legacy vault path may de-escalate from a refused launch nonce
+    /// to Direct for handle-addressed operations. A claim-bound connection gets
+    /// its principal at presentation and cannot override it in `route.open`.
     async fn open_route(
         self: &Arc<Self>,
         connection: &Arc<LiveConnection>,
         route_generation: u64,
     ) -> Result<RouteLease, ClientFailure> {
+        if self.claims.is_some() {
+            return self
+                .open_route_inner(connection, route_generation, None)
+                .await;
+        }
+        let identity = consumer_identity();
         if self.require_identity {
-            if consumer_identity().is_none() {
+            if identity.is_none() {
                 return Err(ClientFailure::IdentityRefused);
             }
             return self
-                .open_route_inner(connection, route_generation, true)
+                .open_route_inner(connection, route_generation, identity)
                 .await;
         }
         match self
-            .open_route_inner(connection, route_generation, true)
+            .open_route_inner(connection, route_generation, identity)
             .await
         {
             Err(ClientFailure::IdentityRefused) => {
@@ -784,7 +785,7 @@ impl ClientState {
                      module restart clears it. This is a statement about the identity claim and \
                      NOT about credentials or grants, which will both look fine."
                 );
-                self.open_route_inner(connection, route_generation, false)
+                self.open_route_inner(connection, route_generation, None)
                     .await
             }
             other => other,
@@ -795,10 +796,10 @@ impl ClientState {
         self: &Arc<Self>,
         connection: &Arc<LiveConnection>,
         route_generation: u64,
-        claim_identity: bool,
+        consumer_identity: Option<Value>,
     ) -> Result<RouteLease, ClientFailure> {
         let corr = self.next_corr();
-        let body = serde_json::to_vec(&serde_json::json!({
+        let mut body = serde_json::json!({
             "op": "route.open",
             "target": {
                 "kind": "management_surface",
@@ -810,33 +811,13 @@ impl ClientState {
                 "harness": "ck-quota",
                 "session": "vault-consumer",
             },
-            // WITHOUT THIS THE DAEMON STAMPS US `Direct`, AND SILENTLY.
-            //
-            // `route_open_principal` returns `Principal::Direct` when no consumer
-            // identity is present, and `Reserved { module_id }` when one is present
-            // and the supervisor validates its launch nonce. Being supervised is
-            // not enough and neither is the connection: the principal is a thing
-            // the CALLER SENDS.
-            //
-            // Measured before this existed: a grant on `reserved:insula` was live
-            // and correct, and `credential.list_scoped` still refused with
-            // `NotFound` -- the same answer the vault gives when it simply has
-            // nothing for you, which is why the cause took a source read rather
-            // than a log.
-            //
-            // The daemon does NOT `deny_unknown_fields` here, deliberately, so a
-            // misspelled key would parse to `None` and demote every call to
-            // `Direct` -- capability-safe and diagnostically awful, surfacing far
-            // from its cause. Their own test pins the spelling for that reason;
-            // `consumer_identity_fields_match_the_daemons_wire_names` below pins
-            // our side of the same join.
-            "consumer_identity": if claim_identity {
-                consumer_identity()
-            } else {
-                None
-            },
-        }))
-        .map_err(|_| ClientFailure::RouteSetup)?;
+        });
+        if self.claims.is_none() {
+            // Legacy routes need the nonce to earn Reserved; preserve null when
+            // opening as Direct. Claim-bound routes must omit the entire field.
+            body["consumer_identity"] = consumer_identity.unwrap_or(Value::Null);
+        }
+        let body = serde_json::to_vec(&body).map_err(|_| ClientFailure::RouteSetup)?;
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Passive, false),
@@ -1067,8 +1048,9 @@ pub(crate) struct BusRoute {
 }
 
 impl BusRoute {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf, claims: Option<ClaimMinter>) -> Self {
         let mut state = ClientState::new(path);
+        state.claims = claims;
         state.target_module = "ckbus";
         state.require_identity = true;
         Self {
@@ -1181,8 +1163,17 @@ impl VaultClient {
     }
 
     pub fn new(connection_file_path: impl Into<PathBuf>) -> Self {
+        Self::new_with_claims(connection_file_path, None)
+    }
+
+    pub fn new_with_claims(
+        connection_file_path: impl Into<PathBuf>,
+        claims: Option<ClaimMinter>,
+    ) -> Self {
+        let mut state = ClientState::new(connection_file_path.into());
+        state.claims = claims;
         Self {
-            state: Arc::new(ClientState::new(connection_file_path.into())),
+            state: Arc::new(state),
             watch: AsyncMutex::new(watch::InventoryWatch::default()),
         }
     }
@@ -2378,7 +2369,7 @@ mod tests {
     /// serving, which sends a reader to the one module that is fine.
     #[tokio::test]
     async fn a_refused_bus_route_names_ckbus() {
-        let bus = BusRoute::new(PathBuf::from("/nonexistent/subc-connection.json"));
+        let bus = BusRoute::new(PathBuf::from("/nonexistent/subc-connection.json"), None);
         bus.state.classify_error_frame(
             format!(
                 r#"{{"code":"{}"}}"#,
@@ -2821,6 +2812,10 @@ mod tests {
 
     pub(super) async fn reply_route(stream: &mut TcpStream, channel: u16, epoch: u32) {
         let request = read_frame(stream).await.unwrap().unwrap();
+        send_route_reply(stream, &request, channel, epoch).await;
+    }
+
+    async fn send_route_reply(stream: &mut TcpStream, request: &Frame, channel: u16, epoch: u32) {
         assert_eq!(request.header.ty, FrameType::Request);
         assert_eq!(request.header.channel, 0);
         let response = Frame::build(
@@ -2837,6 +2832,151 @@ mod tests {
         )
         .unwrap();
         write_frame(stream, &response).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_bound_vault_and_bus_present_fresh_claims_before_route_open() {
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("claim-routes").await;
+        let (writer, mut outgoing) = mpsc::channel(4);
+        let claims = ClaimMinter::new(&writer);
+        let vault = VaultClient::new_with_claims(path.clone(), Some(claims.clone()));
+        let bus = BusRoute::new(path, Some(claims.clone()));
+        let server = async {
+            for (target, token) in [
+                (CREDENTIALS_MODULE_ID, "vault-claim"),
+                ("ckbus", "bus-claim"),
+                ("ckbus", "bus-reconnect-claim"),
+            ] {
+                let mint = outgoing.recv().await.unwrap();
+                assert_eq!(mint.header.ty, FrameType::Request);
+                assert_eq!((mint.header.channel, mint.header.epoch), (0, 0));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&mint.body).unwrap(),
+                    serde_json::json!({"op":"claim.mint", "purpose":"self"})
+                );
+                claims.dispatch(claim_test_frame(
+                    FrameType::Response,
+                    mint.header.corr,
+                    serde_json::json!({"op":"claim.mint", "claim":token, "expires_at_ms":0}),
+                ));
+                let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+                let present = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(present.header.ty, FrameType::Request);
+                assert_eq!((present.header.channel, present.header.epoch), (0, 0));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&present.body).unwrap(),
+                    serde_json::json!({"op":"claim.present", "claim":token}),
+                    "the first frame after authentication must present this connection's claim"
+                );
+                write_frame(
+                    &mut stream,
+                    &claim_test_frame(
+                        FrameType::Response,
+                        present.header.corr,
+                        serde_json::json!({"op":"claim.present"}),
+                    ),
+                )
+                .await
+                .unwrap();
+                let request = read_frame(&mut stream).await.unwrap().unwrap();
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["op"], "route.open");
+                assert_eq!(body["target"]["module_id"], target);
+                assert!(body.get("consumer_identity").is_none());
+                send_route_reply(&mut stream, &request, 7, 3).await;
+            }
+        };
+        let clients = async {
+            for state in [&vault.state, &bus.state, &bus.state] {
+                let connection = state.connection().await.unwrap();
+                state.route(&connection).await.unwrap();
+                state.invalidate_connection(connection.generation).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, clients)
+        })
+        .await
+        .expect("claim mint, presentation and route open must finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_route_open_is_first_and_carries_launch_identity() {
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("legacy-route").await;
+        let state = Arc::new(ClientState::new(path));
+        let server = async {
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], "route.open");
+            assert_eq!(
+                body["consumer_identity"],
+                serde_json::json!({"module_id":"insula", "launch_nonce":"fixture-nonce"})
+            );
+            send_route_reply(&mut stream, &request, 7, 3).await;
+        };
+        let client = async {
+            let connection = state.connection().await.unwrap();
+            let identity = consumer_identity_from(|_| Some("insula".into()), Some("fixture-nonce"));
+            state
+                .open_route_inner(&connection, 1, identity)
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("legacy route open must finish without a claim");
+    }
+
+    #[tokio::test]
+    async fn refused_claim_presentation_closes_without_opening_a_direct_route() {
+        let (listener, path, key, daemon_id, _dir) = loopback_listener("refused-claim").await;
+        let (writer, mut outgoing) = mpsc::channel(1);
+        let claims = ClaimMinter::new(&writer);
+        let client = VaultClient::new_with_claims(path, Some(claims.clone()));
+        let server = async {
+            let mint = outgoing.recv().await.unwrap();
+            claims.dispatch(claim_test_frame(
+                FrameType::Response,
+                mint.header.corr,
+                serde_json::json!({"op":"claim.mint", "claim":"refused-claim", "expires_at_ms":0}),
+            ));
+            let mut stream = accept_authenticated(&listener, &key, &daemon_id).await;
+            let present = read_frame(&mut stream).await.unwrap().unwrap();
+            write_frame(
+                &mut stream,
+                &claim_test_frame(
+                    FrameType::Error,
+                    present.header.corr,
+                    serde_json::json!({"code":"claim_invalid", "message":"claim refused"}),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(read_frame(&mut stream).await.unwrap().is_none());
+        };
+        let call = async {
+            let error = client.state.call(Vec::new()).await.unwrap_err();
+            assert_eq!(error, ClientFailure::Transport);
+            assert_eq!(error.vault_error(), VaultGetError::Transient);
+        };
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(server, call) })
+            .await
+            .expect("refusal must close the socket without further requests");
+    }
+
+    fn claim_test_frame(ty: FrameType, corr: u64, body: Value) -> Frame {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
     }
 
     fn get_success(request: &Frame, payload: &[u8]) -> Frame {

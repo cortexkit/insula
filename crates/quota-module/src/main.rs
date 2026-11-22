@@ -21,7 +21,7 @@
 // ONE compiled copy. Declaring `mod` here as well would build the same source
 // twice and let the two drift while both continue to compile.
 use quota_module::usage_watch::{UsageWatches, USAGE_WATCH_OP};
-use quota_module::{bus, ids, vault_client};
+use quota_module::{bus, ids, registration::ClaimMinter, vault_client};
 
 use ids::DEFAULT_MODULE_ID;
 
@@ -44,6 +44,7 @@ use quota_core::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use subc_os::registration_channel::{take_registration_channel, RegistrationChannel};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ConsumerRole, ManagementOperation,
@@ -164,32 +165,18 @@ async fn main() -> Result<(), ModuleError> {
         println!("{message}");
         return Ok(());
     }
-    // THE LAUNCH NONCE IS READ HERE, FIRST, before anything that could start a
-    // child process. The daemon hands it over on an inherited pipe (descriptor 3)
-    // that stays inheritable until it is read, and this module spawns system
-    // binaries (`ps`, `lsof`, `security`) from the refresher: each one started
-    // before this line would inherit the pipe holding the one secret that proves
-    // supervised launch. `subc_os::launch_nonce()` reads it once, closes it, and
-    // caches the answer, so the HELLO and the vault client both go through it
-    // again later and get the same value without touching the descriptor.
-    //
-    // An error REFUSES TO START, with the reason printed (never the nonce). It
-    // means the daemon named a descriptor that could not be read: the handoff is
-    // broken. Carrying on would send a HELLO without the nonce, which the daemon
-    // refuses anyway, and open every vault route as `Direct`, which leaves every
-    // vault-backed account dark while the module looks up. Exiting here makes the
-    // daemon report a failed launch at its cause instead.
-    //
-    // After the informational flags on purpose: `--version` reads no nonce and
-    // spawns nothing, and must keep answering in a shell that inherited the
-    // descriptor variable without the descriptor.
+    // Adopt both handoffs before the refresher can spawn children. Taking the
+    // channel makes it non-inheritable; reading the nonce closes its pipe and
+    // caches the result. Informational flags do neither and spawn nothing.
+    let registration = take_registration_channel()
+        .map_err(|error| ModuleError::Message(format!("registration channel: {error}")))?;
     let launch_nonce = subc_os::launch_nonce().map_err(|error| {
         eprintln!("{LOG_TAG} refusing to start: cannot read the launch nonce: {error}");
         ModuleError::Message(format!("launch nonce: {error}"))
     })?;
     let config = ModuleConfig::from_env(launch_nonce)?;
     let (live_config, config_reloader) = load_quota_config();
-    run(config, live_config, config_reloader).await
+    run(config, registration, live_config, config_reloader).await
 }
 
 struct ModuleConfig {
@@ -371,18 +358,24 @@ fn spawn_config_reloader(
 
 async fn run(
     config: ModuleConfig,
+    registration: Option<RegistrationChannel>,
     quota_config: LiveQuotaConfig,
     config_reloader: Option<ConfigReloader>,
 ) -> Result<(), ModuleError> {
-    let stream = connect_to_subc(&config.connection_file_path).await?;
+    let channel_registration = registration.is_some();
+    let stream = connect_to_subc(&config.connection_file_path, registration).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
+    let claims = channel_registration.then(|| ClaimMinter::new(&tx));
 
     // Held concretely as well as behind the trait: the health path reads this
     // client's own frame-drop counters, which the CredentialSource trait does
     // not expose because they are a property of THIS transport rather than of
     // credential lookup.
-    let vault = Arc::new(VaultClient::new(config.connection_file_path.clone()));
+    let vault = Arc::new(VaultClient::new_with_claims(
+        config.connection_file_path.clone(),
+        claims.clone(),
+    ));
     // Process-lifetime consumption counters. Reset on restart like every other
     // process-lifetime metric here, which is why the AGES matter more than the
     // totals for an operator: a fresh process legitimately shows zero served.
@@ -400,15 +393,27 @@ async fn run(
         samples: Arc::clone(&samples),
         ..Default::default()
     });
+    // No consumer can ask to mint until the daemon has accepted our HELLO.
+    let nonce = config
+        .launch_nonce
+        .as_ref()
+        .map(|nonce| (nonce.value(), nonce.source()));
+    send(
+        &tx,
+        hello_frame(&config.module_id, nonce, channel_registration)?,
+    )
+    .await?;
+    expect_hello_ack(&mut read_half).await?;
 
     // The background refresher owns all provider fetching: the serving path
     // (usage.get) only ever reads the slot store, so route reads never block on
     // the network. Cancelled when the frame loop ends so the task never leaks.
     let refresher_cancel = CancellationToken::new();
     let reload = spawn_config_reloader(config_reloader, refresher_cancel.clone());
-    let publisher = samples.spawn(
+    let publisher = samples.spawn_with_claims(
         config.connection_file_path.clone(),
         refresher_cancel.clone(),
+        claims.clone(),
     );
     let refresher = {
         let registry = Arc::clone(&registry);
@@ -423,12 +428,15 @@ async fn run(
     let loop_result = module_loop(
         &mut read_half,
         tx.clone(),
-        &config,
+        claims.as_ref(),
         Arc::clone(&registry),
         Arc::clone(&vault),
         Arc::clone(&serve),
     )
     .await;
+    if let Some(claims) = claims {
+        claims.close();
+    }
     drop(tx);
 
     // Stop the refresher and reap it before returning.
@@ -450,17 +458,48 @@ async fn run(
     }
 }
 
-async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, ModuleError> {
+trait ModuleStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ModuleStream for T {}
+
+fn registration_stream(channel: RegistrationChannel) -> std::io::Result<Box<dyn ModuleStream>> {
+    #[cfg(unix)]
+    {
+        let stream = channel.into_unix_stream();
+        stream.set_nonblocking(true)?;
+        Ok(Box::new(tokio::net::UnixStream::from_std(stream)?))
+    }
+    #[cfg(windows)]
+    {
+        Ok(Box::new(channel.into_tokio_pipe_client()?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = channel;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+async fn connect_to_subc(
+    connection_file_path: &PathBuf,
+    registration: Option<RegistrationChannel>,
+) -> Result<Box<dyn ModuleStream>, ModuleError> {
     let conn = connection_file::read(connection_file_path)
         .map_err(|e| ModuleError::Message(format!("reading connection file: {e}")))?;
-    let endpoint = conn
-        .endpoints
-        .first()
-        .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?;
+    let mut stream: Box<dyn ModuleStream> = if let Some(channel) = registration {
+        registration_stream(channel)
+            .map_err(|e| ModuleError::Message(format!("adopting registration channel: {e}")))?
+    } else {
+        let endpoint = conn
+            .endpoints
+            .first()
+            .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
+        let addr = format!("{}:{}", endpoint.host, endpoint.port);
+        Box::new(
+            TcpStream::connect(&addr)
+                .await
+                .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?,
+        )
+    };
     authenticate_client(&mut stream, &conn, std::time::Duration::from_secs(2))
         .await
         .map_err(|e| ModuleError::Message(format!("authenticate: {e}")))?;
@@ -470,7 +509,7 @@ async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, Mo
 async fn module_loop<R>(
     read_half: &mut R,
     writer: mpsc::Sender<Frame>,
-    config: &ModuleConfig,
+    claims: Option<&ClaimMinter>,
     registry: Arc<Registry>,
     vault: Arc<VaultClient>,
     serve: Arc<ServeCounters>,
@@ -478,9 +517,6 @@ async fn module_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
-    send_hello(&writer, config).await?;
-    expect_hello_ack(read_half).await?;
-
     let result = async {
         loop {
             let Some(frame) = read_frame(read_half)
@@ -489,6 +525,15 @@ where
             else {
                 return Ok(()); // clean EOF: subc closed the connection.
             };
+            if let Some(claims) = claims {
+                if frame.header.channel == 0
+                    && frame.header.epoch == 0
+                    && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+                {
+                    claims.dispatch(frame);
+                    continue;
+                }
+            }
             if !handle_frame(frame, &writer, &registry, &vault, &serve).await? {
                 return Ok(());
             }
@@ -540,36 +585,30 @@ where
     Ok(())
 }
 
-async fn send_hello(
-    writer: &mpsc::Sender<Frame>,
-    config: &ModuleConfig,
-) -> Result<(), ModuleError> {
+fn hello_frame(
+    module_id: &str,
+    nonce: Option<(&str, subc_os::LaunchNonceSource)>,
+    channel_registration: bool,
+) -> Result<Frame, ModuleError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest: manifest(
-            &config.module_id,
-            config.launch_nonce.as_ref().map(|nonce| nonce.source()),
-        ),
+        manifest: manifest(module_id, nonce.as_ref().map(|(_, source)| *source)),
         protocol_ver: PROTOCOL_VERSION,
         // Advertise health.check so the daemon actively probes us (capability-
         // gated: unadvertised = health "unknown", never probed). We answer L2
         // through the same frame path and report L3 domain health from the sweep.
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        // Echo the launch nonce the daemon gave this process, which it checks to
-        // admit the module as itself. Every daemon-launched module has one,
-        // this one included; it is absent only when the binary was run by hand.
-        // Taken from the single startup read, never from the environment: the
-        // environment copy is going away, and the descriptor can be read only
-        // once.
-        launch_nonce: config
-            .launch_nonce
-            .as_ref()
-            .map(|nonce| nonce.value().to_string()),
+        // The adopted channel already binds this spawn. Only a legacy HELLO
+        // uses the nonce read from the daemon's handoff.
+        launch_nonce: if channel_registration {
+            None
+        } else {
+            nonce.map(|(value, _)| value.to_string())
+        },
     })
     .map_err(ModuleError::Json)?;
     // Channel-0 control frame: epoch is always 0.
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
-        .map_err(|e| ModuleError::Message(e.to_string()))?;
-    send(writer, frame).await
+    Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(|e| ModuleError::Message(e.to_string()))
 }
 
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, ModuleError>
@@ -2254,6 +2293,19 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_hello_echoes_launch_nonce_only_on_the_legacy_stream() {
+        let nonce = Some(("fixture-nonce", subc_os::LaunchNonceSource::Fd));
+        let channel = hello_frame(DEFAULT_MODULE_ID, nonce, true).unwrap();
+        assert_eq!(channel.header.ty, FrameType::Hello);
+        let channel_body: serde_json::Value = serde_json::from_slice(&channel.body).unwrap();
+        assert!(channel_body.get("launch_nonce").is_none());
+
+        let legacy = hello_frame(DEFAULT_MODULE_ID, nonce, false).unwrap();
+        assert_eq!(legacy.header.ty, FrameType::Hello);
+        let legacy_body: serde_json::Value = serde_json::from_slice(&legacy.body).unwrap();
+        assert_eq!(legacy_body["launch_nonce"], "fixture-nonce");
+    }
 
     /// The stderr tag names this module, not a binary it used to be called.
     ///

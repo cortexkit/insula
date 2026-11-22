@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::vault_client::BusRoute;
+use crate::{registration::ClaimMinter, vault_client::BusRoute};
 
 pub const EVENT_NAME: &str = "quota_sampled";
 pub const EVENTS_GET: &str = "events_get";
@@ -275,11 +275,20 @@ impl QuotaSamples {
         path: PathBuf,
         cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_with_claims(path, cancel, None)
+    }
+
+    pub fn spawn_with_claims(
+        self: &Arc<Self>,
+        path: PathBuf,
+        cancel: CancellationToken,
+        claims: Option<ClaimMinter>,
+    ) -> tokio::task::JoinHandle<()> {
         let samples = Arc::clone(self);
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel.cancelled() => {},
-                _ = samples.run(path) => {},
+                _ = samples.run(path, claims) => {},
             }
             samples.set_state("disabled", "shutdown");
         })
@@ -534,11 +543,11 @@ impl QuotaSamples {
         Ok(())
     }
 
-    async fn run(&self, path: PathBuf) {
+    async fn run(&self, path: PathBuf, claims: Option<ClaimMinter>) {
         self.set_state("connecting", "startup");
         // The shared transport keeps reader tasks for its process-lifetime
         // connection. Reuse one bus route rather than orphaning one per retry.
-        let route = Arc::new(BusRoute::new(path));
+        let route = Arc::new(BusRoute::new(path, claims));
         let mut failures = 0u32;
         let mut connected_before = false;
         loop {

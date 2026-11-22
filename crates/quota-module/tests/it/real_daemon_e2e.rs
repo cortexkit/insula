@@ -27,8 +27,8 @@ use std::{
 use tokio::process::{Child, Command};
 
 use common::{
-    ckdev_binary, connect_consumer, isolate_env, raw_route_frame, route_open, unique_temp_dir,
-    usage_get, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
+    ckdev_binary, connect_consumer, control_rpc, isolate_env, raw_route_frame, route_open,
+    unique_temp_dir, usage_get, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
@@ -101,7 +101,7 @@ async fn start_real_daemon() -> RealDaemon {
     let subc_jsonc = serde_json::json!({
         "version": 1,
         "modules": {
-            MODULE_ID: { "program": quota_module, "args": [], "env": {} }
+            MODULE_ID: { "protocol": "subc", "program": quota_module, "args": [], "env": {} }
         }
     });
     std::fs::write(
@@ -153,6 +153,17 @@ async fn real_subc_daemon_supervises_quota_module_and_routes_usage_get() {
 
     // The daemon spawns the module asynchronously; poll the catalog until it lands.
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
+
+    let provenance = control_rpc(
+        &mut consumer,
+        900,
+        serde_json::json!({"op": "supervisor.provenance", "module_id": MODULE_ID}),
+    )
+    .await;
+    assert_eq!(provenance.header.ty, subc_protocol::FrameType::Response);
+    let provenance: serde_json::Value = serde_json::from_slice(&provenance.body).unwrap();
+    assert_eq!(provenance["modules"][0]["module_id"], MODULE_ID);
+    assert_eq!(provenance["modules"][0]["registration"], "channel");
 
     let route = route_open(&mut consumer, 1).await;
 

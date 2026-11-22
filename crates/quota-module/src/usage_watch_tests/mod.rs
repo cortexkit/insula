@@ -54,14 +54,12 @@ impl Wire {
         });
         let loop_serve = Arc::clone(&serve);
         let frame_loop = tokio::spawn(async move {
+            send(&tx, hello_frame("insula", None, false)?).await?;
+            expect_hello_ack(&mut read).await?;
             module_loop(
                 &mut read,
                 tx,
-                &ModuleConfig {
-                    connection_file_path: PathBuf::from("/nonexistent/usage-watch.json"),
-                    module_id: "insula".into(),
-                    launch_nonce: None,
-                },
+                None,
                 registry,
                 Arc::new(VaultClient::new(PathBuf::from(
                     "/nonexistent/usage-watch.json",
