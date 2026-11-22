@@ -1924,6 +1924,34 @@ publishes:
 `unusable_or_cross_region_deposits_send_nothing`,
 `siliconflow_regions_route_only_at_the_family_boundary`.
 
+### 7.20 `trustedrouter`: per-key budget
+
+`trustedrouter` publishes `apiProvider: "trustedrouter"` and one `key_budget`
+spend pool from the bearer-authenticated `GET https://api.trustedrouter.com/v1/key`.
+It reads only a vault deposit, `apikey:trustedrouter` or
+`apikey:trustedrouter:<account>`, one key per host. The budget belongs to the
+key, not to a verified account or the account's balance.
+
+- A capped key gives `remaining` and `total` as exact microdollar amounts
+  (`unit: "USD"`, `exponent: 6`) with `basis: "reported"`. The remainder already
+  excludes in-flight reservations: neither reservations nor usage are subtracted
+  again. A zero remainder with a positive total is exhausted; two zero amounts
+  are a stated zero cap.
+- Two explicit `null` limit fields give `unlimited: true`, `basis: "unstated"`,
+  and neither amount. Missing, malformed, or inconsistent fields, including a
+  remainder above the cap, are `decode_failed`.
+- No spending window, reset timestamp, expiry, funding source, or spendability
+  is inferred. A `limit_reset` cadence alone does not state a reset timestamp.
+  Historical spend is not budget capacity and is not published.
+- HTTP 401 is `credential_rejected` and is reported to the vault with the
+  served record version. HTTP 403 is `upstream_failed` with no vault report,
+  as are 429, 5xx and other unsuccessful statuses. Error messages do not quote
+  response bodies.
+
+Budget amounts and refusal handling were checked against [CodexBar v0.85.0's
+tests](https://github.com/steipete/CodexBar/blob/v0.85.0/TestsPlugin/TrustedRouterPluginTests.swift)
+and insula fixtures, not a live account.
+
 <a id="fields-on-the-account-not-the-window"></a>
 
 ## 8. Account fields and keys

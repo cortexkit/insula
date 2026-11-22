@@ -173,6 +173,13 @@ def claims(cid, fams):
     ['siliconflow-cn']
     >>> claims("apikey:siliconflow-other", fams)
     []
+
+    TrustedRouter's bare and suffixed keys route to the same vault-only provider:
+
+    >>> claims("apikey:trustedrouter", fams)
+    ['trustedrouter']
+    >>> claims("apikey:trustedrouter:fixture", fams)
+    ['trustedrouter']
     """
     return [n for p, n in fams if cid == p or cid.startswith(p + ":")]
 
