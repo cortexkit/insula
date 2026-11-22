@@ -432,6 +432,15 @@ fn api_provider_name(provider: &str) -> Option<&'static str> {
         .map(|(_, slug)| *slug)
 }
 
+fn api_provider_for_slot(key: &SlotKey) -> Option<String> {
+    if key.provider == mimo::PROVIDER_NAME {
+        mimo::api_provider_for_handle(&key.handle)
+    } else {
+        api_provider_name(&key.provider)
+    }
+    .map(String::from)
+}
+
 /// `(this module's provider name, canonical slug)` for every provider that has
 /// a counterpart; see [`api_provider_name`]. Data rather than a `match`, so a
 /// test can check every row against the registry without parsing source.
@@ -1257,7 +1266,7 @@ impl Registry {
                 if let Some((primary_key, primary)) = primary {
                     if let Some(mut entry) = primary.entry.clone() {
                         entry.account = None;
-                        entry.api_provider = api_provider_name(name).map(String::from);
+                        entry.api_provider = api_provider_for_slot(primary_key);
                         entry.credential_ref = credential_ref(primary_key);
                         relax_usage_for_read(&mut entry, primary, read_now);
                         out.push(entry);
@@ -1443,7 +1452,7 @@ impl Registry {
             for (account_id, (key, slot)) in selected {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = Some(account_id);
-                    entry.api_provider = api_provider_name(name).map(String::from);
+                    entry.api_provider = api_provider_for_slot(key);
                     entry.credential_ref = credential_ref(key);
                     relax_usage_for_read(&mut entry, slot, read_now);
                     out.push(entry);
@@ -1460,7 +1469,7 @@ impl Registry {
             {
                 if let Some(mut entry) = slot.entry.clone() {
                     entry.account = None;
-                    entry.api_provider = api_provider_name(name).map(String::from);
+                    entry.api_provider = api_provider_for_slot(key);
                     entry.credential_ref = credential_ref(key);
                     out.push(entry);
                 }

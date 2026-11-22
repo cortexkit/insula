@@ -55,6 +55,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `cookie:amr-api.open-design.ai` | `opendesign` |
 | `cookie:trae.cn` | `traecn` |
 | `cookie:xiaomimimo.com` | `mimo` |
+| `apikey:xiaomi-token-plan-cn`, `apikey:xiaomi-token-plan-sgp` | `mimo` (China or Singapore Token Plan key) |
 | `cookie:ollama.com`, `apikey:ollama-cloud` | `ollama` |
 | `cookie:opencode.ai` | `opencode` and `opencodego` |
 | `apikey:opencode-go` | `opencodego` |
@@ -96,6 +97,15 @@ does not select a region: `apikey:siliconflow:china` still goes only to the
 International `.com` API. There is no origin override, region probing or local
 credential fallback. Each region follows the API-key routing guard that refuses
 multiple deposits in one family; a suffix labels a deposit, not a verified owner.
+
+### Xiaomi MiMo Token Plan keys
+
+Deposit one plain Token Plan key under `apikey:xiaomi-token-plan-cn` or
+`apikey:xiaomi-token-plan-sgp` to match the issuing region. An optional account
+suffix labels the deposit; it never selects a region. Ordinary Xiaomi API keys
+are not substitutes. A listed key replaces the web session for the quota row,
+even if the key is unusable. If several keys are listed, remove all but one;
+insula sends none of them. See [MiMo quota reporting](consumer-contract.md#68-mimo-regional-token-plan-credits).
 
 ### OpenAI Platform browser session keys
 

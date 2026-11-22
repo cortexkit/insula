@@ -171,6 +171,12 @@ def claims(cid, fams):
     ['siliconflow']
     >>> claims("apikey:siliconflow-cn:fixture", fams)
     ['siliconflow-cn']
+    >>> claims("apikey:xiaomi-token-plan-cn:fixture", fams)
+    ['mimo']
+    >>> claims("apikey:xiaomi-token-plan-sgp", fams)
+    ['mimo']
+    >>> claims("apikey:xiaomi-token-plan-sgp-other", fams)
+    []
     >>> claims("apikey:siliconflow-other", fams)
     []
     """

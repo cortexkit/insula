@@ -34,6 +34,8 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // domain `trae.cn`. The deposit is sent only to `api.trae.cn`.
     ("cookie:trae.cn", "traecn"),
     ("cookie:xiaomimimo.com", "mimo"),
+    ("apikey:xiaomi-token-plan-cn", "mimo"),
+    ("apikey:xiaomi-token-plan-sgp", "mimo"),
     ("cookie:ollama.com", "ollama"),
     ("apikey:ollama-cloud", "ollama"),
     ("cookie:opencode.ai", "opencode"),
@@ -691,6 +693,14 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         // outcome can be diagnosed. The registry still collapses unknown owners
         // to one unlabelled row; duplicate keys must not imply distinct balances.
         .filter(|(prefix, _)| *prefix != "apikey:openai-session")
+        // MiMo refuses competing keys as one provider row, including keys from
+        // different regions. It must see every deposit to prevent cookie fallback.
+        .filter(|(prefix, _)| {
+            !matches!(
+                *prefix,
+                "apikey:xiaomi-token-plan-cn" | "apikey:xiaomi-token-plan-sgp"
+            )
+        })
         .filter(|(prefix, _)| {
             !ENRICHMENT_FAMILIES
                 .iter()

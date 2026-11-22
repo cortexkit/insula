@@ -188,7 +188,13 @@ pub fn check_entries(entries: &[ProviderUsage], now: DateTime<Utc>) -> SanityRep
                 entry.provider,
                 entry.account.as_deref().unwrap_or("unlabeled")
             );
-            check_window(&where_, window, now, &mut report.findings);
+            let permits_overage = entry.provider == crate::mimo::PROVIDER_NAME
+                && entry
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.primary.as_ref())
+                    .is_some_and(|primary| std::ptr::eq(window, primary));
+            check_window(&where_, window, now, permits_overage, &mut report.findings);
             report.shares_checked += check_breakdown(&where_, window, &mut report.findings);
         }
     }
@@ -743,7 +749,13 @@ pub fn plausible_window_length(minutes: i64) -> bool {
     minutes > 0 && minutes <= MAX_WINDOW_MINUTES
 }
 
-fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings: &mut Vec<String>) {
+fn check_window(
+    where_: &str,
+    window: &RateWindow,
+    now: DateTime<Utc>,
+    permits_overage: bool,
+    findings: &mut Vec<String>,
+) {
     let percent = window.used_percent;
     if let Some(kind) = window.window_kind.as_deref() {
         if !matches!(
@@ -845,7 +857,7 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
     // the upstream measured, and catches a producer that computed one of the
     // three from the other two incorrectly.
     if let (Some(used), Some(total)) = (window.used_count, window.total_count) {
-        if used > total {
+        if used > total && !permits_overage {
             findings.push(format!(
                 "{where_}: usedCount {used} exceeds totalCount {total}"
             ));
@@ -854,7 +866,14 @@ fn check_window(where_: &str, window: &RateWindow, now: DateTime<Utc>, findings:
         // effective zero that the counts are not expected to match.
         let reported = window.raw_used_percent.unwrap_or(percent);
         if total > 0.0 {
-            let implied = used / total * 100.0;
+            // MiMo preserves the reported counts in overage, but still caps
+            // the percent at 100, just like any other window on the wire.
+            let numerator = if permits_overage {
+                used.min(total)
+            } else {
+                used
+            };
+            let implied = numerator / total * 100.0;
             if (implied - reported).abs() > COUNT_PERCENT_TOLERANCE {
                 findings.push(format!(
                     "{where_}: counts imply {implied:.1}% but the window reports {reported:.1}%"
@@ -1454,7 +1473,38 @@ mod tests {
         assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
-    /// Spending more of an allowance than it holds is not a coherent reading.
+    #[test]
+    fn mimo_primary_can_report_exact_overage_but_the_other_bounds_hold() {
+        let mut overage = window(100.0);
+        overage.used_count = Some(120.0);
+        overage.total_count = Some(100.0);
+        let now = at("2026-07-28T10:00:00Z");
+        let mut mimo = entry(overage.clone());
+        mimo.provider = "mimo".to_string();
+        let report = check_entries(&[mimo.clone()], now);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+        let report = check_entries(&[entry(overage.clone())], now);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.contains("usedCount 120 exceeds totalCount 100")));
+
+        let usage = mimo.usage.as_mut().unwrap();
+        usage.secondary = Some(overage);
+        usage.primary.as_mut().unwrap().raw_used_percent = Some(120.0);
+        let report = check_entries(&[mimo], now);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.contains("secondary: usedCount 120 exceeds totalCount 100")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.contains("rawUsedPercent out of range")));
+    }
+
+    /// Except where a provider reports overage, a used count cannot exceed its total.
     ///
     /// The two counts come from the same upstream payload, so one exceeding the
     /// other means they were read from fields that do not describe the same
