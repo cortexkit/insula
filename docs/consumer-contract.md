@@ -969,8 +969,11 @@ limit the provider named without a readable figure. A consumer that ignores
   publish as on a legacy page, session in `primary` (`windowKind: "five_hour"`,
   `windowMinutes: 300`) and weekly in `secondary` (`windowKind: "weekly"`,
   `windowMinutes: 10080`), with `usedPercent = 100 - remaining_percent` and
-  `resetsAt` from `resets_at` when parseable. A key replaces the
-  cookie lane for that account. `Monthly credits used` and relative
+  `resetsAt` from `resets_at` when parseable. A non-finite or out-of-range
+  `remaining_percent` suppresses that limit's window, without suppressing a
+  readable sibling window or purchased pool. A numeric string remains a decode
+  error; an API body yielding neither a window nor a pool is `decode_failed`.
+  A key replaces the cookie lane for that account. `Monthly credits used` and relative
   `Next refill` prose have no denominator or absolute time and are not
   published as a window or reset.
 - **`cursor`** publishes the plan's monthly window as `primary`

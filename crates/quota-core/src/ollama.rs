@@ -774,12 +774,19 @@ fn api_legacy_limit(
     else {
         return Ok(None);
     };
-    let remaining = remaining
-        .as_f64()
-        .filter(|percent| percent.is_finite())
-        .ok_or_else(balance_decode_error)?;
+    let remaining = remaining.as_f64().ok_or_else(balance_decode_error)?;
+    if !valid_legacy_percent(remaining) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "{} ollama: invalid remaining_percent; limit publishes no window",
+                crate::LOG_TAG
+            );
+        }
+        return Ok(None);
+    }
     Ok(Some(RateWindow {
-        used_percent: 100.0 - remaining.clamp(0.0, 100.0),
+        used_percent: 100.0 - remaining,
         resets_at: api_reset(limit.get("resets_at")),
         window_kind: Some(kind.to_string()),
         window_minutes: Some(window_minutes),
@@ -789,6 +796,10 @@ fn api_legacy_limit(
         regeneration: None,
         breakdown: None,
     }))
+}
+
+fn valid_legacy_percent(percent: f64) -> bool {
+    percent.is_finite() && (0.0..=100.0).contains(&percent)
 }
 
 fn balance_decode_error() -> FetchError {
@@ -864,7 +875,12 @@ fn parse_api_balance(text: &str) -> Result<ProviderUsage, FetchError> {
             }
         }
     }
-    if !root.get("included").is_some_and(|value| value.is_object()) && entry.spend.is_none() {
+    let usage = entry.usage.as_ref().unwrap();
+    if usage.primary.is_none()
+        && usage.secondary.is_none()
+        && usage.tertiary.is_none()
+        && entry.spend.is_none()
+    {
         return Err(balance_decode_error());
     }
     Ok(entry)
@@ -1249,13 +1265,11 @@ mod tests {
                 "missing included amount cannot derive utilization"
             );
         }
-        assert!(
+        assert_eq!(
             parse_api_balance(r#"{"included":{"allowance_usd":"0","balance_usd":"0"}}"#)
-                .unwrap()
-                .usage
-                .unwrap()
-                .primary
-                .is_none()
+                .unwrap_err()
+                .error_class(),
+            "decode_failed"
         );
     }
 
@@ -1364,9 +1378,42 @@ mod tests {
         assert_eq!(session.used_percent, 25.0);
         assert!(session.resets_at.is_none());
 
-        let over = API_LEGACY.replace("\"remaining_percent\":75", "\"remaining_percent\":140");
-        let usage = parse_api_balance(&over).unwrap().usage.unwrap();
-        assert_eq!(usage.primary.unwrap().used_percent, 0.0);
+        // CodexBar v0.85.0 rejects out-of-range legacy percentages:
+        // Tests/CodexBarTests/OllamaAPIBalanceTests.swift:33-89.
+        for remaining in [-1, 101, 140] {
+            let body = API_LEGACY.replace(
+                "\"remaining_percent\":75",
+                &format!("\"remaining_percent\":{remaining}"),
+            );
+            let entry = parse_api_balance(&body).unwrap();
+            assert_eq!(
+                entry.spend.unwrap()[0].remaining.as_ref().unwrap().minor,
+                25
+            );
+            let usage = entry.usage.unwrap();
+            assert!(usage.primary.is_none());
+            assert_eq!(usage.secondary.unwrap().used_percent, 60.0);
+
+            let only_invalid =
+                format!(r#"{{"included":{{"session":{{"remaining_percent":{remaining}}}}}}}"#);
+            assert_eq!(
+                parse_api_balance(&only_invalid).unwrap_err().error_class(),
+                "decode_failed"
+            );
+        }
+        let sibling_only = r#"{"included":{"session":{"remaining_percent":-1},"weekly":{"remaining_percent":58}}}"#;
+        let usage = parse_api_balance(sibling_only).unwrap().usage.unwrap();
+        assert!(usage.primary.is_none());
+        assert_eq!(usage.secondary.unwrap().used_percent, 42.0);
+        let pool_only =
+            r#"{"included":{"weekly":{"remaining_percent":101}},"purchased":{"balance_usd":0}}"#;
+        let entry = parse_api_balance(pool_only).unwrap();
+        assert!(entry.usage.unwrap().secondary.is_none());
+        assert_eq!(entry.spend.unwrap()[0].remaining.as_ref().unwrap().minor, 0);
+        for remaining in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 101.0] {
+            assert!(!valid_legacy_percent(remaining));
+        }
+        assert!(valid_legacy_percent(0.0) && valid_legacy_percent(100.0));
 
         for body in [
             API_LEGACY.replace("\"remaining_percent\":75", "\"remaining_percent\":\"75\""),
