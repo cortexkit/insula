@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use crate::credential_source::{ScopedRowState, ScopedSnapshot};
 use crate::provider::{CredentialHandle, HandlesError};
 
+pub(crate) const SILICONFLOW_CN_COOKIE: &str = "cookie:cloud.siliconflow.cn";
+
 /// Credential-id families consumed by this module and their registry providers.
 pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     ("chatgpt:openai", "codex"),
@@ -47,6 +49,7 @@ pub const CREDENTIAL_FAMILIES: &[(&str, &str)] = &[
     // Regional models.dev names bind each key to one official origin.
     ("apikey:siliconflow", "siliconflow"),
     ("apikey:siliconflow-cn", "siliconflow-cn"),
+    ("cookie:cloud.siliconflow.cn", "siliconflow-cn"),
     ("apikey:synthetic", "synthetic"),
     ("apikey:openrouter", "openrouter"),
     // Browser session keys can act on the whole organization: exact grants only,
@@ -731,6 +734,11 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
     let cursor_oauth_present = rows
         .iter()
         .any(|row| handle_id_names_family(&row.credential_id, "oauth:cursor"));
+    // Inspect the snapshot before filtering refused rows: even duplicate keys
+    // must not cause a switch to a potentially different console account.
+    let siliconflow_cn_key_present = rows
+        .iter()
+        .any(|row| handle_id_names_family(&row.credential_id, "apikey:siliconflow-cn"));
     let mut unsupported = Vec::new();
     let mut ignored_cursor_cookie = Vec::new();
     let mut mapped = ProviderHandleSnapshot::default();
@@ -750,6 +758,11 @@ fn map_handles(rows: &[ScopedRowState]) -> (ProviderHandleSnapshot, Option<Strin
         }
         if cursor_oauth_present && handle_id_names_family(&row.credential_id, "cookie:cursor.com") {
             ignored_cursor_cookie.push(row.credential_id.clone());
+            continue;
+        }
+        if siliconflow_cn_key_present
+            && handle_id_names_family(&row.credential_id, SILICONFLOW_CN_COOKIE)
+        {
             continue;
         }
         let providers = providers_for_id(&row.credential_id);
@@ -822,6 +835,24 @@ mod tests {
             "apikey:siliconflow-cn",
             "apikey:siliconflow"
         ));
+    }
+
+    #[test]
+    fn siliconflow_cn_duplicate_keys_do_not_admit_a_console_cookie() {
+        let loader = super::VaultHandleLoader::default();
+        let deposit = ("cookie:cloud.siliconflow.cn:fixture", "cookie");
+        loader.install_rows_for_test(&[
+            ("apikey:siliconflow-cn", "apikey"),
+            ("apikey:siliconflow-cn:fixture", "apikey"),
+            deposit,
+        ]);
+        assert!(loader.siliconflow_cn_handles().unwrap().is_empty());
+        loader.install_rows_for_test(&[deposit]);
+        assert_eq!(
+            loader.siliconflow_cn_handles().unwrap()[0].vault_credential_id(),
+            Some(deposit.0)
+        );
+        assert!(loader.siliconflow_handles().unwrap().is_empty());
     }
 
     #[test]

@@ -177,6 +177,10 @@ def claims(cid, fams):
     ['mimo']
     >>> claims("apikey:xiaomi-token-plan-sgp-other", fams)
     []
+    >>> claims("cookie:cloud.siliconflow.cn:fixture", fams)
+    ['siliconflow-cn']
+    >>> claims("cookie:cloud.siliconflow.cn.other:fixture", fams)
+    []
     >>> claims("apikey:siliconflow-other", fams)
     []
 

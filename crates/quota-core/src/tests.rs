@@ -1002,14 +1002,18 @@ fn no_cookie_provider_reports_an_auth_failure_to_the_vault() {
     let registry = Registry::with_defaults(crate::config::QuotaConfig::default(), None);
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    // The module file is the provider name with `-` mapped to `_`, which is how
-    // this crate names them (`qwen-cloud` -> `qwen_cloud.rs`).
+    // SiliconFlow's regions share a module. Other providers map `-` to `_`,
+    // as in `qwen-cloud` -> `qwen_cloud.rs`.
     let mut files: Vec<(String, std::path::PathBuf)> = registry
         .providers
         .iter()
         .filter(|provider| provider.fetcher.is_cookie_based())
         .map(|provider| {
-            let file = dir.join(format!("{}.rs", provider.name.replace('-', "_")));
+            let file = if provider.name == "siliconflow-cn" {
+                dir.join("siliconflow.rs")
+            } else {
+                dir.join(format!("{}.rs", provider.name.replace('-', "_")))
+            };
             (provider.name.clone(), file)
         })
         .collect();
@@ -11187,6 +11191,7 @@ fn cookie_capture_urls_match_the_providers_fetch_urls() {
         ("langdock", include_str!("langdock.rs")),
         ("opendesign", include_str!("opendesign.rs")),
         ("typesafe", include_str!("typesafe.rs")),
+        ("siliconflow-cn", include_str!("siliconflow.rs")),
         ("mimo", include_str!("mimo.rs")),
         ("ollama", include_str!("ollama.rs")),
         ("opencode", include_str!("opencode.rs")),

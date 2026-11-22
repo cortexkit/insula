@@ -62,6 +62,7 @@ next. Records are matched to providers by their id prefix (the "family"):
 | `apikey:deepseek` | `deepseek` |
 | `apikey:siliconflow` | `siliconflow` (International API key, `.com`, USD) |
 | `apikey:siliconflow-cn` | `siliconflow-cn` (China API key, `.cn`, CNY) |
+| `cookie:cloud.siliconflow.cn` | `siliconflow-cn` (China console session, only when no China API key is present) |
 | `apikey:synthetic` | `synthetic` |
 | `apikey:openrouter` | `openrouter` |
 | `apikey:openai-session` | `openai-platform` (Platform browser session key, never Codex) |

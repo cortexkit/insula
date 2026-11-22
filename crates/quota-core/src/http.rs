@@ -478,10 +478,15 @@ enum Method {
 impl JsonRequest {
     /// A GET that accepts JSON.
     pub fn get(url: impl Into<String>) -> Self {
+        Self::get_accepting(url, "application/json")
+    }
+
+    /// A GET with one explicit `Accept` header for a non-JSON endpoint.
+    pub(crate) fn get_accepting(url: impl Into<String>, accept: &'static str) -> Self {
         Self {
             method: Method::Get,
             url: url.into(),
-            headers: vec![Header::new("Accept", "application/json")],
+            headers: vec![Header::new("Accept", accept)],
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -720,6 +725,16 @@ impl JsonRequest {
     /// [`HttpResponse::body_for_parsing`], which carries the full reasoning.
     /// Skipping it silently is how a flapping endpoint comes to read as dead.
     pub async fn send_raw(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
+        self.send_raw_selecting_body(client, |_| true).await
+    }
+
+    /// Like `send_raw`, but skip the body on statuses the caller does not parse.
+    /// A missing or truncated body then cannot hide the response status or headers.
+    pub(crate) async fn send_raw_selecting_body(
+        self,
+        client: &reqwest::Client,
+        read_body: impl FnOnce(u16) -> bool,
+    ) -> Result<HttpResponse, FetchError> {
         let mut builder = match &self.method {
             Method::Get => client.get(&self.url),
             Method::Post(body) => client.post(&self.url).body(body.clone()),
@@ -733,7 +748,9 @@ impl JsonRequest {
         let status = response.status().as_u16();
         let final_url = response.url().to_string();
         let headers = response_headers(&response);
-        let body = if (200..300).contains(&status) {
+        let body = if !read_body(status) {
+            Vec::new()
+        } else if (200..300).contains(&status) {
             read_success_body(response).await?
         } else {
             read_error_body_prefix(response).await?
@@ -1390,9 +1407,10 @@ mod tests {
         // `send` delegates to `send_full`, so it inherits every rule rather than
         // restating one. `send_raw` applies NO classification by design -- it is
         // the escape hatch for providers whose status policy is bespoke (doubao
-        // reads rate-limit headers off a 429), and fencing it would be asserting a
-        // rule it deliberately does not have.
-        let exempt = ["send", "send_raw"];
+        // reads rate-limit headers off a 429). Its body-selecting variant also
+        // allows callers to use only headers, even on success. Neither applies
+        // the empty-body rule, so both are exempt from that agreement test.
+        let exempt = ["send", "send_raw", "send_raw_selecting_body"];
         // Driven together by `every_classifying_helper_treats_an_empty_success_body_alike`.
         let fenced = [
             "send_full",

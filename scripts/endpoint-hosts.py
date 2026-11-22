@@ -137,6 +137,8 @@ EXPECTED: dict[str, dict[str, str]] = {
     "siliconflow": {
         "INTERNATIONAL_URL": "api.siliconflow.com",
         "CHINA_URL": "api.siliconflow.cn",
+        "BILLING_PAGE_URL": "cloud.siliconflow.cn",
+        "WALLET_URL": "cloud.siliconflow.cn",
     },
     "soniox": {"API_BASE": "api.soniox.com"},
     "stepfun": {"API_URL": "platform.stepfun.com"},
