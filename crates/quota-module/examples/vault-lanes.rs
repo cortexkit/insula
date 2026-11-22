@@ -266,10 +266,28 @@ fn evaluate(
         .credential_ids
         .iter()
         .any(|id| quota_core::vault_handles::handle_id_names_family(id, "apikey:ollama-cloud"));
+    let mimo_api_providers: Vec<_> = installed
+        .credential_ids
+        .iter()
+        .filter_map(|id| {
+            [
+                "apikey:xiaomi-token-plan-cn",
+                "apikey:xiaomi-token-plan-sgp",
+            ]
+            .into_iter()
+            .find(|family| quota_core::vault_handles::handle_id_names_family(id, family))
+            .and_then(|family| family.strip_prefix("apikey:"))
+        })
+        .collect();
     let mut identityless_families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (prefix, _) in families {
         if (prefix.starts_with("cookie:") || prefix.starts_with("apikey:"))
-            && *prefix != "apikey:openai-session"
+            && !matches!(
+                *prefix,
+                "apikey:openai-session"
+                    | "apikey:xiaomi-token-plan-cn"
+                    | "apikey:xiaomi-token-plan-sgp"
+            )
         {
             identityless_families.entry(prefix).or_default();
         }
@@ -337,6 +355,12 @@ fn evaluate(
                     && quota_core::vault_handles::handle_id_names_family(
                         credential_id,
                         "cookie:ollama.com",
+                    ))
+                || (!mimo_api_providers.is_empty()
+                    && provider == "mimo"
+                    && quota_core::vault_handles::handle_id_names_family(
+                        credential_id,
+                        "cookie:xiaomimimo.com",
                     ));
             if !dual_lane.iter().any(|(name, _)| *name == provider)
                 && !precedence_suppressed
@@ -376,6 +400,18 @@ fn evaluate(
         .entries
         .iter()
         .filter(|entry| entry.source.as_deref() == Some("vault") && entry.usage.is_some())
+        .filter(|entry| {
+            if entry.provider != "mimo" {
+                return true;
+            }
+            // A cookie (or a reading from the other region) must not hide
+            // a dark Token Plan lane. Conflicting keys must not serve at all.
+            match mimo_api_providers.as_slice() {
+                [] => entry.api_provider.is_none(),
+                [slug] => entry.api_provider.as_deref() == Some(*slug),
+                _ => false,
+            }
+        })
         .map(|entry| entry.provider.as_str())
         .collect();
 
@@ -1183,6 +1219,39 @@ mod tests {
             ENUMERATED_UNSUPPORTED,
         );
         assert_eq!(dark.exit_code, 1);
+    }
+
+    #[test]
+    fn mimo_key_needs_its_regional_reading_not_the_cookie_or_a_competing_key() {
+        let check = |ids: &[&str], row| {
+            evaluate(
+                granted(ids),
+                usage(vec![row]),
+                quota_core::vault_handles::CREDENTIAL_FAMILIES,
+                &[],
+                ENUMERATED_UNSUPPORTED,
+            )
+        };
+        let cookie = "cookie:xiaomimimo.com:fixture";
+        let china = "apikey:xiaomi-token-plan-cn";
+        let singapore = "apikey:xiaomi-token-plan-sgp:fixture";
+        for (id, slug) in [
+            (china, "xiaomi-token-plan-cn"),
+            (singapore, "xiaomi-token-plan-sgp"),
+        ] {
+            assert_eq!(
+                providers_for_id(id, quota_core::vault_handles::CREDENTIAL_FAMILIES),
+                vec!["mimo"]
+            );
+            let mut entry = healthy("mimo", "vault");
+            assert_eq!(check(&[cookie][..], entry.clone()).exit_code, 0);
+            assert_eq!(check(&[cookie, id][..], entry.clone()).exit_code, 1);
+            entry.api_provider = Some(slug.to_string());
+            let report = check(&[cookie, id][..], entry.clone());
+            assert_eq!(report.exit_code, 0, "{report:?}");
+            assert_eq!(report.counts.unwrap().routed, 2);
+            assert_eq!(check(&[cookie, china, singapore][..], entry).exit_code, 1);
+        }
     }
 
     #[test]

@@ -1126,6 +1126,46 @@ Any logic that sorts or selects on reset time must decide what an absent reset
 means. Treating it as "soonest" makes a provider with no evidence of recovery
 win every retry; treating it as "never" excludes it from recovery permanently.
 
+### 6.8 `mimo`: regional Token Plan credits
+
+A Token Plan key is sent as a Bearer token on `GET /v1/platform/token_plan`
+only to the origin named by its vault family:
+
+| Vault family | Origin | `apiProvider` |
+|---|---|---|
+| `apikey:xiaomi-token-plan-cn` | `https://token-plan-cn.xiaomimimo.com` | `xiaomi-token-plan-cn` |
+| `apikey:xiaomi-token-plan-sgp` | `https://token-plan-sgp.xiaomimimo.com` | `xiaomi-token-plan-sgp` |
+
+Both lanes publish `provider: "mimo"` with no `account`: the response does not
+verify an owner and a credential suffix is not an identity. A listed key is
+the only source for the row, even when it cannot be read or its request fails.
+There are no redirects or cross-region retries. With competing key deposits,
+insula uses neither key nor the cookie and reports `credential_unusable`
+without `apiProvider`. With no key, the existing cookie lane remains available
+and does not publish `apiProvider`.
+
+The primary window carries the exact used and total credit counts. A MiMo
+Token Plan `usedCount` may exceed `totalCount`: this is measured overage,
+and `usedPercent` remains 100. The key lane emits no `rawUsedPercent` or spend
+pool. The period's reported end is `resetsAt` in UTC; `windowMinutes` appears
+only if both boundaries give a positive whole number of minutes. No window
+kind is inferred. A valid zero allowance is `no_quota_reported`; a missing
+or invalid count or invalid boundary is `decode_failed`, never a zero reading.
+HTTP 401 is `credential_rejected` and is reported to the vault with the served
+record version. A 403 is `upstream_failed` (permission to read quota may be
+missing) and is not reported; other non-200 statuses are also `upstream_failed`.
+
+**Proven by:** `selected_regional_key_owns_the_row_and_uses_only_its_endpoint`,
+`vault_read_failure_does_not_fall_back_to_cookie`,
+`competing_keys_use_no_deposit_and_cookie_alone_keeps_its_lane`,
+`a_token_plan_key_does_not_follow_redirects`,
+`refusals_fail_the_key_lane_and_only_401_reports_the_served_record`,
+`exhausted_and_over_cap_credit_counts_are_preserved`,
+`mimo_primary_can_report_exact_overage_but_the_other_bounds_hold`,
+`only_exact_reported_utc_boundaries_define_the_period`,
+`missing_or_invalid_counts_and_dates_do_not_become_usage`, and
+`zero_allowance_reports_no_quota_without_inventing_a_window`.
+
 <a id="spend-is-money-and-it-fails-in-the-opposite-direction-from-a-window"></a>
 
 ## 7. Spend pools

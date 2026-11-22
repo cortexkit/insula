@@ -1,5 +1,4 @@
-//! MiMo usage — session-cookie scrape of platform.xiaomimimo.com, with the cookie
-//! read from a `cookie:xiaomimimo.com` vault deposit.
+//! MiMo usage — regional Token Plan API keys or a web session cookie, from the vault.
 //!
 //! VERIFICATION:
 //! This port is fixture-verified against CodexBar source.
@@ -8,19 +7,28 @@
 //! - `Sources/CodexBarCore/Providers/MiMo/MiMoCookieImporter.swift` (lines 7-14, 106-109)
 //! - `Sources/CodexBarCore/Providers/MiMo/MiMoUsageSnapshot.swift`
 //!
-//! No live proof is implied: no logged-in MiMo session was available when it was written.
+//! `token_plan_tests` uses CodexBar v0.85.0 fixtures to verify regional routing,
+//! credit counts, UTC period boundaries, and how refusals are classified.
+//! Neither lane was verified with a live MiMo account.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 
-use crate::provider::{CredentialHandle, FetchAttempt};
 use crate::{
+    credential_source::{
+        get_vault_credential, report_vault_auth_failure, take_utf8_payload, CredentialSource,
+        VaultGetError, VAULT_READ_MIN_TTL_MS,
+    },
     http::{Header, JsonRequest},
     model::{ProviderUsage, RateWindow, Usage},
-    provider::{FetchError, UsageProvider},
+    provider::{
+        AccountObservation, CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider,
+    },
+    vault_handles::{handle_id_names_family, VaultHandleLoader},
 };
 
 pub const PROVIDER_NAME: &str = "mimo";
@@ -30,8 +38,165 @@ const COOKIE_FAMILY: &str = "cookie:xiaomimimo.com";
 
 const DETAIL_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/detail";
 const USAGE_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
+const CHINA_TOKEN_PLAN_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1/platform/token_plan";
+const SINGAPORE_TOKEN_PLAN_URL: &str =
+    "https://token-plan-sgp.xiaomimimo.com/v1/platform/token_plan";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+const TOKEN_PLAN_CONFLICT: &str = "mimo-token-plan-conflict";
+const MAX_SAFE_CREDIT_COUNT: u64 = (1 << 53) - 1;
+
+#[derive(Clone, Copy)]
+enum Region {
+    China,
+    Singapore,
+}
+
+impl Region {
+    fn family(self) -> &'static str {
+        match self {
+            Self::China => "apikey:xiaomi-token-plan-cn",
+            Self::Singapore => "apikey:xiaomi-token-plan-sgp",
+        }
+    }
+
+    fn for_handle(handle: &CredentialHandle) -> Option<Self> {
+        let id = handle.vault_credential_id()?;
+        [Self::China, Self::Singapore]
+            .into_iter()
+            .find(|region| handle_id_names_family(id, region.family()))
+    }
+
+    fn url(self) -> &'static str {
+        match self {
+            Self::China => CHINA_TOKEN_PLAN_URL,
+            Self::Singapore => SINGAPORE_TOKEN_PLAN_URL,
+        }
+    }
+}
+
+pub(crate) fn api_provider_for_handle(handle: &CredentialHandle) -> Option<&'static str> {
+    Region::for_handle(handle)?.family().strip_prefix("apikey:")
+}
+
+#[derive(Deserialize)]
+struct TokenPlan {
+    object: String,
+    quota: TokenPlanQuota,
+    period: TokenPlanPeriod,
+}
+
+#[derive(Deserialize)]
+struct TokenPlanQuota {
+    total_credits: u64,
+    used_credits: u64,
+    remaining_credits: u64,
+}
+
+#[derive(Deserialize)]
+struct TokenPlanPeriod {
+    start_at: Option<String>,
+    end_at: Option<String>,
+}
+
+fn token_plan_date(text: &str) -> Result<NaiveDateTime, FetchError> {
+    const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+    // The zoneless fields are UTC in both regions. Round-trip to reject
+    // lenient forms, including leap seconds the upstream parser rejects.
+    NaiveDateTime::parse_from_str(text, FORMAT)
+        .ok()
+        .filter(|date| {
+            text.len() == 19
+                && date.and_utc().timestamp_subsec_nanos() == 0
+                && date.format(FORMAT).to_string() == text
+        })
+        .ok_or_else(|| FetchError::Decode("mimo: invalid Token Plan period boundary".to_string()))
+}
+
+fn normalize_token_plan(body: &[u8]) -> Result<Usage, FetchError> {
+    let plan: TokenPlan = crate::unread_keys::decode_reporting_unread(PROVIDER_NAME, body)
+        .map_err(|_| FetchError::Decode("mimo: invalid Token Plan response".to_string()))?;
+    if plan.object != "token_plan" {
+        return Err(FetchError::Decode(
+            "mimo: unexpected Token Plan object".to_string(),
+        ));
+    }
+    let TokenPlanQuota {
+        total_credits: total,
+        used_credits: used,
+        remaining_credits: remaining,
+    } = plan.quota;
+    // Both upstream and the wire represent counts exactly in this range.
+    if total > MAX_SAFE_CREDIT_COUNT
+        || used > MAX_SAFE_CREDIT_COUNT
+        || remaining != total.saturating_sub(used)
+    {
+        return Err(FetchError::Decode(
+            "mimo: invalid Token Plan credit counts".to_string(),
+        ));
+    }
+    let start = plan
+        .period
+        .start_at
+        .as_deref()
+        .map(token_plan_date)
+        .transpose()?;
+    let end = plan
+        .period
+        .end_at
+        .as_deref()
+        .map(token_plan_date)
+        .transpose()?;
+    let window_minutes = if let Some((start, end)) = start.zip(end) {
+        let seconds = (end - start).num_seconds();
+        if seconds <= 0 {
+            return Err(FetchError::Decode(
+                "mimo: Token Plan period end must follow its start".to_string(),
+            ));
+        }
+        (seconds % 60 == 0).then_some(seconds / 60)
+    } else {
+        None
+    };
+    if total == 0 {
+        return Err(FetchError::NoQuotaReported(
+            "mimo: Token Plan states no credit allowance".to_string(),
+        ));
+    }
+
+    Ok(Usage {
+        primary: Some(RateWindow {
+            window_kind: None,
+            used_percent: (used.min(total) as f64 / total as f64) * 100.0,
+            raw_used_percent: None,
+            resets_at: end.map(|date| date.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            window_minutes,
+            used_count: Some(used as f64),
+            total_count: Some(total as f64),
+            regeneration: None,
+            breakdown: None,
+        }),
+        ..Usage::default()
+    })
+}
+
+fn token_plan_status(status: u16) -> Result<(), FetchError> {
+    match status {
+        200 => Ok(()),
+        401 => Err(FetchError::ProviderStatus(
+            401,
+            "mimo: Token Plan key rejected".to_string(),
+        )),
+        // Permission to read quota can be refused without invalidating the key.
+        403 => Err(FetchError::Upstream(
+            "mimo: Token Plan quota query forbidden (HTTP 403)".to_string(),
+        )),
+        _ => Err(FetchError::ProviderStatus(
+            status,
+            "mimo: Token Plan quota query failed".to_string(),
+        )),
+    }
+}
 
 #[derive(Deserialize)]
 struct MimoEnvelope<T> {
@@ -167,6 +332,11 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
 pub struct MimoProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
+    token_plan_http: Option<reqwest::Client>,
+    credential_source: Option<Arc<dyn CredentialSource>>,
+    handle_loader: Arc<VaultHandleLoader>,
+    #[cfg(test)]
+    token_plan_test_urls: Vec<(&'static str, String)>,
 }
 
 impl MimoProvider {
@@ -175,8 +345,8 @@ impl MimoProvider {
     // `http::provider_client()`; see clippy.toml for why that bound matters.
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn new_with_handle_loader(
-        credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
-        handle_loader: std::sync::Arc<crate::vault_handles::VaultHandleLoader>,
+        credential_source: Option<Arc<dyn CredentialSource>>,
+        handle_loader: Arc<VaultHandleLoader>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -185,10 +355,67 @@ impl MimoProvider {
         Self {
             http,
             vault: crate::cookie_vault::CookieVault::new(
-                credential_source,
-                handle_loader,
+                credential_source.clone(),
+                Arc::clone(&handle_loader),
                 COOKIE_FAMILY,
             ),
+            token_plan_http: crate::http::provider_client_without_redirects().ok(),
+            credential_source,
+            handle_loader,
+            #[cfg(test)]
+            token_plan_test_urls: Vec::new(),
+        }
+    }
+
+    async fn read_token_plan(&self, region: Region, key: &str) -> Result<Usage, FetchError> {
+        let http = self.token_plan_http.as_ref().ok_or_else(|| {
+            FetchError::Internal(
+                "mimo: could not create a redirect-disabled Token Plan client".to_string(),
+            )
+        })?;
+        let url = region.url();
+        #[cfg(test)]
+        let url = self
+            .token_plan_test_urls
+            .iter()
+            .find(|(endpoint, _)| *endpoint == url)
+            .map(|(_, target)| target.as_str())
+            .ok_or_else(|| FetchError::Internal(format!("missing test route for {url}")))?;
+        let response = JsonRequest::get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .header(Header::new("Accept", "application/json"))
+            .header(Header::bearer(key))
+            .send_raw(http)
+            .await?;
+        token_plan_status(response.status)?;
+        normalize_token_plan(response.body_for_parsing()?)
+    }
+
+    async fn fetch_token_plan(&self, handle: &CredentialHandle, region: Region) -> FetchAttempt {
+        let Some(source) = self.credential_source.as_ref() else {
+            return FetchAttempt::unverified_vault_failure(VaultGetError::Permanent);
+        };
+        let mut served = match get_vault_credential(source, handle, VAULT_READ_MIN_TTL_MS).await {
+            Ok(served) => served,
+            Err(error) => return FetchAttempt::unverified_vault_failure(error),
+        };
+        let result = match take_utf8_payload(&mut served.payload) {
+            Ok(key) if !key.trim().is_empty() => self.read_token_plan(region, key.trim()).await,
+            Ok(_) => Err(FetchError::CredentialUnusable(
+                "mimo: empty Token Plan key deposit".to_string(),
+            )),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(usage) => FetchAttempt::success(
+                Some(AccountObservation::new(None, Some(served.record_version))),
+                "vault",
+                usage,
+            ),
+            Err(error) => {
+                report_vault_auth_failure(Some(source), handle, served.record_version, &error);
+                FetchAttempt::failure(None, Some("vault".to_string()), error)
+            }
         }
     }
 }
@@ -203,11 +430,37 @@ impl UsageProvider for MimoProvider {
         true
     }
 
-    fn handles(&self) -> Result<Vec<CredentialHandle>, crate::provider::HandlesError> {
-        self.vault.handles()
+    fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+        if self.credential_source.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut keys = self
+            .handle_loader
+            .mimo_handles()?
+            .into_iter()
+            .filter(|handle| Region::for_handle(handle).is_some());
+        let Some(key) = keys.next() else {
+            return self.vault.handles();
+        };
+        // Neither endpoint identifies its owner; all deposits compete for one
+        // row. More than one key is a configuration error, not a tie-break.
+        if keys.next().is_some() {
+            return Ok(vec![CredentialHandle::Named(
+                TOKEN_PLAN_CONFLICT.to_string(),
+            )]);
+        }
+        Ok(vec![key])
     }
 
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
+        if matches!(handle, CredentialHandle::Named(name) if name == TOKEN_PLAN_CONFLICT) {
+            return FetchAttempt::failure(None, Some("vault".to_string()), FetchError::CredentialUnusable(
+                "mimo: conflicting Token Plan keys (xiaomi-token-plan-cn or xiaomi-token-plan-sgp); keep only one deposit".to_string(),
+            ));
+        }
+        if let Some(region) = Region::for_handle(handle) {
+            return self.fetch_token_plan(handle, region).await;
+        }
         let result: Result<ProviderUsage, FetchError> = async {
             let (jar, source) = self.vault.jar_for(handle).await?;
 
@@ -403,3 +656,6 @@ mod tests {
         assert_eq!(primary.window_minutes, Some(43200));
     }
 }
+
+#[cfg(test)]
+mod token_plan_tests;

@@ -99,7 +99,12 @@ EXPECTED: dict[str, dict[str, str]] = {
     # to this module still fails the normal unrecorded-constant check below.
     "litellm": {},
     "manus": {"CREDITS_URL": "api.manus.im"},
-    "mimo": {"DETAIL_URL": "platform.xiaomimimo.com", "USAGE_URL": "platform.xiaomimimo.com"},
+    "mimo": {
+        "DETAIL_URL": "platform.xiaomimimo.com",
+        "USAGE_URL": "platform.xiaomimimo.com",
+        "CHINA_TOKEN_PLAN_URL": "token-plan-cn.xiaomimimo.com",
+        "SINGAPORE_TOKEN_PLAN_URL": "token-plan-sgp.xiaomimimo.com",
+    },
     "minimax": {"CHINA_API_BASE": "api.minimaxi.com", "GLOBAL_API_BASE": "api.minimax.io"},
     "muse": {"KEY_URL": "api.meta.ai", "WEB_URL": "dev.meta.ai"},
     "neuralwatt": {"DEFAULT_BASE": "api.neuralwatt.com"},
