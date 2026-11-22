@@ -470,6 +470,7 @@ fn check_base_resp(base: &Option<BaseResp>) -> Result<(), FetchError> {
         .unwrap_or_else(|| format!("status_code {status}"));
     let lower = message.to_lowercase();
     if status == 1004
+        || lower.trim() == "invalid api key"
         || lower.contains("cookie")
         || lower.contains("log in")
         || lower.contains("login")
@@ -1261,6 +1262,25 @@ mod tests {
     }
 
     #[test]
+    fn remains_wrong_region_and_permission_messages_stay_upstream_failures() {
+        for message in ["invalid api key for this region", "permission denied"] {
+            let body =
+                format!(r#"{{"base_resp":{{"status_code":1001,"status_msg":"{message}"}}}}"#);
+            let error = normalize_usage_at(body.as_bytes(), NOW).unwrap_err();
+            assert_eq!(error.error_class(), "upstream_failed", "{error}");
+        }
+    }
+
+    #[test]
+    fn remains_success_status_ignores_invalid_key_text() {
+        let body = br#"{
+          "base_resp":{"status_code":0,"status_msg":"invalid api key"},
+          "model_remains":[{"current_interval_total_count":100,"current_interval_usage_count":80}]
+        }"#;
+        assert!(normalize_usage_at(body, NOW).unwrap().primary.is_some());
+    }
+
+    #[test]
     fn weekly_window_maps_to_secondary() {
         let start = 1_700_000_000_000_i64;
         let end = start + 5 * 60 * 60 * 1000;
@@ -1585,6 +1605,12 @@ mod vault_lane_tests {
       }]
     }"#;
 
+    // Controlled legacy-route fixture: CodexBar v0.85.0
+    // Tests/CodexBarTests/MiniMaxTokenPlanChangeTests.swift:425–442 supplies this
+    // HTTP 200 bearer body for /v1/token_plan/remains, not the legacy route.
+    const INVALID_KEY: &str =
+        r#"{"base_resp":{"status_code":1001,"status_msg":"invalid api key"}}"#;
+
     /// A port nothing listens on, for the host a test must not reach.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
 
@@ -1779,6 +1805,34 @@ mod vault_lane_tests {
         assert_eq!(settled(&reports).await, vec![(401, 44)]);
     }
 
+    #[tokio::test]
+    async fn a_legacy_remains_invalid_key_is_rejected_without_reporting_to_vault() {
+        // CodexBar v0.85.0 Tests/CodexBarTests/MiniMaxProviderTests.swift:255–261
+        // also checks case and whitespace in the web parser. Both bodies are
+        // served on our legacy route here; neither is a capture from that route.
+        let padded = br#"{"base_resp":{"status_code":1001,"status_msg":" INVALID API KEY \n"}}"#;
+        for body in [INVALID_KEY.as_bytes(), padded] {
+            let (global, request) = crate::loopback::serve_once(200, body.to_vec()).await;
+            let (china, china_paths) = serve_paths(|_| (403, "")).await;
+            let (source, reports) = source(Ok(credential(b"minimax-vault-key", 44)));
+            let provider = provider_at(Some(source), &global, &china);
+
+            let attempt = provider
+                .fetch_handle_from(&vault_handle(), env_of(&[]))
+                .await;
+
+            let request = request.await.unwrap();
+            assert_eq!(request.split_whitespace().nth(1), Some(REMAINS_PATH));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer minimax-vault-key"));
+            let error = attempt.usage.expect_err("the remains body refused the key");
+            assert_eq!(error.error_class(), "credential_rejected", "{error}");
+            assert!(china_paths.lock().unwrap().is_empty());
+            assert!(settled(&reports).await.is_empty());
+        }
+    }
+
     /// A 403 is not reported: it can describe entitlement rather than a bad key.
     #[tokio::test]
     async fn a_vault_key_refused_with_403_is_not_reported() {
@@ -1845,6 +1899,27 @@ mod vault_lane_tests {
             }
         });
         (format!("http://{address}"), paths)
+    }
+
+    #[tokio::test]
+    async fn a_wallet_invalid_key_body_leaves_usage_healthy_without_pools() {
+        let (global, paths) = serve_paths(|path| match path {
+            REMAINS_PATH => (200, std::str::from_utf8(REMAINS).unwrap()),
+            BALANCE_PATH => (200, INVALID_KEY),
+            _ => (404, ""),
+        })
+        .await;
+        let (source, reports) = source(Ok(credential(b"minimax-vault-key", 44)));
+        let provider = provider_at(Some(source), &global, UNREACHABLE);
+
+        let attempt = provider
+            .fetch_handle_from(&vault_handle(), env_of(&[]))
+            .await;
+
+        assert!(attempt.usage.is_ok(), "{:?}", attempt.usage);
+        assert!(attempt.pools.is_none());
+        assert_eq!(*paths.lock().unwrap(), [REMAINS_PATH, BALANCE_PATH]);
+        assert!(settled(&reports).await.is_empty());
     }
 
     /// The wallet is asked on the host that accepted the credential.
