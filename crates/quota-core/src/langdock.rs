@@ -257,7 +257,6 @@ impl UsageProvider for LangdockProvider {
             let response = JsonRequest::get(request_url(&self.url))
                 .timeout(REQUEST_TIMEOUT)
                 .header(Header::new("Cookie", jar.header()))
-                .header(Header::new("Accept", "application/json"))
                 .header(Header::new("Referer", REFERER_URL))
                 .send_raw(&self.http)
                 .await?;
@@ -618,9 +617,8 @@ mod tests {
             header("referer"),
             ["https://app.langdock.com/settings/account/usage"]
         );
-        let mut accept = header("accept");
-        accept.dedup();
-        assert_eq!(accept, ["application/json"]);
+        // `JsonRequest::get` already sends this; adding it again sent it twice.
+        assert_eq!(header("accept"), ["application/json"]);
     }
 
     #[tokio::test]
