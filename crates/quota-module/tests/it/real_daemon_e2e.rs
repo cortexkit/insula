@@ -163,7 +163,16 @@ async fn real_subc_daemon_supervises_quota_module_and_routes_usage_get() {
     assert_eq!(provenance.header.ty, subc_protocol::FrameType::Response);
     let provenance: serde_json::Value = serde_json::from_slice(&provenance.body).unwrap();
     assert_eq!(provenance["modules"][0]["module_id"], MODULE_ID);
-    assert_eq!(provenance["modules"][0]["registration"], "channel");
+    // A daemon that offers a registration channel reports how the module
+    // registered, and insula must have used the channel. An older daemon
+    // (the public release the release script also tests against) offers no
+    // channel and reports no `registration`; insula then registers through
+    // the connection file, which the rest of this test still exercises.
+    let registration = &provenance["modules"][0]["registration"];
+    assert!(
+        registration.is_null() || registration == "channel",
+        "insula registered as {registration} although the daemon reports registration"
+    );
 
     let route = route_open(&mut consumer, 1).await;
 
