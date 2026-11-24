@@ -269,6 +269,27 @@ mod tests {
             r#"{"limits": [{"used": 1, "bar": 1}, {"used": 2, "bar": 2}, {"baz": 3}]}"#,
         );
         assert_eq!(names, vec!["limits[].bar", "limits[].baz"]);
+        let (_, names) =
+            decode_collecting_unread::<Vec<Inner>>(br#"[{"extra":1},{"extra":2},{"other":3}]"#);
+        assert_eq!(names, ["[].extra", "[].other"]);
+    }
+
+    #[test]
+    fn serde_wrappers_do_not_add_path_segments() {
+        use serde_ignored::Path;
+        let root = Path::Root;
+        let item = Path::Map {
+            parent: &root,
+            key: "item".into(),
+        };
+        let some = Path::Some { parent: &item };
+        let newtype = Path::NewtypeStruct { parent: &some };
+        let variant = Path::NewtypeVariant { parent: &newtype };
+        let extra = Path::Map {
+            parent: &variant,
+            key: "extra".into(),
+        };
+        assert_eq!(render_path(&extra), "item.extra");
     }
 
     #[test]
@@ -297,13 +318,35 @@ mod tests {
 
     #[test]
     fn a_failed_decode_reports_nothing() {
-        let body = br#"{"five_hour": {"used": "x"}, "leaked_key": 1}"#;
-        assert!(decode_reporting_unread::<Body>("test-unread-failed", body).is_err());
+        let body = br#"{"leaked_key": 1, "five_hour": {"used": "x"}}"#;
+        let error = decode_reporting_unread::<Body>("test-unread-failed", body).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
         // Had the failed decode reported, this name would already be spent.
         assert_eq!(
             reported_names("test-unread-failed", r#"{"leaked_key": 1}"#),
             vec!["leaked_key"]
         );
+    }
+
+    #[test]
+    fn collecting_defers_reporting_until_the_caller_selects_the_shape() {
+        let provider = "test-unread-collecting";
+        let body = br#"{"extra":true}"#;
+        let (_, unread) = decode_collecting_unread::<Body>(body);
+        assert_eq!(unread, ["extra"]);
+        assert!(!was_reported(provider, "extra"));
+        let decoded = decode_reporting_unread::<Body>(provider, body).unwrap();
+        assert_eq!(
+            decoded,
+            Body {
+                five_hour: None,
+                limits: None,
+                nested: None
+            }
+        );
+        assert!(was_reported(provider, "extra"));
+        assert!(!was_reported(provider, "other"));
+        assert!(!was_reported("test-unread-other", "extra"));
     }
 
     #[test]
@@ -318,17 +361,50 @@ mod tests {
             vec!["access_token", "five_hour.token", "limits[].key"]
         );
         let line = format_line("test-unread-secret", &names, 0).expect("names were reported");
-        assert!(!line.contains("SECRETVALUE"), "{line}");
-        assert!(line.starts_with("[insula] test-unread-secret: "), "{line}");
+        assert_eq!(line, "[insula] test-unread-secret: response carries keys insula does not read: access_token, five_hour.token, limits[].key");
+        assert_eq!(format_line("test-unread-secret", &[], 4), None);
+    }
+
+    #[test]
+    fn a_new_name_reaches_stderr_once_without_its_value() {
+        const CHILD: &str = "INSULA_TEST_UNREAD_STDERR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let body = br#"{"extra":"private fixture value"}"#;
+            for _ in 0..2 {
+                decode_reporting_unread::<Body>("test-unread-stderr", body).unwrap();
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unread_keys::tests::a_new_name_reaches_stderr_once_without_its_value",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr.trim(),
+            "[insula] test-unread-stderr: response carries keys insula does not read: extra"
+        );
     }
 
     #[test]
     fn names_are_sanitized_and_capped() {
-        let long = "k".repeat(200);
-        let body = format!(r#"{{"evil\nname": 1, "{long}": 2}}"#);
+        let exact = "é".repeat(64);
+        let body = format!(r#"{{"evil\n\t\u007fname": 1, "{exact}": 2, "{exact}x": 3}}"#);
         let names = reported_names("test-unread-sanitize", &body);
-        assert_eq!(names[0], "evil?name");
-        assert_eq!(names[1], format!("{}...", "k".repeat(MAX_NAME_CHARS)));
+        assert_eq!(
+            names,
+            [
+                "evil???name".to_owned(),
+                exact.clone(),
+                format!("{exact}...")
+            ]
+        );
     }
 
     #[test]
@@ -338,12 +414,39 @@ mod tests {
         let (result, unread) = decode_collecting_unread::<Body>(body.as_bytes());
         result.unwrap();
         let (first, more) = remember_new("test-unread-cap", unread.clone());
-        assert_eq!(first.len(), MAX_NAMES_PER_LINE);
+        assert_eq!(
+            first,
+            (0..20).map(|i| format!("extra{i:02}")).collect::<Vec<_>>()
+        );
         assert_eq!(more, 5);
         let line = format_line("test-unread-cap", &first, more).unwrap();
         assert!(line.ends_with(" +5 more"), "{line}");
         let (second, more) = remember_new("test-unread-cap", unread);
-        assert_eq!(second.len(), 5);
+        assert_eq!(
+            second,
+            ["extra20", "extra21", "extra22", "extra23", "extra24"]
+        );
         assert_eq!(more, 0);
+    }
+
+    #[test]
+    fn each_provider_stops_remembering_names_at_512() {
+        let provider = "test-unread-memory-cap";
+        let names = |range: std::ops::Range<usize>| -> Vec<String> {
+            range.map(|i| format!("key{i}")).collect()
+        };
+        for start in (0..500).step_by(20) {
+            let batch = names(start..start + 20);
+            assert_eq!(remember_new(provider, batch.clone()), (batch, 0));
+        }
+        assert_eq!(
+            remember_new(provider, names(500..520)),
+            (names(500..512), 8)
+        );
+        assert_eq!(remember_new(provider, names(511..513)), (vec![], 1));
+        assert_eq!(
+            remember_new("test-unread-memory-independent", names(511..513)),
+            (names(511..513), 0)
+        );
     }
 }

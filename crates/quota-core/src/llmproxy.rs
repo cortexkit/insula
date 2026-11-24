@@ -187,19 +187,21 @@ mod tests {
         // Shaped like the real /v1/quota-stats response.
         let body = br#"{
             "providers": {
-                "openai": { "quota_groups": [ { "remaining_percent": 80.0, "reset_time": "2026-06-22T17:00:00Z" } ] },
-                "anthropic": { "quota_groups": [
-                    { "remaining_percent": 30.0, "reset_time": "2026-06-22T18:00:00Z" },
-                    { "remaining_percent": 55.0, "reset_time": "2026-06-22T19:00:00Z" }
+                "a": {},
+                "anthropic": { "quota_groups": [ { "remaining_percent": 80.0, "reset_time": "2026-06-22T17:00:00Z" } ] },
+                "openai": { "quota_groups": [
+                    { "reset_time": "2026-06-22T16:00:00Z" },
+                    { "remaining_percent": 55.0, "reset_time": "2026-06-22T19:00:00Z" },
+                    { "remaining_percent": 30.0, "reset_time": "2026-06-22T18:00:00Z" }
                 ] }
             },
             "summary": { "total_requests": 10 }
         }"#;
         let usage = normalize_usage(body).unwrap();
         let primary = usage.primary.unwrap();
-        // The worst group is anthropic's 30%-remaining pool, so the window reports
-        // 70% used and ITS reset. Taking the earliest reset across all groups would
-        // pair this pressure with openai's 17:00 — an hour before the pool that
+        // The worst group is OpenAI's 30%-remaining pool, so the window reports
+        // 70% used and its reset. Taking the earliest reset across all groups would
+        // pair this pressure with Anthropic's 17:00 — an hour before the pool that
         // actually gates the account recovers, so a consumer would resume into a
         // still-exhausted upstream.
         assert_eq!(primary.used_percent, 70.0);
@@ -209,12 +211,63 @@ mod tests {
             "the reset must belong to the group whose depletion is being reported"
         );
         assert_eq!(primary.window_minutes, None);
+        assert_eq!(primary.window_kind, None);
+        assert_eq!(primary.raw_used_percent, None);
+        assert_eq!((primary.used_count, primary.total_count), (None, None));
+        assert!(primary.regeneration.is_none() && primary.breakdown.is_none());
+        assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+        assert!(usage.extra_rate_windows.is_none());
     }
 
     #[test]
     fn no_groups_yields_no_window() {
-        let body = br#"{ "providers": { "openai": { "quota_groups": null } } }"#;
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+        for body in [
+            r#"{"providers":{}}"#,
+            r#"{"providers":{"a":{"quota_groups":null},"b":{},"c":{"quota_groups":[]}}}"#,
+            r#"{"providers":{"a":{"quota_groups":[{"reset_time":"2026-06-22T18:00:00Z"}]}}}"#,
+        ] {
+            assert!(
+                normalize_usage(body.as_bytes()).unwrap().primary.is_none(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_quota_stats_are_decode_errors() {
+        for body in [
+            r#"{}"#,
+            r#"{"providers":{"a":{"quota_groups":[{"remaining_percent":"30"}]}}}"#,
+        ] {
+            assert_eq!(
+                normalize_usage(body.as_bytes()).unwrap_err().error_class(),
+                "decode_failed",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamps_pressure_and_keeps_the_first_pool_on_a_tie() {
+        for (remaining, used) in [(-5, 100.0), (105, 0.0)] {
+            let body = format!(
+                r#"{{"providers":{{"x":{{"quota_groups":[{{"remaining_percent":{remaining}}}]}}}}}}"#
+            );
+            assert_eq!(
+                normalize_usage(body.as_bytes())
+                    .unwrap()
+                    .primary
+                    .unwrap()
+                    .used_percent,
+                used
+            );
+        }
+        let body = br#"{"providers":{"a":{"quota_groups":[
+            {"remaining_percent":20,"reset_time":"2026-06-22T17:00:00Z"},
+            {"remaining_percent":20,"reset_time":"2026-06-22T18:00:00Z"}
+        ]}}}"#;
+        let primary = normalize_usage(body).unwrap().primary.unwrap();
+        assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T17:00:00Z"));
     }
 
     #[test]
@@ -258,9 +311,87 @@ mod tests {
             Some("https://proxy.example.com/v1/quota-stats")
         );
         assert_eq!(
-            quota_stats_url("https://proxy.example.com/v1").as_deref(),
+            quota_stats_url("  https://proxy.example.com/v1///  ").as_deref(),
             Some("https://proxy.example.com/v1/quota-stats")
         );
-        assert_eq!(quota_stats_url("").as_deref(), None);
+        assert_eq!(quota_stats_url("  ///  ").as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn quota_fetch_requires_configuration_and_sends_bearer_auth() {
+        const CASE: &str = "INSULA_TEST_LLMPROXY_CASE";
+        if let Ok(case) = std::env::var(CASE) {
+            let provider = LlmProxyProvider::default();
+            assert_eq!(provider.name(), "llmproxy");
+            let attempt = provider
+                .fetch_handle(&CredentialHandle::ImplicitLocal)
+                .await;
+            match case.as_str() {
+                "missing-key" | "missing-base" => {
+                    assert_eq!(
+                        attempt.usage.unwrap_err().error_class(),
+                        "credential_absent"
+                    );
+                }
+                "unusable-base" => {
+                    assert_eq!(
+                        attempt.usage.unwrap_err().error_class(),
+                        "credential_unusable"
+                    );
+                }
+                "success" => {
+                    assert_eq!(attempt.source.as_deref(), Some("api"));
+                    assert_eq!(
+                        attempt.observed,
+                        Some(crate::provider::AccountObservation::new(None, None))
+                    );
+                    assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 70.0);
+                }
+                _ => panic!("unknown fixture case {case}"),
+            }
+            return;
+        }
+
+        let (base, request) = crate::loopback::serve_once(
+            200,
+            br#"{"providers":{"a":{"quota_groups":[{"remaining_percent":30}]}}}"#.to_vec(),
+        )
+        .await;
+        // Configure the child, never the process shared with other provider tests.
+        for (case, key, base) in [
+            ("missing-key", "", base.as_str()),
+            ("missing-base", "fixture-key", ""),
+            ("unusable-base", "fixture-key", "///"),
+            ("success", "fixture-key", base.as_str()),
+        ] {
+            let base = base.to_owned();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llmproxy::tests::quota_fetch_requires_configuration_and_sends_bearer_auth",
+                ])
+                .env(CASE, case)
+                .env("LLM_PROXY_API_KEY", key)
+                .env("LLM_PROXY_BASE_URL", base)
+                .env("NO_PROXY", "127.0.0.1")
+                .output()
+                .await
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "{case}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /v1/quota-stats http/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\r\nauthorization: bearer fixture-key\r\n"),
+            "{request}"
+        );
     }
 }

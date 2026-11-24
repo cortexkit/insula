@@ -171,13 +171,49 @@ mod tests {
         assert_eq!(primary.used_percent, 25.0);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-06-22T13:44:39Z"));
         assert_eq!(primary.window_minutes, None);
-        assert!(usage.secondary.is_none());
+        assert_eq!(primary.window_kind, None);
+        assert_eq!(primary.raw_used_percent, None);
+        assert_eq!((primary.used_count, primary.total_count), (None, None));
+        assert!(primary.regeneration.is_none() && primary.breakdown.is_none());
+        assert!(usage.secondary.is_none() && usage.tertiary.is_none());
+        assert!(usage.extra_rate_windows.is_none());
     }
 
     #[test]
-    fn zero_limit_yields_no_window() {
-        let body = br#"{ "character_count": 0, "character_limit": 0 }"#;
-        assert!(normalize_usage(body).unwrap().primary.is_none());
+    fn missing_counts_and_nonpositive_limits_yield_no_window() {
+        for body in [
+            r#"{"character_count":0,"character_limit":0}"#,
+            r#"{"character_count":3,"character_limit":-1}"#,
+            r#"{"character_count":3}"#,
+            r#"{"character_limit":10}"#,
+        ] {
+            assert!(
+                normalize_usage(body.as_bytes()).unwrap().primary.is_none(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamps_usage_and_drops_unrepresentable_reset_dates() {
+        for (count, percent) in [(-1, 0.0), (0, 0.0), (11, 100.0)] {
+            let body = format!(
+                r#"{{"character_count":{count},"character_limit":10,"next_character_count_reset_unix":9223372036854775807}}"#
+            );
+            let primary = normalize_usage(body.as_bytes()).unwrap().primary.unwrap();
+            assert_eq!(primary.used_percent, percent, "count {count}");
+            assert_eq!(primary.resets_at, None);
+        }
+    }
+
+    #[test]
+    fn invalid_subscription_fields_are_decode_errors() {
+        assert_eq!(
+            normalize_usage(br#"{"character_count":"10","character_limit":20}"#)
+                .unwrap_err()
+                .error_class(),
+            "decode_failed"
+        );
     }
 
     #[test]
@@ -200,12 +236,104 @@ mod tests {
     #[test]
     fn url_does_not_double_v1() {
         assert_eq!(
-            subscription_url("https://api.elevenlabs.io"),
+            subscription_url("  ///  "),
             "https://api.elevenlabs.io/v1/user/subscription"
         );
         assert_eq!(
-            subscription_url("https://proxy.local/v1"),
+            subscription_url("  https://proxy.local/v1///  "),
             "https://proxy.local/v1/user/subscription"
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_fetch_uses_env_precedence_and_the_xi_header() {
+        const CASE: &str = "INSULA_TEST_ELEVENLABS_CASE";
+        if let Ok(case) = std::env::var(CASE) {
+            let provider = ElevenLabsProvider::default();
+            assert_eq!(provider.name(), "elevenlabs");
+            let attempt = provider
+                .fetch_handle(&CredentialHandle::ImplicitLocal)
+                .await;
+            if case == "missing" {
+                assert_eq!(
+                    attempt.usage.unwrap_err().error_class(),
+                    "credential_absent"
+                );
+            } else if case == "default-base" {
+                assert_eq!(attempt.usage.unwrap_err().error_class(), "upstream_failed");
+            } else {
+                assert_eq!(attempt.source.as_deref(), Some("api"));
+                assert_eq!(
+                    attempt.observed,
+                    Some(crate::provider::AccountObservation::new(None, None))
+                );
+                assert_eq!(attempt.usage.unwrap().primary.unwrap().used_percent, 25.0);
+            }
+            return;
+        }
+
+        // An isolated test process selects credentials without racing other tests' env reads.
+        for (case, main, alias, expected) in [
+            ("missing", "", "  ", None),
+            ("primary", " main-key ", "alias-key", Some("main-key")),
+            ("alias", "   ", "alias-key", Some("alias-key")),
+            ("default-base", "main-key", "", None),
+        ] {
+            let (base, request) = crate::loopback::serve_once(
+                200,
+                br#"{"character_count":1,"character_limit":4}"#.to_vec(),
+            )
+            .await;
+            let (url, proxy) = if case == "default-base" {
+                // End the HTTPS tunnel locally, so the default host is observed without dialing it.
+                ("", base.as_str())
+            } else {
+                (base.as_str(), "http://127.0.0.1:0")
+            };
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "elevenlabs::tests::subscription_fetch_uses_env_precedence_and_the_xi_header",
+                ])
+                .env(CASE, case)
+                .env("ELEVENLABS_API_KEY", main)
+                .env("XI_API_KEY", alias)
+                .env("ELEVENLABS_API_URL", url)
+                .env("NO_PROXY", "127.0.0.1")
+                .env("HTTPS_PROXY", proxy)
+                .env("HTTP_PROXY", proxy)
+                .output()
+                .await
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "{case}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(key) = expected {
+                let request = request.await.unwrap().to_ascii_lowercase();
+                assert!(
+                    request.starts_with("get /v1/user/subscription http/1.1\r\n"),
+                    "{request}"
+                );
+                assert!(
+                    request.contains(&format!("\r\nxi-api-key: {key}\r\n")),
+                    "{request}"
+                );
+                assert!(!request.contains("\r\nauthorization:"), "{request}");
+            } else if case == "default-base" {
+                let request = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    request.starts_with("CONNECT api.elevenlabs.io:443 HTTP/1.1\r\n"),
+                    "{request}"
+                );
+            } else {
+                request.abort();
+            }
+        }
     }
 }

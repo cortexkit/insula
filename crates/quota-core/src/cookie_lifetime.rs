@@ -125,7 +125,7 @@ pub(crate) fn render_age(age: Duration) -> String {
 mod tests {
     use super::*;
 
-    const ID: &str = "cookie:ollama.com:ufuk";
+    const ID: &str = "cookie:ollama.com:fixture";
 
     #[test]
     fn the_first_rejection_after_a_served_read_reports_its_age() {
@@ -171,6 +171,7 @@ mod tests {
         let start = Instant::now();
         lifetimes.observe(ID, Some(3), true, false, start);
         lifetimes.observe(ID, Some(3), false, true, start + Duration::from_secs(60));
+        lifetimes.observe(ID, Some(3), true, false, start + Duration::from_secs(90));
         assert_eq!(
             lifetimes.observe(ID, Some(3), false, true, start + Duration::from_secs(120)),
             LifetimeEvent::Quiet
@@ -224,15 +225,49 @@ mod tests {
     fn a_transient_failure_neither_starts_nor_ends_a_lifetime() {
         let mut lifetimes = CookieLifetimes::default();
         let start = Instant::now();
+        assert_eq!(
+            lifetimes.observe(ID, Some(3), false, false, start),
+            LifetimeEvent::Quiet
+        );
+        assert_eq!(lifetimes.rejection_reported(ID), None);
         lifetimes.observe(ID, Some(3), true, false, start);
         assert_eq!(
             lifetimes.observe(ID, Some(3), false, false, start + Duration::from_secs(60)),
             LifetimeEvent::Quiet
         );
-        assert!(matches!(
+        assert_eq!(
             lifetimes.observe(ID, Some(3), false, true, start + Duration::from_secs(120)),
-            LifetimeEvent::FirstRejection { .. }
-        ));
+            LifetimeEvent::FirstRejection {
+                record_version: Some(3),
+                age: Duration::from_secs(120),
+            }
+        );
+    }
+
+    #[test]
+    fn unversioned_cookies_keep_separate_clocks_and_never_report_negative_age() {
+        let mut lifetimes = CookieLifetimes::default();
+        let start = Instant::now();
+        let other = "cookie:ollama.com:second";
+        lifetimes.observe(ID, None, true, false, start + Duration::from_secs(20));
+        assert_eq!(lifetimes.rejection_reported(other), None);
+        lifetimes.observe(other, None, true, false, start);
+        assert_eq!(
+            lifetimes.observe(ID, None, false, true, start + Duration::from_secs(10)),
+            LifetimeEvent::FirstRejection {
+                record_version: None,
+                age: Duration::ZERO
+            }
+        );
+        assert_eq!(lifetimes.rejection_reported(ID), Some(true));
+        assert_eq!(lifetimes.rejection_reported(other), Some(false));
+        assert_eq!(
+            lifetimes.observe(other, None, false, true, start + Duration::from_secs(10)),
+            LifetimeEvent::FirstRejection {
+                record_version: None,
+                age: Duration::from_secs(10)
+            }
+        );
     }
 
     #[test]

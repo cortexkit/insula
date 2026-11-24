@@ -37,8 +37,8 @@ fn is_session_cookie(name: &str) -> bool {
     name == "auth_token"
 }
 
-fn request_url() -> String {
-    let mut url = reqwest::Url::parse(USAGE_URL).expect("Langdock usage URL is a valid constant");
+fn request_url(base: &str) -> String {
+    let mut url = reqwest::Url::parse(base).expect("Langdock usage URL is valid");
     url.query_pairs_mut()
         .extend_pairs([("batch", "1"), ("input", TRPC_INPUT)]);
     url.into()
@@ -210,6 +210,7 @@ fn check_response(status: u16, final_url: &str) -> Result<(), FetchError> {
 pub struct LangdockProvider {
     vault: crate::cookie_vault::CookieVault,
     http: reqwest::Client,
+    url: String,
 }
 
 impl LangdockProvider {
@@ -219,6 +220,7 @@ impl LangdockProvider {
     ) -> Self {
         Self {
             http: crate::http::provider_client(),
+            url: USAGE_URL.to_owned(),
             vault: crate::cookie_vault::CookieVault::new(
                 credential_source,
                 handle_loader,
@@ -252,7 +254,7 @@ impl UsageProvider for LangdockProvider {
                     jar.session_absence_detail()
                 )));
             }
-            let response = JsonRequest::get(request_url())
+            let response = JsonRequest::get(request_url(&self.url))
                 .timeout(REQUEST_TIMEOUT)
                 .header(Header::new("Cookie", jar.header()))
                 .header(Header::new("Accept", "application/json"))
@@ -271,6 +273,8 @@ impl UsageProvider for LangdockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault_handles::VaultHandleLoader;
+    use crate::vercel::testkit::{credential, MockSource};
 
     // Included-limit, no-limit and malformed responses pin the plugin's wire
     // contract without requiring a live account. Inline fixtures from CodexBar v0.73.0, commit
@@ -301,12 +305,30 @@ mod tests {
         assert_eq!(weekly.resets_at.as_deref(), Some("2026-09-28T12:00:00Z"));
         assert_eq!(weekly.window_minutes, Some(10080));
         assert_eq!(weekly.window_kind.as_deref(), Some("weekly"));
+        for window in [session, weekly] {
+            assert_eq!(window.raw_used_percent, None);
+            assert_eq!((window.used_count, window.total_count), (None, None));
+            assert!(window.regeneration.is_none() && window.breakdown.is_none());
+        }
+        assert!(usage.tertiary.is_none() && usage.extra_rate_windows.is_none());
+    }
+
+    #[test]
+    fn unread_envelope_fields_are_reported_as_langdock_fields() {
+        let mut batch: Value = serde_json::from_slice(NORMAL).unwrap();
+        batch[0]["fixture_extra"] = Value::Bool(true);
+        let usage = normalize(&serde_json::to_vec(&batch).unwrap()).unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 12.5);
+        assert!(crate::unread_keys::was_reported(
+            "langdock",
+            "[].fixture_extra"
+        ));
     }
 
     #[test]
     fn no_included_limits_reports_no_quota_not_an_idle_window() {
         for body in [
-            br#"[{"result":{"data":{"json":{"hasIncludedUsageLimits":false}}}}]"#.as_slice(),
+            br#"[{"result":{"data":{"json":{"hasIncludedUsageLimits":false,"planUsage":{"sessionUsageLimitsEnabled":false,"weeklyUsagePercent":4}}}}}]"#.as_slice(),
             br#"[{"result":{"data":{"json":{"hasIncludedUsageLimits":true,"planUsage":null}}}}]"#,
             br#"[{"result":{"data":{"json":{}}}}]"#,
         ] {
@@ -324,12 +346,31 @@ mod tests {
         for url in [
             "https://app.langdock.com/login?returnTo=%2Fsettings",
             "https://app.langdock.com/signin",
+            "https://app.langdock.com/session/Sign-In/callback",
+            "https://app.langdock.com/auth",
             "https://auth.langdock.com/",
         ] {
-            let result = check_response(200, url).and_then(|()| normalize(NORMAL));
-            assert_eq!(result.unwrap_err().error_class(), "credential_rejected");
+            for status in [200, 403] {
+                let result = check_response(status, url).and_then(|()| normalize(NORMAL));
+                assert_eq!(
+                    result.unwrap_err().error_class(),
+                    "credential_rejected",
+                    "HTTP {status} at {url}"
+                );
+            }
         }
-        assert!(check_response(200, USAGE_URL).is_ok());
+        let ordinary = "https://app.langdock.com/method.login?q=/auth";
+        assert!(!is_sign_in_redirect(ordinary));
+        assert!(!is_sign_in_redirect("not an absolute URL"));
+        assert_eq!(
+            check_response(200, ordinary)
+                .and_then(|()| normalize(NORMAL))
+                .unwrap()
+                .primary
+                .unwrap()
+                .used_percent,
+            12.5
+        );
     }
 
     #[test]
@@ -359,19 +400,41 @@ mod tests {
     }
 
     #[test]
+    fn reset_offsets_are_normalized_to_utc() {
+        let body = br#"[{"result":{"data":{"json":{"planUsage":{
+            "sessionUsageLimitsEnabled":false,"weeklyUsagePercent":4,
+            "weeklyResetsAt":"2026-09-25T16:00:00.123456+04:00"
+        }}}}}]"#;
+        assert_eq!(
+            normalize(body)
+                .unwrap()
+                .secondary
+                .unwrap()
+                .resets_at
+                .as_deref(),
+            Some("2026-09-25T12:00:00.123456Z")
+        );
+    }
+
+    #[test]
     fn garbage_and_invalid_fields_report_decode_failed() {
         for body in [
             "not JSON",
             "[]",
             "[{},{}]",
+            "[{}]",
             r#"[{"result":{"data":null}}]"#,
+            r#"[{"result":{"data":{"json":null}}}]"#,
             r#"[{"error":{}}]"#,
             r#"[{"error":{"json":{"data":{"code":403}}}}]"#,
             r#"[{"result":{"data":{"json":{"hasIncludedUsageLimits":null}}}}]"#,
+            r#"[{"result":{"data":{"json":{"planUsage":{"weeklyUsagePercent":4}}}}}]"#,
+            r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":0,"weeklyUsagePercent":4}}}}}]"#,
             r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":true,"weeklyUsagePercent":4}}}}}]"#,
             r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":true,"sessionUsagePercent":"5","weeklyUsagePercent":4}}}}}]"#,
             r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":false,"weeklyUsagePercent":"4"}}}}}]"#,
             r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":false,"weeklyUsagePercent":4,"weeklyResetsAt":"tomorrow"}}}}}]"#,
+            r#"[{"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":false,"weeklyUsagePercent":4,"weeklyResetsAt":100}}}}}]"#,
         ] {
             assert_eq!(
                 normalize(body.as_bytes()).unwrap_err().error_class(),
@@ -410,7 +473,7 @@ mod tests {
             check_response(401, USAGE_URL).unwrap_err().error_class(),
             "credential_rejected"
         );
-        for status in [403, 429, 500] {
+        for status in [199, 300, 403, 429, 500] {
             let error = check_response(status, USAGE_URL).unwrap_err();
             assert_eq!(error.error_class(), "upstream_failed");
             assert!(matches!(
@@ -418,16 +481,57 @@ mod tests {
                 crate::refresh::FetchClass::Transient
             ));
         }
-        for (code, class) in [
-            ("UNAUTHORIZED", "credential_rejected"),
-            ("FORBIDDEN", "upstream_failed"),
-            ("TOO_MANY_REQUESTS", "upstream_failed"),
-            ("TIMEOUT", "upstream_failed"),
-            ("INTERNAL_SERVER_ERROR", "upstream_failed"),
+        for status in [200, 299] {
+            let usage = check_response(status, USAGE_URL)
+                .and_then(|()| normalize(NORMAL))
+                .unwrap();
+            assert_eq!(usage.secondary.unwrap().used_percent, 104.2);
+        }
+        for (code, class, detail) in [
+            (
+                "UNAUTHORIZED",
+                "credential_rejected",
+                "langdock session expired",
+            ),
+            ("FORBIDDEN", "upstream_failed", "langdock permission denied"),
+            (
+                "TOO_MANY_REQUESTS",
+                "upstream_failed",
+                "langdock rate limited",
+            ),
+            (
+                "TIMEOUT",
+                "upstream_failed",
+                "langdock provider unavailable",
+            ),
+            (
+                "INTERNAL_SERVER_ERROR",
+                "upstream_failed",
+                "langdock provider unavailable",
+            ),
+            ("", "decode_failed", "langdock: missing tRPC error code"),
+            (
+                "UNRECOGNIZED_CODE",
+                "upstream_failed",
+                "langdock tRPC request failed",
+            ),
         ] {
             let body = format!(r#"[{{"error":{{"json":{{"data":{{"code":"{code}"}}}}}}}}]"#);
-            assert_eq!(normalize(body.as_bytes()).unwrap_err().error_class(), class);
+            let error = normalize(body.as_bytes()).unwrap_err();
+            assert_eq!(error.error_class(), class, "code {code:?}");
+            assert!(error.to_string().contains(detail), "code {code:?}: {error}");
+            if code == "TOO_MANY_REQUESTS" {
+                assert!(
+                    matches!(error, FetchError::ProviderStatus(429, _)),
+                    "{error:?}"
+                );
+            }
         }
+        let body = br#"[{"error":{"json":{"data":{"code":"UNAUTHORIZED"}}},"result":{"data":{"json":{"planUsage":{"sessionUsageLimitsEnabled":false,"weeklyUsagePercent":4}}}}}]"#;
+        assert_eq!(
+            normalize(body).unwrap_err().error_class(),
+            "credential_rejected"
+        );
     }
 
     #[test]
@@ -442,14 +546,123 @@ mod tests {
 
     #[test]
     fn request_targets_personal_usage_with_the_upstream_batch_input() {
-        let url = reqwest::Url::parse(&request_url()).unwrap();
+        let provider =
+            LangdockProvider::new_with_handle_loader(None, Arc::new(VaultHandleLoader::default()));
+        let url = reqwest::Url::parse(&request_url(&provider.url)).unwrap();
+        assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("app.langdock.com"));
         assert_eq!(url.path(), "/api/trpc/usageSettings.getPersonalUsage");
         let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query.len(), 2);
         assert_eq!(query.get("batch").map(|value| value.as_ref()), Some("1"));
         assert_eq!(
             query.get("input").map(|value| value.as_ref()),
             Some(r#"{"0":{"json":null,"meta":{"values":["undefined"],"v":1}}}"#)
         );
+    }
+
+    // Route the production hostname to loopback so the real redirect check still runs.
+    #[allow(clippy::disallowed_methods)]
+    fn loopback_provider(base: &str, cookie: &str) -> LangdockProvider {
+        let id = "cookie:langdock.com:fixture";
+        let loader = Arc::new(VaultHandleLoader::default());
+        loader.install_rows_for_test(&[(id, "cookie")]);
+        let (source, _) = MockSource::serving(&[(id, credential(cookie, 1))]);
+        let mut provider = LangdockProvider::new_with_handle_loader(Some(source), loader);
+        let address: std::net::SocketAddr = base.strip_prefix("http://").unwrap().parse().unwrap();
+        provider.url = format!(
+            "http://app.langdock.com:{}/api/trpc/usageSettings.getPersonalUsage",
+            address.port()
+        );
+        provider.http = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("app.langdock.com", address)
+            .build()
+            .unwrap();
+        provider
+    }
+
+    #[tokio::test]
+    async fn fetch_uses_the_deposited_cookie_without_publishing_its_suffix() {
+        let (base, request) = crate::loopback::serve_once(200, NORMAL.to_vec()).await;
+        let provider = loopback_provider(&base, "auth_token=fixture; preferences=fixture");
+        let handle = provider.handles().unwrap().remove(0);
+        let attempt = provider.fetch_handle(&handle).await;
+        assert_eq!(attempt.source.as_deref(), Some("vault"));
+        assert_eq!(
+            attempt.observed,
+            Some(crate::provider::AccountObservation::new(None, None))
+        );
+        let usage = attempt.usage.unwrap();
+        assert_eq!(usage.primary.unwrap().used_percent, 12.5);
+        assert_eq!(usage.secondary.unwrap().used_percent, 104.2);
+        let request = request.await.unwrap();
+        assert!(
+            request.starts_with("GET /api/trpc/usageSettings.getPersonalUsage?batch=1&input="),
+            "{request}"
+        );
+        let header = |name: &str| {
+            request
+                .lines()
+                .filter_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            header("cookie"),
+            ["auth_token=fixture; preferences=fixture"]
+        );
+        assert_eq!(
+            header("referer"),
+            ["https://app.langdock.com/settings/account/usage"]
+        );
+        let mut accept = header("accept");
+        accept.dedup();
+        assert_eq!(accept, ["application/json"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_missing_auth_and_checks_status_before_decoding() {
+        let (base, request) = crate::loopback::serve_once(200, NORMAL.to_vec()).await;
+        let provider = loopback_provider(&base, "preferences=fixture");
+        let handle = provider.handles().unwrap().remove(0);
+        let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "credential_absent");
+        assert!(error
+            .to_string()
+            .contains("no langdock auth_token session cookie in the deposited cookie"));
+        request.abort();
+
+        for (status, body, class) in [
+            (403, NORMAL, "upstream_failed"),
+            (401, b"not JSON", "credential_rejected"),
+            (200, b"", "upstream_failed"),
+            (200, b"not JSON", "decode_failed"),
+        ] {
+            let (base, request) = crate::loopback::serve_once(status, body.to_vec()).await;
+            let provider = loopback_provider(&base, "auth_token=fixture");
+            let handle = provider.handles().unwrap().remove(0);
+            let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+            assert_eq!(error.error_class(), class, "HTTP {status}, body {body:?}");
+            request.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_cannot_wait_more_than_twenty_seconds() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let provider = loopback_provider(&base, "auth_token=fixture");
+        let handle = provider.handles().unwrap().remove(0);
+        // Leave the server socket open without replying; only the request deadline ends the fetch.
+        let started = tokio::time::Instant::now();
+        let error = provider.fetch_handle(&handle).await.usage.unwrap_err();
+        assert_eq!(error.error_class(), "upstream_failed");
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        drop(listener);
     }
 }
