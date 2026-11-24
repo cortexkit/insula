@@ -79,6 +79,10 @@ worker() {
     gate "$platform cargo version" cargo --version
     gate "$platform format" cargo fmt --all -- --check
     gate "$platform clippy (committed lock)" cargo clippy --locked --workspace --all-targets -- -D warnings
+    # The release workflow builds only the binary, without dev dependencies, so
+    # a feature that only a dev dependency turns on is missing there. Check the
+    # binary alone so that shows up before a release.
+    gate "$platform release binary" cargo check --locked -p quota-module --bin ck-insula
     workspace_tests "$platform"
     gate "$platform doctests" cargo test --locked --workspace --doc
     if [ "$e2e" -eq 1 ]; then

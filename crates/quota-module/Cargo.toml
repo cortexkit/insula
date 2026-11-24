@@ -29,7 +29,9 @@ quota-core = { path = "../quota-core" }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
-subc-os = { workspace = true }
+# `tokio` provides the Windows registration channel's named-pipe client. Dev
+# dependencies enable it too, so only a binary-only build shows it missing.
+subc-os = { workspace = true, features = ["tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
