@@ -395,11 +395,11 @@ impl SlotStore {
     /// a duplicate lane must not keep serving its pre-reset credit count.
     ///
     /// Clearing the call-observation stamp is what makes "now" stick. While
-    /// reply readings arrive, `poll_due_at` defers the poll to 15 minutes after
-    /// the last one, whatever `next_due_at` says. And those reply readings can't
-    /// show the reset themselves: a reading whose period starts before the held
-    /// reset time is refused as `early_new_period`. So without this, a redeemed
-    /// account kept its pre-reset reading for up to 15 minutes.
+    /// reply readings arrive, `poll_due_at` holds the poll (up to 15 minutes
+    /// after the last one), whatever `next_due_at` says. And those reply
+    /// readings can't show the reset themselves: a reading whose period starts
+    /// before the held reset time is refused as `early_new_period`. So without
+    /// this, a redeemed account kept its pre-reset reading for up to 15 minutes.
     pub(crate) fn mark_account_due(&mut self, provider: &str, account_id: &str, now: Instant) {
         for (key, slot) in &mut self.slots {
             if key.provider == provider
@@ -1163,7 +1163,6 @@ mod tests {
 mod redeem_due_tests {
     use super::*;
     use crate::provider::AccountObservation;
-    use crate::refresh::CALL_OBSERVED_INTERVAL;
     use std::time::Duration;
 
     /// A redeemed account is polled on the next tick even while reply readings
@@ -1188,7 +1187,7 @@ mod redeem_due_tests {
             .poll_due_at("codex", redeemed, false);
         assert_eq!(
             deferred,
-            start + CALL_OBSERVED_INTERVAL,
+            start + Duration::from_secs(5) + crate::refresh::BASE_INTERVAL,
             "fixture must start inside the reply-reading deferral"
         );
 

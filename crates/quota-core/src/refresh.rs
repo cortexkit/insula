@@ -392,6 +392,13 @@ impl ProviderSlot {
     /// Recompute the call-based delay whenever deciding whether to schedule a
     /// poll, so call silence restores the normal polling cadence. Failed polls
     /// and vault-repair deadlines keep priority.
+    ///
+    /// Reply readings replace a poll only while they keep arriving: the poll is
+    /// held until one normal poll interval after the newest reply reading, and
+    /// never past the 15-minute backstop after the last poll. Holding it to the
+    /// backstop regardless let an idle session's reading age up to 15 minutes,
+    /// and consumers that treat a reading over a few minutes old as absent then
+    /// fell back to polling the provider themselves.
     pub fn poll_due_at(&self, provider: &str, now: Instant, codex_resets_armed: bool) -> Instant {
         // Billing reads stay slow even after failures or a vault replacement
         // makes next_due_at immediate. Neither event replenishes API credits.
@@ -406,8 +413,12 @@ impl ProviderSlot {
                 .last_call_observation_at
                 .is_some_and(|at| now.saturating_duration_since(at) < CALL_OBSERVED_INTERVAL)
         {
-            if let Some(last_poll) = self.last_poll_completed_at {
-                return self.next_due_at.max(last_poll + CALL_OBSERVED_INTERVAL);
+            if let (Some(last_poll), Some(last_call)) =
+                (self.last_poll_completed_at, self.last_call_observation_at)
+            {
+                let held =
+                    (last_call + poll_interval(provider)).min(last_poll + CALL_OBSERVED_INTERVAL);
+                return self.next_due_at.max(held);
             }
         }
         self.next_due_at

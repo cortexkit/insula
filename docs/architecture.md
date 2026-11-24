@@ -124,10 +124,11 @@ longer enumerated.
 ### 3. Schedule
 
 A slot is due at its provider's interval after its last completion: 180 s for
-Claude, `BASE_INTERVAL` (60 s) otherwise. When an account has an applied call
-reading in the last three minutes, its next Claude poll is deferred to fifteen
-minutes after its last poll. This is recomputed at admission, so calls stopping
-automatically restore the ordinary cadence and cold accounts remain due. A failed slot
+Claude, `BASE_INTERVAL` (60 s) otherwise. While call readings for an account
+keep arriving, its next poll waits until one interval after the newest reading,
+and never past fifteen minutes after its last poll. This is recomputed at
+admission, so calls stopping restores the ordinary cadence within one interval,
+and cold accounts remain due. A failed slot
 waits out a backoff instead: `NON_TRANSIENT_BACKOFF` (300 s) for a failure
 retrying cannot fix, or an exponential backoff capped at
 `MAX_TRANSIENT_BACKOFF` (900 s) for a transient one. A vault row that comes

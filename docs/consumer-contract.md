@@ -455,10 +455,11 @@ facts. A report's 100% or `limit_reached: true` never reaches the reset coordina
 or authorizes a consume POST. A Codex report with any held window at 99% or
 higher revokes existing saved-reset output relaxation; reports never grant that
 eligibility. Lower readings leave the poll's latch unchanged. While accepted
-readings arrived within the last
-15 minutes, healthy polls back off to a 15-minute backstop after the last poll.
-Call silence restores normal cadence; endpoint failure/429 backoff is never
-shortened. **Codex exception:** live `codex.auto_use_resets` being armed keeps the
+readings keep arriving, a healthy poll waits until one normal poll interval after
+the newest one, and never past 15 minutes after the last poll. So an entry stays
+within about one interval old whether it was last refreshed by a report or a poll,
+and call silence restores normal cadence within one interval; endpoint
+failure/429 backoff is never shortened. **Codex exception:** live `codex.auto_use_resets` being armed keeps the
 normal Codex poll cadence, so every sibling is read within 600 seconds. Config
 reloads change this decision without a restart.
 
@@ -557,10 +558,10 @@ threshold must clear that sum, not the interval alone; below it, every healthy
 provider reads stale for part of every cycle, all at once, which looks like a
 producer-wide outage. This module itself counts an entry as fresh for 120 s
 (`FRESH_HORIZON`). Claude polls every 180 s instead, with a health freshness
-horizon of 215 s. An account with a call reading applied in the last fifteen
-minutes defers polling until fifteen minutes after its last completed poll.
-Once calls stop, its ordinary schedule resumes; cold accounts are
-never deferred. Codex keeps its normal cadence while live `auto_use_resets`
+horizon of 215 s. An account whose call readings keep arriving defers its next
+poll until one interval after the newest reading, and never past fifteen minutes
+after its last completed poll. Once calls stop, its ordinary schedule resumes
+within one interval; cold accounts are never deferred. Codex keeps its normal cadence while live `auto_use_resets`
 is armed. Failure backoff and vault-repair acceleration take precedence
 over this deferral: an account backing off after a 429 polls on the backoff
 schedule even while call readings arrive.

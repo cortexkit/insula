@@ -716,8 +716,16 @@ mod tests {
         );
         assert_eq!(
             slot.poll_due_at("claude", last + Duration::from_secs(180), false),
-            last + Duration::from_secs(900),
-            "recent call readings must defer the poll to its fifteen-minute backstop"
+            last + Duration::from_secs(179 + 180),
+            "a reply reading holds the poll for one Claude interval after it"
+        );
+        // Readings that keep arriving hold the poll, but never past the
+        // fifteen-minute backstop after the last poll.
+        let mut busy = slot.clone();
+        busy.last_call_observation_at = Some(last + Duration::from_secs(850));
+        assert_eq!(
+            busy.poll_due_at("claude", last + Duration::from_secs(860), false),
+            last + Duration::from_secs(900)
         );
         assert_eq!(
             slot.poll_due_at("claude", last + Duration::from_secs(1079), false),
@@ -741,7 +749,8 @@ mod tests {
         );
         assert_eq!(
             slot.poll_due_at("codex", last + Duration::from_secs(180), false),
-            last + Duration::from_secs(900)
+            last + Duration::from_secs(179 + 60),
+            "Codex resumes one base interval after its last reply reading"
         );
         let other = refresh::next_slot_after_attempt(
             &refresh::ProviderSlot::due_now(last, slot.incarnation),

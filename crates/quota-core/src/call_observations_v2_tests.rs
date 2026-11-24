@@ -290,6 +290,10 @@ async fn codex_cadence_exception_tracks_live_config() {
     let mut registry = registry("codex").await;
     let config = crate::config::LiveQuotaConfig::from(crate::config::QuotaConfig::default());
     registry.live_config = Some(config.clone());
+    // A reply reading 30 s after the poll holds the next poll to 30 s past the
+    // normal one. So at the normal due time, only armed Codex resets (which skip
+    // the call-based poll delay) make the poll due.
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
     assert_eq!(
         registry
             .observe_calls(ObservationWriter::Broca, vec![row("codex")])
@@ -342,6 +346,6 @@ async fn codex_cadence_exception_tracks_live_config() {
     assert_eq!(due(), 0);
     assert_eq!(
         slot.poll_due_at("codex", now, false),
-        last + std::time::Duration::from_secs(900)
+        slot.last_call_observation_at.unwrap() + crate::refresh::BASE_INTERVAL
     );
 }
