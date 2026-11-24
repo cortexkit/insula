@@ -193,6 +193,13 @@ jobs:
       - name: Clippy, on the committed lock
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The release workflow builds only the binary, without dev dependencies.
+      # A dependency feature that only a dev dependency turns on is then
+      # missing, which every step above hides (v0.4.1's Windows builds failed
+      # this way). Check the binary alone.
+      - name: Release binary, without dev dependencies
+        run: cargo check --locked -p quota-module --bin ck-insula
+
       # Runs the quota-core unit tests + the in-process skeleton_e2e CI test
       # (skeleton_round_trips_usage_get_over_the_wire). The #[ignore] tests do not
       # run in this step; the daemon one runs in its own step below.

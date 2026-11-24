@@ -242,6 +242,7 @@ sys.exit(int(os.environ.get(platform.upper() + "_RC", "0")))
                 self.assertEqual([call["args"] for call in self.cargo_calls()], [
                     ["--version"], ["fmt", "--all", "--", "--check"],
                     ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
+                    ["check", "--locked", "-p", "quota-module", "--bin", "ck-insula"],
                     ["test", "--locked", "--workspace", "--all-targets"],
                     ["test", "--locked", "--workspace", "--doc"],
                     ["run", "-p", "quota-core", "--example", "completeness-envelopes"],
