@@ -132,6 +132,7 @@ fn window(windows: &[Value], seconds: u64, kind: &str) -> Result<Option<RateWind
         total_count: Some(limit),
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     }))
 }
 

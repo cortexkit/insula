@@ -245,6 +245,7 @@ fn rate_limit_to_extra(rate_limit: RateLimitResponse) -> Option<ExtraWindow> {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }),
     })
 }

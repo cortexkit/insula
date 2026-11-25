@@ -95,6 +95,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             })
         }
         _ => None,

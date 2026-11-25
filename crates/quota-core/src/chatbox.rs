@@ -338,6 +338,7 @@ fn parse(body: &[u8], now: DateTime<Utc>) -> Result<Reading, FetchError> {
             total_count: Some(plan.limit as f64),
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }
     });
 

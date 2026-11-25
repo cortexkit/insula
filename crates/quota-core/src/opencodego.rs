@@ -412,6 +412,7 @@ fn console_meter_window(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -1008,7 +1009,7 @@ impl UsageProvider for OpenCodeGoProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         classify_go_page, is_console_workspace_id, looks_unsubscribed, parse_api_usage,
         parse_console_go_status, parse_console_workspace_ids, redirected_off_go_page, Endpoints,
@@ -1818,6 +1819,10 @@ mod tests {
             );
         }
         serde_json::json!({ "usage": windows }).to_string()
+    }
+
+    pub(crate) fn fixture_usage() -> crate::model::Usage {
+        parse_api_usage(&api_payload(1.0, Some(25.0), Some(40.0)), UPSTREAM_NOW).unwrap()
     }
 
     fn iso(rfc3339: &str) -> Option<String> {

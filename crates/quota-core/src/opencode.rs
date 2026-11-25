@@ -800,6 +800,7 @@ fn window_from_map(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -1018,6 +1019,7 @@ fn window_from_parts(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 

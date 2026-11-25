@@ -89,6 +89,7 @@ const TIME_LIMIT: &str = "TIME_LIMIT";
 
 #[derive(Clone)]
 struct ValidLimit {
+    is_model_quota: bool,
     used_percent: f64,
     window_minutes: Option<i64>,
     resets_at: Option<String>,
@@ -254,6 +255,7 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             time_limit_window_minutes(unit, number)
         };
         let valid = ValidLimit {
+            is_model_quota: is_token_limit,
             used_percent,
             window_minutes,
             resets_at,
@@ -289,6 +291,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: limit
+                .is_model_quota
+                .then(|| cortexkit_provider_usage::model_scope::ALL.to_string()),
         });
 
     let secondary = if token_limit.is_some() && time_limit.is_some() {
@@ -302,6 +307,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: limit
+                .is_model_quota
+                .then(|| cortexkit_provider_usage::model_scope::ALL.to_string()),
         })
     } else {
         None
@@ -317,6 +325,9 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: limit
+            .is_model_quota
+            .then(|| cortexkit_provider_usage::model_scope::ALL.to_string()),
     });
 
     Ok(Usage {

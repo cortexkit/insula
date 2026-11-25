@@ -175,6 +175,7 @@ fn normalize_token_plan(body: &[u8]) -> Result<Usage, FetchError> {
             total_count: Some(total as f64),
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }),
         ..Usage::default()
     })
@@ -312,6 +313,7 @@ pub fn normalize(detail_json: &str, usage_json: &str) -> Result<Usage, FetchErro
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     });
 
     if primary.is_none() {

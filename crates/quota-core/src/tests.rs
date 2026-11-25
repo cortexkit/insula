@@ -2178,6 +2178,7 @@ impl UsageProvider for PairedDropProvider {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: None,
                 }),
                 secondary: None,
                 tertiary: None,
@@ -2289,6 +2290,7 @@ async fn a_verdict_discloses_no_staleness_while_a_stale_served_window_does() {
                             total_count: None,
                             regeneration: None,
                             breakdown: None,
+                            model_scope: None,
                         }),
                         secondary: None,
                         tertiary: None,
@@ -4262,6 +4264,7 @@ impl UsageProvider for EmptyBodyProvider {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: None,
                 }),
                 ..Usage::default()
             };
@@ -7553,6 +7556,23 @@ async fn two_handles_resolving_same_account_send_exactly_one_post() {
     assert_eq!(transport.posts.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn model_scope_is_all_on_account_wide_fixture_windows() {
+    let cases = [
+        ("kimi", crate::kimi::tests::fixture_usage(), 4),
+        ("muse", crate::muse::tests::fixture_usage(), 2),
+        ("cursor", crate::cursor::tests::fixture_usage(), 1),
+        ("opencodego", crate::opencodego::tests::fixture_usage(), 3),
+        ("ollama", crate::ollama::tests::fixture_usage(), 2),
+    ];
+    for (provider, usage, count) in cases {
+        let scopes: Vec<_> = crate::model::windows(&usage)
+            .map(|window| window.model_scope.as_deref())
+            .collect();
+        assert_eq!(scopes, vec![Some("all"); count], "{provider}");
+    }
+}
+
 fn primary_percent(entry: &ProviderUsage) -> f64 {
     entry
         .usage
@@ -7573,6 +7593,7 @@ fn full_usage(percent: f64) -> Usage {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: None,
     };
     Usage {
         primary: Some(window(percent, "01:00", 300)),
@@ -7640,10 +7661,12 @@ async fn f8_labeled_emission_applies_fresh_relaxation_transform() {
 
 #[tokio::test]
 async fn relaxation_is_read_time_only_and_expires_at_the_freshness_horizon() {
+    let mut usage = full_usage(41.0);
+    usage.primary.as_mut().unwrap().model_scope = Some("all".into());
     let registry = Registry::new(vec![Box::new(RelaxingProvider {
         name: "codex",
         eligible: true,
-        usage: full_usage(41.0),
+        usage,
     })]);
     tick(&registry).await;
 
@@ -7664,6 +7687,10 @@ async fn relaxation_is_read_time_only_and_expires_at_the_freshness_horizon() {
     let fresh = registry.get_usage(None).await;
     let fresh_usage = fresh[0].usage.as_ref().unwrap();
     assert_eq!(fresh_usage.primary.as_ref().unwrap().used_percent, 0.0);
+    assert_eq!(
+        fresh_usage.primary.as_ref().unwrap().model_scope.as_deref(),
+        Some("all")
+    );
     assert_eq!(fresh_usage.secondary.as_ref().unwrap().used_percent, 0.0);
     assert_eq!(fresh_usage.tertiary.as_ref().unwrap().used_percent, 0.0);
     assert_eq!(
@@ -8653,6 +8680,7 @@ impl UsageProvider for StaleDuplicateProvider {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
             ..Usage::default()
         };
@@ -8695,6 +8723,7 @@ impl UsageProvider for ResetDuplicateProvider {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
             ..Usage::default()
         };
@@ -8966,6 +8995,7 @@ fn named_window(id: &str) -> Usage {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
         }]),
         ..Usage::default()
@@ -12108,6 +12138,7 @@ fn weekly_facts(percent: f64, limit_reached: Option<bool>) -> UsageFacts {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: None,
         }),
         ..Usage::default()
     };

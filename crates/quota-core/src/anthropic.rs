@@ -524,6 +524,7 @@ fn scoped_weekly_extras(limits: &[ApiLimitEntry]) -> Option<Vec<crate::model::Ex
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: Some(cortexkit_provider_usage::model_scope::SUBSET.to_string()),
                 }),
             })
         })
@@ -531,7 +532,12 @@ fn scoped_weekly_extras(limits: &[ApiLimitEntry]) -> Option<Vec<crate::model::Ex
     (!extras.is_empty()).then_some(extras)
 }
 
-fn to_window(window: Option<&OAuthWindow>, window_minutes: i64, kind: &str) -> Option<RateWindow> {
+fn to_window(
+    window: Option<&OAuthWindow>,
+    window_minutes: i64,
+    kind: &str,
+    model_scope: Option<&str>,
+) -> Option<RateWindow> {
     let window = window?;
     // CodexBar's makeWindow (ClaudeUsageFetcher.swift:945-956) builds a window
     // from `utilization` alone and leaves resetsAt nil when absent — an idle
@@ -549,6 +555,7 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64, kind: &str) -> O
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: model_scope.map(str::to_owned),
     })
 }
 
@@ -556,8 +563,7 @@ fn to_window(window: Option<&OAuthWindow>, window_minutes: i64, kind: &str) -> O
 ///
 /// Mapping: `five_hour` → primary (the session window), `seven_day` → secondary
 /// (the weekly all-models window), and the model-scoped weekly (`seven_day_opus`
-/// preferred, else `seven_day_sonnet`) → tertiary. Account-wide windows only;
-/// per-model routing is a later concern (the consumer's extractor handles that).
+/// preferred, else `seven_day_sonnet`) → tertiary.
 ///
 /// **This is where slot holes come from.** Each slot is filled from its own
 /// independent optional field, so an account with a model-scoped weekly limit and
@@ -598,6 +604,7 @@ pub fn call_windows(headers: &std::collections::BTreeMap<String, String>) -> Usa
             }),
             minutes,
             kind,
+            None,
         )
     };
     Usage {
@@ -666,6 +673,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
             response.five_hour.as_ref(),
             FIVE_HOUR_MINUTES,
             cortexkit_provider_usage::window_kind::FIVE_HOUR,
+            Some(cortexkit_provider_usage::model_scope::ALL),
         ),
         // The split describes `seven_day` only, so it goes on that window and
         // nowhere else.
@@ -673,6 +681,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
             response.seven_day.as_ref(),
             SEVEN_DAY_MINUTES,
             cortexkit_provider_usage::window_kind::WEEKLY,
+            Some(cortexkit_provider_usage::model_scope::ALL),
         )
         .map(|mut window| {
             window.breakdown = weekly_breakdown(response.seven_day_breakdown);
@@ -685,6 +694,7 @@ fn normalize_inventory(body: &[u8]) -> Result<NormalizedInventory, FetchError> {
                 .or(response.seven_day_sonnet.as_ref()),
             SEVEN_DAY_MINUTES,
             cortexkit_provider_usage::window_kind::WEEKLY,
+            Some(cortexkit_provider_usage::model_scope::SUBSET),
         ),
         extra_rate_windows: scoped_weekly_extras(&limit_entries(response.limits.as_ref())),
     };
@@ -2827,6 +2837,7 @@ mod tests {
             br#"{
                 "five_hour": {"utilization": 12.0, "resets_at": "2026-07-18T12:00:00Z"},
                 "seven_day": {"utilization": 60.0, "resets_at": "2026-07-20T12:00:00Z"},
+                "seven_day_opus": {"utilization": 28.0, "resets_at": "2026-07-20T12:00:00Z"},
                 "limits": [
                     {
                         "kind": "weekly_scoped",
@@ -2860,6 +2871,15 @@ mod tests {
         assert_eq!(window.used_percent, 100.0);
         assert_eq!(window.window_kind.as_deref(), Some("weekly"));
         assert_eq!(window.window_minutes, Some(SEVEN_DAY_MINUTES));
+        assert_eq!(
+            [
+                usage.primary.unwrap().model_scope.as_deref(),
+                usage.secondary.unwrap().model_scope.as_deref(),
+                usage.tertiary.unwrap().model_scope.as_deref(),
+                window.model_scope.as_deref(),
+            ],
+            [Some("all"), Some("all"), Some("subset"), Some("subset")],
+        );
     }
 
     #[test]

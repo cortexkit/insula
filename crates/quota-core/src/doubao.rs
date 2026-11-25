@@ -165,6 +165,7 @@ pub fn normalize_usage(headers: &DoubaoHeaderSnapshot) -> Result<Usage, FetchErr
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: None,
     });
 
     Ok(Usage {
@@ -220,6 +221,7 @@ fn coding_plan_window(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -659,6 +661,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             })
         );
         assert_eq!(
@@ -673,6 +676,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             })
         );
         assert_eq!(
@@ -687,6 +691,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             })
         );
         assert_eq!(usage.extra_rate_windows, None);

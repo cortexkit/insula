@@ -205,6 +205,7 @@ pub fn normalize_usage(html: &str, now: DateTime<Utc>) -> Result<Usage, FetchErr
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             })
         }
     } else {

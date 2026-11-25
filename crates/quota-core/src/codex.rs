@@ -438,6 +438,7 @@ fn normalize_window(snapshot: &WindowSnapshot) -> Option<RateWindow> {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -2449,6 +2450,13 @@ mod tests {
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.window_kind, None);
         assert_eq!(secondary.window_minutes, Some(10080)); // weekly
+        assert_eq!(
+            [
+                primary.model_scope.as_deref(),
+                secondary.model_scope.as_deref()
+            ],
+            [Some("all"), Some("all")],
+        );
         assert!(usage.tertiary.is_none());
     }
 

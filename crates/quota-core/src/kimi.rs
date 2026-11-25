@@ -263,6 +263,7 @@ fn detail_to_window(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> Op
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -365,6 +366,7 @@ fn subscription_balance_to_window(balance: KimiSubscriptionBalance) -> Option<Ex
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }),
     })
 }
@@ -388,6 +390,7 @@ fn subscription_rate_limit_to_window(limit: KimiSubscriptionRateLimit) -> Option
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }),
     })
 }
@@ -537,7 +540,7 @@ impl UsageProvider for KimiProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// GetUsages alone, as published when GetSubscriptionStats yields nothing.
@@ -628,6 +631,14 @@ mod tests {
         assert_eq!(usage.primary.unwrap().used_percent, 25.0);
         assert_eq!(usage.secondary.unwrap().used_percent, 20.0);
         assert_eq!(usage.extra_rate_windows.unwrap().len(), 1);
+    }
+
+    pub(crate) fn fixture_usage() -> Usage {
+        publishable_usage(
+            normalize_coding_usage(&fixture_body()).unwrap(),
+            normalize_subscription_stats(&subscription_fixture(true)).unwrap(),
+        )
+        .unwrap()
     }
 
     fn fixture_body() -> Vec<u8> {

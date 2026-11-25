@@ -314,6 +314,7 @@ fn window_from_detail(detail: &KimiUsageDetail, window_minutes: Option<i64>) -> 
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -328,6 +329,7 @@ fn ratio_window(pool: &KimiRatioPool, minutes: Option<i64>) -> RateWindow {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     }
 }
 
@@ -492,6 +494,9 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                             total_count: None,
                             regeneration: None,
                             breakdown: None,
+                            model_scope: Some(
+                                cortexkit_provider_usage::model_scope::ALL.to_string(),
+                            ),
                         }),
                     });
                 }
@@ -520,6 +525,9 @@ fn parse_subscription_extras(body: &[u8]) -> Vec<crate::model::ExtraWindow> {
                             total_count: None,
                             regeneration: None,
                             breakdown: None,
+                            model_scope: Some(
+                                cortexkit_provider_usage::model_scope::ALL.to_string(),
+                            ),
                         }),
                     });
                 }
@@ -1154,6 +1162,7 @@ mod tests {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         };
         let expected = Usage {
             primary: Some(expected_window(WEEKLY_MINUTES, "2026-07-01T12:00:00Z")),

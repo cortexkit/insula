@@ -432,6 +432,7 @@ mod tests {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: None,
         }
     }
 

@@ -1805,6 +1805,7 @@ fn resolve_window(group: &QuotaGroup, bucket: &QuotaBucket) -> Option<ResolvedWi
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::SUBSET.to_string()),
         },
         title,
         id: bucket.bucket_id.clone(),
@@ -2148,6 +2149,7 @@ fn parse_remote_quota(body: &[u8]) -> Result<Usage, FetchError> {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::SUBSET.to_string()),
             },
             title: format!("{title} ({models} models)"),
             id: title.to_string(),
@@ -3901,6 +3903,11 @@ mod tests {
     fn every_bucket_is_published_as_its_own_named_window() {
         let usage = parse_quota_summary(SUMMARY_FIXTURE).unwrap();
         assert_eq!(
+            ["gemini-5h", "gemini-weekly", "3p-5h"]
+                .map(|id| pool_window(&usage, id).model_scope.as_deref()),
+            [Some("subset"); 3],
+        );
+        assert_eq!(
             pool_window(&usage, "gemini-5h").window_kind.as_deref(),
             Some("five_hour")
         );
@@ -4286,6 +4293,11 @@ mod tests {
             ],
             "the Argon title must not repeat its group name or cadence"
         );
+        assert_eq!(
+            ["gemini-weekly", "gemini-argon-wtu-weekly"]
+                .map(|id| pool_window(&usage, id).model_scope.as_deref()),
+            [Some("subset"); 2],
+        );
         let argon = pool_window(&usage, "gemini-argon-wtu-weekly");
         assert_eq!(argon.used_percent, 47.0);
         assert_eq!(argon.window_minutes, Some(10080));
@@ -4635,6 +4647,11 @@ mod tests {
     #[test]
     fn the_remote_lane_folds_models_into_the_same_pools_the_local_probe_publishes() {
         let usage = parse_remote_quota(REMOTE_FIXTURE).expect("fixture parses");
+        assert_eq!(
+            ["Gemini Models", "Claude and GPT models"]
+                .map(|id| pool_window(&usage, id).model_scope.as_deref()),
+            [Some("subset"); 2],
+        );
 
         // The native Gemini pool owns the unnamed slot, as locally: an unnamed
         // window reads as the account's own capacity, and the external pool in
