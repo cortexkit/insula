@@ -2404,7 +2404,7 @@ pub(crate) mod tests {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
-                    model_scope: None,
+                    model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
                 }),
                 secondary: None,
                 tertiary: None,

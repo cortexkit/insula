@@ -282,10 +282,13 @@ fn production_lines(source: &str) -> Vec<(usize, &str)> {
     let mut index = 0;
 
     while index < lines.len() {
+        // A test module may be `pub(crate)` so the registry tests can share its
+        // fixtures; it is still test code.
         let opens_test_module = lines[index].trim_end() == "#[cfg(test)]"
-            && lines
-                .get(index + 1)
-                .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'));
+            && lines.get(index + 1).is_some_and(|next| {
+                let next = next.strip_prefix("pub(crate) ").unwrap_or(next);
+                next.starts_with("mod ") && next.ends_with('{')
+            });
         if opens_test_module {
             index += 2;
             while index < lines.len() && lines[index] != "}" {
