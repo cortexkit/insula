@@ -264,6 +264,7 @@ fn rate_window_from_left_and_reset(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -283,6 +284,7 @@ fn credit_window(credit: Option<&CreditRateLimit>) -> Option<RateWindow> {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: None,
     })
 }
 

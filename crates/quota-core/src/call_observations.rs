@@ -231,7 +231,7 @@ impl Registry {
         for (key, prev) in eligible {
             let mut next = prev.clone();
             let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();
-            // Preserve breakdowns and all poll-only windows and metadata. A
+            // Preserve model scope, breakdowns, and all poll-only windows and metadata. A
             // partial call response cannot describe the complete account
             // inventory, so it only updates windows the poll already holds and
             // never adds one. Anthropic removed the 5-hour limit from verified
@@ -384,7 +384,7 @@ mod tests {
         serde_json::from_value(json!({"provider":"claude", "account":"a", "source":"oauth",
             "accountInfo":{"email":"a@example.com"},
             "savedResets":{"availableCount":2},
-            "usage":{"primary":{"usedPercent":90,"windowMinutes":300,"windowKind":"five_hour"},
+            "usage":{"primary":{"usedPercent":90,"windowMinutes":300,"windowKind":"five_hour","modelScope":"all"},
                 "secondary":{"usedPercent":100,"windowMinutes":10080,"windowKind":"weekly"},
                 "tertiary":{"usedPercent":17},
                 "extraRateWindows":[{"id":"fable", "label":"Fable", "window":{"usedPercent":8}}]},
@@ -418,7 +418,10 @@ mod tests {
     #[test]
     fn captured_call_headers_parse_and_missing_values_do_not_invent_windows() {
         let parsed = anthropic::call_windows(&headers());
-        let poll = anthropic::normalize_usage(br#"{"five_hour":{"utilization":21,"resets_at":"2026-09-26T03:40:00Z"},"seven_day":{"utilization":100,"resets_at":"2026-09-30T04:00:00Z"}}"#).unwrap();
+        let mut poll = anthropic::normalize_usage(br#"{"five_hour":{"utilization":21,"resets_at":"2026-09-26T03:40:00Z"},"seven_day":{"utilization":100,"resets_at":"2026-09-30T04:00:00Z"}}"#).unwrap();
+        // Reply readings carry meter values, not the poll's inventory metadata.
+        poll.primary.as_mut().unwrap().model_scope = None;
+        poll.secondary.as_mut().unwrap().model_scope = None;
         assert_eq!(
             serde_json::to_value(parsed).unwrap(),
             serde_json::to_value(poll).unwrap()
@@ -502,6 +505,13 @@ mod tests {
             );
         }
         assert_eq!(after["usage"]["primary"]["usedPercent"], 21.0);
+        assert_eq!(
+            [
+                &after["usage"]["primary"]["modelScope"],
+                &after["usage"]["secondary"]["modelScope"]
+            ],
+            [&json!("all"), &serde_json::Value::Null],
+        );
         assert_eq!(registry.drop_page(None).await.drops.len(), 1);
         assert_eq!(registry.call_observation_metrics().applied, 1);
     }

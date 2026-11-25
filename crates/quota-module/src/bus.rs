@@ -645,7 +645,7 @@ mod tests {
 
     fn entry(account: Option<&str>, at: &str) -> ProviderUsage {
         let mut value = json!({"provider":"deepseek", "source":"api", "fetchedAt":at,
-            "usage":{"primary":{"usedPercent":25.0}},
+            "usage":{"primary":{"usedPercent":25.0,"modelScope":"all"}},
             "accountInfo":{"email":"private@example.com","orgName":"private org"}});
         if let Some(account) = account {
             value["account"] = json!(account);
@@ -751,6 +751,10 @@ mod tests {
         let s = samples.pop().unwrap();
         samples.retain_body(&s);
         let reply = samples.events_get(&s.id, EVENT_NAME);
+        assert_eq!(
+            reply["result"]["body"]["usage"]["primary"]["modelScope"],
+            "all"
+        );
         let digest =
             ContentDigest::of_bytes(&serde_json::to_vec(&reply["result"]["body"]).unwrap());
         assert_eq!(

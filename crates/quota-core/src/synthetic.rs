@@ -359,6 +359,7 @@ fn parse_quota(map: &serde_json::Map<String, serde_json::Value>) -> Option<RateW
         total_count: None,
         regeneration: regeneration_step(map),
         breakdown: None,
+        model_scope: None,
     })
 }
 
@@ -380,11 +381,16 @@ fn regeneration_step(map: &serde_json::Map<String, serde_json::Value>) -> Option
     })
 }
 
-fn named_quota(val: &serde_json::Value, kind: &str) -> Option<RateWindow> {
+fn named_quota(
+    val: &serde_json::Value,
+    kind: &str,
+    model_scope: Option<&str>,
+) -> Option<RateWindow> {
     let map = val.as_object()?;
     if is_quota_payload(map) {
         parse_quota(map).map(|mut window| {
             window.window_kind = Some(kind.to_string());
+            window.model_scope = model_scope.map(str::to_owned);
             window
         })
     } else {
@@ -404,12 +410,19 @@ fn prioritized_quota_slots(
     let plan_weekly = root
         .get("planWeeklyLimit")
         .or_else(|| data_dict.and_then(|d| d.get("planWeeklyLimit")));
+    let account_wide = Some(cortexkit_provider_usage::model_scope::ALL);
     let weekly = plan_weekly
         .or_else(|| {
             root.get("weeklyTokenLimit")
                 .or_else(|| data_dict.and_then(|d| d.get("weeklyTokenLimit")))
         })
-        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::WEEKLY));
+        .and_then(|v| {
+            named_quota(
+                v,
+                cortexkit_provider_usage::window_kind::WEEKLY,
+                account_wide,
+            )
+        });
 
     // A readable new-plan weekly pool retires the five-hour allowance.
     // CodexBar v0.84.0's synthetic.js accepts any finite quota field as its
@@ -420,7 +433,13 @@ fn prioritized_quota_slots(
     } else {
         root.get("rollingFiveHourLimit")
             .or_else(|| data_dict.and_then(|d| d.get("rollingFiveHourLimit")))
-            .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::FIVE_HOUR))
+            .and_then(|v| {
+                named_quota(
+                    v,
+                    cortexkit_provider_usage::window_kind::FIVE_HOUR,
+                    account_wide,
+                )
+            })
     };
 
     let search_hourly = root
@@ -434,7 +453,7 @@ fn prioritized_quota_slots(
                     .and_then(|s| s.get("hourly"))
             })
         })
-        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::HOURLY));
+        .and_then(|v| named_quota(v, cortexkit_provider_usage::window_kind::HOURLY, None));
 
     if rolling.is_some() || weekly.is_some() || search_hourly.is_some() {
         Some(vec![rolling, weekly, search_hourly])

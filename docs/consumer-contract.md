@@ -446,7 +446,7 @@ Readings only refresh windows the poll holds; they never add or remove inventory
 can lower use only after the held reset has passed at `observedAtMs`; same-period
 falls greater than 1 point refuse the whole row. Applied readings advance
 `fetchedAt` and clear stale-serving, preserving source, account metadata,
-errorClass, completeness, breakdowns, tertiary/extra windows, saved resets,
+errorClass, completeness, model scope, breakdowns, tertiary/extra windows, saved resets,
 spend pools and vault-auth reporting. They reuse poll drop accounting, quota
 samples and `usage.watch` invalidations.
 
@@ -888,6 +888,7 @@ producer guarantees it instead:
 | `resetsAt` | when the window resets, as the upstream stated it | no reset was stated ([6.7](#an-exhausted-window-may-carry-no-reset-at-all)) |
 | `windowMinutes` | the window's length, when the upstream states a cadence or its field name implies one | no stated length; never "unlimited" |
 | `windowKind` | the period named by the upstream's own label, key or field: `hourly`, `five_hour`, `daily`, `weekly` or `monthly` | not named; never "some other kind" |
+| `modelScope` | which models draw on the window, from the provider's reply | not stated; never `all` |
 | `usedCount`, `totalCount` | the absolute figures behind the percentage, where the upstream reports them | not reported |
 | `breakdown` | who consumed the window ([6.5](#breakdown-who-consumed-a-window)) | no split published |
 
@@ -927,6 +928,81 @@ limit the provider named without a readable figure. A consumer that ignores
   skip list passes every form nobody anticipated.
 - Ids this module constructs are stable and change only with notice; ids passed
   through from an upstream change when the upstream does.
+
+#### Model scope
+
+`modelScope` is an open string. `all` means every model in the account's plan
+counts against the window. `subset` means only some models count and the
+window does not enumerate them. An omitted field means insula did not state a
+scope, whether it could not determine the scope or the window is not a model
+quota. Treat absence and unrecognized strings as unknown, never as `all`.
+Reply readings and banked-reset relaxation do not change the poll's scope.
+The same field appears in `quota_sampled` bodies served by `events_get`.
+
+For named `subset` windows, use `(provider, id)` to identify the pool, not the
+slot or the display title. Antigravity summary/sidebar ids beginning with
+`gemini-` and `3p-` identify the Gemini and Claude/GPT families respectively;
+use the full id to distinguish cadences and separate buckets such as
+`gemini-argon-wtu-weekly`. The per-model fallback uses its pool names as ids.
+Claude's named extras use the upstream model id if present or its display
+name (for example `Fable`). An unnamed `subset` slot cannot be keyed by id;
+its scope alone does not tell you which models draw on it.
+
+| Provider | `all` | `subset` | Not stated |
+|---|---|---|---|
+| `alibaba` | Coding Plan 5h, weekly, monthly | — | — |
+| `amp` | Free-tier usage | — | — |
+| `antigravity` | — | Every quota-summary/sidebar bucket and every per-model fallback pool | — |
+| `chatbox` | Plan compute-point window | — | — |
+| `claude` | `five_hour` (primary), `seven_day` (secondary) | Model-specific weekly extras; legacy weekly tertiary (Opus preferred, otherwise Sonnet; no model id on the wire) | — |
+| `clinepass` | Plan 5h, weekly, monthly | — | — |
+| `codebuff` | Credit usage and subscription weekly | — | — |
+| `codex` | `rate_limit` primary and secondary | — | Other upstream limits, such as code review, are not published |
+| `copilot` | — | — | Premium interactions/completions and chat are feature quotas, not named model groups |
+| `cursor` | Individual plan cycle and unified-account shared weekly quota | — | — |
+| `doubao` | Coding Plan windows | — | Ark request headers don't identify the scope of the cap |
+| `elevenlabs` | Subscription character allowance | — | — |
+| `factory` | — | Standard and Core 5h/weekly/monthly pools, including named Core extras | — |
+| `grok` | Grok Build billing-period utilization | — | — |
+| `jetbrains` | Tariff quota, including local log fallback | — | — |
+| `kilo` | Kilo Pass allowance | — | — |
+| `kimi` | Code-plan windows, membership monthly and Code 7-day extras | — | — |
+| `kimi-for-coding` | Coding-plan windows and monthly/Code 7-day extras | — | — |
+| `langdock` | Personal plan session and weekly | — | — |
+| `llmproxy` | — | Binding upstream provider quota group | — |
+| `manus` | Refilling account allotment | — | — |
+| `mimo` | Token Plan billing-period window in both lanes | — | — |
+| `minimax` | — | Windows from explicitly named models or groups | The `general` row doesn't say whether media models share it; a blank or missing model name also leaves scope unknown |
+| `muse` | 5h and weekly, including the verified team lane | — | — |
+| `neuralwatt` | Subscription energy quota | — | Key dollar allowance doesn't state what models the key can use |
+| `ollama` | Free/monthly usage, session, weekly and API included-credit allowance | — | — |
+| `opencode` | Legacy Zen subscription windows | — | — |
+| `opencodego` | Rolling, weekly, monthly, in every lane | — | — |
+| `opendesign` | Workspace Coding Plan 5h and weekly | — | — |
+| `qoder` | Combined member base/shared credits | — | — |
+| `qwen-cloud` | Personal 5h, weekly, monthly; Team Token Plan shared credit allowance | — | — |
+| `sakana` | Subscription 5h and weekly | — | — |
+| `soniox` | — | — | Organization budget reports dollars but not its model coverage |
+| `stepfun` | Rolling 5h and weekly | — | Subscription credit-only reply doesn't state model coverage |
+| `sub2api` | Key's reported rate-limit windows | — | — |
+| `synthetic` | Named rolling 5h and weekly plan quotas | — | Hourly search is a feature allowance; generic legacy quota objects don't name the resource |
+| `vercel-budget` | Personal AI Gateway budget | — | — |
+| `warp` | Account request allowance | — | — |
+| `zai` | Token and credit limits | — | `TIME_LIMIT` meters MCP tools such as web search |
+| `zenmux` | Subscription 5h and 7-day request quotas | — | — |
+
+Other registered providers publish no rate windows. Spend and credit pools are
+unchanged and do not carry `modelScope`.
+
+**Proven by:** `scoped_weekly_limits_become_named_extra_windows`,
+`every_bucket_is_published_as_its_own_named_window`,
+`a_versioned_gemini_group_title_does_not_repeat_its_name_or_cadence`,
+`the_remote_lane_folds_models_into_the_same_pools_the_local_probe_publishes`,
+`duration_only_windows_stay_unnamed`,
+`model_scope_is_all_on_account_wide_fixture_windows`,
+`call_observation_preserves_poll_inventory_and_publishes_drop_and_value_time`,
+`relaxation_is_read_time_only_and_expires_at_the_freshness_horizon`, and
+`cached_body_digest_matches_notice` (`crates/quota-module/src/bus.rs`).
 
 #### Provider-specific window shapes
 

@@ -894,6 +894,7 @@ fn normalize_quota(quota: QuotaInfo, refill: Option<NextRefill>) -> Result<Norma
                 total_count,
                 regeneration,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             }),
             secondary: None,
             tertiary: None,

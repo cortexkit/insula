@@ -268,6 +268,15 @@ fn is_general_model(m: &ModelRemains) -> bool {
         .is_some_and(|name| name.trim().eq_ignore_ascii_case("general"))
 }
 
+fn quota_model_scope(m: &ModelRemains) -> Option<String> {
+    // A general row does not say whether it also meters the media models.
+    m.model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !is_general_model(m))
+        .map(|_| cortexkit_provider_usage::model_scope::SUBSET.to_string())
+}
+
 fn interval_total(m: &ModelRemains) -> i64 {
     opt_int(&m.current_interval_total_count).unwrap_or(0).max(0)
 }
@@ -357,6 +366,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: quota_model_scope(m),
         });
     }
 
@@ -376,6 +386,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: quota_model_scope(m),
     })
 }
 
@@ -409,6 +420,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: quota_model_scope(m),
                 });
             }
             if weekly_total(m) == 0 && opt_int(&m.current_weekly_usage_count).unwrap_or(0) == 0 {
@@ -430,6 +442,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: quota_model_scope(m),
         });
     }
 
@@ -453,6 +466,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: quota_model_scope(m),
     })
 }
 

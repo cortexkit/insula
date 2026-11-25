@@ -506,6 +506,7 @@ fn window_for(
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
                 });
             }
         }
@@ -795,6 +796,7 @@ fn api_legacy_limit(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     }))
 }
 
@@ -871,6 +873,7 @@ fn parse_api_balance(text: &str) -> Result<ProviderUsage, FetchError> {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
                 });
             }
         }
@@ -1145,7 +1148,7 @@ impl UsageProvider for OllamaProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Shapes consumed by CodexBar v0.74.0's wallet parser and ollama-api.ts;
@@ -1609,6 +1612,10 @@ mod tests {
 
     /// A captured-real ollama.com/settings usage section (collapsed but structurally
     /// faithful: `N% used` spans + a `data-time` local-time div per window).
+    pub(crate) fn fixture_usage() -> Usage {
+        normalize_usage(SETTINGS_FIXTURE).unwrap()
+    }
+
     const SETTINGS_FIXTURE: &str = r#"
       <div class="flex justify-between mb-2">
         <span class="text-sm">Session usage</span>

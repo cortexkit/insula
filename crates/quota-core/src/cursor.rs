@@ -569,6 +569,7 @@ fn plan_usage(summary: CursorUsageSummary) -> Result<Usage, FetchError> {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
             }),
             secondary: None,
             tertiary: None,
@@ -761,6 +762,7 @@ fn shared_weekly_pool(body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Option
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -1048,7 +1050,7 @@ impl UsageProvider for CursorProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1481,8 +1483,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_healthy_total_percent_used() {
+    pub(crate) fn fixture_usage() -> Usage {
         let json = r#"{
             "billingCycleEnd": "2026-07-24T03:00:00Z",
             "individualUsage": {
@@ -1491,8 +1492,12 @@ mod tests {
                 }
             }
         }"#;
-        let usage = normalize_usage(json.as_bytes()).unwrap();
-        let primary = usage.primary.unwrap();
+        normalize_usage(json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn parses_healthy_total_percent_used() {
+        let primary = fixture_usage().primary.unwrap();
         assert_eq!(primary.used_percent, 45.5);
         assert_eq!(primary.resets_at.as_deref(), Some("2026-07-24T03:00:00Z"));
         assert_eq!(primary.window_minutes, Some(43200));
@@ -2186,6 +2191,7 @@ mod tests {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
         }
     }
 
@@ -2398,6 +2404,7 @@ mod tests {
                     total_count: None,
                     regeneration: None,
                     breakdown: None,
+                    model_scope: None,
                 }),
                 secondary: None,
                 tertiary: None,

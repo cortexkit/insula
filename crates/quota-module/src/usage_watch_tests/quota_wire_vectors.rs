@@ -35,6 +35,7 @@ fn window(used_percent: f64, minutes: i64, kind: &str, resets_at: &str) -> RateW
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: None,
     }
 }
 
@@ -80,11 +81,22 @@ impl UsageProvider for VectorProvider {
             secondary: Some(window(62.5, 10080, "weekly", "2026-01-19T12:00:00Z")),
             ..Default::default()
         };
+        if self.name == "claude" {
+            for window in [&mut usage.primary, &mut usage.secondary]
+                .into_iter()
+                .flatten()
+            {
+                window.model_scope = Some("all".into());
+            }
+        }
         if self.name == "antigravity" {
             usage.extra_rate_windows = Some(vec![ExtraWindow {
                 id: Some("gemini-pro".into()),
                 title: Some("Gemini Pro".into()),
-                window: Some(window(12.5, 300, "rolling", "2026-01-15T17:00:00Z")),
+                window: Some(RateWindow {
+                    model_scope: Some("subset".into()),
+                    ..window(12.5, 300, "rolling", "2026-01-15T17:00:00Z")
+                }),
             }]);
         }
         let mut attempt = FetchAttempt::success(observed, "api", usage);

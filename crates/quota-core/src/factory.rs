@@ -244,6 +244,7 @@ fn rate_window_from(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::SUBSET.to_string()),
     })
 }
 

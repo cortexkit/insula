@@ -426,6 +426,7 @@ fn window_from_fraction(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     })
 }
 
@@ -863,6 +864,7 @@ fn normalize_team_summary(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     };
     Ok(Some(TeamPlan {
         usage: Usage {
@@ -1875,7 +1877,7 @@ mod tests {
         let usage = normalize_usage(HAR_RESPONSE.as_bytes()).unwrap();
         assert_eq!(
             serde_json::to_string(&usage).unwrap(),
-            r#"{"primary":{"usedPercent":13.117665718963334,"resetsAt":"2026-07-20T00:09:00Z","windowMinutes":300,"windowKind":"five_hour"},"secondary":{"usedPercent":5.3834972282899995,"resetsAt":"2026-07-26T14:09:00Z","windowMinutes":10080,"windowKind":"weekly"}}"#
+            r#"{"primary":{"usedPercent":13.117665718963334,"resetsAt":"2026-07-20T00:09:00Z","windowMinutes":300,"windowKind":"five_hour","modelScope":"all"},"secondary":{"usedPercent":5.3834972282899995,"resetsAt":"2026-07-26T14:09:00Z","windowMinutes":10080,"windowKind":"weekly","modelScope":"all"}}"#
         );
     }
 
@@ -2273,6 +2275,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
             secondary: Some(RateWindow {
                 window_kind: None,
@@ -2284,6 +2287,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
             ..Usage::default()
         }

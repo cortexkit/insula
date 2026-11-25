@@ -148,6 +148,7 @@ fn window(
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: Some(cortexkit_provider_usage::model_scope::ALL.to_string()),
     }
 }
 
@@ -590,7 +591,7 @@ impl UsageProvider for MuseProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::credential_source::{VaultCredential, VaultGetError};
     use std::sync::Mutex;
@@ -607,6 +608,10 @@ mod tests {
             "weekly": {"used_percent": 12.25, "resets_at": 1791500000}
         }
     }"#;
+
+    pub(crate) fn fixture_usage() -> Usage {
+        parse(FULL.as_bytes()).unwrap().usage.unwrap()
+    }
 
     fn env_with(vars: &[(&str, &str)]) -> EnvLookup {
         let vars: Vec<(String, OsString)> = vars

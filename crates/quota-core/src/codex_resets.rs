@@ -3686,6 +3686,7 @@ mod tests {
             total_count: None,
             regeneration: None,
             breakdown: None,
+            model_scope: None,
         });
 
         // The upstream is explicit that it is not currently refusing requests.
@@ -3778,6 +3779,7 @@ mod tests {
                 total_count: None,
                 regeneration: None,
                 breakdown: None,
+                model_scope: None,
             }),
             ..Usage::default()
         }

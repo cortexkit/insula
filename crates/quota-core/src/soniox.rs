@@ -205,6 +205,7 @@ fn reading(balance: &Balance, monthly: &Monthly) -> Result<(Usage, Vec<Pool>), F
         total_count: None,
         regeneration: None,
         breakdown: None,
+        model_scope: None,
     });
     let mut pools = Vec::new();
     if !balance.invoice_billing {
