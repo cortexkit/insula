@@ -369,3 +369,78 @@ async fn saved_reset_timeout_keeps_pending_id_for_retry() {
     assert_eq!(record.redeem_request_id, ID);
     assert_eq!(record.status, JournalStatus::Pending);
 }
+
+/// A pending redemption retried after a newer one resolved must not POST
+/// inside the account's spend bound.
+///
+/// The old request was written as pending and attempted, but its POST never
+/// reached the provider, and nothing retried it for longer than the spend
+/// bound (resets were disarmed meanwhile). A manual redemption under a new id
+/// is then allowed and resolves `reset`. The next armed tick finds the old id
+/// still pending and sends it straight away: the pending branch of `reserve`
+/// returns before the spend bound is read, and a pending retry needs no
+/// trigger. Because the provider never saw the old id, its deduplication
+/// cannot stop it from spending a second saved reset.
+#[tokio::test]
+#[ignore = "external audit finding 4: pending retry POSTs inside the spend bound of a newer redemption, fix pending"]
+async fn external_audit_a_stale_pending_retry_respects_a_newer_redemptions_spend_bound() {
+    let (_temp, journal) = journal();
+    let now = Utc::now();
+    let stale = now - chrono::Duration::seconds(SPEND_BOUND_SECS + 60);
+    journal
+        .reserve_manual(ACCOUNT, "stale-pending-request", stale)
+        .unwrap();
+    journal
+        .record_attempt(ACCOUNT, "stale-pending-request", stale)
+        .unwrap();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let server = Server::new(200, r#"{"code":"reset"}"#).await;
+    let transport = ReqwestResetTransport::new(crate::http::provider_client());
+
+    let newer = coordinator
+        .use_saved_reset(
+            ACCOUNT,
+            "newer-request",
+            now,
+            &transport,
+            &server.request(),
+            Duration::from_secs(2),
+        )
+        .await;
+    assert_eq!(
+        newer.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
+    );
+    assert_eq!(server.count(), 1);
+
+    // An armed tick for the same account, which is not at its wall and has
+    // no credit about to expire: nothing here calls for a redemption.
+    let tick = coordinator
+        .process_tick(
+            ACCOUNT,
+            ResetTickInput {
+                armed: true,
+                now,
+                earliest_expiry: None,
+                auto_use_resets_secs: 3600,
+                facts: UsageFacts {
+                    raw_percents: vec![5.0],
+                    any_used_floor: true,
+                    at_wall: false,
+                    wall_clear: true,
+                    wall_lifts_at: None,
+                },
+                elapsed_since_attempt_start: Duration::ZERO,
+            },
+            &transport,
+            &server.request(),
+        )
+        .await;
+    assert_eq!(
+        server.count(),
+        1,
+        "a consume POST was sent inside the spend bound of the newer redemption \
+         (consume_attempted={})",
+        tick.consume_attempted
+    );
+}

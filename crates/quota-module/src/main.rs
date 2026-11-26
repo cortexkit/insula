@@ -3129,6 +3129,47 @@ mod tests {
         }
     }
 
+    /// The health check must not republish a credential an upstream echoed back.
+    ///
+    /// The stale-episode message is the failure's published text, cut down;
+    /// for a refusal that text quotes the upstream's body unredacted. The
+    /// message below is what that text reads like when the body echoes the
+    /// rejected bearer. The account label is left out of this check: the same
+    /// label is already published as `account` on every usage entry.
+    #[test]
+    #[ignore = "external audit finding 2: health republishes an echoed credential from a refusal, fix pending"]
+    fn external_audit_stale_episode_health_omits_an_echoed_credential() {
+        let mut snapshot = healthy_snapshot();
+        let bearer = "synthetic-echoed-bearer";
+        snapshot.last_stale_episode = Some(quota_core::store::StaleEpisode {
+            provider: "claude".to_string(),
+            account: None,
+            class: Some("upstream_failed"),
+            message: Some(format!(
+                r#"provider returned HTTP 429: {{"error":"rate limited for bearer {bearer}"}}"#
+            )),
+            at: "2026-09-26T03:00:00Z".parse().unwrap(),
+        });
+        let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
+            &snapshot,
+            &test_vault(),
+            &ServeCounters::default(),
+            &Default::default(),
+            None,
+        ) else {
+            panic!("health_report must produce a HealthCheck response");
+        };
+        let metrics = serde_json::to_string(&metrics).unwrap();
+        assert!(
+            metrics.contains("lastStaleEpisode"),
+            "control: the episode is reported"
+        );
+        assert!(
+            !metrics.contains(bearer),
+            "health metrics republish the echoed credential"
+        );
+    }
+
     fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
         let ModuleControlResponse::HealthCheck { status, .. } = health_report(
             snapshot,
