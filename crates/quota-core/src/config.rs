@@ -524,6 +524,26 @@ mod tests {
         assert_eq!(reloader.live().status().last_error, None);
     }
 
+    #[test]
+    #[ignore = "external audit finding 3: failed reload leaves automatic resets armed, fix pending"]
+    fn external_audit_failed_reload_suspends_automatic_resets() {
+        let temp = crate::tests::ResetTempDir::with_prefix("ck-quota-config", "reload-failure");
+        let path = temp.path().join("ck-quota.jsonc");
+        std::fs::write(&path, ARMED_3600).unwrap();
+        let (mut reloader, _) = counting_reloader(&path);
+        reloader.check();
+        assert!(reloader.live().codex().is_enabled());
+
+        std::fs::write(&path, r#"{"codex":{"auto_use_resets":0"#).unwrap();
+        reloader.check();
+        drop(temp);
+        assert!(reloader.live().status().last_error.is_some());
+        assert!(
+            !reloader.live().codex().is_enabled(),
+            "an unusable reload must suspend automatic authorization"
+        );
+    }
+
     /// A deleted file applies the defaults, which disarm resets.
     ///
     /// Unlike an unreadable file, absence is a state the file documents: no

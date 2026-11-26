@@ -3129,6 +3129,35 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "external audit finding 2: health includes private stale-episode fields, fix pending"]
+    fn external_audit_stale_episode_health_omits_private_fields() {
+        let mut snapshot = healthy_snapshot();
+        let account = "synthetic@example.invalid";
+        let message = "private provider diagnostic";
+        snapshot.last_stale_episode = Some(quota_core::store::StaleEpisode {
+            provider: "claude".to_string(),
+            account: Some(account.to_string()),
+            class: Some("upstream_error"),
+            message: Some(message.to_string()),
+            at: "2026-09-26T03:00:00Z".parse().unwrap(),
+        });
+        let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
+            &snapshot,
+            &test_vault(),
+            &ServeCounters::default(),
+            &Default::default(),
+            None,
+        ) else {
+            panic!("health_report must produce a HealthCheck response");
+        };
+        let metrics = serde_json::to_string(&metrics).unwrap();
+        assert!(
+            !metrics.contains(account) && !metrics.contains(message),
+            "health metrics must omit the account label and diagnostic text"
+        );
+    }
+
     fn status_of(snapshot: &quota_core::health::HealthSnapshot) -> HealthStatus {
         let ModuleControlResponse::HealthCheck { status, .. } = health_report(
             snapshot,
