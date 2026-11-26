@@ -408,24 +408,15 @@ fn stable_handle_key(key: &SlotKey) -> (u8, &str) {
 /// consumer keys on one canonical name instead of maintaining its own
 /// CodexBar→canonical map.
 ///
-/// ADDING A SLUG HERE IS A CONSUMER-VISIBLE CHANGE, AND FOR ONE PROVIDER IT IS
-/// LOAD-BEARING IN A WAY NOTHING HERE SHOWS. `antigravity` deliberately has no
-/// entry: it has no models.dev counterpart, so it joins to nothing in the model
-/// catalog. A routing consumer relies on that absence today — its optimistic
-/// path (swapping a selection to a `-fast` sibling on a low-pressure reading) is
-/// gated on a catalog join, and antigravity is the one lane here whose reading
-/// can legitimately be an HOUR old, because a paid-tier account with the editor
-/// closed is served from that editor's plugin cache and carries the cache's own
-/// timestamp.
-///
-/// So giving `antigravity` a slug would silently make that path live for a lane
-/// it was never sized for. If a counterpart ever appears, say so to the routing
-/// consumer in the same change — their fix is one line (take the older of their
-/// observation time and `fetchedAt` for that gate) and they cannot know to apply
-/// it from anything they can see.
-///
-/// Recorded here rather than in a runbook because this line is what someone edits
-/// to break it. Verified with the routing seat 2026-09-11.
+/// ADDING A SLUG HERE IS A CONSUMER-VISIBLE CHANGE: consumers join quota to
+/// routes and prices on it. `antigravity` publishes `google` because Fusiform
+/// lists the Antigravity models as `google/antigravity-*` rows and keys its
+/// quota-pool model lists by that provider. It used to publish nothing, because
+/// a routing path once trusted any catalog-joined reading without checking its
+/// age, and an Antigravity reading can come from the editor plugin's cache with
+/// the cache's own (older) timestamp. Routing confirmed on 2026-11-26 that the
+/// path is gone and that it ages every reading by `fetchedAt`. So keep that
+/// stamp honest: a cached reading must carry the cache's time, never the read's.
 fn api_provider_name(provider: &str) -> Option<&'static str> {
     API_PROVIDER_SLUGS
         .iter()
@@ -450,6 +441,7 @@ const API_PROVIDER_SLUGS: &[(&str, &str)] = &[
     ("siliconflow-cn", "siliconflow-cn"),
     ("codex", "openai"),
     ("claude", "anthropic"),
+    ("antigravity", "google"),
     ("grok", "xai"),
     ("copilot", "github-copilot"),
     ("deepseek", "deepseek"),

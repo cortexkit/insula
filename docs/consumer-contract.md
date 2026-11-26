@@ -2237,8 +2237,11 @@ different real entry:
 |---|---|---|
 | `alibaba` | `alibaba-coding-plan` | the coding-plan subscription |
 | `qwen-cloud` | `alibaba-token-plan` | the token-plan console |
+| `antigravity` | `google` | the Antigravity subscription; its models are the catalog's `google/antigravity-*` rows |
 
 `alibaba` and `qwen-cloud` are separate upstreams with separate credentials.
+`antigravity` shares `google` with plain Gemini API keys, so a consumer that
+needs to tell the two apart keys on `provider` as well.
 Prefer the published
 `apiProvider` over a local mapping table.
 

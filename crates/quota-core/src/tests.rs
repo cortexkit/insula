@@ -1569,7 +1569,9 @@ fn every_api_provider_key_names_a_registered_provider() {
     for (key, value) in &keys {
         assert_eq!(crate::api_provider_name(key), Some(value.as_str()), "{key}");
     }
-    assert_eq!(crate::api_provider_name("antigravity"), None);
+    // Fusiform keys Antigravity's quota-pool model lists by `google`.
+    assert_eq!(crate::api_provider_name("antigravity"), Some("google"));
+    assert_eq!(crate::api_provider_name("cursor"), None);
 
     assert!(
         keys.len() >= 15,
