@@ -3566,6 +3566,37 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "external audit finding 12: unavailable paid-tier evidence permits fresh cloud-pool substitution, fix pending"]
+    async fn external_audit_finding_12_paid_account_without_tier_evidence_withholds_cloud() {
+        let mut account = super::plugin_lane_tests::sidebar_account_json(
+            "paid-unknown@example.test",
+            Utc::now().timestamp_millis(),
+        );
+        account.as_object_mut().unwrap().remove("tier");
+        let (sidebar, _home) = super::plugin_lane_tests::sidebar_fixture(
+            "vault-paid-unknown",
+            serde_json::json!([account]),
+        );
+        let mut mock = cloud_preflight_mock(200, b"{}".to_vec()).await;
+        mock.provider.override_store = None;
+        mock.provider.env_lookup = sidebar.env_lookup;
+        let handle = attach_vault(&mut mock.provider, None, Arc::new(AtomicUsize::new(0)));
+        mock.provider.credential_source = Some(Arc::new(PreflightVaultSource {
+            project: None,
+            email: Some("paid-unknown@example.test".to_string()),
+            reports: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let attempt = mock.provider.fetch_handle(&handle).await;
+
+        assert!(
+            matches!(attempt.usage, Err(FetchError::LocalSourceUnavailable(_))),
+            "a paid account without tier evidence must not publish a different cloud pool as fresh"
+        );
+        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn a_free_sidebar_tier_still_reaches_the_vault_cloud() {
         assert_sidebar_tier_reaches_vault_cloud(
             "vault-free",

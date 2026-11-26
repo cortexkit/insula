@@ -1601,6 +1601,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "external audit finding 13: stale XML and log readings are accepted as healthy, fix pending"]
+    fn external_audit_finding_13_stale_local_sources_are_not_current_readings() {
+        let stale_xml = IdeFiles::new();
+        stale_xml.xml(
+            "DataGrip2026.2",
+            ACTIVE_XML,
+            SystemTime::now() - std::time::Duration::from_secs(366 * 24 * 60 * 60),
+        );
+        let stale_log = IdeFiles::new();
+        let timestamp = (Local::now() - chrono::Duration::days(366))
+            .format("%Y-%m-%d %H:%M:%S,%3f")
+            .to_string();
+        let line = LATEST_QUOTA_LINE.replacen("2026-10-05 15:27:49,811", &timestamp, 1);
+        stale_log.log("DataGrip2026.2", format!("{REFILL_LINE}\n{line}\n"));
+
+        let xml = stale_xml.fetch();
+        let log = stale_log.fetch();
+        assert!(
+            xml.is_err() && log.is_err(),
+            "year-old sources must not publish current quota: XML accepted {}, log accepted {}",
+            xml.is_ok(),
+            log.is_ok()
+        );
+    }
+
+    #[test]
     fn an_invalid_absent_or_unreadable_log_publishes_xml_unchanged() {
         let files = IdeFiles::new();
         files.xml("DataGrip2026.2", ACTIVE_XML, SystemTime::UNIX_EPOCH);
