@@ -1,5 +1,9 @@
 # insula
 
+> [!WARNING]
+> **Alpha.** insula is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
 insula reads how much quota is left on each AI provider account a machine is
 signed in to, and when each window resets. It runs as a module under
 [subc](https://github.com/cortexkit/subconscious), the CortexKit supervisor:
