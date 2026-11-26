@@ -1662,7 +1662,7 @@ pub(crate) mod tests {
     async fn external_audit_finding_14_console_workspace_selection_rejects_ambiguity() {
         let body = br#"[{"id":"wrk_A"},{"id":"wrk_B"}]"#.to_vec();
         let (origin, server) = crate::loopback::serve_once(200, body).await;
-        let client = reqwest::Client::new();
+        let client = crate::http::provider_client();
         let result = fetch_console_workspace_id(&client, "auth=test", &origin).await;
         let _ = server.await;
 
