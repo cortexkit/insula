@@ -2042,6 +2042,165 @@ mod tests {
         assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
     }
 
+    /// A vault credential stays on the provider's own origin, whatever the
+    /// local Codex CLI's `config.toml` names as `chatgpt_base_url`.
+    ///
+    /// The override belongs to the local login: it says where that one CLI
+    /// install talks. Vault credentials can belong to other accounts entirely,
+    /// so following it hands their bearers to whatever host the file names.
+    /// The local lane is fetched first as a control: its bearer does reach the
+    /// stub, which shows the stub records `Authorization` headers and that the
+    /// assertion about the vault bearer is not vacuous.
+    ///
+    /// Once fixed, the vault lane's requests leave for the default origin
+    /// instead of the stub; offline they fail at DNS, which this test ignores.
+    #[tokio::test]
+    #[ignore = "external audit finding 1: vault bearer follows the local chatgpt_base_url override, fix pending"]
+    async fn external_audit_vault_bearer_never_reaches_the_local_base_url_override() {
+        const LOCAL_BEARER: &str = "synthetic-local-bearer";
+        const VAULT_BEARER: &str = "synthetic-vault-bearer";
+        struct VaultSource;
+        #[async_trait]
+        impl CredentialSource for VaultSource {
+            async fn get_scoped(
+                &self,
+                _credential_id: &str,
+                _min_ttl_ms: u64,
+            ) -> Result<VaultCredential, crate::credential_source::VaultGetError> {
+                Ok(VaultCredential {
+                    payload: VAULT_BEARER.as_bytes().to_vec(),
+                    expires_at_ms: None,
+                    record_version: 1,
+                    account_id: Some("synthetic-vault-account".to_string()),
+                    project_id: None,
+                    email: None,
+                    org_name: None,
+                })
+            }
+        }
+
+        // The host the override names: a loopback stub that records every
+        // request and answers each with a small usage body.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let override_host = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = crate::loopback::read_request(&mut stream).await;
+                recorded.lock().unwrap().push(request);
+                let body = br#"{"rate_limit":{"primary_window":{"used_percent":5}}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+
+        let home = crate::tests::ResetTempDir::with_prefix("ck-quota-codex", "vault-override");
+        std::fs::write(
+            home.path().join("auth.json"),
+            format!(
+                r#"{{"tokens":{{"access_token":"{LOCAL_BEARER}","account_id":"synthetic-local-account"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            context_config(&format!("http://{override_host}/backend-api")).unwrap(),
+        )
+        .unwrap();
+        let coordinator = Arc::new(
+            ResetCoordinator::new(RedemptionJournal::new(home.path().join("redemptions.json")))
+                .unwrap(),
+        );
+        let provider = CodexProvider::new_for_test(
+            CodexConfig::default(),
+            Some(Arc::new(VaultSource)),
+            Arc::new(ReqwestResetTransport::new(crate::http::provider_client())),
+            coordinator,
+            VaultHandleLoader::default(),
+            home.path().to_path_buf(),
+        );
+
+        let _ = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        let _ = provider
+            .fetch_handle(&CredentialHandle::scoped(
+                "chatgpt:openai:synthetic",
+                "oauth",
+            ))
+            .await;
+        server.abort();
+
+        let received = received.lock().unwrap().clone();
+        let carrying = |bearer: &str| {
+            let header = format!("authorization: bearer {bearer}\r\n");
+            received
+                .iter()
+                .filter(|request| request.to_ascii_lowercase().contains(&header))
+                .map(|request| request.lines().next().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !carrying(LOCAL_BEARER).is_empty(),
+            "control: the local login's own override must still be followed"
+        );
+        let leaked = carrying(VAULT_BEARER);
+        assert!(
+            leaked.is_empty(),
+            "the vault bearer reached the override host {override_host}: {leaked:?}"
+        );
+    }
+
+    /// A refusal whose body echoes the rejected bearer must not publish it.
+    ///
+    /// The failure's `Display` text is what becomes a degraded entry's `error`
+    /// and, cut down, the health check's `lastStaleEpisode`. The non-2xx
+    /// excerpt is copied into it unredacted, so an upstream that quotes the
+    /// credential back in its refusal puts the credential on both surfaces.
+    #[tokio::test]
+    #[ignore = "external audit finding 2: a refusal echoing the bearer is published verbatim, fix pending"]
+    async fn external_audit_a_refusal_echoing_the_bearer_does_not_publish_it() {
+        const BEARER: &str = "synthetic-echoed-bearer";
+        let body = format!(r#"{{"error":"invalid bearer {BEARER}"}}"#);
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let base_url = serve_one_raw_response(response.into_bytes()).await;
+        let attempt = CodexProvider::default()
+            .fetch_context(
+                ServedCodexContext {
+                    bearer: BEARER.to_string(),
+                    canonical_account_id: None,
+                    email: None,
+                    org_name: None,
+                    record_version: Some(1),
+                    vault_handle: Some(CredentialHandle::scoped("chatgpt:openai", "oauth")),
+                    is_oauth: true,
+                    source: "vault",
+                },
+                context_config(&base_url),
+                Instant::now(),
+            )
+            .await;
+        let published = attempt
+            .usage
+            .as_ref()
+            .expect_err("a 401 is a failed attempt")
+            .to_string();
+        assert!(published.contains("HTTP 401"), "{published}");
+        assert!(
+            !published.contains(BEARER),
+            "the published error carries the echoed bearer: {published}"
+        );
+    }
+
     #[test]
     fn secret_bearing_codex_debug_is_redacted() {
         let secret = "codex-debug-secret";

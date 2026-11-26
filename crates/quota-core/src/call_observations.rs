@@ -352,24 +352,6 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
 
-    #[test]
-    #[ignore = "external audit finding 10: earlier period anchor allows usage regression, fix pending"]
-    fn external_audit_earlier_period_anchor_cannot_lower_usage() {
-        let held = serde_json::from_value(json!({
-            "usedPercent": 40, "resetsAt": "2026-09-26T06:00:00Z"
-        }))
-        .unwrap();
-        let revised = serde_json::from_value(json!({
-            "usedPercent": 30, "resetsAt": "2026-09-26T05:00:00Z"
-        }))
-        .unwrap();
-        let incoming = "2026-09-26T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert!(
-            guard_window(&held, &revised, incoming).is_err(),
-            "an earlier reset estimate cannot prove a new period"
-        );
-    }
-
     const STAMP: i64 = 1790394000123;
     fn headers() -> BTreeMap<String, String> {
         [

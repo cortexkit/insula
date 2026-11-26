@@ -448,6 +448,110 @@ async fn a_rate_limited_or_failing_redeem_is_retryable_with_the_same_grant() {
         .all(|request| request.contains("\"grant_id\":\"grant-sooner\"")));
 }
 
+/// A first send of `phone-request-0001` whose reply is lost, after which the
+/// grant it named is gone from the next poll (the send landed after all), and
+/// the module restarts. Returns the fixture and the restarted provider.
+async fn restarted_after_a_lost_reply(
+    remaining: Vec<serde_json::Value>,
+) -> (Fixture, crate::anthropic::AnthropicProvider) {
+    let fixture = Fixture::new(two_session_grants()).await;
+    fixture.server.set_reply(503, "{}");
+    let lost = fixture.spend("phone-request-0001", "session").await;
+    assert!(lost.consume_attempted);
+    assert!(matches!(
+        lost.result,
+        Err(SavedResetError::ProviderUnavailable(_))
+    ));
+    fixture
+        .server
+        .set_usage(mock::usage_body(mock::eligible(remaining, None)));
+    fixture.server.set_reply(200, r#"{"result":"reset"}"#);
+    let restarted = Fixture::provider(&fixture.server, &fixture.source, &fixture.journal).await;
+    (fixture, restarted)
+}
+
+/// The grant each redemption request named, in the order they arrived.
+fn redeemed_grants(server: &MockAnthropic) -> Vec<String> {
+    server
+        .redeems()
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            body["grant_id"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+/// A retried request id names the grant its first send named, even after a
+/// restart.
+///
+/// The grant a request id was sent with lives only in process memory, so a
+/// restarted module picks a grant from the current inventory instead and
+/// sends the same request id with a different grant.
+#[tokio::test]
+#[ignore = "external audit finding 5: a retried Claude request id names a different grant after restart, fix pending"]
+async fn external_audit_a_restarted_retry_names_the_grant_its_first_send_named() {
+    let (fixture, restarted) = restarted_after_a_lost_reply(vec![
+        mock::grant(
+            "grant-later",
+            "2099-02-01T00:00:00Z",
+            json!({"type": "session"}),
+        ),
+        mock::grant(
+            "grant-weekly",
+            "2098-01-01T00:00:00Z",
+            json!({"type": "weekly"}),
+        ),
+    ])
+    .await;
+    let retry = restarted
+        .use_saved_reset(&handle(), ACCOUNT, "phone-request-0001", Some("session"))
+        .await;
+    assert!(retry.consume_attempted);
+    assert_eq!(
+        redeemed_grants(&fixture.server),
+        vec!["grant-sooner", "grant-sooner"],
+        "the restarted retry of one request id named a different grant"
+    );
+}
+
+/// A restarted retry with no grant of its kind left still resolves the
+/// attempt its first send left pending.
+///
+/// With nothing in the inventory to choose, the retry answers
+/// `nothing_to_reset` without sending, and the request id stays pending in
+/// the journal: the caller is told nothing happened while the first send may
+/// have reset the account.
+#[tokio::test]
+#[ignore = "external audit finding 5: a restarted Claude retry reports nothing_to_reset and leaves its attempt pending, fix pending"]
+async fn external_audit_a_restarted_retry_without_inventory_resolves_its_pending_attempt() {
+    let (fixture, restarted) = restarted_after_a_lost_reply(vec![mock::grant(
+        "grant-weekly",
+        "2098-01-01T00:00:00Z",
+        json!({"type": "weekly"}),
+    )])
+    .await;
+    let retry = restarted
+        .use_saved_reset(&handle(), ACCOUNT, "phone-request-0001", Some("session"))
+        .await;
+    let status = RedemptionJournal::new(fixture.journal.clone())
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.redeem_request_id == "phone-request-0001")
+        .expect("the first send left a journal record")
+        .status;
+    let outcome = retry.result.map(|(outcome, _)| outcome);
+    assert!(
+        !(outcome == Ok(ConsumeOutcome::NothingToReset)
+            && status == crate::codex_resets::JournalStatus::Pending),
+        "the retry answered {outcome:?} (consume_attempted={}) while its first send is still \
+         pending in the journal",
+        retry.consume_attempted
+    );
+}
+
 #[test]
 fn journal_records_are_scoped_by_provider_and_old_journals_still_read() {
     let temp = crate::tests::ResetTempDir::with_prefix("ck-claude-reset", "scope");

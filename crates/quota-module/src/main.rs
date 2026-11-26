@@ -3129,17 +3129,25 @@ mod tests {
         }
     }
 
+    /// The health check must not republish a credential an upstream echoed back.
+    ///
+    /// The stale-episode message is the failure's published text, cut down;
+    /// for a refusal that text quotes the upstream's body unredacted. The
+    /// message below is what that text reads like when the body echoes the
+    /// rejected bearer. The account label is left out of this check: the same
+    /// label is already published as `account` on every usage entry.
     #[test]
-    #[ignore = "external audit finding 2: health includes private stale-episode fields, fix pending"]
-    fn external_audit_stale_episode_health_omits_private_fields() {
+    #[ignore = "external audit finding 2: health republishes an echoed credential from a refusal, fix pending"]
+    fn external_audit_stale_episode_health_omits_an_echoed_credential() {
         let mut snapshot = healthy_snapshot();
-        let account = "synthetic@example.invalid";
-        let message = "private provider diagnostic";
+        let bearer = "synthetic-echoed-bearer";
         snapshot.last_stale_episode = Some(quota_core::store::StaleEpisode {
             provider: "claude".to_string(),
-            account: Some(account.to_string()),
-            class: Some("upstream_error"),
-            message: Some(message.to_string()),
+            account: None,
+            class: Some("upstream_failed"),
+            message: Some(format!(
+                r#"provider returned HTTP 429: {{"error":"rate limited for bearer {bearer}"}}"#
+            )),
             at: "2026-09-26T03:00:00Z".parse().unwrap(),
         });
         let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
@@ -3153,8 +3161,12 @@ mod tests {
         };
         let metrics = serde_json::to_string(&metrics).unwrap();
         assert!(
-            !metrics.contains(account) && !metrics.contains(message),
-            "health metrics must omit the account label and diagnostic text"
+            metrics.contains("lastStaleEpisode"),
+            "control: the episode is reported"
+        );
+        assert!(
+            !metrics.contains(bearer),
+            "health metrics republish the echoed credential"
         );
     }
 

@@ -349,3 +349,71 @@ async fn codex_cadence_exception_tracks_live_config() {
         slot.last_call_observation_at.unwrap() + crate::refresh::BASE_INTERVAL
     );
 }
+
+/// The weekly window as the registry publishes it.
+async fn published_weekly(registry: &Registry) -> f64 {
+    registry.get_usage(None).await[0]
+        .usage
+        .as_ref()
+        .unwrap()
+        .secondary
+        .as_ref()
+        .unwrap()
+        .used_percent
+}
+
+/// A reply naming an earlier reset than the held one cannot lower usage.
+///
+/// The guard refuses a lower reading at the same reset (beyond rounding) and a
+/// later reset before the held period has ended, but a reset an hour EARLIER
+/// matches neither rule. A period cannot end before the one it follows, so
+/// such a reply proves no rollover, yet its lower usage is published.
+#[tokio::test]
+#[ignore = "external audit finding 10: an earlier reset anchor lowers held usage without a rollover, fix pending"]
+async fn external_audit_an_earlier_reset_anchor_cannot_lower_usage() {
+    let registry = registry("codex").await;
+    assert_eq!(published_weekly(&registry).await, 70.0);
+    let mut earlier = row("codex");
+    earlier["headers"] = json!({"x-codex-primary-used-percent":"30",
+        "x-codex-primary-window-minutes":"10080",
+        "x-codex-primary-reset-at":"1790737200"});
+    let result = registry.observe_calls(ObservationWriter::Broca, vec![earlier]);
+    assert_eq!(
+        published_weekly(&registry).await,
+        70.0,
+        "a reply anchored an hour before the held reset lowered the weekly window \
+         (accepted={})",
+        result.accepted
+    );
+}
+
+/// Same-period decreases within the rounding tolerance cannot add up.
+///
+/// Each reply below is one point lower than the last, at the held reset, so
+/// each passes the one-point tolerance against the value it replaces. The
+/// tolerance is measured from the latest accepted reading rather than a
+/// stable baseline, so twenty replies walk the window from 70% to 50%
+/// without a rollover.
+#[tokio::test]
+#[ignore = "external audit finding 10: repeated in-tolerance decreases lower held usage without a rollover, fix pending"]
+async fn external_audit_in_tolerance_decreases_do_not_accumulate() {
+    let registry = registry("codex").await;
+    let mut accepted = 0;
+    for step in 1..=20_i64 {
+        let mut lower = row("codex");
+        lower["observedAtMs"] = json!(AT + step * 1000);
+        lower["headers"] = json!({
+            "x-codex-primary-used-percent": (70 - step).to_string(),
+            "x-codex-primary-window-minutes":"10080",
+            "x-codex-primary-reset-at":"1790740800"});
+        accepted += registry
+            .observe_calls(ObservationWriter::Broca, vec![lower])
+            .accepted;
+    }
+    let weekly = published_weekly(&registry).await;
+    assert!(
+        weekly >= 69.0,
+        "{accepted} in-tolerance replies lowered the weekly window from 70% to {weekly}% \
+         within one period"
+    );
+}
