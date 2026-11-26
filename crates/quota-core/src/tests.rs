@@ -2633,6 +2633,41 @@ async fn a_contested_identity_names_its_winner_and_an_uncontested_one_stays_sile
 }
 
 #[tokio::test]
+#[ignore = "external audit finding 11: dedup stderr exposes account and credential ids, fix pending"]
+async fn external_audit_finding_11_dedup_notice_redacts_account_and_credential_ids() {
+    const CHILD: &str = "INSULA_TEST_DEDUP_STDERR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let registry = Registry::new(vec![Box::new(PairedDropProvider {
+            percent: Arc::new(Mutex::new(25.0)),
+        })]);
+        tick(&registry).await;
+        assert_eq!(registry.get_usage(None).await.len(), 1);
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::external_audit_finding_11_dedup_notice_redacts_account_and_credential_ids",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let leaked: Vec<_> = ["acct-1", "H1", "H2"]
+        .into_iter()
+        .filter(|identifier| stderr.contains(identifier))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "dedup stderr exposes account or credential identifiers {leaked:?}: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
     // The mixed case: one handle resolves an account and the other cannot. The
     // read path emits labeled entries only when EVERY handle resolves one, so a
@@ -10360,6 +10395,131 @@ async fn an_error_before_any_install_preserves_an_existing_vault_slot() {
     assert_eq!(
         registry.health().vault_enumeration_failure.as_deref(),
         Some("FailClosed")
+    );
+}
+
+#[tokio::test]
+#[ignore = "external audit finding 8: latched credentials consume admission permits before being filtered, fix pending"]
+async fn external_audit_finding_8_latched_credentials_cannot_starve_an_eligible_fetch() {
+    let loader = Arc::new(VaultHandleLoader::default());
+    let mut rows: Vec<_> = (0..refresh::CONCURRENCY_CAP)
+        .map(|index| {
+            scoped_row(
+                &format!("oauth:anthropic:blocked-{index:02}"),
+                "oauth",
+                1,
+                "needs_reauth",
+            )
+        })
+        .collect();
+    rows.push(scoped_row("oauth:anthropic:eligible", "oauth", 1, "active"));
+    let snapshot = scoped_snapshot(1, rows);
+    let source = Arc::new(ScriptedScopedSource::new(vec![Ok(snapshot)]));
+    let (provider, fetches, _) =
+        loader_provider("claude", Arc::clone(&loader), ScopedAccessor::Anthropic);
+    let registry = scoped_registry(vec![provider], loader, source);
+
+    tick(&registry).await;
+
+    let wake = registry.sleep_until_next_due(scheduler_now());
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "the eligible credential must be admitted in the first turn; next wake {wake:?}"
+    );
+    assert!(
+        wake > Duration::ZERO,
+        "after the eligible fetch, latched rows alone must not keep the wake at zero"
+    );
+}
+
+#[tokio::test]
+#[ignore = "external audit finding 9: a failed rotated-credential fetch repeatedly clears its retry backoff, fix pending"]
+async fn external_audit_finding_9_failed_rotation_fetch_preserves_retry_deadline() {
+    struct RotationProvider {
+        loader: Arc<VaultHandleLoader>,
+        fail: Arc<AtomicBool>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UsageProvider for RotationProvider {
+        fn name(&self) -> &str {
+            "claude"
+        }
+
+        fn handles(&self) -> Result<Vec<CredentialHandle>, HandlesError> {
+            self.loader.anthropic_handles()
+        }
+
+        async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return FetchAttempt::unverified_vault_failure(VaultGetError::Transient);
+            }
+            FetchAttempt::success(
+                Some(AccountObservation::new(
+                    Some("rotating-account".to_string()),
+                    Some(1),
+                )),
+                "vault",
+                Usage::default(),
+            )
+        }
+    }
+
+    let loader = Arc::new(VaultHandleLoader::default());
+    let listing = |record_version| {
+        Ok(scoped_snapshot(
+            1,
+            vec![scoped_row(
+                "oauth:anthropic",
+                "oauth",
+                record_version,
+                "active",
+            )],
+        ))
+    };
+    let source = Arc::new(ScriptedScopedSource::new(vec![
+        listing(1),
+        listing(2),
+        listing(2),
+    ]));
+    let fail = Arc::new(AtomicBool::new(false));
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let provider = RotationProvider {
+        loader: Arc::clone(&loader),
+        fail: Arc::clone(&fail),
+        fetches: Arc::clone(&fetches),
+    };
+    let registry = scoped_registry(vec![Box::new(provider)], loader, source);
+
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    fail.store(true, Ordering::SeqCst);
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
+    let backed_off = slot_for(&registry, &handle);
+    assert!(backed_off.next_due_at > scheduler_now());
+    assert_eq!(
+        backed_off
+            .observation
+            .and_then(|observation| observation.record_version),
+        Some(1),
+        "an unverified fetch cannot advance the observed credential version"
+    );
+
+    tick(&registry).await;
+
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "an unchanged listed version must not clear the same retry deadline twice"
+    );
+    assert_eq!(
+        slot_for(&registry, &handle).next_due_at,
+        backed_off.next_due_at
     );
 }
 

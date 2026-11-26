@@ -694,6 +694,40 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "external audit finding 15: account removal emits no usage.watch invalidation, fix pending"]
+    async fn external_audit_finding_15_removed_account_invalidates_usage_watches() {
+        let samples = QuotaSamples::new("epoch".into());
+        let retained = entry(Some("retained"), "2026-01-01T00:00:00Z");
+        let removed = entry(Some("removed"), "2026-01-01T00:00:00Z");
+        samples.observe(vec![retained.clone(), removed]).await;
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+            5,
+            7,
+            91,
+            br#"{"method":"usage.watch"}"#.to_vec(),
+        )
+        .unwrap();
+        samples.watches.subscribe(&frame).unwrap();
+        let initial = samples.watches.try_next().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&initial.body).unwrap()["seq"],
+            1
+        );
+
+        samples.observe(vec![retained]).await;
+
+        let removal = samples.watches.try_next().expect(
+            "removing an account must invalidate watches even when survivors are unchanged",
+        );
+        let removal: Value = serde_json::from_slice(&removal.body).unwrap();
+        assert_eq!(removal["seq"], 2);
+        assert_eq!(removal["provider"], "deepseek");
+        assert_eq!(removal["account"], "removed");
+    }
+
+    #[tokio::test]
     async fn unlabelled_rows_are_keys_and_absent_rows_are_withheld() {
         let samples = QuotaSamples::new("epoch".into());
         samples
