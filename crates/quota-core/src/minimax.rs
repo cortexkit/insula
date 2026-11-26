@@ -948,6 +948,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "external audit finding 16: reset countdown units are guessed from magnitude, fix pending"]
+    fn external_audit_finding_16_short_millisecond_countdown_keeps_its_units() {
+        let mut body: serde_json::Value = serde_json::from_slice(PERCENT_SCHEMA).unwrap();
+        body["model_remains"][0]["remains_time"] = serde_json::json!(900_000);
+        let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+
+        assert_eq!(
+            usage.primary.unwrap().resets_at,
+            env::epoch_to_iso8601(NOW + 900),
+            "900000 milliseconds is fifteen minutes, not 900000 seconds"
+        );
+    }
+
+    #[test]
     fn percent_schema_explicit_boost_spellings_do_not_change_percent_ratios() {
         for spelling in ["permill", "permille"] {
             let mut body: serde_json::Value = serde_json::from_slice(PERCENT_SCHEMA).unwrap();

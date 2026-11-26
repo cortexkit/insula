@@ -605,4 +605,56 @@ mod tests {
         }
         assert_eq!(*reports.lock().unwrap(), vec![(401, 44)]);
     }
+
+    #[test]
+    #[ignore = "external audit finding 17: local auth-store failures become missing login, fix pending"]
+    fn external_audit_finding_17_auth_store_failure_is_not_missing_login() {
+        const CHILD_ENV: &str = "INSULA_DEEPSEEK_AUTH_TEST_CHILD";
+        const TEST_NAME: &str =
+            "deepseek::tests::external_audit_finding_17_auth_store_failure_is_not_missing_login";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let provider = DeepSeekProvider::new_with_handle_loader(
+                None,
+                Arc::new(crate::vault_handles::VaultHandleLoader::default()),
+            );
+            let attempt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(provider.fetch_handle(&CredentialHandle::implicit()));
+            let error = attempt
+                .usage
+                .expect_err("a corrupt store must fail the fetch");
+            assert!(
+                matches!(
+                    error,
+                    FetchError::CredentialUnusable(_) | FetchError::LocalSourceUnavailable(_)
+                ),
+                "the store fault must survive instead of becoming credential_absent: {error:?}"
+            );
+            return;
+        }
+
+        // Isolate the process-global environment in a child instead of mutating it
+        // in the shared unit-test process.
+        let dir = crate::tests::ResetTempDir::with_prefix("deepseek-auth-store", "corrupt");
+        let data_home = dir.path().join("data");
+        let auth_dir = data_home.join("opencode");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(auth_dir.join("auth.json"), "{not json").unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .arg("--include-ignored")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env("XDG_DATA_HOME", &data_home)
+            .env_remove("DEEPSEEK_API_KEY")
+            .env_remove("DEEPSEEK_TOKEN")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated child status: {status}");
+    }
 }

@@ -5384,6 +5384,25 @@ mod plugin_lane_tests {
     }
 
     #[test]
+    #[ignore = "external audit finding 7: sidebar reads have no file-type or size limit, fix pending"]
+    fn external_audit_finding_7_oversized_sidebar_is_refused() {
+        let (provider, _home) = sidebar_fixture("oversized", serde_json::json!([]));
+        let path = sidebar_path(&provider.env_lookup).unwrap();
+        let padding = "x".repeat(2 * 1024 * 1024);
+        std::fs::write(
+            path,
+            format!("{{\"version\":2,\"accounts\":[],\"padding\":\"{padding}\"}}"),
+        )
+        .unwrap();
+
+        let result = provider.stored_accounts();
+        assert!(
+            result.is_err(),
+            "an oversized sidebar must be refused: {result:?}"
+        );
+    }
+
+    #[test]
     fn unsupported_sidebar_versions_require_a_plugin_update() {
         let (provider, _home) = sidebar_fixture("version", serde_json::json!([]));
         for version in [

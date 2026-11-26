@@ -1011,10 +1011,10 @@ impl UsageProvider for OpenCodeGoProvider {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        classify_go_page, is_console_workspace_id, looks_unsubscribed, parse_api_usage,
-        parse_console_go_status, parse_console_workspace_ids, redirected_off_go_page, Endpoints,
-        OpenCodeGoProvider, API_KEY_FAMILY, API_USAGE_URL, CONSOLE_GO_STATUS_PATH,
-        CONSOLE_WORKSPACES_PATH, CONSOLE_WORKSPACE_HEADER,
+        classify_go_page, fetch_console_workspace_id, is_console_workspace_id, looks_unsubscribed,
+        parse_api_usage, parse_console_go_status, parse_console_workspace_ids,
+        redirected_off_go_page, Endpoints, OpenCodeGoProvider, API_KEY_FAMILY, API_USAGE_URL,
+        CONSOLE_GO_STATUS_PATH, CONSOLE_WORKSPACES_PATH, CONSOLE_WORKSPACE_HEADER,
     };
     use crate::opencode::parse_windows;
     use crate::provider::CredentialHandle;
@@ -1655,6 +1655,21 @@ pub(crate) mod tests {
         assert!(parse_console_workspace_ids(r#"[{"id":"acc_TEST"}]"#).is_empty());
         assert!(!is_console_workspace_id("wrk_"));
         assert!(!is_console_workspace_id("wrk two"));
+    }
+
+    #[tokio::test]
+    #[ignore = "external audit finding 14: console selection guesses among workspaces, fix pending"]
+    async fn external_audit_finding_14_console_workspace_selection_rejects_ambiguity() {
+        let body = br#"[{"id":"wrk_A"},{"id":"wrk_B"}]"#.to_vec();
+        let (origin, server) = crate::loopback::serve_once(200, body).await;
+        let client = reqwest::Client::new();
+        let result = fetch_console_workspace_id(&client, "auth=test", &origin).await;
+        let _ = server.await;
+
+        assert!(
+            result.is_err(),
+            "multiple console workspaces are ambiguous, not permission to choose one: {result:?}"
+        );
     }
 
     /// The console payload parses into the same windows the legacy scrape

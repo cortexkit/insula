@@ -887,6 +887,28 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "external audit finding 7: JSON credential reads have no size limit, fix pending"]
+    fn external_audit_finding_7_oversized_json_credential_reads_are_refused() {
+        let dir = fixture("oversized-json");
+        let path = dir.path().join("auth.json");
+        let padding = "x".repeat(2 * 1024 * 1024);
+        let json = format!(
+            "{{\"deepseek\":{{\"type\":\"api\",\"key\":\"synthetic\"}},\
+             \"opencode-go\":{{\"type\":\"api\",\"key\":\"synthetic\"}},\
+             \"padding\":\"{padding}\"}}"
+        );
+        std::fs::write(&path, json).unwrap();
+
+        let general = read_json_provider_at(&path, "deepseek");
+        let legacy_go = read_go_legacy_at(&path);
+        assert!(
+            general.is_err() && legacy_go.is_err(),
+            "both readers must refuse the oversized store: general={general:?}; \
+             legacy_go={legacy_go:?}"
+        );
+    }
+
+    #[test]
     fn expiry_check() {
         let auth = OpencodeAuth::Oauth {
             access: "a".into(),
