@@ -1259,6 +1259,41 @@ mod tests {
         assert!(matches!(normalize_usage(&body), Err(FetchError::Decode(_))));
     }
 
+    #[test]
+    #[ignore = "external audit finding 6: recursive protobuf scan has no depth limit, fix pending"]
+    fn external_audit_finding_6_excessive_protobuf_nesting_is_rejected() {
+        fn response_with_nested_unknown_field(depth: usize) -> Vec<u8> {
+            let valid = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MIN + 1);
+            let mut payload = valid[5..].to_vec();
+            let mut nested = Vec::new();
+            for _ in 0..depth {
+                // Field 9 is a length-delimited unknown message the scanner still walks.
+                let mut wrapper = vec![0x4a];
+                wrapper.extend(varint(nested.len() as u64));
+                wrapper.extend(nested);
+                nested = wrapper;
+            }
+            payload.extend_from_slice(&nested);
+
+            let mut body = vec![FRAME_FLAG_DATA];
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(&payload);
+            body
+        }
+
+        assert!(
+            normalize_usage(&response_with_nested_unknown_field(0)).is_ok(),
+            "the response without the deeply nested field must remain readable"
+        );
+        assert!(
+            matches!(
+                normalize_usage(&response_with_nested_unknown_field(256)),
+                Err(FetchError::Decode(_))
+            ),
+            "an over-deep response must be rejected instead of recursing without a bound"
+        );
+    }
+
     /// The whole point of the re-attribution: an expired credential must reach a
     /// verdict rather than retrying behind a transient classification forever.
     #[test]

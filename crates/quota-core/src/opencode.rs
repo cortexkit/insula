@@ -1298,6 +1298,37 @@ mod stage_tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "external audit finding 14: legacy selection guesses among workspaces, fix pending"]
+    async fn external_audit_finding_14_legacy_workspace_selection_rejects_ambiguity() {
+        let body = br#"[{"id":"wrk_Z"},{"id":"wrk_A"}]"#.to_vec();
+        let (base, server) = crate::loopback::serve_once(200, body).await;
+        let client = reqwest::Client::new();
+        let result =
+            fetch_workspace_id_at(&client, "auth=test", &format!("{base}/_server"), None).await;
+        let _ = server.await;
+
+        assert!(
+            result.is_err(),
+            "multiple workspaces are ambiguous, not permission to choose one: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "external audit finding 14: raw scanning accepts ID-shaped display text, fix pending"]
+    async fn external_audit_finding_14_legacy_workspace_ids_ignore_display_text() {
+        let body = br#"[{"id":"wrk_Z_REAL","name":"wrk_A_DISPLAY"}]"#.to_vec();
+        let (base, server) = crate::loopback::serve_once(200, body).await;
+        let client = reqwest::Client::new();
+        let selected =
+            fetch_workspace_id_at(&client, "auth=test", &format!("{base}/_server"), None)
+                .await
+                .expect("one structured workspace id must be selectable");
+        let _ = server.await;
+
+        assert_eq!(selected, "wrk_Z_REAL");
+    }
+
     /// A payload carrying data is not mistaken for a null.
     ///
     /// The must-not-fire control, and it holds a real builder rather than a

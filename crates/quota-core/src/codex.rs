@@ -2956,6 +2956,16 @@ mod individual_limit_tests {
         );
     }
 
+    #[test]
+    #[ignore = "external audit finding 18: tiny negative balances round to zero, fix pending"]
+    fn external_audit_finding_18_tiny_negative_balance_stays_negative() {
+        assert_eq!(
+            amount_from_json(&serde_json::json!("-0.0000000001")),
+            Some((-1, 9)),
+            "an inexact negative balance must floor below zero even when truncation yields zero"
+        );
+    }
+
     /// One account's budget is never lent to another.
     #[test]
     fn a_remembered_budget_belongs_to_its_own_account() {
