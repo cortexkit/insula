@@ -253,7 +253,10 @@ async fn usage_watch_changed_entry_names_its_identity() {
     for value in [&first, &second] {
         assert_eq!(value["provider"], "deepseek");
     }
-    let mut accounts = [first.get("account").cloned(), second.get("account").cloned()];
+    let mut accounts = [
+        first.get("account").cloned(),
+        second.get("account").cloned(),
+    ];
     accounts.sort_by_key(|account| account.is_some());
     assert_eq!(accounts, [None, Some(json!("a"))]);
     wire.stop().await;
