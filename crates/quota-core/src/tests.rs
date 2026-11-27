@@ -10399,7 +10399,6 @@ async fn an_error_before_any_install_preserves_an_existing_vault_slot() {
 }
 
 #[tokio::test]
-#[ignore = "external audit finding 8: latched credentials consume admission permits before being filtered, fix pending"]
 async fn external_audit_finding_8_latched_credentials_cannot_starve_an_eligible_fetch() {
     let loader = Arc::new(VaultHandleLoader::default());
     let mut rows: Vec<_> = (0..refresh::CONCURRENCY_CAP)
@@ -10433,8 +10432,7 @@ async fn external_audit_finding_8_latched_credentials_cannot_starve_an_eligible_
     );
 }
 
-#[tokio::test]
-#[ignore = "external audit finding 9: a failed rotated-credential fetch repeatedly clears its retry backoff, fix pending"]
+#[tokio::test(start_paused = true)]
 async fn external_audit_finding_9_failed_rotation_fetch_preserves_retry_deadline() {
     struct RotationProvider {
         loader: Arc<VaultHandleLoader>,
@@ -10469,21 +10467,26 @@ async fn external_audit_finding_9_failed_rotation_fetch_preserves_retry_deadline
     }
 
     let loader = Arc::new(VaultHandleLoader::default());
-    let listing = |record_version| {
+    let listing = |record_version, state| {
         Ok(scoped_snapshot(
             1,
             vec![scoped_row(
                 "oauth:anthropic",
                 "oauth",
                 record_version,
-                "active",
+                state,
             )],
         ))
     };
     let source = Arc::new(ScriptedScopedSource::new(vec![
-        listing(1),
-        listing(2),
-        listing(2),
+        listing(1, "active"),
+        listing(2, "active"),
+        listing(2, "active"),
+        listing(3, "active"),
+        listing(2, "active"),
+        listing(3, "needs_reauth"),
+        listing(3, "active"),
+        listing(3, "active"),
     ]));
     let fail = Arc::new(AtomicBool::new(false));
     let fetches = Arc::new(AtomicUsize::new(0));
@@ -10521,6 +10524,37 @@ async fn external_audit_finding_9_failed_rotation_fetch_preserves_retry_deadline
         slot_for(&registry, &handle).next_due_at,
         backed_off.next_due_at
     );
+
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 3, "a newer version is due");
+    let retry_deadline = slot_for(&registry, &handle).next_due_at;
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        3,
+        "an older listing is not due"
+    );
+    assert_eq!(slot_for(&registry, &handle).next_due_at, retry_deadline);
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        3,
+        "a latch suppresses fetch"
+    );
+
+    tick(&registry).await;
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        4,
+        "reactivation is due even if its version already accelerated a fetch"
+    );
+    let retry_deadline = slot_for(&registry, &handle).next_due_at;
+
+    tick(&registry).await;
+    assert_eq!(fetches.load(Ordering::SeqCst), 4);
+    assert_eq!(slot_for(&registry, &handle).next_due_at, retry_deadline);
 }
 
 #[tokio::test]
@@ -11290,6 +11324,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         replaced_record_acceleration(Some(212), 213, "active", false, true, backoff, now),
         Some(ReplacedRecordAcceleration {
             reactivated: false,
+            replacement_version: Some(213),
             discarded_backoff: Some(Duration::from_secs(240)),
         }),
         "a re-sealed record ends the backoff and says how much it discarded"
@@ -11298,6 +11333,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         replaced_record_acceleration(Some(215), 216, "active", false, false, interval, now),
         Some(ReplacedRecordAcceleration {
             reactivated: false,
+            replacement_version: Some(216),
             discarded_backoff: None,
         }),
         "a healthy slot partway through its interval accelerates but discarded no backoff"
@@ -11306,6 +11342,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         replaced_record_acceleration(Some(212), 213, "active", false, true, now, now),
         Some(ReplacedRecordAcceleration {
             reactivated: false,
+            replacement_version: Some(213),
             discarded_backoff: None,
         }),
         "a slot already due discards nothing, so nothing is announced"
@@ -11337,6 +11374,7 @@ fn replaced_record_acceleration_needs_a_version_basis_and_reports_only_real_back
         replaced_record_acceleration(None, 213, "active", true, true, backoff, now),
         Some(ReplacedRecordAcceleration {
             reactivated: true,
+            replacement_version: None,
             discarded_backoff: Some(Duration::from_secs(240)),
         }),
         "reactivation keeps no version bump, so it accelerates on its own signal"

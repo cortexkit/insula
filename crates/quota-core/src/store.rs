@@ -441,15 +441,20 @@ impl SlotStore {
         key: &SlotKey,
         incarnation: Incarnation,
         attempt_sequence: AttemptSequence,
-        next: ProviderSlot,
+        mut next: ProviderSlot,
     ) -> bool {
-        let Some(current) = self.slots.get(key) else {
+        let Some(current) = self.slots.get_mut(key) else {
             return false;
         };
         if current.incarnation != incarnation || current.attempt_sequence != attempt_sequence {
             return false;
         }
-        self.slots.insert(key.clone(), next);
+        // A listing can accelerate the slot while a fetch is in flight. The
+        // fetch can publish its result but cannot make that version new again.
+        next.last_accelerated_listed_version = next
+            .last_accelerated_listed_version
+            .max(current.last_accelerated_listed_version);
+        *current = next;
         true
     }
 
@@ -1112,6 +1117,27 @@ mod tests {
         let (new, new_sequence) = store.admit(&key, incarnation).unwrap();
         assert!(!store.publish_if_current(&key, incarnation, old_sequence, old));
         assert!(store.publish_if_current(&key, incarnation, new_sequence, new));
+    }
+
+    #[test]
+    fn fetch_publication_preserves_listing_acceleration_recorded_in_flight() {
+        let now = Instant::now();
+        let handle = CredentialHandle::scoped("oauth:anthropic", "oauth");
+        let key = SlotKey::new("claude", handle.clone());
+        let mut store = SlotStore::new(now);
+        store.reconcile("claude", &[handle], now);
+        let incarnation = store.get(&key).unwrap().incarnation;
+        let (in_flight, sequence) = store.admit(&key, incarnation).unwrap();
+
+        let mut accelerated = in_flight.clone();
+        accelerated.last_accelerated_listed_version = Some(3);
+        assert!(store.publish_if_current(&key, incarnation, sequence, accelerated));
+        assert!(store.publish_if_current(&key, incarnation, sequence, in_flight));
+
+        assert_eq!(
+            store.get(&key).unwrap().last_accelerated_listed_version,
+            Some(3)
+        );
     }
 
     /// The incarnation half of the publish fence has to be load-bearing on its

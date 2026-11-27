@@ -1686,8 +1686,11 @@ impl Registry {
                         .observation
                         .as_ref()
                         .and_then(|observation| observation.record_version);
+                    let replacement_basis = observed_version.map(|version| {
+                        version.max(slot.last_accelerated_listed_version.unwrap_or_default())
+                    });
                     let Some(acceleration) = refresh::replaced_record_acceleration(
-                        observed_version,
+                        replacement_basis,
                         row.record_version,
                         &row.state,
                         reactivated_ids.contains(credential_id),
@@ -1721,6 +1724,9 @@ impl Registry {
                             discarded.as_secs_f64(),
                         );
                     }
+                    slot.last_accelerated_listed_version = acceleration
+                        .replacement_version
+                        .or(slot.last_accelerated_listed_version);
                     slot.next_due_at = turn_start;
                     store.publish_if_current(&key, slot.incarnation, slot.attempt_sequence, slot);
                 }
@@ -1728,7 +1734,7 @@ impl Registry {
             store.mark_tick(turn_start);
         }
         self.poll_replaced_credentials(turn_start).await;
-        let snapshot = {
+        let mut snapshot = {
             let store = self
                 .store
                 .lock()
@@ -1748,25 +1754,24 @@ impl Registry {
                     .collect()
             })
             .unwrap_or_default();
+        // A credential that cannot be fetched must not take a slot from the batch.
+        snapshot.retain(|(key, _)| {
+            !key.handle
+                .vault_credential_id()
+                .is_some_and(|id| latched_ids.contains(id))
+        });
         let candidates = {
             let mut cursor = self
                 .last_admitted_provider
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (mut candidates, last_admitted) = select_due_round_robin(
+            let (candidates, last_admitted) = select_due_round_robin(
                 &self.providers,
                 snapshot,
                 turn_start,
                 *cursor,
                 self.codex_resets_armed(),
             );
-            candidates.retain(|candidate| {
-                !candidate
-                    .key
-                    .handle
-                    .vault_credential_id()
-                    .is_some_and(|id| latched_ids.contains(id))
-            });
             *cursor = last_admitted;
             candidates
         };

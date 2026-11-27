@@ -246,6 +246,9 @@ pub struct ProviderSlot {
     pub entry: Option<ProviderUsage>,
     /// Most recent independently observed credential identity.
     pub observation: Option<AccountObservation>,
+    /// Highest listed version that already pulled a fetch forward. A failed
+    /// fetch may not observe that version, but must still keep its retry deadline.
+    pub last_accelerated_listed_version: Option<u64>,
     /// The credential changed but no successful usage belongs to the new label.
     /// Readers suppress the slot until a success closes the transition.
     pub label_in_flux: bool,
@@ -341,6 +344,7 @@ impl ProviderSlot {
             error_class: None,
             last_failure_message: None,
             observation: None,
+            last_accelerated_listed_version: None,
             label_in_flux: false,
             relax_eligible: false,
             last_success_at: None,
@@ -708,6 +712,7 @@ fn next_slot_after_attempt_inner(
             error_class: None,
             last_failure_message: None,
             observation: prev.observation.clone(),
+            last_accelerated_listed_version: prev.last_accelerated_listed_version,
             label_in_flux: true,
             relax_eligible: false,
             last_success_at: None,
@@ -838,6 +843,7 @@ fn next_slot_after_attempt_inner(
                 attempt.pools,
             )),
             observation,
+            last_accelerated_listed_version: prev.last_accelerated_listed_version,
             label_in_flux: false,
             relax_eligible: attempt.relax_eligible,
             // Scheduling records this fetch's completion even when the value
@@ -986,6 +992,7 @@ fn next_slot_after_attempt_inner(
                 retry_count,
                 last_failure_class: Some(class),
                 last_status_poll_at: None,
+                last_accelerated_listed_version: prev.last_accelerated_listed_version,
             }
         }
     }
@@ -995,8 +1002,10 @@ fn next_slot_after_attempt_inner(
 /// due now.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReplacedRecordAcceleration {
-    /// The row was reactivated rather than re-sealed.
+    /// The row was reactivated.
     pub reactivated: bool,
+    /// A listed version that independently triggered acceleration.
+    pub replacement_version: Option<u64>,
     /// How much backoff was cut short. `None` when the slot was not in backoff
     /// (its last fetch succeeded) or was already due.
     pub discarded_backoff: Option<Duration>,
@@ -1016,6 +1025,9 @@ pub struct ReplacedRecordAcceleration {
 /// on EVERY turn, so a dead credential in non-transient backoff was fetched
 /// every minute instead of every five. Absence of a basis waits out the backoff,
 /// as it did before the scoped cutover.
+/// When there is an observed version, use the higher of it and the last listed
+/// version that accelerated a fetch: the listing must not clear backoff again
+/// just because the accelerated fetch failed before observing the credential.
 ///
 /// A HEALTHY SLOT IS NOT IN BACKOFF, even though it is not due yet. Its next
 /// fetch sits up to one base interval ahead, and a routine vault refresh
@@ -1029,7 +1041,7 @@ pub struct ReplacedRecordAcceleration {
 /// tell the cases apart because a repair late in a real backoff also discards
 /// under 60s.
 pub fn replaced_record_acceleration(
-    observed_version: Option<u64>,
+    replacement_basis: Option<u64>,
     row_version: u64,
     row_state: &str,
     reactivated: bool,
@@ -1047,12 +1059,15 @@ pub fn replaced_record_acceleration(
     // Treating that difference as "replaced" made the slot due on every turn:
     // measured 2026-10-21, an Antigravity handle fetched about 14 times a minute,
     // and a Claude account in 429 backoff had 891 s of that backoff discarded.
-    let replaced = observed_version.is_some_and(|observed| row_version > observed);
-    if !reactivated && !replaced {
+    let replacement_version = replacement_basis
+        .filter(|&basis| row_version > basis)
+        .map(|_| row_version);
+    if !reactivated && replacement_version.is_none() {
         return None;
     }
     Some(ReplacedRecordAcceleration {
         reactivated,
+        replacement_version,
         discarded_backoff: (in_backoff && next_due_at > turn_start)
             .then(|| next_due_at - turn_start),
     })
