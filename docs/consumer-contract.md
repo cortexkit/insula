@@ -615,8 +615,9 @@ observation `checkedAt` is at most 3600 s old (`CACHED_QUOTA_MAX_AGE`); an
 undated group means no reading yet. Groups age independently, and `fetchedAt`
 carries the oldest served group's `checkedAt`, never the file's publication
 time or the time this module read it. A sidebar read error is transient, never
-an empty roster. Sidebar versions other than v2 (including v1) need a plugin
-update. Changing `CACHED_QUOTA_MAX_AGE` is a contract change: consumers
+an empty roster. The sidebar must be a regular file, not a link, and at most
+4 MiB. Sidebar versions other than v2 (including v1) need a plugin update.
+Changing `CACHED_QUOTA_MAX_AGE` is a contract change: consumers
 (astrocyte's `window_sample` insert) rely on over-age readings being withheld.
 
 For the vault lane, `tier.paidId` present and not `free-tier` is positive
@@ -714,6 +715,10 @@ Notes on single rows:
   meaning. A provider that reads a running application would otherwise appear
   and disappear as someone opens and closes it, while `credential_absent` is a
   stable fact about the host that a consumer may act on.
+  For OpenCode's `auth.json`, the Antigravity sidebar, and credential files
+  read through the shared local credential reader, a non-regular file, a link
+  at the file path, or a file larger than 4 MiB is `local_source_unavailable`,
+  not `credential_absent`.
 - `upstream_failed` and `local_source_unavailable` are rare on a degraded entry,
   because both are transient: seeing either means the slot never had a healthy
   window to fall back on.
