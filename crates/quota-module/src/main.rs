@@ -3131,23 +3131,46 @@ mod tests {
 
     /// The health check must not republish a credential an upstream echoed back.
     ///
-    /// The stale-episode message is the failure's published text, cut down;
-    /// for a refusal that text quotes the upstream's body unredacted. The
-    /// message below is what that text reads like when the body echoes the
-    /// rejected bearer. The account label is left out of this check: the same
-    /// label is already published as `account` on every usage entry.
-    #[test]
-    #[ignore = "external audit finding 2: health republishes an echoed credential from a refusal, fix pending"]
-    fn external_audit_stale_episode_health_omits_an_echoed_credential() {
+    /// Health receives the same refusal text as the usage error. Produce that
+    /// text through the HTTP helper instead of injecting a raw server reply.
+    #[tokio::test]
+    async fn external_audit_stale_episode_health_omits_an_echoed_credential() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let mut snapshot = healthy_snapshot();
         let bearer = "synthetic-echoed-bearer";
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = format!(r#"{{"error":"rate limited for {bearer}"}}"#);
+            let reply = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        });
+        let error = quota_core::http::JsonRequest::get(format!("http://{address}"))
+            .bearer(bearer)
+            .send(&quota_core::http::provider_client())
+            .await
+            .expect_err("the stub refused the request");
+        server.await.unwrap();
         snapshot.last_stale_episode = Some(quota_core::store::StaleEpisode {
             provider: "claude".to_string(),
             account: None,
             class: Some("upstream_failed"),
-            message: Some(format!(
-                r#"provider returned HTTP 429: {{"error":"rate limited for bearer {bearer}"}}"#
-            )),
+            message: Some(error.to_string()),
             at: "2026-09-26T03:00:00Z".parse().unwrap(),
         });
         let ModuleControlResponse::HealthCheck { metrics, .. } = health_report(
@@ -3164,6 +3187,7 @@ mod tests {
             metrics.contains("lastStaleEpisode"),
             "control: the episode is reported"
         );
+        assert!(metrics.contains("HTTP 429") && metrics.contains("rate limited"));
         assert!(
             !metrics.contains(bearer),
             "health metrics republish the echoed credential"

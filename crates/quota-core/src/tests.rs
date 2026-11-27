@@ -5444,7 +5444,8 @@ async fn saved_reset_real_codex_registry_works_disarmed_and_rechecks_account_ide
         coordinator,
         loader,
         home.clone(),
-    );
+    )
+    .with_vault_base_for_test(format!("http://{address}/backend-api"));
     let registry = Registry::new(vec![Box::new(provider)]);
     tick(&registry).await;
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -6126,7 +6127,8 @@ async fn i9_real_codex_provider_two_units_same_account_send_one_consume_post() {
         coordinator,
         handle_loader,
         codex_home,
-    );
+    )
+    .with_vault_base_for_test(format!("http://{address}/backend-api"));
     let registry = Registry::new(vec![Box::new(provider)]);
 
     tick(&registry).await;
@@ -6266,7 +6268,8 @@ async fn real_codex_zero_credit_sibling_headroom_prevents_exhaustion_consume() {
             Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
             handle_loader,
             codex_home,
-        );
+        )
+        .with_vault_base_for_test(format!("http://{address}/backend-api"));
         let registry = Registry::new(vec![Box::new(provider)]);
 
         tick(&registry).await;
@@ -11510,6 +11513,7 @@ async fn a_daemon_without_a_credential_module_serves_local_lanes_on_the_first_tu
 struct FlakyCodexVaultSource {
     list: ScriptedScopedSource,
     gets: AtomicUsize,
+    healthy_reads: usize,
 }
 
 #[async_trait]
@@ -11519,15 +11523,19 @@ impl CredentialSource for FlakyCodexVaultSource {
         credential_id: &str,
         _min_ttl_ms: u64,
     ) -> Result<VaultCredential, VaultGetError> {
-        assert_eq!(credential_id, "chatgpt:openai");
-        if self.gets.fetch_add(1, Ordering::SeqCst) > 0 {
+        let (account, token) = match credential_id {
+            "chatgpt:openai" => ("acct-a", "vault-served-token"),
+            "chatgpt:openai:second" => ("acct-b", "second-vault-token"),
+            _ => panic!("unexpected Codex credential id"),
+        };
+        if self.gets.fetch_add(1, Ordering::SeqCst) >= self.healthy_reads {
             return Err(VaultGetError::Transient);
         }
         Ok(VaultCredential {
-            payload: b"vault-served-token".to_vec(),
+            payload: token.as_bytes().to_vec(),
             expires_at_ms: None,
             record_version: 3,
-            account_id: Some("acct-a".to_string()),
+            account_id: Some(account.to_string()),
             email: None,
             org_name: None,
             project_id: None,
@@ -11563,6 +11571,15 @@ struct CodexVaultAndLocalLogin {
 
 impl CodexVaultAndLocalLogin {
     async fn new(name: &str, local_account: &str, login: LocalCodexLogin) -> Self {
+        Self::with_vault_accounts(name, local_account, login, false).await
+    }
+
+    async fn with_vault_accounts(
+        name: &str,
+        local_account: &str,
+        login: LocalCodexLogin,
+        second: bool,
+    ) -> Self {
         let temp = ResetTempDir::new(name);
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -11581,15 +11598,19 @@ impl CodexVaultAndLocalLogin {
                     let vault_bearer = request.lines().any(|line| {
                         line.eq_ignore_ascii_case("authorization: Bearer vault-served-token")
                     });
-                    if !vault_bearer {
+                    let second_bearer = request.lines().any(|line| {
+                        line.eq_ignore_ascii_case("authorization: Bearer second-vault-token")
+                    });
+                    if !vault_bearer && !second_bearer {
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
-                    let used_percent = match (vault_bearer, login) {
-                        (true, _) => Some(12.0),
-                        (false, LocalCodexLogin::Healthy) => Some(21.0),
+                    let used_percent = match (vault_bearer, second_bearer, login) {
+                        (true, _, _) => Some(12.0),
+                        (_, true, _) => Some(62.0),
+                        (false, false, LocalCodexLogin::Healthy) => Some(21.0),
                         // With no auth.json the local lane never builds a request,
                         // so reaching here means it did: answer as an expired login.
-                        (false, LocalCodexLogin::Expired | LocalCodexLogin::Absent) => None,
+                        (false, false, LocalCodexLogin::Expired | LocalCodexLogin::Absent) => None,
                     };
                     let response = match used_percent {
                         Some(used_percent) => {
@@ -11639,18 +11660,23 @@ impl CodexVaultAndLocalLogin {
         );
 
         let loader = Arc::new(VaultHandleLoader::default());
+        // Whitespace on the vault side proves both ids are normalized before comparison.
+        let mut rows = vec![scoped_row_for_account(
+            "chatgpt:openai",
+            "oauth",
+            " acct-a ",
+        )];
+        if second {
+            rows.push(scoped_row_for_account(
+                "chatgpt:openai:second",
+                "oauth",
+                "acct-b",
+            ));
+        }
         let source = Arc::new(FlakyCodexVaultSource {
-            // Surrounding whitespace on the vault side proves both ids are
-            // normalised before they are compared.
-            list: ScriptedScopedSource::new(vec![Ok(scoped_snapshot(
-                1,
-                vec![scoped_row_for_account(
-                    "chatgpt:openai",
-                    "oauth",
-                    " acct-a ",
-                )],
-            ))]),
+            list: ScriptedScopedSource::new(vec![Ok(scoped_snapshot(1, rows))]),
             gets: AtomicUsize::new(0),
+            healthy_reads: 1 + usize::from(second),
         });
         let credential_source: Arc<dyn CredentialSource> = source.clone();
         let provider = crate::codex::CodexProvider::new_with_handle_loader(
@@ -11658,7 +11684,8 @@ impl CodexVaultAndLocalLogin {
             Some(Arc::clone(&credential_source)),
             Arc::clone(&loader),
         )
-        .with_codex_home_for_test(codex_home);
+        .with_codex_home_for_test(codex_home)
+        .with_vault_base_for_test(format!("http://{address}/backend-api"));
         let registry = scoped_registry(vec![Box::new(provider)], loader, credential_source);
         Self {
             registry,
@@ -11698,6 +11725,49 @@ impl Drop for CodexVaultAndLocalLogin {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+#[tokio::test]
+async fn two_codex_vault_readings_fail_closed_to_the_healthy_local_login() {
+    let fixture = CodexVaultAndLocalLogin::with_vault_accounts(
+        "codex-two-vault-lanes-disconnected",
+        "acct-a",
+        LocalCodexLogin::Healthy,
+        true,
+    )
+    .await;
+    let used = |rows: &[ProviderUsage], account| {
+        rows.iter()
+            .find(|row| row.account.as_deref() == Some(account))
+            .and_then(|row| row.usage.as_ref()?.primary.as_ref())
+            .map(|window| window.used_percent)
+    };
+    tick(&fixture.registry).await;
+    let healthy = fixture.registry.get_usage(Some("codex")).await;
+    assert_eq!(used(&healthy, "acct-a"), Some(21.0));
+    assert_eq!(used(&healthy, "acct-b"), Some(62.0));
+    let vault_rows: Vec<_> = fixture
+        .registry
+        .store
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .filter(|(key, _)| key.provider == "codex" && key.handle.is_vault())
+        .filter_map(|(_, slot)| slot.entry)
+        .collect();
+    assert_eq!(used(&vault_rows, "acct-a"), Some(12.0));
+    assert_eq!(used(&vault_rows, "acct-b"), Some(62.0));
+    force_due(&fixture.registry, "codex");
+    tick(&fixture.registry).await;
+    let unavailable = fixture.registry.get_usage(Some("codex")).await;
+    assert_eq!(used(&unavailable, "acct-a"), Some(21.0));
+    assert!(!unavailable
+        .iter()
+        .any(|row| row.account.as_deref() == Some("acct-b")));
+    assert!(unavailable
+        .iter()
+        .any(|row| row.account.is_none() && row.error.is_some()));
 }
 
 /// A host that keeps every codex account in the vault and has no local login
@@ -12201,7 +12271,8 @@ async fn real_codex_restart_waits_for_delayed_sibling_then_consumes_latest_wall_
         Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
         handle_loader,
         codex_home,
-    );
+    )
+    .with_vault_base_for_test(format!("http://{address}/backend-api"));
     let registry = Arc::new(Registry::new(vec![Box::new(provider)]));
     let first_registry = Arc::clone(&registry);
     let first_tick = tokio::spawn(async move {
@@ -12889,7 +12960,8 @@ async fn real_codex_reported_401_recovers_via_status_with_open_watch_and_local_d
         Arc::new(ResetCoordinator::new(temp.journal()).unwrap()),
         provider_loader,
         codex_home,
-    );
+    )
+    .with_vault_base_for_test(format!("http://{address}/backend-api"));
     let registry = scoped_registry(
         vec![Box::new(provider)],
         Arc::new(VaultHandleLoader::default()),
@@ -13169,7 +13241,9 @@ async fn an_unreadable_config_file_never_arms_redemption() {
     let line = reloader.check().expect("an unreadable file must be logged");
     assert!(
         line.contains("read failed")
-            && line.contains("keeping last good config: codex.auto_use_resets 0s (disarmed)"),
+            && line.contains(
+                "keeping other settings from last good config; codex.auto_use_resets 0s (disarmed)"
+            ),
         "an unreadable config must never arm resets: {line}"
     );
     tick(&registry).await;

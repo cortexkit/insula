@@ -32,7 +32,7 @@ on every operating system. The public wire semantics are in
 
 | Provider | Credential sources / vault families | Main endpoints or local source | Published windows / signals |
 |---|---|---|---|
-| `codex` | Codex CLI `~/.codex/auth.json`; vault `chatgpt:openai` | `GET https://chatgpt.com/backend-api/wham/usage` (base configurable); `/wham/rate-limit-reset-credits` and optional consume | Provider-reported windows (including 5h / weekly), banked resets, credit balance |
+| `codex` | Codex CLI `~/.codex/auth.json`; vault `chatgpt:openai` | `GET https://chatgpt.com/backend-api/wham/usage` (base configurable for the local login only); `/wham/rate-limit-reset-credits` and optional consume | Provider-reported windows (including 5h / weekly), banked resets, credit balance |
 | `claude` | OpenCode `anthropic` OAuth; vault `oauth:anthropic`; `cookie:claude.ai` enrichment | `GET https://api.anthropic.com/api/oauth/usage`; profile and optional web subscription enrichment | 5h / weekly, named model windows, optional extra usage and subscription dates |
 | `antigravity` | Running editor/CLI, OpenCode 1-only plugin sidebar cache; OpenCode 2 hosts use vault `antigravity:google` | Loopback `LanguageServerService/RetrieveUserQuotaSummary`; `https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` (the production host answers a different Gemini pool), refusal fallback `retrieveUserQuota` | Named Gemini and Claude/GPT pool windows (5h / weekly when stated); the vault login reads a paid account's own pool, so neither the editor nor the plugin needs to run |
 | `grok` | OpenCode `xai` OAuth; vault `oauth:xai` | gRPC-web `POST https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` | Billing-period utilization and reset |

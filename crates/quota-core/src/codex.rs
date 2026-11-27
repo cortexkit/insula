@@ -28,7 +28,7 @@
 //!
 //! Fetch: `GET {base}/wham/usage` with `Authorization: Bearer <token>`,
 //! `ChatGPT-Account-Id: <account_id>`. `base` defaults to
-//! `https://chatgpt.com/backend-api` and is overridable via `chatgpt_base_url`
+//! `https://chatgpt.com/backend-api`; only the local login honors `chatgpt_base_url`
 //! in `~/.codex/config.toml` (CODEX_HOME-relative), matching CodexBar.
 //!
 //! Normalize: `rate_limit.{primary,secondary}_window` →
@@ -658,11 +658,13 @@ fn amount_from_json(value: &serde_json::Value) -> Option<(i64, u8)> {
         serde_json::Value::Number(number) => number.to_string(),
         _ => return None,
     };
+    let negative = text.trim_start().starts_with('-');
     let (text, inexact) = floor_fraction(&text, WHAM_MAX_FRACTION_DIGITS);
     let amount = crate::money::parse_amount(&text, CREDIT_UNIT)?;
     // `floor_fraction` cut a negative figure toward zero; one more minor unit
-    // down makes it a true floor, so the result never exceeds the stated amount.
-    let minor = if inexact && amount.minor < 0 {
+    // down makes it a true floor. Use the original sign because truncation can
+    // turn a negative amount into zero.
+    let minor = if inexact && negative {
         amount.minor.checked_sub(1)?
     } else {
         amount.minor
@@ -769,10 +771,6 @@ fn resolve_base_url(config_toml: Option<&str>) -> String {
         normalized.push_str("/backend-api");
     }
     normalized
-}
-
-fn resolve_usage_url(config_toml: Option<&str>) -> String {
-    format!("{}{USAGE_PATH}", resolve_base_url(config_toml))
 }
 
 /// Extract `chatgpt_base_url = "..."` from a config.toml body (comment-aware).
@@ -895,6 +893,8 @@ pub struct CodexProvider {
     credential_source: Option<Arc<dyn CredentialSource>>,
     handle_loader: Arc<VaultHandleLoader>,
     codex_home_override: Option<PathBuf>,
+    #[cfg(test)]
+    vault_base_override: Option<String>,
     reset_tick_logger: ResetTickLogger,
     /// Each account's last readable workspace credit-limit pool, so a reading
     /// whose limit couldn't be parsed keeps it rather than dropping it (see
@@ -906,7 +906,7 @@ impl CodexProvider {
     fn reset_request(
         &self,
         context: &ServedCodexContext,
-        config_toml: Option<&str>,
+        base_url: String,
         account_id: &str,
     ) -> ResetRequest {
         let auth_failure = match (
@@ -924,7 +924,7 @@ impl CodexProvider {
             _ => None,
         };
         ResetRequest {
-            base_url: resolve_base_url(config_toml),
+            base_url,
             bearer: context.bearer.clone(),
             account_id: account_id.to_owned(),
             auth_failure,
@@ -956,6 +956,8 @@ impl CodexProvider {
             credential_source,
             handle_loader,
             codex_home_override: None,
+            #[cfg(test)]
+            vault_base_override: None,
             reset_tick_logger: ResetTickLogger::default(),
             last_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -1057,6 +1059,21 @@ impl CodexProvider {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_vault_base_for_test(mut self, base_url: impl Into<String>) -> Self {
+        self.vault_base_override = Some(base_url.into());
+        self
+    }
+
+    fn vault_base(&self) -> String {
+        #[cfg(test)]
+        if let Some(base_url) = &self.vault_base_override {
+            return base_url.clone();
+        }
+        // The CLI's configured proxy is only authorized for its own login.
+        DEFAULT_BASE.to_owned()
+    }
+
     fn resolved_codex_home(&self) -> Option<PathBuf> {
         self.codex_home_override.clone().or_else(codex_home)
     }
@@ -1096,14 +1113,14 @@ impl CodexProvider {
     async fn fetch_context(
         &self,
         context: ServedCodexContext,
-        config_toml: Option<String>,
+        base_url: String,
         attempt_started: Instant,
     ) -> FetchAttempt {
         let observed = Some(context.observation());
         let source = context.source;
         let credentials = context.credentials();
         let preserve_provider_status = context.vault_handle.is_some();
-        let usage_url = resolve_usage_url(config_toml.as_deref());
+        let usage_url = format!("{base_url}{USAGE_PATH}");
         let account_id = context
             .canonical_account_id
             .as_deref()
@@ -1153,7 +1170,7 @@ impl CodexProvider {
             };
         };
 
-        let reset_request = self.reset_request(&context, config_toml.as_deref(), account_id);
+        let reset_request = self.reset_request(&context, base_url, account_id);
         let usage_timeout = if reset_eligible {
             ARMED_USAGE_TIMEOUT
         } else {
@@ -1381,7 +1398,6 @@ impl UsageProvider for CodexProvider {
     async fn fetch_handle(&self, handle: &CredentialHandle) -> FetchAttempt {
         let attempt = async {
             let attempt_started = Instant::now();
-            let codex_home = self.resolved_codex_home();
             if handle.is_vault() {
                 let Some(credential_source) = self.credential_source.as_ref() else {
                     return FetchAttempt::unverified_vault_failure(
@@ -1408,15 +1424,10 @@ impl UsageProvider for CodexProvider {
                         return FetchAttempt::failure(fallback_observation, None, error);
                     }
                 };
-                let config_toml = tokio::task::spawn_blocking(move || {
-                    codex_home
-                        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
-                })
-                .await
-                .unwrap_or(None);
-                self.fetch_context(context, config_toml, attempt_started)
+                self.fetch_context(context, self.vault_base(), attempt_started)
                     .await
             } else {
+                let codex_home = self.resolved_codex_home();
                 let resolved = tokio::task::spawn_blocking(move || {
                     let home = codex_home.ok_or_else(|| {
                         FetchError::NoSession(
@@ -1453,8 +1464,12 @@ impl UsageProvider for CodexProvider {
                         );
                     }
                 };
-                self.fetch_context(context, config_toml, attempt_started)
-                    .await
+                self.fetch_context(
+                    context,
+                    resolve_base_url(config_toml.as_deref()),
+                    attempt_started,
+                )
+                .await
             }
         }
         .await;
@@ -1507,11 +1522,7 @@ impl UsageProvider for CodexProvider {
             }
         }
         let resolved = async {
-            let home = self.resolved_codex_home();
-            let config_toml = home
-                .as_ref()
-                .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok());
-            let context = if handle.is_vault() {
+            let (context, base_url) = if handle.is_vault() {
                 let source = self
                     .credential_source
                     .as_ref()
@@ -1525,15 +1536,24 @@ impl UsageProvider for CodexProvider {
                 .map_err(|_| {
                     SavedResetError::ProviderUnavailable("credential unavailable".into())
                 })?;
-                ServedCodexContext::vault(handle.clone(), credential)
-                    .map_err(|_| SavedResetError::UnknownAccount)?
+                (
+                    ServedCodexContext::vault(handle.clone(), credential)
+                        .map_err(|_| SavedResetError::UnknownAccount)?,
+                    self.vault_base(),
+                )
             } else {
-                let home = home.ok_or(SavedResetError::UnknownAccount)?;
+                let home = self
+                    .resolved_codex_home()
+                    .ok_or(SavedResetError::UnknownAccount)?;
                 let data =
                     crate::env::read_credential_file(&home.join("auth.json"), "codex auth.json")
                         .map_err(|_| SavedResetError::UnknownAccount)?;
-                ServedCodexContext::local(
-                    parse_credentials(&data).map_err(|_| SavedResetError::UnknownAccount)?,
+                let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
+                (
+                    ServedCodexContext::local(
+                        parse_credentials(&data).map_err(|_| SavedResetError::UnknownAccount)?,
+                    ),
+                    resolve_base_url(config_toml.as_deref()),
                 )
             };
             // A credential can rotate after the usage row was read. Never spend
@@ -1541,7 +1561,7 @@ impl UsageProvider for CodexProvider {
             if !context.is_oauth || context.canonical_account_id.as_deref() != Some(account_id) {
                 return Err(SavedResetError::UnknownAccount);
             }
-            Ok(self.reset_request(&context, config_toml.as_deref(), account_id))
+            Ok(self.reset_request(&context, base_url, account_id))
         }
         .await;
         let request = match resolved {
@@ -1945,7 +1965,7 @@ mod tests {
                     is_oauth: true,
                     source: "oauth",
                 },
-                context_config(&base_url),
+                base_url,
                 Instant::now(),
             )
             .await;
@@ -1971,7 +1991,7 @@ mod tests {
                     email: None,
                     is_oauth: true,
                 }),
-                context_config(&local_url),
+                local_url,
                 Instant::now(),
             )
             .await;
@@ -1993,7 +2013,7 @@ mod tests {
                     is_oauth: true,
                     source: "vault",
                 },
-                context_config(&vault_url),
+                vault_url,
                 Instant::now(),
             )
             .await;
@@ -2025,7 +2045,7 @@ mod tests {
                     is_oauth: true,
                     source: "vault",
                 },
-                context_config(&base_url),
+                base_url,
                 Instant::now(),
             )
             .await;
@@ -2052,10 +2072,7 @@ mod tests {
     /// stub, which shows the stub records `Authorization` headers and that the
     /// assertion about the vault bearer is not vacuous.
     ///
-    /// Once fixed, the vault lane's requests leave for the default origin
-    /// instead of the stub; offline they fail at DNS, which this test ignores.
     #[tokio::test]
-    #[ignore = "external audit finding 1: vault bearer follows the local chatgpt_base_url override, fix pending"]
     async fn external_audit_vault_bearer_never_reaches_the_local_base_url_override() {
         const LOCAL_BEARER: &str = "synthetic-local-bearer";
         const VAULT_BEARER: &str = "synthetic-vault-bearer";
@@ -2128,13 +2145,26 @@ mod tests {
             home.path().to_path_buf(),
         );
 
-        let _ = provider.fetch_handle(&CredentialHandle::implicit()).await;
-        let _ = provider
+        assert_eq!(provider.vault_base(), "https://chatgpt.com/backend-api");
+        let (vault_base, vault_usage, vault_credits, _, vault_server) =
+            serve_codex_metadata_routes(
+                br#"{"rate_limit":{"primary_window":{"used_percent":6}}}"#.to_vec(),
+                br#"{"credits":[],"available_count":0}"#.to_vec(),
+            )
+            .await;
+        let provider = provider.with_vault_base_for_test(vault_base);
+        let local = provider.fetch_handle(&CredentialHandle::implicit()).await;
+        assert!(local.usage.is_ok());
+        let vault = provider
             .fetch_handle(&CredentialHandle::scoped(
                 "chatgpt:openai:synthetic",
                 "oauth",
             ))
             .await;
+        assert!(vault.usage.is_ok());
+        assert_eq!(vault_usage.load(Ordering::SeqCst), 1);
+        assert_eq!(vault_credits.load(Ordering::SeqCst), 1);
+        vault_server.abort();
         server.abort();
 
         let received = received.lock().unwrap().clone();
@@ -2164,7 +2194,6 @@ mod tests {
     /// excerpt is copied into it unredacted, so an upstream that quotes the
     /// credential back in its refusal puts the credential on both surfaces.
     #[tokio::test]
-    #[ignore = "external audit finding 2: a refusal echoing the bearer is published verbatim, fix pending"]
     async fn external_audit_a_refusal_echoing_the_bearer_does_not_publish_it() {
         const BEARER: &str = "synthetic-echoed-bearer";
         let body = format!(r#"{{"error":"invalid bearer {BEARER}"}}"#);
@@ -2185,7 +2214,7 @@ mod tests {
                     is_oauth: true,
                     source: "vault",
                 },
-                context_config(&base_url),
+                base_url,
                 Instant::now(),
             )
             .await;
@@ -2194,7 +2223,10 @@ mod tests {
             .as_ref()
             .expect_err("a 401 is a failed attempt")
             .to_string();
-        assert!(published.contains("HTTP 401"), "{published}");
+        assert!(
+            published.contains("HTTP 401") && published.contains("invalid bearer"),
+            "{published}"
+        );
         assert!(
             !published.contains(BEARER),
             "the published error carries the echoed bearer: {published}"
@@ -2655,16 +2687,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_url_default_and_override() {
+    fn resolve_local_base_default_and_override() {
+        assert_eq!(resolve_base_url(None), "https://chatgpt.com/backend-api");
         assert_eq!(
-            resolve_usage_url(None),
-            "https://chatgpt.com/backend-api/wham/usage"
-        );
-        assert_eq!(
-            resolve_usage_url(Some(
+            resolve_base_url(Some(
                 "chatgpt_base_url = \"https://proxy.local/backend-api\"\n"
             )),
-            "https://proxy.local/backend-api/wham/usage"
+            "https://proxy.local/backend-api"
         );
     }
 }
@@ -3116,7 +3145,6 @@ mod individual_limit_tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 18: tiny negative balances round to zero, fix pending"]
     fn external_audit_finding_18_tiny_negative_balance_stays_negative() {
         assert_eq!(
             amount_from_json(&serde_json::json!("-0.0000000001")),

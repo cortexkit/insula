@@ -80,11 +80,6 @@ async fn reported_codex_wall_never_reaches_armed_coordinator_or_consume() {
             seen.fetch_add(1, Ordering::SeqCst);
         }
     });
-    std::fs::write(
-        scratch.path().join("config.toml"),
-        format!("chatgpt_base_url = \"http://{address}/backend-api\"\n"),
-    )
-    .unwrap();
     let coordinator = Arc::new(
         ResetCoordinator::new(RedemptionJournal::new(
             scratch.path().join("redemptions.json"),
@@ -106,7 +101,8 @@ async fn reported_codex_wall_never_reaches_armed_coordinator_or_consume() {
         Arc::clone(&coordinator),
         loader,
         scratch.path().to_path_buf(),
-    );
+    )
+    .with_vault_base_for_test(format!("http://{address}/backend-api"));
     let mut registry = crate::Registry::new(vec![Box::new(provider)]);
     registry.live_config = Some(crate::config::LiveQuotaConfig::from(CodexConfig {
         auto_use_resets: 1,

@@ -110,7 +110,7 @@ async fn saved_reset_legacy_replay_uses_last_attempt_at() {
     fs::write(journal.path(), LEGACY_JOURNAL).unwrap();
     let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
     let result = coordinator
-        .manual_redeem(CODEX_PROVIDER, ACCOUNT, ID, now(), || async {
+        .manual_redeem(CODEX_PROVIDER, ACCOUNT, ID, now(), None, |_, _| async {
             panic!("a resolved legacy request must not contact the provider")
         })
         .await;
@@ -373,16 +373,9 @@ async fn saved_reset_timeout_keeps_pending_id_for_retry() {
 /// A pending redemption retried after a newer one resolved must not POST
 /// inside the account's spend bound.
 ///
-/// The old request was written as pending and attempted, but its POST never
-/// reached the provider, and nothing retried it for longer than the spend
-/// bound (resets were disarmed meanwhile). A manual redemption under a new id
-/// is then allowed and resolves `reset`. The next armed tick finds the old id
-/// still pending and sends it straight away: the pending branch of `reserve`
-/// returns before the spend bound is read, and a pending retry needs no
-/// trigger. Because the provider never saw the old id, its deduplication
-/// cannot stop it from spending a second saved reset.
+/// A journal from an older version can contain both records, so seed that
+/// history directly instead of relying on new reservations to create it.
 #[tokio::test]
-#[ignore = "external audit finding 4: pending retry POSTs inside the spend bound of a newer redemption, fix pending"]
 async fn external_audit_a_stale_pending_retry_respects_a_newer_redemptions_spend_bound() {
     let (_temp, journal) = journal();
     let now = Utc::now();
@@ -393,25 +386,32 @@ async fn external_audit_a_stale_pending_retry_respects_a_newer_redemptions_spend
     journal
         .record_attempt(ACCOUNT, "stale-pending-request", stale)
         .unwrap();
+    let mut records = journal.records().unwrap();
+    let mut other = records[0].clone();
+    other.redeem_request_id = "newer-request".into();
+    other.created_at = now.to_rfc3339();
+    other.last_attempt_at = Some(now.to_rfc3339());
+    other.status = JournalStatus::Resolved;
+    other.outcome = Some(ConsumeOutcome::Reset);
+    other.resolved_at = Some(now.to_rfc3339());
+    records.push(other);
+    journal.save(&records).unwrap();
     let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
     let server = Server::new(200, r#"{"code":"reset"}"#).await;
     let transport = ReqwestResetTransport::new(crate::http::provider_client());
 
-    let newer = coordinator
+    let retry = coordinator
         .use_saved_reset(
             ACCOUNT,
-            "newer-request",
+            "stale-pending-request",
             now,
             &transport,
             &server.request(),
             Duration::from_secs(2),
         )
         .await;
-    assert_eq!(
-        newer.result.map(|(outcome, _)| outcome),
-        Ok(ConsumeOutcome::Reset)
-    );
-    assert_eq!(server.count(), 1);
+    assert_eq!(retry.result, Err(SavedResetError::RecentlyReset(now)));
+    assert!(!retry.consume_attempted);
 
     // An armed tick for the same account, which is not at its wall and has
     // no credit about to expire: nothing here calls for a redemption.
@@ -438,9 +438,40 @@ async fn external_audit_a_stale_pending_retry_respects_a_newer_redemptions_spend
         .await;
     assert_eq!(
         server.count(),
-        1,
+        0,
         "a consume POST was sent inside the spend bound of the newer redemption \
          (consume_attempted={})",
         tick.consume_attempted
     );
+}
+
+#[tokio::test]
+async fn saved_reset_fresh_press_finishes_an_older_request_and_replays_the_answer() {
+    let (_temp, journal) = journal();
+    let stale = now() - chrono::Duration::seconds(SPEND_BOUND_SECS + 1);
+    let original = "old-synthetic-id";
+    journal.reserve_manual(ACCOUNT, original, stale).unwrap();
+    let coordinator = ResetCoordinator::new(journal.clone()).unwrap();
+    let server = Server::new(200, r#"{"code":"already_redeemed"}"#).await;
+    let result = redeem(&coordinator, &server, ID).await;
+    assert!(result.consume_attempted);
+    let decided = result.result.unwrap();
+    assert_eq!(decided.0, ConsumeOutcome::AlreadyRedeemed);
+    assert_eq!(server.count(), 1);
+    let body = server.requests.lock().unwrap()[0]
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .1
+        .to_owned();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["redeem_request_id"],
+        original
+    );
+    let restarted = ResetCoordinator::new(journal).unwrap();
+    for id in [ID, original] {
+        let replay = redeem(&restarted, &server, id).await;
+        assert_eq!(replay.result, Ok(decided));
+        assert!(!replay.consume_attempted);
+    }
+    assert_eq!(server.count(), 1);
 }

@@ -302,7 +302,7 @@ async fn a_spend_posts_the_chosen_grant_under_the_profiles_organization() {
                "request_id": "phone-request-0001"})
     );
     assert_eq!(fixture.server.profile_reads(), 1);
-    // The journal records the spend by provider and account, never the grant.
+    // Once decided, the journal needs only the outcome, not the grant.
     let journal = std::fs::read_to_string(&fixture.journal).unwrap();
     assert!(journal.contains("\"provider\": \"claude\""), "{journal}");
     assert!(!journal.contains("grant-"), "{journal}");
@@ -462,6 +462,9 @@ async fn restarted_after_a_lost_reply(
         lost.result,
         Err(SavedResetError::ProviderUnavailable(_))
     ));
+    let journal: Value = serde_json::from_slice(&std::fs::read(&fixture.journal).unwrap()).unwrap();
+    assert_eq!(journal[0]["provider"], "claude");
+    assert_eq!(journal[0]["claude_grant_id"], "grant-sooner");
     fixture
         .server
         .set_usage(mock::usage_body(mock::eligible(remaining, None)));
@@ -485,12 +488,7 @@ fn redeemed_grants(server: &MockAnthropic) -> Vec<String> {
 
 /// A retried request id names the grant its first send named, even after a
 /// restart.
-///
-/// The grant a request id was sent with lives only in process memory, so a
-/// restarted module picks a grant from the current inventory instead and
-/// sends the same request id with a different grant.
 #[tokio::test]
-#[ignore = "external audit finding 5: a retried Claude request id names a different grant after restart, fix pending"]
 async fn external_audit_a_restarted_retry_names_the_grant_its_first_send_named() {
     let (fixture, restarted) = restarted_after_a_lost_reply(vec![
         mock::grant(
@@ -518,13 +516,7 @@ async fn external_audit_a_restarted_retry_names_the_grant_its_first_send_named()
 
 /// A restarted retry with no grant of its kind left still resolves the
 /// attempt its first send left pending.
-///
-/// With nothing in the inventory to choose, the retry answers
-/// `nothing_to_reset` without sending, and the request id stays pending in
-/// the journal: the caller is told nothing happened while the first send may
-/// have reset the account.
 #[tokio::test]
-#[ignore = "external audit finding 5: a restarted Claude retry reports nothing_to_reset and leaves its attempt pending, fix pending"]
 async fn external_audit_a_restarted_retry_without_inventory_resolves_its_pending_attempt() {
     let (fixture, restarted) = restarted_after_a_lost_reply(vec![mock::grant(
         "grant-weekly",
@@ -542,14 +534,83 @@ async fn external_audit_a_restarted_retry_without_inventory_resolves_its_pending
         .find(|record| record.redeem_request_id == "phone-request-0001")
         .expect("the first send left a journal record")
         .status;
-    let outcome = retry.result.map(|(outcome, _)| outcome);
-    assert!(
-        !(outcome == Ok(ConsumeOutcome::NothingToReset)
-            && status == crate::codex_resets::JournalStatus::Pending),
-        "the retry answered {outcome:?} (consume_attempted={}) while its first send is still \
-         pending in the journal",
-        retry.consume_attempted
+    assert!(retry.consume_attempted);
+    assert_eq!(
+        retry.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
     );
+    assert_eq!(status, crate::codex_resets::JournalStatus::Resolved);
+    assert_eq!(
+        redeemed_grants(&fixture.server),
+        vec!["grant-sooner", "grant-sooner"]
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_pending_request_without_a_grant_expires_without_a_post() {
+    let fixture = Fixture::new(two_session_grants()).await;
+    let current = chrono::Utc::now();
+    let old_id = "phone-legacy-request";
+    let write_pending = |at: chrono::DateTime<chrono::Utc>| {
+        let at = at.to_rfc3339();
+        std::fs::write(
+            &fixture.journal,
+            json!([{
+                "provider": "claude", "account_id": ACCOUNT, "redeem_request_id": old_id,
+                "created_at": at, "last_attempt_at": at, "attempt_count": 1,
+                "status": "pending", "outcome": null, "manual": true,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write_pending(current);
+    let early = fixture.spend("phone-new-request", "session").await;
+    assert!(matches!(
+        early.result,
+        Err(SavedResetError::ProviderUnavailable(_))
+    ));
+    assert!(!early.consume_attempted);
+    assert!(fixture.server.redeems().is_empty());
+
+    write_pending(current - chrono::Duration::minutes(31));
+    let fresh = fixture.spend("phone-new-request", "session").await;
+    assert!(fresh.consume_attempted);
+    assert_eq!(
+        fresh.result.map(|(outcome, _)| outcome),
+        Ok(ConsumeOutcome::Reset)
+    );
+    let records = RedemptionJournal::new(fixture.journal.clone())
+        .records()
+        .unwrap();
+    assert_eq!(
+        records[0].status,
+        crate::codex_resets::JournalStatus::Abandoned
+    );
+    assert_eq!(records[0].outcome, None);
+    let replay = fixture.spend(old_id, "session").await;
+    assert!(matches!(
+        replay.result,
+        Err(SavedResetError::ProviderUnavailable(_))
+    ));
+    assert!(!replay.consume_attempted);
+    let requests = fixture.server.redeems();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("\"request_id\":\"phone-new-request\""));
+}
+
+#[tokio::test]
+async fn a_claude_refusal_does_not_publish_the_pending_grant() {
+    let fixture = Fixture::new(two_session_grants()).await;
+    fixture
+        .server
+        .set_reply(403, r#"{"error":"grant-sooner was rejected"}"#);
+    let result = fixture.spend("phone-request-0001", "session").await;
+    let Err(SavedResetError::ProviderRefused(excerpt)) = result.result else {
+        panic!("expected a provider refusal");
+    };
+    assert!(excerpt.contains("was rejected"));
+    assert!(!excerpt.contains("grant-sooner"));
 }
 
 #[test]
@@ -567,12 +628,18 @@ fn journal_records_are_scoped_by_provider_and_old_journals_still_read() {
     assert_eq!(records[0].provider, "codex");
     // The Codex record's bound does not block the same account id on Claude,
     // and Claude's record does not reach the automatic Codex policy.
-    assert_eq!(
+    assert!(matches!(
         journal
-            .reserve_manual_for("claude", "shared", "claude-request", now())
+            .reserve_manual_with_grant(
+                "claude",
+                "shared",
+                "claude-request",
+                now(),
+                Some("synthetic-grant")
+            )
             .unwrap(),
-        crate::codex_resets::ManualReservation::Pending
-    );
+        crate::codex_resets::ManualReservation::Pending { .. }
+    ));
     assert!(matches!(
         journal
             .reserve_manual("shared", "codex-request", now())

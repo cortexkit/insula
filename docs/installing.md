@@ -81,8 +81,9 @@ later redemption decision, and setting it back arms them again. Each applied cha
 `[insula] config reloaded: codex.auto_use_resets 3600 -> 0 (disarmed)`, and
 `health.check` reports the value in force and when it was loaded under
 `quotaConfig`. A missing file, or one deleted while the module runs, means the
-defaults. A file that cannot be read or parsed keeps the last good config
-(at start, the defaults), and the warning names the file and the reason.
+defaults. A file that cannot be read or parsed disarms automatic saved resets
+until a valid file loads. Other settings keep their last good values (at start,
+the defaults). The warning names the file and the reason once per failure.
 Today the file has one setting:
 
 ```jsonc

@@ -45,7 +45,7 @@ use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     net::TcpListener,
     process::{Child, Command},
     time::{sleep, Instant},
@@ -262,7 +262,7 @@ const DEFAULT_STUB_CREDENTIALS: [StubCredential; 2] = [
         "chatgpt:openai",
         "oauth",
         "openai",
-        b"vault-token-primary",
+        b"synthetic\ninvalid-header",
         "account-primary",
         7,
         Some("openai-oauth"),
@@ -271,7 +271,7 @@ const DEFAULT_STUB_CREDENTIALS: [StubCredential; 2] = [
         "chatgpt:openai:gmail",
         "oauth",
         "openai",
-        b"vault-token-second",
+        b"synthetic\ninvalid-header",
         "account-second",
         11,
         Some("openai-oauth"),
@@ -455,78 +455,6 @@ async fn start_vault_stub_with_credentials(
         }
     });
     VaultStub { task }
-}
-
-struct UsageHttpStub {
-    base_url: String,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for UsageHttpStub {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn start_usage_http_stub() -> UsageHttpStub {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut request = vec![0; 16 * 1024];
-                let Ok(size) = stream.read(&mut request).await else {
-                    return;
-                };
-                let request = String::from_utf8_lossy(&request[..size]);
-                let header = |wanted: &str| {
-                    request.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
-                    })
-                };
-                let account = header("chatgpt-account-id");
-                let authorization = header("authorization");
-                assert!(
-                    matches!(
-                        (account, authorization),
-                        (
-                            Some("account-primary"),
-                            Some("Bearer local-token" | "Bearer vault-token-primary")
-                        ) | (Some("account-second"), Some("Bearer vault-token-second"))
-                    ),
-                    "bearer/account headers must come from one served context"
-                );
-                let used_percent = match account {
-                    Some("account-second") => 62,
-                    _ => 21,
-                };
-                let body = serde_json::json!({
-                    "rate_limit": {
-                        "limit_reached": false,
-                        "primary_window": {
-                            "used_percent": used_percent,
-                            "reset_at": 1900000000,
-                            "limit_window_seconds": 604800
-                        }
-                    }
-                })
-                .to_string();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    UsageHttpStub {
-        base_url: format!("http://{address}/backend-api"),
-        task,
-    }
 }
 
 fn write_owner_only(path: &Path, body: &[u8]) {
@@ -1168,21 +1096,13 @@ async fn scoped_inventory_routes_every_vault_backed_provider_family() {
 #[tokio::test]
 async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
     let daemon = start_daemon().await;
-    let usage_stub = start_usage_http_stub().await;
     let mut vault_stub = start_vault_stub(&daemon.connection_file_path).await;
     wait_for_registration(&daemon.registry, VAULT_MODULE_ID, SETUP_TIMEOUT).await;
 
-    let codex_home = daemon.temp_dir.join("codex-home");
-    write_owner_only(
-        &codex_home.join("auth.json"),
-        br#"{"tokens":{"access_token":"local-token","account_id":"account-primary"}}"#,
-    );
-    write_owner_only(
-        &codex_home.join("config.toml"),
-        format!("chatgpt_base_url = {:?}\n", usage_stub.base_url).as_bytes(),
-    );
+    // The payload decodes, so the module can publish the verified account,
+    // but cannot form an HTTP header. This produces a retryable error without
+    // sending anything to the provider; a decode error has a longer backoff.
     let child = quota_module_command(&daemon.connection_file_path, &daemon.temp_dir)
-        .env("CODEX_HOME", &codex_home)
         .spawn()
         .expect("spawn vault-wired quota-module");
     let _module = ModuleProcess::new(child);
@@ -1190,45 +1110,25 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
 
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
     let route = route_open(&mut consumer, 10).await;
-    // DERIVED FROM THE SCHEDULER, NOT CHOSEN. This test drives the REAL registry,
-    // so the second of codex's two handles is not fetched until codex's second
-    // round: the refresher selects round-robin ACROSS providers under a
-    // concurrency cap, so one round costs roughly (providers / cap) slot fetches,
-    // each bounded by the fetch deadline.
-    //
-    // With 37 registered providers and a cap of 8, two rounds is on the order of a
-    // minute on a host whose providers are configured and therefore actually make
-    // network calls. The old 20s bound was written when fewer lanes had
-    // credentials, and it held for exactly as long as that stayed true.
-    //
-    // MEASURED before changing it, so this is a corrected bound rather than a
-    // raised one: at 20s the poll saw 23 of 37 providers and one of two codex
-    // accounts -- a sweep still in progress, not a stuck one. At 90s the same test
-    // passes in 101s with both accounts and their distinct percentages.
-    //
-    // CI is unaffected in either direction: with no credentials every lane fails
-    // fast, a full sweep takes seconds, and this bound is never approached. It
-    // only binds on a populated host, which is where it was failing.
+    // The real refresher reaches the two handles in separate provider rounds.
     let deadline = Instant::now() + Duration::from_secs(150);
     let mut corr = 11;
     let initial = loop {
         let response = usage_get(&mut consumer, route, corr).await;
         let result = response["result"].as_array().cloned().unwrap_or_default();
-        let mut codex_accounts = result
+        let mut codex = result
             .iter()
             .filter(|entry| entry["provider"] == "codex")
-            .filter_map(|entry| entry["account"].as_str())
             .collect::<Vec<_>>();
-        codex_accounts.sort_unstable();
-        if codex_accounts == ["account-primary", "account-second"] {
-            let used_percent = |account: &str| {
-                result
-                    .iter()
-                    .find(|entry| entry["provider"] == "codex" && entry["account"] == account)
-                    .and_then(|entry| entry["usage"]["primary"]["usedPercent"].as_f64())
-            };
-            assert_eq!(used_percent("account-primary"), Some(21.0));
-            assert_eq!(used_percent("account-second"), Some(62.0));
+        codex.sort_by_key(|entry| entry["account"].as_str());
+        if codex
+            .iter()
+            .filter_map(|entry| entry["account"].as_str())
+            .eq(["account-primary", "account-second"])
+        {
+            assert!(codex
+                .iter()
+                .all(|entry| entry["errorClass"] == "upstream_failed"));
             break result;
         }
         assert!(
@@ -1256,33 +1156,19 @@ async fn i8_vault_stub_two_accounts_fail_closed_without_handle_reap() {
             .iter()
             .filter(|entry| entry["provider"] == "codex")
             .collect::<Vec<_>>();
-        // Fail-closed is about the second account's USAGE, not about its silence.
-        // The labeled row must be gone and must not be stale-served; a single
-        // UNLABELED verdict in its place is correct and is now asserted, because
-        // dropping that too publishes the "not fetched yet" shape for a credential
-        // the module reached and could not resolve (insula#8).
-        let labeled_primary = codex
-            .iter()
-            .filter(|entry| entry["account"] == "account-primary")
-            .collect::<Vec<_>>();
-        let unlabeled_verdict = codex
-            .iter()
-            .filter(|entry| entry["account"].is_null() && !entry["error"].is_null())
-            .count();
-        let failed_closed = labeled_primary.len() == 1
-            && labeled_primary[0]["error"].is_null()
-            && labeled_primary[0]["usage"]["primary"]["usedPercent"] == 21.0
-            && unlabeled_verdict == 1
-            && !result
+        // A disconnected vault no longer verifies either label. Keep a
+        // failure verdict rather than silently removing every Codex row.
+        if !codex.is_empty()
+            && codex
                 .iter()
-                .any(|entry| entry["provider"] == "codex" && entry["account"] == "account-second");
-        if failed_closed {
-            assert!(
-                result
-                    .iter()
-                    .any(|entry| entry["provider"] == unaffected_provider),
-                "non-codex provider disappeared after the vault was killed: {result:?}"
-            );
+                .all(|entry| entry["account"].is_null() && !entry["error"].is_null())
+            && codex
+                .iter()
+                .any(|entry| entry["errorClass"] != "credential_absent")
+        {
+            assert!(result
+                .iter()
+                .any(|entry| entry["provider"] == unaffected_provider));
             break;
         }
         assert!(
