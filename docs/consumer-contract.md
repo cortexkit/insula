@@ -209,12 +209,12 @@ with `ADMISSION=2` (sheddable):
 ```
 
 Notice 1 is queued immediately, with no `provider` or `account`: read
-`usage.get` now. Later notices name one changed `(provider, account)` entry
-from the same per-refresher-turn change detector as `quota_sampled` (section
-13). They omit `account` when the entry has none, and carry no quota data or
-account metadata. An unchanged turn emits nothing. Account metadata alone
-does not change a sample. These are invalidations, not account-deletion
-events; all completeness and absence rules for `usage.get` still apply.
+`usage.get` now. Later notices name one changed or removed `(provider, account)`
+entry. They omit `account` when the entry has none, and carry no quota data or
+account metadata. An unchanged turn emits nothing, and account metadata alone
+does not trigger a notice. Removals do not enqueue a `quota_sampled` body
+(section 13). These are invalidations, not account-deletion events; all
+completeness and absence rules for `usage.get` still apply.
 
 `seq` starts at 1 **per watch**, not per account. `epoch` is the same opaque
 process-lifetime epoch returned by `usage.drops`, not the frame's route-binding
@@ -420,7 +420,7 @@ Reply: `{"result":{"accepted":1,"ignored":[]}}`. Ignored rows carry `reason` and
 | `future_reading` | value time is more than 60 seconds ahead of insula's clock |
 | `older_than_held` | value time is older than or equal to the held reading |
 | `no_usable_window` | no usable reading matches a window held by the poll |
-| `window_regressed` | use falls by more than 1 point with reset unchanged to the minute, or with no reset stated (a reply without a reset keeps the poll's reset time) |
+| `window_regressed` | reset moves earlier, same-period usage is more than 1 point below the poll, or usage falls in a period only replies have measured |
 | `early_new_period` | reset moved later and use fell before the held reset passed at the reading's own time |
 | `vouch_mismatch` | missing/wrong Claustrum vouch, or any vouch from another writer |
 
@@ -442,9 +442,14 @@ Non-default families never override default windows. Credits, promo, allowed,
 limit_reached, code-review limits and additional model limits are ignored.
 
 Readings only refresh windows the poll holds; they never add or remove inventory.
-**Codex matches by window length**, not primary/secondary position. A later reset
-can lower use only after the held reset has passed at `observedAtMs`; same-period
-falls greater than 1 point refuse the whole row. Applied readings advance
+**Codex matches by window length**, not primary/secondary position. A reset
+earlier than the held reset refuses the whole row. A later reset can establish
+a new period once it is at least 60 seconds later and the held reset has
+passed at `observedAtMs`. A reply without a reset keeps the held reset time.
+Within the same period, the 1-point rounding allowance is measured from the
+poll, not the previous reply. A reply that establishes a new period or supplies
+the first reset for an undated window retires the poll's rounding allowance
+for that window. Decreases then wait for another poll. Applied readings advance
 `fetchedAt` and clear stale-serving, preserving source, account metadata,
 errorClass, completeness, model scope, breakdowns, tertiary/extra windows, saved resets,
 spend pools and vault-auth reporting. They reuse poll drop accounting, quota
@@ -717,6 +722,9 @@ Notes on single rows:
 - `upstream_failed` and `local_source_unavailable` are rare on a degraded entry,
   because both are transient: seeing either means the slot never had a healthy
   window to fall back on.
+- For DeepSeek's local OpenCode auth-store fallback, a missing API key is
+  `credential_absent`; a store read or decode fault retains the store's error
+  class (`local_source_unavailable` or `credential_unusable`).
 - `internal_error` means the provider may be healthy and this module failed
   reading it. It is *sometimes* because a panic on one response clears on the
   next fetch, while a deterministic bug repeats until fixed here; nothing on the
@@ -898,6 +906,9 @@ alone does not name a period: Codex's `limit_window_seconds` leaves
 string; this producer emits only the five values above. A calendar month has no
 fixed length, so a monthly window carries `windowKind: "monthly"` and no
 `windowMinutes`.
+
+MiniMax keeps a reported window even if it has no usable absolute end time.
+It does not infer `resetsAt` from the size of a remaining-time countdown.
 
 `usedCount` and `totalCount` are whole numbers; the wire type is `f64` for
 range only. `usedCount` is published only where the upstream reports a count,
@@ -1533,6 +1544,11 @@ and beside any `credits` pool:
 <a id="jetbrains-the-purchased-top-up-as-the-topupquota-pool"></a>
 
 ### 7.10 `jetbrains`: the purchased top-up as the `topUpQuota` pool
+
+`fetchedAt` is the quota XML's modification time or the selected log record's
+timestamp, not poll time or the log file's modification time. An older reading
+can still be served; consumers decide how much age to tolerate. When XML is
+unreadable, only a newer quota record from the same IDE may replace it.
 
 JetBrains splits AI quota into a tariff that refills at `nextRefill` and a
 purchased top-up that does not renew and is drawn only after the tariff is
@@ -2819,9 +2835,12 @@ match. Capture tools take the URL from this table:
   deposit is supported, with no domain aliases. This port is fixture-verified
   against CodexBar v0.83.0 only; no live OpenDesign account is available.
 - **OpenCode Zen (`opencode`)**: shares the `cookie:opencode.ai[:<account>]`
-  deposit with Go, but publishes a different plan. Healthy legacy workspaces
-  keep their subscription windows and make no console calls. After a migrated
-  workspace redirects, the console's first workspace/org from `/console/api/orgs`
+  deposit with Go, but publishes a different plan. Both cookie lanes take
+  workspace IDs only from structured `id` fields and require one distinct
+  workspace per list. Multiple distinct IDs produce `decode_failed` with the
+  count rather than choosing an account. Healthy legacy workspaces keep their
+  subscription windows and make no console calls. After a migrated workspace
+  redirects, the sole workspace or organization from `/console/api/orgs`
   scopes `/console/api/billing/status` through `x-org-id`. Only
   `billingMode: "prepaid"` and `mode: "pay-as-you-go"` with a readable string
   `balanceMicroCents` serve a `prepaid_balance` pool: purchased USD,

@@ -248,61 +248,96 @@ fn apply_headers(req: JsonRequest, headers: Vec<Header>) -> JsonRequest {
 }
 
 pub fn parse_workspace_ids(text: &str) -> Vec<String> {
-    let mut ids = scan_wrk_ids(text);
-    if ids.is_empty() {
-        if let Ok(v) = serde_json::from_str::<Value>(text) {
-            collect_workspace_ids(&v, &mut ids);
-        }
+    let mut ids = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        collect_workspace_ids(&value, &mut ids);
+    } else {
+        collect_serialized_workspace_ids(text, &mut ids);
     }
     ids.sort();
     ids.dedup();
     ids
 }
 
-/// Scan a raw response for `wrk_...` identifiers.
-///
-/// The cursor walks one BYTE at a time, so every comparison and slice here must
-/// be byte-based: a workspace name is user-chosen, so the response can carry any
-/// UTF-8, and slicing the `&str` at a cursor that has landed inside a multibyte
-/// scalar panics. The matched id itself is always ASCII (`wrk_` plus alphanumerics
-/// and underscores), so it is safe to build from bytes.
-fn scan_wrk_ids(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let needle = b"wrk_";
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i + needle.len() < bytes.len() {
-        if bytes[i..].starts_with(needle) {
-            let start = i;
-            i += needle.len();
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            // ASCII by construction, so this is a lossless conversion.
-            let id = String::from_utf8_lossy(&bytes[start..i]).into_owned();
-            if id.len() > 4 && !out.contains(&id) {
-                out.push(id);
-            }
+fn is_legacy_workspace_id(id: &str) -> bool {
+    id.strip_prefix("wrk_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
+/// The legacy workspace response can serialize object fields with unquoted keys. Read an
+/// `id` property in that form too, but skip whole quoted tokens so a user-chosen
+/// name cannot supply a workspace id or imitate a property.
+fn collect_serialized_workspace_ids(mut text: &str, out: &mut Vec<String>) {
+    let mut at_field = true;
+    while let Some(first) = text.trim_start().chars().next() {
+        text = text.trim_start();
+        let (token, rest) = if matches!(first, '"' | '\'' | '`') {
+            let Some(parts) = quoted_token(text) else {
+                break;
+            };
+            parts
         } else {
-            i += 1;
+            let word_len = text
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+                .count();
+            text.split_at(word_len.max(first.len_utf8()))
+        };
+        if at_field && matches!(token, "id" | r#""id""# | "'id'") {
+            if let Some(value) = rest.trim_start().strip_prefix(':') {
+                if let Some((literal, after)) = quoted_token(value.trim_start()) {
+                    let id = &literal[1..literal.len() - 1];
+                    if is_legacy_workspace_id(id)
+                        && (after.trim_start().is_empty()
+                            || after.trim_start().starts_with([',', '}']))
+                    {
+                        out.push(id.to_owned());
+                    }
+                }
+            }
+        }
+        at_field = matches!(token, "{" | ",");
+        text = rest;
+    }
+}
+
+fn quoted_token(text: &str) -> Option<(&str, &str)> {
+    let quote = text
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let mut escaped = false;
+    for (offset, c) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if c == quote {
+            return Some(text.split_at(offset + 1));
+        } else if c == '\\' {
+            escaped = true;
         }
     }
-    out
+    None
 }
 
 fn collect_workspace_ids(value: &Value, out: &mut Vec<String>) {
     match value {
-        Value::String(s) if s.starts_with("wrk_") && s.len() > 4 => {
-            if !out.contains(s) {
-                out.push(s.clone());
-            }
-        }
         Value::Array(a) => {
             for v in a {
                 collect_workspace_ids(v, out);
             }
         }
         Value::Object(m) => {
+            if let Some(id) = m
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| is_legacy_workspace_id(id))
+            {
+                out.push(id.to_owned());
+            }
             for v in m.values() {
                 collect_workspace_ids(v, out);
             }
@@ -311,15 +346,54 @@ fn collect_workspace_ids(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum WorkspaceLookupError {
+    Fetch(FetchError),
+    Ambiguous { source: &'static str, count: usize },
+}
+
+impl From<FetchError> for WorkspaceLookupError {
+    fn from(error: FetchError) -> Self {
+        Self::Fetch(error)
+    }
+}
+
+impl From<WorkspaceLookupError> for FetchError {
+    fn from(error: WorkspaceLookupError) -> Self {
+        match error {
+            WorkspaceLookupError::Fetch(error) => error,
+            WorkspaceLookupError::Ambiguous { source, count } => Self::Decode(format!(
+                "{source}: ambiguous workspace selection ({count} workspaces)"
+            )),
+        }
+    }
+}
+
+pub(crate) fn select_workspace_id(
+    mut ids: Vec<String>,
+    source: &'static str,
+    missing: &str,
+) -> Result<String, WorkspaceLookupError> {
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.len() {
+        0 => Err(FetchError::Decode(missing.to_owned()).into()),
+        1 => Ok(ids.pop().unwrap()),
+        count => Err(WorkspaceLookupError::Ambiguous { source, count }),
+    }
+}
+
 pub async fn fetch_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
 ) -> Result<String, FetchError> {
-    fetch_workspace_id_at(client, cookie, SERVER_BASE, Some(ORIGIN)).await
+    fetch_workspace_id_at(client, cookie, SERVER_BASE, Some(ORIGIN))
+        .await
+        .map_err(FetchError::from)
 }
 
 /// Ask the OpenCode console whether it accepts this cookie, answering with the
-/// first workspace id it lists.
+/// only distinct workspace id it lists.
 ///
 /// The same console call the provider makes before it publishes a signed-out
 /// verdict for the workspaces stage, exposed so a diagnostic asks the real
@@ -329,7 +403,9 @@ pub async fn fetch_console_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
 ) -> Result<String, FetchError> {
-    crate::opencodego::fetch_console_workspace_id(client, cookie, ORIGIN).await
+    crate::opencodego::fetch_console_workspace_id(client, cookie, ORIGIN)
+        .await
+        .map_err(FetchError::from)
 }
 
 /// [`fetch_workspace_id`] against an explicit server base, so both providers
@@ -344,10 +420,10 @@ pub(crate) async fn fetch_workspace_id_at(
     cookie: &str,
     server_base: &str,
     console_origin: Option<&str>,
-) -> Result<String, FetchError> {
+) -> Result<String, WorkspaceLookupError> {
     match fetch_workspace_at(client, cookie, server_base, console_origin).await? {
         Workspace::Legacy(id) => Ok(id),
-        Workspace::Console { no_balance, .. } => Err(no_balance),
+        Workspace::Console { no_balance, .. } => Err(no_balance.into()),
     }
 }
 
@@ -361,7 +437,7 @@ async fn fetch_workspace_at(
     cookie: &str,
     server_base: &str,
     console_origin: Option<&str>,
-) -> Result<Workspace, FetchError> {
+) -> Result<Workspace, WorkspaceLookupError> {
     let get_url = server_get_url_at(server_base, WORKSPACES_SERVER_ID, None);
     let text = server_get(
         client,
@@ -382,7 +458,8 @@ async fn fetch_workspace_at(
     if is_explicit_null(&text) {
         return Err(FetchError::NoQuotaReported(
             "opencode: this account has no workspace".to_string(),
-        ));
+        )
+        .into());
     }
     let mut ids = parse_workspace_ids(&text);
     if ids.is_empty() {
@@ -401,16 +478,17 @@ async fn fetch_workspace_at(
         if is_explicit_null(&fallback) {
             return Err(FetchError::NoQuotaReported(
                 "opencode: this account has no workspace".to_string(),
-            ));
+            )
+            .into());
         }
         ids = parse_workspace_ids(&fallback);
     }
-    ids.into_iter()
-        .next()
-        .map(Workspace::Legacy)
-        .ok_or_else(|| {
-            FetchError::Decode("opencode: missing workspace id in _server response".to_string())
-        })
+    select_workspace_id(
+        ids,
+        "opencode legacy",
+        "opencode: missing workspace id in _server response",
+    )
+    .map(Workspace::Legacy)
 }
 
 /// Resolve a sign-in redirect without discarding an accepted console workspace.
@@ -427,6 +505,8 @@ async fn fetch_workspace_at(
 ///   `Decode` diagnosis if billing supplies no balance. `Decode` is not counted
 ///   as a stale login.
 /// - it answers 401: the session really is expired; the original verdict.
+/// - it lists several distinct workspaces: the session is valid, but there is
+///   no safe workspace to read.
 /// - anything else (transport error, 5xx, unreadable body, empty list): we
 ///   cannot tell, so the original verdict stands. This check must never make a
 ///   genuinely expired session read as something else.
@@ -435,7 +515,7 @@ async fn signed_out_workspace(
     cookie: &str,
     console_origin: Option<&str>,
     stage: &str,
-) -> Result<Workspace, FetchError> {
+) -> Result<Workspace, WorkspaceLookupError> {
     let original = FetchError::Unauthorized(format!("opencode session expired ({stage})"));
     let moved = || {
         FetchError::Decode(format!(
@@ -445,17 +525,15 @@ async fn signed_out_workspace(
         ))
     };
     let Some(origin) = console_origin else {
-        return Err(original);
+        return Err(original.into());
     };
     match crate::opencodego::fetch_console_workspace_id(client, cookie, origin).await {
         Ok(id) => Ok(Workspace::Console {
             id,
             no_balance: moved(),
         }),
-        // The console rejected the cookie too: a real expiry.
-        Err(FetchError::Unauthorized(_)) => Err(original),
-        // The console could not answer, so it says nothing about the session.
-        Err(_) => Err(original),
+        Err(error @ WorkspaceLookupError::Ambiguous { .. }) => Err(error),
+        Err(WorkspaceLookupError::Fetch(_)) => Err(original.into()),
     }
 }
 
@@ -1259,7 +1337,9 @@ mod stage_tests {
     async fn drive(call: Call, base: &str) -> Result<String, FetchError> {
         let client = reqwest::Client::new();
         match call {
-            Call::Workspaces => fetch_workspace_id_at(&client, "auth=test", base, None).await,
+            Call::Workspaces => fetch_workspace_id_at(&client, "auth=test", base, None)
+                .await
+                .map_err(FetchError::from),
             Call::Subscription => {
                 fetch_subscription_text_at(&client, "auth=test", "wrk_TEST", base).await
             }
@@ -1299,23 +1379,23 @@ mod stage_tests {
     }
 
     #[tokio::test]
-    #[ignore = "external audit finding 14: legacy selection guesses among workspaces, fix pending"]
     async fn external_audit_finding_14_legacy_workspace_selection_rejects_ambiguity() {
         let body = br#"[{"id":"wrk_Z"},{"id":"wrk_A"}]"#.to_vec();
         let (base, server) = crate::loopback::serve_once(200, body).await;
         let client = reqwest::Client::new();
-        let result =
-            fetch_workspace_id_at(&client, "auth=test", &format!("{base}/_server"), None).await;
+        let error = fetch_workspace_id_at(&client, "auth=test", &format!("{base}/_server"), None)
+            .await
+            .map_err(FetchError::from)
+            .unwrap_err();
         let _ = server.await;
 
         assert!(
-            result.is_err(),
-            "multiple workspaces are ambiguous, not permission to choose one: {result:?}"
+            matches!(&error, FetchError::Decode(message) if message.contains("ambiguous") && message.contains("2 workspaces")),
+            "{error:?}"
         );
     }
 
     #[tokio::test]
-    #[ignore = "external audit finding 14: raw scanning accepts ID-shaped display text, fix pending"]
     async fn external_audit_finding_14_legacy_workspace_ids_ignore_display_text() {
         let body = br#"[{"id":"wrk_Z_REAL","name":"wrk_A_DISPLAY"}]"#.to_vec();
         let (base, server) = crate::loopback::serve_once(200, body).await;
@@ -1636,19 +1716,19 @@ mod tests {
 
     #[test]
     fn parse_workspace_ids_from_serialized() {
-        let text = r#"id:"wrk_abc123xyz",name:"Main""#;
-        let ids = parse_workspace_ids(text);
-        assert_eq!(ids, vec!["wrk_abc123xyz"]);
+        for text in [
+            r#"id:"wrk_abc123xyz",name:"Main""#,
+            r#"[{name:"fake, id:\"wrk_DISPLAY\"", id : "wrk_abc123xyz"}, {"id":"wrk_abc123xyz"}]"#,
+        ] {
+            assert_eq!(parse_workspace_ids(text), vec!["wrk_abc123xyz"]);
+        }
+        assert!(parse_workspace_ids(r#"{name:'Café, id:"wrk_DISPLAY"'}"#).is_empty());
+        assert!(parse_workspace_ids(r#"["wrk_DISPLAY", {"name":"wrk_OTHER"}]"#).is_empty());
     }
 
     #[test]
     fn parse_workspace_ids_handles_multibyte_names() {
-        // A workspace name is user-chosen, so the response can contain any
-        // UTF-8. Scanning must use byte comparisons, because slicing a &str at
-        // an arbitrary byte offset panics if the offset lands inside a multibyte
-        // character. The refresher contains such a panic rather than crashing,
-        // but records it as a permanent provider failure, which discards the
-        // usage figures cached from the last successful fetch.
+        // Workspace names are user-chosen and can contain any UTF-8.
         let text = "{\"name\":\"Café 中文 😀\",\"id\":\"wrk_abc123xyz\"}";
         let ids = parse_workspace_ids(text);
         assert_eq!(ids, vec!["wrk_abc123xyz"]);
@@ -1830,6 +1910,23 @@ mod console_check_tests {
         (error, seen)
     }
 
+    #[tokio::test]
+    async fn migrated_zen_refuses_ambiguous_workspaces_without_reading_billing() {
+        let (error, seen) = signed_out_workspaces_with_console(
+            200,
+            r#"[{"id":"org_TEST123"},{"id":"wrk_TEST456"}]"#,
+        )
+        .await;
+        assert!(
+            matches!(&error, FetchError::Decode(message) if message.contains("ambiguous") && message.contains("2 workspaces")),
+            "{error:?}"
+        );
+        assert!(seen.iter().any(|path| path == CONSOLE_WORKSPACES_PATH));
+        assert!(!seen
+            .iter()
+            .any(|path| path == "/console/api/billing/status"));
+    }
+
     /// A migrated account on a valid session, as observed live on 2026-09-23.
     ///
     /// The legacy call reads as signed out, the console lists a workspace on the
@@ -1904,7 +2001,7 @@ mod console_check_tests {
                     // `console organization IDs preserve workspace scope`.
                     (
                         200,
-                        r#"[{"id":"org_TEST123"},{"id":"wrk_TEST456"}]"#.to_string(),
+                        r#"[{"id":"org_TEST123"},{"id":"org_TEST123"}]"#.to_string(),
                     )
                 }
                 "/console/api/billing/status" => {

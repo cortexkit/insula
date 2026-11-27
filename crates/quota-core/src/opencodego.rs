@@ -64,9 +64,9 @@ use crate::{
     model::{ProviderUsage, RateWindow, Usage},
     opencode::{
         fetch_workspace_id_at, looks_signed_out, parse_date_value, parse_windows,
-        CONSOLE_SESSION_COOKIE_NAMES, LEGACY_SESSION_COOKIE_NAMES, MONTHLY_WINDOW_MINUTES,
-        PERCENT_KEYS, RESET_AT_KEYS, RESET_IN_KEYS, ROLLING_WINDOW_MINUTES, USER_AGENT,
-        WEEKLY_WINDOW_MINUTES,
+        select_workspace_id, WorkspaceLookupError, CONSOLE_SESSION_COOKIE_NAMES,
+        LEGACY_SESSION_COOKIE_NAMES, MONTHLY_WINDOW_MINUTES, PERCENT_KEYS, RESET_AT_KEYS,
+        RESET_IN_KEYS, ROLLING_WINDOW_MINUTES, USER_AGENT, WEEKLY_WINDOW_MINUTES,
     },
     provider::{CredentialHandle, FetchAttempt, FetchError, HandlesError, UsageProvider},
     vault_handles::{handle_id_names_family, VaultHandleLoader},
@@ -239,17 +239,16 @@ pub(crate) async fn fetch_console_workspace_id(
     client: &reqwest::Client,
     cookie: &str,
     origin: &str,
-) -> Result<String, FetchError> {
+) -> Result<String, WorkspaceLookupError> {
     let url = format!("{origin}{CONSOLE_WORKSPACES_PATH}");
     let text = fetch_console_text(client, cookie, &url, None)
         .await
         .map_err(|error| error.stage("console workspace list"))?;
-    parse_console_workspace_ids(&text)
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            FetchError::Decode("opencodego: no workspace id in the console orgs list".to_string())
-        })
+    select_workspace_id(
+        parse_console_workspace_ids(&text),
+        "opencode console",
+        "opencodego: no workspace id in the console orgs list",
+    )
 }
 
 async fn fetch_console_go_usage(
@@ -658,14 +657,18 @@ async fn fetch_go_usage(
 ) -> Result<Usage, FetchError> {
     let workspace_id = match fetch_console_workspace_id(client, cookie, &endpoints.origin).await {
         Ok(id) => id,
-        Err(console_error) => {
+        // A valid console list with several distinct workspaces is not a
+        // failed console read. The legacy lane cannot choose one for it.
+        Err(error @ WorkspaceLookupError::Ambiguous { .. }) => return Err(error.into()),
+        Err(WorkspaceLookupError::Fetch(console_error)) => {
             if !should_try_legacy(&console_error, cookie) {
                 return Err(console_error);
             }
             // No console check inside: the console has just been asked and failed.
             match fetch_workspace_id_at(client, cookie, &endpoints.server_base, None).await {
                 Ok(id) => id,
-                Err(legacy_error) => {
+                Err(error @ WorkspaceLookupError::Ambiguous { .. }) => return Err(error.into()),
+                Err(WorkspaceLookupError::Fetch(legacy_error)) => {
                     return Err(resolve_dual_failure(console_error, legacy_error, cookie));
                 }
             }
@@ -1011,7 +1014,7 @@ impl UsageProvider for OpenCodeGoProvider {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        classify_go_page, fetch_console_workspace_id, is_console_workspace_id, looks_unsubscribed,
+        classify_go_page, fetch_go_usage, is_console_workspace_id, looks_unsubscribed,
         parse_api_usage, parse_console_go_status, parse_console_workspace_ids,
         redirected_off_go_page, Endpoints, OpenCodeGoProvider, API_KEY_FAMILY, API_USAGE_URL,
         CONSOLE_GO_STATUS_PATH, CONSOLE_WORKSPACES_PATH, CONSOLE_WORKSPACE_HEADER,
@@ -1658,17 +1661,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "external audit finding 14: console selection guesses among workspaces, fix pending"]
     async fn external_audit_finding_14_console_workspace_selection_rejects_ambiguity() {
-        let body = br#"[{"id":"wrk_A"},{"id":"wrk_B"}]"#.to_vec();
+        let body = br#"[{"id":"wrk_A"},{"id":"wrk_B"},{"id":"wrk_A"}]"#.to_vec();
         let (origin, server) = crate::loopback::serve_once(200, body).await;
         let client = crate::http::provider_client();
-        let result = fetch_console_workspace_id(&client, "auth=test", &origin).await;
-        let _ = server.await;
-
+        let endpoints = Endpoints {
+            server_base: format!("{origin}/_server"),
+            origin,
+            ..Endpoints::production()
+        };
+        let error = fetch_go_usage(&client, "auth=test", &endpoints)
+            .await
+            .unwrap_err();
+        assert!(server.await.unwrap().contains(CONSOLE_WORKSPACES_PATH));
         assert!(
-            result.is_err(),
-            "multiple console workspaces are ambiguous, not permission to choose one: {result:?}"
+            matches!(&error, FetchError::Decode(message) if message.contains("ambiguous") && message.contains("2 workspaces")),
+            "{error:?}"
         );
     }
 

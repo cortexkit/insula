@@ -196,17 +196,19 @@ impl DeepSeekProvider {
     /// Both are checked because a host may have either: the environment is the
     /// documented way to configure this provider, and the auth store is where a
     /// user who signed in through another tool already has the same key.
-    fn api_key() -> Option<String> {
+    fn api_key() -> Result<Option<String>, FetchError> {
         if let Some(key) = env::first_env(ENV_KEYS) {
-            return Some(key);
+            return Ok(Some(key));
         }
-        match crate::opencode_auth::read_provider(OPENCODE_PROVIDER) {
-            Ok(Some(crate::opencode_auth::OpencodeAuth::Api { key })) => Some(key),
-            // An OAuth entry under this name is not this provider's credential:
-            // the balance endpoint takes an API key, and sending an access token
-            // would produce a 401 recorded as a rejected credential.
-            _ => None,
-        }
+        Ok(
+            match crate::opencode_auth::read_provider(OPENCODE_PROVIDER)? {
+                Some(crate::opencode_auth::OpencodeAuth::Api { key }) => Some(key),
+                // An OAuth entry under this name is not this provider's credential:
+                // the balance endpoint takes an API key, and sending an access token
+                // would produce a 401 recorded as a rejected credential.
+                Some(crate::opencode_auth::OpencodeAuth::Oauth { .. }) | None => None,
+            },
+        )
     }
 
     async fn fetch_with_key(&self, key: &str) -> Result<Vec<Pool>, FetchError> {
@@ -308,15 +310,19 @@ impl UsageProvider for DeepSeekProvider {
         if handle.is_vault() {
             return self.fetch_vault(handle).await;
         }
-        let Some(key) = Self::api_key() else {
-            return FetchAttempt::failure(
-                None,
-                None,
-                FetchError::NoSession(
-                    "no DEEPSEEK_API_KEY and no deepseek entry in the opencode auth store"
-                        .to_string(),
-                ),
-            );
+        let key = match Self::api_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return FetchAttempt::failure(
+                    None,
+                    None,
+                    FetchError::NoSession(
+                        "no DEEPSEEK_API_KEY and no deepseek entry in the opencode auth store"
+                            .to_string(),
+                    ),
+                );
+            }
+            Err(error) => return FetchAttempt::failure(None, None, error),
         };
 
         let pools = match self.fetch_with_key(&key).await {
@@ -607,7 +613,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 17: local auth-store failures become missing login, fix pending"]
     fn external_audit_finding_17_auth_store_failure_is_not_missing_login() {
         const CHILD_ENV: &str = "INSULA_DEEPSEEK_AUTH_TEST_CHILD";
         const TEST_NAME: &str =
@@ -647,7 +652,6 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg(TEST_NAME)
             .arg("--exact")
-            .arg("--include-ignored")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
             .env("XDG_DATA_HOME", &data_home)

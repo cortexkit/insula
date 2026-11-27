@@ -11,7 +11,7 @@
 //! and secondary weekly percent windows; the first available non-text model is
 //! tertiary. Explicit remaining percentages win over used/total percentages.
 //! Legacy count windows keep their remaining-count semantics and epoch-derived durations.
-//! `resets_at` comes from the reported end epoch, or the remaining-time offset.
+//! `resets_at` comes from the reported end epoch, not a unitless countdown.
 //! Unlimited percent windows intentionally omit `resets_at` and absolute counts.
 //!
 //! VERIFICATION: fixture-verified (CodexBar-sourced), NOT live-verified — no
@@ -118,8 +118,6 @@ struct ModelRemains {
     start_time: Option<serde_json::Value>,
     #[serde(rename = "end_time")]
     end_time: Option<serde_json::Value>,
-    #[serde(rename = "remains_time")]
-    remains_time: Option<serde_json::Value>,
     #[serde(rename = "current_weekly_total_count")]
     current_weekly_total_count: Option<serde_json::Value>,
     #[serde(rename = "current_weekly_usage_count")]
@@ -136,8 +134,6 @@ struct ModelRemains {
     weekly_start_time: Option<serde_json::Value>,
     #[serde(rename = "weekly_end_time")]
     weekly_end_time: Option<serde_json::Value>,
-    #[serde(rename = "weekly_remains_time")]
-    weekly_remains_time: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,22 +232,11 @@ fn window_minutes(start_raw: Option<i64>, end_raw: Option<i64>) -> Option<i64> {
     }
 }
 
-fn resets_at_iso(end_raw: Option<i64>, remains_raw: Option<i64>, now_secs: i64) -> Option<String> {
-    if let Some(end_secs) = end_raw.and_then(epoch_to_secs) {
-        if end_secs > now_secs {
-            return env::epoch_to_iso8601(end_secs);
-        }
-    }
-    let remains = remains_raw?;
-    if remains <= 0 {
-        return None;
-    }
-    let offset_secs = if remains > 1_000_000 {
-        remains / 1000
-    } else {
-        remains
-    };
-    env::epoch_to_iso8601(now_secs + offset_secs)
+fn resets_at_iso(end_raw: Option<i64>, now_secs: i64) -> Option<String> {
+    let end_secs = end_raw
+        .and_then(epoch_to_secs)
+        .filter(|end| *end > now_secs)?;
+    env::epoch_to_iso8601(end_secs)
 }
 
 fn is_text_quota_model(name: &str) -> bool {
@@ -359,7 +344,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             resets_at: if is_unlimited {
                 None
             } else {
-                resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs)
+                resets_at_iso(opt_int(&m.end_time), now_secs)
             },
             window_minutes: minutes,
             used_count: None,
@@ -375,7 +360,7 @@ fn make_interval_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
     if total <= 0 {
         return None;
     }
-    let resets_at = resets_at_iso(opt_int(&m.end_time), opt_int(&m.remains_time), now_secs);
+    let resets_at = resets_at_iso(opt_int(&m.end_time), now_secs);
     Some(RateWindow {
         window_kind: None,
         used_percent: used_percent(total, remaining),
@@ -432,11 +417,7 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
             window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
             used_percent: remaining_percent_to_used(remaining_percent),
             raw_used_percent: None,
-            resets_at: resets_at_iso(
-                opt_int(&m.weekly_end_time),
-                opt_int(&m.weekly_remains_time),
-                now_secs,
-            ),
+            resets_at: resets_at_iso(opt_int(&m.weekly_end_time), now_secs),
             window_minutes: Some(7 * 24 * 60),
             used_count: None,
             total_count: None,
@@ -451,16 +432,12 @@ fn make_weekly_window(m: &ModelRemains, now_secs: i64) -> Option<RateWindow> {
         return None;
     }
     let remaining = opt_int(&m.current_weekly_usage_count)?;
-    let resets_at = resets_at_iso(
-        opt_int(&m.weekly_end_time),
-        opt_int(&m.weekly_remains_time),
-        now_secs,
-    )?;
+    let resets_at = resets_at_iso(opt_int(&m.weekly_end_time), now_secs);
     Some(RateWindow {
         window_kind: Some(cortexkit_provider_usage::window_kind::WEEKLY.to_string()),
         used_percent: used_percent(total, remaining),
         raw_used_percent: None,
-        resets_at: Some(resets_at),
+        resets_at,
         window_minutes: window_minutes(opt_int(&m.weekly_start_time), opt_int(&m.weekly_end_time)),
         used_count: None,
         total_count: None,
@@ -933,7 +910,7 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 8.0);
         assert_eq!(primary.window_minutes, Some(300));
-        assert_eq!(primary.resets_at, env::epoch_to_iso8601(NOW + 3600));
+        assert_eq!(primary.resets_at, None);
         assert_eq!(primary.used_count, None);
         assert_eq!(primary.total_count, None);
 
@@ -941,24 +918,27 @@ mod tests {
         assert_eq!(secondary.used_percent, 30.0);
         assert_eq!(secondary.window_kind.as_deref(), Some("weekly"));
         assert_eq!(secondary.window_minutes, Some(10_080));
-        assert_eq!(secondary.resets_at, env::epoch_to_iso8601(NOW + 7200));
+        assert_eq!(secondary.resets_at, None);
         assert_eq!(secondary.used_count, None);
         assert_eq!(secondary.total_count, None);
         assert!(usage.tertiary.is_none());
     }
 
     #[test]
-    #[ignore = "external audit finding 16: reset countdown units are guessed from magnitude, fix pending"]
-    fn external_audit_finding_16_short_millisecond_countdown_keeps_its_units() {
+    fn external_audit_finding_16_countdowns_without_absolute_ends_do_not_set_resets() {
         let mut body: serde_json::Value = serde_json::from_slice(PERCENT_SCHEMA).unwrap();
         body["model_remains"][0]["remains_time"] = serde_json::json!(900_000);
         let usage = normalize_usage_at(&serde_json::to_vec(&body).unwrap(), NOW).unwrap();
 
-        assert_eq!(
-            usage.primary.unwrap().resets_at,
-            env::epoch_to_iso8601(NOW + 900),
-            "900000 milliseconds is fifteen minutes, not 900000 seconds"
-        );
+        assert_eq!(usage.primary.unwrap().resets_at, None);
+        assert_eq!(usage.secondary.unwrap().resets_at, None);
+
+        let counts = br#"{"model_remains":[{"model_name":"general",
+            "current_weekly_total_count":100, "current_weekly_usage_count":75,
+            "weekly_end_time":1699999999, "weekly_remains_time":900000}]}"#;
+        let weekly = normalize_usage_at(counts, NOW).unwrap().secondary.unwrap();
+        assert_eq!(weekly.used_percent, 25.0);
+        assert_eq!(weekly.resets_at, None);
     }
 
     #[test]
@@ -1013,10 +993,10 @@ mod tests {
                 "model_name": "MiniMax-M2.7",
                 "current_interval_status": 3,
                 "current_interval_remaining_percent": 50,
-                "remains_time": 3600000,
+                "end_time": NOW + 3600,
                 "current_weekly_status": 3,
                 "current_weekly_remaining_percent": 50,
-                "weekly_remains_time": 7200000
+                "weekly_end_time": NOW + 7200
             });
             let field = if new_interval {
                 "current_interval_used_percent"
@@ -1114,11 +1094,11 @@ mod tests {
         let primary = usage.primary.unwrap();
         assert_eq!(primary.used_percent, 8.0);
         assert_eq!(primary.window_minutes, None);
-        assert_eq!(primary.resets_at, env::epoch_to_iso8601(NOW + 3600));
+        assert_eq!(primary.resets_at, None);
         let secondary = usage.secondary.unwrap();
         assert_eq!(secondary.used_percent, 30.0);
         assert_eq!(secondary.window_minutes, Some(10_080));
-        assert_eq!(secondary.resets_at, env::epoch_to_iso8601(NOW + 7200));
+        assert_eq!(secondary.resets_at, None);
         assert!(usage.tertiary.is_none());
     }
 
