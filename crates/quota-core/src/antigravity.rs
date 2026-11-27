@@ -1,8 +1,7 @@
 //! Antigravity usage — LOCAL PROBE of the running Antigravity editor.
 //!
-//! Unlike the OAuth providers, Antigravity's authoritative paid-tier usage is not a
-//! cloud call: the Antigravity editor (its `language_server`, or the `agy` CLI) runs a
-//! local server on a loopback port. The opencode antigravity-auth plugin publishes
+//! The Antigravity editor (its `language_server`, or the `agy` CLI) serves quota
+//! on a loopback port. The opencode antigravity-auth plugin publishes
 //! remaining fractions, reset times and observation times for that paid quota in
 //! its non-secret sidebar v2 JSON file. We prefer the live server, then a recent
 //! sidebar reading; vault credentials without a known paid tier may use the cloud.
@@ -27,10 +26,10 @@
 //! 127.0.0.1 (validating a loopback self-signed cert is meaningless; the peer is the
 //! user's own machine). Every request URL is guarded to be loopback before sending.
 //!
-//! PAID-TIER AUTHORITY REMAINS DESKTOP-COUPLED: a live editor is authoritative, and
-//! the plugin cache extends that reading for at most one hour. Beyond that, withholding
-//! is safer than replacing the paid pool with the cloud client's different standard
-//! pool. Free-tier accounts use that cloud lane because it is their real pool.
+//! A live editor is authoritative, and the plugin cache extends that reading for
+//! at most one hour. Positive paid-tier evidence keeps the existing local-only
+//! policy. Without that evidence the vault's cloud summary is available; it was
+//! measured reading the editor's pool on the daily host.
 //!
 //! VERIFICATION: LIVE-verified — the real local-probe chain (discover `agy` →
 //! loopback port → POST quota summary → parse) returns real windows on a machine
@@ -82,8 +81,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 ///
 /// This returns merged pools carrying explicit per-cadence windows -- the same
 /// `gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly` bucket ids the local
-/// probe returns, so [`parse_quota_summary`] handles both and the two lanes
-/// cannot describe one account differently.
+/// probe returns, so [`parse_quota_summary`] handles both formats.
 ///
 /// **The host decides which Gemini pool answers.** On 2026-10-20, with one vault
 /// token in one minute, `daily-cloudcode-pa` returned the editor's Gemini pool
@@ -251,8 +249,7 @@ pub struct StoredAccount {
     pub email: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Paid accounts spend a different pool from the cloud credential's standard
-    /// quota; only positive paid-tier metadata justifies withholding cloud usage.
+    /// Positive paid-tier metadata opts the account into the local-only policy.
     #[serde(default)]
     pub tier: Option<SidebarTier>,
     #[serde(default)]
@@ -307,7 +304,7 @@ fn stored_account_for_email<'a>(
         .find(|account| emails_match(email, account.email.as_deref()))
 }
 
-/// Only positive paid-tier metadata withholds the cloud's standard-tier pool.
+/// Only positive paid-tier metadata withholds a cloud reading.
 /// An absent tier is unknown, so a host with no plugin can still use its vault.
 fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
     account
@@ -316,10 +313,10 @@ fn account_holds_paid_tier(account: Option<&StoredAccount>) -> bool {
         .is_some_and(|tier| tier != "free-tier")
 }
 
-/// Withhold a paid account's cloud quota because it is a different, standard-tier
-/// pool the user does not spend. An unmatched credential is also withheld when
-/// any paid account is known: it could belong to that account. With no positive
-/// paid-tier evidence, cloud usage remains available for free or unknown tiers.
+/// Keep the existing local-only policy for a known paid account. An unmatched
+/// credential is also withheld when any paid account is known: it could belong
+/// to that account. Without positive paid-tier evidence, cloud usage remains
+/// available for free or unknown tiers.
 ///
 /// The wrong pool came from the opencode plugin's own OAuth token (measured
 /// 2026-09-08: 7.15% from the cloud against the editor's 58.41%). With the
@@ -347,9 +344,8 @@ fn cloud_lane_must_withhold(
 ///
 /// Deliberately `LocalSourceUnavailable` rather than a degraded entry: it is
 /// classified transient, so the last correct reading keeps serving while the
-/// editor is closed. Publishing the cloud number instead would replace a true
-/// figure with a confident wrong one -- a different pool, not a stale one -- and
-/// a router cannot tell those apart.
+/// editor is closed. The local-only policy and its existing diagnostic are
+/// retained even though the daily summary was measured reading the editor pool.
 fn paid_tier_usage_unavailable() -> FetchError {
     FetchError::LocalSourceUnavailable(
         "this account holds a paid Antigravity tier, but neither a matching local \
@@ -387,10 +383,11 @@ enum SidebarRoster {
 /// Failure means keep the last roster, not remove its accounts. Absence without
 /// installation evidence or a stale snapshot means no plugin roster to enumerate.
 fn read_sidebar(lookup: &EnvLookup, now: DateTime<Utc>) -> Result<SidebarRoster, String> {
+    use crate::local_file::{self, ReadError};
     let path = sidebar_path(lookup)?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let bytes = match local_file::read(&path) {
+        Ok(bytes) => bytes,
+        Err(ReadError::Missing(_)) => {
             let home = env::home_dir_from(|key| lookup(key)).ok_or_else(|| {
                 "home directory unresolved, so plugin evidence can't be checked".to_string()
             })?;
@@ -407,9 +404,17 @@ fn read_sidebar(lookup: &EnvLookup, now: DateTime<Utc>) -> Result<SidebarRoster,
             }
             return Ok(SidebarRoster::Current(Vec::new()));
         }
-        Err(error) => return Err(format!("plugin sidebar state unreadable: {error}")),
+        Err(ReadError::Io(error)) => {
+            return Err(format!("plugin sidebar state unreadable: {error}"))
+        }
+        Err(ReadError::Refused(reason)) => {
+            return Err(format!("plugin sidebar state unreadable: {reason}"))
+        }
     };
-    let file = serde_json::from_str::<SidebarFile>(&text)
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        "plugin sidebar state unreadable: stream did not contain valid UTF-8".to_string()
+    })?;
+    let file = serde_json::from_str::<SidebarFile>(text)
         .map_err(|error| format!("plugin sidebar state did not parse: {error}"))?;
     if file.version.as_u64() != Some(2) {
         return Err(format!(
@@ -1970,7 +1975,7 @@ fn parse_cached_quota(cache: &CachedQuota, now: DateTime<Utc>) -> Option<(Usage,
 }
 
 /// Serve a recent sidebar only for positively identified paid accounts. Free
-/// and unknown tiers keep the vault credential's standard cloud quota path.
+/// and unknown tiers keep the vault cloud quota path.
 fn fresh_paid_cached_quota(
     account: Option<&StoredAccount>,
     now: DateTime<Utc>,
@@ -2616,9 +2621,7 @@ impl AntigravityProvider {
             .unwrap_or_else(|| "vault-unidentified".to_string());
 
         // 1. Probe the local lane first if this vault handle's identity is known.
-        // A local editor outranks the cloud credential because the cloud credential is
-        // entitled to a different tier. If the local session matches this vault handle's
-        // identity, serve local usage.
+        // A matching local editor is authoritative for the signed-in account.
         if let Some(expected_email) = &observed_email {
             // As in the plugin lane: could-not-look falls through to the lanes
             // below, the same as no matching session.
@@ -2645,9 +2648,8 @@ impl AntigravityProvider {
         let accounts = self.stored_accounts().unwrap_or_default();
         let plugin_account = stored_account_for_email(&accounts, observed_email.as_deref());
 
-        // The account-local plugin cache outranks this live network call because
-        // the token below is entitled to the standard tier, while the cache was
-        // read from the pool the signed-in account actually spends.
+        // A recent sidebar observation is the next preferred local reading
+        // for an account with positive paid-tier evidence.
         if let Some((usage, updated_at)) = fresh_paid_cached_quota(plugin_account, Utc::now()) {
             self.note_lane(&lane_key, "plugin-cache");
             return FetchAttempt::success(observed, "vault", usage)
@@ -2655,10 +2657,8 @@ impl AntigravityProvider {
                 .with_account_info(account_info);
         }
 
-        // A paid account's cloud credential reaches a different, standard-tier
-        // pool. The sidebar identifies paid accounts by email; if this credential
-        // has no matching identity while a paid account is known, it could be
-        // that account and must also be withheld. No paid evidence means serve.
+        // Keep the local-only policy when the sidebar identifies a paid account
+        // and the credential matches it or cannot be matched to another account.
         if cloud_lane_must_withhold(&accounts, plugin_account) {
             return FetchAttempt::failure(
                 observed,
@@ -3563,37 +3563,6 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_sidebar_tier_still_reaches_the_vault_cloud() {
         assert_sidebar_tier_reaches_vault_cloud("vault-unknown", None).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "external audit finding 12: unavailable paid-tier evidence permits fresh cloud-pool substitution, fix pending"]
-    async fn external_audit_finding_12_paid_account_without_tier_evidence_withholds_cloud() {
-        let mut account = super::plugin_lane_tests::sidebar_account_json(
-            "paid-unknown@example.test",
-            Utc::now().timestamp_millis(),
-        );
-        account.as_object_mut().unwrap().remove("tier");
-        let (sidebar, _home) = super::plugin_lane_tests::sidebar_fixture(
-            "vault-paid-unknown",
-            serde_json::json!([account]),
-        );
-        let mut mock = cloud_preflight_mock(200, b"{}".to_vec()).await;
-        mock.provider.override_store = None;
-        mock.provider.env_lookup = sidebar.env_lookup;
-        let handle = attach_vault(&mut mock.provider, None, Arc::new(AtomicUsize::new(0)));
-        mock.provider.credential_source = Some(Arc::new(PreflightVaultSource {
-            project: None,
-            email: Some("paid-unknown@example.test".to_string()),
-            reports: Arc::new(AtomicUsize::new(0)),
-        }));
-
-        let attempt = mock.provider.fetch_handle(&handle).await;
-
-        assert!(
-            matches!(attempt.usage, Err(FetchError::LocalSourceUnavailable(_))),
-            "a paid account without tier evidence must not publish a different cloud pool as fresh"
-        );
-        assert_eq!(mock.quota_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -4815,11 +4784,9 @@ mod plugin_lane_tests {
     /// An unidentifiable credential beside a known paid account must withhold.
     ///
     /// THE DEFECT THIS PINS, found on live data rather than by reading: the tier
-    /// lookup is by email, and `emails_match(None, _)` is false, so any fetch where
-    /// the vault supplied no identity found no row and answered "not paid". The
-    /// cloud then published the STANDARD-tier pool for an account that does not
-    /// spend it -- the exact wrong-pool reading the guard exists to prevent,
-    /// arriving through the one door it did not cover.
+    /// lookup is by email, so a vault record with no identity found no row and
+    /// bypassed the local-only policy. The cloud path in use at the time could
+    /// return a different pool from the editor.
     ///
     /// It is intermittent, which is what made it expensive: it fires only on the
     /// fetches that resolve no identity, so the published percent alternates
@@ -4839,20 +4806,20 @@ mod plugin_lane_tests {
         // The matched paid account: withheld, as before.
         assert!(
             cloud_lane_must_withhold(&[paid.clone(), free.clone()], Some(&paid)),
-            "a matched paid account must not be served the standard pool"
+            "a matched paid account must not take the cloud path"
         );
 
         // No row matched, but a paid account is known. This credential could
-        // belong to that account, so publishing its standard pool is unsafe.
+        // belong to that account, so keep its local-only policy.
         assert!(
             cloud_lane_must_withhold(&[paid.clone(), free.clone()], None),
             "an unidentifiable credential beside a known paid account must withhold"
         );
 
-        // Silent: the matched account is free, so the cloud reports its real pool.
+        // Silent: a matched free account is eligible for the cloud path.
         assert!(
             !cloud_lane_must_withhold(&[paid.clone(), free.clone()], Some(&free)),
-            "a free-tier account's real pool IS the cloud's, so serving it is correct"
+            "a matched free account can take the cloud path"
         );
 
         // Silent, and load-bearing: no paid account is known anywhere, so there is
@@ -5384,21 +5351,23 @@ mod plugin_lane_tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 7: sidebar reads have no file-type or size limit, fix pending"]
     fn external_audit_finding_7_oversized_sidebar_is_refused() {
         let (provider, _home) = sidebar_fixture("oversized", serde_json::json!([]));
         let path = sidebar_path(&provider.env_lookup).unwrap();
-        let padding = "x".repeat(2 * 1024 * 1024);
+        let padding = "x".repeat(4 * 1024 * 1024);
         std::fs::write(
             path,
             format!("{{\"version\":2,\"accounts\":[],\"padding\":\"{padding}\"}}"),
         )
         .unwrap();
 
-        let result = provider.stored_accounts();
+        let error = provider
+            .stored_accounts()
+            .expect_err("an oversized sidebar must be refused");
+        assert!(error.contains("local file limit"), "{error}");
         assert!(
-            result.is_err(),
-            "an oversized sidebar must be refused: {result:?}"
+            provider.handles().is_err(),
+            "a refusal is not an empty roster"
         );
     }
 

@@ -342,10 +342,16 @@ fn go_token(token: Option<String>) -> Result<String, FetchError> {
 }
 
 fn read_go_legacy_at(path: &std::path::Path) -> Result<Option<String>, FetchError> {
-    let data = match std::fs::read(path) {
+    use crate::local_file::{self, ReadError};
+    let data = match local_file::read(path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
+        Err(ReadError::Missing(_)) => return Ok(None),
+        Err(ReadError::Refused(reason)) => {
+            return Err(FetchError::LocalSourceUnavailable(format!(
+                "cannot read OpenCode auth.json: {reason}"
+            )))
+        }
+        Err(ReadError::Io(_)) => {
             return Err(FetchError::LocalSourceUnavailable(
                 "cannot read OpenCode auth.json".into(),
             ))
@@ -407,12 +413,18 @@ fn read_json_provider_at(
     path: &std::path::Path,
     provider: &str,
 ) -> Result<Option<OpencodeAuth>, FetchError> {
-    let data = match std::fs::read(path) {
+    use crate::local_file::{self, ReadError};
+    let data = match local_file::read(path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(ReadError::Missing(_)) => return Ok(None),
+        Err(ReadError::Refused(reason)) => {
+            return Err(FetchError::LocalSourceUnavailable(format!(
+                "reading the opencode auth store: {reason}"
+            )))
+        }
         // The path is deliberately not interpolated: this error string reaches
         // the wire, and it would carry the operating-system username.
-        Err(e) => {
+        Err(ReadError::Io(e)) => {
             return Err(FetchError::CredentialUnusable(format!(
                 "reading the opencode auth store: {e}"
             )))
@@ -855,17 +867,14 @@ mod tests {
         let missing = dir.join("no-such-auth.json");
         assert!(matches!(read_provider_at(&missing, "anthropic"), Ok(None)));
 
-        // Present and unreadable. A directory where the file belongs, rather
-        // than a permission bit, because a mode of 000 does not stop root -- so
-        // on a root run a permission fixture would quietly exercise the absent
-        // case while appearing to exercise this one.
+        // A directory where the file belongs is an unavailable local source.
         let occupied = dir.join("occupied.json");
         std::fs::create_dir_all(&occupied).unwrap();
         let error = read_provider_at(&occupied, "anthropic")
             .expect_err("an unreadable auth store must not report as absent");
         assert!(
-            matches!(error, FetchError::CredentialUnusable(_)),
-            "expected CredentialUnusable, got {error:?}"
+            matches!(error, FetchError::LocalSourceUnavailable(_)),
+            "expected LocalSourceUnavailable, got {error:?}"
         );
 
         // Unparseable contents are equally a host to fix, not a host with
@@ -887,11 +896,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 7: JSON credential reads have no size limit, fix pending"]
     fn external_audit_finding_7_oversized_json_credential_reads_are_refused() {
         let dir = fixture("oversized-json");
         let path = dir.path().join("auth.json");
-        let padding = "x".repeat(2 * 1024 * 1024);
+        let padding = "x".repeat(4 * 1024 * 1024);
         let json = format!(
             "{{\"deepseek\":{{\"type\":\"api\",\"key\":\"synthetic\"}},\
              \"opencode-go\":{{\"type\":\"api\",\"key\":\"synthetic\"}},\
@@ -902,7 +910,8 @@ mod tests {
         let general = read_json_provider_at(&path, "deepseek");
         let legacy_go = read_go_legacy_at(&path);
         assert!(
-            general.is_err() && legacy_go.is_err(),
+            matches!(general, Err(FetchError::LocalSourceUnavailable(_)))
+                && matches!(legacy_go, Err(FetchError::LocalSourceUnavailable(_))),
             "both readers must refuse the oversized store: general={general:?}; \
              legacy_go={legacy_go:?}"
         );

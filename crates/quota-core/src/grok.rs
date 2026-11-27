@@ -67,6 +67,18 @@ const EPOCH_MAX: u64 = 2_100_000_000;
 
 // ---- minimal protobuf wire scan (schema-less) -------------------------------
 
+// Billing messages are shallow. The HTTP byte cap alone does not bound stack
+// depth or the number of candidate fields and their allocated paths.
+const MAX_MESSAGE_DEPTH: usize = 32;
+const MAX_SCAN_STEPS: usize = 16_384;
+
+fn charge_scan_step(remaining: &mut usize) -> Result<(), FetchError> {
+    *remaining = remaining
+        .checked_sub(1)
+        .ok_or_else(|| FetchError::Decode("grok: gRPC-web scan budget exceeded".to_string()))?;
+    Ok(())
+}
+
 /// A scalar field discovered by the scan, tagged with its nested field-number path.
 struct Fixed32Field {
     path: Vec<u64>,
@@ -107,9 +119,21 @@ fn read_varint(bytes: &[u8], i: &mut usize) -> Option<u64> {
 /// Recursively scan one protobuf message, recording varint + fixed32 fields with
 /// their field-number `path`. Length-delimited fields are tried as sub-messages
 /// (the scan simply yields nothing for genuine strings/bytes).
-fn scan_message(bytes: &[u8], path: &[u64], scan: &mut Scan) {
+fn scan_message(
+    bytes: &[u8],
+    path: &[u64],
+    scan: &mut Scan,
+    remaining: &mut usize,
+) -> Result<(), FetchError> {
+    if path.len() > MAX_MESSAGE_DEPTH {
+        return Err(FetchError::Decode(
+            "grok: protobuf nesting limit exceeded".to_string(),
+        ));
+    }
     let mut i = 0;
     while i < bytes.len() {
+        // Charge even skipped or malformed keys: they still take work to scan.
+        charge_scan_step(remaining)?;
         let field_start = i;
         let Some(key) = read_varint(bytes, &mut i) else {
             break;
@@ -183,12 +207,13 @@ fn scan_message(bytes: &[u8], path: &[u64], scan: &mut Scan) {
                 if end > bytes.len() {
                     break;
                 }
-                scan_message(&bytes[i..end], &field_path, scan);
+                scan_message(&bytes[i..end], &field_path, scan, remaining)?;
                 i = end;
             }
             _ => break,
         }
     }
+    Ok(())
 }
 
 /// gRPC-web frame flags this decoder accepts: an uncompressed data frame and an
@@ -209,11 +234,17 @@ const FRAME_FLAG_TRAILER: u8 = 0x80;
 /// upstream `grpcWebDataFrames` in
 /// `Sources/CodexBarCore/Providers/Grok/GrokWebBillingFetcher.swift` (v0.69.0,
 /// `b9ea0da7b`).
-fn grpc_web_frames(data: &[u8]) -> Result<(Vec<Vec<u8>>, String), FetchError> {
+fn grpc_web_frames<'a>(
+    data: &'a [u8],
+    remaining: &mut usize,
+) -> Result<(Vec<&'a [u8]>, String), FetchError> {
     let mut data_frames = Vec::new();
     let mut trailer = String::new();
     let mut i = 0;
     while i + 5 <= data.len() {
+        // Empty frames do not incur protobuf field work, but still take space
+        // in the list of frames and time to visit.
+        charge_scan_step(remaining)?;
         let flags = data[i];
         if flags != FRAME_FLAG_DATA && flags != FRAME_FLAG_TRAILER {
             return Err(FetchError::Decode(format!(
@@ -230,7 +261,7 @@ fn grpc_web_frames(data: &[u8]) -> Result<(Vec<Vec<u8>>, String), FetchError> {
             break;
         }
         if flags == FRAME_FLAG_DATA {
-            data_frames.push(data[start..end].to_vec());
+            data_frames.push(&data[start..end]);
         } else {
             trailer.push_str(&String::from_utf8_lossy(&data[start..end]));
         }
@@ -253,7 +284,8 @@ fn grpc_status(trailer: &str) -> Option<i64> {
 /// Decode a gRPC-web protobuf billing response to [`Usage`]. Pure — unit-testable
 /// against captured real wire bytes.
 pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
-    let (frames, trailer) = grpc_web_frames(body)?;
+    let mut remaining = MAX_SCAN_STEPS;
+    let (frames, trailer) = grpc_web_frames(body, &mut remaining)?;
     if let Some(status) = grpc_status(&trailer) {
         if status != 0 {
             return Err(FetchError::Upstream(format!("grok grpc-status {status}")));
@@ -273,8 +305,8 @@ pub fn normalize_usage(body: &[u8]) -> Result<Usage, FetchError> {
     }
 
     let mut scan = Scan::default();
-    for frame in &frames {
-        scan_message(frame, &[], &mut scan);
+    for frame in frames {
+        scan_message(frame, &[], &mut scan, &mut remaining)?;
     }
 
     // Percent: shallowest fixed32 whose path ends in field 1 and sits in 0..=100
@@ -1117,7 +1149,8 @@ mod tests {
         // would be read from, so a rejection below is the window's doing and
         // not a fixture that never carried a candidate.
         let mut scan = Scan::default();
-        scan_message(&implausible[5..], &[], &mut scan);
+        let mut remaining = MAX_SCAN_STEPS;
+        scan_message(&implausible[5..], &[], &mut scan, &mut remaining).unwrap();
         assert_eq!(
             scan.varints.iter().filter(|v| v.path == [1, 5, 1]).count(),
             1,
@@ -1201,7 +1234,8 @@ mod tests {
         // Prove the fixture actually carries the percent, so this cannot pass by
         // failing to parse anything at all.
         let mut scan = Scan::default();
-        scan_message(&payload, &[], &mut scan);
+        let mut remaining = MAX_SCAN_STEPS;
+        scan_message(&payload, &[], &mut scan, &mut remaining).unwrap();
         assert_eq!(
             scan.fixed32.len(),
             1,
@@ -1260,7 +1294,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 6: recursive protobuf scan has no depth limit, fix pending"]
     fn external_audit_finding_6_excessive_protobuf_nesting_is_rejected() {
         fn response_with_nested_unknown_field(depth: usize) -> Vec<u8> {
             let valid = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MIN + 1);
@@ -1292,6 +1325,25 @@ mod tests {
             ),
             "an over-deep response must be rejected instead of recursing without a bound"
         );
+    }
+
+    #[test]
+    fn scan_budget_counts_skipped_keys_across_data_frames() {
+        let mut response = frame_with_percent_and_varint_at_reset_path(50.0, EPOCH_MIN + 1);
+        // Zero keys are skipped. Each frame fits the budget on its own, but
+        // together they exceed it even though they add no quota candidates.
+        let padding_len = MAX_SCAN_STEPS / 2;
+        let mut padding = vec![FRAME_FLAG_DATA];
+        padding.extend_from_slice(&(padding_len as u32).to_be_bytes());
+        padding.resize(5 + padding_len, 0);
+
+        response.extend_from_slice(&padding);
+        assert!(normalize_usage(&response).is_ok());
+        response.extend_from_slice(&padding);
+        assert!(matches!(
+            normalize_usage(&response),
+            Err(FetchError::Decode(_))
+        ));
     }
 
     /// The whole point of the re-attribution: an expired credential must reach a

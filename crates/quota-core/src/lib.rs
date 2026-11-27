@@ -47,6 +47,7 @@ pub mod kimi_for_coding;
 pub mod langdock;
 pub mod litellm;
 pub mod llmproxy;
+mod local_file;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod loopback;
 pub mod manus;

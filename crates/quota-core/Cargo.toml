@@ -33,7 +33,7 @@ futures-util = { workspace = true }
 base64 = "0.22"
 serde_ignored = "0.1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

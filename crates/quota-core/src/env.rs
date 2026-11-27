@@ -103,17 +103,16 @@ pub fn read_credential_file(
     path: &std::path::Path,
     description: &str,
 ) -> Result<Vec<u8>, crate::provider::FetchError> {
-    std::fs::read(path).map_err(|error| {
-        let message = format!("reading {description}: {error}");
-        // A missing file means nobody configured this provider here, which is a
-        // permanent and correct state. Any other read failure -- no permission,
-        // a directory where a file belongs, an I/O error -- means the file is
-        // there and we cannot use it, which someone can act on. Reporting both
-        // as absent files the second under "nothing to fix", where nobody looks.
-        if error.kind() == std::io::ErrorKind::NotFound {
-            crate::provider::FetchError::NoSession(message)
-        } else {
-            crate::provider::FetchError::CredentialUnusable(message)
+    use crate::{local_file::ReadError, provider::FetchError};
+    crate::local_file::read(path).map_err(|error| match error {
+        ReadError::Missing(error) => {
+            FetchError::NoSession(format!("reading {description}: {error}"))
+        }
+        ReadError::Io(error) => {
+            FetchError::CredentialUnusable(format!("reading {description}: {error}"))
+        }
+        ReadError::Refused(reason) => {
+            FetchError::LocalSourceUnavailable(format!("reading {description}: {reason}"))
         }
     })
 }
@@ -177,15 +176,19 @@ mod tests {
             .expect_err("a missing file must fail");
         assert_eq!(absent.error_class(), "credential_absent");
 
-        // A directory where a file belongs: present on disk, unreadable as a
-        // file. Any non-NotFound I/O error would do; this one is portable.
-        let unusable = read_credential_file(&dir, "test creds")
+        let refused = read_credential_file(&dir, "test creds")
             .expect_err("reading a directory as a file must fail");
+        assert_eq!(refused.error_class(), "local_source_unavailable");
+
+        // An embedded NUL yields an ordinary I/O error on Unix and Windows.
+        let unusable = read_credential_file(&dir.join("invalid\0name.json"), "test creds")
+            .expect_err("invalid path must fail");
         assert_eq!(unusable.error_class(), "credential_unusable");
 
         // Not vacuous: both still describe the failure, so this cannot pass by
         // returning an empty or identical message.
         assert!(absent.to_string().contains("test creds"));
+        assert!(refused.to_string().contains("test creds"));
         assert!(unusable.to_string().contains("test creds"));
 
         std::fs::remove_dir_all(&dir).ok();
