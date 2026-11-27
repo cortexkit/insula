@@ -8,11 +8,9 @@
 //! A reload changes behaviour with no restart: the Codex provider reads
 //! `codex.auto_use_resets` from the handle on every tick, so once the reloader
 //! has applied an edit that sets it to 0, no later tick redeems, and once it
-//! applies one that sets it back, later ticks may. That setting spends real
-//! credit, so the reloader only ever fails toward the value already in force:
-//! a file it cannot read or parse leaves the last good config in place, and
-//! only a file that is truly gone falls back to the defaults (resets
-//! disarmed).
+//! applies one that sets it back, later ticks may. A file the reloader cannot
+//! read or parse suspends automatic resets, which spend real credit. Other
+//! settings keep their last good values. A missing file applies all defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -97,7 +95,7 @@ pub struct LiveConfigStatus {
     /// built in code, or a file that could not be used at startup.
     pub loaded_at: Option<DateTime<Utc>>,
     /// Why the latest look at the file could not be used, while that is still
-    /// so. `config` is then the last good config, not what the file says.
+    /// so. `config` is then the last good config with automatic resets disabled.
     pub last_error: Option<String>,
 }
 
@@ -171,9 +169,11 @@ impl LiveQuotaConfig {
         std::mem::replace(&mut status.config, config)
     }
 
-    /// Record that the file could not be used, leaving the config in force.
+    /// An unreadable file cannot authorize spending. Keep unrelated settings.
     fn record_error(&self, reason: &str) {
-        self.write().last_error = Some(reason.to_string());
+        let mut status = self.write();
+        status.config.codex.auto_use_resets = 0;
+        status.last_error = Some(reason.to_string());
     }
 }
 
@@ -234,21 +234,16 @@ enum FileRead {
 /// again only when its bytes changed. Each change of
 /// state produces exactly one log line, returned from [`Self::check`].
 ///
-/// THE FAILURE DIRECTION IS THE POINT. `codex.auto_use_resets` spends real
-/// credit, so the reloader never moves the config on the strength of a file it
-/// could not read: an unreadable or unparseable file keeps the last good
-/// config, armed or not. Only a file that is gone applies the defaults, because
-/// a missing config is the documented "no overrides" state and the default
-/// disarms resets.
+/// A failure disables automatic spending without resetting unrelated settings.
+/// A missing file is the documented "no overrides" state and applies all defaults.
 pub struct ConfigReloader {
     path: PathBuf,
     parse: ConfigParser,
     live: LiveQuotaConfig,
     /// The file as last examined. `None` before the first check.
     seen: Option<FileStamp>,
-    /// The failure last logged, so a file that stays broken is reported once
-    /// rather than on every check, and a different failure is reported again.
-    reported_failure: Option<String>,
+    /// Whether an ongoing failure has been logged, until the file recovers.
+    reported_failure: bool,
 }
 
 impl ConfigReloader {
@@ -258,7 +253,7 @@ impl ConfigReloader {
             parse,
             live,
             seen: None,
-            reported_failure: None,
+            reported_failure: false,
         }
     }
 
@@ -304,7 +299,7 @@ impl ConfigReloader {
     fn adopt(&mut self, config: QuotaConfig, first: bool, missing: bool) -> Option<String> {
         let next = config.codex.clone();
         let previous = self.live.apply(config, Utc::now()).codex;
-        let recovered = self.reported_failure.take().is_some();
+        let recovered = std::mem::take(&mut self.reported_failure);
         let path = self.path.display();
         let value = format!(
             "codex.auto_use_resets {}s ({})",
@@ -322,7 +317,7 @@ impl ConfigReloader {
                  arm one host per account"
             ));
         }
-        if previous != next {
+        if previous != next && !recovered {
             let removed = if missing {
                 format!(" ({path} removed; defaults apply)")
             } else {
@@ -340,9 +335,7 @@ impl ConfigReloader {
                 "{LOG_TAG} config {path} removed; defaults already in force: {value}"
             ))
         } else if recovered {
-            Some(format!(
-                "{LOG_TAG} config {path} readable again; unchanged: {value}"
-            ))
+            Some(format!("{LOG_TAG} config {path} readable again: {value}"))
         } else {
             None
         }
@@ -350,10 +343,9 @@ impl ConfigReloader {
 
     fn keep_last_good(&mut self, reason: String, first: bool) -> Option<String> {
         self.live.record_error(&reason);
-        if self.reported_failure.as_deref() == Some(reason.as_str()) {
+        if self.reported_failure {
             return None;
         }
-        let kept = self.live.codex();
         // At the first check nothing was ever loaded, so what is kept is the
         // defaults the handle started with.
         let what = if first {
@@ -362,13 +354,11 @@ impl ConfigReloader {
             "last good config"
         };
         let line = format!(
-            "{LOG_TAG} warning: config {} unreadable or malformed ({reason}); keeping {what}: \
-             codex.auto_use_resets {}s ({})",
-            self.path.display(),
-            kept.auto_use_resets,
-            armed_word(&kept)
+            "{LOG_TAG} warning: config {} unreadable or malformed ({reason}); keeping other \
+             settings from {what}; codex.auto_use_resets 0s (disarmed)",
+            self.path.display()
         );
-        self.reported_failure = Some(reason);
+        self.reported_failure = true;
         Some(line)
     }
 }
@@ -475,17 +465,14 @@ mod tests {
         (reloader, parses)
     }
 
-    /// A broken edit leaves the armed value in force and is reported once.
-    ///
-    /// Falling back to the defaults here would disarm a host whose operator
-    /// saved a typo, and the reverse failure -- adopting whatever a broken file
-    /// seems to say -- could arm one. Keeping the last good config is the only
-    /// direction that cannot spend credit nobody configured.
+    /// A broken edit suspends automatic spending but preserves unrelated settings.
     #[test]
-    fn an_unparseable_edit_keeps_the_previous_value_and_logs_once() {
+    fn an_unparseable_edit_disarms_resets_keeps_other_settings_and_logs_once() {
         let temp = crate::tests::ResetTempDir::with_prefix("ck-quota-config", "unparseable");
         let path = temp.path().join("ck-quota.jsonc");
-        std::fs::write(&path, ARMED_3600).unwrap();
+        let armed_with_muse =
+            r#"{"codex":{"auto_use_resets":3600},"muse":{"team_id":"synthetic-team"}}"#;
+        std::fs::write(&path, armed_with_muse).unwrap();
         let (mut reloader, _) = counting_reloader(&path);
         reloader.check();
         assert_eq!(reloader.live().codex().auto_use_resets, 3600);
@@ -499,13 +486,19 @@ mod tests {
             "the log line must name the file and the reason: {line}"
         );
         assert!(
-            line.contains("keeping last good config: codex.auto_use_resets 3600s (armed)"),
+            line.contains(
+                "keeping other settings from last good config; codex.auto_use_resets 0s (disarmed)"
+            ),
             "the log line must say what stays in force: {line}"
         );
         assert_eq!(
             reloader.live().codex().auto_use_resets,
-            3600,
-            "an unparseable edit must keep the previous value"
+            0,
+            "an unparseable edit must disarm automatic spending"
+        );
+        assert_eq!(
+            reloader.live().muse().team_id.as_deref(),
+            Some("synthetic-team")
         );
         assert!(reloader
             .live()
@@ -518,14 +511,14 @@ mod tests {
             "a file that stays broken is reported once, not on every check"
         );
 
-        std::fs::write(&path, ARMED_3600).unwrap();
+        std::fs::write(&path, armed_with_muse).unwrap();
         let line = reloader.check().expect("recovery must be logged");
         assert!(line.contains("readable again"), "{line}");
+        assert_eq!(reloader.live().codex().auto_use_resets, 3600);
         assert_eq!(reloader.live().status().last_error, None);
     }
 
     #[test]
-    #[ignore = "external audit finding 3: failed reload leaves automatic resets armed, fix pending"]
     fn external_audit_failed_reload_suspends_automatic_resets() {
         let temp = crate::tests::ResetTempDir::with_prefix("ck-quota-config", "reload-failure");
         let path = temp.path().join("ck-quota.jsonc");

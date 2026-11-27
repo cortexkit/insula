@@ -447,6 +447,7 @@ pub fn normalize_consume_response(body: &[u8]) -> Result<ConsumeOutcome, FetchEr
 pub enum JournalStatus {
     Pending,
     Resolved,
+    Abandoned,
 }
 
 /// Durable record for one logical redemption.
@@ -473,9 +474,26 @@ pub struct RedemptionRecord {
     /// keeps its bytes and an older module reads it as before.
     #[serde(default = "codex_provider", skip_serializing_if = "is_codex_provider")]
     pub provider: String,
+    /// Needed only while a Claude POST may have landed without a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_grant_id: Option<ClaudeGrantId>,
+    /// Later presses that resumed this request instead of starting a spend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reply_request_ids: Vec<String>,
 }
 
 const CODEX_PROVIDER: &str = "codex";
+const CLAUDE_PROVIDER: &str = crate::anthropic::PROVIDER_NAME;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClaudeGrantId(String);
+
+impl std::fmt::Debug for ClaudeGrantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
 
 fn codex_provider() -> String {
     CODEX_PROVIDER.to_string()
@@ -496,13 +514,30 @@ impl RedemptionRecord {
     fn is_for(&self, provider: &str, account_id: &str) -> bool {
         self.provider == provider && self.account_id == account_id
     }
+
+    fn answers(&self, request_id: &str) -> bool {
+        self.redeem_request_id == request_id
+            || self.reply_request_ids.iter().any(|id| id == request_id)
+    }
+
+    fn outcome(&self) -> Result<(ConsumeOutcome, DateTime<Utc>), JournalError> {
+        Ok((
+            self.outcome
+                .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?,
+            parse_record_resolved_time(self)?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualReservation {
-    Pending,
+    Pending {
+        request_id: String,
+        grant: Option<ClaudeGrantId>,
+    },
     Resolved(ConsumeOutcome, DateTime<Utc>),
     RecentlyReset(DateTime<Utc>),
+    NothingToReset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,13 +870,8 @@ impl RedemptionJournal {
         // the server just said nothing needed resetting, so an account that
         // becomes genuinely walled inside the next half hour waits at most that
         // long. The cost of the tidy version is unbounded.
-        let spend_bound_allows = !records.iter().any(|record| {
-            record.is_for(CODEX_PROVIDER, account_id)
-                && record.status == JournalStatus::Resolved
-                && parse_record_latest_time(record).is_ok_and(|latest| {
-                    now.signed_duration_since(latest).num_seconds() < SPEND_BOUND_SECS
-                })
-        });
+        let spend_bound_allows =
+            recent_resolved_at(&records, CODEX_PROVIDER, account_id, now)?.is_none();
         // The cross-account fence. Any record counts, pending or resolved and
         // whatever its outcome, for the reason the spend bound above is
         // outcome-blind; and a record dated in the future counts too, so a
@@ -868,19 +898,19 @@ impl RedemptionJournal {
         })
     }
 
-    /// Reserve a request id durably before network mutation. Existing pending ids
-    /// are always reused; a fresh id is never minted alongside one.
+    /// Reserve a request id durably before network mutation. An existing pending
+    /// id can only be reused after the account's spend bound permits a POST.
     pub fn reserve(
         &self,
         account_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, JournalError> {
         let state = self.inspect_account(account_id, now)?;
-        if let Some(id) = state.pending_id {
-            return Ok(Reservation::ExistingPending(id));
-        }
         if !state.spend_bound_allows {
             return Ok(Reservation::SpendBound);
+        }
+        if let Some(id) = state.pending_id {
+            return Ok(Reservation::ExistingPending(id));
         }
 
         let mut records = self.load()?;
@@ -926,6 +956,8 @@ impl RedemptionJournal {
             resolved_at: None,
             manual: false,
             provider: codex_provider(),
+            claude_grant_id: None,
+            reply_request_ids: Vec::new(),
         });
         self.save(&records)?;
         eprintln!(
@@ -956,38 +988,94 @@ impl RedemptionJournal {
         request_id: &str,
         now: DateTime<Utc>,
     ) -> Result<ManualReservation, JournalError> {
+        self.reserve_manual_with_grant(provider, account_id, request_id, now, None)
+    }
+
+    pub(crate) fn reserve_manual_with_grant(
+        &self,
+        provider: &str,
+        account_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+        grant: Option<&str>,
+    ) -> Result<ManualReservation, JournalError> {
         let mut records = self.load()?;
-        if let Some(record) = records.iter_mut().find(|record| {
-            record.is_for(provider, account_id) && record.redeem_request_id == request_id
-        }) {
-            let reservation = match record.status {
-                JournalStatus::Pending => ManualReservation::Pending,
-                JournalStatus::Resolved => ManualReservation::Resolved(
-                    record
-                        .outcome
-                        .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?,
-                    parse_record_resolved_time(record)?,
-                ),
-            };
-            // A phone can resume an automatic pending redemption too. Preserve
-            // its result for subsequent phone retries instead of pruning it.
+        loop {
+            let matching = records.iter().position(|record| {
+                record.is_for(provider, account_id) && record.answers(request_id)
+            });
+            if let Some(index) = matching {
+                let record = &mut records[index];
+                if record.status == JournalStatus::Resolved {
+                    let (outcome, at) = record.outcome()?;
+                    if !record.manual {
+                        record.manual = true;
+                        self.save(&records)?;
+                    }
+                    return Ok(ManualReservation::Resolved(outcome, at));
+                }
+                if record.status == JournalStatus::Abandoned {
+                    return Err(JournalError::new(
+                        "the original Claude grant is unavailable",
+                    ));
+                }
+            }
+            if let Some(at) = recent_resolved_at(&records, provider, account_id, now)? {
+                return Ok(ManualReservation::RecentlyReset(at));
+            }
+            let pending = matching.or_else(|| {
+                records.iter().position(|record| {
+                    record.is_for(provider, account_id) && record.status == JournalStatus::Pending
+                })
+            });
+            let Some(index) = pending else { break };
+            let record = &mut records[index];
+            let at = parse_record_latest_time(record)?;
+            let recent = inside_spend_bound(at, now);
+            if provider == CLAUDE_PROVIDER && record.claude_grant_id.is_none() {
+                // An older journal cannot tell which grant was on the POST. Do
+                // not attach the id to a different grant, even after the bound.
+                if recent {
+                    return Err(JournalError::new(
+                        "the original Claude grant is unavailable",
+                    ));
+                }
+                record.status = JournalStatus::Abandoned;
+                let old_id = record.redeem_request_id.clone();
+                self.save(&records)?;
+                eprintln!("{LOG_TAG} {provider} reset journal abandoned account_id={account_id} redeem_request_id={old_id}: original grant unavailable");
+                if matching.is_some() {
+                    return Err(JournalError::new(
+                        "the original Claude grant is unavailable",
+                    ));
+                }
+                continue;
+            }
+            if matching.is_none() && recent {
+                return Ok(ManualReservation::RecentlyReset(at));
+            }
+            // A fresh press can finish an older pending request, but it never
+            // sends a second provider id. Persist the link before the POST so
+            // either client id can replay the first answer after a restart.
+            if matching.is_none() {
+                record.reply_request_ids.push(request_id.to_owned());
+            }
             record.manual = true;
+            let reservation = ManualReservation::Pending {
+                request_id: record.redeem_request_id.clone(),
+                grant: record.claude_grant_id.clone(),
+            };
             self.save(&records)?;
             return Ok(reservation);
         }
-        let mut latest = None;
-        for record in records
-            .iter()
-            .filter(|record| record.is_for(provider, account_id))
-        {
-            let at = parse_record_latest_time(record)?;
-            if now.signed_duration_since(at).num_seconds() < SPEND_BOUND_SECS {
-                latest = Some(latest.map_or(at, |last: DateTime<Utc>| last.max(at)));
-            }
-        }
-        if let Some(at) = latest {
-            return Ok(ManualReservation::RecentlyReset(at));
-        }
+        let claude_grant_id = if provider == CLAUDE_PROVIDER {
+            let Some(grant) = grant else {
+                return Ok(ManualReservation::NothingToReset);
+            };
+            Some(ClaudeGrantId(grant.to_owned()))
+        } else {
+            None
+        };
         records.push(RedemptionRecord {
             account_id: account_id.to_owned(),
             redeem_request_id: request_id.to_owned(),
@@ -999,9 +1087,14 @@ impl RedemptionJournal {
             resolved_at: None,
             manual: true,
             provider: provider.to_owned(),
+            claude_grant_id: claude_grant_id.clone(),
+            reply_request_ids: Vec::new(),
         });
         self.save(&records)?;
-        Ok(ManualReservation::Pending)
+        Ok(ManualReservation::Pending {
+            request_id: request_id.to_owned(),
+            grant: claude_grant_id,
+        })
     }
 
     /// Persist attempt metadata immediately before sending a consume POST.
@@ -1023,6 +1116,11 @@ impl RedemptionJournal {
         attempted_at: DateTime<Utc>,
     ) -> Result<(), JournalError> {
         let mut records = self.load()?;
+        if recent_resolved_at(&records, provider, account_id, attempted_at)?.is_some() {
+            return Err(JournalError::new(
+                "account is inside the saved-reset spend bound",
+            ));
+        }
         let record = records
             .iter_mut()
             .find(|record| {
@@ -1078,6 +1176,7 @@ impl RedemptionJournal {
             })?;
         record.status = JournalStatus::Resolved;
         record.outcome = Some(outcome);
+        record.claude_grant_id = None;
         let resolved_at = Utc::now();
         #[cfg(any(test, feature = "test-hooks"))]
         let resolved_at = self.resolution_time.unwrap_or(resolved_at);
@@ -1106,6 +1205,11 @@ impl RedemptionJournal {
         })?;
         for record in &records {
             parse_record_latest_time(record)?;
+            if record.provider != CLAUDE_PROVIDER && record.claude_grant_id.is_some() {
+                return Err(JournalError::new(
+                    "Claude grant stored for a different provider",
+                ));
+            }
         }
         Ok(records)
     }
@@ -1210,6 +1314,28 @@ fn parse_record_resolved_time(record: &RedemptionRecord) -> Result<DateTime<Utc>
         .as_deref()
         .ok_or_else(|| JournalError::new("resolved redemption has no last_attempt_at"))?;
     parse_record_timestamp(record, "last_attempt_at", value)
+}
+
+fn inside_spend_bound(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(at).num_seconds() < SPEND_BOUND_SECS
+}
+
+fn recent_resolved_at(
+    records: &[RedemptionRecord],
+    provider: &str,
+    account_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, JournalError> {
+    let mut latest = None;
+    for record in records.iter().filter(|record| {
+        record.is_for(provider, account_id) && record.status == JournalStatus::Resolved
+    }) {
+        let at = parse_record_latest_time(record)?;
+        if inside_spend_bound(at, now) {
+            latest = Some(latest.map_or(at, |previous: DateTime<Utc>| previous.max(at)));
+        }
+    }
+    Ok(latest)
 }
 
 fn prune_records(
@@ -2139,27 +2265,38 @@ impl ResetCoordinator {
         request_id: &str,
     ) -> Result<Option<(ConsumeOutcome, DateTime<Utc>)>, JournalError> {
         let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
-        let outcome = self
-            .journal
-            .records()?
-            .iter()
-            .find(|record| {
-                record.is_for(provider, account_id)
-                    && record.redeem_request_id == request_id
-                    && record.status == JournalStatus::Resolved
-            })
-            .map(|record| {
-                let outcome = record
-                    .outcome
-                    .ok_or_else(|| JournalError::new("resolved redemption has no outcome"))?;
-                Ok((outcome, parse_record_resolved_time(record)?))
-            })
-            .transpose()?;
-        if outcome.is_some() {
-            self.journal
-                .reserve_manual_for(provider, account_id, request_id, Utc::now())?;
+        let mut records = self.journal.records()?;
+        let Some(record) = records
+            .iter_mut()
+            .find(|record| record.is_for(provider, account_id) && record.answers(request_id))
+        else {
+            return Ok(None);
+        };
+        match record.status {
+            JournalStatus::Resolved => {
+                let outcome = record.outcome()?;
+                if !record.manual {
+                    record.manual = true;
+                    self.journal.save(&records)?;
+                }
+                Ok(Some(outcome))
+            }
+            JournalStatus::Pending => Ok(None),
+            JournalStatus::Abandoned => Err(JournalError::new(
+                "the original Claude grant is unavailable",
+            )),
         }
-        Ok(outcome)
+    }
+
+    pub(crate) fn has_pending_saved_reset_for(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<bool, JournalError> {
+        let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(self.journal.records()?.iter().any(|record| {
+            record.is_for(provider, account_id) && record.status == JournalStatus::Pending
+        }))
     }
 
     /// The journal lock is shared with automatic ticks, including when automatic
@@ -2178,12 +2315,19 @@ impl ResetCoordinator {
             account_id,
             request_id,
             now,
-            move || async move {
-                match tokio::time::timeout(timeout, transport.consume_manual(request, request_id))
-                    .await
+            None,
+            move |provider_request_id, _| async move {
+                match tokio::time::timeout(
+                    timeout,
+                    transport.consume_manual(request, &provider_request_id),
+                )
+                .await
                 {
                     Ok(Ok(body)) => normalize_consume_response(&body).map_err(|_| {
-                        SavedResetError::ProviderRefused(crate::http::refusal_excerpt(&body))
+                        SavedResetError::ProviderRefused(crate::http::scrubbed_refusal_excerpt(
+                            &body,
+                            [request.bearer.as_str()],
+                        ))
                     }),
                     Ok(Err(error)) => {
                         request.report_auth_failure(&error);
@@ -2210,21 +2354,21 @@ impl ResetCoordinator {
     /// `post`, fenced by the journal whatever the provider.
     ///
     /// A request id already resolved replays its stored outcome without running
-    /// `post`. A new id for an account with any record inside the 30-minute
-    /// spend bound is refused. Otherwise the id is written as pending, with the
-    /// attempt recorded, before `post` runs, so a reply lost in transit leaves a
-    /// pending record that a retry of the same id resumes. Only a decided
-    /// outcome resolves the record; an error leaves it pending.
+    /// `post`. An older pending request is resumed under its original id and
+    /// grant, not replaced. Reservations inside the spend bound can refuse a
+    /// new id, and recent resolutions can refuse even a pending retry. The
+    /// attempt is recorded before `post`; an error leaves it pending.
     pub async fn manual_redeem<F, Fut>(
         &self,
         provider: &str,
         account_id: &str,
         request_id: &str,
         now: DateTime<Utc>,
+        grant: Option<&str>,
         post: F,
     ) -> SavedResetResult
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(String, Option<String>) -> Fut,
         Fut: std::future::Future<Output = Result<ConsumeOutcome, SavedResetError>>,
     {
         let unavailable =
@@ -2232,16 +2376,16 @@ impl ResetCoordinator {
         let reserved = {
             let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
             self.journal
-                .reserve_manual_for(provider, account_id, request_id, now)
+                .reserve_manual_with_grant(provider, account_id, request_id, now, grant)
                 .and_then(|reservation| {
-                    if reservation == ManualReservation::Pending {
+                    if let ManualReservation::Pending { request_id, .. } = &reservation {
                         self.journal
                             .record_attempt_for(provider, account_id, request_id, now)?;
                     }
                     Ok(reservation)
                 })
         };
-        match reserved {
+        let (provider_request_id, provider_grant) = match reserved {
             Ok(ManualReservation::Resolved(outcome, resolved_at)) => {
                 return SavedResetResult {
                     result: Ok((outcome, resolved_at)),
@@ -2251,30 +2395,42 @@ impl ResetCoordinator {
             Ok(ManualReservation::RecentlyReset(at)) => {
                 return SavedResetResult::before_post(SavedResetError::RecentlyReset(at))
             }
+            Ok(ManualReservation::NothingToReset) => {
+                return SavedResetResult {
+                    result: Ok((ConsumeOutcome::NothingToReset, now)),
+                    consume_attempted: false,
+                }
+            }
             Err(error) => return SavedResetResult::before_post(unavailable(error)),
-            Ok(ManualReservation::Pending) => {}
-        }
-        let result = post().await.and_then(|outcome| {
+            Ok(ManualReservation::Pending { request_id, grant }) => (request_id, grant),
+        };
+        let result = post(
+            provider_request_id.clone(),
+            provider_grant.map(|grant| grant.0),
+        )
+        .await
+        .and_then(|outcome| {
             let _guard = self.journal_io.lock().unwrap_or_else(|p| p.into_inner());
             // Concurrent retries use the same upstream id. The first resolution
             // wins locally too, so a late already_redeemed cannot replace reset.
-            match self
-                .journal
-                .reserve_manual_for(provider, account_id, request_id, now)
-                .map_err(unavailable)?
+            if let Some(record) =
+                self.journal
+                    .records()
+                    .map_err(unavailable)?
+                    .iter()
+                    .find(|record| {
+                        record.is_for(provider, account_id)
+                            && record.redeem_request_id == provider_request_id
+                            && record.status == JournalStatus::Resolved
+                    })
             {
-                ManualReservation::Resolved(stored, resolved_at) => Ok((stored, resolved_at)),
-                ManualReservation::Pending => {
-                    let resolved_at = self
-                        .journal
-                        .resolve_for(provider, account_id, request_id, outcome)
-                        .map_err(unavailable)?;
-                    Ok((outcome, resolved_at))
-                }
-                ManualReservation::RecentlyReset(_) => {
-                    unreachable!("the reserved id remains in the journal")
-                }
+                return record.outcome().map_err(unavailable);
             }
+            let resolved_at = self
+                .journal
+                .resolve_for(provider, account_id, &provider_request_id, outcome)
+                .map_err(unavailable)?;
+            Ok((outcome, resolved_at))
         });
         SavedResetResult {
             result,
@@ -3201,6 +3357,8 @@ mod tests {
         RedemptionRecord {
             manual: false,
             provider: codex_provider(),
+            claude_grant_id: None,
+            reply_request_ids: Vec::new(),
             account_id: account.to_string(),
             redeem_request_id: request.to_string(),
             created_at: "2026-08-20T12:00:00+00:00".to_string(),

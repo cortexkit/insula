@@ -1062,10 +1062,6 @@ pub struct AnthropicProvider {
     /// Per handle stable id and account, the organization the OAuth profile
     /// named, read when a reset is first spent. Memory only.
     organizations: Mutex<HashMap<(String, String), String>>,
-    /// Per account and request id, the grant a request was sent for, so that a
-    /// retry of the same request id names the same grant even after the next
-    /// poll changed which grant would be chosen. Memory only.
-    sent_grants: Mutex<HashMap<(String, String), String>>,
     reset_organizations_url: String,
     /// The redemption journal shared with Codex, opened on the first spend.
     reset_coordinator:
@@ -1133,7 +1129,6 @@ impl AnthropicProvider {
             subscription: crate::claude_subscription::SubscriptionCache::new(),
             held_grants: Mutex::new(HashMap::new()),
             organizations: Mutex::new(HashMap::new()),
-            sent_grants: Mutex::new(HashMap::new()),
             reset_organizations_url: RESET_ORGANIZATIONS_URL.to_string(),
             reset_coordinator: std::sync::OnceLock::new(),
         }
@@ -1377,25 +1372,9 @@ impl AnthropicProvider {
         }
     }
 
-    /// The id of the grant to spend for `account_id`'s `kind`, from the grants
-    /// its last poll stated, or the grant an earlier send of this request id
-    /// named.
-    fn grant_to_spend(
-        &self,
-        handle_id: &str,
-        account_id: &str,
-        request_id: &str,
-        kind: &str,
-    ) -> Option<String> {
-        let sent = self
-            .sent_grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(account_id.to_string(), request_id.to_string()))
-            .cloned();
-        if sent.is_some() {
-            return sent;
-        }
+    /// Choose a grant for a new spend. The journal instead supplies the grant
+    /// for a retry, even if it no longer appears in this inventory.
+    fn grant_to_spend(&self, handle_id: &str, account_id: &str, kind: &str) -> Option<String> {
         let table = self
             .held_grants
             .lock()
@@ -1450,6 +1429,7 @@ impl AnthropicProvider {
         JsonRequest::post_json(url, crate::claude_resets::redeem_body(grant_id, request_id))
             .timeout(REDEEM_TIMEOUT)
             .bearer(bearer)
+            .redact_in_refusals(grant_id)
             .header(Header::new("anthropic-beta", BETA_HEADER))
             .header(Header::new("User-Agent", cli_user_agent()))
             .send_provider_status_first(&self.http, PROVIDER_NAME)
@@ -1516,14 +1496,23 @@ impl AnthropicProvider {
             }
         }
         let handle_id = handle.stable_id();
-        let Some(grant_id) = self.grant_to_spend(handle_id, account_id, request_id, kind) else {
-            // No journal decision is stored when there is no grant: each call
-            // decides this local outcome afresh.
-            return SavedResetResult {
-                result: Ok((ConsumeOutcome::NothingToReset, chrono::Utc::now())),
-                consume_attempted: false,
-            };
-        };
+        let grant = self.grant_to_spend(handle_id, account_id, kind);
+        if grant.is_none() {
+            match coordinator.has_pending_saved_reset_for(PROVIDER_NAME, account_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return SavedResetResult {
+                        result: Ok((ConsumeOutcome::NothingToReset, chrono::Utc::now())),
+                        consume_attempted: false,
+                    }
+                }
+                Err(error) => {
+                    return SavedResetResult::before_post(SavedResetError::ProviderUnavailable(
+                        error.to_string(),
+                    ))
+                }
+            }
+        }
         let (Some(source), true) = (self.credential_source.as_ref(), handle.is_vault()) else {
             return SavedResetResult::before_post(SavedResetError::UnknownAccount);
         };
@@ -1561,24 +1550,43 @@ impl AnthropicProvider {
                 ))
             }
         };
-        let sent_key = (account_id.to_string(), request_id.to_string());
-        self.sent_grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(sent_key.clone(), grant_id.clone());
-        let (bearer, organization, grant) = (&bearer, &organization, &grant_id);
-        let result = coordinator
+        let (bearer, organization) = (&bearer, &organization);
+        coordinator
             .manual_redeem(
                 PROVIDER_NAME,
                 account_id,
                 request_id,
                 chrono::Utc::now(),
-                move || async move {
+                grant.as_deref(),
+                move |provider_request_id, provider_grant| async move {
+                    let grant = provider_grant.expect("a Claude POST requires a reserved grant");
                     match self
-                        .post_redeem(bearer, organization, grant, request_id)
+                        .post_redeem(bearer, organization, &grant, &provider_request_id)
                         .await
                     {
-                        Ok(body) => crate::claude_resets::map_reply(&body),
+                        Ok(body) => match crate::claude_resets::map_reply(&body) {
+                            Err(SavedResetError::ProviderRefused(_)) => {
+                                Err(SavedResetError::ProviderRefused(
+                                    crate::http::scrubbed_refusal_excerpt(
+                                        &body,
+                                        [bearer.as_str(), grant.as_str()],
+                                    ),
+                                ))
+                            }
+                            Err(SavedResetError::ProviderDeclined { result, reason }) => {
+                                let reason = reason.map(|reason| {
+                                    if reason.contains(grant.as_str())
+                                        || reason.contains(bearer.as_str())
+                                    {
+                                        "unrecognized".to_string()
+                                    } else {
+                                        reason
+                                    }
+                                });
+                                Err(SavedResetError::ProviderDeclined { result, reason })
+                            }
+                            answer => answer,
+                        },
                         Err(error) => {
                             self.report_auth_failure(handle, record_version, &error);
                             Err(crate::claude_resets::map_failure(error))
@@ -1586,16 +1594,7 @@ impl AnthropicProvider {
                     }
                 },
             )
-            .await;
-        // Once nothing was sent, or the outcome is in the journal, a retry of
-        // this request id no longer needs the grant it named.
-        if !result.consume_attempted || result.result.is_ok() {
-            self.sent_grants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&sent_key);
-        }
-        result
+            .await
     }
 
     async fn fetch_local_bearer(&self, handle_id: &str, bearer: &str) -> FetchAttempt {

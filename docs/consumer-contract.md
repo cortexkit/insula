@@ -303,18 +303,25 @@ hyphens (`[A-Za-z0-9-]`), and at most 64 for Claude. Persist it on the phone unt
 the same id after a lost reply**, including after either side restarts. The durable
 journal returns a resolved id's stored outcome without another consume POST; a
 pending id resumes the provider's redemption with that exact request id. Manual
-results remain in the journal beyond automatic record retention. A fresh id is
-refused if this account has any reservation within the 30-minute spend bound,
-regardless of outcome. A retry does not become a new intent when the bound expires.
+results remain in the journal beyond automatic record retention. A recent resolved
+redemption blocks any consuming POST for that account for 30 minutes, regardless
+of outcome, including a retry of another pending id. A fresh id is also refused
+while a pending reservation is inside the bound. If the pending reservation is
+older, the fresh press resumes it under its original provider id rather than
+starting another spend. Both ids then replay the same stored outcome and time.
+A retry does not become a new intent when the bound expires.
 The journal and the bound are kept per provider and account, so a Claude spend
 never blocks a Codex account or the automatic Codex policy.
 
-The operation works even with `codex.auto_use_resets = 0`. Manual intent bypasses
-automation's sibling-headroom policy and provider-wide ten-minute floor, **not**
-the account bound or journal. Its reservation counts toward the automatic path's
-bound and floor. The chosen credential lane is re-resolved and its current Codex
+The operation works even with `codex.auto_use_resets = 0`. Automation can defer
+when another Codex account still has capacity, and it spaces new redemptions
+across Codex accounts by at least ten minutes. Manual intent bypasses those
+automatic rules, **not** the account bound or journal. Its reservation still
+counts toward the automatic rules. The chosen credential lane is re-resolved and its current Codex
 identity checked before spending, so a rotated credential cannot spend for a stale
-row. After a provider attempt, all lanes for that account are made due for refresh;
+row. Vault-backed Codex requests use OpenAI's default endpoint; the Codex CLI's
+`chatgpt_base_url` applies only to its local login. After a provider attempt, all
+lanes for that account are made due for refresh;
 the normal refresher publishes the new row and `usage.watch` invalidation. The
 operation reply does not wait for that refreshed reading.
 
@@ -336,8 +343,14 @@ in canonical RFC 3339 UTC with nanosecond precision and `+00:00`, like
 resolution time; a resolved `request_id` replays the original resolution time,
 not the retry's time. For older journal records without a resolution timestamp,
 `last_attempt_at` is the closest recorded decision time. Claude's local
-`nothing_to_reset` answer when no grant is available is not journaled and is
-decided afresh on each call.
+`nothing_to_reset` answer for a new spend when no grant is available is not
+journaled and is decided afresh on each call. A pending Claude redemption resumes
+with the grant recorded when it was reserved, even when that grant no longer
+appears in the latest inventory. Its outcome comes from the provider's reply.
+An older journal may have a pending Claude request without a recorded grant:
+it cannot be retried and returns `provider_unavailable` without a POST. Once its
+30-minute bound expires it is marked abandoned and no longer blocks a fresh id.
+Retrying that abandoned id still cannot POST or claim a reset outcome.
 
 Persist the send time alongside the request id. A `redeemed_at` earlier than that
 send time identifies a result decided before this request, so show that an earlier
@@ -356,7 +369,7 @@ Error frame body (`code`, `message`, optional `detail`, the `subc_protocol::Erro
 | `unsupported_provider` | provider is not `codex` or `claude` |
 | `unknown_account` | no current slot/credential of that provider matches that row's account |
 | `recently_reset` | a different reservation is inside the 30-minute bound; `detail.last_reset_at` is its RFC 3339 timestamp (latest attempt, or creation if unattempted). For Claude also Anthropic's own `cooldown` answer, with `detail.cooldown_until` when Anthropic gave it |
-| `provider_refused` | the provider refused the redemption or returned an unrecognized outcome; `detail.excerpt` contains its existing bounded excerpt, at most 200 characters. Claude's `ineligible` and `unavailable` answers instead carry `detail.result` and `detail.reason` (Claude's reason code, such as `tier` or `paused`, or `unrecognized`) |
+| `provider_refused` | the provider refused the redemption or returned an unrecognized outcome; `detail.excerpt` contains a scrubbed excerpt of at most 200 characters. Claude's `ineligible` and `unavailable` answers instead carry `detail.result` and `detail.reason` (Claude's reason code, such as `tier` or `paused`, or `unrecognized`) |
 | `provider_unavailable` | timeout, transport failure, 429, 5xx, or unavailable journal/credential/organization; retry the same id |
 
 An unsuccessful provider attempt leaves the record pending rather than guessing
@@ -741,6 +754,9 @@ removal is authorised only by `completeProviders`
 
 **The `error` string is prose with no stability promise**, and its wording has
 changed between releases. Use it for display and logs; branch on `errorClass`.
+HTTP refusal excerpts retain the status and diagnostic words, with credentials
+and token-shaped values removed before publication, including in stale-episode
+health messages.
 
 **Proven by:** `every_wire_error_class_has_a_documented_row` (this table against
 `FetchError::error_class`, both directions), `a_degraded_entry_publishes_its_error_class`,
@@ -1526,7 +1542,8 @@ and beside any `credits` pool:
   published, without `resetsAt`, when the reset is missing or unreadable.
 - Amounts keep at most nine decimal places. The provider renders them from
   floats with up to 14 places of noise, so a longer fraction is cut toward a
-  floor: `remaining` is never overstated.
+  floor: `remaining` is never overstated. A negative amount smaller than one
+  minor unit floors to `minor: -1`, not zero.
 - **No pool means no limit**: the account has none (`individual_limit: null`)
   or sends no `spend_control`. Clear a remembered budget only then.
 - **A limit that is stated but can't be read** (a field missing or not a plain
@@ -2613,7 +2630,7 @@ not happened, never zero.
 | Metric | Type | Meaning |
 |---|---|---|
 | `buildCommit` | string | the commit the running binary was built from |
-| `quotaConfig` | object or `null` | the `ck-quota.jsonc` settings in force now, which the module re-reads while it runs: `codexAutoUseResetsSecs` (number), `codexResetsArmed` (boolean), `loadedAt` (RFC 3339 time the config was last taken from the file or from the file's absence, `null` if never) and `lastError` (the latest stat, read or parse failure seen on the file, `null` once a usable file or the file's absence has been applied; the last good config stays in force meanwhile) |
+| `quotaConfig` | object or `null` | the `ck-quota.jsonc` settings in force now, which the module re-reads while it runs: `codexAutoUseResetsSecs` (number), `codexResetsArmed` (boolean), `loadedAt` (RFC 3339 time the config was last taken from the file or from the file's absence, `null` if never) and `lastError` (the latest stat, read or parse failure seen on the file, `null` once a usable file or the file's absence has been applied). While `lastError` is set, automatic saved resets are disabled and other settings keep their last good values. |
 | `providersTotal` | number | providers registered |
 | `fresh` | number | providers serving a reading inside the freshness horizon |
 | `stale` | number | providers serving a reading preserved through transient failure |

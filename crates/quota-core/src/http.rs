@@ -118,40 +118,8 @@ async fn read_success_body(mut response: reqwest::Response) -> Result<Vec<u8>, F
     Ok(body)
 }
 
-/// The upstream's own words from a refusal, bounded for the wire.
-///
-/// ONE PRODUCER, because there were three and they had already drifted. Two took
-/// 200 characters and then asked whether the result was blank; the third, written
-/// hours before this extraction, trimmed FIRST and then took 200 -- so a body with
-/// leading whitespace yielded a different excerpt depending on which path reached
-/// it. Nothing was wrong enough to notice, which is the point: a rule copied three
-/// times is three chances to answer differently, and the answers diverge quietly.
-///
-/// Trim-then-take is the kept order. Leading whitespace is not evidence, and
-/// spending the 200-character budget on it costs exactly the part of the message
-/// a reader needs.
-///
-/// THE EXCERPT IS UNREDACTED BY CONSTRUCTION and reaches `ProviderUsage.error`.
-/// That is the standing review point: when adding a provider, check what its
-/// non-2xx bodies contain before routing it through here. It bites hardest on the
-/// auth statuses, since a refusal is the likeliest place for a provider to echo
-/// the rejected credential back.
 /// How a non-2xx status reads, body or no body.
-///
-/// SHARED BY BOTH NON-2XX BRANCHES, because the reasoning belongs to neither.
-/// An empty body is a FACT worth stating rather than a blank to hide: it tells a
-/// reader the upstream said nothing, which is different from nobody having
-/// looked.
-///
-/// That reasoning was written on the auth branch and applied only there, so the
-/// sibling branch rendered `HTTP 503: ` — a trailing colon introducing nothing,
-/// which reads as a truncation rather than as silence.
-///
-/// It surfaced only under a loopback harness. No provider on this host had
-/// answered non-2xx with an empty body, so the live wire had never shown the
-/// string, and the two branches had no way to be seen disagreeing.
-fn status_detail(status: u16, body: &[u8]) -> String {
-    let excerpt = refusal_excerpt(body);
+fn status_detail(status: u16, excerpt: &str) -> String {
     if excerpt.is_empty() {
         format!("HTTP {status} (no response body)")
     } else {
@@ -163,7 +131,11 @@ fn status_detail(status: u16, body: &[u8]) -> String {
 /// Status-first callers can apply this after making their provider-specific retry
 /// decision, without duplicating authentication classification or excerpt wording.
 pub(crate) fn status_error(status: u16, body: &[u8]) -> FetchError {
-    let detail = status_detail(status, body);
+    status_error_from_excerpt(status, &refusal_excerpt(body))
+}
+
+fn status_error_from_excerpt(status: u16, excerpt: &str) -> FetchError {
+    let detail = status_detail(status, excerpt);
     if status == 401 || status == 403 {
         FetchError::Unauthorized(detail)
     } else {
@@ -172,11 +144,90 @@ pub(crate) fn status_error(status: u16, body: &[u8]) -> FetchError {
 }
 
 pub(crate) fn refusal_excerpt(body: &[u8]) -> String {
-    String::from_utf8_lossy(body)
+    scrubbed_refusal_excerpt(body, [])
+}
+
+pub(crate) fn scrubbed_refusal_excerpt<'a>(
+    body: &[u8],
+    secrets: impl IntoIterator<Item = &'a str>,
+) -> String {
+    scrub_refusal(body, secrets)
         .trim()
         .chars()
         .take(ERROR_EXCERPT_CHARS)
         .collect()
+}
+
+/// Remove credentials before truncating, so the excerpt cannot end in a
+/// partial token. Preserve surrounding punctuation and the provider's words.
+fn scrub_refusal<'a>(body: &[u8], secrets: impl IntoIterator<Item = &'a str>) -> String {
+    const REDACTED: &str = "[redacted]";
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    for secret in secrets.into_iter().filter(|secret| !secret.is_empty()) {
+        text = text.replace(secret, REDACTED);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    let mut after_bearer = false;
+    while !rest.is_empty() {
+        if after_bearer {
+            let token = rest.trim_start_matches(char::is_whitespace);
+            let len = token
+                .find(|c: char| !c.is_ascii_alphanumeric() && !"-_.~+/=".contains(c))
+                .unwrap_or(token.len());
+            let word = token[..len].trim_end_matches('.');
+            if token.len() != rest.len() && !word.is_empty() {
+                out.push_str(&rest[..rest.len() - token.len()]);
+                out.push_str(REDACTED);
+                rest = &token[word.len()..];
+                after_bearer = false;
+                continue;
+            }
+        }
+        let start = rest
+            .find(|c: char| c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let (prefix, tail) = rest.split_at(start);
+        out.push_str(prefix);
+        if tail.is_empty() {
+            break;
+        }
+        let len = tail
+            .find(|c: char| !c.is_ascii_alphanumeric() && !"-_.".contains(c))
+            .unwrap_or(tail.len());
+        let word = tail[..len].trim_end_matches('.');
+        let key_len = word
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(word.len());
+        let key = ["sk-", "sess-"]
+            .iter()
+            .any(|prefix| key_len > prefix.len() && word.starts_with(prefix));
+        if jwt_shaped(word) {
+            out.push_str(REDACTED);
+            rest = &tail[word.len()..];
+        } else if key {
+            out.push_str(REDACTED);
+            rest = &tail[key_len..];
+        } else {
+            out.push_str(&tail[..len]);
+            rest = &tail[len..];
+        }
+        after_bearer = word.eq_ignore_ascii_case("bearer") && word.len() == len;
+    }
+    out
+}
+
+fn jwt_shaped(word: &str) -> bool {
+    let mut parts = word.split('.');
+    // JWTs begin with a base64url JSON header, not just any dotted name.
+    let Some(header) = parts.next().filter(|header| header.starts_with("eyJ")) else {
+        return false;
+    };
+    fn base64url(part: &str) -> bool {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    }
+    base64url(header) && matches!(parts.clone().count(), 2 | 4) && parts.all(base64url)
 }
 
 /// Characters of an upstream refusal published for diagnosis.
@@ -467,6 +518,7 @@ pub struct JsonRequest {
     method: Method,
     url: String,
     headers: Vec<Header>,
+    refusal_secrets: Vec<String>,
     timeout: Duration,
 }
 
@@ -487,6 +539,7 @@ impl JsonRequest {
             method: Method::Get,
             url: url.into(),
             headers: vec![Header::new("Accept", accept)],
+            refusal_secrets: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -500,6 +553,7 @@ impl JsonRequest {
                 Header::new("Accept", "application/json"),
                 Header::new("Content-Type", "application/json"),
             ],
+            refusal_secrets: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -513,6 +567,7 @@ impl JsonRequest {
             method: Method::Post(body),
             url: url.into(),
             headers: vec![],
+            refusal_secrets: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -528,6 +583,7 @@ impl JsonRequest {
                 Header::new("Accept", "application/json"),
                 Header::new("Content-Type", "application/x-www-form-urlencoded"),
             ],
+            refusal_secrets: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -541,6 +597,42 @@ impl JsonRequest {
     pub fn header(mut self, header: Header) -> Self {
         self.headers.push(header);
         self
+    }
+
+    /// Keep provider-private values from the request body out of refusal text.
+    pub(crate) fn redact_in_refusals(mut self, value: &str) -> Self {
+        self.refusal_secrets.push(value.to_owned());
+        self
+    }
+
+    fn refusal_secrets(&self) -> Vec<&str> {
+        let mut secrets: Vec<_> = self.refusal_secrets.iter().map(String::as_str).collect();
+        for header in &self.headers {
+            let name = header.name.to_ascii_lowercase();
+            let value = header.value.trim();
+            match name.as_str() {
+                "authorization" | "proxy-authorization" => {
+                    secrets.push(
+                        value
+                            .split_once(' ')
+                            .map_or(value, |(_, token)| token.trim()),
+                    );
+                }
+                "cookie" => secrets.extend(
+                    value
+                        .split(';')
+                        .filter_map(|pair| pair.split_once('=').map(|(_, value)| value.trim())),
+                ),
+                name if name.ends_with("api-key")
+                    || name.ends_with("-token")
+                    || name == "x-msh-session-id" =>
+                {
+                    secrets.push(value)
+                }
+                _ => {}
+            }
+        }
+        secrets
     }
 
     /// Override the default 30s timeout.
@@ -567,57 +659,7 @@ impl JsonRequest {
     /// `x-ratelimit-reset-*`). Same uniform error mapping as [`send`](Self::send).
     pub async fn send_full(self, client: &reqwest::Client) -> Result<HttpResponse, FetchError> {
         let raw = self.send_raw(client).await?;
-        if raw.status == 401 || raw.status == 403 {
-            // EXCERPTED LIKE EVERY OTHER NON-2XX, which it was not until now, and
-            // the omission was exactly backwards. Every other refusal carried 200
-            // characters of the upstream's own words; the one class whose remedy is
-            // an OPERATOR ACTION carried `HTTP 403` and nothing else.
-            //
-            // A 403 is not reliably an auth verdict. Two live rows said so: the
-            // former `gemini` provider answered `unauthorized: quota: HTTP 403`
-            // because Google sunset Code Assist for individual accounts, where re-authenticating
-            // cannot help, and upstream CodexBar hit the same shape from a different
-            // direction at v0.56.4 -- claude.ai returning 403 for a Cloudflare
-            // challenge, which they had to add a distinct class for because the
-            // remedy is a network change rather than a login.
-            //
-            // The class stays `Unauthorized` rather than growing a sibling. A
-            // challenge-versus-expiry predicate would be a guess about pages we have
-            // never observed, and the honest fix is to carry the evidence rather
-            // than to classify it: an operator reading a Cloudflare interstitial or
-            // Google's own sunset text in `ProviderUsage.error` can tell what
-            // happened, and no wire change is needed for them to do it.
-            //
-            // THIS EXTENDS THE UNREDACTED-EXCERPT REVIEW POINT BELOW TO 401/403
-            // BODIES. Refusal bodies are the likeliest place for a provider to echo
-            // the rejected credential back, so the obligation stated there -- check
-            // what a new provider's non-2xx bodies contain -- now covers the auth
-            // statuses too, and matters more there.
-            return Err(status_error(raw.status, &raw.body));
-        }
         if !(200..300).contains(&raw.status) {
-            // THE EXCERPT IS UNREDACTED BY CONSTRUCTION, and it reaches the wire
-            // in `ProviderUsage.error`. Every other leak class here is closed --
-            // URLs are stripped, credential paths are replaced by descriptions,
-            // lengths are bounded -- but this path echoes 200 characters of
-            // whatever the upstream sent, which is what makes it useful for
-            // diagnosis and also what makes it the one uninspected channel.
-            //
-            // No provider currently returns a secret in an error body. The hazard
-            // is that a SUCCESS payload can carry one and nobody would look here:
-            // minimax's `token_plan_credit` response includes a live `api_key`
-            // field (reported on insula#2, 2026-08-17). That endpoint signals
-            // app-level errors as `base_resp.status_code` on HTTP 200, so its
-            // failures are parsed rather than excerpted and it does not leak
-            // today -- but a provider that carried a secret in a payload AND
-            // answered non-2xx with it would, silently.
-            //
-            // Deliberately not scrubbed with a key-shaped heuristic: it would
-            // mangle genuine diagnostics far more often than it would catch a
-            // secret, and a scrubber that mostly fires on false positives trains
-            // people to distrust the field. The rule instead is a REVIEW POINT --
-            // when adding a provider whose payload carries credentials, check
-            // what its non-2xx bodies contain before routing it through here.
             return Err(status_error(raw.status, &raw.body));
         }
         raw.body_for_parsing()?;
@@ -666,25 +708,8 @@ impl JsonRequest {
         let final_url = response.url().to_string();
         let headers = response_headers(&response);
         if !(200..300).contains(&status) {
-            // The body was already read here to drain the connection and then
-            // thrown away, which discarded the diagnosis at the one point it
-            // existed. A bare code cannot separate a challenge from an
-            // entitlement withdrawal from an expired session.
-            //
-            // EXCERPTED TO THE SAME 200 CHARACTERS AS EVERY OTHER NON-2XX PATH.
-            // The drain reads up to 8 KiB for connection reuse, and the first cut
-            // of this change put all of it on the wire -- the same class of data
-            // under two different bounds, with the tighter one bypassed. Later
-            // backstops (a 1 KiB cap on `Display`, 512-byte wire strings) would
-            // have hidden that, which is exactly why the bound belongs here where
-            // the decision is, rather than being left to whatever truncates last.
-            //
-            // The unredacted-excerpt obligation stated above applies to this path
-            // in full, and more sharply: every caller is a bearer-token lane
-            // (anthropic, antigravity, codex, grok, kimi-for-coding, muse), so a
-            // provider echoing the rejected credential back would echo it here.
             let body = match read_error_body_prefix(response).await {
-                Ok(body) => refusal_excerpt(&body),
+                Ok(body) => scrubbed_refusal_excerpt(&body, self.refusal_secrets()),
                 Err(_) => {
                     eprintln!(
                         "{LOG_TAG} warning: {provider} rejected-response body was incomplete status={status}"
@@ -717,6 +742,7 @@ impl JsonRequest {
     /// rare provider whose status semantics are bespoke — e.g. doubao must read
     /// rate-limit headers off BOTH 200 AND 429 — so it owns the status policy while
     /// still riding this shared transport instead of hand-rolling `reqwest`.
+    /// Refusal bodies are scrubbed before callers can publish them.
     ///
     /// The empty-body rule that [`send`](Self::send) applies is **deliberately
     /// absent here**, because a caller reading rate-limit headers off a `429`
@@ -753,7 +779,8 @@ impl JsonRequest {
         } else if (200..300).contains(&status) {
             read_success_body(response).await?
         } else {
-            read_error_body_prefix(response).await?
+            let body = read_error_body_prefix(response).await?;
+            scrub_refusal(&body, self.refusal_secrets()).into_bytes()
         };
 
         Ok(HttpResponse {
@@ -1067,19 +1094,33 @@ mod tests {
     #[test]
     fn an_empty_body_reads_the_same_on_both_non_2xx_branches() {
         assert_eq!(
-            status_detail(503, b""),
+            status_detail(503, ""),
             "HTTP 503 (no response body)",
             "an upstream that sent nothing must say so, not trail a colon"
         );
         assert_eq!(
-            status_detail(401, b""),
+            status_detail(401, ""),
             "HTTP 401 (no response body)",
             "the auth branch's wording is the one being shared, unchanged"
         );
         assert_eq!(
-            status_detail(503, b"upstream is draining"),
+            status_detail(503, "upstream is draining"),
             "HTTP 503: upstream is draining",
             "a body that exists is still echoed for diagnosis"
+        );
+    }
+
+    #[test]
+    fn refusal_excerpts_remove_credentials_before_bounding_the_text() {
+        let body = b"Denied: opaque-test-value; Bearer _other-token; key=sk-example, sess-example; jwt=eyJhbGciOiJIUzI1NiJ9.e30.c2ln. Please sign in.";
+        assert_eq!(
+            scrubbed_refusal_excerpt(body, ["opaque-test-value"]),
+            "Denied: [redacted]; Bearer [redacted]; key=[redacted], [redacted]; jwt=[redacted]. Please sign in."
+        );
+        let body = format!("{}opaque-test-value", "x".repeat(195));
+        assert_eq!(
+            scrubbed_refusal_excerpt(body.as_bytes(), ["opaque-test-value"]),
+            format!("{}[reda", "x".repeat(195))
         );
     }
 

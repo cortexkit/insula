@@ -68,8 +68,8 @@ defaults, with banked resets off) into a live handle, builds
 credential source, and spawns `Registry::refresh_loop_observed` and a reload
 task after registration. The reload task reads the
 file every 5 seconds and parses it only when its bytes changed: an edit applies on the provider's next decision, a deleted file
-applies the defaults, and a file that cannot be read or parsed keeps the last
-good config. The manifest declares one management
+applies the defaults, and a file that cannot be read or parsed disarms automatic
+saved resets while keeping the last good values for other settings. The manifest declares one management
 surface with the queries `usage.get`, `usage.watch`, `usage.drops` and `events_get`
 and the writer operation `usage.observe`, and declares that the module consumes
 the credential vault and ckbus.
