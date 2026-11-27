@@ -76,40 +76,27 @@ jobs:
       # macOS one have different causes, and cancelling the matrix on the first
       # hides whichever would have finished second.
       fail-fast: false
+      # The five targets `ck setup` supports, matching core's release lane. Every
+      # target builds and runs the test suite on its own architecture: a binary
+      # that only cross-compiled has never been seen to run where it ships.
       matrix:
         include:
           - asset: ck-insula-darwin-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
-            cross: false
-            runnable: true
-          - asset: ck-insula-darwin-x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            cross: false
-            runnable: true
           - asset: ck-insula-linux-x64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cross: false
-            runnable: true
           - asset: ck-insula-linux-arm64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
-            # An x64 Linux runner cannot execute this ARM64 binary natively.
-            runnable: false
           - asset: ck-insula-windows-x64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-            cross: false
-            runnable: true
           - asset: ck-insula-windows-arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            cross: false
-            runnable: true
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: insula
@@ -122,19 +109,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross for Linux ARM64
-        if: matrix.cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross@0.2.5
+      # The real-daemon tests stay ignored here: they need a ck-subc build, and
+      # the CI gate runs them against one.
+      - name: Test natively
+        run: cargo test --locked --workspace --all-targets --target ${{ matrix.target }}
 
       - name: Build release binary
-        if: '!matrix.cross'
         run: cargo build --locked --release -p quota-module --target ${{ matrix.target }}
-
-      - name: Cross-build release binary
-        if: matrix.cross
-        run: cross build --locked --release -p quota-module --target ${{ matrix.target }}
 
       # RUN THE BINARY, DO NOT ASSUME IT RUNS. An asset that cannot execute on
       # the platform it is named for is indistinguishable from a good one until a
@@ -146,7 +127,6 @@ jobs:
       # 81fee3d, because it is normally spawned by the daemon and nobody had run
       # it by hand.
       - name: Verify the binary self-reports its version
-        if: matrix.runnable
         shell: bash
         run: |
           set -euo pipefail
@@ -159,7 +139,6 @@ jobs:
             echo "::error::binary reports '${reported}', release is '${expected}'"
             exit 1
           fi
-
       # DARWIN SIGNS AND NOTARIZES BEFORE PACKAGING, and the ordering is the
       # whole point -- see scripts/release/macos-sign-notarize.sh. Signing mutates
       # the binary and stapling mutates the ZIP, so the checksum step below must

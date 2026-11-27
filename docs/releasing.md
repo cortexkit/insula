@@ -73,10 +73,12 @@ Build and publish jobs depend on this gate.
 ## Platforms and failure recovery
 
 Assets are named `ck-insula-<os>-<arch>.zip` with `.zip.sha256` sidecars:
-darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64 and windows-arm64.
-Both macOS builds use the same Developer ID signing and notarization script
-before checksumming. Native targets run `--version` on their runner; Linux ARM64
-uses `cross` on x64 Linux, so it cannot run its binary natively there.
+darwin-arm64, linux-x64, linux-arm64, windows-x64 and windows-arm64, the five
+targets `ck setup` supports. Each target runs the test suite natively on its own
+architecture before its binary is built.
+The macOS build is signed with the Developer ID and notarized before
+checksumming. Every target also runs its built binary's `--version` on its
+runner.
 
 A pre-tag failure publishes no tag or release. A failure after a bump may leave
 the bump dirty or committed locally, and a failed train leaves its branch for
