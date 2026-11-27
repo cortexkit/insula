@@ -242,11 +242,20 @@ async fn usage_watch_changed_entry_names_its_identity() {
         5,
         "notices must contain identities, not quota or metadata"
     );
+    // The labelled row goes away and an unlabelled one appears: one notice for
+    // the new row and one for the removal of "a", in either order.
     wire.serve.samples.observe(vec![entry(None, 22)]).await;
-    let value = notice(wire.recv().await, 5, 7, 91);
-    assert_eq!(value["seq"], 3);
-    assert_eq!(value["provider"], "deepseek");
-    assert!(value.get("account").is_none());
+    let first = notice(wire.recv().await, 5, 7, 91);
+    let second = notice(wire.recv().await, 5, 7, 91);
+    let mut seqs = [first["seq"].as_u64(), second["seq"].as_u64()];
+    seqs.sort();
+    assert_eq!(seqs, [Some(3), Some(4)]);
+    for value in [&first, &second] {
+        assert_eq!(value["provider"], "deepseek");
+    }
+    let mut accounts = [first.get("account").cloned(), second.get("account").cloned()];
+    accounts.sort_by_key(|account| account.is_some());
+    assert_eq!(accounts, [None, Some(json!("a"))]);
     wire.stop().await;
     wire.finish().await;
 }
