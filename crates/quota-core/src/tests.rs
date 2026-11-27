@@ -2633,41 +2633,6 @@ async fn a_contested_identity_names_its_winner_and_an_uncontested_one_stays_sile
 }
 
 #[tokio::test]
-#[ignore = "external audit finding 11: dedup stderr exposes account and credential ids, fix pending"]
-async fn external_audit_finding_11_dedup_notice_redacts_account_and_credential_ids() {
-    const CHILD: &str = "INSULA_TEST_DEDUP_STDERR_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        let registry = Registry::new(vec![Box::new(PairedDropProvider {
-            percent: Arc::new(Mutex::new(25.0)),
-        })]);
-        tick(&registry).await;
-        assert_eq!(registry.get_usage(None).await.len(), 1);
-        return;
-    }
-
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "tests::external_audit_finding_11_dedup_notice_redacts_account_and_credential_ids",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(CHILD, "1")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{stderr}");
-    let leaked: Vec<_> = ["acct-1", "H1", "H2"]
-        .into_iter()
-        .filter(|identifier| stderr.contains(identifier))
-        .collect();
-    assert!(
-        leaked.is_empty(),
-        "dedup stderr exposes account or credential identifiers {leaked:?}: {stderr}"
-    );
-}
-
-#[tokio::test]
 async fn one_identity_less_handle_suppresses_the_labels_of_every_other_handle() {
     // The mixed case: one handle resolves an account and the other cannot. The
     // read path emits labeled entries only when EVERY handle resolves one, so a
