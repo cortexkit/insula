@@ -121,6 +121,15 @@ impl QuotaSamples {
             .count();
         self.dropped.fetch_add(absent as u64, Ordering::Relaxed);
         pending.queue.retain(|s| current.contains_key(&s.key));
+        // A removal invalidates a reader's snapshot, but there is no reading
+        // to publish. Forget the old value so a returning row is seen again.
+        pending.seen.retain(|key, _| {
+            let present = current.contains_key(key);
+            if !present {
+                self.watches.changed(&key.0, key.1.as_deref());
+            }
+            present
+        });
         pending.current = current;
         let changed = pending
             .current
@@ -694,12 +703,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "external audit finding 15: account removal emits no usage.watch invalidation, fix pending"]
     async fn external_audit_finding_15_removed_account_invalidates_usage_watches() {
         let samples = QuotaSamples::new("epoch".into());
         let retained = entry(Some("retained"), "2026-01-01T00:00:00Z");
         let removed = entry(Some("removed"), "2026-01-01T00:00:00Z");
-        samples.observe(vec![retained.clone(), removed]).await;
+        samples
+            .observe(vec![retained.clone(), removed.clone()])
+            .await;
+        assert!(samples.pop().is_some());
+        assert!(samples.pop().is_some());
         let frame = subc_protocol::Frame::build(
             subc_protocol::FrameType::Request,
             subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
@@ -716,7 +728,7 @@ mod tests {
             1
         );
 
-        samples.observe(vec![retained]).await;
+        samples.observe(vec![retained.clone()]).await;
 
         let removal = samples.watches.try_next().expect(
             "removing an account must invalidate watches even when survivors are unchanged",
@@ -725,6 +737,21 @@ mod tests {
         assert_eq!(removal["seq"], 2);
         assert_eq!(removal["provider"], "deepseek");
         assert_eq!(removal["account"], "removed");
+        assert!(removal.get("usage").is_none());
+        assert!(samples.pop().is_none());
+
+        samples.observe(vec![retained.clone()]).await;
+        assert!(samples.watches.try_next().is_none());
+
+        samples.observe(vec![retained, removed]).await;
+        let returned = samples.watches.try_next().unwrap();
+        let returned: Value = serde_json::from_slice(&returned.body).unwrap();
+        assert_eq!(returned["seq"], 3);
+        assert_eq!(returned["account"], "removed");
+        assert!(samples.watches.try_next().is_none());
+        let sample = samples.pop().unwrap();
+        assert_eq!(sample.key.1.as_deref(), Some("removed"));
+        assert_eq!(sample.body["seq"], 2);
     }
 
     #[tokio::test]

@@ -212,22 +212,8 @@ impl Registry {
         if windows.primary.is_none() && windows.secondary.is_none() {
             return Err("no_usable_window");
         }
-        for (_, slot) in &eligible {
-            let usage = slot.entry.as_ref().unwrap().usage.as_ref().unwrap();
-            for (index, held) in [usage.primary.as_ref(), usage.secondary.as_ref()]
-                .into_iter()
-                .enumerate()
-            {
-                if let Some(held) = held {
-                    if let Some(update) =
-                        matching_window(&windows, held, index, &observation.provider)
-                    {
-                        guard_window(held, update, incoming)?;
-                    }
-                }
-            }
-        }
-        let mut updated = false;
+        // Stage every slot first so a rejected window leaves the entire row alone.
+        let mut updates = Vec::new();
         for (key, prev) in eligible {
             let mut next = prev.clone();
             let usage = next.entry.as_mut().unwrap().usage.as_mut().unwrap();
@@ -247,9 +233,16 @@ impl Registry {
                     if let Some(update) =
                         matching_window(&windows, held, index, &observation.provider)
                     {
+                        if guard_window(
+                            held,
+                            update,
+                            incoming,
+                            prev.poll_window_used_percent[index],
+                        )? {
+                            next.poll_window_used_percent[index] = None;
+                        }
                         held.used_percent = update.used_percent;
-                        // A reply that states no reset says nothing about the
-                        // period, so it keeps the poll's reset time.
+                        // A reply that states no reset keeps the held reset time.
                         if update.resets_at.is_some() {
                             held.resets_at = update.resets_at.clone();
                         }
@@ -268,7 +261,6 @@ impl Registry {
             {
                 next.relax_eligible = false;
             }
-            updated = true;
             next.last_success_wall = Some(incoming);
             next.last_success_at = Some(now);
             next.last_call_observation_at = Some(now);
@@ -277,13 +269,15 @@ impl Registry {
             next.failing_since_wall = None;
             // Keep poll failures and their retry deadline: a model success must
             // not erase the endpoint's rate-limit backoff or vault repair state.
+            updates.push((key, prev, next));
+        }
+        if updates.is_empty() {
+            return Err("no_usable_window");
+        }
+        for (key, prev, next) in updates {
             self.publish_reading(&mut store, &key, &prev, next, now);
         }
-        if updated {
-            Ok(())
-        } else {
-            Err("no_usable_window")
-        }
+        Ok(())
     }
 }
 
@@ -307,33 +301,40 @@ fn matching_window<'a>(
     }
 }
 
-/// A reply cannot roll a counter back before the held period has ended.
+/// Check the reading, returning whether it establishes a different reset period.
 fn guard_window(
     held: &crate::model::RateWindow,
     update: &crate::model::RateWindow,
     incoming: DateTime<Utc>,
-) -> Result<(), &'static str> {
+    poll_used_percent: Option<f64>,
+) -> Result<bool, &'static str> {
     let parse = |s: &Option<String>| {
         s.as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&Utc))
     };
-    // A reply with no reset can't show a new period began, so it is held to
-    // the current period: no fall beyond rounding.
-    if update.resets_at.is_none() && update.used_percent < held.used_percent - 1.0 {
-        return Err("window_regressed");
-    }
-    if let (Some(old), Some(new)) = (parse(&held.resets_at), parse(&update.resets_at)) {
-        if (old.timestamp() - new.timestamp()).abs() < 60
-            && update.used_percent < held.used_percent - 1.0
-        {
-            return Err("window_regressed");
+    match (parse(&held.resets_at), parse(&update.resets_at)) {
+        (Some(old), Some(new)) if new < old => return Err("window_regressed"),
+        (Some(old), Some(new)) if new.timestamp() - old.timestamp() >= 60 && incoming >= old => {
+            return Ok(true);
         }
-        if new > old && update.used_percent < held.used_percent && incoming < old {
+        (Some(old), Some(new))
+            if new > old && update.used_percent < held.used_percent && incoming < old =>
+        {
             return Err("early_new_period");
         }
+        // The poll without a reset cannot anchor the reply's stated period.
+        (None, Some(_)) => return Ok(true),
+        _ => {}
     }
-    Ok(())
+    // A missing or nearly unchanged reset does not prove a new period. Only
+    // the poll sets a rounding allowance; chaining reply allowances would let
+    // a counter run down without rolling over.
+    let floor = poll_used_percent.map_or(held.used_percent, |polled| polled - 1.0);
+    if update.used_percent < floor {
+        return Err("window_regressed");
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

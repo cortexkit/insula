@@ -362,40 +362,28 @@ async fn published_weekly(registry: &Registry) -> f64 {
         .used_percent
 }
 
-/// A reply naming an earlier reset than the held one cannot lower usage.
-///
-/// The guard refuses a lower reading at the same reset (beyond rounding) and a
-/// later reset before the held period has ended, but a reset an hour EARLIER
-/// matches neither rule. A period cannot end before the one it follows, so
-/// such a reply proves no rollover, yet its lower usage is published.
+/// The reset cannot move backwards, even on a reply that reports higher use.
 #[tokio::test]
-#[ignore = "external audit finding 10: an earlier reset anchor lowers held usage without a rollover, fix pending"]
 async fn external_audit_an_earlier_reset_anchor_cannot_lower_usage() {
     let registry = registry("codex").await;
     assert_eq!(published_weekly(&registry).await, 70.0);
-    let mut earlier = row("codex");
-    earlier["headers"] = json!({"x-codex-primary-used-percent":"30",
-        "x-codex-primary-window-minutes":"10080",
-        "x-codex-primary-reset-at":"1790737200"});
-    let result = registry.observe_calls(ObservationWriter::Broca, vec![earlier]);
-    assert_eq!(
-        published_weekly(&registry).await,
-        70.0,
-        "a reply anchored an hour before the held reset lowered the weekly window \
-         (accepted={})",
-        result.accepted
-    );
+    for (percent, reset) in [("30", "1790737200"), ("80", "1790740799")] {
+        let mut earlier = row("codex");
+        earlier["headers"]["x-codex-primary-used-percent"] = json!(percent);
+        earlier["headers"]["x-codex-primary-reset-at"] = json!(reset);
+        ignored(
+            &registry,
+            ObservationWriter::Broca,
+            earlier,
+            "window_regressed",
+        );
+    }
+    assert_eq!(published_weekly(&registry).await, 70.0);
 }
 
 /// Same-period decreases within the rounding tolerance cannot add up.
 ///
-/// Each reply below is one point lower than the last, at the held reset, so
-/// each passes the one-point tolerance against the value it replaces. The
-/// tolerance is measured from the latest accepted reading rather than a
-/// stable baseline, so twenty replies walk the window from 70% to 50%
-/// without a rollover.
 #[tokio::test]
-#[ignore = "external audit finding 10: repeated in-tolerance decreases lower held usage without a rollover, fix pending"]
 async fn external_audit_in_tolerance_decreases_do_not_accumulate() {
     let registry = registry("codex").await;
     let mut accepted = 0;
@@ -410,10 +398,40 @@ async fn external_audit_in_tolerance_decreases_do_not_accumulate() {
             .observe_calls(ObservationWriter::Broca, vec![lower])
             .accepted;
     }
-    let weekly = published_weekly(&registry).await;
-    assert!(
-        weekly >= 69.0,
-        "{accepted} in-tolerance replies lowered the weekly window from 70% to {weekly}% \
-         within one period"
+    assert_eq!(accepted, 1);
+    assert_eq!(published_weekly(&registry).await, 69.0);
+}
+
+#[tokio::test]
+async fn a_reply_only_period_has_no_rounding_allowance_until_polled() {
+    let registry = registry("codex").await;
+    let mut reply = row("codex");
+    reply["observedAtMs"] = json!(1_790_740_800_000_i64);
+    reply["headers"]["x-codex-primary-reset-at"] = json!("1791345600");
+    reply["headers"]["x-codex-primary-used-percent"] = json!("10");
+    assert_eq!(
+        registry
+            .observe_calls(ObservationWriter::Broca, vec![reply.clone()])
+            .accepted,
+        1
     );
+
+    reply["observedAtMs"] = json!(1_790_740_801_000_i64);
+    reply["headers"]["x-codex-primary-used-percent"] = json!("11");
+    assert_eq!(
+        registry
+            .observe_calls(ObservationWriter::Broca, vec![reply.clone()])
+            .accepted,
+        1
+    );
+
+    reply["observedAtMs"] = json!(1_790_740_802_000_i64);
+    reply["headers"]["x-codex-primary-used-percent"] = json!("10.5");
+    ignored(
+        &registry,
+        ObservationWriter::Broca,
+        reply,
+        "window_regressed",
+    );
+    assert_eq!(published_weekly(&registry).await, 11.0);
 }

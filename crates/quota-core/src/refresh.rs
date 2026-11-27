@@ -284,6 +284,9 @@ pub struct ProviderSlot {
     /// Keep poll completion separate from call readings, so frequent calls
     /// cannot defer the next poll indefinitely.
     pub last_poll_completed_at: Option<Instant>,
+    /// Primary and secondary percentages from the poll, not the latest reply.
+    /// A reply that establishes a different period clears the old baseline.
+    pub(crate) poll_window_used_percent: [Option<f64>; 2],
     pub last_call_observation_at: Option<Instant>,
     pub status: SlotStatus,
     /// Why the most recent attempt failed, as a stable class name.
@@ -347,6 +350,7 @@ impl ProviderSlot {
             last_success_wall: None,
             last_attempt_at: None,
             last_poll_completed_at: None,
+            poll_window_used_percent: [None; 2],
             last_call_observation_at: None,
             status: SlotStatus::Pending,
             next_due_at: now,
@@ -714,6 +718,7 @@ fn next_slot_after_attempt_inner(
             last_success_wall: None,
             last_attempt_at: Some(attempt_start),
             last_poll_completed_at: Some(completed),
+            poll_window_used_percent: [None; 2],
             last_call_observation_at: prev.last_call_observation_at,
             status: prev.status,
             next_due_at: completed + poll_interval(provider_name),
@@ -828,6 +833,8 @@ fn next_slot_after_attempt_inner(
             attempt_sequence: prev.attempt_sequence,
             error_class: None,
             last_failure_message: None,
+            poll_window_used_percent: [usage.primary.as_ref(), usage.secondary.as_ref()]
+                .map(|window| window.map(|window| window.used_percent)),
             entry: Some(healthy_entry(
                 provider_name,
                 observation.as_ref(),
@@ -975,6 +982,11 @@ fn next_slot_after_attempt_inner(
                 },
                 last_attempt_at: Some(attempt_start),
                 last_poll_completed_at: Some(completed),
+                poll_window_used_percent: if status == SlotStatus::StaleTransient {
+                    retry_base.poll_window_used_percent
+                } else {
+                    [None; 2]
+                },
                 last_call_observation_at: if account_changed {
                     None
                 } else {

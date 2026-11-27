@@ -183,7 +183,7 @@ fn log_file_path_from(
 fn discover_usage_from(
     bases: &[PathBuf],
     log_path: impl Fn(&Path) -> Option<PathBuf>,
-) -> Result<Normalized, FetchError> {
+) -> Result<TimedUsage, FetchError> {
     let mut installations = Vec::new();
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for base in bases {
@@ -196,12 +196,20 @@ fn discover_usage_from(
             }
             installations.push(entry.path());
             let candidate = entry.path().join(QUOTA_FILE_REL);
-            let Ok(meta) = std::fs::metadata(&candidate) else {
-                continue;
+            let meta = match std::fs::metadata(&candidate) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(FetchError::LocalSourceUnavailable(format!(
+                        "cannot inspect JetBrains quota XML: {error}"
+                    )));
+                }
             };
-            let Ok(mtime) = meta.modified() else {
-                continue;
-            };
+            let mtime = meta.modified().map_err(|error| {
+                FetchError::LocalSourceUnavailable(format!(
+                    "cannot date JetBrains quota XML: {error}"
+                ))
+            })?;
             if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
                 best = Some((mtime, candidate));
             }
@@ -213,24 +221,24 @@ fn discover_usage_from(
             .parent()
             .and_then(Path::parent)
             .expect("quota path has options parent");
-        let log = read_log(ide);
-        let xml = crate::env::read_credential_file(&path, "JetBrains quota XML")
-            .and_then(|bytes| normalize(&bytes));
-        // No active quota is an account state, not corrupt XML. An older log
-        // must not revive an account superseded by a newer no-quota XML state.
-        let xml_invalid = xml.is_err() && !matches!(&xml, Err(FetchError::NoQuotaReported(_)));
-        if let Some(log) = log {
-            if log.timestamp > mtime || xml_invalid {
-                return Ok(log.normalized);
-            }
+        // An older log may belong to the previous login. An XML read fault
+        // does not make that log current or prove the account is unchanged.
+        if let Some(log) = read_log(ide).filter(|log| log.timestamp > mtime) {
+            return Ok(log);
         }
-        return xml;
+        let normalized = normalize(&crate::env::read_credential_file(
+            &path,
+            "JetBrains quota XML",
+        )?)?;
+        return Ok(TimedUsage {
+            timestamp: mtime,
+            normalized,
+        });
     }
     installations
         .iter()
         .filter_map(|ide| read_log(ide))
         .max_by_key(|entry| entry.timestamp)
-        .map(|entry| entry.normalized)
         .ok_or_else(|| {
             FetchError::NoSession("no JetBrains quota XML or valid log found".to_string())
         })
@@ -248,12 +256,12 @@ const JUNIE_MARKER: &str = "AiaActivationTransmitter - Received message from jun
 const DISABLED_ASSISTANT_MARKER: &str =
     "QuotaManager2Impl - New quota state is: Error(exception=com.intellij.ml.llm.core.AIAssistantForbiddenException";
 
-struct LogEntry {
+struct TimedUsage {
     timestamp: SystemTime,
     normalized: Normalized,
 }
 
-fn latest_log_entry(path: &Path) -> Option<LogEntry> {
+fn latest_log_entry(path: &Path) -> Option<TimedUsage> {
     let mut file = std::fs::File::open(path).ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
     latest_log_entry_in(&read_log_tail(&mut file, end)?)
@@ -281,7 +289,7 @@ fn read_log_tail(reader: &mut (impl Read + Seek), end: u64) -> Option<String> {
     String::from_utf8(bytes.split_off(start)).ok()
 }
 
-fn latest_log_entry_in(content: &str) -> Option<LogEntry> {
+fn latest_log_entry_in(content: &str) -> Option<TimedUsage> {
     let mut quota = None;
     let mut refill = None;
     let mut found_refill = false;
@@ -323,7 +331,7 @@ fn latest_log_entry_in(content: &str) -> Option<LogEntry> {
     // Junie states its reset as `until`; text records use their own refill line.
     // Never borrow XML refill data: the XML may belong to a previous account.
     let normalized = normalize_quota(quota, own_refill.or(refill)).ok()?;
-    Some(LogEntry {
+    Some(TimedUsage {
         timestamp,
         normalized,
     })
@@ -919,6 +927,24 @@ impl Default for JetBrainsProvider {
     }
 }
 
+fn fetch_usage_from(
+    bases: &[PathBuf],
+    log_path: impl Fn(&Path) -> Option<PathBuf>,
+) -> FetchAttempt {
+    let TimedUsage {
+        timestamp,
+        normalized,
+    } = match discover_usage_from(bases, log_path) {
+        Ok(reading) => reading,
+        Err(error) => return FetchAttempt::from_provider_usage(Err(error)),
+    };
+    let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", normalized.usage);
+    // Absent rather than empty when there is no top-up: an empty list
+    // would state that the provider reports none.
+    entry.spend = normalized.top_up.map(|pool| vec![pool]);
+    FetchAttempt::from_provider_usage(Ok(entry)).with_value_observed_at(timestamp.into())
+}
+
 #[async_trait]
 impl UsageProvider for JetBrainsProvider {
     fn name(&self) -> &str {
@@ -926,18 +952,9 @@ impl UsageProvider for JetBrainsProvider {
     }
 
     async fn fetch_handle(&self, _handle: &CredentialHandle) -> FetchAttempt {
-        let result: Result<ProviderUsage, FetchError> = async {
-            let normalized = discover_usage_from(&config_base_dirs(), |ide| {
-                log_file_path_from(ide, crate::env::home_dir(), |key| std::env::var_os(key))
-            })?;
-            let mut entry = ProviderUsage::healthy(PROVIDER_NAME, None, "api", normalized.usage);
-            // Absent rather than empty when there is no top-up: an empty list
-            // would state that the provider reports none.
-            entry.spend = normalized.top_up.map(|pool| vec![pool]);
-            Ok(entry)
-        }
-        .await;
-        FetchAttempt::from_provider_usage(result)
+        fetch_usage_from(&config_base_dirs(), |ide| {
+            log_file_path_from(ide, crate::env::home_dir(), |key| std::env::var_os(key))
+        })
     }
 }
 
@@ -1526,6 +1543,7 @@ mod tests {
 
         fn fetch(&self) -> Result<Normalized, FetchError> {
             discover_usage_from(&[self.base()], |ide| self.log_path(ide))
+                .map(|reading| reading.normalized)
         }
     }
 
@@ -1601,29 +1619,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external audit finding 13: stale XML and log readings are accepted as healthy, fix pending"]
     fn external_audit_finding_13_stale_local_sources_are_not_current_readings() {
         let stale_xml = IdeFiles::new();
-        stale_xml.xml(
-            "DataGrip2026.2",
-            ACTIVE_XML,
-            SystemTime::now() - std::time::Duration::from_secs(366 * 24 * 60 * 60),
-        );
+        let xml_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        stale_xml.xml("DataGrip2026.2", ACTIVE_XML, xml_time);
         let stale_log = IdeFiles::new();
-        let timestamp = (Local::now() - chrono::Duration::days(366))
-            .format("%Y-%m-%d %H:%M:%S,%3f")
-            .to_string();
-        let line = LATEST_QUOTA_LINE.replacen("2026-10-05 15:27:49,811", &timestamp, 1);
-        stale_log.log("DataGrip2026.2", format!("{REFILL_LINE}\n{line}\n"));
+        stale_log.log("DataGrip2026.2", log_fixture());
 
-        let xml = stale_xml.fetch();
-        let log = stale_log.fetch();
-        assert!(
-            xml.is_err() && log.is_err(),
-            "year-old sources must not publish current quota: XML accepted {}, log accepted {}",
-            xml.is_ok(),
-            log.is_ok()
-        );
+        for (files, expected) in [(&stale_xml, xml_time), (&stale_log, log_fixture_time())] {
+            let attempt = fetch_usage_from(&[files.base()], |ide| files.log_path(ide));
+            assert!(
+                attempt.usage.is_ok(),
+                "age alone does not invalidate the reading"
+            );
+            assert_eq!(attempt.value_observed_at, Some(expected.into()));
+        }
     }
 
     #[test]
@@ -1675,18 +1685,27 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xml_can_fall_back_to_its_own_valid_log() {
+    fn malformed_xml_can_fall_back_only_to_its_own_newer_log() {
+        let malformed = r#"<option name="quotaInfo" value="not JSON" />"#;
         let files = IdeFiles::new();
         files.xml(
             "DataGrip2026.2",
-            "not xml",
-            log_fixture_time() + std::time::Duration::from_secs(86400),
+            malformed,
+            log_fixture_time() - std::time::Duration::from_secs(86400),
         );
         files.log("DataGrip2026.2", log_fixture());
         assert!(
             (files.fetch().unwrap().usage.primary.unwrap().used_percent - 34.6495294).abs()
                 < 0.000001
         );
+        for delay in [0, 86400] {
+            files.xml(
+                "DataGrip2026.2",
+                malformed,
+                log_fixture_time() + std::time::Duration::from_secs(delay),
+            );
+            assert!(matches!(files.fetch(), Err(FetchError::Decode(_))));
+        }
     }
 
     #[test]
